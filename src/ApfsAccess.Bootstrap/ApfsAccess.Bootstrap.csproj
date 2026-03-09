@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>APFSAccess.Portable</AssemblyName>
+    <ApplicationIcon>..\..\assets\icons\tray_idle.ico</ApplicationIcon>
+    <PortablePayloadZip Condition="'$(PortablePayloadZip)'==''">$(MSBuildProjectDirectory)\click-run-payload.zip</PortablePayloadZip>
+  </PropertyGroup>
+
+  <ItemGroup Condition="Exists('$(PortablePayloadZip)')">
+    <EmbeddedResource Include="$(PortablePayloadZip)" LogicalName="ApfsAccess.Bootstrap.Payload.click-run.zip" />
+  </ItemGroup>
+</Project>

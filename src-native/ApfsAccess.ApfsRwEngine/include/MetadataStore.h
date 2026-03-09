@@ -1,0 +1,349 @@
+#pragma once
+
+#include "BtreeMutationCodec.h"
+#include "BlockDevice.h"
+
+#include <cstdint>
+#include <cstddef>
+#include <filesystem>
+#include <functional>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+namespace apfsaccess::rw
+{
+class MetadataStore
+{
+public:
+    enum class MutationStatus
+    {
+        Applied,
+        NotReady,
+        InvalidRequest,
+        AllocationFailed,
+        UnsupportedOperation,
+    };
+
+    enum class CommitStatus
+    {
+        Committed,
+        NothingToCommit,
+        NotReady,
+        NotWritable,
+        AllocationFailed,
+        InvariantFailed,
+        PersistFailed,
+        FlushFailed,
+    };
+
+    enum class MutationOperation
+    {
+        CreateFile,
+        CreateDirectory,
+        Write,
+        SetFileSize,
+        Rename,
+        Delete,
+        SetBasicInfo,
+    };
+
+    enum class NativeWriteCommitModel
+    {
+        ScaffoldCheckpoint,
+        CanonicalApfsCheckpoint,
+    };
+
+    enum class NativeWriteValidationState
+    {
+        Scaffold,
+        CanonicalImageValidated,
+        HardwarePilotValidated,
+        CrossOsValidated,
+        Stable,
+    };
+
+    struct MutationRequest
+    {
+        MutationOperation operation = MutationOperation::Write;
+        std::wstring path;
+        std::wstring secondary_path;
+        std::uint64_t offset = 0;
+        std::uint64_t length = 0;
+        bool replace_if_exists = false;
+        std::uint64_t timestamp_utc = 0;
+    };
+
+    struct ObjectMapUpdate
+    {
+        std::uint64_t object_id = 0;
+        std::uint64_t physical_address = 0;
+        std::uint64_t logical_size = 0;
+        std::uint64_t xid = 0;
+    };
+
+    struct InodeRecord
+    {
+        std::uint64_t object_id = 0;
+        std::uint64_t parent_object_id = 0;
+        std::wstring name;
+        std::wstring full_path;
+        bool is_directory = false;
+        std::uint64_t logical_size = 0;
+        std::uint64_t data_physical_address = 0;
+        std::uint64_t xid = 0;
+        std::uint64_t timestamp_utc = 0;
+    };
+
+    struct DirectoryLink
+    {
+        std::uint64_t parent_object_id = 0;
+        std::wstring entry_name;
+        std::uint64_t child_object_id = 0;
+        std::uint64_t xid = 0;
+    };
+
+    struct SpacemanAllocation
+    {
+        std::uint64_t physical_address = 0;
+        std::uint64_t bytes = 0;
+    };
+
+    struct VolumeContext
+    {
+        std::wstring device_path;
+        std::wstring volume_name;
+        bool allow_raw_physical_write = false;
+        bool integrity_check_on_mount = true;
+        std::wstring crash_replay_mode = L"FailClosed";
+        bool allow_legacy_scaffold_for_fixtures = true;
+        bool disallow_scaffold_commit_on_non_fixture = true;
+        bool reject_scaffold_replay_blob_on_non_fixture = true;
+        bool require_canonical_replay_candidate_on_non_fixture = true;
+    };
+
+    explicit MetadataStore(VolumeContext context);
+
+    [[nodiscard]] const VolumeContext& Context() const noexcept;
+    [[nodiscard]] const BlockDevice& Device() const noexcept;
+    [[nodiscard]] bool LoadContainerState();
+    [[nodiscard]] bool LoadVolumeState();
+    [[nodiscard]] bool LoadCanonicalState();
+    [[nodiscard]] bool LoadContainerSuperblocks();
+    [[nodiscard]] bool LoadObjectMap();
+    [[nodiscard]] bool LoadSpacemanState();
+    [[nodiscard]] bool IsContainerLoaded() const noexcept;
+    [[nodiscard]] std::optional<std::uint32_t> BlockSizeBytes() const noexcept;
+    [[nodiscard]] std::optional<std::uint64_t> TotalBlocks() const noexcept;
+    [[nodiscard]] std::optional<std::uint64_t> CheckpointXid() const noexcept;
+    [[nodiscard]] bool PrepareNativeWritePath();
+    [[nodiscard]] bool IsNativeWriteReady() const noexcept;
+    [[nodiscard]] bool IsCommitPathReady() const noexcept;
+    [[nodiscard]] bool IsRecoveryRequired() const noexcept;
+    [[nodiscard]] std::wstring RecoveryReason() const;
+    [[nodiscard]] MutationStatus StageMutation(const MutationRequest& request);
+    [[nodiscard]] MutationStatus ApplyMutation(const MutationRequest& request);
+    [[nodiscard]] CommitStatus CommitTransaction();
+    [[nodiscard]] CommitStatus CommitCanonicalTransaction();
+    [[nodiscard]] CommitStatus CommitPendingMutations();
+    [[nodiscard]] bool ReplayOrRecover();
+    [[nodiscard]] bool ReplayCanonicalCheckpoint();
+    [[nodiscard]] bool VerifyIntegrity() const;
+    [[nodiscard]] bool IsCanonicalCommitReady() const noexcept;
+    [[nodiscard]] bool IsProductionCanonicalPathActive() const noexcept;
+    [[nodiscard]] std::wstring LastCanonicalGateFailure() const;
+    [[nodiscard]] std::string LastCommitStage() const;
+    [[nodiscard]] std::string LastReplayStage() const;
+    [[nodiscard]] std::string LastCommitBlobMagic() const;
+    [[nodiscard]] bool LastReplayCheckpointCandidatePresent() const noexcept;
+    [[nodiscard]] bool LastReplayCheckpointPendingWindow() const noexcept;
+    [[nodiscard]] NativeWriteCommitModel ActiveCommitModel() const noexcept;
+    [[nodiscard]] NativeWriteValidationState ValidationState() const noexcept;
+    [[nodiscard]] bool IsFixtureLegacyFallbackActive() const noexcept;
+    [[nodiscard]] bool IsFixtureCompatibilityPathActive() const noexcept;
+    [[nodiscard]] bool UsesScaffoldCommitBlob() const noexcept;
+    [[nodiscard]] std::size_t PendingMutationCount() const noexcept;
+    [[nodiscard]] std::size_t PendingObjectMapUpdateCount() const noexcept;
+    [[nodiscard]] std::size_t PendingAllocationCount() const noexcept;
+    [[nodiscard]] std::size_t PendingDeallocationCount() const noexcept;
+    [[nodiscard]] std::size_t PendingBtreeRecordCount() const noexcept;
+    [[nodiscard]] std::optional<std::uint64_t> LastCommittedXid() const noexcept;
+    [[nodiscard]] std::size_t CommittedObjectCount() const noexcept;
+    [[nodiscard]] std::size_t CommittedAllocationCount() const noexcept;
+    [[nodiscard]] std::size_t CommittedFreeExtentCount() const noexcept;
+    [[nodiscard]] std::size_t CommittedBtreeRecordCount() const noexcept;
+    [[nodiscard]] std::optional<ObjectMapUpdate> LookupCommittedObject(std::uint64_t object_id) const;
+    [[nodiscard]] std::size_t CommittedInodeCount() const noexcept;
+    [[nodiscard]] std::optional<InodeRecord> LookupCommittedInodeByPath(const std::wstring& path) const;
+    [[nodiscard]] std::vector<InodeRecord> SnapshotCommittedInodes() const;
+    [[nodiscard]] bool ReadCommittedFileRange(
+        const std::wstring& path,
+        std::uint64_t offset,
+        std::size_t bytes_to_read,
+        std::vector<std::byte>& out_payload) const;
+    void SetCommitStageHook(std::function<bool(std::string_view stage)> hook);
+    void SetFilePayloadProvider(
+        std::function<std::optional<std::vector<std::byte>>(const std::wstring& path, std::uint64_t logical_size)> provider);
+
+    // Allocation/free-space primitives used by staged native mutations.
+    [[nodiscard]] std::optional<std::uint64_t> AllocateExtent(std::uint64_t bytes);
+    [[nodiscard]] bool FreeExtent(std::uint64_t physical_address, std::uint64_t bytes);
+
+private:
+    [[nodiscard]] static std::uint32_t ReadLe32(const std::vector<std::byte>& buffer, std::size_t offset);
+    [[nodiscard]] static std::uint64_t ReadLe64(const std::vector<std::byte>& buffer, std::size_t offset);
+    [[nodiscard]] static std::uint64_t StableObjectIdFromPath(const std::wstring& path);
+    [[nodiscard]] static std::wstring NormalizePath(const std::wstring& path);
+    [[nodiscard]] static std::wstring CanonicalPathKey(const std::wstring& normalized_path);
+    [[nodiscard]] static bool IsRootPath(const std::wstring& normalized_path);
+    [[nodiscard]] static bool IsDescendantPath(const std::wstring& candidate_path, const std::wstring& parent_path);
+    [[nodiscard]] static std::wstring ParentPath(const std::wstring& normalized_path);
+    [[nodiscard]] static std::wstring LeafName(const std::wstring& normalized_path);
+    [[nodiscard]] static bool IsLikelyRawDevicePath(const std::wstring& path);
+    [[nodiscard]] static bool IsFixtureImagePath(const std::wstring& path);
+    [[nodiscard]] bool IsLegacyFixtureFallbackAllowedForCurrentContext() const noexcept;
+    [[nodiscard]] bool RequiresCanonicalNonFixtureCommitPath() const noexcept;
+    [[nodiscard]] std::optional<std::uint64_t> ResolveObjectBlockIndex(std::uint64_t object_or_block) const;
+    [[nodiscard]] bool ReadMetadataBlock(std::uint64_t block_index, std::vector<std::byte>& out_block) const;
+    [[nodiscard]] bool WriteMetadataBlock(std::uint64_t block_index, const std::vector<std::byte>& block);
+    [[nodiscard]] bool IsReservedMetadataBlock(std::uint64_t block_index) const;
+    [[nodiscard]] std::optional<std::uint64_t> FindCheckpointCompanionBlock(
+        std::uint64_t primary_block,
+        const std::vector<std::uint64_t>& disallowed_blocks) const;
+    [[nodiscard]] std::vector<std::uint64_t> ResolveObjectMapCheckpointBlockIndices() const;
+    [[nodiscard]] std::vector<std::uint64_t> ResolveSpacemanCheckpointBlockIndices() const;
+    [[nodiscard]] std::vector<std::uint64_t> ResolveInodeCheckpointBlockIndices() const;
+    [[nodiscard]] std::vector<std::uint64_t> ResolveBtreeCheckpointBlockIndices() const;
+    [[nodiscard]] std::vector<std::uint64_t> ResolveReplayCheckpointBlockIndices() const;
+    [[nodiscard]] bool LoadObjectMapCheckpointBlock(std::uint64_t block_index, const std::vector<std::byte>& block);
+    [[nodiscard]] bool LoadSpacemanCheckpointBlock(std::uint64_t block_index, const std::vector<std::byte>& block);
+    [[nodiscard]] std::optional<std::uint64_t> ResolveInodeCheckpointBlockIndex() const;
+    [[nodiscard]] bool LoadInodeCheckpointBlock(std::uint64_t block_index, const std::vector<std::byte>& block);
+    [[nodiscard]] bool LoadBtreeCheckpointBlock(std::uint64_t block_index, const std::vector<std::byte>& block);
+    [[nodiscard]] bool LoadReplayCheckpointBlock(
+        std::uint64_t block_index,
+        const std::vector<std::byte>& block,
+        std::uint64_t& out_target_xid,
+        std::uint64_t& out_source_xid,
+        std::uint64_t& out_commit_blob_address,
+        std::uint64_t& out_commit_blob_bytes) const;
+    [[nodiscard]] bool RebuildInodeStateFromBtreeRecords(
+        const std::vector<BtreeRecord>& records,
+        std::unordered_map<std::uint64_t, InodeRecord>& out_inodes,
+        std::unordered_map<std::wstring, std::uint64_t>& out_path_index,
+        std::vector<DirectoryLink>& out_directory_links) const;
+    [[nodiscard]] bool ReadBlockByIndexDirect(std::uint64_t block_index, std::vector<std::byte>& out_block) const;
+    [[nodiscard]] bool WriteBlockByIndexDirect(std::uint64_t block_index, const std::vector<std::byte>& block);
+    [[nodiscard]] bool EnsureRootState();
+    [[nodiscard]] bool ValidateInodeGraphState(
+        const std::unordered_map<std::uint64_t, InodeRecord>& inode_table,
+        const std::unordered_map<std::wstring, std::uint64_t>& path_index,
+        const std::vector<DirectoryLink>& directory_links,
+        bool require_root_object
+    ) const;
+    void RefreshObjectIdAllocator();
+    [[nodiscard]] std::uint64_t ResolveUniqueObjectId(const std::wstring& normalized_path);
+    [[nodiscard]] bool IsDirectoryInWorkingState(const std::wstring& normalized_path) const;
+    [[nodiscard]] std::optional<InodeRecord> LookupWorkingInode(const std::wstring& normalized_path) const;
+    [[nodiscard]] bool HasWorkingChildren(std::uint64_t parent_object_id) const;
+    void UpsertWorkingDirectoryLink(std::uint64_t parent_object_id, const std::wstring& entry_name, std::uint64_t child_object_id, std::uint64_t xid);
+    void RemoveWorkingDirectoryLink(std::uint64_t parent_object_id, const std::wstring& entry_name);
+    [[nodiscard]] bool StageObjectMapUpdate(std::uint64_t object_id, std::uint64_t physical_address, std::uint64_t logical_size);
+    [[nodiscard]] bool StageSpacemanAllocation(std::uint64_t physical_address, std::uint64_t bytes);
+    [[nodiscard]] bool StageSpacemanDeallocation(std::uint64_t physical_address, std::uint64_t bytes);
+    [[nodiscard]] std::uint64_t AlignExtentBytes(std::uint64_t bytes) const noexcept;
+    [[nodiscard]] bool ExtentOverlapsReservedMetadata(std::uint64_t physical_address, std::uint64_t bytes) const;
+    [[nodiscard]] bool ValidateCommitBlobLocation(std::uint64_t physical_address, std::uint64_t bytes) const;
+    [[nodiscard]] bool ShouldAcceptScaffoldCommitBlobForCurrentContext() const noexcept;
+    [[nodiscard]] bool ShouldUseScaffoldCommitBlobForCurrentContext() const noexcept;
+    [[nodiscard]] bool ValidateReplayCommitBlobCandidate(
+        std::uint64_t physical_address,
+        std::uint64_t bytes,
+        std::uint64_t expected_source_xid,
+        std::uint64_t expected_target_xid) const;
+    void SyncCommitBlobTelemetryWithMode() noexcept;
+    [[nodiscard]] bool ValidatePendingCommitState() const;
+    [[nodiscard]] bool AllowCommitStage(std::string_view stage);
+    void RefreshCanonicalGateState() const;
+    void MarkRecoveryRequired(std::wstring reason);
+    void ClearRecoveryRequired();
+    [[nodiscard]] bool PersistObjectMapCheckpoint(std::uint64_t target_xid);
+    [[nodiscard]] bool PersistSpacemanCheckpoint(std::uint64_t target_xid);
+    [[nodiscard]] bool PersistInodeCheckpoint(std::uint64_t target_xid);
+    [[nodiscard]] bool PersistBtreeCheckpoint(std::uint64_t target_xid);
+    [[nodiscard]] bool PersistReplayCheckpoint(std::uint64_t target_xid);
+    [[nodiscard]] bool PersistCheckpointSuperblock(std::uint64_t target_xid);
+    [[nodiscard]] std::vector<std::byte> BuildCommitBlob(std::uint64_t target_xid);
+    [[nodiscard]] bool LoadPersistentState();
+    [[nodiscard]] bool PersistPersistentState(std::uint64_t commit_blob_address, std::uint64_t commit_blob_bytes);
+    [[nodiscard]] static std::filesystem::path BuildPersistentStatePath(const VolumeContext& context);
+    static void AppendLe32(std::vector<std::byte>& blob, std::uint32_t value);
+    static void AppendLe64(std::vector<std::byte>& blob, std::uint64_t value);
+    static void WriteLe32(std::vector<std::byte>& buffer, std::size_t offset, std::uint32_t value);
+    static void WriteLe64(std::vector<std::byte>& buffer, std::size_t offset, std::uint64_t value);
+
+    VolumeContext context_;
+    BlockDevice device_;
+    bool container_loaded_ = false;
+    bool object_map_loaded_ = false;
+    bool spaceman_loaded_ = false;
+    std::uint32_t block_size_ = 4096;
+    std::uint64_t total_blocks_ = 0;
+    std::uint64_t checkpoint_xid_ = 0;
+    std::uint64_t loaded_superblock_checkpoint_xid_ = 0;
+    std::uint64_t active_superblock_offset_ = 0;
+    std::uint64_t alternate_superblock_offset_ = 0;
+    std::uint64_t first_superblock_block_ = 0;
+    std::uint64_t first_meta_block_ = 0;
+    std::uint32_t current_superblock_map_index_ = 0;
+    std::uint32_t current_meta_index_ = 0;
+    std::uint32_t next_meta_index_ = 0;
+    std::uint64_t spaceman_object_id_ = 0;
+    std::uint64_t volume_root_block_ = 0;
+    std::uint64_t next_ephemeral_extent_ = 0;
+    std::uint64_t working_next_ephemeral_extent_ = 0;
+    std::uint64_t next_generated_object_id_ = 1;
+    bool native_write_ready_ = false;
+    bool commit_path_ready_ = false;
+    bool canonical_state_loaded_ = false;
+    bool canonical_commit_ready_ = false;
+    mutable bool production_canonical_path_active_ = false;
+    bool legacy_fixture_fallback_used_ = false;
+    bool uses_scaffold_commit_blob_ = false;
+    mutable std::wstring last_canonical_gate_failure_;
+    std::string last_commit_stage_;
+    std::string last_replay_stage_;
+    std::string last_commit_blob_magic_ = "APFSRWCANON3";
+    bool last_replay_checkpoint_candidate_present_ = false;
+    bool last_replay_checkpoint_pending_window_ = false;
+    bool write_device_allowed_ = false;
+    bool recovery_required_ = false;
+    std::wstring recovery_reason_;
+    bool persistent_state_loaded_ = false;
+    std::optional<std::uint64_t> last_committed_xid_;
+    std::optional<std::uint64_t> last_commit_blob_address_;
+    std::optional<std::uint64_t> last_commit_blob_bytes_;
+    std::unordered_map<std::uint64_t, std::uint64_t> superblock_object_block_map_;
+    std::vector<MutationRequest> pending_mutations_;
+    std::unordered_map<std::uint64_t, ObjectMapUpdate> committed_object_map_;
+    std::unordered_map<std::uint64_t, InodeRecord> committed_inodes_;
+    std::unordered_map<std::wstring, std::uint64_t> committed_path_index_;
+    std::vector<DirectoryLink> committed_directory_links_;
+    std::vector<BtreeRecord> committed_btree_records_;
+    std::unordered_map<std::uint64_t, InodeRecord> working_inodes_;
+    std::unordered_map<std::wstring, std::uint64_t> working_path_index_;
+    std::vector<DirectoryLink> working_directory_links_;
+    std::vector<SpacemanAllocation> committed_spaceman_allocations_;
+    std::vector<SpacemanAllocation> committed_spaceman_free_extents_;
+    std::vector<SpacemanAllocation> working_spaceman_free_extents_;
+    std::vector<ObjectMapUpdate> pending_object_map_updates_;
+    std::vector<SpacemanAllocation> pending_spaceman_allocations_;
+    std::vector<SpacemanAllocation> pending_spaceman_deallocations_;
+    std::vector<BtreeRecord> pending_btree_records_;
+    std::function<bool(std::string_view stage)> commit_stage_hook_;
+    std::function<std::optional<std::vector<std::byte>>(const std::wstring&, std::uint64_t)> file_payload_provider_;
+    std::filesystem::path persistent_state_path_;
+};
+} // namespace apfsaccess::rw
