@@ -19,6 +19,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     ];
     private static readonly string[] HighPriorityReplayRecoveryReasons =
     [
+        "IntegrityMissingAllocationMap",
         "ReplayCheckpointPendingWindow",
         "ReplayCheckpointNotPendingWindow",
         "ReplayCanonicalCandidateMissing",
@@ -26,6 +27,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private readonly SynchronizationContext _uiContext;
     private readonly NotifyIcon _notifyIcon;
+    private readonly ToolStripMenuItem _ejectItem;
     private readonly List<Icon> _ownedIcons = [];
     private readonly Dictionary<RuntimeState, Icon> _iconByState;
     private readonly HashSet<string> _shownWarnings = new(StringComparer.OrdinalIgnoreCase);
@@ -41,6 +43,12 @@ public sealed class TrayApplicationContext : ApplicationContext
         _iconByState = LoadIcons();
 
         var menu = new ContextMenuStrip();
+        _ejectItem = new ToolStripMenuItem("Eject APFS drives");
+        _ejectItem.Click += OnEjectClicked;
+        _ejectItem.Enabled = false;
+        menu.Items.Add(_ejectItem);
+        menu.Items.Add(new ToolStripSeparator());
+
         var quitItem = new ToolStripMenuItem("Quit");
         quitItem.Click += OnQuitClicked;
         menu.Items.Add(quitItem);
@@ -74,6 +82,28 @@ public sealed class TrayApplicationContext : ApplicationContext
         _ = sender;
         _ = e;
         await RequestQuitAndExitAsync().ConfigureAwait(false);
+    }
+
+    private async void OnEjectClicked(object? sender, EventArgs e)
+    {
+        _ = sender;
+        _ = e;
+        await RequestEjectAsync().ConfigureAwait(false);
+    }
+
+    private async Task RequestEjectAsync()
+    {
+        PostToUi(() => _ejectItem.Enabled = false);
+        var (success, message) = await TrySendEjectAsync().ConfigureAwait(false);
+        PostToUi(() =>
+        {
+            _ejectItem.Enabled = true;
+            _notifyIcon.ShowBalloonTip(
+                5000,
+                success ? "APFS Access" : "APFS Access Notice",
+                string.IsNullOrWhiteSpace(message) ? (success ? "APFS drives ejected." : "Eject failed.") : message,
+                success ? ToolTipIcon.Info : ToolTipIcon.Warning);
+        });
     }
 
     private async Task RequestQuitAndExitAsync()
@@ -264,6 +294,55 @@ public sealed class TrayApplicationContext : ApplicationContext
         return false;
     }
 
+    private async Task<(bool Success, string? Message)> TrySendEjectAsync()
+    {
+        var requestId = Guid.NewGuid().ToString("N");
+
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        try
+        {
+            await using var peer = await NamedPipeMessageClient
+                .ConnectAsync(ApfsPipeConstants.PipeName, timeoutMilliseconds: 1000, timeoutCts.Token)
+                .ConfigureAwait(false);
+
+            var ejectMessage = PipeMessageCodec.Create(
+                ApfsMessageTypes.EjectRequested,
+                new EjectRequestedPayload(Environment.UserName, DateTime.UtcNow),
+                requestId
+            );
+
+            await peer.SendAsync(ejectMessage, timeoutCts.Token).ConfigureAwait(false);
+
+            while (!timeoutCts.Token.IsCancellationRequested)
+            {
+                var response = await peer.ReadMessageAsync(timeoutCts.Token).ConfigureAwait(false);
+                if (response is null)
+                {
+                    break;
+                }
+
+                if (!string.Equals(response.Type, ApfsMessageTypes.Ack, StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(response.RequestId, requestId, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (PipeMessageCodec.TryGetPayload<AckPayload>(response, out var ack) && ack is not null)
+                {
+                    return (ack.Success, ack.Message);
+                }
+
+                return (false, "The service returned an unreadable eject response.");
+            }
+        }
+        catch (Exception ex)
+        {
+            return (false, $"Could not request eject: {ex.Message}");
+        }
+
+        return (false, "Timed out waiting for APFS Access to eject drives.");
+    }
+
     private void SetDisconnectedUi()
     {
         _notifyIcon.Icon = _iconByState[RuntimeState.Error];
@@ -279,9 +358,23 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         _notifyIcon.Icon = icon;
 
+        var text = BuildNotifyIconText(payload);
+
+        if (text.Length > 63)
+        {
+            text = text[..63];
+        }
+
+        _notifyIcon.Text = text;
+        _ejectItem.Enabled = payload.MountPoints.Count > 0;
+        ShowWarnings(payload);
+    }
+
+    private static string BuildNotifyIconText(StatusChangedPayload payload)
+    {
         var text = payload.State switch
         {
-            RuntimeState.MountedRw => $"APFS Access: mounted RO ({payload.MountPoints.Count})",
+            RuntimeState.MountedRw => $"APFS Access: mounted RW ({payload.MountPoints.Count})",
             RuntimeState.MountedRo => $"APFS Access: mounted RO ({payload.MountPoints.Count})",
             RuntimeState.Error => "APFS Access: error",
             RuntimeState.Starting => "APFS Access: starting",
@@ -325,13 +418,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             text = $"{text} [mut:{payload.InFlightMutationCallbacks}]";
         }
 
-        if (text.Length > 63)
-        {
-            text = text[..63];
-        }
-
-        _notifyIcon.Text = text;
-        ShowWarnings(payload);
+        return text;
     }
 
     private void ShowWarnings(StatusChangedPayload payload)
@@ -507,7 +594,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             [RuntimeState.Starting] = Load("tray_idle.ico", SystemIcons.Application),
             [RuntimeState.Idle] = Load("tray_idle.ico", SystemIcons.Application),
-            [RuntimeState.MountedRw] = Load("tray_mounted_ro.ico", SystemIcons.Shield),
+            [RuntimeState.MountedRw] = Load("tray_mounted_rw.ico", SystemIcons.Shield),
             [RuntimeState.MountedRo] = Load("tray_mounted_ro.ico", SystemIcons.Shield),
             [RuntimeState.Error] = Load("tray_error.ico", SystemIcons.Error),
             [RuntimeState.Stopping] = Load("tray_idle.ico", SystemIcons.Application),

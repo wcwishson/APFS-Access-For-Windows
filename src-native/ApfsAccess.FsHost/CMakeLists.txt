@@ -13,7 +13,6 @@ add_executable(ApfsAccess.FsHost
 target_compile_definitions(ApfsAccess.FsHost PRIVATE
     UNICODE
     _UNICODE
-    WIN32_LEAN_AND_MEAN
     NOMINMAX
 )
 
@@ -53,7 +52,6 @@ if(APFSACCESS_BUILD_FSHOST_TESTS)
     target_compile_definitions(ApfsAccess.FsHost.SemanticsTests PRIVATE
         UNICODE
         _UNICODE
-        WIN32_LEAN_AND_MEAN
         NOMINMAX
         APFSACCESS_FSHOST_UNIT_TEST=1
     )

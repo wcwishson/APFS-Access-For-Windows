@@ -34,6 +34,8 @@ public sealed record StatusChangedPayload(
 
 public sealed record QuitRequestedPayload(string Requester, DateTime TimestampUtc);
 
+public sealed record EjectRequestedPayload(string Requester, DateTime TimestampUtc);
+
 public sealed record AckPayload(bool Success, string? Message);
 
 public sealed record PingPayload(DateTime TimestampUtc);

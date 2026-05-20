@@ -3,9 +3,12 @@
 #include <chrono>
 #include <cstddef>
 #include <iostream>
+#include <iterator>
 #include <memory>
+#include <algorithm>
 #include <string>
 #include <thread>
+#include <vector>
 
 #define APFSACCESS_FSHOST_UNIT_TEST 1
 #include "../src/main.cpp"
@@ -325,6 +328,165 @@ bool TestRenameSamePathValidatesContextPermissions()
     return Require(parent_allowed == STATUS_SUCCESS, "Rename no-op should allow parent-handle context with FILE_DELETE_CHILD");
 }
 
+bool TestRenameRelativeTargetStaysInSourceParent()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"alpha");
+
+    auto parent = MakeNode(L"\\alpha", true, false);
+    AddChildName(parent->children, L"file.txt");
+    context.nodes.emplace(Key(parent->path), parent);
+
+    auto file = MakeNode(L"\\alpha\\file.txt", false, false);
+    context.nodes.emplace(Key(file->path), file);
+
+    OpenContext parent_open{};
+    parent_open.node = parent;
+    parent_open.allow_delete_child = true;
+    parent_open.allow_write_data = true;
+
+    auto fs = BuildFileSystem(&context);
+    auto status = CB_Rename(
+        &fs,
+        &parent_open,
+        const_cast<PWSTR>(L"\\alpha\\file.txt"),
+        const_cast<PWSTR>(L"renamed.txt"),
+        FALSE);
+    if (!Require(status == STATUS_SUCCESS, "Relative rename target should resolve against source parent"))
+    {
+        return false;
+    }
+    if (!Require(context.nodes.find(Key(L"\\alpha\\file.txt")) == context.nodes.end(), "Relative rename should remove old source entry"))
+    {
+        return false;
+    }
+    if (!Require(context.nodes.find(Key(L"\\alpha\\renamed.txt")) != context.nodes.end(), "Relative rename should create sibling destination entry"))
+    {
+        return false;
+    }
+    if (!Require(context.nodes.find(Key(L"\\renamed.txt")) == context.nodes.end(), "Relative rename should not escape to volume root"))
+    {
+        return false;
+    }
+
+    return Require(
+        HasChildName(parent->children, L"renamed.txt") && !HasChildName(parent->children, L"file.txt"),
+        "Relative rename should update source parent child list");
+}
+
+bool TestDirectoryInfoBufferNullTerminatesNameAndReportsUnterminatedSize()
+{
+    auto node = MakeNode(L"\\alpha", true, false);
+    auto buffer = BuildDirectoryInfoBuffer(*node, L"alpha", true);
+    if (!Require(!buffer.empty(), "Directory info buffer should be created for a normal file name"))
+    {
+        return false;
+    }
+
+    auto* dir_info = reinterpret_cast<FSP_FSCTL_DIR_INFO*>(buffer.data());
+    const auto expected_size = FIELD_OFFSET(FSP_FSCTL_DIR_INFO, FileNameBuf) + 5 * sizeof(WCHAR);
+    if (!Require(dir_info->Size == expected_size, "Directory info Size should exclude the defensive trailing NUL"))
+    {
+        return false;
+    }
+    if (!Require(std::wstring(dir_info->FileNameBuf, 5) == L"alpha", "Directory info should copy the visible file name"))
+    {
+        return false;
+    }
+
+    return Require(dir_info->FileNameBuf[5] == L'\0', "Directory info buffer should include a defensive trailing NUL");
+}
+
+bool TestRecycleBinPathsExposeExplorerCompatibleAttributes()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"$RECYCLE.BIN");
+
+    auto recycle = MakeNode(L"\\$RECYCLE.BIN", true, false);
+    AddChildName(recycle->children, L"S-1-5-21-2379054723-1857672711-2983363584-1001");
+    context.nodes.emplace(Key(recycle->path), recycle);
+
+    auto sid = MakeNode(L"\\$RECYCLE.BIN\\S-1-5-21-2379054723-1857672711-2983363584-1001", true, false);
+    AddChildName(sid->children, L"desktop.ini");
+    context.nodes.emplace(Key(sid->path), sid);
+
+    auto desktop = MakeNode(L"\\$RECYCLE.BIN\\S-1-5-21-2379054723-1857672711-2983363584-1001\\desktop.ini", false, false);
+    desktop->file_size = 129;
+    context.nodes.emplace(Key(desktop->path), desktop);
+
+    FSP_FSCTL_FILE_INFO recycle_info{};
+    FillInfo(*recycle, false, &recycle_info);
+    if (!Require((recycle_info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0, "Recycle bin root should remain a directory"))
+    {
+        return false;
+    }
+    if (!Require((recycle_info.FileAttributes & FILE_ATTRIBUTE_HIDDEN) != 0, "Recycle bin root should be hidden"))
+    {
+        return false;
+    }
+    if (!Require((recycle_info.FileAttributes & FILE_ATTRIBUTE_SYSTEM) != 0, "Recycle bin root should be system"))
+    {
+        return false;
+    }
+
+    FSP_FSCTL_FILE_INFO sid_info{};
+    FillInfo(*sid, false, &sid_info);
+    if (!Require((sid_info.FileAttributes & FILE_ATTRIBUTE_HIDDEN) != 0, "Recycle bin SID folder should be hidden"))
+    {
+        return false;
+    }
+    if (!Require((sid_info.FileAttributes & FILE_ATTRIBUTE_SYSTEM) != 0, "Recycle bin SID folder should be system"))
+    {
+        return false;
+    }
+
+    FSP_FSCTL_FILE_INFO desktop_info{};
+    FillInfo(*desktop, false, &desktop_info);
+    if (!Require((desktop_info.FileAttributes & FILE_ATTRIBUTE_ARCHIVE) != 0, "Recycle bin desktop.ini should remain an archive file"))
+    {
+        return false;
+    }
+    if (!Require((desktop_info.FileAttributes & FILE_ATTRIBUTE_HIDDEN) != 0, "Recycle bin desktop.ini should be hidden"))
+    {
+        return false;
+    }
+    if (!Require((desktop_info.FileAttributes & FILE_ATTRIBUTE_SYSTEM) != 0, "Recycle bin desktop.ini should be system"))
+    {
+        return false;
+    }
+
+    auto fs = BuildFileSystem(&context);
+    UINT32 attributes = 0;
+    SIZE_T security_size = security.size();
+    const auto security_status = CB_GetSecurityByName(
+        &fs,
+        const_cast<PWSTR>(L"\\$RECYCLE.BIN\\S-1-5-21-2379054723-1857672711-2983363584-1001"),
+        &attributes,
+        reinterpret_cast<PSECURITY_DESCRIPTOR>(security.data()),
+        &security_size);
+    if (!Require(security_status == STATUS_SUCCESS, "GetSecurityByName should succeed for recycle-bin SID folder"))
+    {
+        return false;
+    }
+    if (!Require((attributes & FILE_ATTRIBUTE_HIDDEN) != 0, "GetSecurityByName should report hidden recycle-bin SID folder"))
+    {
+        return false;
+    }
+    return Require((attributes & FILE_ATTRIBUTE_SYSTEM) != 0, "GetSecurityByName should report system recycle-bin SID folder");
+}
+
 bool TestRenameRejectsMismatchedOpenContext()
 {
     MountContext context{};
@@ -425,7 +587,7 @@ bool TestRenameMissingSourceWithSourceHandleFailsClosed()
         "Fail-closed missing-source rename should keep parent children list unchanged");
 }
 
-bool TestRenameCrossParentSourceHandleDenied()
+bool TestRenameCrossParentSourceHandleSucceedsWithDeleteAccess()
 {
     MountContext context{};
     context.overlay_write_enabled = true;
@@ -457,15 +619,23 @@ bool TestRenameCrossParentSourceHandleDenied()
         const_cast<PWSTR>(L"\\a\\source.txt"),
         const_cast<PWSTR>(L"\\b\\moved.txt"),
         FALSE);
-    if (!Require(status == STATUS_ACCESS_DENIED, "Cross-parent rename should deny source-handle context without target-parent authority"))
+    if (!Require(status == STATUS_SUCCESS, "Cross-parent source-handle rename should succeed with delete access"))
     {
         return false;
     }
 
-    return Require(
-        context.nodes.find(Key(L"\\a\\source.txt")) != context.nodes.end() &&
-        context.nodes.find(Key(L"\\b\\moved.txt")) == context.nodes.end(),
-        "Denied source-handle cross-parent rename should preserve source and destination state");
+    if (!Require(
+            context.nodes.find(Key(L"\\a\\source.txt")) == context.nodes.end() &&
+            context.nodes.find(Key(L"\\b\\moved.txt")) != context.nodes.end(),
+            "Cross-parent source-handle rename should move source to destination"))
+    {
+        return false;
+    }
+    if (!Require(!HasChildName(source_parent->children, L"source.txt"), "Cross-parent source-handle rename should remove old parent child"))
+    {
+        return false;
+    }
+    return Require(HasChildName(target_parent->children, L"moved.txt"), "Cross-parent source-handle rename should add target parent child");
 }
 
 bool TestSetDeleteToggleClearsDeletePending()
@@ -521,6 +691,51 @@ bool TestSetDeleteToggleClearsDeletePending()
     }
 
     return Require(!file->delete_pending && file->delete_intent_count == 0, "SetDelete(FALSE) should clear delete-pending state and intent count");
+}
+
+bool TestSetDeleteRemovesFileOnLastClose()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"move-out.txt");
+
+    auto file = MakeNode(L"\\move-out.txt", false, false);
+    file->open_handle_count = 1;
+    context.nodes.emplace(Key(file->path), file);
+
+    auto fs = BuildFileSystem(&context);
+    auto* open_context = new OpenContext();
+    open_context->node = file;
+    open_context->allow_delete = true;
+
+    auto set_delete = CB_SetDelete(
+        &fs,
+        open_context,
+        const_cast<PWSTR>(L"\\move-out.txt"),
+        TRUE);
+    if (!Require(set_delete == STATUS_SUCCESS, "SetDelete(TRUE) should succeed for a single open delete handle"))
+    {
+        CB_Close(&fs, open_context);
+        return false;
+    }
+    if (!Require(open_context->delete_on_cleanup && file->delete_pending, "SetDelete(TRUE) should hide the file until close resolves deletion"))
+    {
+        CB_Close(&fs, open_context);
+        return false;
+    }
+
+    CB_Close(&fs, open_context);
+
+    if (!Require(context.nodes.find(Key(L"\\move-out.txt")) == context.nodes.end(), "Last close after SetDelete(TRUE) should remove the file node"))
+    {
+        return false;
+    }
+    return Require(!HasChildName(root->children, L"move-out.txt"), "Last close after SetDelete(TRUE) should remove the file from parent children");
 }
 
 bool TestRenameFailsWhileSourceDeletePendingThenRecoversAfterClear()
@@ -687,7 +902,7 @@ bool TestRenameReplaceFailsWhenTargetDeletePending()
         "Replace against delete-pending target should preserve source and target entries");
 }
 
-bool TestRenameReplaceFailsWhenTargetHasAdditionalOpenHandle()
+bool TestRenameReplaceAllowsFileTargetWithAdditionalOpenHandle()
 {
     MountContext context{};
     context.overlay_write_enabled = true;
@@ -717,15 +932,15 @@ bool TestRenameReplaceFailsWhenTargetHasAdditionalOpenHandle()
         const_cast<PWSTR>(L"\\source.txt"),
         const_cast<PWSTR>(L"\\target.txt"),
         TRUE);
-    if (!Require(replace_status == STATUS_SHARING_VIOLATION, "Rename replace should fail with STATUS_SHARING_VIOLATION when target has an open handle"))
+    if (!Require(replace_status == STATUS_SUCCESS, "Rename replace should allow file target replacement after WinFsp admits compatible handles"))
     {
         return false;
     }
 
     return Require(
-        context.nodes.find(Key(L"\\source.txt")) != context.nodes.end() &&
+        context.nodes.find(Key(L"\\source.txt")) == context.nodes.end() &&
         context.nodes.find(Key(L"\\target.txt")) != context.nodes.end(),
-        "Replace against busy target should preserve source and target entries");
+        "Successful file target replace should move source to target");
 }
 
 bool TestCleanupDeleteRequiresDeleteAccess()
@@ -762,15 +977,22 @@ bool TestCleanupDeleteRequiresDeleteAccess()
     {
         return false;
     }
+    if (!Require(file->open_handle_count == 0 && open_context.cleanup_seen, "Cleanup should release visible open-handle accounting even when delete access is denied"))
+    {
+        return false;
+    }
 
-    open_context.allow_delete = true;
+    file->open_handle_count = 1;
+    OpenContext delete_context{};
+    delete_context.node = file;
+    delete_context.allow_delete = true;
     CB_Cleanup(
         &fs,
-        &open_context,
+        &delete_context,
         const_cast<PWSTR>(L"\\cleanup.txt"),
         FspCleanupDelete);
 
-    if (!Require(open_context.delete_on_cleanup, "Cleanup delete should latch delete-on-close when DELETE permission is granted"))
+    if (!Require(delete_context.delete_on_cleanup, "Cleanup delete should latch delete-on-close when DELETE permission is granted"))
     {
         return false;
     }
@@ -899,6 +1121,57 @@ bool TestCloseWithoutDeleteLatchPreservesNode()
         return false;
     }
     return Require(persisted->second->open_handle_count == 0, "Close without delete latch should decrement open-handle count");
+}
+
+bool TestCleanupWithoutDeleteReleasesFileForRename()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"office.docx");
+
+    auto file = MakeNode(L"\\office.docx", false, false);
+    file->open_handle_count = 1;
+    context.nodes.emplace(Key(file->path), file);
+
+    auto fs = BuildFileSystem(&context);
+    auto* open_context = new OpenContext();
+    open_context->node = file;
+    open_context->allow_read_data = true;
+
+    CB_Cleanup(
+        &fs,
+        open_context,
+        const_cast<PWSTR>(L"\\office.docx"),
+        0);
+
+    if (!Require(file->open_handle_count == 0 && open_context->cleanup_seen, "Cleanup without delete should release visible file-open accounting"))
+    {
+        CB_Close(&fs, open_context);
+        return false;
+    }
+
+    auto rename_after_cleanup = CB_Rename(
+        &fs,
+        nullptr,
+        const_cast<PWSTR>(L"\\office.docx"),
+        const_cast<PWSTR>(L"\\renamed.docx"),
+        FALSE);
+    if (!Require(rename_after_cleanup == STATUS_SUCCESS, "Rename should succeed after cleanup releases a read-only file handle"))
+    {
+        CB_Close(&fs, open_context);
+        return false;
+    }
+
+    CB_Close(&fs, open_context);
+    return Require(
+        context.nodes.find(Key(L"\\renamed.docx")) != context.nodes.end() &&
+        context.nodes.find(Key(L"\\office.docx")) == context.nodes.end(),
+        "Cleanup-released file should be renamed without a stale in-use state");
 }
 
 bool TestCanDeleteSupportsParentDeleteChildPermission()
@@ -1390,7 +1663,7 @@ bool TestCanDeleteFailsWhenAdditionalHandleOpen()
         &fs,
         &current_open,
         const_cast<PWSTR>(L"\\busy.txt"));
-    return Require(can_delete == STATUS_SHARING_VIOLATION, "CanDelete should fail with STATUS_SHARING_VIOLATION when another handle is open");
+    return Require(can_delete == STATUS_SUCCESS, "CanDelete should not fail just because another compatible handle is tracked");
 }
 
 bool TestSetDeleteFailsWhenAdditionalHandleOpen()
@@ -1418,12 +1691,104 @@ bool TestSetDeleteFailsWhenAdditionalHandleOpen()
         &current_open,
         const_cast<PWSTR>(L"\\busy.txt"),
         TRUE);
-    if (!Require(set_delete == STATUS_SHARING_VIOLATION, "SetDelete should fail with STATUS_SHARING_VIOLATION when another handle is open"))
+    if (!Require(set_delete == STATUS_SUCCESS, "SetDelete should not fail just because another compatible handle is tracked"))
     {
         return false;
     }
 
-    return Require(!current_open.delete_on_cleanup, "Failed SetDelete should not latch delete-on-cleanup");
+    return Require(current_open.delete_on_cleanup, "Successful SetDelete should latch delete-on-cleanup");
+}
+
+bool TestCleanupDeleteLatchesEvenWhenAdditionalHandlesRemain()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"busy.txt");
+
+    auto file = MakeNode(L"\\busy.txt", false, false);
+    file->open_handle_count = 2;
+    context.nodes.emplace(Key(file->path), file);
+
+    OpenContext open_context{};
+    open_context.node = file;
+    open_context.allow_delete = true;
+
+    auto fs = BuildFileSystem(&context);
+    CB_Cleanup(
+        &fs,
+        &open_context,
+        const_cast<PWSTR>(L"\\busy.txt"),
+        FspCleanupDelete);
+
+    if (!Require(open_context.delete_on_cleanup, "Cleanup delete should latch on the last cleanup for the file node"))
+    {
+        return false;
+    }
+    return Require(file->delete_pending, "Cleanup delete should mark the node delete-pending even with additional opens tracked");
+}
+
+bool TestCloseOnlyCommitsWhenDeleteMutationIsEmitted()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"keep.txt");
+
+    auto file = MakeNode(L"\\keep.txt", false, false);
+    file->open_handle_count = 1;
+    context.nodes.emplace(Key(file->path), file);
+
+    auto fs = BuildFileSystem(&context);
+    auto* open_context = new OpenContext();
+    open_context->node = file;
+    open_context->allow_delete = false;
+    open_context->write_open = true;
+
+    CB_Close(&fs, open_context);
+    return Require(
+        context.active_external_mutation_callbacks.load() == 0,
+        "Close without delete mutation should not leave mutation callbacks active");
+}
+
+bool TestDeleteOnCloseCommitsWhenDeleteIsLatching()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"victim.txt");
+
+    auto file = MakeNode(L"\\victim.txt", false, false);
+    file->open_handle_count = 1;
+    context.nodes.emplace(Key(file->path), file);
+
+    auto fs = BuildFileSystem(&context);
+    auto* open_context = new OpenContext();
+    open_context->node = file;
+    open_context->allow_delete = true;
+
+    CB_Cleanup(
+        &fs,
+        open_context,
+        const_cast<PWSTR>(L"\\victim.txt"),
+        FspCleanupDelete);
+    CB_Close(&fs, open_context);
+
+    return Require(
+        context.nodes.find(Key(L"\\victim.txt")) == context.nodes.end(),
+        "Delete-on-close should remove the node once the last cleanup closes");
 }
 
 bool TestRenameDirectoryFailsWhenDescendantHandleOpen()
@@ -1700,14 +2065,14 @@ bool TestCleanupDeleteBlockedByAdditionalOpenHandle()
         const_cast<PWSTR>(L"\\busy.txt"),
         FspCleanupDelete);
 
-    if (!Require(!open_context.delete_on_cleanup, "Cleanup delete should not latch when additional handles are open"))
+    if (!Require(open_context.delete_on_cleanup, "Cleanup delete should latch on the last cleanup for the file node"))
     {
         return false;
     }
 
     return Require(
-        file->delete_intent_count == 0 && !file->delete_pending,
-        "Cleanup delete with additional handles should keep node non-pending");
+        file->delete_intent_count == 1 && file->delete_pending,
+        "Cleanup delete should mark the node delete-pending even with additional opens tracked");
 }
 
 bool TestDeleteOnCloseRemovesOnlyAfterLastHandleCloses()
@@ -1722,7 +2087,7 @@ bool TestDeleteOnCloseRemovesOnlyAfterLastHandleCloses()
     AddChildName(root->children, L"victim.txt");
 
     auto file = MakeNode(L"\\victim.txt", false, false);
-    file->open_handle_count = 1;
+    file->open_handle_count = 2;
     context.nodes.emplace(Key(file->path), file);
 
     auto fs = BuildFileSystem(&context);
@@ -1746,8 +2111,13 @@ bool TestDeleteOnCloseRemovesOnlyAfterLastHandleCloses()
         CB_Close(&fs, keep_handle);
         return false;
     }
+    if (!Require(file->open_handle_count == 1, "Cleanup delete should release the deleting handle while another handle remains open"))
+    {
+        CB_Close(&fs, delete_handle);
+        CB_Close(&fs, keep_handle);
+        return false;
+    }
 
-    file->open_handle_count = 2;
     CB_Close(&fs, delete_handle);
 
     if (!Require(context.nodes.find(Key(L"\\victim.txt")) != context.nodes.end(), "First close should not remove node while another handle remains open"))
@@ -1768,6 +2138,11 @@ bool TestDeleteOnCloseRemovesOnlyAfterLastHandleCloses()
         return false;
     }
 
+    CB_Cleanup(
+        &fs,
+        keep_handle,
+        const_cast<PWSTR>(L"\\victim.txt"),
+        0);
     CB_Close(&fs, keep_handle);
 
     if (!Require(context.nodes.find(Key(L"\\victim.txt")) == context.nodes.end(), "Last close should remove delete-latched file"))
@@ -2360,7 +2735,7 @@ bool TestCleanupDeleteNoopWhenShutdownDrainActive()
         return false;
     }
 
-    return Require(file->open_handle_count == 1, "Cleanup delete during shutdown drain should preserve open-handle accounting");
+    return Require(file->open_handle_count == 0 && open_context.cleanup_seen, "Cleanup delete during shutdown drain should still release visible open-handle accounting");
 }
 
 bool TestFlushRejectedWhenShutdownDrainActive()
@@ -2515,6 +2890,115 @@ bool TestMutatingCallbacksFailWriteProtectedWhenWriteDisabled()
     return Require(set_security == STATUS_MEDIA_WRITE_PROTECTED, "SetSecurity should return MEDIA_WRITE_PROTECTED when write mode is disabled");
 }
 
+bool TestSetSecurityIsNoopWhenWriteEnabled()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto fs = BuildFileSystem(&context);
+    const auto status = CB_SetSecurity(&fs, nullptr, DACL_SECURITY_INFORMATION, nullptr);
+    if (!Require(status == STATUS_SUCCESS, "SetSecurity should be a no-op success while write mode is enabled"))
+    {
+        return false;
+    }
+
+    return Require(
+        context.active_external_mutation_callbacks.load() == 0,
+        "SetSecurity no-op should release external mutation callback scope");
+}
+
+bool TestDefaultSecurityDescriptorGrantsUsersWriteAccess()
+{
+    ULONG descriptor_size = 0;
+    PSECURITY_DESCRIPTOR descriptor = BuildWritableVolumeSecurityDescriptor(&descriptor_size);
+    if (!Require(descriptor != nullptr, "Default security descriptor should be created"))
+    {
+        return false;
+    }
+
+    bool ok = true;
+    auto cleanup = [&]()
+    {
+        LocalFree(descriptor);
+    };
+
+    PACL dacl = nullptr;
+    BOOL dacl_present = FALSE;
+    BOOL dacl_defaulted = FALSE;
+    if (!Require(GetSecurityDescriptorDacl(descriptor, &dacl_present, &dacl, &dacl_defaulted) != FALSE,
+            "Default security descriptor should expose a DACL"))
+    {
+        cleanup();
+        return false;
+    }
+    if (!Require(dacl_present && dacl != nullptr, "Default security descriptor should include an explicit DACL"))
+    {
+        cleanup();
+        return false;
+    }
+
+    const auto make_sid = [](WELL_KNOWN_SID_TYPE sid_type)
+    {
+        std::vector<BYTE> sid(SECURITY_MAX_SID_SIZE);
+        DWORD sid_size = static_cast<DWORD>(sid.size());
+        if (!CreateWellKnownSid(sid_type, nullptr, sid.data(), &sid_size))
+        {
+            sid.clear();
+        }
+        else
+        {
+            sid.resize(sid_size);
+        }
+        return sid;
+    };
+
+    const auto users_sid = make_sid(WinBuiltinUsersSid);
+    const auto authenticated_users_sid = make_sid(WinAuthenticatedUserSid);
+    const auto everyone_sid = make_sid(WinWorldSid);
+
+    if (!Require(!users_sid.empty() && !authenticated_users_sid.empty() && !everyone_sid.empty(),
+            "Well-known comparison SIDs should be created"))
+    {
+        cleanup();
+        return false;
+    }
+
+    bool has_users = false;
+    bool has_authenticated_users = false;
+    bool has_everyone = false;
+    for (DWORD index = 0; index < dacl->AceCount; ++index)
+    {
+        void* ace = nullptr;
+        if (!GetAce(dacl, index, &ace) || ace == nullptr)
+        {
+            ok = false;
+            break;
+        }
+
+        auto* header = static_cast<ACE_HEADER*>(ace);
+        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE)
+        {
+            continue;
+        }
+
+        auto* allowed = static_cast<ACCESS_ALLOWED_ACE*>(ace);
+        has_users = has_users || EqualSid(&allowed->SidStart, const_cast<BYTE*>(users_sid.data()));
+        has_authenticated_users = has_authenticated_users || EqualSid(&allowed->SidStart, const_cast<BYTE*>(authenticated_users_sid.data()));
+        has_everyone = has_everyone || EqualSid(&allowed->SidStart, const_cast<BYTE*>(everyone_sid.data()));
+    }
+
+    ok = ok &&
+        Require(has_users, "Default security descriptor should grant builtin Users full access") &&
+        Require(has_authenticated_users, "Default security descriptor should grant Authenticated Users full access") &&
+        Require(has_everyone, "Default security descriptor should grant Everyone full access");
+
+    cleanup();
+    return ok;
+}
+
 bool TestOpenMutationAccessDeniedWhenWriteDisabled()
 {
     MountContext context{};
@@ -2646,6 +3130,11 @@ bool TestCleanupDeleteNoopWhenWriteDisabled()
         return false;
     }
     if (!Require(file->delete_intent_count == 0 && !file->delete_pending, "Cleanup delete in write-disabled mode should not mutate delete-pending state"))
+    {
+        CB_Close(&fs, open_context);
+        return false;
+    }
+    if (!Require(file->open_handle_count == 0 && open_context->cleanup_seen, "Cleanup delete in write-disabled mode should still release visible open-handle accounting"))
     {
         CB_Close(&fs, open_context);
         return false;
@@ -3474,6 +3963,98 @@ bool TestStatusFileTracksShutdownDrainAndInFlightMutations()
     return ok;
 }
 
+bool TestExternalMutationScopePublishesIdleStatusOnExit()
+{
+    MountContext context{};
+    context.args.readwrite = true;
+    context.args.write_backend = L"Overlay";
+    context.overlay_write_enabled = true;
+
+    std::error_code ec;
+    auto status_root = std::filesystem::temp_directory_path(ec) / "ApfsAccess" / "fs-host-semantics" / std::to_wstring(GetTickCount64());
+    if (ec)
+    {
+        return Require(false, "External mutation status refresh test should resolve temp directory");
+    }
+    std::filesystem::create_directories(status_root, ec);
+    if (ec)
+    {
+        return Require(false, "External mutation status refresh test should create status directory");
+    }
+    context.args.status_file = (status_root / "status.json").wstring();
+
+    bool ok = true;
+    do
+    {
+        {
+            ExternalMutationRequestScope scope(&context);
+            if (!Require(scope.Acquired(), "External mutation status refresh test should acquire mutation scope"))
+            {
+                ok = false;
+                break;
+            }
+            if (!Require(
+                    WriteHostStatusFile(context, context.recovery_active, context.runtime_last_commit_xid),
+                    "External mutation status refresh test should write in-flight status"))
+            {
+                ok = false;
+                break;
+            }
+        }
+
+        const auto status_path = std::filesystem::path(context.args.status_file);
+        std::ifstream in(status_path, std::ios::binary);
+        if (!Require(in.good(), "External mutation status refresh test should open refreshed status file"))
+        {
+            ok = false;
+            break;
+        }
+
+        std::stringstream buffer;
+        buffer << in.rdbuf();
+        const auto json = buffer.str();
+        if (!Require(json.find("\"inFlightMutationCallbacks\":0") != std::string::npos, "External mutation scope exit should publish zero in-flight callbacks"))
+        {
+            ok = false;
+            break;
+        }
+    } while (false);
+
+    std::filesystem::remove_all(status_root, ec);
+    return ok;
+}
+
+bool TestCleanRecoveryCheckpointXidPrefersSuperblockWhenCommittedTelemetryStale()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    const auto reconciled = ResolveCleanRecoveryCheckpointXid(765ull, 766ull);
+    if (!Require(
+            reconciled.has_value() && reconciled.value() == 766ull,
+            "Recovery-marker reconciliation should prefer the newer clean checkpoint xid over stale committed telemetry"))
+    {
+        return false;
+    }
+
+    const auto committed_only = ResolveCleanRecoveryCheckpointXid(765ull, std::optional<std::uint64_t>{});
+    if (!Require(
+            committed_only.has_value() && committed_only.value() == 765ull,
+            "Recovery-marker reconciliation should preserve committed xid when checkpoint xid is unavailable"))
+    {
+        return false;
+    }
+
+    const auto checkpoint_only = ResolveCleanRecoveryCheckpointXid(std::optional<std::uint64_t>{}, 766ull);
+    if (!Require(
+            checkpoint_only.has_value() && checkpoint_only.value() == 766ull,
+            "Recovery-marker reconciliation should use checkpoint xid when committed xid is unavailable"))
+    {
+        return false;
+    }
+#endif
+
+    return true;
+}
+
 bool TestConcurrentCreateSamePathIsSerializedAndConsistent()
 {
     MountContext context{};
@@ -3796,34 +4377,41 @@ bool TestConcurrentRenameReplaceAndTargetSetDeleteIsFailClosed()
     const auto rename = static_cast<NTSTATUS>(rename_status.load());
     const auto set_delete = static_cast<NTSTATUS>(set_delete_status.load());
 
-    const bool rename_blocked =
-        rename == STATUS_SHARING_VIOLATION ||
-        rename == STATUS_DELETE_PENDING;
-    if (!Require(rename_blocked, "Concurrent rename-replace vs target set-delete should fail closed (SHARING_VIOLATION or DELETE_PENDING)"))
-    {
-        return false;
-    }
-    if (!Require(set_delete == STATUS_SUCCESS, "Concurrent target set-delete should succeed in rename-replace contention race"))
+    const bool delete_won =
+        (rename == STATUS_DELETE_PENDING || rename == STATUS_OBJECT_NAME_NOT_FOUND) &&
+        set_delete == STATUS_SUCCESS &&
+        context.nodes.find(Key(L"\\source.txt")) != context.nodes.end() &&
+        context.nodes.find(Key(L"\\target.txt")) != context.nodes.end() &&
+        context.nodes.at(Key(L"\\target.txt"))->delete_pending;
+
+    const bool rename_won =
+        rename == STATUS_SUCCESS &&
+        (set_delete == STATUS_OBJECT_NAME_NOT_FOUND || set_delete == STATUS_INVALID_PARAMETER) &&
+        context.nodes.find(Key(L"\\source.txt")) == context.nodes.end() &&
+        context.nodes.find(Key(L"\\target.txt")) != context.nodes.end();
+
+    const bool serialized_collision =
+        rename == STATUS_OBJECT_NAME_COLLISION &&
+        set_delete == STATUS_SUCCESS &&
+        context.nodes.find(Key(L"\\source.txt")) != context.nodes.end() &&
+        context.nodes.find(Key(L"\\target.txt")) != context.nodes.end() &&
+        context.nodes.at(Key(L"\\target.txt"))->delete_pending;
+
+    if (!Require(rename_won || delete_won || serialized_collision, "Concurrent rename-replace vs target set-delete should resolve to a serialized non-corrupt state"))
     {
         return false;
     }
 
-    if (!Require(context.nodes.find(Key(L"\\source.txt")) != context.nodes.end(), "Failed rename-replace race should preserve source path"))
+    if (rename_won)
     {
-        return false;
-    }
-    if (!Require(context.nodes.find(Key(L"\\target.txt")) != context.nodes.end(), "Failed rename-replace race should preserve target path"))
-    {
-        return false;
+        return Require(
+            !context.nodes.at(Key(L"\\target.txt"))->delete_pending,
+            "Rename-winning replace race should leave replacement target visible");
     }
 
-    auto target_after = context.nodes.at(Key(L"\\target.txt"));
-    if (!Require(target_after->delete_pending, "Target should be delete-pending after successful set-delete race"))
-    {
-        return false;
-    }
-
-    return Require(target_after->delete_intent_count > 0, "Target delete intent count should be latched after set-delete race");
+    return Require(
+        context.nodes.at(Key(L"\\target.txt"))->delete_intent_count > 0,
+        "SetDelete-winning replace race should latch target delete intent");
 }
 
 bool TestConcurrentRenameReplaceAndDeleteCloseInterleavingIsConsistent()
@@ -4606,6 +5194,186 @@ bool TestParseArgsParsesStrictNonFixtureControlOverrides()
     return Require(parsed.mount == L"Q:", "ParseArgs should normalize mount letter casing");
 }
 
+bool TestBuildWinFspMountPointUsesGlobalDriveForExplorer()
+{
+    if (!Require(BuildWinFspMountPoint(L"E:") == L"\\\\.\\E:", "Drive-letter mounts should use Mount Manager syntax"))
+    {
+        return false;
+    }
+
+    if (!Require(BuildWinFspMountPoint(L"q:") == L"\\\\.\\Q:", "Drive-letter global mount syntax should normalize casing"))
+    {
+        return false;
+    }
+
+    return Require(
+        BuildWinFspMountPoint(L"C:\\apfs-mount") == L"C:\\apfs-mount",
+        "Directory mount points should not be rewritten as global drives");
+}
+
+bool TestVolumeParamsUseExplorerFriendlyCleanupFlags()
+{
+    FSP_FSCTL_VOLUME_PARAMS params{};
+    params.PostCleanupWhenModifiedOnly = 0;
+    params.FlushAndPurgeOnCleanup = 1;
+    params.PostDispositionWhenNecessaryOnly = 1;
+    params.SupportsPosixUnlinkRename = 1;
+    params.PersistentAcls = 0;
+
+    if (!Require(params.PostCleanupWhenModifiedOnly == 0, "Volume params should deliver cleanup for every user handle so Explorer/Office locks clear promptly"))
+    {
+        return false;
+    }
+    if (!Require(params.FlushAndPurgeOnCleanup != 0, "Volume params should purge cached file data on cleanup for Explorer/Office compatibility"))
+    {
+        return false;
+    }
+    if (!Require(params.PostDispositionWhenNecessaryOnly != 0, "Volume params should request disposition callbacks only when Windows needs them"))
+    {
+        return false;
+    }
+    if (!Require(params.SupportsPosixUnlinkRename != 0, "Volume params should preserve POSIX-style unlink semantics for compatible shell handles"))
+    {
+        return false;
+    }
+    return Require(params.PersistentAcls == 0, "Volume params should not advertise persistent ACLs while APFS Access returns synthetic security descriptors");
+}
+
+bool TestNormalizePathStripsDriveQualifiedRoot()
+{
+    if (!Require(NormalizePath(L"E:") == L"\\", "NormalizePath should treat drive-qualified current-directory roots as volume root"))
+    {
+        return false;
+    }
+    if (!Require(NormalizePath(L"E:\\") == L"\\", "NormalizePath should treat drive-qualified slash roots as volume root"))
+    {
+        return false;
+    }
+    if (!Require(NormalizePath(L"E:\\folder\\file.txt") == L"\\folder\\file.txt", "NormalizePath should strip drive prefixes from absolute child paths"))
+    {
+        return false;
+    }
+
+    return Require(NormalizePath(L"folder\\file.txt") == L"\\folder\\file.txt", "NormalizePath should preserve relative child path behavior");
+}
+
+bool TestStableVolumeSerialDependsOnVolumeIdentityNotProcessUptime()
+{
+    Arguments first{};
+    first.device = L"\\\\.\\PhysicalDrive2";
+    first.volume = L"Main";
+    first.device_offset_bytes = 4096;
+
+    Arguments same = first;
+    Arguments other = first;
+    other.volume = L"Other";
+
+    const auto serial = BuildStableVolumeSerial(first);
+    if (!Require(serial != 0, "Stable volume serial should never be zero"))
+    {
+        return false;
+    }
+    if (!Require(serial == BuildStableVolumeSerial(same), "Stable volume serial should be deterministic for the same APFS volume identity"))
+    {
+        return false;
+    }
+    return Require(serial != BuildStableVolumeSerial(other), "Stable volume serial should change when the APFS volume identity changes");
+}
+
+bool TestVolumeInfoFallbackKeepsExplorerCapacityBarUsable()
+{
+    MountContext context{};
+    context.label = BuildExplorerVolumeLabel(L"Main");
+    context.reported_total_size_bytes = 128111046656ull;
+    context.reported_free_size_bytes.reset();
+    context.reported_allocation_unit_bytes = 4096;
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+    SeedRoot(context);
+
+    auto fs = BuildFileSystem(&context);
+    FSP_FSCTL_VOLUME_INFO volume_info{};
+    const auto status = CB_GetVolumeInfo(&fs, &volume_info);
+    if (!Require(status == STATUS_SUCCESS, "GetVolumeInfo should succeed with total-size-only fallback metadata"))
+    {
+        return false;
+    }
+    if (!Require(volume_info.TotalSize == 128111046656ull, "GetVolumeInfo should preserve APFS total size for Explorer"))
+    {
+        return false;
+    }
+    if (!Require(volume_info.FreeSize == 128111046656ull, "GetVolumeInfo should use total size as temporary free-space fallback"))
+    {
+        return false;
+    }
+
+    context.reported_free_size_bytes = 128500000000ull;
+    const auto clamped_status = CB_GetVolumeInfo(&fs, &volume_info);
+    if (!Require(clamped_status == STATUS_SUCCESS, "GetVolumeInfo should succeed when reported free space exceeds total size"))
+    {
+        return false;
+    }
+    if (!Require(volume_info.FreeSize == volume_info.TotalSize, "GetVolumeInfo should clamp free space to total size"))
+    {
+        return false;
+    }
+
+    context.reported_free_size_bytes = 0;
+    const auto zero_free_status = CB_GetVolumeInfo(&fs, &volume_info);
+    if (!Require(zero_free_status == STATUS_SUCCESS, "GetVolumeInfo should succeed when richer APFS free space is unavailable"))
+    {
+        return false;
+    }
+    return Require(volume_info.FreeSize == volume_info.TotalSize, "GetVolumeInfo should preserve Explorer capacity bar when APFS free space is unknown");
+}
+
+bool TestVolumeInfoUsesMetadataStoreWhenAvailable()
+{
+    MountContext context{};
+    context.label = BuildExplorerVolumeLabel(L"Main");
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+    SeedRoot(context);
+
+    auto fs = BuildFileSystem(&context);
+    FSP_FSCTL_VOLUME_INFO volume_info{};
+    const auto empty_status = CB_GetVolumeInfo(&fs, &volume_info);
+    if (!Require(empty_status == STATUS_SUCCESS, "GetVolumeInfo should succeed without metadata store"))
+    {
+        return false;
+    }
+    if (!Require(volume_info.TotalSize == 0 && volume_info.FreeSize == 0, "GetVolumeInfo should fall back to zero values when metadata is unavailable"))
+    {
+        return false;
+    }
+    if (!Require(volume_info.VolumeLabelLength == 4 * sizeof(WCHAR), "GetVolumeInfo should expose the APFS volume label without debug suffixes"))
+    {
+        return false;
+    }
+    if (!Require(std::wstring(volume_info.VolumeLabel, volume_info.VolumeLabelLength / sizeof(WCHAR)) == L"Main", "GetVolumeInfo should report the native volume label"))
+    {
+        return false;
+    }
+
+    context.reported_total_size_bytes = 1000;
+    context.reported_free_size_bytes.reset();
+    context.reported_allocation_unit_bytes = 128;
+    const auto fallback_status = CB_GetVolumeInfo(&fs, &volume_info);
+    if (!Require(fallback_status == STATUS_SUCCESS, "GetVolumeInfo should succeed with reported fallback capacity"))
+    {
+        return false;
+    }
+    if (!Require(volume_info.TotalSize == 896 && volume_info.FreeSize == 896, "GetVolumeInfo should align fallback total/free space to allocation units"))
+    {
+        return false;
+    }
+    context.reported_total_size_bytes.reset();
+    context.reported_free_size_bytes.reset();
+    context.reported_allocation_unit_bytes = 4096;
+
+    return true;
+}
+
 bool TestRequiresCanonicalMutationGateDefaultsToStrict()
 {
     Arguments args{};
@@ -4708,28 +5476,81 @@ bool TestApplyNonFixtureCanonicalSafetyOverrides_FixtureNamedDirectoryWithoutPat
         args.write_require_canonical_replay_candidate_on_non_fixture,
         "Fixture-like directory names must not bypass strict non-fixture canonical safety overrides");
 }
+bool RunSelectedTest(const std::string& name)
+{
+    if (name == "recycle-bin-attributes")
+    {
+        return TestRecycleBinPathsExposeExplorerCompatibleAttributes();
+    }
+    if (name == "volume-acl-flag")
+    {
+        return TestVolumeParamsUseExplorerFriendlyCleanupFlags();
+    }
+    if (name == "stable-volume-serial")
+    {
+        return TestStableVolumeSerialDependsOnVolumeIdentityNotProcessUptime();
+    }
+
+    std::cerr << "[FAIL] Unknown selected FsHost semantics test: " << name << std::endl;
+    return false;
+}
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+    if (argc > 1)
+    {
+        bool selected_ok = true;
+        bool ran_selected = false;
+        for (int i = 1; i < argc; ++i)
+        {
+            const std::string name = argv[i] ? argv[i] : "";
+            if (name.empty() || name == "--only")
+            {
+                continue;
+            }
+
+            ran_selected = true;
+            selected_ok &= RunSelectedTest(name);
+        }
+
+        if (!ran_selected)
+        {
+            std::cerr << "[FAIL] No selected FsHost semantics tests were requested." << std::endl;
+            return 1;
+        }
+        if (!selected_ok)
+        {
+            return 1;
+        }
+
+        std::cout << "[PASS] Selected FsHost semantics tests passed." << std::endl;
+        return 0;
+    }
+
     bool ok = true;
     ok &= TestCreateRejectsConflictingTypeFlags();
     ok &= TestDeletePendingAncestorBlocksOpenSecurityDelete();
     ok &= TestDeleteIntentAncestorBlocksOpenAndCreate();
     ok &= TestRenameSamePathRequiresExistingNode();
     ok &= TestRenameSamePathValidatesContextPermissions();
+    ok &= TestRenameRelativeTargetStaysInSourceParent();
+    ok &= TestDirectoryInfoBufferNullTerminatesNameAndReportsUnterminatedSize();
+    ok &= TestRecycleBinPathsExposeExplorerCompatibleAttributes();
     ok &= TestRenameRejectsMismatchedOpenContext();
     ok &= TestRenameMissingSourceWithSourceHandleFailsClosed();
-    ok &= TestRenameCrossParentSourceHandleDenied();
+    ok &= TestRenameCrossParentSourceHandleSucceedsWithDeleteAccess();
     ok &= TestSetDeleteToggleClearsDeletePending();
+    ok &= TestSetDeleteRemovesFileOnLastClose();
     ok &= TestRenameFailsWhileSourceDeletePendingThenRecoversAfterClear();
     ok &= TestRenameFailsWhenSourceDeleteIntentStateIsStale();
     ok &= TestRenameReplaceFailsWhenTargetDeletePending();
-    ok &= TestRenameReplaceFailsWhenTargetHasAdditionalOpenHandle();
+    ok &= TestRenameReplaceAllowsFileTargetWithAdditionalOpenHandle();
     ok &= TestCleanupDeleteRequiresDeleteAccess();
     ok &= TestCleanupDeleteBlocksRenameUntilCloseRemovesSource();
     ok &= TestCloseRemovesEmptyDirectoryAfterCleanupDelete();
     ok &= TestCloseWithoutDeleteLatchPreservesNode();
+    ok &= TestCleanupWithoutDeleteReleasesFileForRename();
     ok &= TestCanDeleteSupportsParentDeleteChildPermission();
     ok &= TestRenameSupportsParentDeleteChildPermission();
     ok &= TestRenameSameParentRequiresInsertPermission();
@@ -4742,6 +5563,9 @@ int main()
     ok &= TestCanDeleteNullNameParentHandleRequiresDeleteNotDeleteChild();
     ok &= TestCanDeleteFailsWhenAdditionalHandleOpen();
     ok &= TestSetDeleteFailsWhenAdditionalHandleOpen();
+    ok &= TestCleanupDeleteLatchesEvenWhenAdditionalHandlesRemain();
+    ok &= TestCloseOnlyCommitsWhenDeleteMutationIsEmitted();
+    ok &= TestDeleteOnCloseCommitsWhenDeleteIsLatching();
     ok &= TestRenameDirectoryFailsWhenDescendantHandleOpen();
     ok &= TestRenameSourceHandleSucceedsWithOnlyCurrentHandleOpen();
     ok &= TestRenameTargetParentRequiresFileInsertPermission();
@@ -4764,6 +5588,8 @@ int main()
     ok &= TestFlushAllowedWhenWriteDisabledDuringShutdownDrain();
     ok &= TestFlushReleasesExternalMutationScopeAfterSuccessfulWriteEnabledFlush();
     ok &= TestMutatingCallbacksFailWriteProtectedWhenWriteDisabled();
+    ok &= TestSetSecurityIsNoopWhenWriteEnabled();
+    ok &= TestDefaultSecurityDescriptorGrantsUsersWriteAccess();
     ok &= TestOpenMutationAccessDeniedWhenWriteDisabled();
     ok &= TestOpenDeleteAccessDeniedWhenWriteDisabled();
     ok &= TestOpenFailsWhenDeleteIntentStateIsStale();
@@ -4778,6 +5604,8 @@ int main()
     ok &= TestBeginMutationShutdownDrainWaitsForInFlightMutation();
     ok &= TestBeginMutationShutdownDrainTimesOutWithStuckMutation();
     ok &= TestStatusFileTracksShutdownDrainAndInFlightMutations();
+    ok &= TestExternalMutationScopePublishesIdleStatusOnExit();
+    ok &= TestCleanRecoveryCheckpointXidPrefersSuperblockWhenCommittedTelemetryStale();
     ok &= TestConcurrentCreateSamePathIsSerializedAndConsistent();
     ok &= TestConcurrentRenameSameSourceDifferentTargetsIsSerialized();
     ok &= TestConcurrentRenameAndSetDeleteOnSameSourceIsSerialized();
@@ -4791,6 +5619,12 @@ int main()
     ok &= TestLoadHydratedPayloadReadsExistingHydrationWhenHydrateDisabled();
     ok &= TestParseArgsDefaultsStrictNonFixtureControls();
     ok &= TestParseArgsParsesStrictNonFixtureControlOverrides();
+    ok &= TestBuildWinFspMountPointUsesGlobalDriveForExplorer();
+    ok &= TestVolumeParamsUseExplorerFriendlyCleanupFlags();
+    ok &= TestNormalizePathStripsDriveQualifiedRoot();
+    ok &= TestStableVolumeSerialDependsOnVolumeIdentityNotProcessUptime();
+    ok &= TestVolumeInfoFallbackKeepsExplorerCapacityBarUsable();
+    ok &= TestVolumeInfoUsesMetadataStoreWhenAvailable();
     ok &= TestRequiresCanonicalMutationGateDefaultsToStrict();
     ok &= TestRequiresCanonicalMutationGateNeedsAllStrictFlagsDisabled();
     ok &= TestApplyNonFixtureCanonicalSafetyOverrides_EnforcesStrictControls();

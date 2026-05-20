@@ -26,7 +26,7 @@ public:
         std::uint32_t physical_block_size = 4096;
     };
 
-    explicit BlockDevice(std::wstring path);
+    explicit BlockDevice(std::wstring path, std::uint64_t base_offset_bytes = 0);
     ~BlockDevice();
 
     BlockDevice(const BlockDevice&) = delete;
@@ -46,8 +46,10 @@ private:
     [[nodiscard]] bool EnsureHandle(bool write_access) const;
     void CloseHandleLocked() const;
     [[nodiscard]] bool QueryGeometryLocked(Geometry& geometry) const;
+    [[nodiscard]] std::uint32_t LogicalBlockSizeLocked() const;
 
     std::wstring path_;
+    std::uint64_t base_offset_bytes_ = 0;
     mutable HANDLE handle_ = INVALID_HANDLE_VALUE;
     mutable bool writable_ = false;
     mutable bool geometry_cached_ = false;

@@ -9,6 +9,7 @@ add_library(ApfsAccess.ApfsRwEngine STATIC
     src/BtreeMutationCodec.cpp
     src/BlockDevice.cpp
     src/MetadataStore.cpp
+    src/NativeApfsReader.cpp
     src/TransactionManager.cpp
 )
 

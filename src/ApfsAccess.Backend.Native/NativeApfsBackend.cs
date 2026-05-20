@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -55,15 +57,19 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     private const int CommandTimeoutSeconds = 12;
     private const string DefaultMainVolumeName = "Main";
     private static readonly TimeSpan RuntimeStatusPollTimeout = TimeSpan.FromMilliseconds(350);
+    private static readonly Guid ApfsPartitionTypeGuid = new("7C3457EF-0000-11AA-AA11-00306543ECAC");
+    private static readonly int[] ProbeSectorSizes = [512, 4096];
+    private const int MaxGptEntriesToRead = 1024;
 
     private readonly ServiceHostOptions _options;
-    private readonly string? _apfsUtilPath;
     private readonly string? _nativeFsHostPath;
     private readonly IReadOnlyList<string> _deviceCandidates;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly ConcurrentDictionary<string, MountedVolumeState> _mounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, HostProcessState> _hosts = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, VolumeInfo> _volumeCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, DiscoveredDevice> _deviceDiscoveryCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, VolumeMountTarget> _mountTargetsByVolumeId = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, NativeWriteValidationEvidence> _validationEvidenceByVolumeId = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, NativeWriteValidationEvidence> _validationEvidenceByProfileId = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _lastPromotedEvidenceSessionByProfileId = new(StringComparer.OrdinalIgnoreCase);
@@ -74,120 +80,60 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         ArgumentNullException.ThrowIfNull(options);
 
         _options = options;
-        _apfsUtilPath = ResolveApfsUtilPath(options);
         _nativeFsHostPath = ResolveNativeFsHostPath(options);
         _deviceCandidates = BuildDeviceCandidates(options);
         Directory.CreateDirectory(_writeDiagnosticsRoot);
         LoadValidationEvidenceFromDisk();
     }
 
-    public async Task<IReadOnlyList<DeviceInfo>> ProbeDevicesAsync(CancellationToken cancellationToken)
+    public Task<IReadOnlyList<DeviceInfo>> ProbeDevicesAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        EnsureApfsUtilConfigured();
 
         var devices = new List<DeviceInfo>();
         foreach (var candidate in _deviceCandidates)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var result = await RunApfsUtilAsync(
-                commandName: "enumroot",
-                target: candidate,
-                cancellationToken
-            ).ConfigureAwait(false);
-
-            if (IsSuccessForCommand(result.StdOut, "enumroot"))
+            var discovered = DiscoverDevice(candidate);
+            if (discovered is not null)
             {
-                devices.Add(new DeviceInfo(candidate, $"APFS Device ({candidate})", true));
+                _deviceDiscoveryCache[candidate] = discovered;
+                devices.Add(new DeviceInfo(discovered.DeviceId, discovered.DisplayName, true));
+            }
+            else
+            {
+                _deviceDiscoveryCache.TryRemove(candidate, out _);
             }
         }
 
-        return devices;
+        return Task.FromResult<IReadOnlyList<DeviceInfo>>(devices);
     }
 
-    public async Task<IReadOnlyList<VolumeInfo>> ProbeVolumesAsync(string deviceId, CancellationToken cancellationToken)
+    public Task<IReadOnlyList<VolumeInfo>> ProbeVolumesAsync(string deviceId, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentException.ThrowIfNullOrWhiteSpace(deviceId);
-        EnsureApfsUtilConfigured();
 
-        var result = await RunApfsUtilAsync(
-            commandName: "listsubvolumes",
-            target: deviceId,
-            cancellationToken
-        ).ConfigureAwait(false);
-
-        if (!IsSuccessForCommand(result.StdOut, "listsubvolumes"))
+        var discovered = DiscoverDevice(deviceId);
+        if (discovered is null)
         {
-            return Array.Empty<VolumeInfo>();
+            _deviceDiscoveryCache.TryRemove(deviceId, out _);
+            return Task.FromResult<IReadOnlyList<VolumeInfo>>(Array.Empty<VolumeInfo>());
         }
 
-        var parsedVolumeRows = ParseVolumeRows(result.StdOut);
-        if (parsedVolumeRows.Count == 0)
-        {
-            parsedVolumeRows.Add(new ParsedVolumeRow(
-                Name: DefaultMainVolumeName,
-                IsEncrypted: false,
-                WriteIncompatibilities: Array.Empty<string>(),
-                WriteUnsupportedFeatures: Array.Empty<string>()));
-        }
+        _deviceDiscoveryCache[deviceId] = discovered;
 
-        var volumes = parsedVolumeRows
-            .GroupBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
-            .Select(group =>
-            {
-                var volumeName = group.Key;
-                var isEncrypted = group.Any(x => x.IsEncrypted);
-                var writeIncompatibilities = group
-                    .SelectMany(static x => x.WriteIncompatibilities)
-                    .Where(static x => !string.IsNullOrWhiteSpace(x))
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
-                    .ToArray();
-                var writeUnsupportedFeatures = group
-                    .SelectMany(static x => x.WriteUnsupportedFeatures)
-                    .Where(static x => !string.IsNullOrWhiteSpace(x))
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
-                    .ToArray();
-                var writeBackend = (_options.WriteBackendMode ?? string.Empty).Trim();
-                var supportsConfiguredWrite = _options.EnableNativeWrite &&
-                                              !isEncrypted &&
-                                              writeIncompatibilities.Length == 0 &&
-                                              (IsWriteBackendMode(writeBackend, "Overlay") ||
-                                               IsWriteBackendMode(writeBackend, "Native"));
-                var nativeWriteReadiness = supportsConfiguredWrite
-                    ? IsWriteBackendMode(writeBackend, "Native")
-                        ? NativeWriteReadiness.BootstrapReady
-                        : NativeWriteReadiness.MutationReady
-                    : NativeWriteReadiness.Unavailable;
-                var volume = new VolumeInfo(
-                    VolumeId: CreateVolumeId(deviceId, volumeName),
-                    DeviceId: deviceId,
-                    VolumeName: volumeName,
-                    SupportsReadWrite: supportsConfiguredWrite,
-                    IsEncrypted: isEncrypted,
-                    SupportsExplorerMount: !isEncrypted,
-                    NativeVolumePath: BuildNativeVolumePath(deviceId, volumeName),
-                    SupportsNativeWrite: supportsConfiguredWrite,
-                    WriteBlockReason: isEncrypted
-                        ? "Encrypted APFS write path is not supported in this release."
-                        : writeIncompatibilities.Length > 0
-                            ? string.Join(" ", writeIncompatibilities)
-                        : supportsConfiguredWrite
-                            ? null
-                            : "Write backend is disabled (set Service.WriteBackendMode=Overlay or Native for experimental write-path testing).",
-                    WriteIncompatibilities: writeIncompatibilities,
-                    WriteUnsupportedFeatures: writeUnsupportedFeatures,
-                    NativeWriteReadiness: nativeWriteReadiness
-                );
-                _volumeCache[volume.VolumeId] = volume;
-                return volume;
-            })
+        var volumes = discovered.Volumes
+            .Select(discoveredVolume => CreateDiscoveredVolumeInfo(deviceId, discoveredVolume))
             .ToArray();
 
-        return volumes;
+        foreach (var volume in volumes)
+        {
+            _volumeCache[volume.VolumeId] = volume;
+        }
+
+        return Task.FromResult<IReadOnlyList<VolumeInfo>>(volumes);
     }
 
     public async Task<MountResult> MountAsync(MountRequest request, CancellationToken cancellationToken)
@@ -195,7 +141,6 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentNullException.ThrowIfNull(request);
 
-        EnsureApfsUtilConfigured();
         if (string.IsNullOrWhiteSpace(_nativeFsHostPath) || !File.Exists(_nativeFsHostPath))
         {
                 return new MountResult(
@@ -243,6 +188,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
 
         var mountPoint = NormalizeMountPoint(request.DriveLetter);
         var startupTimeout = TimeSpan.FromSeconds(Math.Clamp(_options.NativeHostStartupTimeoutSeconds, 2, 60));
+        var resolvedVolume = await ResolveVolumeAsync(request.VolumeId, cancellationToken).ConfigureAwait(false);
 
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -263,8 +209,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 );
             }
 
-            if (!_volumeCache.TryGetValue(request.VolumeId, out var volume) &&
-                !TryBuildVolumeFromId(request.VolumeId, out volume))
+            if (resolvedVolume is null)
             {
                 return new MountResult(
                     Success: false,
@@ -277,6 +222,8 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                     SafetyGateState: "UnknownVolume"
                 );
             }
+
+            var volume = resolvedVolume;
 
             if (volume.IsEncrypted)
             {
@@ -376,6 +323,9 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             var started = await WaitForMountOrExitAsync(
                 hostState.Process,
                 mountPoint,
+                hostState.StatusFilePath,
+                request.AccessMode,
+                _options.WriteBackendMode,
                 startupTimeout,
                 cancellationToken
             ).ConfigureAwait(false);
@@ -1449,8 +1399,14 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             CreateNoWindow = true,
             WorkingDirectory = Path.GetDirectoryName(_nativeFsHostPath!) ?? AppContext.BaseDirectory,
         };
+        var mountTarget = ResolveMountTarget(volume);
         psi.ArgumentList.Add("--device");
-        psi.ArgumentList.Add(volume.DeviceId);
+        psi.ArgumentList.Add(mountTarget.DevicePath);
+        if (mountTarget.DeviceOffsetBytes > 0)
+        {
+            psi.ArgumentList.Add("--device-offset");
+            psi.ArgumentList.Add(mountTarget.DeviceOffsetBytes.ToString(CultureInfo.InvariantCulture));
+        }
         psi.ArgumentList.Add("--volume");
         psi.ArgumentList.Add(volume.VolumeName);
         psi.ArgumentList.Add("--mount");
@@ -1567,11 +1523,6 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 psi.ArgumentList.Add("--allow-raw-physical-write");
             }
         }
-        if (!string.IsNullOrWhiteSpace(_apfsUtilPath))
-        {
-            psi.ArgumentList.Add("--apfsutil");
-            psi.ArgumentList.Add(_apfsUtilPath);
-        }
         psi.ArgumentList.Add("--lifetime-file");
         psi.ArgumentList.Add(lifetimeFilePath);
         psi.ArgumentList.Add("--status-file");
@@ -1629,6 +1580,9 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     private static async Task<bool> WaitForMountOrExitAsync(
         Process process,
         string mountPoint,
+        string statusFilePath,
+        MountAccessMode accessMode,
+        string? configuredWriteBackend,
         TimeSpan timeout,
         CancellationToken cancellationToken
     )
@@ -1648,6 +1602,16 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 return true;
             }
 
+            if (await IsHostMountReadyAsync(
+                    statusFilePath,
+                    accessMode,
+                    configuredWriteBackend,
+                    cancellationToken
+                ).ConfigureAwait(false))
+            {
+                return true;
+            }
+
             var elapsed = Stopwatch.GetElapsedTime(startedAt);
             if (elapsed.Ticks >= timeoutTicks)
             {
@@ -1660,17 +1624,132 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         return false;
     }
 
-    private static bool IsDriveVisible(string mountPoint)
+    private static async Task<bool> IsHostMountReadyAsync(
+        string statusFilePath,
+        MountAccessMode accessMode,
+        string? configuredWriteBackend,
+        CancellationToken cancellationToken
+    )
     {
-        try
-        {
-            return DriveInfo.GetDrives()
-                .Any(drive => string.Equals(drive.Name, mountPoint, StringComparison.OrdinalIgnoreCase));
-        }
-        catch
+        if (string.IsNullOrWhiteSpace(statusFilePath))
         {
             return false;
         }
+
+        var runtimeStatus = await ReadHostRuntimeStatusAsync(
+            statusFilePath,
+            accessMode,
+            configuredWriteBackend,
+            timeout: TimeSpan.FromMilliseconds(100),
+            cancellationToken
+        ).ConfigureAwait(false);
+
+        return runtimeStatus.MountReady;
+    }
+
+    private static bool IsDriveVisible(string mountPoint)
+    {
+        var normalizedMountPoint = NormalizeMountPoint(mountPoint);
+
+        try
+        {
+            if (DriveInfo.GetDrives()
+                .Any(drive => string.Equals(drive.Name, normalizedMountPoint, StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+        }
+        catch
+        {
+            // Fall through to direct Win32 probes below. DriveInfo can lag behind
+            // WinFsp drive-letter exposure during mount startup.
+        }
+
+        if (!OperatingSystem.IsWindows())
+        {
+            return false;
+        }
+
+        return Win32DriveVisibilityProbe.HasRootAttributes(normalizedMountPoint) ||
+               Win32DriveVisibilityProbe.HasVolumeInformation(normalizedMountPoint) ||
+               Win32DriveVisibilityProbe.HasDosDevice(normalizedMountPoint);
+    }
+
+    private static class Win32DriveVisibilityProbe
+    {
+        private const uint InvalidFileAttributes = 0xFFFFFFFF;
+        private const int DosDeviceBufferLength = 4096;
+
+        public static bool HasRootAttributes(string rootPath)
+        {
+            try
+            {
+                return GetFileAttributesW(rootPath) != InvalidFileAttributes;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static bool HasVolumeInformation(string rootPath)
+        {
+            try
+            {
+                return GetVolumeInformationW(
+                    rootPath,
+                    lpVolumeNameBuffer: null,
+                    nVolumeNameSize: 0,
+                    lpVolumeSerialNumber: out _,
+                    lpMaximumComponentLength: out _,
+                    lpFileSystemFlags: out _,
+                    lpFileSystemNameBuffer: null,
+                    nFileSystemNameSize: 0);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static bool HasDosDevice(string rootPath)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(rootPath))
+                {
+                    return false;
+                }
+
+                var deviceName = $"{char.ToUpperInvariant(rootPath[0])}:";
+                var targetPath = new StringBuilder(DosDeviceBufferLength);
+                return QueryDosDeviceW(deviceName, targetPath, targetPath.Capacity) != 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFileAttributesW(string lpFileName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool GetVolumeInformationW(
+            string lpRootPathName,
+            StringBuilder? lpVolumeNameBuffer,
+            uint nVolumeNameSize,
+            out uint lpVolumeSerialNumber,
+            out uint lpMaximumComponentLength,
+            out uint lpFileSystemFlags,
+            StringBuilder? lpFileSystemNameBuffer,
+            uint nFileSystemNameSize);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint QueryDosDeviceW(
+            string lpDeviceName,
+            StringBuilder lpTargetPath,
+            int ucchMax);
     }
 
     private void CleanupExitedHosts_NoLock()
@@ -1749,7 +1828,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     }
 
     private static string BuildNativeVolumePath(string deviceId, string volumeName)
-        => $@"{deviceId}\Ufsd_Volumes\{volumeName}";
+        => $@"{deviceId}\ApfsAccess_Volumes\{volumeName}";
 
     private bool TryBuildVolumeFromId(string volumeId, out VolumeInfo volume)
     {
@@ -1814,69 +1893,366 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         return true;
     }
 
-    private async Task<CommandResult> RunApfsUtilAsync(
-        string commandName,
-        string target,
-        CancellationToken cancellationToken
-    )
+    private VolumeInfo CreateDiscoveredVolumeInfo(string deviceId, DiscoveredVolume discoveredVolume)
     {
-        EnsureApfsUtilConfigured();
+        var writeBackend = (_options.WriteBackendMode ?? string.Empty).Trim();
+        var writeIncompatibilities = discoveredVolume.WriteIncompatibilities
+            .Where(static value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var writeUnsupportedFeatures = discoveredVolume.WriteUnsupportedFeatures
+            .Where(static value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var supportsConfiguredWrite = _options.EnableNativeWrite &&
+                                      !discoveredVolume.IsEncrypted &&
+                                      writeIncompatibilities.Length == 0 &&
+                                      (IsWriteBackendMode(writeBackend, "Overlay") ||
+                                       IsWriteBackendMode(writeBackend, "Native"));
+        var nativeWriteReadiness = supportsConfiguredWrite
+            ? IsWriteBackendMode(writeBackend, "Native")
+                ? NativeWriteReadiness.BootstrapReady
+                : NativeWriteReadiness.MutationReady
+            : NativeWriteReadiness.Unavailable;
+        var volumeId = CreateVolumeId(deviceId, discoveredVolume.VolumeName);
 
-        var psi = new ProcessStartInfo
+        _mountTargetsByVolumeId[volumeId] = discoveredVolume.MountTarget;
+
+        return new VolumeInfo(
+            VolumeId: volumeId,
+            DeviceId: deviceId,
+            VolumeName: discoveredVolume.VolumeName,
+            SupportsReadWrite: supportsConfiguredWrite,
+            IsEncrypted: discoveredVolume.IsEncrypted,
+            SupportsExplorerMount: !discoveredVolume.IsEncrypted,
+            NativeVolumePath: discoveredVolume.NativeVolumePath,
+            SupportsNativeWrite: supportsConfiguredWrite,
+            WriteBlockReason: discoveredVolume.IsEncrypted
+                ? "Encrypted APFS write path is not supported in this release."
+                : writeIncompatibilities.Length > 0
+                    ? string.Join(" ", writeIncompatibilities)
+                    : supportsConfiguredWrite
+                        ? null
+                        : "Write backend is disabled (set Service.WriteBackendMode=Overlay or Native for experimental write-path testing).",
+            WriteIncompatibilities: writeIncompatibilities,
+            WriteUnsupportedFeatures: writeUnsupportedFeatures,
+            NativeWriteReadiness: nativeWriteReadiness
+        );
+    }
+
+    private async Task<VolumeInfo?> ResolveVolumeAsync(string volumeId, CancellationToken cancellationToken)
+    {
+        if (_volumeCache.TryGetValue(volumeId, out var cachedVolume))
         {
-            FileName = _apfsUtilPath!,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            StandardOutputEncoding = Encoding.UTF8,
-            StandardErrorEncoding = Encoding.UTF8,
-        };
-        psi.ArgumentList.Add(commandName);
-        psi.ArgumentList.Add(target);
+            return cachedVolume;
+        }
 
-        using var process = new Process { StartInfo = psi };
-        process.Start();
+        if (!TryParseVolumeId(volumeId, out var deviceId, out _))
+        {
+            return null;
+        }
 
-        var stdoutTask = process.StandardOutput.ReadToEndAsync();
-        var stderrTask = process.StandardError.ReadToEndAsync();
+        var discoveredVolumes = await ProbeVolumesAsync(deviceId, cancellationToken).ConfigureAwait(false);
+        var discoveredVolume = discoveredVolumes.FirstOrDefault(volume =>
+            string.Equals(volume.VolumeId, volumeId, StringComparison.OrdinalIgnoreCase));
+        if (discoveredVolume is not null)
+        {
+            return discoveredVolume;
+        }
 
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutCts.CancelAfter(TimeSpan.FromSeconds(CommandTimeoutSeconds));
+        return TryBuildVolumeFromId(volumeId, out var fallbackVolume)
+            ? fallbackVolume
+            : null;
+    }
+
+    private VolumeMountTarget ResolveMountTarget(VolumeInfo volume)
+    {
+        if (_mountTargetsByVolumeId.TryGetValue(volume.VolumeId, out var mountTarget))
+        {
+            return mountTarget;
+        }
+
+        return new VolumeMountTarget(volume.DeviceId, 0);
+    }
+
+    private DiscoveredDevice? DiscoverDevice(string deviceId)
+    {
+        if (string.IsNullOrWhiteSpace(deviceId))
+        {
+            return null;
+        }
+
+        if (_deviceDiscoveryCache.TryGetValue(deviceId, out var cachedDevice))
+        {
+            return cachedDevice;
+        }
+
+        var discoveredVolumes = DiscoverVolumes(deviceId);
+        if (discoveredVolumes.Count == 0)
+        {
+            return null;
+        }
+
+        var displayName = IsRawPhysicalDevicePath(deviceId)
+            ? $"APFS Device ({deviceId})"
+            : $"APFS Image ({Path.GetFileName(deviceId)})";
+
+        return new DiscoveredDevice(deviceId, displayName, discoveredVolumes);
+    }
+
+    private IReadOnlyList<DiscoveredVolume> DiscoverVolumes(string deviceId)
+    {
+        var discoveredVolumes = new List<DiscoveredVolume>();
+        var usedVolumeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        if (TryReadApfsContainerHeader(deviceId, 0, out _))
+        {
+            discoveredVolumes.Add(new DiscoveredVolume(
+                VolumeName: DefaultMainVolumeName,
+                IsEncrypted: false,
+                WriteIncompatibilities: Array.Empty<string>(),
+                WriteUnsupportedFeatures: Array.Empty<string>(),
+                NativeVolumePath: BuildNativeVolumePath(deviceId, DefaultMainVolumeName),
+                MountTarget: new VolumeMountTarget(deviceId, 0)));
+            return discoveredVolumes;
+        }
+
+        if (!TryReadGptPartitions(deviceId, out var partitions))
+        {
+            return discoveredVolumes;
+        }
+
+        var apfsPartitions = partitions
+            .Where(partition => partition.PartitionTypeGuid == ApfsPartitionTypeGuid)
+            .Where(partition => TryReadApfsContainerHeader(deviceId, partition.StartOffsetBytes, out _))
+            .ToArray();
+
+        foreach (var partition in apfsPartitions)
+        {
+            var baseName = NormalizeDiscoveredVolumeName(
+                partition.PartitionName,
+                allowDefaultMain: apfsPartitions.Length == 1,
+                partitionNumber: partition.PartitionNumber);
+            var volumeName = baseName;
+            for (var suffix = 2; !usedVolumeNames.Add(volumeName); suffix++)
+            {
+                volumeName = $"{baseName}_{suffix}";
+            }
+
+            discoveredVolumes.Add(new DiscoveredVolume(
+                VolumeName: volumeName,
+                IsEncrypted: false,
+                WriteIncompatibilities: Array.Empty<string>(),
+                WriteUnsupportedFeatures: Array.Empty<string>(),
+                NativeVolumePath: BuildNativeVolumePath(deviceId, volumeName),
+                MountTarget: new VolumeMountTarget(deviceId, partition.StartOffsetBytes)));
+        }
+
+        return discoveredVolumes;
+    }
+
+    private static string NormalizeDiscoveredVolumeName(string? rawName, bool allowDefaultMain, int partitionNumber)
+    {
+        var sanitized = (rawName ?? string.Empty)
+            .Replace('|', '_')
+            .Trim();
+
+        if (!string.IsNullOrWhiteSpace(sanitized))
+        {
+            return sanitized;
+        }
+
+        return allowDefaultMain
+            ? DefaultMainVolumeName
+            : $"Partition{partitionNumber}";
+    }
+
+    private static bool TryReadGptPartitions(string deviceId, out IReadOnlyList<GptPartitionInfo> partitions)
+    {
+        foreach (var sectorSize in ProbeSectorSizes)
+        {
+            if (!TryReadBytes(deviceId, (ulong)sectorSize, sectorSize, out var header) || header.Length < 92)
+            {
+                continue;
+            }
+
+            if (!header.AsSpan(0, 8).SequenceEqual("EFI PART"u8))
+            {
+                continue;
+            }
+
+            var partitionEntryCount = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(80, 4));
+            var partitionEntrySize = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(84, 4));
+            if (partitionEntryCount == 0 || partitionEntrySize is < 128 or > 4096)
+            {
+                continue;
+            }
+
+            var cappedEntryCount = (int)Math.Min(partitionEntryCount, (uint)MaxGptEntriesToRead);
+            var entryBlockLength = checked(cappedEntryCount * (int)partitionEntrySize);
+            var partitionEntryLba = BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(72, 8));
+            var partitionEntryOffsetBytes = checked(partitionEntryLba * (ulong)sectorSize);
+            if (!TryReadBytes(deviceId, partitionEntryOffsetBytes, entryBlockLength, out var entriesBlock))
+            {
+                continue;
+            }
+
+            var discoveredPartitions = new List<GptPartitionInfo>();
+            for (var index = 0; index < cappedEntryCount; index++)
+            {
+                var entryOffset = index * (int)partitionEntrySize;
+                var entry = entriesBlock.AsSpan(entryOffset, (int)partitionEntrySize);
+                var hasPartitionTypeGuid = false;
+                for (var typeIndex = 0; typeIndex < 16; typeIndex++)
+                {
+                    if (entry[typeIndex] != 0)
+                    {
+                        hasPartitionTypeGuid = true;
+                        break;
+                    }
+                }
+
+                if (!hasPartitionTypeGuid)
+                {
+                    continue;
+                }
+
+                var typeGuid = new Guid(entry[..16]);
+                var startLba = BinaryPrimitives.ReadUInt64LittleEndian(entry.Slice(32, 8));
+                var endLba = BinaryPrimitives.ReadUInt64LittleEndian(entry.Slice(40, 8));
+                if (startLba == 0 || endLba < startLba)
+                {
+                    continue;
+                }
+
+                var name = Encoding.Unicode.GetString(entry.Slice(56, 72)).TrimEnd('\0', ' ');
+                discoveredPartitions.Add(new GptPartitionInfo(
+                    PartitionNumber: index + 1,
+                    PartitionTypeGuid: typeGuid,
+                    StartOffsetBytes: checked(startLba * (ulong)sectorSize),
+                    PartitionName: name));
+            }
+
+            partitions = discoveredPartitions;
+            return true;
+        }
+
+        partitions = Array.Empty<GptPartitionInfo>();
+        return false;
+    }
+
+    private static bool TryReadApfsContainerHeader(string deviceId, ulong offsetBytes, out ApfsContainerHeader? header)
+    {
+        header = default;
+
+        if (!TryReadBytes(deviceId, offsetBytes, 4096, out var primaryBlock) || primaryBlock.Length < 0xA8)
+        {
+            return false;
+        }
+
+        if (!TryParseApfsContainerHeader(primaryBlock, out var parsedHeader) || parsedHeader is null)
+        {
+            return false;
+        }
+
+        header = parsedHeader;
+        if (header.BlockSize > 0 &&
+            TryReadBytes(deviceId, checked(offsetBytes + header.BlockSize), 4096, out var secondaryBlock) &&
+            secondaryBlock.Length >= 0xA8 &&
+            TryParseApfsContainerHeader(secondaryBlock, out var secondaryHeader) &&
+            secondaryHeader is not null &&
+            secondaryHeader.BlockSize == header.BlockSize &&
+            secondaryHeader.TotalBlocks == header.TotalBlocks &&
+            secondaryHeader.VolumeRootBlock == header.VolumeRootBlock &&
+            secondaryHeader.CheckpointXid > header.CheckpointXid)
+        {
+            header = secondaryHeader;
+        }
+
+        return true;
+    }
+
+    private static bool TryParseApfsContainerHeader(byte[] block, out ApfsContainerHeader? header)
+    {
+        header = default;
+        if (block.Length < 0xA8)
+        {
+            return false;
+        }
+
+        const uint nxsbMagic = 0x4253584E;
+        var magic = BinaryPrimitives.ReadUInt32LittleEndian(block.AsSpan(0x20, 4));
+        var blockSize = BinaryPrimitives.ReadUInt32LittleEndian(block.AsSpan(0x24, 4));
+        var totalBlocks = BinaryPrimitives.ReadUInt64LittleEndian(block.AsSpan(0x28, 8));
+        var checkpointXid = BinaryPrimitives.ReadUInt64LittleEndian(block.AsSpan(0x10, 8));
+        var volumeRootBlock = BinaryPrimitives.ReadUInt64LittleEndian(block.AsSpan(0xA0, 8));
+
+        if (magic != nxsbMagic ||
+            blockSize is 0 or > (1 << 20) ||
+            totalBlocks == 0 ||
+            volumeRootBlock == 0)
+        {
+            return false;
+        }
+
+        header = new ApfsContainerHeader(blockSize, totalBlocks, checkpointXid, volumeRootBlock);
+        return true;
+    }
+
+    private static bool TryReadBytes(string path, ulong offsetBytes, int length, out byte[] buffer)
+    {
+        buffer = Array.Empty<byte>();
+        if (string.IsNullOrWhiteSpace(path) || length <= 0 || offsetBytes > long.MaxValue)
+        {
+            return false;
+        }
 
         try
         {
-            await process.WaitForExitAsync(timeoutCts.Token).ConfigureAwait(false);
+            using var stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete,
+                bufferSize: Math.Min(length, 64 * 1024),
+                FileOptions.RandomAccess);
+            stream.Seek((long)offsetBytes, SeekOrigin.Begin);
+
+            buffer = new byte[length];
+            var totalRead = 0;
+            while (totalRead < length)
+            {
+                var read = stream.Read(buffer, totalRead, length - totalRead);
+                if (read <= 0)
+                {
+                    break;
+                }
+
+                totalRead += read;
+            }
+
+            if (totalRead == buffer.Length)
+            {
+                return true;
+            }
+
+            Array.Resize(ref buffer, totalRead);
+            return totalRead > 0;
         }
-        catch (OperationCanceledException)
+        catch (IOException)
         {
-            try
-            {
-                process.Kill(entireProcessTree: true);
-            }
-            catch
-            {
-                // Ignore cleanup errors.
-            }
-
-            throw;
+            return false;
         }
-
-        var stdout = await stdoutTask.ConfigureAwait(false);
-        var stderr = await stderrTask.ConfigureAwait(false);
-        return new CommandResult(process.ExitCode, stdout, stderr);
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
     }
 
-    private void EnsureApfsUtilConfigured()
-    {
-        if (string.IsNullOrWhiteSpace(_apfsUtilPath))
-        {
-            throw new InvalidOperationException(
-                "Native backend is enabled but 'apfsutil.exe' was not found. " +
-                "Build Paragon APFS SDK CE apfsutil and set Service.NativeApfsUtilPath in appsettings.json."
-            );
-        }
-    }
+    private static bool IsRawPhysicalDevicePath(string path)
+        => !string.IsNullOrWhiteSpace(path) &&
+           (path.StartsWith(@"\\.\PhysicalDrive", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith(@"\\?\PhysicalDrive", StringComparison.OrdinalIgnoreCase));
 
     private static bool IsSuccessForCommand(string stdout, string commandName)
     {
@@ -2212,40 +2588,6 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
 
     private static string CreateVolumeId(string deviceId, string volumeName)
         => $"{deviceId}|{volumeName}";
-
-    private static string? ResolveApfsUtilPath(ServiceHostOptions options)
-    {
-        if (!string.IsNullOrWhiteSpace(options.NativeApfsUtilPath))
-        {
-            var configured = Path.GetFullPath(options.NativeApfsUtilPath);
-            if (File.Exists(configured))
-            {
-                return configured;
-            }
-        }
-
-        var envPath = Environment.GetEnvironmentVariable("APFSUTIL_PATH");
-        if (!string.IsNullOrWhiteSpace(envPath))
-        {
-            var fromEnv = Path.GetFullPath(envPath);
-            if (File.Exists(fromEnv))
-            {
-                return fromEnv;
-            }
-        }
-
-        var projectHint = Path.GetFullPath(Path.Combine(
-            AppContext.BaseDirectory,
-            "..", "..", "..", "..",
-            "third_party", "paragon_apfs_sdk_ce", ".build", "Release", "apfsutil.exe"
-        ));
-        if (File.Exists(projectHint))
-        {
-            return projectHint;
-        }
-
-        return null;
-    }
 
     private static string? ResolveNativeFsHostPath(ServiceHostOptions options)
     {
@@ -3769,6 +4111,10 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         {
             "CanonicalPathNotActive" => true,
             "CanonicalStateNotLoaded" => true,
+            "CanonicalVolumeStateLoadFailed" => true,
+            "CanonicalObjectMapStateInvalid" => true,
+            "CanonicalSpacemanStateInvalid" => true,
+            "CanonicalVolumeTreeStateInvalid" => true,
             "NativeWriteNotReady" => true,
             "WriteDeviceNotAllowed" => true,
             "CommitPathNotReady" => true,
@@ -3841,7 +4187,10 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 CommitBlobMagic: null,
                 CanonicalPathActive: null,
                 CanonicalGateFailure: null
-            );
+            )
+            {
+                MountReady = false,
+            };
         }
 
         if (IsWriteBackendMode(configuredWriteBackend, "Native"))
@@ -3869,7 +4218,10 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 CommitBlobMagic: null,
                 CanonicalPathActive: null,
                 CanonicalGateFailure: null
-            );
+            )
+            {
+                MountReady = false,
+            };
         }
 
         if (IsWriteBackendMode(configuredWriteBackend, "Overlay"))
@@ -3897,7 +4249,10 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 CommitBlobMagic: null,
                 CanonicalPathActive: null,
                 CanonicalGateFailure: null
-            );
+            )
+            {
+                MountReady = false,
+            };
         }
 
         return new HostRuntimeStatus(
@@ -3923,7 +4278,10 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             CommitBlobMagic: null,
             CanonicalPathActive: null,
             CanonicalGateFailure: null
-        );
+        )
+        {
+            MountReady = false,
+        };
     }
 
     private static NativeWriteReadiness ParseNativeWriteReadiness(
@@ -4059,6 +4417,9 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             "persistentstateloadfailed" => "PersistentStateLoadFailed",
             "rootstateinvalid" => "RootStateInvalid",
             "integritycheckfailedonmount" => "IntegrityCheckFailedOnMount",
+            "integritymissingallocationmap" => "IntegrityMissingAllocationMap",
+            "missingallocation" => "IntegrityMissingAllocationMap",
+            "missingallocationmap" => "IntegrityMissingAllocationMap",
             "persistentstateaheadofsuperblock" => "PersistentStateAheadOfSuperblock",
             "persistentstatebehindsuperblock" => "PersistentStateBehindSuperblock",
             "recoveryloadvolumestatefailed" => "RecoveryLoadVolumeStateFailed",
@@ -4082,6 +4443,10 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             "canonical path not active" => "CanonicalPathNotActive",
             "canonicalgatefailure" => "CanonicalPathNotActive",
             "canonicalstatenotloaded" => "CanonicalStateNotLoaded",
+            "canonicalvolumestateloadfailed" => "CanonicalVolumeStateLoadFailed",
+            "canonicalobjectmapstateinvalid" => "CanonicalObjectMapStateInvalid",
+            "canonicalspacemanstateinvalid" => "CanonicalSpacemanStateInvalid",
+            "canonicalvolumetreestateinvalid" => "CanonicalVolumeTreeStateInvalid",
             "nativewritenotready" => "NativeWriteNotReady",
             "writedevicenotallowed" => "WriteDeviceNotAllowed",
             "commitpathnotready" => "CommitPathNotReady",
@@ -4151,12 +4516,14 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             return normalizedCanonicalGateFailure;
         }
 
-        if (status.ReplayCheckpointPendingWindow == true)
+        if (ShouldTreatReplayCheckpointTelemetryAsActiveFailure(status, normalizedRecoveryReason) &&
+            status.ReplayCheckpointPendingWindow == true)
         {
             return "ReplayCheckpointPendingWindow";
         }
 
-        if (status.ReplayCheckpointCandidatePresent == true &&
+        if (ShouldTreatReplayCheckpointTelemetryAsActiveFailure(status, normalizedRecoveryReason) &&
+            status.ReplayCheckpointCandidatePresent == true &&
             status.ReplayCheckpointPendingWindow == false)
         {
             return "ReplayCheckpointNotPendingWindow";
@@ -4174,6 +4541,11 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             return "ReplayCanonicalCandidateMissing";
         }
 
+        if (string.Equals(normalizedRecoveryReason, "IntegrityMissingAllocationMap", StringComparison.Ordinal))
+        {
+            return "IntegrityMissingAllocationMap";
+        }
+
         if (status.CanonicalPathActive != true)
         {
             // Non-fixture production media always requires explicit canonical
@@ -4183,6 +4555,41 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         }
 
         return null;
+    }
+
+    private static bool ShouldTreatReplayCheckpointTelemetryAsActiveFailure(
+        HostRuntimeStatus status,
+        string? normalizedRecoveryReason)
+    {
+        if (normalizedRecoveryReason is "ReplayCheckpointPendingWindow" or "ReplayCheckpointNotPendingWindow")
+        {
+            return true;
+        }
+
+        if (status.RecoveryActive ||
+            status.NativeWriteReadiness == NativeWriteReadiness.RecoveryMode ||
+            status.NativeWriteSafetyState == NativeWriteSafetyState.RecoveryBlocked)
+        {
+            return true;
+        }
+
+        return !IsHealthyCanonicalNativeWriteStatus(status);
+    }
+
+    private static bool IsHealthyCanonicalNativeWriteStatus(HostRuntimeStatus status)
+    {
+        return string.Equals(status.WriteBackend, "Native", StringComparison.OrdinalIgnoreCase) &&
+               status.CommitModel == NativeWriteCommitModel.CanonicalApfsCheckpoint &&
+               status.NativeWriteReadiness == NativeWriteReadiness.CommitReady &&
+               status.NativeWriteSafetyState != NativeWriteSafetyState.RecoveryBlocked &&
+               !status.RecoveryActive &&
+               string.IsNullOrWhiteSpace(NormalizeRecoveryReason(status.RecoveryReason)) &&
+               status.CanonicalPathActive == true &&
+               !status.FixtureLegacyFallbackActive &&
+               !status.FixtureCompatibilityPathActive &&
+               !status.UsesScaffoldCommitBlob &&
+               !IsScaffoldCommitBlobMagic(status.CommitBlobMagic) &&
+               string.IsNullOrWhiteSpace(NormalizeRecoveryReason(status.CanonicalGateFailure));
     }
 
     private static string? GetFailClosedReasonForRuntimeStatus(
@@ -4292,6 +4699,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             "PersistentStateLoadFailed" => "RecoveryFailClosedBootstrap",
             "RootStateInvalid" => "RecoveryFailClosedBootstrap",
             "IntegrityCheckFailedOnMount" => "RecoveryFailClosedIntegrity",
+            "IntegrityMissingAllocationMap" => "RecoveryFailClosedIntegrityAllocationMap",
             "PersistentStateAheadOfSuperblock" => "RecoveryFailClosedReplay",
             "PersistentStateBehindSuperblock" => "RecoveryFailClosedReplay",
             "RecoveryLoadVolumeStateFailed" => "RecoveryFailClosedReplay",
@@ -4313,6 +4721,10 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             "DirtyTransactionLimitExceeded" => "RecoveryFailClosedDirtyLimit",
             "CanonicalPathNotActive" => "RecoveryFailClosedCanonicalPath",
             "CanonicalStateNotLoaded" => "RecoveryFailClosedCanonicalGate",
+            "CanonicalVolumeStateLoadFailed" => "RecoveryFailClosedCanonicalGate",
+            "CanonicalObjectMapStateInvalid" => "RecoveryFailClosedCanonicalGate",
+            "CanonicalSpacemanStateInvalid" => "RecoveryFailClosedCanonicalGate",
+            "CanonicalVolumeTreeStateInvalid" => "RecoveryFailClosedCanonicalGate",
             "NativeWriteNotReady" => "RecoveryFailClosedCanonicalGate",
             "WriteDeviceNotAllowed" => "RecoveryFailClosedCanonicalGate",
             "CommitPathNotReady" => "RecoveryFailClosedCanonicalGate",
@@ -4379,6 +4791,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             "PersistentStateLoadFailed" => "NativeWriteBootstrapFailed",
             "RootStateInvalid" => "NativeWriteBootstrapFailed",
             "IntegrityCheckFailedOnMount" => "NativeWriteIntegrityCheckFailed",
+            "IntegrityMissingAllocationMap" => "NativeWriteIntegrityMissingAllocationMap",
             "PersistentStateAheadOfSuperblock" => "NativeWriteReplayFailed",
             "PersistentStateBehindSuperblock" => "NativeWriteReplayFailed",
             "RecoveryLoadVolumeStateFailed" => "NativeWriteReplayFailed",
@@ -4400,6 +4813,10 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             "DirtyTransactionLimitExceeded" => "NativeWriteDirtyTransactionLimitExceeded",
             "CanonicalPathNotActive" => "NativeWriteCanonicalPathNotActive",
             "CanonicalStateNotLoaded" => "NativeWriteCanonicalGateFailure",
+            "CanonicalVolumeStateLoadFailed" => "NativeWriteCanonicalGateFailure",
+            "CanonicalObjectMapStateInvalid" => "NativeWriteCanonicalGateFailure",
+            "CanonicalSpacemanStateInvalid" => "NativeWriteCanonicalGateFailure",
+            "CanonicalVolumeTreeStateInvalid" => "NativeWriteCanonicalGateFailure",
             "NativeWriteNotReady" => "NativeWriteCanonicalGateFailure",
             "WriteDeviceNotAllowed" => "NativeWriteCanonicalGateFailure",
             "CommitPathNotReady" => "NativeWriteCanonicalGateFailure",
@@ -4466,6 +4883,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             "PersistentStateLoadFailed" => "persistent native-write state could not be loaded",
             "RootStateInvalid" => "root inode/path state was invalid during bootstrap",
             "IntegrityCheckFailedOnMount" => "mount-time integrity checks failed and write mode was blocked",
+            "IntegrityMissingAllocationMap" => "native write cannot prove the APFS spaceman allocation map for existing file extents, so physical-media writes are blocked",
             "PersistentStateAheadOfSuperblock" => "persistent state checkpoint xid is ahead of superblock checkpoint and requires replay",
             "PersistentStateBehindSuperblock" => "persistent state checkpoint xid is behind superblock checkpoint and requires conservative recovery",
             "RecoveryLoadVolumeStateFailed" => "recovery could not load volume state for replay evaluation",
@@ -4487,6 +4905,10 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             "DirtyTransactionLimitExceeded" => "pending native-write dirty transaction count exceeded the configured safety limit",
             "CanonicalPathNotActive" => "canonical non-fixture native write path proof was not active and write mode was blocked",
             "CanonicalStateNotLoaded" => "canonical non-fixture write path state was not fully loaded; explicit canonical gate blocked writable mode",
+            "CanonicalVolumeStateLoadFailed" => "canonical volume state could not be loaded for non-fixture writable mode",
+            "CanonicalObjectMapStateInvalid" => "canonical object-map state failed validation for non-fixture writable mode",
+            "CanonicalSpacemanStateInvalid" => "canonical spaceman/free-space state failed validation for non-fixture writable mode",
+            "CanonicalVolumeTreeStateInvalid" => "canonical volume tree state failed validation for non-fixture writable mode",
             "NativeWriteNotReady" => "native write path is not ready for canonical commit and was blocked by canonical gate policy",
             "WriteDeviceNotAllowed" => "device is not allow-listed for canonical writable mode and was blocked by canonical gate policy",
             "CommitPathNotReady" => "commit path readiness checks failed canonical gate validation",
@@ -4761,6 +5183,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             "PersistentStateLoadFailed" => "BootstrapFailClosed",
             "RootStateInvalid" => "BootstrapFailClosed",
             "IntegrityCheckFailedOnMount" => "BootstrapIntegrityBlocked",
+            "IntegrityMissingAllocationMap" => "BootstrapIntegrityMissingAllocationMap",
             "PersistentStateAheadOfSuperblock" => "ReplaySkippedFailClosed",
             "PersistentStateBehindSuperblock" => "ReplaySkippedFailClosed",
             "RecoveryLoadVolumeStateFailed" => "ReplaySkippedFailClosed",
@@ -4782,6 +5205,10 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             "DirtyTransactionLimitExceeded" => "DowngradedAfterDirtyTransactionLimit",
             "CanonicalPathNotActive" => "DowngradedAfterCanonicalPathProofMissing",
             "CanonicalStateNotLoaded" => "DowngradedAfterCanonicalGateFailure",
+            "CanonicalVolumeStateLoadFailed" => "DowngradedAfterCanonicalGateFailure",
+            "CanonicalObjectMapStateInvalid" => "DowngradedAfterCanonicalGateFailure",
+            "CanonicalSpacemanStateInvalid" => "DowngradedAfterCanonicalGateFailure",
+            "CanonicalVolumeTreeStateInvalid" => "DowngradedAfterCanonicalGateFailure",
             "NativeWriteNotReady" => "DowngradedAfterCanonicalGateFailure",
             "WriteDeviceNotAllowed" => "DowngradedAfterCanonicalGateFailure",
             "CommitPathNotReady" => "DowngradedAfterCanonicalGateFailure",
@@ -4853,6 +5280,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         }
         var replayCheckpointCandidatePresent = payload.ReplayCheckpointCandidatePresent;
         var replayCheckpointPendingWindow = payload.ReplayCheckpointPendingWindow;
+        var mountReady = payload.MountReady ?? fallback.MountReady;
         var parsedCommitModel = ParseNativeWriteCommitModel(payload.CommitModel, fallback.CommitModel);
         var parsedValidationState = ParseNativeWriteValidationState(
             payload.NativeWriteValidationState,
@@ -4890,6 +5318,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             {
                 ReplayCheckpointCandidatePresent = null,
                 ReplayCheckpointPendingWindow = null,
+                MountReady = mountReady,
             };
         }
 
@@ -4956,6 +5385,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             {
                 ReplayCheckpointCandidatePresent = replayCheckpointCandidatePresent,
                 ReplayCheckpointPendingWindow = replayCheckpointPendingWindow,
+                MountReady = mountReady,
             };
         }
 
@@ -5002,6 +5432,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             {
                 ReplayCheckpointCandidatePresent = null,
                 ReplayCheckpointPendingWindow = null,
+                MountReady = mountReady,
             };
         }
 
@@ -5032,6 +5463,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         {
             ReplayCheckpointCandidatePresent = null,
             ReplayCheckpointPendingWindow = null,
+            MountReady = mountReady,
         };
     }
 
@@ -5150,6 +5582,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 CanonicalGateFailure: ReadJsonString(root, "canonicalGateFailure")
             )
             {
+                MountReady = ReadJsonBoolean(root, "mountReady"),
                 ReplayCheckpointCandidatePresent = ReadJsonBoolean(root, "replayCheckpointCandidatePresent"),
                 ReplayCheckpointPendingWindow = ReadJsonBoolean(root, "replayCheckpointPendingWindow"),
             };
@@ -5388,6 +5821,37 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         IReadOnlyList<string> WriteUnsupportedFeatures
     );
 
+    private sealed record ApfsContainerHeader(
+        uint BlockSize,
+        ulong TotalBlocks,
+        ulong CheckpointXid,
+        ulong VolumeRootBlock
+    );
+
+    private sealed record GptPartitionInfo(
+        int PartitionNumber,
+        Guid PartitionTypeGuid,
+        ulong StartOffsetBytes,
+        string PartitionName
+    );
+
+    private sealed record VolumeMountTarget(string DevicePath, ulong DeviceOffsetBytes);
+
+    private sealed record DiscoveredVolume(
+        string VolumeName,
+        bool IsEncrypted,
+        IReadOnlyList<string> WriteIncompatibilities,
+        IReadOnlyList<string> WriteUnsupportedFeatures,
+        string NativeVolumePath,
+        VolumeMountTarget MountTarget
+    );
+
+    private sealed record DiscoveredDevice(
+        string DeviceId,
+        string DisplayName,
+        IReadOnlyList<DiscoveredVolume> Volumes
+    );
+
     private sealed record HostProcessState(
         Process Process,
         string LifetimeFilePath,
@@ -5424,6 +5888,8 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         public bool? ReplayCheckpointCandidatePresent { get; init; }
 
         public bool? ReplayCheckpointPendingWindow { get; init; }
+
+        public bool MountReady { get; init; }
     }
 
     private sealed record HostRuntimeStatusPayload(
@@ -5460,6 +5926,8 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         string? CanonicalGateFailure
     )
     {
+        public bool? MountReady { get; init; }
+
         public bool? ReplayCheckpointCandidatePresent { get; init; }
 
         public bool? ReplayCheckpointPendingWindow { get; init; }

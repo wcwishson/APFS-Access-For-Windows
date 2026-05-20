@@ -85,6 +85,34 @@ function To-Bool {
     return $false
 }
 
+function Get-OptionInt {
+    param(
+        [pscustomobject]$Options,
+        [string]$Name,
+        [int]$DefaultValue
+    )
+
+    if ($Options.PSObject.Properties.Name -contains $Name) {
+        return To-Int $Options.$Name
+    }
+
+    return [Math]::Max(0, $DefaultValue)
+}
+
+function Get-OptionBool {
+    param(
+        [pscustomobject]$Options,
+        [string]$Name,
+        [bool]$DefaultValue = $false
+    )
+
+    if ($Options.PSObject.Properties.Name -contains $Name) {
+        return To-Bool $Options.$Name
+    }
+
+    return $DefaultValue
+}
+
 function Normalize-IsoUtc {
     param([object]$Value)
 
@@ -122,7 +150,11 @@ function Normalize-ProfileToken {
         " "
     )
 
-    return if ([string]::IsNullOrWhiteSpace($normalized)) { "unknown" } else { $normalized }
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        return "unknown"
+    }
+
+    return $normalized
 }
 
 function New-BlankEvidence {
@@ -218,25 +250,24 @@ function Evaluate-ProfileConfiguration {
         ""
     }
 
-    if (-not (To-Bool $Options.EnableNativeWrite)) {
+    if (-not (Get-OptionBool -Options $Options -Name "EnableNativeWrite")) {
         $reasons.Add("NativeWriteDisabled")
     }
     if (-not (Test-WriteRolloutEnabled $writeRolloutChannel)) {
         $reasons.Add("RolloutBlocked")
     }
 
-    $allowListEntries = if ($Options.PSObject.Properties.Name -contains "NativeWriteHardwarePilotDeviceAllowList" -and
-                            $null -ne $Options.NativeWriteHardwarePilotDeviceAllowList) {
-        @($Options.NativeWriteHardwarePilotDeviceAllowList)
-    }
-    else {
-        @()
-    }
+    $allowListEntries = @(
+        if ($Options.PSObject.Properties.Name -contains "NativeWriteHardwarePilotDeviceAllowList" -and
+            $null -ne $Options.NativeWriteHardwarePilotDeviceAllowList) {
+            $Options.NativeWriteHardwarePilotDeviceAllowList
+        }
+    )
     $allowListConfigured = ($allowListEntries.Count -gt 0)
     $allowListed = $false
 
     if ($Profile.rawPhysical) {
-        if (-not (To-Bool $Options.NativeWriteAllowRawPhysicalDevices)) {
+        if (-not (Get-OptionBool -Options $Options -Name "NativeWriteAllowRawPhysicalDevices")) {
             $reasons.Add("RawPhysicalWriteBlocked")
         }
 
@@ -280,7 +311,7 @@ function Evaluate-ProfileEvidence {
 
     $reasons = New-Object System.Collections.Generic.List[string]
     $isRaw = $true
-    $maxAge = [Math]::Max(0, (To-Int $Options.NativeWriteValidationEvidenceMaxAgeDays))
+    $maxAge = Get-OptionInt -Options $Options -Name "NativeWriteValidationEvidenceMaxAgeDays" -DefaultValue 30
     $lastValidatedUtc = Normalize-IsoUtc $Evidence.lastValidatedUtc
     $stale = $false
     if ($isRaw -and $maxAge -gt 0) {
@@ -296,13 +327,13 @@ function Evaluate-ProfileEvidence {
         $reasons.Add("ValidationEvidenceStale")
     }
 
-    $crashRequired = [Math]::Max(0, (To-Int $Options.NativeWriteMinCrashFaultPasses))
-    $crashMatrixRequired = [Math]::Max(0, (To-Int $Options.NativeWriteMinCrashStageMatrixPasses))
-    $hardwareRequired = [Math]::Max(0, (To-Int $Options.NativeWriteMinHardwarePilotPasses))
-    $hotUnplugRequired = [Math]::Max(0, (To-Int $Options.NativeWriteMinHotUnplugPasses))
-    $macRequired = [Math]::Max(0, (To-Int $Options.NativeWriteMinMacOsValidationPasses))
-    $macConsistencyRequired = [Math]::Max(0, (To-Int $Options.NativeWriteMinMacOsConsistencyPasses))
-    $powerReplayRequired = [Math]::Max(0, (To-Int $Options.NativeWriteMinPowerLossReplayPasses))
+    $crashRequired = Get-OptionInt -Options $Options -Name "NativeWriteMinCrashFaultPasses" -DefaultValue 1
+    $crashMatrixRequired = Get-OptionInt -Options $Options -Name "NativeWriteMinCrashStageMatrixPasses" -DefaultValue 1
+    $hardwareRequired = Get-OptionInt -Options $Options -Name "NativeWriteMinHardwarePilotPasses" -DefaultValue 3
+    $hotUnplugRequired = Get-OptionInt -Options $Options -Name "NativeWriteMinHotUnplugPasses" -DefaultValue 1
+    $macRequired = Get-OptionInt -Options $Options -Name "NativeWriteMinMacOsValidationPasses" -DefaultValue 2
+    $macConsistencyRequired = Get-OptionInt -Options $Options -Name "NativeWriteMinMacOsConsistencyPasses" -DefaultValue 2
+    $powerReplayRequired = Get-OptionInt -Options $Options -Name "NativeWriteMinPowerLossReplayPasses" -DefaultValue 1
 
     $crash = To-Int $Evidence.crashFaultPasses
     $crashMatrix = To-Int $Evidence.crashStageMatrixPasses
@@ -313,10 +344,10 @@ function Evaluate-ProfileEvidence {
     $powerReplay = To-Int $Evidence.powerLossReplayPasses
     $powerPass = To-Bool $Evidence.powerLossPassVerified
 
-    $requiresCrashMatrix = To-Bool $Options.NativeWriteCrashFaultMatrixRequired
-    $requiresCrossOs = To-Bool $Options.NativeWriteCrossOsValidationRequired
-    $requiresMacOsForStable = To-Bool $Options.NativeWriteRequireMacOsValidationForStable
-    $requiresPowerLoss = To-Bool $Options.NativeWriteStableRequiresPowerLossPass
+    $requiresCrashMatrix = Get-OptionBool -Options $Options -Name "NativeWriteCrashFaultMatrixRequired" -DefaultValue $true
+    $requiresCrossOs = Get-OptionBool -Options $Options -Name "NativeWriteCrossOsValidationRequired" -DefaultValue $true
+    $requiresMacOsForStable = Get-OptionBool -Options $Options -Name "NativeWriteRequireMacOsValidationForStable" -DefaultValue $true
+    $requiresPowerLoss = Get-OptionBool -Options $Options -Name "NativeWriteStableRequiresPowerLossPass" -DefaultValue $true
 
     if ($Policy -eq "PilotHardware" -or $Policy -eq "Stable") {
         if ($requiresCrashMatrix -and $crash -lt $crashRequired) {

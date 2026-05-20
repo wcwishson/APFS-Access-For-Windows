@@ -30,11 +30,11 @@
    - `--readwrite --write-backend Overlay`: write operations are handled against a temporary overlay layer (`Create`, `Write`, `SetFileSize`, `Rename`, delete flow).
    - `--readwrite --write-backend Native`: write operations use the same Explorer-facing flow plus native mutation planning/journaling and flush-time commit scaffolding.
 4. Overlay mode does not mutate APFS media and is not persisted across sessions.
-5. Native mode now persists staged payload bytes + commit scaffold records on writable image-backed targets and advances a checkpoint-switch scaffold (`checkpoint_xid`) during commit (primary/secondary slot alternation), but does not yet implement full APFS metadata transaction/checkpoint semantics.
+5. Native mode now persists staged payload bytes and native checkpoint state through the self-developed RW engine; image-backed validation is green, while real-device validation is still pending.
 6. Native metadata bootstrap reconciles persisted RW state against superblock checkpoint xid. Divergence marks recovery-required and keeps commit path blocked (`RecoveryMode` telemetry) with explicit `recoveryReason`.
-7. Bridges callbacks to Paragon CE CLI path:
-   - directory enumeration: `apfsutil enumfolder`
-   - file payload hydration: `apfsutil readraw` on-demand (per opened file)
+7. Serves callbacks from the native APFS engine path:
+   - directory enumeration and metadata lookup from committed inode/tree state
+   - file payload hydration from native committed extent reads and staged native-write payloads
 8. In readwrite mode, FsHost performs RW-engine bootstrap checks against the device path and logs container readiness warnings when APFS metadata bootstrap is unavailable.
 9. In readwrite mode, mutating callbacks emit transaction journal records under `%TEMP%\ApfsAccess\rw-journal` (begin/commit/abort + mutation intent metadata).
 10. Status sidecar telemetry includes `nativeWriteSafetyState`, `lastRecoveryAction`, and `dirtyTransactionCount`.

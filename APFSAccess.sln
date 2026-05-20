@@ -31,6 +31,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ApfsAccess.Service.Tests", 
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ApfsAccess.Tray.Tests", "tests\ApfsAccess.Tray.Tests\ApfsAccess.Tray.Tests.csproj", "{4BB18A41-8C7F-4906-9DF0-BC659AB46D58}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ApfsAccess.NativeProbe", "src\ApfsAccess.NativeProbe\ApfsAccess.NativeProbe.csproj", "{76F0ACCB-B309-4895-A22C-92E5A7F1609D}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -185,6 +187,18 @@ Global
 		{4BB18A41-8C7F-4906-9DF0-BC659AB46D58}.Release|x64.Build.0 = Release|Any CPU
 		{4BB18A41-8C7F-4906-9DF0-BC659AB46D58}.Release|x86.ActiveCfg = Release|Any CPU
 		{4BB18A41-8C7F-4906-9DF0-BC659AB46D58}.Release|x86.Build.0 = Release|Any CPU
+		{76F0ACCB-B309-4895-A22C-92E5A7F1609D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{76F0ACCB-B309-4895-A22C-92E5A7F1609D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{76F0ACCB-B309-4895-A22C-92E5A7F1609D}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{76F0ACCB-B309-4895-A22C-92E5A7F1609D}.Debug|x64.Build.0 = Debug|Any CPU
+		{76F0ACCB-B309-4895-A22C-92E5A7F1609D}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{76F0ACCB-B309-4895-A22C-92E5A7F1609D}.Debug|x86.Build.0 = Debug|Any CPU
+		{76F0ACCB-B309-4895-A22C-92E5A7F1609D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{76F0ACCB-B309-4895-A22C-92E5A7F1609D}.Release|Any CPU.Build.0 = Release|Any CPU
+		{76F0ACCB-B309-4895-A22C-92E5A7F1609D}.Release|x64.ActiveCfg = Release|Any CPU
+		{76F0ACCB-B309-4895-A22C-92E5A7F1609D}.Release|x64.Build.0 = Release|Any CPU
+		{76F0ACCB-B309-4895-A22C-92E5A7F1609D}.Release|x86.ActiveCfg = Release|Any CPU
+		{76F0ACCB-B309-4895-A22C-92E5A7F1609D}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -202,5 +216,6 @@ Global
 		{11B88E59-98A4-4E12-A17F-16D829C0B439} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 		{14F4E3A7-0E1C-48D7-B062-4377F96B2418} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 		{4BB18A41-8C7F-4906-9DF0-BC659AB46D58} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
+		{76F0ACCB-B309-4895-A22C-92E5A7F1609D} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 	EndGlobalSection
 EndGlobal

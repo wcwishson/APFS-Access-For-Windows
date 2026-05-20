@@ -115,7 +115,7 @@ public sealed class WriteGatePolicyTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: "Ufsd_Volumes/Vol",
+            NativeVolumePath: "ApfsAccess_Volumes/Vol",
             SupportsNativeWrite: true,
             WriteBlockReason: null
         );
@@ -142,7 +142,7 @@ public sealed class WriteGatePolicyTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: "Ufsd_Volumes/Vol",
+            NativeVolumePath: "ApfsAccess_Volumes/Vol",
             SupportsNativeWrite: true,
             WriteBlockReason: null
         );
@@ -170,7 +170,7 @@ public sealed class WriteGatePolicyTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: "Ufsd_Volumes/Vol",
+            NativeVolumePath: "ApfsAccess_Volumes/Vol",
             SupportsNativeWrite: true,
             WriteBlockReason: null
         );
@@ -196,7 +196,7 @@ public sealed class WriteGatePolicyTests
             SupportsReadWrite: false,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: "Ufsd_Volumes/Vol",
+            NativeVolumePath: "ApfsAccess_Volumes/Vol",
             SupportsNativeWrite: false,
             WriteBlockReason: "Unsupported APFS flags.",
             WriteIncompatibilities: ["Unsupported APFS flags."]
@@ -227,7 +227,7 @@ public sealed class WriteGatePolicyTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: "Ufsd_Volumes/Vol",
+            NativeVolumePath: "ApfsAccess_Volumes/Vol",
             SupportsNativeWrite: true,
             WriteBlockReason: null
         );
@@ -257,7 +257,7 @@ public sealed class WriteGatePolicyTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: "Ufsd_Volumes/Vol",
+            NativeVolumePath: "ApfsAccess_Volumes/Vol",
             SupportsNativeWrite: true,
             WriteBlockReason: null
         );

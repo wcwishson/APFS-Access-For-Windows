@@ -1,0 +1,47 @@
+# Build outputs
+artifacts/
+**/bin/
+**/obj/
+TestResults/
+*.trx
+coverage/
+coverage.*
+
+# Published/release binaries belong in GitHub Releases, not source git
+APFSAccess_Portable.exe
+Run_APFS_Access_Silent.vbs
+*.msix
+*.msi
+*.nupkg
+
+# Native build products and intermediates
+src-native/**/build/
+src-native/**/out/
+src-native/**/*.ilk
+src-native/**/*.pdb
+src-native/**/*.obj
+src-native/**/*.lib
+src-native/**/*.exp
+src-native/**/*.exe
+
+# Local IDE/editor state
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+
+# Logs, crash dumps, and local validation media
+*.log
+*.dmp
+*.dump
+*.apfs.img
+*.img
+*.apfs.fixture
+pilot-feedback/
+physical-usb-tests/
+
+# Local/private app overrides
+appsettings.Local.json
+*.local.json

@@ -212,10 +212,6 @@ bool DecodeBtreeInodeRecord(const BtreeRecord& record, DecodedBtreeInode& decode
             return false;
         }
     }
-    else if (decoded.logical_size > 0 && decoded.data_physical_address == 0)
-    {
-        return false;
-    }
 
     return true;
 }
@@ -294,7 +290,6 @@ bool DecodeBtreeExtentRecord(const BtreeRecord& record, DecodedBtreeExtent& deco
     const auto tombstone_flag = std::to_integer<unsigned char>(record.value[24]);
     if (decoded.xid == 0 ||
         decoded.logical_offset != 0 ||
-        decoded.physical_address == 0 ||
         decoded.extent_bytes == 0 ||
         tombstone_flag != 0)
     {
@@ -413,7 +408,7 @@ bool ApfsVolumeTreeStore::TryProjectFromBtreeRecords(
             return false;
         }
 
-        if ((inode.logical_size == 0 || inode.data_physical_address == 0) &&
+        if (inode.logical_size == 0 &&
             decoded_extents_by_object.contains(object_id))
         {
             out_error = L"BtreeExtentUnexpectedForZeroLengthInode";

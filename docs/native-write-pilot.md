@@ -6,6 +6,27 @@
 2. Promotion stays fail-closed: `ScaffoldOnly -> PilotHardware -> Stable`.
 3. `Stable` requires hardware evidence and macOS validation evidence.
 
+## Image-backed preflight
+
+Run this before any physical-drive pilot. It creates a disposable normal file and proves that the native probe can discover APFS Access synthetic media without formatting or repartitioning a disk.
+
+```powershell
+pwsh -NoProfile -File .\scripts\create_test_image.ps1 `
+  -Path .\artifacts\test-images\apfsaccess-test.apfs.img `
+  -SizeMiB 64
+
+pwsh -NoProfile -File .\scripts\native_probe.ps1 `
+  -DeviceId .\artifacts\test-images\apfsaccess-test.apfs.img `
+  -AsJson
+```
+
+Safety notes:
+
+1. `create_test_image.ps1` refuses raw `\\.\PhysicalDrive*` paths.
+2. It refuses to overwrite an existing file.
+3. The image is APFS Access synthetic validation media, not a macOS-compatible APFS formatter output.
+4. Physical drive testing is still required for real hardware behavior, hot-unplug, power-loss replay, and macOS mount/read/integrity evidence.
+
 ## One-click Windows smoke automation
 
 1. Build the beta bundle once:
@@ -13,20 +34,49 @@
 .\Build_APFS_Access_Beta.bat
 ```
 2. Connect a sacrificial APFS drive.
-3. Run the one-click launcher:
+3. The repo-side pilot launcher now uses `scripts\native_probe.ps1`, which runs the self-developed native backend probe instead of `apfsutil`.
+4. Run the one-click launcher:
 ```powershell
 .\Run_APFS_Pilot_Validation.bat
 ```
-4. The launcher:
-   - auto-discovers APFS raw drives and volumes;
-   - rewrites the published click-run `appsettings.json` for native pilot mode;
-   - uses a temporary session-local evidence ledger to unlock the writable Windows smoke session without editing the real `%ProgramData%\ApfsAccess\write-evidence.json`;
-   - launches APFS Access, waits for mount, runs `CreateDirectory` / `Write` / `SetBasicInfo` / `Rename` / `SetFileSize` / `Delete`, restarts the app, verifies remount persistence, and zips a feedback bundle.
-5. Feedback bundle location:
+5. The launcher:
+   - auto-discovers APFS raw drives and volumes through the self-developed native probe path;
+   - rewrites the published click-run `appsettings.json` for read-only native physical validation by default;
+   - launches APFS Access, waits for mount, enumerates files, copies a bounded sample to the feedback folder, verifies SHA-256 hashes, and zips a feedback bundle.
+6. Feedback bundle location:
 ```text
 artifacts\publish\click-run\pilot-feedback\<timestamp>.zip
 ```
-6. The generated `validation-report.json` marks only the automated Windows `HardwarePilot` smoke result. It does not satisfy crash, hot-unplug, power-loss, or macOS evidence requirements by itself.
+7. The generated `validation-report.json` marks only the automated Windows read-only hardware smoke result. It does not satisfy write promotion, crash, hot-unplug, power-loss, or macOS evidence requirements by itself.
+
+Destructive raw-device write smoke is intentionally opt-in:
+
+```powershell
+pwsh -NoProfile -File .\scripts\run_pilot_validation.ps1 -AllowDestructiveWriteSmoke
+```
+
+Use that switch only after the native write allocator/spaceman safety blockers are cleared. Without it, the script does not enable native write, does not allow raw physical writes, and ignores bootstrap evidence.
+
+## Mounted-volume Windows read/write validation
+
+After the sacrificial APFS volume is mounted read/write, run the guarded mounted-volume validator against the APFS drive letter. It refuses non-APFS targets and writes only inside a generated `apfs-access-*` folder on that mounted volume.
+
+```powershell
+pwsh -NoProfile -File .\scripts\run_physical_rw_validation.ps1 `
+  -Mode Storm `
+  -MountRoot E:\ `
+  -StatusFile "$env:TEMP\ApfsAccess\physical-rw-fixed\latest\fshost.status.json" `
+  -ScratchRoot "$env:TEMP\ApfsAccessPhysicalRw"
+```
+
+The script covers create/copy/read/hash, direct APFS writes, rename, move, cross-volume move, recursive copy, delete, long path names, and an optional storm workload. Save the emitted manifest and rerun after remount:
+
+```powershell
+pwsh -NoProfile -File .\scripts\run_physical_rw_validation.ps1 `
+  -Mode VerifyManifest `
+  -ExistingManifest .\artifacts\physical-rw-validation\physical-rw-storm-YYYYMMDD-HHMMSS.json `
+  -StatusFile "$env:TEMP\ApfsAccess\physical-rw-fixed\latest\fshost.status.json"
+```
 
 ## Prerequisites
 
@@ -126,10 +176,11 @@ pwsh -NoProfile -File .\scripts\evaluate_write_promotion.ps1 `
 
 ## Manual boundary after the one-click launcher
 
-1. Run the crash fault / crash-stage matrix on the same device and import the report or update evidence counters.
-2. Run hot-unplug validation on the same device and import the result.
-3. Attach the same media to macOS, confirm mount/read behavior and integrity, then import the macOS validation report.
-4. For `Stable`, run the power-loss replay scenario and import that result as well.
+1. Complete canonical allocation/spaceman write safety before raw-device write smoke.
+2. Run the crash fault / crash-stage matrix on the same device and import the report or update evidence counters.
+3. Run hot-unplug validation on the same device and import the result.
+4. Attach the same media to macOS, confirm mount/read behavior and integrity, then import the macOS validation report.
+5. For `Stable`, run the power-loss replay scenario and import that result as well.
 
 ## macOS validation checklist
 

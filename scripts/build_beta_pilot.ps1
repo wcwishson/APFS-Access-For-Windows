@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Configuration = "Release",
     [string]$Runtime = "win-x64"
 )
@@ -18,5 +18,5 @@ $bundleRoot = Join-Path $repoRoot "artifacts/publish/click-run"
 Write-Host ""
 Write-Host "[beta-build] ready"
 Write-Host "[beta-build] bundle : $bundleRoot"
-Write-Host "[beta-build] next   : connect a sacrificial APFS drive, then run:"
-Write-Host "                $bundleRoot\\Run_APFS_Pilot_Validation.bat"
+Write-Host "[beta-build] next   : connect a sacrificial APFS drive, launch the tray app, and follow the native-write pilot runbook/manual validation steps."
+Write-Host "                $bundleRoot\\Run_APFS_Access.bat"

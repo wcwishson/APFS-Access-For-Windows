@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <array>
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -111,6 +112,13 @@ public:
         std::uint64_t bytes = 0;
     };
 
+    struct FileExtent
+    {
+        std::uint64_t logical_offset = 0;
+        std::uint64_t physical_address = 0;
+        std::uint64_t bytes = 0;
+    };
+
     struct VolumeContext
     {
         std::wstring device_path;
@@ -122,6 +130,7 @@ public:
         bool disallow_scaffold_commit_on_non_fixture = true;
         bool reject_scaffold_replay_blob_on_non_fixture = true;
         bool require_canonical_replay_candidate_on_non_fixture = true;
+        std::uint64_t device_offset_bytes = 0;
     };
 
     explicit MetadataStore(VolumeContext context);
@@ -137,12 +146,17 @@ public:
     [[nodiscard]] bool IsContainerLoaded() const noexcept;
     [[nodiscard]] std::optional<std::uint32_t> BlockSizeBytes() const noexcept;
     [[nodiscard]] std::optional<std::uint64_t> TotalBlocks() const noexcept;
+    [[nodiscard]] std::optional<std::uint64_t> TotalSizeBytes() const noexcept;
+    [[nodiscard]] std::optional<std::uint64_t> FreeSizeBytes() const noexcept;
     [[nodiscard]] std::optional<std::uint64_t> CheckpointXid() const noexcept;
     [[nodiscard]] bool PrepareNativeWritePath();
     [[nodiscard]] bool IsNativeWriteReady() const noexcept;
     [[nodiscard]] bool IsCommitPathReady() const noexcept;
     [[nodiscard]] bool IsRecoveryRequired() const noexcept;
     [[nodiscard]] std::wstring RecoveryReason() const;
+    [[nodiscard]] std::wstring LastIntegrityFailureReason() const;
+    [[nodiscard]] std::optional<std::uint64_t> LastIntegrityFailureObjectId() const noexcept;
+    [[nodiscard]] std::wstring LastMutationFailureReason() const;
     [[nodiscard]] MutationStatus StageMutation(const MutationRequest& request);
     [[nodiscard]] MutationStatus ApplyMutation(const MutationRequest& request);
     [[nodiscard]] CommitStatus CommitTransaction();
@@ -178,6 +192,7 @@ public:
     [[nodiscard]] std::size_t CommittedInodeCount() const noexcept;
     [[nodiscard]] std::optional<InodeRecord> LookupCommittedInodeByPath(const std::wstring& path) const;
     [[nodiscard]] std::vector<InodeRecord> SnapshotCommittedInodes() const;
+    [[nodiscard]] bool SetCommittedReadExtents(std::uint64_t object_id, std::vector<FileExtent> extents);
     [[nodiscard]] bool ReadCommittedFileRange(
         const std::wstring& path,
         std::uint64_t offset,
@@ -203,12 +218,30 @@ private:
     [[nodiscard]] static std::wstring LeafName(const std::wstring& normalized_path);
     [[nodiscard]] static bool IsLikelyRawDevicePath(const std::wstring& path);
     [[nodiscard]] static bool IsFixtureImagePath(const std::wstring& path);
+    [[nodiscard]] std::uint64_t RootDirectoryObjectId() const;
     [[nodiscard]] bool IsLegacyFixtureFallbackAllowedForCurrentContext() const noexcept;
     [[nodiscard]] bool RequiresCanonicalNonFixtureCommitPath() const noexcept;
+    [[nodiscard]] bool CanLoadNativeCheckpointXid(std::uint64_t persisted_xid) const noexcept;
     [[nodiscard]] std::optional<std::uint64_t> ResolveObjectBlockIndex(std::uint64_t object_or_block) const;
     [[nodiscard]] bool ReadMetadataBlock(std::uint64_t block_index, std::vector<std::byte>& out_block) const;
     [[nodiscard]] bool WriteMetadataBlock(std::uint64_t block_index, const std::vector<std::byte>& block);
+    [[nodiscard]] bool WriteChunkedCheckpointBlocks(
+        const std::vector<std::uint64_t>& block_indices,
+        std::uint64_t target_xid,
+        const std::vector<std::byte>& data);
+    [[nodiscard]] std::vector<std::byte> ReadChunkedCheckpointBytes(
+        const std::vector<std::uint64_t>& block_indices,
+        std::uint64_t target_xid,
+        const std::array<char, 12>& magic,
+        std::uint32_t expected_payload_bytes) const;
     [[nodiscard]] bool IsReservedMetadataBlock(std::uint64_t block_index) const;
+    [[nodiscard]] std::optional<std::uint64_t> ResolveNativeCheckpointBandStartBlock() const;
+    [[nodiscard]] bool IsNativeCheckpointBandBlock(std::uint64_t block_index) const;
+    [[nodiscard]] bool AreNativeCheckpointBlocksWritable(const std::vector<std::uint64_t>& block_indices) const;
+    [[nodiscard]] std::vector<std::uint64_t> SelectWritableChunkedCheckpointBlocks(
+        const std::vector<std::uint64_t>& block_indices,
+        std::uint64_t target_xid,
+        std::size_t required_blocks) const;
     [[nodiscard]] std::optional<std::uint64_t> FindCheckpointCompanionBlock(
         std::uint64_t primary_block,
         const std::vector<std::uint64_t>& disallowed_blocks) const;
@@ -219,6 +252,8 @@ private:
     [[nodiscard]] std::vector<std::uint64_t> ResolveReplayCheckpointBlockIndices() const;
     [[nodiscard]] bool LoadObjectMapCheckpointBlock(std::uint64_t block_index, const std::vector<std::byte>& block);
     [[nodiscard]] bool LoadSpacemanCheckpointBlock(std::uint64_t block_index, const std::vector<std::byte>& block);
+    [[nodiscard]] bool LoadSpacemanChunkInfoState(std::uint64_t spaceman_block_index, const std::vector<std::byte>& block);
+    [[nodiscard]] bool RefreshNativeReadExtentProjection();
     [[nodiscard]] std::optional<std::uint64_t> ResolveInodeCheckpointBlockIndex() const;
     [[nodiscard]] bool LoadInodeCheckpointBlock(std::uint64_t block_index, const std::vector<std::byte>& block);
     [[nodiscard]] bool LoadBtreeCheckpointBlock(std::uint64_t block_index, const std::vector<std::byte>& block);
@@ -244,6 +279,8 @@ private:
         bool require_root_object
     ) const;
     void RefreshObjectIdAllocator();
+    void SyncWorkingStateFromCommitted();
+    [[nodiscard]] MutationStatus RejectMutation(std::wstring reason);
     [[nodiscard]] std::uint64_t ResolveUniqueObjectId(const std::wstring& normalized_path);
     [[nodiscard]] bool IsDirectoryInWorkingState(const std::wstring& normalized_path) const;
     [[nodiscard]] std::optional<InodeRecord> LookupWorkingInode(const std::wstring& normalized_path) const;
@@ -267,6 +304,8 @@ private:
     [[nodiscard]] bool ValidatePendingCommitState() const;
     [[nodiscard]] bool AllowCommitStage(std::string_view stage);
     void RefreshCanonicalGateState() const;
+    void RecordIntegrityFailure(std::wstring reason, std::uint64_t object_id = 0) const;
+    [[nodiscard]] std::wstring ResolveIntegrityCheckFailureRecoveryReason() const;
     void MarkRecoveryRequired(std::wstring reason);
     void ClearRecoveryRequired();
     [[nodiscard]] bool PersistObjectMapCheckpoint(std::uint64_t target_xid);
@@ -302,6 +341,8 @@ private:
     std::uint32_t next_meta_index_ = 0;
     std::uint64_t spaceman_object_id_ = 0;
     std::uint64_t volume_root_block_ = 0;
+    std::uint64_t checkpoint_anchor_block_ = 0;
+    std::optional<std::uint64_t> spaceman_free_bytes_;
     std::uint64_t next_ephemeral_extent_ = 0;
     std::uint64_t working_next_ephemeral_extent_ = 0;
     std::uint64_t next_generated_object_id_ = 1;
@@ -318,9 +359,13 @@ private:
     std::string last_commit_blob_magic_ = "APFSRWCANON3";
     bool last_replay_checkpoint_candidate_present_ = false;
     bool last_replay_checkpoint_pending_window_ = false;
+    std::optional<std::uint64_t> replay_checkpoint_load_xid_;
     bool write_device_allowed_ = false;
     bool recovery_required_ = false;
     std::wstring recovery_reason_;
+    mutable std::wstring last_integrity_failure_reason_;
+    mutable std::optional<std::uint64_t> last_integrity_failure_object_id_;
+    std::wstring last_mutation_failure_reason_;
     bool persistent_state_loaded_ = false;
     std::optional<std::uint64_t> last_committed_xid_;
     std::optional<std::uint64_t> last_commit_blob_address_;
@@ -332,6 +377,7 @@ private:
     std::unordered_map<std::wstring, std::uint64_t> committed_path_index_;
     std::vector<DirectoryLink> committed_directory_links_;
     std::vector<BtreeRecord> committed_btree_records_;
+    std::unordered_map<std::uint64_t, std::vector<FileExtent>> committed_read_extents_;
     std::unordered_map<std::uint64_t, InodeRecord> working_inodes_;
     std::unordered_map<std::wstring, std::uint64_t> working_path_index_;
     std::vector<DirectoryLink> working_directory_links_;

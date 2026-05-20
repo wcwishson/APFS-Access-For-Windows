@@ -280,6 +280,10 @@ public sealed class NativeApfsBackendRuntimeStatusTests
     [Theory]
     [InlineData(" canonical path not active ", "CanonicalPathNotActive", "DowngradedAfterCanonicalPathProofMissing")]
     [InlineData(" canonical state not loaded ", "CanonicalStateNotLoaded", "DowngradedAfterCanonicalGateFailure")]
+    [InlineData(" canonical volume state load failed ", "CanonicalVolumeStateLoadFailed", "DowngradedAfterCanonicalGateFailure")]
+    [InlineData(" canonical object map state invalid ", "CanonicalObjectMapStateInvalid", "DowngradedAfterCanonicalGateFailure")]
+    [InlineData(" canonical spaceman state invalid ", "CanonicalSpacemanStateInvalid", "DowngradedAfterCanonicalGateFailure")]
+    [InlineData(" canonical volume tree state invalid ", "CanonicalVolumeTreeStateInvalid", "DowngradedAfterCanonicalGateFailure")]
     [InlineData(" native write not ready ", "NativeWriteNotReady", "DowngradedAfterCanonicalGateFailure")]
     [InlineData(" write device not allowed ", "WriteDeviceNotAllowed", "DowngradedAfterCanonicalGateFailure")]
     [InlineData(" commit path not ready ", "CommitPathNotReady", "DowngradedAfterCanonicalGateFailure")]
@@ -722,6 +726,34 @@ public sealed class NativeApfsBackendRuntimeStatusTests
         Assert.Equal((ulong)19, status.LastCommitXid);
         Assert.Equal(NativeWriteSafetyState.RecoveryBlocked, status.NativeWriteSafetyState);
         Assert.Equal("BootstrapIntegrityBlocked", status.LastRecoveryAction);
+    }
+
+    [Fact]
+    public async Task ReadHostRuntimeStatusAsync_CanonicalizesMissingAllocationMapReason()
+    {
+        using var statusFile = new TemporaryStatusFile("""
+            {
+              "writeBackend": "Native",
+              "nativeWriteReadiness": "RecoveryMode",
+              "recoveryActive": true,
+              "recoveryReason": " missing allocation ",
+              "lastCommitXid": 20
+            }
+            """);
+
+        var status = await InvokeReadHostRuntimeStatusAsync(
+            statusFilePath: statusFile.Path,
+            accessMode: MountAccessMode.ReadWrite,
+            configuredWriteBackend: "Native",
+            timeout: TimeSpan.FromMilliseconds(220));
+
+        Assert.Equal("Native", status.WriteBackend);
+        Assert.Equal(NativeWriteReadiness.RecoveryMode, status.NativeWriteReadiness);
+        Assert.True(status.RecoveryActive);
+        Assert.Equal("IntegrityMissingAllocationMap", status.RecoveryReason);
+        Assert.Equal((ulong)20, status.LastCommitXid);
+        Assert.Equal(NativeWriteSafetyState.RecoveryBlocked, status.NativeWriteSafetyState);
+        Assert.Equal("BootstrapIntegrityMissingAllocationMap", status.LastRecoveryAction);
     }
 
     [Fact]

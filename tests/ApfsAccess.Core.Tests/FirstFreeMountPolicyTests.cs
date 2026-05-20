@@ -4,7 +4,7 @@ namespace ApfsAccess.Core.Tests;
 
 public sealed class FirstFreeMountPolicyTests
 {
-    private static readonly VolumeInfo SampleVolume = new("vol-1", "dev-1", "Sample", true, false, true, @"\\.\PhysicalDrive1\Ufsd_Volumes\Sample");
+    private static readonly VolumeInfo SampleVolume = new("vol-1", "dev-1", "Sample", true, false, true, @"\\.\PhysicalDrive1\ApfsAccess_Volumes\Sample");
 
     [Fact]
     public void SelectDriveLetter_UsesConfiguredPool()

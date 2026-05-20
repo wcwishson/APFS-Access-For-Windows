@@ -26,7 +26,8 @@ else
 
 builder.Services.AddSingleton<RuntimeStatusPublisher>();
 
-builder.Services.AddHostedService<ApfsMountWorker>();
+builder.Services.AddSingleton<ApfsMountWorker>();
+builder.Services.AddHostedService(static sp => sp.GetRequiredService<ApfsMountWorker>());
 builder.Services.AddHostedService<TrayPipeHostService>();
 
 await builder.Build().RunAsync();

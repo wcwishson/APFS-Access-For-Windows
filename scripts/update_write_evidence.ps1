@@ -2,16 +2,6 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ProfileId,
 
-    [ValidateSet(
-        "CrashFault",
-        "CrashStageMatrix",
-        "HardwarePilot",
-        "HotUnplug",
-        "MacOsValidation",
-        "MacOsConsistency",
-        "PowerLossReplay",
-        "PowerLossVerified"
-    )]
     [string[]]$Scenario = @(),
 
     [ValidateRange(1, 1000)]
@@ -52,8 +42,11 @@ function ConvertTo-EvidenceRecord {
         return $record
     }
 
-    foreach ($name in $record.Keys) {
-        if ($InputObject.PSObject.Properties.Name -contains $name) {
+    foreach ($name in @($record.Keys)) {
+        if ($InputObject -is [System.Collections.IDictionary] -and $InputObject.Contains($name)) {
+            $record[$name] = $InputObject[$name]
+        }
+        elseif ($InputObject.PSObject.Properties.Name -contains $name) {
             $record[$name] = $InputObject.$name
         }
     }
@@ -113,6 +106,42 @@ function Apply-Scenario {
     }
 }
 
+function Expand-ScenarioList {
+    param([string[]]$Values)
+
+    $allowed = @(
+        "CrashFault",
+        "CrashStageMatrix",
+        "HardwarePilot",
+        "HotUnplug",
+        "MacOsValidation",
+        "MacOsConsistency",
+        "PowerLossReplay",
+        "PowerLossVerified"
+    )
+    $expanded = New-Object System.Collections.Generic.List[string]
+    foreach ($value in @($Values)) {
+        if ($null -eq $value) {
+            continue
+        }
+
+        foreach ($token in ($value -split ",")) {
+            $trimmed = $token.Trim()
+            if ([string]::IsNullOrWhiteSpace($trimmed)) {
+                continue
+            }
+
+            if ($allowed -notcontains $trimmed) {
+                throw "Invalid scenario '$trimmed'. Valid values: $($allowed -join ', ')"
+            }
+
+            $expanded.Add($trimmed)
+        }
+    }
+
+    return $expanded.ToArray()
+}
+
 $path = [Environment]::ExpandEnvironmentVariables($EvidenceStorePath)
 if ([string]::IsNullOrWhiteSpace($path)) {
     throw "EvidenceStorePath resolved to an empty value."
@@ -144,6 +173,7 @@ $normalizedProfileId = $ProfileId.Trim()
 if ([string]::IsNullOrWhiteSpace($normalizedProfileId)) {
     throw "ProfileId must not be empty."
 }
+$normalizedScenarios = Expand-ScenarioList -Values $Scenario
 
 $profileRecord = if ($payload.profiles.ContainsKey($normalizedProfileId)) {
     ConvertTo-EvidenceRecord $payload.profiles[$normalizedProfileId]
@@ -152,7 +182,7 @@ else {
     New-EvidenceRecord
 }
 
-foreach ($item in $Scenario) {
+foreach ($item in $normalizedScenarios) {
     Apply-Scenario -Record $profileRecord -Name $item -Delta $Count
 }
 
@@ -199,7 +229,7 @@ if (-not $DryRun) {
 
 Write-Host "[write-evidence] path      : $path"
 Write-Host "[write-evidence] profile   : $normalizedProfileId"
-Write-Host "[write-evidence] scenarios : $($Scenario -join ',')"
+Write-Host "[write-evidence] scenarios : $($normalizedScenarios -join ',')"
 Write-Host "[write-evidence] count     : $Count"
 if (-not [string]::IsNullOrWhiteSpace($VolumeId)) {
     Write-Host "[write-evidence] volume    : $($VolumeId.Trim())"

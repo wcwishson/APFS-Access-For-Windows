@@ -1,56 +1,31 @@
-param(
-    [Parameter(Mandatory = $true)]
-    [string]$ApfsUtilPath,
-
+﻿param(
     [string]$AppSettingsPath = "",
-
     [string]$NativeFsHostPath = "",
-
     [string[]]$DeviceCandidates = @(),
-
     [switch]$AutoDiscoverPhysicalDrives,
-
     [int]$MaxPhysicalDriveIndex = 8,
-
     [switch]$UseRelativeBinaryPaths,
-
     [switch]$EnableNativeWrite,
-
     [ValidateSet("Disabled", "Pilot", "Enabled")]
     [string]$WriteRolloutChannel = "Disabled",
-
     [ValidateSet("Conservative", "Balanced", "Aggressive")]
     [string]$WriteSafetyLevel = "Conservative",
-
     [ValidateSet("Disabled", "Overlay", "Native")]
     [string]$WriteBackendMode = "Disabled",
-
     [switch]$AllowWriteOnUnsupportedFeatures,
-
     [int]$WriteCommitTimeoutSeconds = 15,
-
     [bool]$NativeWriteStrictMode = $true,
-
     [int]$NativeWriteMaxDirtyTransactions = 128,
-
     [ValidateSet("FailClosed", "BestEffort")]
     [string]$NativeWriteRecoveryPolicy = "FailClosed",
-
     [switch]$NativeWriteAllowRawPhysicalDevices,
-
     [string[]]$NativeWritePilotVolumeAllowList = @(),
-
     [bool]$NativeWriteIntegrityCheckOnMount = $true,
-
     [ValidateSet("FailClosed", "ReplayIfSafe")]
-    [string]$NativeWriteCrashReplayMode = "FailClosed",
-
+    [string]$NativeWriteCrashReplayMode = "ReplayIfSafe",
     [bool]$NativeWriteRequireCanonicalCommit = $true,
-
     [bool]$NativeWriteAllowLegacyScaffoldForFixtures = $true,
-
     [string[]]$NativeWriteHardwarePilotDeviceAllowList = @(),
-
     [bool]$NativeWriteRequireMacOsValidationForStable = $true
 )
 
@@ -61,12 +36,17 @@ if ([string]::IsNullOrWhiteSpace($AppSettingsPath)) {
     $AppSettingsPath = Join-Path $repoRoot "artifacts\publish\click-run\appsettings.json"
 }
 
-if (!(Test-Path -LiteralPath $ApfsUtilPath)) {
-    throw "apfsutil.exe was not found at: $ApfsUtilPath"
-}
-
 if (!(Test-Path -LiteralPath $AppSettingsPath)) {
     throw "appsettings.json was not found at: $AppSettingsPath"
+}
+
+$resolvedNativeHost = ""
+if (![string]::IsNullOrWhiteSpace($NativeFsHostPath)) {
+    if (!(Test-Path -LiteralPath $NativeFsHostPath)) {
+        throw "ApfsAccess.FsHost.exe was not found at: $NativeFsHostPath"
+    }
+
+    $resolvedNativeHost = (Resolve-Path -LiteralPath $NativeFsHostPath).Path
 }
 
 $json = Get-Content -Path $AppSettingsPath -Raw | ConvertFrom-Json
@@ -75,16 +55,16 @@ if ($null -eq $json.Service) {
 }
 
 $json.Service.BackendMode = "Native"
-$resolvedApfsUtil = (Resolve-Path -LiteralPath $ApfsUtilPath).Path
-$resolvedNativeHost = if ([string]::IsNullOrWhiteSpace($NativeFsHostPath)) { "" } else { (Resolve-Path -LiteralPath $NativeFsHostPath).Path }
+if ($json.Service.PSObject.Properties.Name -contains 'NativeApfsUtilPath') {
+    $null = $json.Service.PSObject.Properties.Remove('NativeApfsUtilPath')
+}
 
 if ($UseRelativeBinaryPaths) {
-    $json.Service.NativeApfsUtilPath = [System.IO.Path]::GetFileName($resolvedApfsUtil)
     $json.Service.NativeFsHostPath = if ([string]::IsNullOrWhiteSpace($resolvedNativeHost)) { "" } else { [System.IO.Path]::GetFileName($resolvedNativeHost) }
 } else {
-    $json.Service.NativeApfsUtilPath = $resolvedApfsUtil
     $json.Service.NativeFsHostPath = $resolvedNativeHost
 }
+
 $json.Service.NativeDeviceCandidates = @($DeviceCandidates)
 $json.Service.NativeAutoDiscoverPhysicalDrives = [bool]$AutoDiscoverPhysicalDrives
 $json.Service.NativeMaxPhysicalDriveIndex = $MaxPhysicalDriveIndex
@@ -114,7 +94,6 @@ $json | ConvertTo-Json -Depth 10 | Set-Content -Path $AppSettingsPath -Encoding 
 
 Write-Host "Configured Native backend in: $AppSettingsPath"
 Write-Host "  BackendMode: Native"
-Write-Host "  NativeApfsUtilPath: $($json.Service.NativeApfsUtilPath)"
 Write-Host "  NativeFsHostPath: $($json.Service.NativeFsHostPath)"
 Write-Host "  NativeDeviceCandidates count: $(@($json.Service.NativeDeviceCandidates).Count)"
 Write-Host "  NativeAutoDiscoverPhysicalDrives: $($json.Service.NativeAutoDiscoverPhysicalDrives)"

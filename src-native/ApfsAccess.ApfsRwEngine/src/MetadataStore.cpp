@@ -2,25 +2,41 @@
 #include "ApfsObjectMapStore.h"
 #include "ApfsSpacemanStore.h"
 #include "ApfsVolumeTreeStore.h"
+#include "NativeApfsReader.h"
 
 #include <algorithm>
 #include <array>
 #include <cstring>
 #include <cwctype>
+#include <cstdlib>
 #include <fstream>
+#include <iostream>
 #include <set>
 #include <limits>
 #include <unordered_set>
 #include <utility>
+#include <Windows.h>
 
 namespace apfsaccess::rw
 {
 namespace
 {
+constexpr std::uint64_t kApfsRootDirectoryObjectId = 2;
 constexpr std::size_t kCheckpointHeaderBytes = 32;
 constexpr std::size_t kCheckpointChecksumOffset = 28;
 constexpr std::uint32_t kCheckpointChecksumSeed = 2166136261u;
 constexpr std::uint32_t kCheckpointChecksumPrime = 16777619u;
+constexpr std::uint64_t kNativeCheckpointBandBlocks = 128;
+constexpr std::uint64_t kNativeObjectMapCheckpointOffset = 0;
+constexpr std::uint64_t kNativeSpacemanCheckpointOffset = 4;
+constexpr std::uint64_t kNativeInodeCheckpointOffset = 8;
+constexpr std::uint64_t kNativeBtreeCheckpointOffset = 24;
+constexpr std::uint64_t kNativeReplayCheckpointOffset = 64;
+constexpr std::uint64_t kNativeOverflowCheckpointOffset = kNativeReplayCheckpointOffset + 2;
+constexpr std::uint64_t kNativeObjectMapOverflowBlocks = 16;
+constexpr std::uint64_t kNativeInodeOverflowOffset = kNativeOverflowCheckpointOffset + kNativeObjectMapOverflowBlocks;
+constexpr std::uint64_t kNativeCheckpointExtensionBlocks = 192;
+constexpr std::uint64_t kNativeBtreeExtensionOffset = 0;
 
 std::uint32_t UpdateFnv1a(std::uint32_t hash, const std::byte* bytes, std::size_t length)
 {
@@ -30,6 +46,463 @@ std::uint32_t UpdateFnv1a(std::uint32_t hash, const std::byte* bytes, std::size_
         hash *= kCheckpointChecksumPrime;
     }
     return hash;
+}
+
+bool IsReadTraceEnabled()
+{
+    static const bool enabled = []()
+    {
+        wchar_t value[8]{};
+        const auto chars = GetEnvironmentVariableW(L"APFSACCESS_TRACE_READS", value, static_cast<DWORD>(std::size(value)));
+        return chars > 0 && value[0] != L'\0' && value[0] != L'0';
+    }();
+    return enabled;
+}
+
+void TraceReadFailure(
+    std::wstring_view path,
+    std::uint64_t object_id,
+    std::uint64_t offset,
+    std::uint64_t bytes,
+    std::wstring_view reason)
+{
+    if (!IsReadTraceEnabled())
+    {
+        return;
+    }
+
+    std::wcerr << L"[MetadataStore] ReadCommittedFileRange failed"
+               << L" path=" << path
+               << L" object=" << object_id
+               << L" offset=" << offset
+               << L" bytes=" << bytes
+               << L" reason=" << reason
+               << std::endl;
+}
+
+void TraceIntegrityFailure(std::wstring_view reason, std::uint64_t object_id = 0)
+{
+    if (!IsReadTraceEnabled())
+    {
+        return;
+    }
+
+    std::wcerr << L"[MetadataStore] VerifyIntegrity failed"
+               << L" reason=" << reason
+               << L" object=" << object_id
+               << std::endl;
+}
+
+void TraceGraphFailure(std::wstring_view reason, std::uint64_t object_id = 0)
+{
+    if (!IsReadTraceEnabled())
+    {
+        return;
+    }
+
+    std::wcerr << L"[MetadataStore] ValidateInodeGraphState failed"
+               << L" reason=" << reason
+               << L" object=" << object_id
+               << std::endl;
+}
+
+void TraceMutationFailure(
+    std::wstring_view operation,
+    std::wstring_view path,
+    std::wstring_view secondary_path,
+    std::wstring_view reason)
+{
+    if (!IsReadTraceEnabled())
+    {
+        return;
+    }
+
+    std::wcerr << L"[MetadataStore] ApplyMutation rejected"
+               << L" operation=" << operation
+               << L" path=" << path;
+    if (!secondary_path.empty())
+    {
+        std::wcerr << L" secondary=" << secondary_path;
+    }
+    std::wcerr << L" reason=" << reason
+               << std::endl;
+}
+
+bool IsCommitTraceEnabled()
+{
+    static const bool enabled = []()
+    {
+        wchar_t value[8]{};
+        const auto chars = GetEnvironmentVariableW(L"APFSACCESS_TRACE_COMMITS", value, static_cast<DWORD>(std::size(value)));
+        return chars > 0 && value[0] != L'\0' && value[0] != L'0';
+    }();
+    return enabled;
+}
+
+void TracePendingCommitFailure(std::wstring_view reason, std::uint64_t object_id = 0)
+{
+    if (!IsCommitTraceEnabled() && !IsReadTraceEnabled())
+    {
+        return;
+    }
+
+    std::wcerr << L"[MetadataStore] ValidatePendingCommitState failed"
+               << L" reason=" << reason
+               << L" object=" << object_id
+               << std::endl;
+}
+
+bool PhysicalRangeContains(std::uint64_t container_start, std::uint64_t container_bytes, std::uint64_t physical_address, std::uint64_t required_bytes)
+{
+    if (container_start > physical_address ||
+        container_start > (std::numeric_limits<std::uint64_t>::max() - container_bytes) ||
+        physical_address > (std::numeric_limits<std::uint64_t>::max() - required_bytes))
+    {
+        return false;
+    }
+
+    const auto container_end = container_start + container_bytes;
+    const auto requested_end = physical_address + required_bytes;
+    return requested_end <= container_end;
+}
+
+bool ConservativePhysicalRangeContains(
+    std::uint64_t extent_physical_address,
+    std::uint64_t extent_bytes,
+    std::uint64_t physical_address,
+    std::uint64_t required_bytes,
+    std::uint32_t block_size)
+{
+    if (block_size == 0 ||
+        extent_physical_address == 0 ||
+        extent_bytes == 0 ||
+        physical_address == 0 ||
+        required_bytes == 0)
+    {
+        return false;
+    }
+
+    const auto block_bytes = static_cast<std::uint64_t>(block_size);
+    if (extent_physical_address > (std::numeric_limits<std::uint64_t>::max() - extent_bytes))
+    {
+        return false;
+    }
+
+    const auto aligned_start = extent_physical_address - (extent_physical_address % block_bytes);
+    const auto extent_end = extent_physical_address + extent_bytes;
+    if ((extent_end % block_bytes) != 0 &&
+        extent_end > (std::numeric_limits<std::uint64_t>::max() - (block_bytes - (extent_end % block_bytes))))
+    {
+        return false;
+    }
+    const auto aligned_end = (extent_end % block_bytes) == 0
+        ? extent_end
+        : extent_end + (block_bytes - (extent_end % block_bytes));
+    if (aligned_end <= aligned_start)
+    {
+        return false;
+    }
+
+    return PhysicalRangeContains(
+        aligned_start,
+        aligned_end - aligned_start,
+        physical_address,
+        required_bytes);
+}
+
+bool AddConservativeAllocationFromReadExtents(
+    const std::vector<MetadataStore::FileExtent>& extents,
+    std::vector<MetadataStore::SpacemanAllocation>& allocations,
+    std::uint32_t block_size)
+{
+    if (block_size == 0)
+    {
+        return false;
+    }
+
+    const auto block_bytes = static_cast<std::uint64_t>(block_size);
+    for (const auto& extent : extents)
+    {
+        if (extent.physical_address == 0 || extent.bytes == 0)
+        {
+            continue;
+        }
+        if (extent.physical_address > (std::numeric_limits<std::uint64_t>::max() - extent.bytes))
+        {
+            return false;
+        }
+
+        const auto aligned_start = extent.physical_address - (extent.physical_address % block_bytes);
+        const auto physical_end = extent.physical_address + extent.bytes;
+        if ((physical_end % block_bytes) != 0 &&
+            physical_end > (std::numeric_limits<std::uint64_t>::max() - (block_bytes - (physical_end % block_bytes))))
+        {
+            return false;
+        }
+        const auto aligned_end = (physical_end % block_bytes) == 0
+            ? physical_end
+            : physical_end + (block_bytes - (physical_end % block_bytes));
+        if (aligned_end <= aligned_start)
+        {
+            return false;
+        }
+
+        const auto aligned_bytes = aligned_end - aligned_start;
+        if (aligned_start == 0 || aligned_bytes == 0)
+        {
+            return false;
+        }
+        if (aligned_start > (std::numeric_limits<std::uint64_t>::max() - aligned_bytes))
+        {
+            return false;
+        }
+
+        allocations.push_back({ aligned_start, aligned_bytes });
+    }
+
+    std::sort(
+        allocations.begin(),
+        allocations.end(),
+        [](const MetadataStore::SpacemanAllocation& lhs, const MetadataStore::SpacemanAllocation& rhs)
+        {
+            if (lhs.physical_address == rhs.physical_address)
+            {
+                return lhs.bytes < rhs.bytes;
+            }
+            return lhs.physical_address < rhs.physical_address;
+        });
+
+    std::vector<MetadataStore::SpacemanAllocation> merged;
+    merged.reserve(allocations.size());
+    for (const auto& extent : allocations)
+    {
+        if (extent.physical_address == 0 || extent.bytes == 0)
+        {
+            continue;
+        }
+
+        if (merged.empty())
+        {
+            merged.push_back(extent);
+            continue;
+        }
+
+        auto& previous = merged.back();
+        if (previous.physical_address > (std::numeric_limits<std::uint64_t>::max() - previous.bytes))
+        {
+            return false;
+        }
+        const auto previous_end = previous.physical_address + previous.bytes;
+        const auto extent_end = extent.physical_address + extent.bytes;
+        if (extent.physical_address <= previous_end)
+        {
+            if (extent_end > previous_end)
+            {
+                previous.bytes = extent_end - previous.physical_address;
+            }
+            continue;
+        }
+
+        merged.push_back(extent);
+    }
+
+    allocations = std::move(merged);
+    return true;
+}
+
+bool SubtractAllocationsFromFreeExtents(
+    std::vector<MetadataStore::SpacemanAllocation>& free_extents,
+    const std::vector<MetadataStore::SpacemanAllocation>& allocations)
+{
+    if (free_extents.empty() || allocations.empty())
+    {
+        return true;
+    }
+
+    std::vector<MetadataStore::SpacemanAllocation> sorted_allocations;
+    sorted_allocations.reserve(allocations.size());
+    for (const auto& allocation : allocations)
+    {
+        if (allocation.physical_address == 0 || allocation.bytes == 0)
+        {
+            continue;
+        }
+        if (allocation.physical_address > (std::numeric_limits<std::uint64_t>::max() - allocation.bytes))
+        {
+            return false;
+        }
+        sorted_allocations.push_back(allocation);
+    }
+
+    std::sort(
+        sorted_allocations.begin(),
+        sorted_allocations.end(),
+        [](const MetadataStore::SpacemanAllocation& lhs, const MetadataStore::SpacemanAllocation& rhs)
+        {
+            if (lhs.physical_address == rhs.physical_address)
+            {
+                return lhs.bytes < rhs.bytes;
+            }
+            return lhs.physical_address < rhs.physical_address;
+        });
+
+    std::vector<MetadataStore::SpacemanAllocation> adjusted;
+    adjusted.reserve(free_extents.size());
+    for (const auto& free_extent : free_extents)
+    {
+        if (free_extent.physical_address == 0 || free_extent.bytes == 0)
+        {
+            continue;
+        }
+        if (free_extent.physical_address > (std::numeric_limits<std::uint64_t>::max() - free_extent.bytes))
+        {
+            return false;
+        }
+
+        const auto free_end = free_extent.physical_address + free_extent.bytes;
+        auto cursor = free_extent.physical_address;
+        for (const auto& allocation : sorted_allocations)
+        {
+            const auto allocation_end = allocation.physical_address + allocation.bytes;
+            if (allocation_end <= cursor)
+            {
+                continue;
+            }
+            if (allocation.physical_address >= free_end)
+            {
+                break;
+            }
+            if (allocation.physical_address > cursor)
+            {
+                adjusted.push_back({ cursor, allocation.physical_address - cursor });
+            }
+            cursor = std::max(cursor, std::min(allocation_end, free_end));
+            if (cursor >= free_end)
+            {
+                break;
+            }
+        }
+
+        if (cursor < free_end)
+        {
+            adjusted.push_back({ cursor, free_end - cursor });
+        }
+    }
+
+    std::sort(
+        adjusted.begin(),
+        adjusted.end(),
+        [](const MetadataStore::SpacemanAllocation& lhs, const MetadataStore::SpacemanAllocation& rhs)
+        {
+            if (lhs.physical_address == rhs.physical_address)
+            {
+                return lhs.bytes < rhs.bytes;
+            }
+            return lhs.physical_address < rhs.physical_address;
+        });
+
+    std::vector<MetadataStore::SpacemanAllocation> merged;
+    merged.reserve(adjusted.size());
+    for (const auto& extent : adjusted)
+    {
+        if (extent.physical_address == 0 || extent.bytes == 0)
+        {
+            continue;
+        }
+        if (extent.physical_address > (std::numeric_limits<std::uint64_t>::max() - extent.bytes))
+        {
+            return false;
+        }
+
+        if (merged.empty())
+        {
+            merged.push_back(extent);
+            continue;
+        }
+
+        auto& previous = merged.back();
+        if (previous.physical_address > (std::numeric_limits<std::uint64_t>::max() - previous.bytes))
+        {
+            return false;
+        }
+        const auto previous_end = previous.physical_address + previous.bytes;
+        const auto extent_end = extent.physical_address + extent.bytes;
+        if (extent.physical_address <= previous_end)
+        {
+            if (extent_end > previous_end)
+            {
+                previous.bytes = extent_end - previous.physical_address;
+            }
+            continue;
+        }
+
+        merged.push_back(extent);
+    }
+
+    free_extents = std::move(merged);
+    return true;
+}
+
+bool NormalizeSpacemanExtents(std::vector<MetadataStore::SpacemanAllocation>& extents)
+{
+    if (extents.empty())
+    {
+        return true;
+    }
+
+    std::sort(
+        extents.begin(),
+        extents.end(),
+        [](const MetadataStore::SpacemanAllocation& lhs, const MetadataStore::SpacemanAllocation& rhs)
+        {
+            if (lhs.physical_address == rhs.physical_address)
+            {
+                return lhs.bytes < rhs.bytes;
+            }
+            return lhs.physical_address < rhs.physical_address;
+        });
+
+    std::vector<MetadataStore::SpacemanAllocation> merged;
+    merged.reserve(extents.size());
+    for (const auto& extent : extents)
+    {
+        if (extent.physical_address == 0 || extent.bytes == 0)
+        {
+            continue;
+        }
+        if (extent.physical_address > (std::numeric_limits<std::uint64_t>::max() - extent.bytes))
+        {
+            return false;
+        }
+
+        if (merged.empty())
+        {
+            merged.push_back(extent);
+            continue;
+        }
+
+        auto& previous = merged.back();
+        if (previous.physical_address > (std::numeric_limits<std::uint64_t>::max() - previous.bytes))
+        {
+            return false;
+        }
+
+        const auto previous_end = previous.physical_address + previous.bytes;
+        const auto extent_end = extent.physical_address + extent.bytes;
+        if (extent.physical_address <= previous_end)
+        {
+            if (extent_end > previous_end)
+            {
+                previous.bytes = extent_end - previous.physical_address;
+            }
+            continue;
+        }
+
+        merged.push_back(extent);
+    }
+
+    extents = std::move(merged);
+    return true;
 }
 
 std::uint32_t ComputeCheckpointChecksum(const std::vector<std::byte>& block, std::size_t payload_bytes)
@@ -77,6 +550,8 @@ std::vector<apfsaccess::rw::BtreeRecord> CanonicalizeBtreeRecords(
 {
     std::unordered_map<std::string, apfsaccess::rw::BtreeRecord> latest_by_key;
     latest_by_key.reserve(source.size());
+    std::unordered_map<std::uint64_t, std::string> inode_key_by_object_id;
+    inode_key_by_object_id.reserve(source.size());
 
     for (const auto& record : source)
     {
@@ -88,6 +563,44 @@ std::vector<apfsaccess::rw::BtreeRecord> CanonicalizeBtreeRecords(
         auto key_blob = BuildBtreeKeyBlob(record.key);
         if (key_blob.empty())
         {
+            continue;
+        }
+
+        if (record.kind == apfsaccess::rw::BtreeRecordKind::Inode)
+        {
+            constexpr std::size_t kInodeKeyObjectIdOffset = 9;
+            constexpr std::size_t kExpectedInodeKeyBytes = 1 + 8 + 8;
+            if (record.key.size() != kExpectedInodeKeyBytes)
+            {
+                continue;
+            }
+
+            std::uint64_t object_id = 0;
+            for (int index = 0; index < 8; ++index)
+            {
+                object_id |= static_cast<std::uint64_t>(
+                    std::to_integer<unsigned char>(record.key[kInodeKeyObjectIdOffset + static_cast<std::size_t>(index)])) << (index * 8);
+            }
+            if (object_id == 0)
+            {
+                continue;
+            }
+
+            if (auto previous_key = inode_key_by_object_id.find(object_id);
+                previous_key != inode_key_by_object_id.end())
+            {
+                latest_by_key.erase(previous_key->second);
+            }
+
+            if (record.tombstone)
+            {
+                latest_by_key.erase(key_blob);
+                inode_key_by_object_id.erase(object_id);
+                continue;
+            }
+
+            inode_key_by_object_id[object_id] = key_blob;
+            latest_by_key.insert_or_assign(std::move(key_blob), record);
             continue;
         }
 
@@ -317,10 +830,6 @@ bool DecodeBtreeInodeRecord(const apfsaccess::rw::BtreeRecord& record, DecodedBt
             return false;
         }
     }
-    else if (decoded.logical_size > 0 && decoded.data_physical_address == 0)
-    {
-        return false;
-    }
 
     return true;
 }
@@ -395,7 +904,7 @@ bool DecodeBtreeExtentRecord(const apfsaccess::rw::BtreeRecord& record, DecodedB
     {
         return false;
     }
-    if (decoded.physical_address == 0 || decoded.extent_bytes == 0)
+    if (decoded.extent_bytes == 0)
     {
         return false;
     }
@@ -411,7 +920,7 @@ bool DecodeBtreeExtentRecord(const apfsaccess::rw::BtreeRecord& record, DecodedB
 
 MetadataStore::MetadataStore(VolumeContext context)
     : context_(std::move(context))
-    , device_(context_.device_path)
+    , device_(context_.device_path, context_.device_offset_bytes)
 {
     SyncCommitBlobTelemetryWithMode();
 }
@@ -465,7 +974,7 @@ bool MetadataStore::LoadVolumeState()
 
     if (context_.integrity_check_on_mount && !VerifyIntegrity())
     {
-        MarkRecoveryRequired(L"IntegrityCheckFailedOnMount");
+        MarkRecoveryRequired(ResolveIntegrityCheckFailureRecoveryReason());
         return false;
     }
 
@@ -479,6 +988,10 @@ bool MetadataStore::LoadCanonicalState()
 
     if (!LoadVolumeState())
     {
+        if (recovery_reason_.empty())
+        {
+            MarkRecoveryRequired(L"CanonicalVolumeStateLoadFailed");
+        }
         return false;
     }
 
@@ -538,8 +1051,7 @@ bool MetadataStore::LoadCanonicalState()
 
     canonical_state_loaded_ = container_loaded_ &&
                               object_map_loaded_ &&
-                              spaceman_loaded_ &&
-                              !recovery_required_;
+                              spaceman_loaded_;
     canonical_commit_ready_ = CanReportCanonicalCommitReady(
         canonical_state_loaded_,
         commit_path_ready_,
@@ -550,7 +1062,7 @@ bool MetadataStore::LoadCanonicalState()
 
 bool MetadataStore::LoadContainerSuperblocks()
 {
-    // Offsets are based on apfs_sb layout from Paragon CE apfs_struct.h.
+    // NXSB superblock field offsets used by the native APFS metadata reader.
     constexpr std::size_t kSuperblockBytes = 0x570;
     constexpr std::size_t kMagicOffset = 0x20;
     constexpr std::size_t kBlockSizeOffset = 0x24;
@@ -657,6 +1169,7 @@ bool MetadataStore::LoadContainerSuperblocks()
     current_meta_index_ = selected.current_meta_index;
     spaceman_object_id_ = selected.spaceman_object_id;
     volume_root_block_ = selected.volume_root_block;
+    checkpoint_anchor_block_ = ResolveObjectBlockIndex(volume_root_block_).value_or(volume_root_block_);
     next_ephemeral_extent_ = static_cast<std::uint64_t>(block_size_) * 0x100ull;
     const auto metadata_cursor_index = static_cast<std::uint64_t>(std::max(current_meta_index_, next_meta_index_));
     if (first_meta_block_ != 0 && block_size_ != 0)
@@ -690,6 +1203,7 @@ bool MetadataStore::LoadContainerSuperblocks()
     last_committed_xid_.reset();
     last_commit_blob_address_.reset();
     last_commit_blob_bytes_.reset();
+    spaceman_free_bytes_.reset();
     superblock_object_block_map_.clear();
     pending_mutations_.clear();
     committed_object_map_.clear();
@@ -697,6 +1211,7 @@ bool MetadataStore::LoadContainerSuperblocks()
     committed_path_index_.clear();
     committed_directory_links_.clear();
     committed_btree_records_.clear();
+    committed_read_extents_.clear();
     working_inodes_.clear();
     working_path_index_.clear();
     working_directory_links_.clear();
@@ -837,8 +1352,58 @@ bool MetadataStore::LoadObjectMap()
 
     if (!object_map_loaded_)
     {
-        MarkRecoveryRequired(L"CanonicalObjectMapCheckpointMissing");
-        return false;
+        NativeApfsVolumeProjection projection{};
+        std::wstring projection_error;
+        if (IsLikelyRawDevicePath(context_.device_path) &&
+            NativeApfsReader::TryLoadVolumeProjection(
+                device_,
+                0,
+                projection,
+                projection_error))
+        {
+            committed_object_map_.clear();
+            committed_inodes_.clear();
+            committed_path_index_.clear();
+            committed_directory_links_.clear();
+            committed_btree_records_ = std::move(projection.btree_records);
+            committed_read_extents_.clear();
+            for (const auto& inode : projection.inodes)
+            {
+                committed_inodes_[inode.object_id] = inode;
+                committed_path_index_[CanonicalPathKey(inode.full_path)] = inode.object_id;
+                if (!inode.is_directory && inode.data_physical_address != 0 && inode.logical_size != 0)
+                {
+                    committed_object_map_[inode.object_id] = ObjectMapUpdate
+                    {
+                        inode.object_id,
+                        inode.data_physical_address,
+                        inode.logical_size,
+                        projection.checkpoint_xid
+                    };
+                }
+            }
+            for (auto& [object_id, extents] : projection.read_extents_by_inode)
+            {
+                if (!SetCommittedReadExtents(object_id, std::move(extents)))
+                {
+                    committed_read_extents_.erase(object_id);
+                }
+            }
+            object_map_loaded_ = true;
+            last_committed_xid_ = projection.checkpoint_xid;
+            checkpoint_anchor_block_ = projection.root_tree_block != 0
+                ? projection.root_tree_block
+                : checkpoint_anchor_block_;
+            volume_root_block_ = projection.root_directory_inode != 0 ? projection.root_directory_inode : volume_root_block_;
+        }
+        else
+        {
+            MarkRecoveryRequired(
+                projection_error.empty()
+                    ? L"CanonicalObjectMapCheckpointMissing"
+                    : projection_error);
+            return false;
+        }
     }
 
     return object_map_loaded_;
@@ -867,7 +1432,44 @@ bool MetadataStore::LoadSpacemanState()
     std::optional<std::uint64_t> selected_last_committed_xid;
     std::uint64_t selected_checkpoint_xid = 0;
     bool selected_checkpoint_valid = false;
+    bool apple_spaceman_loaded = false;
 
+    const auto spaceman_block = ResolveObjectBlockIndex(spaceman_object_id_).value_or(0);
+    if (RequiresCanonicalNonFixtureCommitPath() && spaceman_block != 0)
+    {
+        std::vector<std::byte> spaceman;
+        const auto read_spaceman = ReadBlockByIndexDirect(spaceman_block, spaceman);
+        if (IsReadTraceEnabled())
+        {
+            std::wcerr << L"[MetadataStore] Spaceman load decision"
+                       << L" object=" << spaceman_object_id_
+                       << L" block=" << spaceman_block
+                       << L" read=" << (read_spaceman ? L"true" : L"false")
+                       << L" bytes=" << spaceman.size()
+                       << std::endl;
+        }
+        if (read_spaceman &&
+            LoadSpacemanCheckpointBlock(spaceman_block, spaceman))
+        {
+            selected_checkpoint_xid = ReadLe64(spaceman, 12);
+            selected_allocations = committed_spaceman_allocations_;
+            selected_free_extents = committed_spaceman_free_extents_;
+            selected_working_free_extents = working_spaceman_free_extents_;
+            selected_next_ephemeral_extent = next_ephemeral_extent_;
+            selected_working_next_ephemeral_extent = working_next_ephemeral_extent_;
+            selected_last_committed_xid = last_committed_xid_;
+            selected_checkpoint_valid = true;
+        }
+        if (read_spaceman &&
+            LoadSpacemanChunkInfoState(spaceman_block, spaceman))
+        {
+            apple_spaceman_loaded = true;
+        }
+    }
+
+    // A production mount may have a valid Apple spaceman block and a newer
+    // native checkpoint from our last transaction. Prefer the native checkpoint
+    // so object-map and allocation state advance together during replay.
     for (const auto candidate_block : ResolveSpacemanCheckpointBlockIndices())
     {
         std::vector<std::byte> checkpoint_block;
@@ -912,6 +1514,21 @@ bool MetadataStore::LoadSpacemanState()
         last_committed_xid_ = selected_last_committed_xid;
         spaceman_loaded_ = true;
     }
+    else if (apple_spaceman_loaded)
+    {
+        next_ephemeral_extent_ = baseline_next_ephemeral_extent;
+        for (const auto& allocation : committed_spaceman_allocations_)
+        {
+            if (allocation.physical_address <= (std::numeric_limits<std::uint64_t>::max() - allocation.bytes))
+            {
+                next_ephemeral_extent_ = std::max(next_ephemeral_extent_, allocation.physical_address + allocation.bytes);
+            }
+        }
+        working_spaceman_free_extents_ = committed_spaceman_free_extents_;
+        working_next_ephemeral_extent_ = next_ephemeral_extent_;
+        last_committed_xid_ = baseline_last_committed_xid;
+        spaceman_loaded_ = true;
+    }
     else
     {
         committed_spaceman_allocations_ = baseline_allocations;
@@ -922,12 +1539,16 @@ bool MetadataStore::LoadSpacemanState()
         last_committed_xid_ = baseline_last_committed_xid;
     }
 
-    const auto spaceman_block = ResolveObjectBlockIndex(spaceman_object_id_).value_or(0);
     if (!spaceman_loaded_ && spaceman_block != 0)
     {
         std::vector<std::byte> spaceman;
-        if (ReadMetadataBlock(spaceman_block, spaceman))
+        if (ReadBlockByIndexDirect(spaceman_block, spaceman))
         {
+            if (LoadSpacemanChunkInfoState(spaceman_block, spaceman))
+            {
+                spaceman_loaded_ = true;
+            }
+
             constexpr std::size_t kBmdBlockSizeOffset = 0x20;
             constexpr std::size_t kBmdTotalBlocksOffset = 0x30;
             constexpr std::size_t kBmdFreeBlocksOffset = 0x48;
@@ -946,7 +1567,21 @@ bool MetadataStore::LoadSpacemanState()
             if (block_size_matches && total_blocks_plausible && bitmap_block_plausible && free_blocks_plausible)
             {
                 spaceman_loaded_ = true;
+                if (bmd_free_blocks > 0 &&
+                    bmd_free_blocks <= (std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(block_size_)))
+                {
+                    spaceman_free_bytes_ = bmd_free_blocks * static_cast<std::uint64_t>(block_size_);
+                }
             }
+        }
+    }
+
+    if (IsLikelyRawDevicePath(context_.device_path))
+    {
+        const auto read_extents_snapshot = committed_read_extents_;
+        if (!RefreshNativeReadExtentProjection())
+        {
+            committed_read_extents_ = read_extents_snapshot;
         }
     }
 
@@ -962,6 +1597,75 @@ bool MetadataStore::LoadSpacemanState()
     {
         MarkRecoveryRequired(L"CanonicalSpacemanCheckpointMissing");
         return false;
+    }
+
+    if (RequiresCanonicalNonFixtureCommitPath() &&
+        !persistent_state_loaded_ &&
+        !LoadPersistentState())
+    {
+        if (recovery_reason_.empty())
+        {
+            MarkRecoveryRequired(L"PersistentStateLoadFailed");
+        }
+        return false;
+    }
+
+    if (context_.allow_raw_physical_write &&
+        IsLikelyRawDevicePath(context_.device_path) &&
+        !committed_read_extents_.empty())
+    {
+        auto merged_allocations = committed_spaceman_allocations_;
+        const auto original_allocation_count = merged_allocations.size();
+        for (const auto& [_, extents] : committed_read_extents_)
+        {
+            if (!AddConservativeAllocationFromReadExtents(
+                    extents,
+                    merged_allocations,
+                    block_size_))
+            {
+                MarkRecoveryRequired(L"RecoveredReadExtentAllocationInvalid");
+                return false;
+            }
+        }
+
+        if (merged_allocations.size() != original_allocation_count)
+        {
+            committed_spaceman_allocations_ = std::move(merged_allocations);
+            if (!SubtractAllocationsFromFreeExtents(
+                    committed_spaceman_free_extents_,
+                    committed_spaceman_allocations_))
+            {
+                MarkRecoveryRequired(L"RecoveredReadExtentFreeLedgerInvalid");
+                return false;
+            }
+
+            for (const auto& allocation : committed_spaceman_allocations_)
+            {
+                if (allocation.physical_address <= (std::numeric_limits<std::uint64_t>::max() - allocation.bytes))
+                {
+                    next_ephemeral_extent_ = std::max(next_ephemeral_extent_, allocation.physical_address + allocation.bytes);
+                }
+            }
+
+            working_spaceman_free_extents_ = committed_spaceman_free_extents_;
+            if (!SubtractAllocationsFromFreeExtents(
+                    working_spaceman_free_extents_,
+                    committed_spaceman_allocations_))
+            {
+                MarkRecoveryRequired(L"RecoveredReadExtentWorkingLedgerInvalid");
+                return false;
+            }
+            working_next_ephemeral_extent_ = next_ephemeral_extent_;
+
+            if (IsReadTraceEnabled())
+            {
+                std::wcerr << L"[MetadataStore] Added recovered read-extents to spaceman allocation ledger"
+                           << L" allocationsBefore=" << original_allocation_count
+                           << L" allocationsAfter=" << committed_spaceman_allocations_.size()
+                           << L" freeExtents=" << committed_spaceman_free_extents_.size()
+                           << std::endl;
+            }
+        }
     }
 
     return spaceman_loaded_;
@@ -1046,6 +1750,208 @@ bool MetadataStore::WriteBlockByIndexDirect(std::uint64_t block_index, const std
     return device_.Write(block_offset, payload);
 }
 
+std::vector<std::uint64_t> RotateCheckpointBlocks(
+    const std::vector<std::uint64_t>& block_indices,
+    std::uint64_t target_xid)
+{
+    if (block_indices.empty())
+    {
+        return {};
+    }
+
+    std::vector<std::uint64_t> rotated;
+    rotated.reserve(block_indices.size());
+    const auto start = static_cast<std::size_t>(
+        target_xid % static_cast<std::uint64_t>(block_indices.size()));
+    rotated.insert(rotated.end(), block_indices.begin() + static_cast<std::ptrdiff_t>(start), block_indices.end());
+    rotated.insert(rotated.end(), block_indices.begin(), block_indices.begin() + static_cast<std::ptrdiff_t>(start));
+    return rotated;
+}
+
+std::vector<std::vector<std::uint64_t>> SelectChunkedCheckpointBlockWindows(
+    const std::vector<std::uint64_t>& block_indices,
+    std::uint64_t target_xid,
+    std::size_t required_blocks);
+
+std::vector<std::uint64_t> SelectChunkedCheckpointBlocks(
+    const std::vector<std::uint64_t>& block_indices,
+    std::uint64_t target_xid,
+    std::size_t required_blocks)
+{
+    auto windows = SelectChunkedCheckpointBlockWindows(block_indices, target_xid, required_blocks);
+    if (windows.empty())
+    {
+        return {};
+    }
+
+    return std::move(windows.front());
+}
+
+std::vector<std::vector<std::uint64_t>> SelectChunkedCheckpointBlockWindows(
+    const std::vector<std::uint64_t>& block_indices,
+    std::uint64_t target_xid,
+    std::size_t required_blocks)
+{
+    if (block_indices.empty() ||
+        required_blocks == 0 ||
+        required_blocks > block_indices.size())
+    {
+        return {};
+    }
+
+    const auto generation_count = block_indices.size() / required_blocks;
+    if (generation_count == 0)
+    {
+        return {};
+    }
+
+    const auto preferred_generation = static_cast<std::size_t>(
+        target_xid % static_cast<std::uint64_t>(generation_count));
+
+    std::vector<std::vector<std::uint64_t>> windows;
+    windows.reserve(generation_count);
+    for (std::size_t offset = 0; offset < generation_count; ++offset)
+    {
+        const auto generation_index = (preferred_generation + offset) % generation_count;
+        const auto begin = generation_index * required_blocks;
+        if (begin > (block_indices.size() - required_blocks))
+        {
+            continue;
+        }
+
+        windows.emplace_back(
+            block_indices.begin() + static_cast<std::ptrdiff_t>(begin),
+            block_indices.begin() + static_cast<std::ptrdiff_t>(begin + required_blocks));
+    }
+
+    return windows;
+}
+
+bool MetadataStore::WriteChunkedCheckpointBlocks(
+    const std::vector<std::uint64_t>& block_indices,
+    std::uint64_t target_xid,
+    const std::vector<std::byte>& data)
+{
+    if (block_indices.empty() || block_size_ == 0)
+    {
+        return false;
+    }
+
+    const auto block_size = static_cast<std::size_t>(block_size_);
+    const auto block_count = (data.size() + block_size - 1) / block_size;
+    if (block_count > block_indices.size())
+    {
+        return false;
+    }
+    auto selected_blocks = SelectWritableChunkedCheckpointBlocks(block_indices, target_xid, block_count);
+    if (selected_blocks.empty())
+    {
+        return false;
+    }
+
+    for (std::size_t index = 0; index < block_count; ++index)
+    {
+        std::vector<std::byte> block(static_cast<std::size_t>(block_size), std::byte{0});
+        const auto begin = data.begin() + static_cast<std::vector<std::byte>::difference_type>(index * block_size);
+        const auto end_index = std::min(data.size(), (index + 1) * block_size);
+        const auto end = data.begin() + static_cast<std::vector<std::byte>::difference_type>(end_index);
+        std::copy(begin, end, block.begin());
+
+        if (!WriteBlockByIndexDirect(selected_blocks[index], block))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+std::vector<std::byte> MetadataStore::ReadChunkedCheckpointBytes(
+    const std::vector<std::uint64_t>& block_indices,
+    std::uint64_t target_xid,
+    const std::array<char, 12>& magic,
+    std::uint32_t expected_payload_bytes) const
+{
+    if (block_indices.empty() || block_size_ == 0)
+    {
+        return {};
+    }
+
+    const auto block_size = static_cast<std::size_t>(block_size_);
+    if (expected_payload_bytes > (std::numeric_limits<std::size_t>::max() - kCheckpointHeaderBytes))
+    {
+        return {};
+    }
+    const auto required_bytes = kCheckpointHeaderBytes + static_cast<std::size_t>(expected_payload_bytes);
+    const auto required_blocks = (required_bytes + block_size - 1) / block_size;
+    if (required_blocks == 0 || required_blocks > block_indices.size())
+    {
+        return {};
+    }
+    auto block_orders = SelectChunkedCheckpointBlockWindows(block_indices, target_xid, required_blocks);
+    if (auto legacy_blocks = RotateCheckpointBlocks(block_indices, target_xid);
+        !legacy_blocks.empty())
+    {
+        block_orders.push_back(std::move(legacy_blocks));
+    }
+    if (block_orders.empty())
+    {
+        return {};
+    }
+
+    for (const auto& ordered_blocks : block_orders)
+    {
+        if (ordered_blocks.size() < required_blocks)
+        {
+            continue;
+        }
+
+        std::vector<std::byte> combined;
+        combined.reserve(required_blocks * block_size);
+        bool read_failed = false;
+        for (std::size_t index = 0; index < required_blocks; ++index)
+        {
+            std::vector<std::byte> block;
+            if (!ReadBlockByIndexDirect(ordered_blocks[index], block) ||
+                block.size() < block_size)
+            {
+                read_failed = true;
+                break;
+            }
+            combined.insert(combined.end(), block.begin(), block.begin() + static_cast<std::vector<std::byte>::difference_type>(block_size));
+        }
+        if (read_failed)
+        {
+            continue;
+        }
+
+        bool magic_matches = true;
+        for (std::size_t magic_index = 0; magic_index < magic.size(); ++magic_index)
+        {
+            if (std::to_integer<unsigned char>(combined[magic_index]) != static_cast<unsigned char>(magic[magic_index]))
+            {
+                magic_matches = false;
+                break;
+            }
+        }
+        if (!magic_matches)
+        {
+            continue;
+        }
+
+        std::uint64_t persisted_xid = 0;
+        if (!TryReadLe64(combined, 12, persisted_xid) || persisted_xid != target_xid)
+        {
+            continue;
+        }
+
+        combined.resize(required_bytes);
+        return combined;
+    }
+
+    return {};
+}
+
 bool MetadataStore::ReadMetadataBlock(std::uint64_t block_index, std::vector<std::byte>& out_block) const
 {
     out_block.clear();
@@ -1076,6 +1982,10 @@ bool MetadataStore::IsReservedMetadataBlock(std::uint64_t block_index) const
         return true;
     }
     if (total_blocks_ != 0 && block_index >= total_blocks_)
+    {
+        return true;
+    }
+    if (IsNativeCheckpointBandBlock(block_index))
     {
         return true;
     }
@@ -1128,7 +2038,7 @@ bool MetadataStore::IsReservedMetadataBlock(std::uint64_t block_index) const
         }
     }
 
-    if (auto volume_root_block = ResolveObjectBlockIndex(volume_root_block_);
+    if (auto volume_root_block = ResolveObjectBlockIndex(checkpoint_anchor_block_ != 0 ? checkpoint_anchor_block_ : volume_root_block_);
         volume_root_block.has_value() && volume_root_block.value() == block_index)
     {
         return true;
@@ -1140,6 +2050,102 @@ bool MetadataStore::IsReservedMetadataBlock(std::uint64_t block_index) const
     }
 
     return false;
+}
+
+std::optional<std::uint64_t> MetadataStore::ResolveNativeCheckpointBandStartBlock() const
+{
+    if (total_blocks_ <= kNativeCheckpointBandBlocks)
+    {
+        return std::nullopt;
+    }
+
+    return total_blocks_ - kNativeCheckpointBandBlocks;
+}
+
+bool MetadataStore::IsNativeCheckpointBandBlock(std::uint64_t block_index) const
+{
+    const auto band_start = ResolveNativeCheckpointBandStartBlock();
+    if (!band_start.has_value())
+    {
+        return false;
+    }
+
+    if (block_index >= band_start.value() && block_index < total_blocks_)
+    {
+        return true;
+    }
+
+    if (band_start.value() >= kNativeCheckpointExtensionBlocks)
+    {
+        const auto extension_start = band_start.value() - kNativeCheckpointExtensionBlocks;
+        if (block_index >= extension_start && block_index < band_start.value())
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool MetadataStore::AreNativeCheckpointBlocksWritable(const std::vector<std::uint64_t>& block_indices) const
+{
+    if (block_indices.empty() || block_size_ == 0)
+    {
+        return false;
+    }
+
+    for (const auto block_index : block_indices)
+    {
+        if (!IsNativeCheckpointBandBlock(block_index) ||
+            block_index > (std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(block_size_)))
+        {
+            return false;
+        }
+
+        const auto physical_address = block_index * static_cast<std::uint64_t>(block_size_);
+        const auto overlaps = [&](const std::vector<SpacemanAllocation>& extents)
+        {
+            for (const auto& extent : extents)
+            {
+                if (extent.bytes == 0 ||
+                    extent.physical_address > (std::numeric_limits<std::uint64_t>::max() - extent.bytes))
+                {
+                    continue;
+                }
+
+                const auto extent_end = extent.physical_address + extent.bytes;
+                if (physical_address >= extent.physical_address && physical_address < extent_end)
+                {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        if (overlaps(committed_spaceman_allocations_) ||
+            overlaps(pending_spaceman_allocations_))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+std::vector<std::uint64_t> MetadataStore::SelectWritableChunkedCheckpointBlocks(
+    const std::vector<std::uint64_t>& block_indices,
+    std::uint64_t target_xid,
+    std::size_t required_blocks) const
+{
+    for (auto candidate_blocks : SelectChunkedCheckpointBlockWindows(block_indices, target_xid, required_blocks))
+    {
+        if (AreNativeCheckpointBlocksWritable(candidate_blocks))
+        {
+            return candidate_blocks;
+        }
+    }
+
+    return {};
 }
 
 std::optional<std::uint64_t> MetadataStore::FindCheckpointCompanionBlock(
@@ -1185,53 +2191,64 @@ std::optional<std::uint64_t> MetadataStore::FindCheckpointCompanionBlock(
 std::vector<std::uint64_t> MetadataStore::ResolveObjectMapCheckpointBlockIndices() const
 {
     std::vector<std::uint64_t> candidates;
-    auto primary = ResolveObjectBlockIndex(volume_root_block_);
-    if (!primary.has_value())
+    const auto band_start = ResolveNativeCheckpointBandStartBlock();
+    if (!band_start.has_value() ||
+        band_start.value() > (std::numeric_limits<std::uint64_t>::max() - kNativeObjectMapCheckpointOffset))
     {
         return candidates;
     }
 
-    candidates.push_back(primary.value());
-    std::vector<std::uint64_t> disallowed
+    const auto append_range = [&](std::uint64_t offset, std::uint64_t count)
     {
-        primary.value(),
-        ResolveObjectBlockIndex(spaceman_object_id_).value_or(0)
-    };
-    for (const auto inode_slot : ResolveInodeCheckpointBlockIndices())
-    {
-        disallowed.push_back(inode_slot);
-    }
+        if (count == 0 ||
+            band_start.value() > (std::numeric_limits<std::uint64_t>::max() - offset))
+        {
+            return;
+        }
 
-    if (auto companion = FindCheckpointCompanionBlock(primary.value(), disallowed); companion.has_value())
-    {
-        candidates.push_back(companion.value());
-    }
+        const auto range_start = band_start.value() + offset;
+        for (std::uint64_t index = 0; index < count; ++index)
+        {
+            if (range_start > (std::numeric_limits<std::uint64_t>::max() - index))
+            {
+                break;
+            }
+
+            const auto candidate = range_start + index;
+            if (IsNativeCheckpointBandBlock(candidate))
+            {
+                candidates.push_back(candidate);
+            }
+        }
+    };
+
+    append_range(
+        kNativeObjectMapCheckpointOffset,
+        kNativeSpacemanCheckpointOffset - kNativeObjectMapCheckpointOffset);
+    append_range(
+        kNativeOverflowCheckpointOffset,
+        kNativeObjectMapOverflowBlocks);
     return candidates;
 }
 
 std::vector<std::uint64_t> MetadataStore::ResolveSpacemanCheckpointBlockIndices() const
 {
     std::vector<std::uint64_t> candidates;
-    auto primary = ResolveObjectBlockIndex(spaceman_object_id_);
-    if (!primary.has_value())
+    const auto band_start = ResolveNativeCheckpointBandStartBlock();
+    if (!band_start.has_value() ||
+        band_start.value() > (std::numeric_limits<std::uint64_t>::max() - kNativeSpacemanCheckpointOffset))
     {
         return candidates;
     }
 
-    candidates.push_back(primary.value());
-    std::vector<std::uint64_t> disallowed
+    const auto primary = band_start.value() + kNativeSpacemanCheckpointOffset;
+    for (std::uint64_t index = 0; index < (kNativeInodeCheckpointOffset - kNativeSpacemanCheckpointOffset); ++index)
     {
-        primary.value(),
-        ResolveObjectBlockIndex(volume_root_block_).value_or(0)
-    };
-    for (const auto inode_slot : ResolveInodeCheckpointBlockIndices())
-    {
-        disallowed.push_back(inode_slot);
-    }
-
-    if (auto companion = FindCheckpointCompanionBlock(primary.value(), disallowed); companion.has_value())
-    {
-        candidates.push_back(companion.value());
+        const auto candidate = primary + index;
+        if (IsNativeCheckpointBandBlock(candidate))
+        {
+            candidates.push_back(candidate);
+        }
     }
     return candidates;
 }
@@ -1239,34 +2256,74 @@ std::vector<std::uint64_t> MetadataStore::ResolveSpacemanCheckpointBlockIndices(
 std::vector<std::uint64_t> MetadataStore::ResolveInodeCheckpointBlockIndices() const
 {
     std::vector<std::uint64_t> candidates;
-    auto volume_block = ResolveObjectBlockIndex(volume_root_block_);
-    if (!volume_block.has_value())
+    const auto band_start = ResolveNativeCheckpointBandStartBlock();
+    if (!band_start.has_value() ||
+        band_start.value() > (std::numeric_limits<std::uint64_t>::max() - kNativeInodeCheckpointOffset))
     {
         return candidates;
     }
 
-    const auto spaceman_block = ResolveObjectBlockIndex(spaceman_object_id_).value_or(0);
-    for (std::uint64_t delta = 1; delta <= 64 && candidates.size() < 2; ++delta)
+    const auto append_range = [&](std::uint64_t offset, std::uint64_t count)
     {
-        if (volume_block.value() > (std::numeric_limits<std::uint64_t>::max() - delta))
+        if (count == 0 ||
+            band_start.value() > (std::numeric_limits<std::uint64_t>::max() - offset))
+        {
+            return;
+        }
+
+        const auto range_start = band_start.value() + offset;
+        for (std::uint64_t index = 0; index < count; ++index)
+        {
+            if (range_start > (std::numeric_limits<std::uint64_t>::max() - index))
+            {
+                break;
+            }
+
+            const auto candidate = range_start + index;
+            if (IsNativeCheckpointBandBlock(candidate))
+            {
+                candidates.push_back(candidate);
+            }
+        }
+    };
+
+    append_range(
+        kNativeInodeCheckpointOffset,
+        kNativeBtreeCheckpointOffset - kNativeInodeCheckpointOffset);
+    append_range(
+        kNativeInodeOverflowOffset,
+        kNativeCheckpointBandBlocks - kNativeInodeOverflowOffset);
+
+    return candidates;
+}
+
+std::vector<std::uint64_t> ResolveLegacyContiguousCheckpointBlocks(
+    std::optional<std::uint64_t> band_start,
+    std::uint64_t offset,
+    std::uint64_t count,
+    const std::function<bool(std::uint64_t)>& is_allowed)
+{
+    std::vector<std::uint64_t> candidates;
+    if (!band_start.has_value() ||
+        count == 0 ||
+        band_start.value() > (std::numeric_limits<std::uint64_t>::max() - offset))
+    {
+        return candidates;
+    }
+
+    const auto range_start = band_start.value() + offset;
+    for (std::uint64_t index = 0; index < count; ++index)
+    {
+        if (range_start > (std::numeric_limits<std::uint64_t>::max() - index))
         {
             break;
         }
 
-        const auto candidate = volume_block.value() + delta;
-        if (candidate == 0 ||
-            candidate == volume_block.value() ||
-            candidate == spaceman_block ||
-            IsReservedMetadataBlock(candidate))
+        const auto candidate = range_start + index;
+        if (is_allowed(candidate))
         {
-            continue;
+            candidates.push_back(candidate);
         }
-        if (std::find(candidates.begin(), candidates.end(), candidate) != candidates.end())
-        {
-            continue;
-        }
-
-        candidates.push_back(candidate);
     }
 
     return candidates;
@@ -1275,41 +2332,44 @@ std::vector<std::uint64_t> MetadataStore::ResolveInodeCheckpointBlockIndices() c
 std::vector<std::uint64_t> MetadataStore::ResolveBtreeCheckpointBlockIndices() const
 {
     std::vector<std::uint64_t> candidates;
-    auto volume_block = ResolveObjectBlockIndex(volume_root_block_);
-    if (!volume_block.has_value())
+    const auto band_start = ResolveNativeCheckpointBandStartBlock();
+    if (!band_start.has_value() ||
+        band_start.value() > (std::numeric_limits<std::uint64_t>::max() - kNativeBtreeCheckpointOffset))
     {
         return candidates;
     }
 
-    std::vector<std::uint64_t> disallowed
+    const auto primary = band_start.value() + kNativeBtreeCheckpointOffset;
+    for (std::uint64_t index = 0; index < (kNativeReplayCheckpointOffset - kNativeBtreeCheckpointOffset); ++index)
     {
-        volume_block.value(),
-        ResolveObjectBlockIndex(spaceman_object_id_).value_or(0)
-    };
+        const auto candidate = primary + index;
+        if (IsNativeCheckpointBandBlock(candidate))
+        {
+            candidates.push_back(candidate);
+        }
+    }
 
-    const auto object_map_slots = ResolveObjectMapCheckpointBlockIndices();
-    disallowed.insert(disallowed.end(), object_map_slots.begin(), object_map_slots.end());
-    const auto spaceman_slots = ResolveSpacemanCheckpointBlockIndices();
-    disallowed.insert(disallowed.end(), spaceman_slots.begin(), spaceman_slots.end());
-    const auto inode_slots = ResolveInodeCheckpointBlockIndices();
-    disallowed.insert(disallowed.end(), inode_slots.begin(), inode_slots.end());
-
-    for (std::uint64_t delta = 1; delta <= 96 && candidates.size() < 2; ++delta)
+    if (band_start.value() >= kNativeCheckpointExtensionBlocks)
     {
-        if (volume_block.value() > (std::numeric_limits<std::uint64_t>::max() - delta))
+        const auto extension_start = band_start.value() - kNativeCheckpointExtensionBlocks;
+        for (std::uint64_t index = 0; index < kNativeCheckpointExtensionBlocks; ++index)
         {
-            break;
-        }
+            if (extension_start > (std::numeric_limits<std::uint64_t>::max() - index))
+            {
+                break;
+            }
 
-        const auto candidate = volume_block.value() + delta;
-        if (candidate == 0 ||
-            IsReservedMetadataBlock(candidate) ||
-            std::find(disallowed.begin(), disallowed.end(), candidate) != disallowed.end())
-        {
-            continue;
+            const auto candidate = extension_start + kNativeBtreeExtensionOffset + index;
+            if (candidate >= band_start.value())
+            {
+                break;
+            }
+
+            if (IsNativeCheckpointBandBlock(candidate))
+            {
+                candidates.push_back(candidate);
+            }
         }
-        candidates.push_back(candidate);
-        disallowed.push_back(candidate);
     }
 
     return candidates;
@@ -1318,43 +2378,21 @@ std::vector<std::uint64_t> MetadataStore::ResolveBtreeCheckpointBlockIndices() c
 std::vector<std::uint64_t> MetadataStore::ResolveReplayCheckpointBlockIndices() const
 {
     std::vector<std::uint64_t> candidates;
-    auto volume_block = ResolveObjectBlockIndex(volume_root_block_);
-    if (!volume_block.has_value())
+    const auto band_start = ResolveNativeCheckpointBandStartBlock();
+    if (!band_start.has_value() ||
+        band_start.value() > (std::numeric_limits<std::uint64_t>::max() - kNativeReplayCheckpointOffset))
     {
         return candidates;
     }
 
-    std::vector<std::uint64_t> disallowed
+    const auto primary = band_start.value() + kNativeReplayCheckpointOffset;
+    for (std::uint64_t index = 0; index < 2; ++index)
     {
-        volume_block.value(),
-        ResolveObjectBlockIndex(spaceman_object_id_).value_or(0)
-    };
-
-    const auto object_map_slots = ResolveObjectMapCheckpointBlockIndices();
-    disallowed.insert(disallowed.end(), object_map_slots.begin(), object_map_slots.end());
-    const auto spaceman_slots = ResolveSpacemanCheckpointBlockIndices();
-    disallowed.insert(disallowed.end(), spaceman_slots.begin(), spaceman_slots.end());
-    const auto inode_slots = ResolveInodeCheckpointBlockIndices();
-    disallowed.insert(disallowed.end(), inode_slots.begin(), inode_slots.end());
-    const auto btree_slots = ResolveBtreeCheckpointBlockIndices();
-    disallowed.insert(disallowed.end(), btree_slots.begin(), btree_slots.end());
-
-    for (std::uint64_t delta = 1; delta <= 128 && candidates.size() < 2; ++delta)
-    {
-        if (volume_block.value() > (std::numeric_limits<std::uint64_t>::max() - delta))
+        const auto candidate = primary + index;
+        if (IsNativeCheckpointBandBlock(candidate))
         {
-            break;
+            candidates.push_back(candidate);
         }
-
-        const auto candidate = volume_block.value() + delta;
-        if (candidate == 0 ||
-            IsReservedMetadataBlock(candidate) ||
-            std::find(disallowed.begin(), disallowed.end(), candidate) != disallowed.end())
-        {
-            continue;
-        }
-        candidates.push_back(candidate);
-        disallowed.push_back(candidate);
     }
 
     return candidates;
@@ -1363,10 +2401,55 @@ std::vector<std::uint64_t> MetadataStore::ResolveReplayCheckpointBlockIndices() 
 bool MetadataStore::LoadObjectMapCheckpointBlock(std::uint64_t block_index, const std::vector<std::byte>& block)
 {
     (void)block_index;
+    constexpr std::array<char, 12> kMagic =
+    {
+        'A', 'P', 'F', 'S', 'R', 'W', 'O', 'M', 'A', 'P', '3', '\0'
+    };
+    if (block.size() < kCheckpointHeaderBytes)
+    {
+        return false;
+    }
+    auto payload_block = block;
+    const auto persisted_xid_hint = ReadLe64(block, 12);
+    const auto persisted_payload_bytes = ReadLe32(block, 24);
+    if (persisted_payload_bytes > (payload_block.size() - kCheckpointHeaderBytes))
+    {
+        const auto checkpoint_blocks = ResolveObjectMapCheckpointBlockIndices();
+        payload_block = ReadChunkedCheckpointBytes(
+            checkpoint_blocks,
+            persisted_xid_hint,
+            kMagic,
+            persisted_payload_bytes);
+        if (payload_block.empty())
+        {
+            auto legacy_blocks = ResolveLegacyContiguousCheckpointBlocks(
+                ResolveNativeCheckpointBandStartBlock(),
+                kNativeObjectMapCheckpointOffset,
+                kNativeSpacemanCheckpointOffset - kNativeObjectMapCheckpointOffset,
+                [this](std::uint64_t candidate)
+                {
+                    return IsNativeCheckpointBandBlock(candidate);
+                });
+            payload_block = ReadChunkedCheckpointBytes(
+                legacy_blocks,
+                persisted_xid_hint,
+                kMagic,
+                persisted_payload_bytes);
+            if (payload_block.empty())
+            {
+                return false;
+            }
+        }
+    }
+
     ApfsObjectMapStore object_map_store;
     std::vector<ApfsObjectMapEntry> parsed_entries;
     std::uint64_t persisted_xid = 0;
-    if (!object_map_store.TryParseCheckpointV3(block, parsed_entries, persisted_xid))
+    if (!object_map_store.TryParseCheckpointV3(payload_block, parsed_entries, persisted_xid))
+    {
+        return false;
+    }
+    if (!CanLoadNativeCheckpointXid(persisted_xid))
     {
         return false;
     }
@@ -1396,15 +2479,52 @@ bool MetadataStore::LoadObjectMapCheckpointBlock(std::uint64_t block_index, cons
 bool MetadataStore::LoadSpacemanCheckpointBlock(std::uint64_t block_index, const std::vector<std::byte>& block)
 {
     (void)block_index;
+    constexpr std::array<char, 12> kMagic =
+    {
+        'A', 'P', 'F', 'S', 'R', 'W', 'S', 'P', 'M', '3', '\0', '\0'
+    };
+    if (block.size() < kCheckpointHeaderBytes)
+    {
+        return false;
+    }
+
+    auto payload_block = block;
+    const auto persisted_xid_hint = ReadLe64(block, 12);
+    const auto allocation_count = ReadLe32(block, 20);
+    const auto free_extent_count = ReadLe32(block, 24);
+    const auto total_records = static_cast<std::uint64_t>(allocation_count) + static_cast<std::uint64_t>(free_extent_count);
+    if (total_records > (std::numeric_limits<std::uint32_t>::max() / 16u))
+    {
+        return false;
+    }
+    const auto persisted_payload_bytes = static_cast<std::uint32_t>(total_records * 16u);
+    if (persisted_payload_bytes > (payload_block.size() - kCheckpointHeaderBytes))
+    {
+        const auto checkpoint_blocks = ResolveSpacemanCheckpointBlockIndices();
+        payload_block = ReadChunkedCheckpointBytes(
+            checkpoint_blocks,
+            persisted_xid_hint,
+            kMagic,
+            persisted_payload_bytes);
+        if (payload_block.empty())
+        {
+            return false;
+        }
+    }
+
     ApfsSpacemanStore spaceman_store;
     std::vector<ApfsExtent> parsed_allocations;
     std::vector<ApfsExtent> parsed_free_extents;
     std::uint64_t persisted_xid = 0;
     if (!spaceman_store.TryParseCheckpointV3(
-            block,
+            payload_block,
             parsed_allocations,
             parsed_free_extents,
             persisted_xid))
+    {
+        return false;
+    }
+    if (!CanLoadNativeCheckpointXid(persisted_xid))
     {
         return false;
     }
@@ -1443,38 +2563,11 @@ bool MetadataStore::LoadSpacemanCheckpointBlock(std::uint64_t block_index, const
             });
     }
 
-    std::sort(
-        committed_spaceman_free_extents_.begin(),
-        committed_spaceman_free_extents_.end(),
-        [](const SpacemanAllocation& lhs, const SpacemanAllocation& rhs)
-        {
-            return lhs.physical_address < rhs.physical_address;
-        });
-
-    std::vector<SpacemanAllocation> merged_free_extents;
-    merged_free_extents.reserve(committed_spaceman_free_extents_.size());
-    for (const auto& extent : committed_spaceman_free_extents_)
+    if (!NormalizeSpacemanExtents(committed_spaceman_allocations_) ||
+        !NormalizeSpacemanExtents(committed_spaceman_free_extents_))
     {
-        if (merged_free_extents.empty())
-        {
-            merged_free_extents.push_back(extent);
-            continue;
-        }
-
-        auto& previous = merged_free_extents.back();
-        const auto previous_end = previous.physical_address + previous.bytes;
-        const auto current_end = extent.physical_address + extent.bytes;
-        if (extent.physical_address <= previous_end)
-        {
-            if (current_end > previous_end)
-            {
-                previous.bytes = current_end - previous.physical_address;
-            }
-            continue;
-        }
-        merged_free_extents.push_back(extent);
+        return false;
     }
-    committed_spaceman_free_extents_ = std::move(merged_free_extents);
 
     for (const auto& allocation : committed_spaceman_allocations_)
     {
@@ -1490,6 +2583,580 @@ bool MetadataStore::LoadSpacemanCheckpointBlock(std::uint64_t block_index, const
     if (persisted_xid > 0)
     {
         last_committed_xid_ = std::max(last_committed_xid_.value_or(0), persisted_xid);
+    }
+
+    return true;
+}
+
+bool MetadataStore::LoadSpacemanChunkInfoState(std::uint64_t spaceman_block_index, const std::vector<std::byte>& block)
+{
+    (void)spaceman_block_index;
+    if (!container_loaded_ || block_size_ == 0 || total_blocks_ == 0 || block.size() < 0x60)
+    {
+        return false;
+    }
+
+    constexpr std::size_t kObjectTypeOffset = 0x18;
+    constexpr std::size_t kBlockSizeOffset = 0x20;
+    constexpr std::size_t kBlocksPerChunkOffset = 0x24;
+    constexpr std::size_t kChunksPerCibOffset = 0x28;
+    constexpr std::size_t kCibsPerCabOffset = 0x2C;
+    constexpr std::size_t kMainDeviceOffset = 0x30;
+    constexpr std::size_t kDeviceBlockCountOffset = 0x00;
+    constexpr std::size_t kDeviceChunkCountOffset = 0x08;
+    constexpr std::size_t kDeviceCibCountOffset = 0x10;
+    constexpr std::size_t kDeviceCabCountOffset = 0x14;
+    constexpr std::size_t kDeviceFreeCountOffset = 0x18;
+    constexpr std::size_t kDeviceAddrOffsetOffset = 0x20;
+    constexpr std::size_t kCibHeaderBytes = 0x28;
+    constexpr std::size_t kCabHeaderBytes = 0x28;
+    constexpr std::size_t kChunkInfoBytes = 0x20;
+    constexpr std::size_t kChunkInfoXidOffset = 0x00;
+    constexpr std::size_t kChunkInfoAddressOffset = 0x08;
+    constexpr std::size_t kChunkInfoBlockCountOffset = 0x10;
+    constexpr std::size_t kChunkInfoFreeCountOffset = 0x14;
+    constexpr std::size_t kChunkInfoBitmapAddressOffset = 0x18;
+    constexpr std::uint32_t kObjectTypeMask = 0x0000FFFF;
+    constexpr std::uint32_t kObjectTypeSpaceman = 0x00000005;
+    constexpr std::uint32_t kObjectTypeChunkInfoAddress = 0x00000006;
+    constexpr std::uint32_t kObjectTypeChunkInfo = 0x00000007;
+
+    if ((ReadLe32(block, kObjectTypeOffset) & kObjectTypeMask) != kObjectTypeSpaceman)
+    {
+        if (IsReadTraceEnabled())
+        {
+            std::wcerr << L"[MetadataStore] Spaceman chunk-info parse failed"
+                       << L" reason=SpacemanHeader"
+                       << L" type=" << (ReadLe32(block, kObjectTypeOffset) & kObjectTypeMask)
+                       << std::endl;
+        }
+        return false;
+    }
+
+    const auto sm_block_size = ReadLe32(block, kBlockSizeOffset);
+    const auto blocks_per_chunk = ReadLe32(block, kBlocksPerChunkOffset);
+    const auto chunks_per_cib = ReadLe32(block, kChunksPerCibOffset);
+    const auto cibs_per_cab = ReadLe32(block, kCibsPerCabOffset);
+    const auto device_block_count = ReadLe64(block, kMainDeviceOffset + kDeviceBlockCountOffset);
+    const auto device_chunk_count = ReadLe64(block, kMainDeviceOffset + kDeviceChunkCountOffset);
+    const auto device_cib_count = ReadLe32(block, kMainDeviceOffset + kDeviceCibCountOffset);
+    const auto device_cab_count = ReadLe32(block, kMainDeviceOffset + kDeviceCabCountOffset);
+    const auto device_free_count = ReadLe64(block, kMainDeviceOffset + kDeviceFreeCountOffset);
+    const auto device_addr_offset = ReadLe32(block, kMainDeviceOffset + kDeviceAddrOffsetOffset);
+
+    if (sm_block_size != block_size_ ||
+        blocks_per_chunk == 0 ||
+        chunks_per_cib == 0 ||
+        cibs_per_cab == 0 ||
+        device_chunk_count == 0 ||
+        device_cib_count == 0 ||
+        device_cib_count > 4096 ||
+        device_cab_count > 4096 ||
+        device_chunk_count > static_cast<std::uint64_t>(device_cib_count) * static_cast<std::uint64_t>(chunks_per_cib) ||
+        device_block_count == 0 ||
+        device_block_count > total_blocks_ ||
+        device_free_count > device_block_count)
+    {
+        if (IsReadTraceEnabled())
+        {
+            std::wcerr << L"[MetadataStore] Spaceman chunk-info parse failed"
+                       << L" reason=DeviceSummary"
+                       << L" smBlockSize=" << sm_block_size
+                       << L" blocksPerChunk=" << blocks_per_chunk
+                       << L" chunksPerCib=" << chunks_per_cib
+                       << L" cibsPerCab=" << cibs_per_cab
+                       << L" blockCount=" << device_block_count
+                       << L" chunkCount=" << device_chunk_count
+                       << L" cibCount=" << device_cib_count
+                       << L" cabCount=" << device_cab_count
+                       << L" freeCount=" << device_free_count
+                       << L" addrOffset=" << device_addr_offset
+                       << std::endl;
+        }
+        return false;
+    }
+    if (blocks_per_chunk > (std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(block_size_)))
+    {
+        return false;
+    }
+    if (static_cast<std::uint64_t>(blocks_per_chunk) > (std::numeric_limits<std::size_t>::max() * 8ull))
+    {
+        return false;
+    }
+
+    std::vector<SpacemanAllocation> parsed_allocations;
+    std::vector<SpacemanAllocation> parsed_free_extents;
+    parsed_allocations.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(device_chunk_count, 4096)));
+    parsed_free_extents.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(device_chunk_count, 4096)));
+
+    const auto push_extent = [](std::vector<SpacemanAllocation>& extents, std::uint64_t physical_address, std::uint64_t bytes) -> bool
+    {
+        if (bytes == 0)
+        {
+            return true;
+        }
+        if (physical_address > (std::numeric_limits<std::uint64_t>::max() - bytes))
+        {
+            return false;
+        }
+        if (!extents.empty())
+        {
+            auto& previous = extents.back();
+            if (previous.physical_address <= (std::numeric_limits<std::uint64_t>::max() - previous.bytes) &&
+                previous.physical_address + previous.bytes == physical_address)
+            {
+                if (previous.bytes > (std::numeric_limits<std::uint64_t>::max() - bytes))
+                {
+                    return false;
+                }
+                previous.bytes += bytes;
+                return true;
+            }
+        }
+        extents.push_back(SpacemanAllocation{ physical_address, bytes });
+        return true;
+    };
+
+    const auto record_run = [&](std::uint64_t chunk_start_block, std::uint64_t start_in_chunk, std::uint64_t block_count, bool allocated) -> bool
+    {
+        if (block_count == 0)
+        {
+            return true;
+        }
+        if (start_in_chunk > static_cast<std::uint64_t>(blocks_per_chunk) ||
+            block_count > (static_cast<std::uint64_t>(blocks_per_chunk) - start_in_chunk) ||
+            chunk_start_block > (std::numeric_limits<std::uint64_t>::max() - start_in_chunk))
+        {
+            return false;
+        }
+        const auto start_block = chunk_start_block + start_in_chunk;
+        if (start_block > (std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(block_size_)) ||
+            block_count > (std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(block_size_)))
+        {
+            return false;
+        }
+        const auto physical_address = start_block * static_cast<std::uint64_t>(block_size_);
+        const auto bytes = block_count * static_cast<std::uint64_t>(block_size_);
+        if (physical_address == 0 && bytes > 0)
+        {
+            if (bytes == static_cast<std::uint64_t>(block_size_))
+            {
+                return true;
+            }
+            return push_extent(
+                allocated ? parsed_allocations : parsed_free_extents,
+                static_cast<std::uint64_t>(block_size_),
+                bytes - static_cast<std::uint64_t>(block_size_));
+        }
+        return push_extent(allocated ? parsed_allocations : parsed_free_extents, physical_address, bytes);
+    };
+
+    std::uint64_t parsed_chunk_count = 0;
+    std::uint64_t parsed_free_blocks = 0;
+    std::vector<std::uint64_t> cib_block_indices;
+    cib_block_indices.reserve(device_cib_count);
+
+    const auto read_address_from_spaceman = [&](std::uint32_t index, std::uint64_t& out_block_index) -> bool
+    {
+        const auto address_offset = static_cast<std::size_t>(device_addr_offset) +
+            static_cast<std::size_t>(index) * sizeof(std::uint64_t);
+        if (address_offset > block.size() || sizeof(std::uint64_t) > (block.size() - address_offset))
+        {
+            return false;
+        }
+
+        out_block_index = ReadLe64(block, address_offset);
+        return out_block_index != 0 && out_block_index < total_blocks_;
+    };
+
+    if (device_cab_count == 0)
+    {
+        for (std::uint32_t cib_index = 0; cib_index < device_cib_count; ++cib_index)
+        {
+            std::uint64_t cib_block_index = 0;
+            if (!read_address_from_spaceman(cib_index, cib_block_index))
+            {
+                if (IsReadTraceEnabled())
+                {
+                    std::wcerr << L"[MetadataStore] Spaceman chunk-info parse failed"
+                               << L" reason=CibBlockAddress"
+                               << L" cibIndex=" << cib_index
+                               << L" cibBlock=" << cib_block_index
+                               << std::endl;
+                }
+                return false;
+            }
+            cib_block_indices.push_back(cib_block_index);
+        }
+    }
+    else
+    {
+        for (std::uint32_t cab_index = 0; cab_index < device_cab_count; ++cab_index)
+        {
+            std::uint64_t cab_block_index = 0;
+            if (!read_address_from_spaceman(cab_index, cab_block_index))
+            {
+                if (IsReadTraceEnabled())
+                {
+                    std::wcerr << L"[MetadataStore] Spaceman chunk-info parse failed"
+                               << L" reason=CabBlockAddress"
+                               << L" cabIndex=" << cab_index
+                               << L" cabBlock=" << cab_block_index
+                               << std::endl;
+                }
+                return false;
+            }
+
+            std::vector<std::byte> cab_block;
+            if (!ReadBlockByIndexDirect(cab_block_index, cab_block) ||
+                cab_block.size() < kCabHeaderBytes)
+            {
+                return false;
+            }
+
+            const auto cab_type = ReadLe32(cab_block, 0x18) & kObjectTypeMask;
+            const auto stored_cab_index = ReadLe32(cab_block, 0x20);
+            const auto cab_cib_count = ReadLe32(cab_block, 0x24);
+            if (cab_type != kObjectTypeChunkInfoAddress ||
+                stored_cab_index != cab_index ||
+                cab_cib_count == 0 ||
+                cab_cib_count > cibs_per_cab ||
+                kCabHeaderBytes + (static_cast<std::size_t>(cab_cib_count) * sizeof(std::uint64_t)) > cab_block.size())
+            {
+                if (IsReadTraceEnabled())
+                {
+                    std::wcerr << L"[MetadataStore] Spaceman chunk-info parse failed"
+                               << L" reason=CabHeader"
+                               << L" cabIndex=" << cab_index
+                               << L" cabType=" << cab_type
+                               << L" storedIndex=" << stored_cab_index
+                               << L" cibCount=" << cab_cib_count
+                               << std::endl;
+                }
+                return false;
+            }
+
+            for (std::uint32_t index = 0; index < cab_cib_count; ++index)
+            {
+                const auto entry_offset = kCabHeaderBytes + static_cast<std::size_t>(index) * sizeof(std::uint64_t);
+                const auto cib_block_index = ReadLe64(cab_block, entry_offset);
+                if (cib_block_index == 0 || cib_block_index >= total_blocks_)
+                {
+                    if (IsReadTraceEnabled())
+                    {
+                        std::wcerr << L"[MetadataStore] Spaceman chunk-info parse failed"
+                                   << L" reason=CabCibBlockAddress"
+                                   << L" cabIndex=" << cab_index
+                                   << L" cibIndex=" << index
+                                   << L" cibBlock=" << cib_block_index
+                                   << std::endl;
+                    }
+                    return false;
+                }
+                cib_block_indices.push_back(cib_block_index);
+            }
+        }
+
+        if (cib_block_indices.size() != device_cib_count)
+        {
+            if (IsReadTraceEnabled())
+            {
+                std::wcerr << L"[MetadataStore] Spaceman chunk-info parse failed"
+                           << L" reason=CabCibCount"
+                           << L" parsedCibs=" << cib_block_indices.size()
+                           << L" expectedCibs=" << device_cib_count
+                           << std::endl;
+            }
+            return false;
+        }
+    }
+
+    for (std::uint32_t cib_index = 0; cib_index < device_cib_count; ++cib_index)
+    {
+        const auto cib_block_index = cib_block_indices[static_cast<std::size_t>(cib_index)];
+        std::vector<std::byte> cib_block;
+        if (!ReadBlockByIndexDirect(cib_block_index, cib_block) ||
+            cib_block.size() < kCibHeaderBytes)
+        {
+            return false;
+        }
+
+        const auto cib_type = ReadLe32(cib_block, 0x18) & kObjectTypeMask;
+        const auto stored_cib_index = ReadLe32(cib_block, 0x20);
+        const auto chunk_info_count = ReadLe32(cib_block, 0x24);
+        if (cib_type != kObjectTypeChunkInfo ||
+            stored_cib_index != cib_index ||
+            chunk_info_count == 0 ||
+            chunk_info_count > chunks_per_cib ||
+            kCibHeaderBytes + (static_cast<std::size_t>(chunk_info_count) * kChunkInfoBytes) > cib_block.size())
+        {
+            if (IsReadTraceEnabled())
+            {
+                std::wcerr << L"[MetadataStore] Spaceman chunk-info parse failed"
+                           << L" reason=CibHeader"
+                           << L" cibIndex=" << cib_index
+                           << L" cibType=" << cib_type
+                           << L" storedIndex=" << stored_cib_index
+                           << L" chunkCount=" << chunk_info_count
+                           << std::endl;
+            }
+            return false;
+        }
+
+        for (std::uint32_t chunk_info_index = 0; chunk_info_index < chunk_info_count; ++chunk_info_index)
+        {
+            const auto entry_offset = kCibHeaderBytes + static_cast<std::size_t>(chunk_info_index) * kChunkInfoBytes;
+            const auto ci_xid = ReadLe64(cib_block, entry_offset + kChunkInfoXidOffset);
+            const auto ci_addr = ReadLe64(cib_block, entry_offset + kChunkInfoAddressOffset);
+            const auto ci_block_count = ReadLe32(cib_block, entry_offset + kChunkInfoBlockCountOffset);
+            const auto ci_free_count = ReadLe32(cib_block, entry_offset + kChunkInfoFreeCountOffset);
+            const auto ci_bitmap_addr = ReadLe64(cib_block, entry_offset + kChunkInfoBitmapAddressOffset);
+
+            if (ci_xid == 0 ||
+                ci_block_count == 0 ||
+                ci_block_count > blocks_per_chunk ||
+                ci_free_count > ci_block_count ||
+                ci_addr >= total_blocks_ ||
+                ci_block_count > (total_blocks_ - ci_addr))
+            {
+                if (IsReadTraceEnabled())
+                {
+                    std::wcerr << L"[MetadataStore] Spaceman chunk-info parse failed"
+                               << L" reason=ChunkInfo"
+                               << L" cibIndex=" << cib_index
+                               << L" chunkIndex=" << chunk_info_index
+                               << L" xid=" << ci_xid
+                               << L" addr=" << ci_addr
+                               << L" blocks=" << ci_block_count
+                               << L" free=" << ci_free_count
+                               << L" bitmap=" << ci_bitmap_addr
+                               << std::endl;
+                }
+                return false;
+            }
+
+            ++parsed_chunk_count;
+            parsed_free_blocks += ci_free_count;
+
+            if (ci_free_count == ci_block_count)
+            {
+                if (!record_run(ci_addr, 0, ci_block_count, false))
+                {
+                    return false;
+                }
+                continue;
+            }
+
+            if (ci_free_count == 0 && ci_bitmap_addr == 0)
+            {
+                if (!record_run(ci_addr, 0, ci_block_count, true))
+                {
+                    return false;
+                }
+                continue;
+            }
+
+            if (ci_bitmap_addr == 0 || ci_bitmap_addr >= total_blocks_)
+            {
+                if (IsReadTraceEnabled())
+                {
+                    std::wcerr << L"[MetadataStore] Spaceman chunk-info parse failed"
+                               << L" reason=BitmapAddress"
+                               << L" cibIndex=" << cib_index
+                               << L" chunkIndex=" << chunk_info_index
+                               << L" bitmap=" << ci_bitmap_addr
+                               << std::endl;
+                }
+                return false;
+            }
+
+            std::vector<std::byte> bitmap;
+            if (!ReadBlockByIndexDirect(ci_bitmap_addr, bitmap))
+            {
+                return false;
+            }
+            const auto bytes_needed = static_cast<std::size_t>((static_cast<std::uint64_t>(ci_block_count) + 7ull) / 8ull);
+            if (bytes_needed == 0 || bytes_needed > bitmap.size())
+            {
+                return false;
+            }
+
+            bool current_allocated = (std::to_integer<unsigned char>(bitmap[0]) & 0x1u) != 0;
+            std::uint64_t run_start = 0;
+            std::uint64_t counted_free = 0;
+            const auto free_count_from_bitmap = [&]() -> std::uint64_t
+            {
+                std::uint64_t value = 0;
+                for (std::uint32_t bit_index = 0; bit_index < ci_block_count; ++bit_index)
+                {
+                    const auto byte_value = std::to_integer<unsigned char>(bitmap[static_cast<std::size_t>(bit_index / 8u)]);
+                    const bool allocated = ((byte_value >> (bit_index % 8u)) & 0x1u) != 0;
+                    if (!allocated)
+                    {
+                        ++value;
+                    }
+                }
+                return value;
+            }();
+            const auto suppressed_free_bits = free_count_from_bitmap > ci_free_count
+                ? free_count_from_bitmap - static_cast<std::uint64_t>(ci_free_count)
+                : 0;
+            std::uint64_t suppressed_so_far = 0;
+            if (free_count_from_bitmap < ci_free_count)
+            {
+                if (IsReadTraceEnabled())
+                {
+                    std::wcerr << L"[MetadataStore] Spaceman chunk-info parse failed"
+                               << L" reason=BitmapFreeCount"
+                               << L" cibIndex=" << cib_index
+                               << L" chunkIndex=" << chunk_info_index
+                               << L" countedFree=" << free_count_from_bitmap
+                               << L" expectedFree=" << ci_free_count
+                               << std::endl;
+                }
+                return false;
+            }
+
+            for (std::uint32_t bit_index = 0; bit_index < ci_block_count; ++bit_index)
+            {
+                const auto byte_value = std::to_integer<unsigned char>(bitmap[static_cast<std::size_t>(bit_index / 8u)]);
+                bool allocated = ((byte_value >> (bit_index % 8u)) & 0x1u) != 0;
+                if (!allocated && suppressed_so_far < suppressed_free_bits)
+                {
+                    allocated = true;
+                    ++suppressed_so_far;
+                }
+                if (!allocated)
+                {
+                    ++counted_free;
+                }
+                if (allocated == current_allocated)
+                {
+                    continue;
+                }
+                if (!record_run(ci_addr, run_start, static_cast<std::uint64_t>(bit_index) - run_start, current_allocated))
+                {
+                    return false;
+                }
+                current_allocated = allocated;
+                run_start = bit_index;
+            }
+            if (!record_run(ci_addr, run_start, static_cast<std::uint64_t>(ci_block_count) - run_start, current_allocated))
+            {
+                return false;
+            }
+            if (counted_free != ci_free_count)
+            {
+                if (IsReadTraceEnabled())
+                {
+                    std::wcerr << L"[MetadataStore] Spaceman chunk-info parse failed"
+                               << L" reason=BitmapFreeCount"
+                               << L" cibIndex=" << cib_index
+                               << L" chunkIndex=" << chunk_info_index
+                               << L" countedFree=" << counted_free
+                               << L" expectedFree=" << ci_free_count
+                               << std::endl;
+                }
+                return false;
+            }
+        }
+    }
+
+    if (parsed_chunk_count != device_chunk_count ||
+        parsed_free_blocks != device_free_count)
+    {
+        if (IsReadTraceEnabled())
+        {
+            std::wcerr << L"[MetadataStore] Spaceman chunk-info parse failed"
+                       << L" reason=SummaryMismatch"
+                       << L" parsedChunks=" << parsed_chunk_count
+                       << L" expectedChunks=" << device_chunk_count
+                       << L" parsedFree=" << parsed_free_blocks
+                       << L" expectedFree=" << device_free_count
+                       << std::endl;
+        }
+        return false;
+    }
+
+    committed_spaceman_allocations_ = std::move(parsed_allocations);
+    committed_spaceman_free_extents_ = std::move(parsed_free_extents);
+    working_spaceman_free_extents_ = committed_spaceman_free_extents_;
+    working_next_ephemeral_extent_ = next_ephemeral_extent_;
+    if (IsReadTraceEnabled())
+    {
+        std::wcerr << L"[MetadataStore] Spaceman chunk-info parse loaded"
+                   << L" chunks=" << parsed_chunk_count
+                   << L" freeBlocks=" << parsed_free_blocks
+                   << L" allocations=" << committed_spaceman_allocations_.size()
+                   << L" freeExtents=" << committed_spaceman_free_extents_.size()
+                   << std::endl;
+    }
+    return true;
+}
+
+bool MetadataStore::RefreshNativeReadExtentProjection()
+{
+    if (!IsLikelyRawDevicePath(context_.device_path))
+    {
+        return true;
+    }
+
+    NativeApfsVolumeProjection projection{};
+    std::wstring projection_error;
+    if (!NativeApfsReader::TryLoadVolumeProjection(
+            device_,
+            0,
+            projection,
+            projection_error))
+    {
+        return false;
+    }
+
+    std::unordered_map<std::wstring, std::uint64_t> native_path_to_object_id;
+    native_path_to_object_id.reserve(projection.inodes.size());
+    for (const auto& inode : projection.inodes)
+    {
+        if (!inode.is_directory && inode.logical_size > 0)
+        {
+            native_path_to_object_id[CanonicalPathKey(inode.full_path)] = inode.object_id;
+        }
+    }
+
+    for (auto& [native_object_id, extents] : projection.read_extents_by_inode)
+    {
+        auto native_inode_it = std::find_if(
+            projection.inodes.begin(),
+            projection.inodes.end(),
+            [native_object_id](const InodeRecord& inode)
+            {
+                return inode.object_id == native_object_id;
+            });
+        if (native_inode_it == projection.inodes.end() ||
+            native_inode_it->is_directory ||
+            native_inode_it->logical_size == 0)
+        {
+            continue;
+        }
+
+        const auto path_key = CanonicalPathKey(native_inode_it->full_path);
+        const auto committed_path_it = committed_path_index_.find(path_key);
+        if (committed_path_it == committed_path_index_.end())
+        {
+            continue;
+        }
+
+        const auto committed_inode_it = committed_inodes_.find(committed_path_it->second);
+        if (committed_inode_it == committed_inodes_.end() ||
+            committed_inode_it->second.is_directory ||
+            committed_inode_it->second.logical_size != native_inode_it->logical_size)
+        {
+            continue;
+        }
+
+        if (!SetCommittedReadExtents(committed_inode_it->first, std::move(extents)))
+        {
+            committed_read_extents_.erase(committed_inode_it->first);
+        }
     }
 
     return true;
@@ -1517,9 +3184,14 @@ bool MetadataStore::LoadInodeCheckpointBlock(std::uint64_t block_index, const st
     {
         'A', 'P', 'F', 'S', 'R', 'W', 'I', 'N', 'O', 'D', '5', '\0'
     };
+    constexpr std::array<char, 12> kMagicV6 =
+    {
+        'A', 'P', 'F', 'S', 'R', 'W', 'I', 'N', 'O', 'D', '6', '\0'
+    };
     constexpr std::size_t kHeaderBytes = kCheckpointHeaderBytes;
     constexpr std::size_t kRecordFixedBytesV4 = 52;
     constexpr std::size_t kRecordFixedBytesV5 = 60;
+    constexpr std::size_t kRecordFixedBytesV6 = 60;
     if (block.size() < kHeaderBytes)
     {
         return false;
@@ -1536,17 +3208,52 @@ bool MetadataStore::LoadInodeCheckpointBlock(std::uint64_t block_index, const st
         }
         return true;
     };
-    const auto has_persisted_timestamp = matches_magic(kMagicV5);
-    if (!has_persisted_timestamp && !matches_magic(kMagicV4))
+    const auto has_compact_parent_name_paths = matches_magic(kMagicV6);
+    const auto has_persisted_timestamp = has_compact_parent_name_paths || matches_magic(kMagicV5);
+    if (!has_persisted_timestamp && !has_compact_parent_name_paths && !matches_magic(kMagicV4))
     {
         return false;
     }
-    const auto kRecordFixedBytes = has_persisted_timestamp ? kRecordFixedBytesV5 : kRecordFixedBytesV4;
+    const auto kRecordFixedBytes = has_compact_parent_name_paths
+        ? kRecordFixedBytesV6
+        : (has_persisted_timestamp ? kRecordFixedBytesV5 : kRecordFixedBytesV4);
 
     const auto persisted_xid = ReadLe64(block, 12);
+    if (!CanLoadNativeCheckpointXid(persisted_xid))
+    {
+        return false;
+    }
     const auto inode_count = ReadLe32(block, 20);
     const auto persisted_payload_bytes = ReadLe32(block, 24);
     const auto persisted_checksum = ReadLe32(block, kCheckpointChecksumOffset);
+    auto payload_block = block;
+    if (persisted_payload_bytes > (payload_block.size() - kHeaderBytes))
+    {
+        const auto chunk_magic = has_compact_parent_name_paths
+            ? kMagicV6
+            : (has_persisted_timestamp ? kMagicV5 : kMagicV4);
+        payload_block = ReadChunkedCheckpointBytes(
+            ResolveInodeCheckpointBlockIndices(),
+            persisted_xid,
+            chunk_magic,
+            persisted_payload_bytes);
+        if (payload_block.empty())
+        {
+            auto legacy_blocks = ResolveLegacyContiguousCheckpointBlocks(
+                ResolveNativeCheckpointBandStartBlock(),
+                kNativeInodeCheckpointOffset,
+                12,
+                [this](std::uint64_t candidate)
+                {
+                    return IsNativeCheckpointBandBlock(candidate);
+                });
+            payload_block = ReadChunkedCheckpointBytes(legacy_blocks, persisted_xid, chunk_magic, persisted_payload_bytes);
+            if (payload_block.empty())
+            {
+                return false;
+            }
+        }
+    }
 
     std::unordered_map<std::uint64_t, InodeRecord> loaded_inodes;
     std::unordered_map<std::wstring, std::uint64_t> loaded_path_index;
@@ -1558,31 +3265,31 @@ bool MetadataStore::LoadInodeCheckpointBlock(std::uint64_t block_index, const st
     std::size_t cursor = kHeaderBytes;
     for (std::uint32_t index = 0; index < inode_count; ++index)
     {
-        if (cursor > block.size() ||
-            kRecordFixedBytes > (block.size() - cursor))
+        if (cursor > payload_block.size() ||
+            kRecordFixedBytes > (payload_block.size() - cursor))
         {
             return false;
         }
 
         InodeRecord inode{};
-        inode.object_id = ReadLe64(block, cursor + 0);
-        inode.parent_object_id = ReadLe64(block, cursor + 8);
-        inode.logical_size = ReadLe64(block, cursor + 16);
-        inode.data_physical_address = ReadLe64(block, cursor + 24);
-        inode.xid = ReadLe64(block, cursor + 32);
+        inode.object_id = ReadLe64(payload_block, cursor + 0);
+        inode.parent_object_id = ReadLe64(payload_block, cursor + 8);
+        inode.logical_size = ReadLe64(payload_block, cursor + 16);
+        inode.data_physical_address = ReadLe64(payload_block, cursor + 24);
+        inode.xid = ReadLe64(payload_block, cursor + 32);
         std::size_t flags_offset = cursor + 40;
         std::size_t name_length_offset = cursor + 44;
         std::size_t path_length_offset = cursor + 48;
         if (has_persisted_timestamp)
         {
-            inode.timestamp_utc = ReadLe64(block, cursor + 40);
+            inode.timestamp_utc = ReadLe64(payload_block, cursor + 40);
             flags_offset += 8;
             name_length_offset += 8;
             path_length_offset += 8;
         }
-        const auto flags = ReadLe32(block, flags_offset);
-        const auto name_length = ReadLe32(block, name_length_offset);
-        const auto path_length = ReadLe32(block, path_length_offset);
+        const auto flags = ReadLe32(payload_block, flags_offset);
+        const auto name_length = ReadLe32(payload_block, name_length_offset);
+        const auto path_length = ReadLe32(payload_block, path_length_offset);
         cursor += kRecordFixedBytes;
 
         const auto name_bytes = static_cast<std::uint64_t>(name_length) * static_cast<std::uint64_t>(sizeof(wchar_t));
@@ -1593,7 +3300,7 @@ bool MetadataStore::LoadInodeCheckpointBlock(std::uint64_t block_index, const st
             return false;
         }
         const auto required_bytes = static_cast<std::size_t>(name_bytes + path_bytes);
-        if (required_bytes > (block.size() - cursor))
+        if (required_bytes > (payload_block.size() - cursor))
         {
             return false;
         }
@@ -1602,25 +3309,29 @@ bool MetadataStore::LoadInodeCheckpointBlock(std::uint64_t block_index, const st
         inode.name.resize(name_length);
         if (name_bytes > 0)
         {
-            std::memcpy(inode.name.data(), block.data() + cursor, static_cast<std::size_t>(name_bytes));
+            std::memcpy(inode.name.data(), payload_block.data() + cursor, static_cast<std::size_t>(name_bytes));
         }
         cursor += static_cast<std::size_t>(name_bytes);
         inode.full_path.resize(path_length);
         if (path_bytes > 0)
         {
-            std::memcpy(inode.full_path.data(), block.data() + cursor, static_cast<std::size_t>(path_bytes));
+            std::memcpy(inode.full_path.data(), payload_block.data() + cursor, static_cast<std::size_t>(path_bytes));
         }
         cursor += static_cast<std::size_t>(path_bytes);
 
-        if (inode.object_id == 0 || inode.full_path.empty())
+        if (inode.object_id == 0 || (!has_compact_parent_name_paths && inode.full_path.empty()))
         {
             return false;
         }
-        if (NormalizePath(inode.full_path) != inode.full_path)
+        if (!inode.full_path.empty() && NormalizePath(inode.full_path) != inode.full_path)
         {
             return false;
         }
-        if (!inode.is_directory && inode.logical_size > 0 && inode.data_physical_address == 0)
+        if (!inode.is_directory &&
+            inode.logical_size > 0 &&
+            inode.data_physical_address == 0 &&
+            !committed_read_extents_.contains(inode.object_id) &&
+            !(context_.allow_raw_physical_write && IsLikelyRawDevicePath(context_.device_path)))
         {
             return false;
         }
@@ -1635,22 +3346,25 @@ bool MetadataStore::LoadInodeCheckpointBlock(std::uint64_t block_index, const st
             return false;
         }
 
-        const auto canonical_path = CanonicalPathKey(inode.full_path);
-        auto [path_it, path_inserted] = loaded_path_index.emplace(canonical_path, inode.object_id);
-        if (!path_inserted && path_it->second != inode.object_id)
+        if (!has_compact_parent_name_paths)
         {
-            return false;
-        }
-
-        if (!IsRootPath(inode.full_path))
-        {
-            loaded_directory_links.push_back(DirectoryLink
+            const auto canonical_path = CanonicalPathKey(inode.full_path);
+            auto [path_it, path_inserted] = loaded_path_index.emplace(canonical_path, inode.object_id);
+            if (!path_inserted && path_it->second != inode.object_id)
             {
-                inode.parent_object_id,
-                inode.name,
-                inode.object_id,
-                inode.xid
-            });
+                return false;
+            }
+
+            if (!IsRootPath(inode.full_path))
+            {
+                loaded_directory_links.push_back(DirectoryLink
+                {
+                    inode.parent_object_id,
+                    inode.name,
+                    inode.object_id,
+                    inode.xid
+                });
+            }
         }
     }
 
@@ -1661,9 +3375,136 @@ bool MetadataStore::LoadInodeCheckpointBlock(std::uint64_t block_index, const st
         return false;
     }
     if (persisted_checksum != 0 &&
-        ComputeCheckpointChecksum(block, payload_bytes) != persisted_checksum)
+        ComputeCheckpointChecksum(payload_block, payload_bytes) != persisted_checksum)
     {
         return false;
+    }
+
+    if (has_compact_parent_name_paths)
+    {
+        std::optional<std::uint64_t> root_object_id;
+        std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> children_by_parent;
+        children_by_parent.reserve(loaded_inodes.size());
+        for (const auto& [object_id, inode] : loaded_inodes)
+        {
+            const auto is_root_candidate =
+                inode.parent_object_id == object_id &&
+                inode.name.empty() &&
+                inode.is_directory;
+            if (is_root_candidate)
+            {
+                if (root_object_id.has_value())
+                {
+                    return false;
+                }
+                root_object_id = object_id;
+                continue;
+            }
+
+            if (inode.name.empty() ||
+                inode.parent_object_id == 0 ||
+                inode.parent_object_id == object_id)
+            {
+                return false;
+            }
+            auto parent_it = loaded_inodes.find(inode.parent_object_id);
+            if (parent_it == loaded_inodes.end() || !parent_it->second.is_directory)
+            {
+                return false;
+            }
+            children_by_parent[inode.parent_object_id].push_back(object_id);
+        }
+        if (!root_object_id.has_value())
+        {
+            return false;
+        }
+
+        auto root_it = loaded_inodes.find(root_object_id.value());
+        if (root_it == loaded_inodes.end())
+        {
+            return false;
+        }
+        root_it->second.full_path = L"\\";
+        loaded_path_index.emplace(CanonicalPathKey(root_it->second.full_path), root_it->first);
+
+        std::vector<std::uint64_t> queue;
+        queue.push_back(root_it->first);
+        std::size_t cursor_index = 0;
+        std::unordered_set<std::uint64_t> visited;
+        visited.reserve(loaded_inodes.size());
+        visited.insert(root_it->first);
+        while (cursor_index < queue.size())
+        {
+            const auto parent_id = queue[cursor_index++];
+            auto parent_it = loaded_inodes.find(parent_id);
+            if (parent_it == loaded_inodes.end() || parent_it->second.full_path.empty())
+            {
+                return false;
+            }
+
+            auto children_it = children_by_parent.find(parent_id);
+            if (children_it == children_by_parent.end())
+            {
+                continue;
+            }
+            for (const auto child_id : children_it->second)
+            {
+                if (!visited.insert(child_id).second)
+                {
+                    return false;
+                }
+
+                auto child_it = loaded_inodes.find(child_id);
+                if (child_it == loaded_inodes.end())
+                {
+                    return false;
+                }
+
+                auto child_path = parent_it->second.full_path;
+                if (!IsRootPath(child_path))
+                {
+                    child_path.push_back(L'\\');
+                }
+                child_path.append(child_it->second.name);
+                child_path = NormalizePath(child_path);
+                if (child_path.empty() || IsRootPath(child_path))
+                {
+                    return false;
+                }
+
+                if (child_it->second.full_path.empty())
+                {
+                    child_it->second.full_path = child_path;
+                }
+                else if (CanonicalPathKey(child_it->second.full_path) != CanonicalPathKey(child_path))
+                {
+                    return false;
+                }
+                const auto canonical_path = CanonicalPathKey(child_it->second.full_path);
+                auto [path_it, path_inserted] = loaded_path_index.emplace(canonical_path, child_id);
+                if (!path_inserted && path_it->second != child_id)
+                {
+                    return false;
+                }
+                loaded_directory_links.push_back(DirectoryLink
+                {
+                    child_it->second.parent_object_id,
+                    child_it->second.name,
+                    child_id,
+                    child_it->second.xid
+                });
+
+                if (child_it->second.is_directory)
+                {
+                    queue.push_back(child_id);
+                }
+            }
+        }
+
+        if (visited.size() != loaded_inodes.size())
+        {
+            return false;
+        }
     }
 
     if (!ValidateInodeGraphState(
@@ -1712,25 +3553,54 @@ bool MetadataStore::LoadBtreeCheckpointBlock(std::uint64_t block_index, const st
     }
 
     const auto persisted_xid = ReadLe64(block, 12);
+    if (!CanLoadNativeCheckpointXid(persisted_xid))
+    {
+        return false;
+    }
     const auto record_count = ReadLe32(block, 20);
     const auto persisted_payload_bytes = ReadLe32(block, 24);
     const auto persisted_checksum = ReadLe32(block, kCheckpointChecksumOffset);
+    auto payload_block = block;
+    if (persisted_payload_bytes > (payload_block.size() - kHeaderBytes))
+    {
+        payload_block = ReadChunkedCheckpointBytes(
+            ResolveBtreeCheckpointBlockIndices(),
+            persisted_xid,
+            kMagic,
+            persisted_payload_bytes);
+        if (payload_block.empty())
+        {
+            auto legacy_blocks = ResolveLegacyContiguousCheckpointBlocks(
+                ResolveNativeCheckpointBandStartBlock(),
+                kNativeBtreeCheckpointOffset,
+                kNativeReplayCheckpointOffset - kNativeBtreeCheckpointOffset,
+                [this](std::uint64_t candidate)
+                {
+                    return IsNativeCheckpointBandBlock(candidate);
+                });
+            payload_block = ReadChunkedCheckpointBytes(legacy_blocks, persisted_xid, kMagic, persisted_payload_bytes);
+            if (payload_block.empty())
+            {
+                return false;
+            }
+        }
+    }
 
     std::vector<BtreeRecord> loaded_records;
     loaded_records.reserve(record_count);
     std::size_t cursor = kHeaderBytes;
     for (std::uint32_t index = 0; index < record_count; ++index)
     {
-        if (cursor > block.size() ||
-            kRecordHeaderBytes > (block.size() - cursor))
+        if (cursor > payload_block.size() ||
+            kRecordHeaderBytes > (payload_block.size() - cursor))
         {
             return false;
         }
 
-        const auto kind_value = ReadLe32(block, cursor + 0);
-        const auto tombstone_flag = ReadLe32(block, cursor + 4);
-        const auto key_length = ReadLe32(block, cursor + 8);
-        const auto value_length = ReadLe32(block, cursor + 12);
+        const auto kind_value = ReadLe32(payload_block, cursor + 0);
+        const auto tombstone_flag = ReadLe32(payload_block, cursor + 4);
+        const auto key_length = ReadLe32(payload_block, cursor + 8);
+        const auto value_length = ReadLe32(payload_block, cursor + 12);
         cursor += kRecordHeaderBytes;
 
         if (kind_value < static_cast<std::uint32_t>(BtreeRecordKind::Inode) ||
@@ -1745,7 +3615,7 @@ bool MetadataStore::LoadBtreeCheckpointBlock(std::uint64_t block_index, const st
         {
             return false;
         }
-        if (static_cast<std::size_t>(required_payload) > (block.size() - cursor))
+        if (static_cast<std::size_t>(required_payload) > (payload_block.size() - cursor))
         {
             return false;
         }
@@ -1757,16 +3627,16 @@ bool MetadataStore::LoadBtreeCheckpointBlock(std::uint64_t block_index, const st
         {
             record.key.insert(
                 record.key.end(),
-                block.begin() + static_cast<std::vector<std::byte>::difference_type>(cursor),
-                block.begin() + static_cast<std::vector<std::byte>::difference_type>(cursor + key_length));
+                payload_block.begin() + static_cast<std::vector<std::byte>::difference_type>(cursor),
+                payload_block.begin() + static_cast<std::vector<std::byte>::difference_type>(cursor + key_length));
             cursor += key_length;
         }
         if (value_length > 0)
         {
             record.value.insert(
                 record.value.end(),
-                block.begin() + static_cast<std::vector<std::byte>::difference_type>(cursor),
-                block.begin() + static_cast<std::vector<std::byte>::difference_type>(cursor + value_length));
+                payload_block.begin() + static_cast<std::vector<std::byte>::difference_type>(cursor),
+                payload_block.begin() + static_cast<std::vector<std::byte>::difference_type>(cursor + value_length));
             cursor += value_length;
         }
         loaded_records.push_back(std::move(record));
@@ -1779,7 +3649,7 @@ bool MetadataStore::LoadBtreeCheckpointBlock(std::uint64_t block_index, const st
         return false;
     }
     if (persisted_checksum != 0 &&
-        ComputeCheckpointChecksum(block, payload_bytes) != persisted_checksum)
+        ComputeCheckpointChecksum(payload_block, payload_bytes) != persisted_checksum)
     {
         return false;
     }
@@ -1997,6 +3867,12 @@ bool MetadataStore::RebuildInodeStateFromBtreeRecords(
         auto extent_it = decoded_extents.find(object_id);
         if (extent_it == decoded_extents.end())
         {
+            if (inode.data_physical_address == 0 &&
+                context_.allow_raw_physical_write &&
+                IsLikelyRawDevicePath(context_.device_path))
+            {
+                continue;
+            }
             return false;
         }
         if (extent_it->second.physical_address != inode.data_physical_address ||
@@ -2007,7 +3883,7 @@ bool MetadataStore::RebuildInodeStateFromBtreeRecords(
     }
 
     const auto root_path = std::wstring(L"\\");
-    const auto root_object_id = volume_root_block_ != 0 ? volume_root_block_ : StableObjectIdFromPath(root_path);
+    const auto root_object_id = RootDirectoryObjectId();
     InodeRecord root_inode{};
     root_inode.object_id = root_object_id;
     root_inode.parent_object_id = root_object_id;
@@ -2154,6 +4030,89 @@ std::optional<std::uint64_t> MetadataStore::TotalBlocks() const noexcept
     return container_loaded_ ? std::optional<std::uint64_t>(total_blocks_) : std::nullopt;
 }
 
+std::optional<std::uint64_t> MetadataStore::TotalSizeBytes() const noexcept
+{
+    if (!container_loaded_ || block_size_ == 0)
+    {
+        return std::nullopt;
+    }
+    if (total_blocks_ == 0)
+    {
+        return std::nullopt;
+    }
+    if (total_blocks_ > (std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(block_size_)))
+    {
+        return std::nullopt;
+    }
+
+    return total_blocks_ * static_cast<std::uint64_t>(block_size_);
+}
+
+std::optional<std::uint64_t> MetadataStore::FreeSizeBytes() const noexcept
+{
+    if (!container_loaded_ || block_size_ == 0)
+    {
+        return std::nullopt;
+    }
+
+    if (!spaceman_loaded_ &&
+        committed_spaceman_allocations_.empty() &&
+        committed_spaceman_free_extents_.empty() &&
+        !spaceman_free_bytes_.has_value())
+    {
+        return std::nullopt;
+    }
+
+    const auto accumulated_bytes = [](const std::vector<SpacemanAllocation>& extents) -> std::optional<std::uint64_t>
+    {
+        std::uint64_t total = 0;
+        for (const auto& extent : extents)
+        {
+            if (extent.bytes == 0)
+            {
+                continue;
+            }
+            if (total > (std::numeric_limits<std::uint64_t>::max() - extent.bytes))
+            {
+                return std::nullopt;
+            }
+            total += extent.bytes;
+        }
+        return total;
+    };
+
+    const auto total_bytes = TotalSizeBytes();
+    const auto allocated_bytes = accumulated_bytes(committed_spaceman_allocations_);
+    if (total_bytes.has_value() && allocated_bytes.has_value())
+    {
+        if (allocated_bytes.value() >= total_bytes.value())
+        {
+            return 0ull;
+        }
+
+        return total_bytes.value() - allocated_bytes.value();
+    }
+
+    if (spaceman_free_bytes_.has_value())
+    {
+        if (total_bytes.has_value() && spaceman_free_bytes_.value() > total_bytes.value())
+        {
+            return total_bytes;
+        }
+        return spaceman_free_bytes_;
+    }
+
+    const auto free_extents = accumulated_bytes(working_spaceman_free_extents_.empty()
+        ? committed_spaceman_free_extents_
+        : working_spaceman_free_extents_);
+    if (free_extents.has_value() && total_bytes.has_value() && free_extents.value() > total_bytes.value())
+    {
+        return total_bytes;
+    }
+
+    return free_extents;
+}
+
 std::optional<std::uint64_t> MetadataStore::CheckpointXid() const noexcept
 {
     return container_loaded_ ? std::optional<std::uint64_t>(checkpoint_xid_) : std::nullopt;
@@ -2171,7 +4130,14 @@ bool MetadataStore::PrepareNativeWritePath()
         SyncCommitBlobTelemetryWithMode();
         if (!reason.empty())
         {
-            MarkRecoveryRequired(std::move(reason));
+            if (recovery_reason_.empty())
+            {
+                MarkRecoveryRequired(std::move(reason));
+            }
+            else
+            {
+                MarkRecoveryRequired(recovery_reason_);
+            }
         }
         return false;
     };
@@ -2186,7 +4152,7 @@ bool MetadataStore::PrepareNativeWritePath()
         {
             return fail_prepare(recovery_reason_);
         }
-        return fail_prepare(L"VolumeStateLoadFailed");
+        return fail_prepare(L"CanonicalStateNotLoaded");
     }
     if (!persistent_state_loaded_ && !LoadPersistentState())
     {
@@ -2209,7 +4175,7 @@ bool MetadataStore::PrepareNativeWritePath()
     }
     if (context_.integrity_check_on_mount && !VerifyIntegrity())
     {
-        return fail_prepare(L"IntegrityCheckFailedOnMount");
+        return fail_prepare(ResolveIntegrityCheckFailureRecoveryReason());
     }
 
     working_inodes_ = committed_inodes_;
@@ -2332,6 +4298,29 @@ std::string MetadataStore::LastCommitBlobMagic() const
     return last_commit_blob_magic_;
 }
 
+void MetadataStore::RecordIntegrityFailure(std::wstring reason, std::uint64_t object_id) const
+{
+    if (last_integrity_failure_reason_.empty())
+    {
+        last_integrity_failure_reason_ = reason.empty() ? L"Unknown" : std::move(reason);
+        last_integrity_failure_object_id_ = object_id == 0
+            ? std::nullopt
+            : std::optional<std::uint64_t>(object_id);
+    }
+
+    TraceIntegrityFailure(last_integrity_failure_reason_, object_id);
+}
+
+std::wstring MetadataStore::ResolveIntegrityCheckFailureRecoveryReason() const
+{
+    if (!_wcsicmp(last_integrity_failure_reason_.c_str(), L"MissingAllocation"))
+    {
+        return L"IntegrityMissingAllocationMap";
+    }
+
+    return L"IntegrityCheckFailedOnMount";
+}
+
 bool MetadataStore::LastReplayCheckpointCandidatePresent() const noexcept
 {
     return last_replay_checkpoint_candidate_present_;
@@ -2405,9 +4394,39 @@ std::wstring MetadataStore::RecoveryReason() const
     return recovery_reason_;
 }
 
+std::wstring MetadataStore::LastIntegrityFailureReason() const
+{
+    return last_integrity_failure_reason_;
+}
+
+std::wstring MetadataStore::LastMutationFailureReason() const
+{
+    return last_mutation_failure_reason_;
+}
+
+std::optional<std::uint64_t> MetadataStore::LastIntegrityFailureObjectId() const noexcept
+{
+    return last_integrity_failure_object_id_;
+}
+
 MetadataStore::MutationStatus MetadataStore::StageMutation(const MutationRequest& request)
 {
     return ApplyMutation(request);
+}
+
+void MetadataStore::SyncWorkingStateFromCommitted()
+{
+    working_inodes_ = committed_inodes_;
+    working_path_index_ = committed_path_index_;
+    working_directory_links_ = committed_directory_links_;
+    working_spaceman_free_extents_ = committed_spaceman_free_extents_;
+    working_next_ephemeral_extent_ = next_ephemeral_extent_;
+}
+
+MetadataStore::MutationStatus MetadataStore::RejectMutation(std::wstring reason)
+{
+    last_mutation_failure_reason_ = reason.empty() ? L"Unknown" : std::move(reason);
+    return MutationStatus::InvalidRequest;
 }
 
 void MetadataStore::MarkRecoveryRequired(std::wstring reason)
@@ -2426,6 +4445,39 @@ void MetadataStore::ClearRecoveryRequired()
 
 MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest& request)
 {
+    const auto operation_name = [](MutationOperation operation) -> std::wstring_view
+    {
+        switch (operation)
+        {
+        case MutationOperation::CreateFile:
+            return L"CreateFile";
+        case MutationOperation::CreateDirectory:
+            return L"CreateDirectory";
+        case MutationOperation::Write:
+            return L"Write";
+        case MutationOperation::SetFileSize:
+            return L"SetFileSize";
+        case MutationOperation::Rename:
+            return L"Rename";
+        case MutationOperation::Delete:
+            return L"Delete";
+        case MutationOperation::SetBasicInfo:
+            return L"SetBasicInfo";
+        default:
+            return L"Unknown";
+        }
+    };
+    const auto reject = [&](std::wstring reason) -> MutationStatus
+    {
+        TraceMutationFailure(
+            operation_name(request.operation),
+            request.path,
+            request.secondary_path,
+            reason);
+        return RejectMutation(std::move(reason));
+    };
+
+    last_mutation_failure_reason_.clear();
     if (!IsNativeWriteReady())
     {
         return MutationStatus::NotReady;
@@ -2433,7 +4485,7 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
     const auto normalized_path = NormalizePath(request.path);
     if (normalized_path.empty())
     {
-        return MutationStatus::InvalidRequest;
+        return reject(L"EmptyPath");
     }
     const auto normalized_secondary = NormalizePath(request.secondary_path);
     const auto target_xid = checkpoint_xid_ + 1;
@@ -2505,20 +4557,20 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
     {
         if (IsRootPath(normalized_path))
         {
-            return MutationStatus::InvalidRequest;
+            return reject(L"CreateRootPath");
         }
 
         const auto parent_path = ParentPath(normalized_path);
         const auto parent_inode = LookupWorkingInode(parent_path);
         if (!parent_inode.has_value() || !parent_inode->is_directory)
         {
-            return MutationStatus::InvalidRequest;
+            return reject(L"CreateParentMissingOrNotDirectory:" + parent_path);
         }
 
         const auto leaf_name = LeafName(normalized_path);
         if (leaf_name.empty())
         {
-            return MutationStatus::InvalidRequest;
+            return reject(L"CreateLeafNameEmpty");
         }
 
         auto existing = LookupWorkingInode(normalized_path);
@@ -2527,15 +4579,15 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         {
             if (!request.replace_if_exists)
             {
-                return MutationStatus::InvalidRequest;
+                return reject(L"CreateDestinationExists");
             }
             if (existing->is_directory != (request.operation == MutationOperation::CreateDirectory))
             {
-                return MutationStatus::InvalidRequest;
+                return reject(L"CreateReplacementTypeMismatch");
             }
             if (existing->is_directory && HasWorkingChildren(existing->object_id))
             {
-                return MutationStatus::InvalidRequest;
+                return reject(L"CreateReplacementDirectoryNotEmpty");
             }
 
             replacement_id = existing->object_id;
@@ -2589,12 +4641,12 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         auto inode = LookupWorkingInode(normalized_path);
         if (!inode.has_value() || inode->is_directory)
         {
-            return MutationStatus::InvalidRequest;
+            return reject(L"WriteTargetMissingOrDirectory");
         }
 
         if (request.offset > (std::numeric_limits<std::uint64_t>::max() - request.length))
         {
-            return MutationStatus::InvalidRequest;
+            return reject(L"WriteRangeOverflow");
         }
 
         const auto requested_end = request.offset + request.length;
@@ -2637,7 +4689,7 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         auto inode = LookupWorkingInode(normalized_path);
         if (!inode.has_value() || inode->is_directory)
         {
-            return MutationStatus::InvalidRequest;
+            return reject(L"SetFileSizeTargetMissingOrDirectory");
         }
 
         auto& inode_ref = working_inodes_[inode->object_id];
@@ -2694,13 +4746,13 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
     {
         if (normalized_secondary.empty() || IsRootPath(normalized_path))
         {
-            return MutationStatus::InvalidRequest;
+            return reject(normalized_secondary.empty() ? L"RenameDestinationEmpty" : L"RenameRootPath");
         }
 
         auto inode = LookupWorkingInode(normalized_path);
         if (!inode.has_value())
         {
-            return MutationStatus::InvalidRequest;
+            return reject(L"RenameSourceMissing");
         }
         const auto source_path_key = CanonicalPathKey(normalized_path);
         const auto destination_path_key = CanonicalPathKey(normalized_secondary);
@@ -2709,17 +4761,17 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         const auto destination_parent = LookupWorkingInode(destination_parent_path);
         if (!destination_parent.has_value() || !destination_parent->is_directory)
         {
-            return MutationStatus::InvalidRequest;
+            return reject(L"RenameDestinationParentMissingOrNotDirectory:" + destination_parent_path);
         }
         if (LeafName(normalized_secondary).empty())
         {
-            return MutationStatus::InvalidRequest;
+            return reject(L"RenameDestinationLeafNameEmpty");
         }
         if (inode->is_directory &&
             (IsDescendantPath(destination_parent_path, normalized_path) ||
              CanonicalPathKey(destination_parent_path) == CanonicalPathKey(normalized_path)))
         {
-            return MutationStatus::InvalidRequest;
+            return reject(L"RenameDirectoryIntoSelf");
         }
 
         auto destination_inode = LookupWorkingInode(normalized_secondary);
@@ -2736,17 +4788,17 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         {
             if (!destination_is_same_object && !request.replace_if_exists)
             {
-                return MutationStatus::InvalidRequest;
+                return reject(L"RenameDestinationExists");
             }
             if (!destination_is_same_object &&
                 destination_inode->is_directory != inode->is_directory)
             {
-                return MutationStatus::InvalidRequest;
+                return reject(L"RenameDestinationTypeMismatch");
             }
             if (!destination_is_same_object &&
                 destination_inode->is_directory && HasWorkingChildren(destination_inode->object_id))
             {
-                return MutationStatus::InvalidRequest;
+                return reject(L"RenameDestinationDirectoryNotEmpty");
             }
             if (!destination_is_same_object)
             {
@@ -2872,17 +4924,17 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
     {
         if (IsRootPath(normalized_path))
         {
-            return MutationStatus::InvalidRequest;
+            return reject(L"DeleteRootPath");
         }
 
         auto inode = LookupWorkingInode(normalized_path);
         if (!inode.has_value())
         {
-            return MutationStatus::InvalidRequest;
+            return reject(L"DeleteTargetMissing");
         }
         if (inode->is_directory && HasWorkingChildren(inode->object_id))
         {
-            return MutationStatus::InvalidRequest;
+            return reject(L"DeleteDirectoryNotEmpty");
         }
 
         RemoveWorkingDirectoryLink(inode->parent_object_id, inode->name);
@@ -2910,7 +4962,7 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         auto inode = LookupWorkingInode(normalized_path);
         if (!inode.has_value())
         {
-            return MutationStatus::InvalidRequest;
+            return reject(L"SetBasicInfoTargetMissing");
         }
 
         auto& inode_ref = working_inodes_[inode->object_id];
@@ -3022,6 +5074,51 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
 
     std::unordered_set<std::wstring> payload_paths;
     payload_paths.reserve(pending_mutations_.size());
+    const auto remap_payload_subtree = [&payload_paths](const std::wstring& source_key, const std::wstring& destination_key)
+    {
+        if (source_key.empty() || destination_key.empty())
+        {
+            return;
+        }
+
+        std::vector<std::wstring> pending_removals;
+        std::vector<std::wstring> pending_additions;
+        pending_removals.reserve(payload_paths.size());
+        pending_additions.reserve(payload_paths.size());
+
+        for (const auto& payload_path : payload_paths)
+        {
+            if (payload_path == source_key)
+            {
+                pending_removals.push_back(payload_path);
+                pending_additions.push_back(destination_key);
+                continue;
+            }
+
+            if (!IsDescendantPath(payload_path, source_key))
+            {
+                continue;
+            }
+
+            auto remapped_path = destination_key;
+            remapped_path.append(payload_path.substr(source_key.size()));
+            pending_removals.push_back(payload_path);
+            pending_additions.push_back(std::move(remapped_path));
+        }
+
+        for (const auto& payload_path : pending_removals)
+        {
+            payload_paths.erase(payload_path);
+        }
+        for (const auto& payload_path : pending_additions)
+        {
+            if (!payload_path.empty())
+            {
+                payload_paths.insert(payload_path);
+            }
+        }
+    };
+
     for (const auto& mutation : pending_mutations_)
     {
         const auto normalized_path = NormalizePath(mutation.path);
@@ -3048,14 +5145,7 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         {
             const auto normalized_secondary = NormalizePath(mutation.secondary_path);
             const auto normalized_secondary_key = CanonicalPathKey(normalized_secondary);
-            if (auto pending = payload_paths.find(normalized_key); pending != payload_paths.end())
-            {
-                payload_paths.erase(pending);
-                if (!normalized_secondary_key.empty())
-                {
-                    payload_paths.insert(normalized_secondary_key);
-                }
-            }
+            remap_payload_subtree(normalized_key, normalized_secondary_key);
             break;
         }
         case MutationOperation::Delete:
@@ -3177,24 +5267,62 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
     for (const auto& update : pending_object_map_updates_)
     {
         committed_object_map_[update.object_id] = update;
+        committed_read_extents_.erase(update.object_id);
     }
     committed_spaceman_allocations_.insert(
         committed_spaceman_allocations_.end(),
         pending_spaceman_allocations_.begin(),
         pending_spaceman_allocations_.end()
     );
+    if (!NormalizeSpacemanExtents(committed_spaceman_allocations_))
+    {
+        rollback_commit_extent_stage();
+        rollback_committed_state();
+        return fail_commit(CommitStatus::InvariantFailed, "committed-allocation-normalize-failed");
+    }
     for (const auto& deallocation : pending_spaceman_deallocations_)
     {
-        committed_spaceman_allocations_.erase(
-            std::remove_if(
-                committed_spaceman_allocations_.begin(),
-                committed_spaceman_allocations_.end(),
-                [&](const SpacemanAllocation& allocation)
-                {
-                    return allocation.physical_address == deallocation.physical_address &&
-                           allocation.bytes == deallocation.bytes;
-                }),
-            committed_spaceman_allocations_.end());
+        std::vector<SpacemanAllocation> adjusted_allocations;
+        adjusted_allocations.reserve(committed_spaceman_allocations_.size() + 1);
+        const auto deallocation_end = deallocation.physical_address + deallocation.bytes;
+        for (const auto& allocation : committed_spaceman_allocations_)
+        {
+            if (!PhysicalRangeContains(
+                    allocation.physical_address,
+                    allocation.bytes,
+                    deallocation.physical_address,
+                    deallocation.bytes))
+            {
+                adjusted_allocations.push_back(allocation);
+                continue;
+            }
+
+            if (allocation.physical_address < deallocation.physical_address)
+            {
+                adjusted_allocations.push_back(
+                    {
+                        allocation.physical_address,
+                        deallocation.physical_address - allocation.physical_address,
+                    });
+            }
+
+            const auto allocation_end = allocation.physical_address + allocation.bytes;
+            if (deallocation_end < allocation_end)
+            {
+                adjusted_allocations.push_back(
+                    {
+                        deallocation_end,
+                        allocation_end - deallocation_end,
+                    });
+            }
+        }
+        committed_spaceman_allocations_ = std::move(adjusted_allocations);
+        if (!NormalizeSpacemanExtents(committed_spaceman_allocations_))
+        {
+            rollback_commit_extent_stage();
+            rollback_committed_state();
+            return fail_commit(CommitStatus::InvariantFailed, "committed-allocation-deallocation-normalize-failed");
+        }
         if (!FreeExtent(deallocation.physical_address, deallocation.bytes))
         {
             rollback_commit_extent_stage();
@@ -3212,82 +5340,163 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         pending_btree_records_.end());
     committed_btree_records_ = CanonicalizeBtreeRecords(merged_btree_records);
     committed_spaceman_free_extents_ = working_spaceman_free_extents_;
+    if (!NormalizeSpacemanExtents(committed_spaceman_free_extents_))
+    {
+        rollback_commit_extent_stage();
+        rollback_committed_state();
+        return fail_commit(CommitStatus::InvariantFailed, "committed-free-extents-normalize-failed");
+    }
     next_ephemeral_extent_ = working_next_ephemeral_extent_;
 
     checkpoint_xid_ = target_xid;
     last_committed_xid_ = target_xid;
     last_commit_blob_address_ = *commit_extent;
     last_commit_blob_bytes_ = commit_blob_persist_bytes;
+    const auto read_chunked_checkpoint_roundtrip_candidate =
+        [&](const std::vector<std::uint64_t>& checkpoint_blocks,
+            std::size_t required_blocks) -> std::optional<std::pair<std::uint64_t, std::vector<std::byte>>>
+    {
+        for (const auto& checkpoint_slots : SelectChunkedCheckpointBlockWindows(
+                 checkpoint_blocks,
+                 target_xid,
+                 required_blocks))
+        {
+            if (checkpoint_slots.empty())
+            {
+                continue;
+            }
+
+            std::vector<std::byte> checkpoint_block;
+            if (!ReadBlockByIndexDirect(checkpoint_slots.front(), checkpoint_block) ||
+                checkpoint_block.size() < kCheckpointHeaderBytes ||
+                ReadLe64(checkpoint_block, 12) != target_xid)
+            {
+                continue;
+            }
+
+            return std::make_pair(checkpoint_slots.front(), std::move(checkpoint_block));
+        }
+
+        return std::nullopt;
+    };
     const auto verify_object_map_checkpoint_roundtrip = [&]() -> bool
     {
         auto checkpoint_blocks = ResolveObjectMapCheckpointBlockIndices();
-        if (checkpoint_blocks.empty())
-        {
-            return false;
-        }
-        const auto checkpoint_slot = checkpoint_blocks[
-            static_cast<std::size_t>(target_xid % static_cast<std::uint64_t>(checkpoint_blocks.size()))];
-
-        std::vector<std::byte> checkpoint_block;
-        if (!ReadBlockByIndexDirect(checkpoint_slot, checkpoint_block))
+        if (checkpoint_blocks.empty() || block_size_ == 0)
         {
             return false;
         }
 
-        ApfsObjectMapStore parser;
-        std::vector<ApfsObjectMapEntry> parsed_entries;
-        std::uint64_t parsed_xid = 0;
-        if (!parser.TryParseCheckpointV3(checkpoint_block, parsed_entries, parsed_xid) ||
-            parsed_xid != target_xid ||
-            parsed_entries.size() != committed_object_map_.size())
+        constexpr std::size_t kObjectMapCheckpointEntryBytes = 32;
+        const auto required_bytes = kCheckpointHeaderBytes + (committed_object_map_.size() * kObjectMapCheckpointEntryBytes);
+        const auto required_blocks = (required_bytes + static_cast<std::size_t>(block_size_) - 1) /
+            static_cast<std::size_t>(block_size_);
+        if (required_blocks == 0)
         {
             return false;
         }
 
-        for (const auto& entry : parsed_entries)
+        auto checkpoint_candidate = read_chunked_checkpoint_roundtrip_candidate(
+            checkpoint_blocks,
+            required_blocks);
+        if (!checkpoint_candidate.has_value())
         {
-            auto expected = committed_object_map_.find(entry.object_id);
-            if (expected == committed_object_map_.end())
+            return false;
+        }
+
+        const auto committed_object_map_snapshot = committed_object_map_;
+        const auto last_committed_xid_snapshot = last_committed_xid_;
+        const auto loaded_superblock_checkpoint_xid_snapshot = loaded_superblock_checkpoint_xid_;
+        const auto restore_state = [&]()
+        {
+            committed_object_map_ = committed_object_map_snapshot;
+            last_committed_xid_ = last_committed_xid_snapshot;
+            loaded_superblock_checkpoint_xid_ = loaded_superblock_checkpoint_xid_snapshot;
+        };
+
+        loaded_superblock_checkpoint_xid_ = std::max(loaded_superblock_checkpoint_xid_, target_xid);
+        if (!LoadObjectMapCheckpointBlock(checkpoint_candidate->first, checkpoint_candidate->second) ||
+            last_committed_xid_.value_or(0) != target_xid ||
+            committed_object_map_.size() != committed_object_map_snapshot.size())
+        {
+            restore_state();
+            return false;
+        }
+
+        for (const auto& [object_id, expected] : committed_object_map_snapshot)
+        {
+            auto parsed = committed_object_map_.find(object_id);
+            if (parsed == committed_object_map_.end())
             {
+                restore_state();
                 return false;
             }
-            if (expected->second.physical_address != entry.physical_address ||
-                expected->second.logical_size != entry.logical_size ||
-                expected->second.xid != entry.xid)
+            if (parsed->second.physical_address != expected.physical_address ||
+                parsed->second.logical_size != expected.logical_size ||
+                parsed->second.xid != expected.xid)
             {
+                restore_state();
                 return false;
             }
         }
 
+        restore_state();
         return true;
     };
     const auto verify_spaceman_checkpoint_roundtrip = [&]() -> bool
     {
         auto checkpoint_blocks = ResolveSpacemanCheckpointBlockIndices();
-        if (checkpoint_blocks.empty())
-        {
-            return false;
-        }
-        const auto checkpoint_slot = checkpoint_blocks[
-            static_cast<std::size_t>(target_xid % static_cast<std::uint64_t>(checkpoint_blocks.size()))];
-
-        std::vector<std::byte> checkpoint_block;
-        if (!ReadBlockByIndexDirect(checkpoint_slot, checkpoint_block))
+        if (checkpoint_blocks.empty() || block_size_ == 0)
         {
             return false;
         }
 
-        ApfsSpacemanStore parser;
-        std::vector<ApfsExtent> parsed_allocations;
-        std::vector<ApfsExtent> parsed_free_extents;
-        std::uint64_t parsed_xid = 0;
-        if (!parser.TryParseCheckpointV3(
-                checkpoint_block,
-                parsed_allocations,
-                parsed_free_extents,
-                parsed_xid) ||
-            parsed_xid != target_xid)
+        constexpr std::size_t kSpacemanCheckpointEntryBytes = 16;
+        const auto required_entries = committed_spaceman_allocations_.size() + committed_spaceman_free_extents_.size();
+        if (required_entries > ((std::numeric_limits<std::size_t>::max() - kCheckpointHeaderBytes) /
+                                kSpacemanCheckpointEntryBytes))
         {
+            return false;
+        }
+        const auto required_bytes = kCheckpointHeaderBytes + (required_entries * kSpacemanCheckpointEntryBytes);
+        const auto required_blocks = (required_bytes + static_cast<std::size_t>(block_size_) - 1) /
+            static_cast<std::size_t>(block_size_);
+        if (required_blocks == 0)
+        {
+            return false;
+        }
+
+        const auto checkpoint_candidate = read_chunked_checkpoint_roundtrip_candidate(
+            checkpoint_blocks,
+            required_blocks);
+        if (!checkpoint_candidate.has_value())
+        {
+            return false;
+        }
+
+        const auto committed_allocations_snapshot = committed_spaceman_allocations_;
+        const auto committed_free_extents_snapshot = committed_spaceman_free_extents_;
+        const auto working_free_extents_snapshot = working_spaceman_free_extents_;
+        const auto next_extent_snapshot = next_ephemeral_extent_;
+        const auto working_next_extent_snapshot = working_next_ephemeral_extent_;
+        const auto last_committed_xid_snapshot = last_committed_xid_;
+        const auto loaded_superblock_checkpoint_xid_snapshot = loaded_superblock_checkpoint_xid_;
+        const auto restore_state = [&]()
+        {
+            committed_spaceman_allocations_ = committed_allocations_snapshot;
+            committed_spaceman_free_extents_ = committed_free_extents_snapshot;
+            working_spaceman_free_extents_ = working_free_extents_snapshot;
+            next_ephemeral_extent_ = next_extent_snapshot;
+            working_next_ephemeral_extent_ = working_next_extent_snapshot;
+            last_committed_xid_ = last_committed_xid_snapshot;
+            loaded_superblock_checkpoint_xid_ = loaded_superblock_checkpoint_xid_snapshot;
+        };
+
+        loaded_superblock_checkpoint_xid_ = std::max(loaded_superblock_checkpoint_xid_, target_xid);
+        if (!LoadSpacemanCheckpointBlock(checkpoint_candidate->first, checkpoint_candidate->second) ||
+            last_committed_xid_.value_or(0) != target_xid)
+        {
+            restore_state();
             return false;
         }
 
@@ -3302,42 +5511,71 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
             std::sort(normalized.begin(), normalized.end());
             return normalized;
         };
-        const auto normalize_parsed = [](const std::vector<ApfsExtent>& extents)
-        {
-            std::vector<std::pair<std::uint64_t, std::uint64_t>> normalized;
-            normalized.reserve(extents.size());
-            for (const auto& extent : extents)
-            {
-                normalized.emplace_back(extent.physical_address, extent.bytes);
-            }
-            std::sort(normalized.begin(), normalized.end());
-            return normalized;
-        };
 
-        return normalize_spaceman(committed_spaceman_allocations_) == normalize_parsed(parsed_allocations) &&
-               normalize_spaceman(committed_spaceman_free_extents_) == normalize_parsed(parsed_free_extents);
+        const auto matches =
+            normalize_spaceman(committed_spaceman_allocations_) == normalize_spaceman(committed_allocations_snapshot) &&
+            normalize_spaceman(committed_spaceman_free_extents_) == normalize_spaceman(committed_free_extents_snapshot);
+        restore_state();
+        return matches;
     };
     const auto verify_inode_checkpoint_roundtrip = [&]() -> bool
     {
         auto checkpoint_blocks = ResolveInodeCheckpointBlockIndices();
-        if (checkpoint_blocks.empty())
-        {
-            return false;
-        }
-        const auto checkpoint_slot = checkpoint_blocks[
-            static_cast<std::size_t>(target_xid % static_cast<std::uint64_t>(checkpoint_blocks.size()))];
-
-        std::vector<std::byte> checkpoint_block;
-        if (!ReadBlockByIndexDirect(checkpoint_slot, checkpoint_block))
+        if (checkpoint_blocks.empty() || block_size_ == 0)
         {
             return false;
         }
 
-        if (checkpoint_block.size() < kCheckpointHeaderBytes)
+        constexpr std::size_t kInodeCheckpointRecordFixedBytes = 60;
+        const auto should_persist_full_path = [&](const InodeRecord& inode)
+        {
+            if (IsRootPath(inode.full_path))
+            {
+                return false;
+            }
+
+            auto parent_it = committed_inodes_.find(inode.parent_object_id);
+            if (parent_it == committed_inodes_.end())
+            {
+                return true;
+            }
+
+            auto reconstructed_path = parent_it->second.full_path;
+            if (!IsRootPath(reconstructed_path))
+            {
+                reconstructed_path.push_back(L'\\');
+            }
+            reconstructed_path.append(inode.name);
+            reconstructed_path = NormalizePath(reconstructed_path);
+            return reconstructed_path != inode.full_path;
+        };
+        std::size_t required_bytes = kCheckpointHeaderBytes;
+        for (const auto& [_, inode] : committed_inodes_)
+        {
+            const auto name_bytes = inode.name.size() * sizeof(wchar_t);
+            const auto path_bytes = should_persist_full_path(inode)
+                ? inode.full_path.size() * sizeof(wchar_t)
+                : 0;
+            if (required_bytes > (std::numeric_limits<std::size_t>::max() -
+                                  kInodeCheckpointRecordFixedBytes -
+                                  name_bytes -
+                                  path_bytes))
+            {
+                return false;
+            }
+            required_bytes += kInodeCheckpointRecordFixedBytes + name_bytes + path_bytes;
+        }
+        const auto required_blocks = (required_bytes + static_cast<std::size_t>(block_size_) - 1) /
+            static_cast<std::size_t>(block_size_);
+        if (required_blocks == 0)
         {
             return false;
         }
-        if (ReadLe64(checkpoint_block, 12) != target_xid)
+
+        const auto checkpoint_candidate = read_chunked_checkpoint_roundtrip_candidate(
+            checkpoint_blocks,
+            required_blocks);
+        if (!checkpoint_candidate.has_value())
         {
             return false;
         }
@@ -3349,6 +5587,7 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         const auto working_path_index_snapshot = working_path_index_;
         const auto working_directory_links_snapshot = working_directory_links_;
         const auto last_committed_xid_snapshot = last_committed_xid_;
+        const auto loaded_superblock_checkpoint_xid_snapshot = loaded_superblock_checkpoint_xid_;
 
         const auto restore_state = [&]()
         {
@@ -3359,9 +5598,11 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
             working_path_index_ = working_path_index_snapshot;
             working_directory_links_ = working_directory_links_snapshot;
             last_committed_xid_ = last_committed_xid_snapshot;
+            loaded_superblock_checkpoint_xid_ = loaded_superblock_checkpoint_xid_snapshot;
         };
 
-        if (!LoadInodeCheckpointBlock(checkpoint_slot, checkpoint_block))
+        loaded_superblock_checkpoint_xid_ = std::max(loaded_superblock_checkpoint_xid_, target_xid);
+        if (!LoadInodeCheckpointBlock(checkpoint_candidate->first, checkpoint_candidate->second))
         {
             restore_state();
             return false;
@@ -3431,34 +5672,47 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         {
             return false;
         }
-        const auto checkpoint_slot = checkpoint_blocks[
-            static_cast<std::size_t>(target_xid % static_cast<std::uint64_t>(checkpoint_blocks.size()))];
 
-        std::vector<std::byte> checkpoint_block;
-        if (!ReadBlockByIndexDirect(checkpoint_slot, checkpoint_block))
+        constexpr std::size_t kBtreeCheckpointRecordHeaderBytes = 16;
+        std::size_t required_bytes = kCheckpointHeaderBytes;
+        for (const auto& record : committed_btree_records_)
+        {
+            if (required_bytes > (std::numeric_limits<std::size_t>::max() -
+                                  kBtreeCheckpointRecordHeaderBytes -
+                                  record.key.size() -
+                                  record.value.size()))
+            {
+                return false;
+            }
+            required_bytes += kBtreeCheckpointRecordHeaderBytes + record.key.size() + record.value.size();
+        }
+        if (block_size_ == 0)
         {
             return false;
         }
-
-        if (checkpoint_block.size() < kCheckpointHeaderBytes)
-        {
-            return false;
-        }
-        if (ReadLe64(checkpoint_block, 12) != target_xid)
+        const auto required_blocks = (required_bytes + static_cast<std::size_t>(block_size_) - 1) /
+            static_cast<std::size_t>(block_size_);
+        const auto checkpoint_candidate = read_chunked_checkpoint_roundtrip_candidate(
+            checkpoint_blocks,
+            required_blocks);
+        if (!checkpoint_candidate.has_value())
         {
             return false;
         }
 
         const auto committed_btree_snapshot = committed_btree_records_;
         const auto last_committed_xid_snapshot = last_committed_xid_;
+        const auto loaded_superblock_checkpoint_xid_snapshot = loaded_superblock_checkpoint_xid_;
 
         const auto restore_state = [&]()
         {
             committed_btree_records_ = committed_btree_snapshot;
             last_committed_xid_ = last_committed_xid_snapshot;
+            loaded_superblock_checkpoint_xid_ = loaded_superblock_checkpoint_xid_snapshot;
         };
 
-        if (!LoadBtreeCheckpointBlock(checkpoint_slot, checkpoint_block))
+        loaded_superblock_checkpoint_xid_ = std::max(loaded_superblock_checkpoint_xid_, target_xid);
+        if (!LoadBtreeCheckpointBlock(checkpoint_candidate->first, checkpoint_candidate->second))
         {
             restore_state();
             return false;
@@ -3792,14 +6046,28 @@ bool MetadataStore::ReplayOrRecover()
         return false;
     };
 
-    set_replay_stage("load-volume-state");
-    if (!LoadVolumeState())
+    if (!container_loaded_ || !object_map_loaded_ || !spaceman_loaded_)
     {
-        if (recovery_reason_.empty())
+        set_replay_stage("load-volume-state");
+        if (!LoadVolumeState())
         {
-            return fail_recovery(L"RecoveryLoadVolumeStateFailed");
+            if (recovery_reason_.empty())
+            {
+                return fail_recovery(L"RecoveryLoadVolumeStateFailed");
+            }
+            return false;
         }
-        return false;
+    }
+    else
+    {
+        set_replay_stage("volume-state-ready");
+    }
+
+    if (RequiresCanonicalNonFixtureCommitPath() &&
+        !persistent_state_loaded_ &&
+        !LoadPersistentState())
+    {
+        return fail_recovery(L"RecoveryPersistentStateLoadFailed");
     }
 
     set_replay_stage("load-persistent-state");
@@ -3834,6 +6102,62 @@ bool MetadataStore::ReplayOrRecover()
         return false;
     }
 
+    const auto maybe_roll_forward_orphan_native_checkpoint = [&]() -> bool
+    {
+        if (!IsLikelyRawDevicePath(context_.device_path) ||
+            !context_.allow_raw_physical_write ||
+            !last_committed_xid_.has_value() ||
+            last_commit_blob_address_.has_value() ||
+            last_commit_blob_bytes_.has_value() ||
+            last_replay_checkpoint_candidate_present_ ||
+            loaded_superblock_checkpoint_xid_ == std::numeric_limits<std::uint64_t>::max() ||
+            last_committed_xid_.value() != (loaded_superblock_checkpoint_xid_ + 1))
+        {
+            return false;
+        }
+
+        set_replay_stage("orphan-native-checkpoint-integrity");
+        if (!VerifyIntegrity())
+        {
+            return fail_recovery(L"ReplayOrphanNativeCheckpointIntegrityFailed");
+        }
+
+        const auto target_xid = last_committed_xid_.value();
+        if (!AllowCommitStage("replay-before-orphan-checkpoint-switch"))
+        {
+            return fail_recovery(L"ReplayInterruptedBeforeCheckpointSwitch");
+        }
+
+        if (!PersistCheckpointSuperblock(target_xid))
+        {
+            return fail_recovery(L"ReplayCheckpointWriteFailed");
+        }
+
+        if (!AllowCommitStage("replay-before-orphan-checkpoint-flush"))
+        {
+            return fail_recovery(L"ReplayInterruptedBeforeCheckpointFlush");
+        }
+
+        if (!device_.Flush())
+        {
+            return fail_recovery(L"ReplayCheckpointFlushFailed");
+        }
+
+        checkpoint_xid_ = target_xid;
+        loaded_superblock_checkpoint_xid_ = target_xid;
+        ClearRecoveryRequired();
+        commit_path_ready_ = native_write_ready_ && write_device_allowed_ && !recovery_required_;
+        canonical_state_loaded_ = native_write_ready_ && !recovery_required_;
+        canonical_commit_ready_ = CanReportCanonicalCommitReady(
+            canonical_state_loaded_,
+            commit_path_ready_,
+            recovery_required_,
+            legacy_fixture_fallback_used_);
+        SyncCommitBlobTelemetryWithMode();
+        set_replay_stage("complete-orphan-native-checkpoint");
+        return true;
+    };
+
     const auto superblock_in_sync = loaded_superblock_checkpoint_xid_ == checkpoint_xid_;
     if (superblock_in_sync &&
         last_committed_xid_.has_value() &&
@@ -3856,6 +6180,11 @@ bool MetadataStore::ReplayOrRecover()
         }
 
         return fail_recovery(L"ReplayIntegrityCheckFailed");
+    }
+
+    if (maybe_roll_forward_orphan_native_checkpoint())
+    {
+        return true;
     }
 
     if (!last_committed_xid_.has_value() ||
@@ -4404,18 +6733,21 @@ bool MetadataStore::ReplayOrRecover()
 
                 const auto value_tombstone = (flags & 0x2u) != 0;
                 (void)timestamp_utc;
-                if (xid != target_xid ||
-                    (flags & ~0x7u) != 0 ||
-                    value_tombstone != raw_record.tombstone ||
-                    (raw_record.tombstone && inode_name.empty() && parent_object_id != object_id) ||
-                    ((flags & 0x1u) != 0 && (logical_size != 0 || data_physical_address != 0)) ||
-                    ((flags & 0x1u) == 0 && logical_size > 0 && data_physical_address == 0))
-                {
-                    return fail_recovery(L"ReplayCommitBlobInvalid");
-                }
+            if (xid != target_xid ||
+                (flags & ~0x7u) != 0 ||
+                value_tombstone != raw_record.tombstone ||
+                (raw_record.tombstone && inode_name.empty() && parent_object_id != object_id) ||
+                ((flags & 0x1u) != 0 && (logical_size != 0 || data_physical_address != 0)) ||
+                ((flags & 0x1u) == 0 &&
+                 logical_size > 0 &&
+                 data_physical_address == 0 &&
+                 !committed_read_extents_.contains(object_id)))
+            {
+                return fail_recovery(L"ReplayCommitBlobInvalid");
+            }
 
                 if (raw_record.tombstone &&
-                    object_id != volume_root_block_)
+                    object_id != RootDirectoryObjectId())
                 {
                     raw_inode_tombstone_triplets.insert(
                         build_directory_entry_triplet_key(parent_object_id, inode_name, object_id));
@@ -4514,6 +6846,41 @@ bool MetadataStore::ReplayOrRecover()
                 return fail_recovery(L"ReplayCommitBlobInvalid");
             }
         }
+
+        const auto has_recovered_read_extent_coverage = [this](std::uint64_t object_id, std::uint64_t physical_address, std::uint64_t logical_size) -> bool
+        {
+            if (object_id == 0 || physical_address == 0 || logical_size == 0)
+            {
+                return false;
+            }
+
+            const auto extents_it = committed_read_extents_.find(object_id);
+            if (extents_it == committed_read_extents_.end())
+            {
+                return false;
+            }
+
+            const auto required_bytes = AlignExtentBytes(logical_size);
+            if (required_bytes == 0)
+            {
+                return false;
+            }
+
+            for (const auto& extent : extents_it->second)
+            {
+                if (ConservativePhysicalRangeContains(
+                        extent.physical_address,
+                        extent.bytes,
+                        physical_address,
+                        required_bytes,
+                        block_size_))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        };
 
         for (const auto& [object_id, update] : final_object_map_updates)
         {
@@ -4615,7 +6982,7 @@ bool MetadataStore::ReplayOrRecover()
         for (const auto& [object_id, inode] : parsed_inodes_by_object)
         {
             if (object_id == 0 ||
-                object_id == volume_root_block_)
+                object_id == RootDirectoryObjectId())
             {
                 continue;
             }
@@ -4653,6 +7020,17 @@ bool MetadataStore::ReplayOrRecover()
             }
 
             auto extent_it = parsed_extents_by_object.find(object_id);
+            const auto has_recovered_read_extents =
+                inode.data_physical_address == 0 &&
+                committed_read_extents_.contains(object_id);
+            if (has_recovered_read_extents)
+            {
+                if (extent_it != parsed_extents_by_object.end())
+                {
+                    return fail_recovery(L"ReplayCommitBlobInvalid");
+                }
+                continue;
+            }
             if (extent_it == parsed_extents_by_object.end() ||
                 extent_it->second.physical_address != inode.data_physical_address ||
                 extent_it->second.extent_bytes != inode.logical_size)
@@ -4692,8 +7070,11 @@ bool MetadataStore::ReplayOrRecover()
             }
             for (const auto& allocation : committed_spaceman_allocations_)
             {
-                if (allocation.physical_address == physical_address &&
-                    allocation.bytes >= bytes_required)
+                if (PhysicalRangeContains(
+                        allocation.physical_address,
+                        allocation.bytes,
+                        physical_address,
+                        bytes_required))
                 {
                     return true;
                 }
@@ -4836,10 +7217,19 @@ bool MetadataStore::ReplayOrRecover()
             }
             else
             {
+                const auto update_has_recovered_read_extents =
+                    update.physical_address != 0 &&
+                    parsed_inode_it != parsed_inodes_by_object.end() &&
+                    parsed_inode_it->second.data_physical_address == 0 &&
+                    has_recovered_read_extent_coverage(
+                        object_id,
+                        update.physical_address,
+                        update.logical_size);
                 if (parsed_inode_it == parsed_inodes_by_object.end() ||
                     parsed_inode_it->second.is_directory ||
                     parsed_inode_it->second.logical_size != update.logical_size ||
-                    parsed_inode_it->second.data_physical_address != update.physical_address)
+                    (!update_has_recovered_read_extents &&
+                     parsed_inode_it->second.data_physical_address != update.physical_address))
                 {
                     return fail_recovery(L"ReplayCommitBlobInvalid");
                 }
@@ -4861,7 +7251,8 @@ bool MetadataStore::ReplayOrRecover()
             {
                 const auto required_bytes = AlignExtentBytes(update.logical_size);
                 if (required_bytes == 0 ||
-                    !has_committed_allocation(update.physical_address, required_bytes))
+                    (!has_committed_allocation(update.physical_address, required_bytes) &&
+                     !has_recovered_read_extent_coverage(object_id, update.physical_address, update.logical_size)))
                 {
                     return fail_recovery(L"ReplayCommitBlobInvalid");
                 }
@@ -4932,9 +7323,25 @@ bool MetadataStore::ReplayOrRecover()
             {
                 continue;
             }
-            auto committed_it = committed_allocation_counts.find(key);
-            if (committed_it == committed_allocation_counts.end() ||
-                committed_it->second < static_cast<std::size_t>(delta))
+            const auto separator = key.find(L':');
+            if (separator == std::wstring::npos)
+            {
+                return fail_recovery(L"ReplayCommitBlobInvalid");
+            }
+            std::uint64_t physical_address = 0;
+            std::uint64_t bytes_required = 0;
+            try
+            {
+                physical_address = std::stoull(key.substr(0, separator));
+                bytes_required = std::stoull(key.substr(separator + 1));
+            }
+            catch (...)
+            {
+                return fail_recovery(L"ReplayCommitBlobInvalid");
+            }
+            if (bytes_required == 0 ||
+                static_cast<std::uint64_t>(delta) != 1 ||
+                !has_committed_allocation(physical_address, bytes_required))
             {
                 return fail_recovery(L"ReplayCommitBlobInvalid");
             }
@@ -5027,8 +7434,12 @@ bool MetadataStore::ReplayCanonicalCheckpoint()
 
 bool MetadataStore::VerifyIntegrity() const
 {
+    last_integrity_failure_reason_.clear();
+    last_integrity_failure_object_id_.reset();
+
     if (!container_loaded_ || !object_map_loaded_ || !spaceman_loaded_)
     {
+        RecordIntegrityFailure(L"Prerequisites");
         return false;
     }
 
@@ -5038,6 +7449,7 @@ bool MetadataStore::VerifyIntegrity() const
             committed_directory_links_,
             true))
     {
+        RecordIntegrityFailure(L"InodeGraph");
         return false;
     }
 
@@ -5045,11 +7457,13 @@ bool MetadataStore::VerifyIntegrity() const
     {
         if (path_key.empty())
         {
+            RecordIntegrityFailure(L"PathKeyEmpty");
             return false;
         }
 
         if (committed_inodes_.find(object_id) == committed_inodes_.end())
         {
+            RecordIntegrityFailure(L"PathMissingInode", object_id);
             return false;
         }
     }
@@ -5058,11 +7472,16 @@ bool MetadataStore::VerifyIntegrity() const
     {
         if (object_id == 0 || inode.object_id != object_id)
         {
+            RecordIntegrityFailure(L"InodeIdentity", object_id);
             return false;
         }
 
-        if (!inode.is_directory && inode.logical_size > 0 && inode.data_physical_address == 0)
+        if (!inode.is_directory &&
+            inode.logical_size > 0 &&
+            inode.data_physical_address == 0 &&
+            !committed_read_extents_.contains(object_id))
         {
+            RecordIntegrityFailure(L"MissingReadExtent", object_id);
             return false;
         }
     }
@@ -5086,14 +7505,62 @@ bool MetadataStore::VerifyIntegrity() const
 
         for (const auto& allocation : committed_spaceman_allocations_)
         {
-            if (allocation.physical_address == physical_address &&
-                allocation.bytes >= required_bytes)
+            if (allocation.physical_address > physical_address ||
+                allocation.bytes < required_bytes)
+            {
+                continue;
+            }
+            const auto requested_end = physical_address + required_bytes;
+            const auto allocation_end = allocation.physical_address + allocation.bytes;
+            if (requested_end >= physical_address &&
+                allocation_end >= allocation.physical_address &&
+                requested_end <= allocation_end)
             {
                 return true;
             }
         }
         return false;
     };
+    const auto has_recovered_read_extent_coverage = [this](std::uint64_t object_id, std::uint64_t physical_address, std::uint64_t logical_size) -> bool
+    {
+        if (!context_.allow_raw_physical_write ||
+            physical_address == 0 ||
+            logical_size == 0)
+        {
+            return false;
+        }
+
+        const auto extents_it = committed_read_extents_.find(object_id);
+        if (extents_it == committed_read_extents_.end())
+        {
+            return false;
+        }
+
+        const auto required_bytes = AlignExtentBytes(logical_size);
+        if (required_bytes == 0)
+        {
+            return false;
+        }
+
+        for (const auto& extent : extents_it->second)
+        {
+            if (ConservativePhysicalRangeContains(
+                    extent.physical_address,
+                    extent.bytes,
+                    physical_address,
+                    required_bytes,
+                    block_size_))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    };
+    const auto relax_physical_read_projection =
+        IsLikelyRawDevicePath(context_.device_path) &&
+        !context_.allow_raw_physical_write &&
+        !committed_read_extents_.empty();
 
     std::unordered_set<std::string> projected_btree_keys;
     projected_btree_keys.reserve(committed_btree_records_.size());
@@ -5103,20 +7570,24 @@ bool MetadataStore::VerifyIntegrity() const
             record.kind < BtreeRecordKind::Inode ||
             record.kind > BtreeRecordKind::FileExtent)
         {
+            RecordIntegrityFailure(L"ProjectedBtreeInvalid");
             return false;
         }
         if (record.tombstone)
         {
+            RecordIntegrityFailure(L"ProjectedBtreeTombstone");
             return false;
         }
         if (std::to_integer<unsigned char>(record.key.front()) != static_cast<unsigned char>(record.kind))
         {
+            RecordIntegrityFailure(L"ProjectedBtreeKindPrefix");
             return false;
         }
 
         auto key_blob = BuildBtreeKeyBlob(record.key);
         if (key_blob.empty() || !projected_btree_keys.insert(std::move(key_blob)).second)
         {
+            RecordIntegrityFailure(L"ProjectedBtreeDuplicate");
             return false;
         }
     }
@@ -5147,6 +7618,7 @@ bool MetadataStore::VerifyIntegrity() const
         auto inode_key = BuildBtreeKeyBlob(inode_key_record.key);
         if (inode_key.empty() || !expected_btree_keys.insert(std::move(inode_key)).second)
         {
+            RecordIntegrityFailure(L"ExpectedBtreeInodeDuplicate", object_id);
             return false;
         }
 
@@ -5164,6 +7636,7 @@ bool MetadataStore::VerifyIntegrity() const
             auto extent_key = BuildBtreeKeyBlob(extent_key_record.key);
             if (extent_key.empty() || !expected_btree_keys.insert(std::move(extent_key)).second)
             {
+                RecordIntegrityFailure(L"ExpectedBtreeExtentDuplicate", object_id);
                 return false;
             }
         }
@@ -5180,18 +7653,21 @@ bool MetadataStore::VerifyIntegrity() const
         auto directory_key = BuildBtreeKeyBlob(directory_key_record.key);
         if (directory_key.empty() || !expected_btree_keys.insert(std::move(directory_key)).second)
         {
+            RecordIntegrityFailure(L"ExpectedBtreeDirectoryDuplicate", link.child_object_id);
             return false;
         }
     }
 
     if (projected_btree_keys.size() != expected_btree_keys.size())
     {
+        RecordIntegrityFailure(L"ProjectedBtreeSize");
         return false;
     }
     for (const auto& expected_key : expected_btree_keys)
     {
         if (!projected_btree_keys.contains(expected_key))
         {
+            RecordIntegrityFailure(L"ProjectedBtreeMissingKey");
             return false;
         }
     }
@@ -5212,6 +7688,7 @@ bool MetadataStore::VerifyIntegrity() const
             DecodedBtreeInode decoded{};
             if (!DecodeBtreeInodeRecord(record, decoded))
             {
+                RecordIntegrityFailure(L"DecodeInode");
                 return false;
             }
             if (!decoded_inodes_by_object.emplace(decoded.object_id, std::move(decoded)).second)
@@ -5225,6 +7702,7 @@ bool MetadataStore::VerifyIntegrity() const
             DecodedBtreeDirectoryEntry decoded{};
             if (!DecodeBtreeDirectoryRecord(record, decoded))
             {
+                RecordIntegrityFailure(L"DecodeDirectory");
                 return false;
             }
             auto key = BuildDirectoryEntryIndexKey(decoded.parent_object_id, decoded.entry_name);
@@ -5239,10 +7717,12 @@ bool MetadataStore::VerifyIntegrity() const
             DecodedBtreeExtent decoded{};
             if (!DecodeBtreeExtentRecord(record, decoded))
             {
+                RecordIntegrityFailure(L"DecodeExtent");
                 return false;
             }
             if (decoded.logical_offset != 0)
             {
+                RecordIntegrityFailure(L"ExtentOffset", decoded.object_id);
                 return false;
             }
             if (!decoded_extents_by_object.emplace(decoded.object_id, std::move(decoded)).second)
@@ -5267,6 +7747,7 @@ bool MetadataStore::VerifyIntegrity() const
     }
     if (decoded_inodes_by_object.size() != expected_non_root_inode_count)
     {
+        RecordIntegrityFailure(L"InodeCount");
         return false;
     }
 
@@ -5280,6 +7761,7 @@ bool MetadataStore::VerifyIntegrity() const
         auto decoded_it = decoded_inodes_by_object.find(object_id);
         if (decoded_it == decoded_inodes_by_object.end())
         {
+            RecordIntegrityFailure(L"MissingDecodedInode", object_id);
             return false;
         }
         const auto& decoded = decoded_it->second;
@@ -5290,26 +7772,39 @@ bool MetadataStore::VerifyIntegrity() const
             decoded.timestamp_utc != inode.timestamp_utc ||
             decoded.name != inode.name)
         {
+            RecordIntegrityFailure(L"DecodedInodeMismatch", object_id);
             return false;
         }
         if (decoded.xid == 0 || decoded.xid > xid_upper_bound)
         {
+            RecordIntegrityFailure(L"InodeXid", object_id);
             return false;
         }
         if (decoded.parent_object_id == 0 || !committed_inodes_.contains(decoded.parent_object_id))
         {
+            RecordIntegrityFailure(L"InodeParentMissing", object_id);
             return false;
         }
         if (auto parent_it = committed_inodes_.find(decoded.parent_object_id);
             parent_it == committed_inodes_.end() || !parent_it->second.is_directory)
         {
+            RecordIntegrityFailure(L"InodeParentDirectory", object_id);
             return false;
         }
 
-        if (inode.is_directory || inode.logical_size == 0 || inode.data_physical_address == 0)
+        if (inode.is_directory || inode.logical_size == 0)
         {
             if (decoded_extents_by_object.contains(object_id))
             {
+                RecordIntegrityFailure(L"UnexpectedExtentForZeroOrDir", object_id);
+                return false;
+            }
+        }
+        else if (inode.data_physical_address == 0)
+        {
+            if (!committed_read_extents_.contains(object_id))
+            {
+                RecordIntegrityFailure(L"MissingCommittedReadExtents", object_id);
                 return false;
             }
         }
@@ -5318,31 +7813,56 @@ bool MetadataStore::VerifyIntegrity() const
             auto extent_it = decoded_extents_by_object.find(object_id);
             if (extent_it == decoded_extents_by_object.end())
             {
+                RecordIntegrityFailure(L"MissingExtentRecord", object_id);
                 return false;
             }
             const auto& extent = extent_it->second;
-            if (extent.physical_address != inode.data_physical_address ||
-                extent.extent_bytes != inode.logical_size ||
+            const auto has_read_extent_projection = committed_read_extents_.contains(object_id);
+            if ((!relax_physical_read_projection &&
+                 !has_read_extent_projection &&
+                 (extent.physical_address != inode.data_physical_address ||
+                  extent.extent_bytes != inode.logical_size)) ||
                 extent.xid == 0 ||
                 extent.xid > xid_upper_bound)
             {
+                RecordIntegrityFailure(L"ExtentMismatch", object_id);
                 return false;
             }
 
             auto mapped = committed_object_map_.find(object_id);
             if (mapped == committed_object_map_.end())
             {
+                RecordIntegrityFailure(L"MissingObjectMap", object_id);
                 return false;
             }
             if (mapped->second.xid == 0 ||
                 mapped->second.xid > xid_upper_bound ||
-                mapped->second.physical_address != extent.physical_address ||
-                mapped->second.logical_size != extent.extent_bytes)
+                (!relax_physical_read_projection &&
+                 !has_read_extent_projection &&
+                 (mapped->second.physical_address != extent.physical_address ||
+                  mapped->second.logical_size != extent.extent_bytes)))
             {
+                RecordIntegrityFailure(L"ObjectMapMismatch", object_id);
                 return false;
             }
-            if (!has_allocation_for_physical(mapped->second.physical_address, mapped->second.logical_size))
+            if (context_.allow_raw_physical_write &&
+                !has_allocation_for_physical(mapped->second.physical_address, mapped->second.logical_size) &&
+                !has_recovered_read_extent_coverage(
+                    object_id,
+                    mapped->second.physical_address,
+                    mapped->second.logical_size))
             {
+                if (IsReadTraceEnabled())
+                {
+                    std::wcerr << L"[MetadataStore] MissingAllocation detail"
+                               << L" object=" << object_id
+                               << L" physical=" << mapped->second.physical_address
+                               << L" logical=" << mapped->second.logical_size
+                               << L" allocations=" << committed_spaceman_allocations_.size()
+                               << L" freeExtents=" << committed_spaceman_free_extents_.size()
+                               << std::endl;
+                }
+                RecordIntegrityFailure(L"MissingAllocation", object_id);
                 return false;
             }
         }
@@ -5350,6 +7870,7 @@ bool MetadataStore::VerifyIntegrity() const
 
     if (decoded_directory_entries.size() != committed_directory_links_.size())
     {
+        RecordIntegrityFailure(L"DirectoryEntryCount");
         return false;
     }
     for (const auto& link : committed_directory_links_)
@@ -5358,6 +7879,7 @@ bool MetadataStore::VerifyIntegrity() const
         auto decoded_it = decoded_directory_entries.find(entry_key);
         if (decoded_it == decoded_directory_entries.end())
         {
+            RecordIntegrityFailure(L"MissingDecodedDirectory", link.child_object_id);
             return false;
         }
         const auto& decoded = decoded_it->second;
@@ -5365,6 +7887,7 @@ bool MetadataStore::VerifyIntegrity() const
             decoded.xid == 0 ||
             decoded.xid > xid_upper_bound)
         {
+            RecordIntegrityFailure(L"DirectoryMismatch", link.child_object_id);
             return false;
         }
 
@@ -5376,6 +7899,7 @@ bool MetadataStore::VerifyIntegrity() const
             child_it->second.parent_object_id != link.parent_object_id ||
             child_it->second.name != link.entry_name)
         {
+            RecordIntegrityFailure(L"DirectoryLinkMismatch", link.child_object_id);
             return false;
         }
     }
@@ -5489,6 +8013,73 @@ std::vector<MetadataStore::InodeRecord> MetadataStore::SnapshotCommittedInodes()
     return snapshot;
 }
 
+bool MetadataStore::SetCommittedReadExtents(std::uint64_t object_id, std::vector<FileExtent> extents)
+{
+    if (object_id == 0)
+    {
+        return false;
+    }
+    if (extents.empty())
+    {
+        committed_read_extents_[object_id] = {};
+        return true;
+    }
+
+    std::sort(extents.begin(), extents.end(), [](const FileExtent& lhs, const FileExtent& rhs)
+    {
+        if (lhs.logical_offset == rhs.logical_offset)
+        {
+            return lhs.physical_address < rhs.physical_address;
+        }
+        return lhs.logical_offset < rhs.logical_offset;
+    });
+
+    std::vector<FileExtent> normalized;
+    normalized.reserve(extents.size());
+    std::uint64_t previous_end = 0;
+    bool has_previous = false;
+    for (const auto& extent : extents)
+    {
+        if (extent.bytes == 0)
+        {
+            return false;
+        }
+        if (extent.logical_offset > (std::numeric_limits<std::uint64_t>::max() - extent.bytes) ||
+            extent.physical_address > (std::numeric_limits<std::uint64_t>::max() - extent.bytes))
+        {
+            return false;
+        }
+        if (!normalized.empty())
+        {
+            const auto& previous = normalized.back();
+            if (extent.logical_offset == previous.logical_offset &&
+                extent.bytes == previous.bytes &&
+                extent.physical_address == previous.physical_address)
+            {
+                continue;
+            }
+        }
+        if (has_previous && extent.logical_offset < previous_end)
+        {
+            return false;
+        }
+
+        previous_end = extent.logical_offset + extent.bytes;
+        has_previous = true;
+        normalized.push_back(extent);
+    }
+
+    if (normalized.empty())
+    {
+        committed_read_extents_[object_id] = {};
+    }
+    else
+    {
+        committed_read_extents_[object_id] = std::move(normalized);
+    }
+    return true;
+}
+
 bool MetadataStore::ReadCommittedFileRange(
     const std::wstring& path,
     std::uint64_t offset,
@@ -5500,6 +8091,7 @@ bool MetadataStore::ReadCommittedFileRange(
     auto inode = LookupCommittedInodeByPath(path);
     if (!inode.has_value() || inode->is_directory)
     {
+        TraceReadFailure(path, 0, offset, bytes_to_read, L"InodeMissingOrDirectory");
         return false;
     }
 
@@ -5508,18 +8100,84 @@ bool MetadataStore::ReadCommittedFileRange(
         return true;
     }
 
-    if (inode->data_physical_address == 0 || inode->logical_size == 0)
-    {
-        return false;
-    }
-
     const auto available_u64 = inode->logical_size - offset;
     const auto available_bytes = available_u64 > static_cast<std::uint64_t>(bytes_to_read)
         ? bytes_to_read
         : static_cast<std::size_t>(available_u64);
 
+    if (auto extents_it = committed_read_extents_.find(inode->object_id);
+        extents_it != committed_read_extents_.end())
+    {
+        out_payload.assign(available_bytes, std::byte{0});
+        const auto request_begin = offset;
+        const auto request_end = offset + static_cast<std::uint64_t>(available_bytes);
+        for (const auto& extent : extents_it->second)
+        {
+            const auto extent_begin = extent.logical_offset;
+            const auto extent_end = extent.logical_offset + extent.bytes;
+            if (extent_end <= request_begin)
+            {
+                continue;
+            }
+            if (extent_begin >= request_end)
+            {
+                break;
+            }
+
+            const auto chunk_begin = std::max(request_begin, extent_begin);
+            const auto chunk_end = std::min(request_end, extent_end);
+            if (chunk_end <= chunk_begin)
+            {
+                continue;
+            }
+            const auto chunk_bytes = static_cast<std::size_t>(chunk_end - chunk_begin);
+            if (extent.physical_address == 0)
+            {
+                continue;
+            }
+            if (extent.physical_address > (std::numeric_limits<std::uint64_t>::max() - (chunk_begin - extent_begin)))
+            {
+                TraceReadFailure(path, inode->object_id, offset, available_bytes, L"ExtentPhysicalOverflow");
+                return false;
+            }
+            const auto physical_offset = extent.physical_address + (chunk_begin - extent_begin);
+
+            std::vector<std::byte> chunk;
+            if (!device_.Read(physical_offset, chunk_bytes, chunk) ||
+                chunk.size() > chunk_bytes)
+            {
+                TraceReadFailure(path, inode->object_id, physical_offset, chunk_bytes, L"ExtentDeviceReadFailed");
+                return false;
+            }
+            if (chunk.size() < chunk_bytes)
+            {
+                TraceReadFailure(path, inode->object_id, physical_offset, chunk_bytes, L"ExtentDeviceShortRead");
+                return false;
+            }
+
+            const auto destination_offset = static_cast<std::size_t>(chunk_begin - request_begin);
+            if (destination_offset > out_payload.size() ||
+                chunk.size() > (out_payload.size() - destination_offset))
+            {
+                return false;
+            }
+            std::copy(
+                chunk.begin(),
+                chunk.end(),
+                out_payload.begin() + static_cast<std::vector<std::byte>::difference_type>(destination_offset));
+        }
+        return true;
+    }
+
+    if (inode->data_physical_address == 0 || inode->logical_size == 0)
+    {
+        TraceReadFailure(path, inode->object_id, offset, available_bytes, L"NoDataExtent");
+        return false;
+    }
+
     if (inode->data_physical_address > (std::numeric_limits<std::uint64_t>::max() - offset))
     {
+        TraceReadFailure(path, inode->object_id, offset, available_bytes, L"SingleExtentPhysicalOverflow");
         return false;
     }
     const auto physical_offset = inode->data_physical_address + offset;
@@ -5527,12 +8185,14 @@ bool MetadataStore::ReadCommittedFileRange(
     std::vector<std::byte> read_buffer;
     if (!device_.Read(physical_offset, available_bytes, read_buffer))
     {
+        TraceReadFailure(path, inode->object_id, physical_offset, available_bytes, L"SingleExtentDeviceReadFailed");
         return false;
     }
 
     if (read_buffer.size() < available_bytes)
     {
-        read_buffer.resize(available_bytes, std::byte{0});
+        TraceReadFailure(path, inode->object_id, physical_offset, available_bytes, L"SingleExtentDeviceShortRead");
+        return false;
     }
 
     out_payload = std::move(read_buffer);
@@ -5851,7 +8511,7 @@ std::wstring MetadataStore::LeafName(const std::wstring& normalized_path)
 bool MetadataStore::EnsureRootState()
 {
     const auto root_path = std::wstring(L"\\");
-    const auto root_object_id = volume_root_block_ != 0 ? volume_root_block_ : StableObjectIdFromPath(root_path);
+    const auto root_object_id = RootDirectoryObjectId();
 
     if (committed_path_index_.empty() && !committed_inodes_.empty())
     {
@@ -5918,6 +8578,7 @@ bool MetadataStore::EnsureRootState()
         /*require_root_object=*/true);
     if (graph_state_valid)
     {
+        SyncWorkingStateFromCommitted();
         RefreshObjectIdAllocator();
     }
     return graph_state_valid;
@@ -5935,6 +8596,9 @@ bool MetadataStore::ValidateInodeGraphState(
         return !require_root_object;
     }
 
+    const auto allow_unresolved_raw_read_extent =
+        context_.allow_raw_physical_write &&
+        IsLikelyRawDevicePath(context_.device_path);
     const auto canonical_name_key = [](const std::wstring& name)
     {
         std::wstring key = name;
@@ -5959,30 +8623,35 @@ bool MetadataStore::ValidateInodeGraphState(
     {
         if (object_id == 0 || inode.full_path.empty())
         {
+            TraceGraphFailure(L"InodeEmpty", object_id);
             return false;
         }
 
         const auto normalized_path = NormalizePath(inode.full_path);
         if (normalized_path != inode.full_path)
         {
+            TraceGraphFailure(L"PathNotNormalized", object_id);
             return false;
         }
 
         const auto path_key = CanonicalPathKey(inode.full_path);
         if (path_key.empty())
         {
+            TraceGraphFailure(L"PathKeyEmpty", object_id);
             return false;
         }
 
         auto [path_it, inserted] = canonical_paths.emplace(path_key, object_id);
         if (!inserted && path_it->second != object_id)
         {
+            TraceGraphFailure(L"CanonicalPathCollision", object_id);
             return false;
         }
 
         auto indexed_it = path_index.find(path_key);
         if (indexed_it == path_index.end() || indexed_it->second != object_id)
         {
+            TraceGraphFailure(L"PathIndexMismatch", object_id);
             return false;
         }
 
@@ -5996,6 +8665,7 @@ bool MetadataStore::ValidateInodeGraphState(
                 inode.data_physical_address != 0 ||
                 inode.logical_size != 0)
             {
+                TraceGraphFailure(L"RootInodeInvalid", object_id);
                 return false;
             }
         }
@@ -6005,17 +8675,20 @@ bool MetadataStore::ValidateInodeGraphState(
                 LeafName(inode.full_path) != inode.name ||
                 inode.parent_object_id == object_id)
             {
+                TraceGraphFailure(L"NonRootNameParentInvalid", object_id);
                 return false;
             }
 
             auto parent_it = inode_table.find(inode.parent_object_id);
             if (parent_it == inode_table.end() || !parent_it->second.is_directory)
             {
+                TraceGraphFailure(L"MissingParentDirectory", object_id);
                 return false;
             }
 
             if (CanonicalPathKey(ParentPath(inode.full_path)) != CanonicalPathKey(parent_it->second.full_path))
             {
+                TraceGraphFailure(L"ParentPathMismatch", object_id);
                 return false;
             }
         }
@@ -6024,14 +8697,19 @@ bool MetadataStore::ValidateInodeGraphState(
         {
             if (inode.data_physical_address != 0 || inode.logical_size != 0)
             {
+                TraceGraphFailure(L"DirectoryHasData", object_id);
                 return false;
             }
         }
         else
         {
             if ((inode.logical_size == 0 && inode.data_physical_address != 0) ||
-                (inode.logical_size > 0 && inode.data_physical_address == 0))
+                (inode.logical_size > 0 &&
+                 inode.data_physical_address == 0 &&
+                 !committed_read_extents_.contains(object_id) &&
+                 !allow_unresolved_raw_read_extent))
             {
+                TraceGraphFailure(L"FileExtentMissing", object_id);
                 return false;
             }
         }
@@ -6039,11 +8717,13 @@ bool MetadataStore::ValidateInodeGraphState(
 
     if (require_root_object && root_count != 1)
     {
+        TraceGraphFailure(L"RootCount");
         return false;
     }
 
     if (path_index.size() != canonical_paths.size())
     {
+        TraceGraphFailure(L"PathIndexSize");
         return false;
     }
     for (const auto& [path_key, object_id] : path_index)
@@ -6051,11 +8731,13 @@ bool MetadataStore::ValidateInodeGraphState(
         auto inode_it = inode_table.find(object_id);
         if (inode_it == inode_table.end())
         {
+            TraceGraphFailure(L"PathIndexMissingInode", object_id);
             return false;
         }
 
         if (path_key != CanonicalPathKey(inode_it->second.full_path))
         {
+            TraceGraphFailure(L"PathIndexKeyMismatch", object_id);
             return false;
         }
     }
@@ -6074,12 +8756,14 @@ bool MetadataStore::ValidateInodeGraphState(
             object_id);
         if (!inserted && it->second != object_id)
         {
+            TraceGraphFailure(L"ExpectedLinkCollision", object_id);
             return false;
         }
     }
 
     if (directory_links.size() != expected_links.size())
     {
+        TraceGraphFailure(L"DirectoryLinkSize");
         return false;
     }
     std::unordered_set<std::wstring> seen_links;
@@ -6088,6 +8772,7 @@ bool MetadataStore::ValidateInodeGraphState(
     {
         if (link.parent_object_id == 0 || link.child_object_id == 0 || link.entry_name.empty())
         {
+            TraceGraphFailure(L"DirectoryLinkInvalid", link.child_object_id);
             return false;
         }
 
@@ -6097,16 +8782,19 @@ bool MetadataStore::ValidateInodeGraphState(
             child_it == inode_table.end() ||
             !parent_it->second.is_directory)
         {
+            TraceGraphFailure(L"DirectoryLinkParentChildMissing", link.child_object_id);
             return false;
         }
 
         if (child_it->second.parent_object_id != link.parent_object_id)
         {
+            TraceGraphFailure(L"DirectoryLinkParentMismatch", link.child_object_id);
             return false;
         }
 
         if (canonical_name_key(link.entry_name) != canonical_name_key(child_it->second.name))
         {
+            TraceGraphFailure(L"DirectoryLinkNameMismatch", link.child_object_id);
             return false;
         }
 
@@ -6114,11 +8802,13 @@ bool MetadataStore::ValidateInodeGraphState(
         auto expected_it = expected_links.find(link_key);
         if (expected_it == expected_links.end() || expected_it->second != link.child_object_id)
         {
+            TraceGraphFailure(L"DirectoryLinkExpectedMismatch", link.child_object_id);
             return false;
         }
 
         if (!seen_links.emplace(link_key).second)
         {
+            TraceGraphFailure(L"DirectoryLinkDuplicate", link.child_object_id);
             return false;
         }
     }
@@ -6134,12 +8824,14 @@ bool MetadataStore::ValidateInodeGraphState(
         {
             if (!seen.emplace(cursor).second)
             {
+                TraceGraphFailure(L"AncestryCycle", object_id);
                 return false;
             }
 
             auto current_it = inode_table.find(cursor);
             if (current_it == inode_table.end())
             {
+                TraceGraphFailure(L"AncestryMissingInode", object_id);
                 return false;
             }
 
@@ -6154,6 +8846,7 @@ bool MetadataStore::ValidateInodeGraphState(
 
         if (!reached_root)
         {
+            TraceGraphFailure(L"AncestryNoRoot", object_id);
             return false;
         }
     }
@@ -6172,7 +8865,7 @@ void MetadataStore::RefreshObjectIdAllocator()
         }
     };
 
-    consider_object_id(volume_root_block_);
+    consider_object_id(RootDirectoryObjectId());
     for (const auto& [object_id, _] : committed_object_map_)
     {
         consider_object_id(object_id);
@@ -6236,9 +8929,9 @@ std::uint64_t MetadataStore::ResolveUniqueObjectId(const std::wstring& normalize
     {
         candidate = 1;
     }
-    if (candidate <= volume_root_block_)
+    if (candidate <= RootDirectoryObjectId())
     {
-        candidate = volume_root_block_ + 1;
+        candidate = RootDirectoryObjectId() + 1;
         if (candidate == 0)
         {
             candidate = 1;
@@ -6443,6 +9136,17 @@ bool MetadataStore::IsFixtureImagePath(const std::wstring& path)
     // "...\\fixtures\\volume.bin"). Production/non-fixture eligibility must be
     // determined by explicit image naming, not incidental folder segments.
     return false;
+}
+
+std::uint64_t MetadataStore::RootDirectoryObjectId() const
+{
+    if (IsLikelyRawDevicePath(context_.device_path))
+    {
+        return kApfsRootDirectoryObjectId;
+    }
+
+    const auto root_path = std::wstring(L"\\");
+    return volume_root_block_ != 0 ? volume_root_block_ : StableObjectIdFromPath(root_path);
 }
 
 bool MetadataStore::StageObjectMapUpdate(
@@ -6685,6 +9389,32 @@ bool MetadataStore::RequiresCanonicalNonFixtureCommitPath() const noexcept
     // All non-fixture media uses canonical commit/replay semantics. Fixture-only
     // compatibility controls must never relax production non-fixture safety paths.
     return true;
+}
+
+bool MetadataStore::CanLoadNativeCheckpointXid(std::uint64_t persisted_xid) const noexcept
+{
+    if (persisted_xid <= loaded_superblock_checkpoint_xid_)
+    {
+        return true;
+    }
+
+    if (replay_checkpoint_load_xid_.has_value())
+    {
+        return persisted_xid == replay_checkpoint_load_xid_.value();
+    }
+
+    if (IsLikelyRawDevicePath(context_.device_path))
+    {
+        return false;
+    }
+
+    if (!RequiresCanonicalNonFixtureCommitPath() ||
+        loaded_superblock_checkpoint_xid_ == std::numeric_limits<std::uint64_t>::max())
+    {
+        return false;
+    }
+
+    return persisted_xid == (loaded_superblock_checkpoint_xid_ + 1);
 }
 
 bool MetadataStore::ShouldAcceptScaffoldCommitBlobForCurrentContext() const noexcept
@@ -7161,9 +9891,15 @@ bool MetadataStore::ValidateReplayCommitBlobCandidate(
 
 bool MetadataStore::ValidatePendingCommitState() const
 {
+    const auto fail_pending = [](std::wstring_view reason, std::uint64_t object_id = 0) -> bool
+    {
+        TracePendingCommitFailure(reason, object_id);
+        return false;
+    };
+
     if (pending_mutations_.empty())
     {
-        return false;
+        return fail_pending(L"NoPendingMutations");
     }
     if (!ValidateInodeGraphState(
             committed_inodes_,
@@ -7171,7 +9907,7 @@ bool MetadataStore::ValidatePendingCommitState() const
             committed_directory_links_,
             /*require_root_object=*/true))
     {
-        return false;
+        return fail_pending(L"CommittedInodeGraph");
     }
     if (!ValidateInodeGraphState(
             working_inodes_,
@@ -7179,7 +9915,7 @@ bool MetadataStore::ValidatePendingCommitState() const
             working_directory_links_,
             /*require_root_object=*/true))
     {
-        return false;
+        return fail_pending(L"WorkingInodeGraph");
     }
 
     std::optional<std::uint64_t> container_bytes;
@@ -7188,7 +9924,7 @@ bool MetadataStore::ValidatePendingCommitState() const
         if (block_size_ == 0 ||
             total_blocks_ > (std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(block_size_)))
         {
-            return false;
+            return fail_pending(L"ContainerSizeOverflow");
         }
         container_bytes = total_blocks_ * static_cast<std::uint64_t>(block_size_);
     }
@@ -7226,7 +9962,7 @@ bool MetadataStore::ValidatePendingCommitState() const
         const auto rhs_end = rhs.physical_address + rhs.bytes;
         return lhs_begin < rhs_end && rhs_begin < lhs_end;
     };
-    const auto has_allocation_for_physical = [&](std::uint64_t physical_address, std::uint64_t logical_size) -> bool
+    const auto has_pending_allocation_for_physical = [&](std::uint64_t physical_address, std::uint64_t logical_size) -> bool
     {
         if (physical_address == 0 || logical_size == 0)
         {
@@ -7242,20 +9978,76 @@ bool MetadataStore::ValidatePendingCommitState() const
         for (const auto& allocation : pending_spaceman_allocations_)
         {
             if (allocation.physical_address == physical_address &&
-                allocation.bytes >= required_bytes)
-            {
-                return true;
-            }
-        }
-        for (const auto& allocation : committed_spaceman_allocations_)
-        {
-            if (allocation.physical_address == physical_address &&
-                allocation.bytes >= required_bytes)
+                allocation.bytes >= required_bytes &&
+                PhysicalRangeContains(allocation.physical_address, allocation.bytes, physical_address, required_bytes))
             {
                 return true;
             }
         }
         return false;
+    };
+    const auto has_recovered_extent_coverage = [this](std::uint64_t physical_address, std::uint64_t logical_size) -> bool
+    {
+        if (!context_.allow_raw_physical_write ||
+            physical_address == 0 ||
+            logical_size == 0)
+        {
+            return false;
+        }
+
+        const auto required_bytes = AlignExtentBytes(logical_size);
+        if (required_bytes == 0 ||
+            physical_address > (std::numeric_limits<std::uint64_t>::max() - required_bytes))
+        {
+            return false;
+        }
+
+        for (const auto& [_, extents] : committed_read_extents_)
+        {
+            for (const auto& extent : extents)
+            {
+                if (ConservativePhysicalRangeContains(
+                        extent.physical_address,
+                        extent.bytes,
+                        physical_address,
+                        required_bytes,
+                        block_size_))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    };
+
+    const auto has_committed_allocation_for_physical = [&](std::uint64_t physical_address, std::uint64_t logical_size) -> bool
+    {
+        if (physical_address == 0 || logical_size == 0)
+        {
+            return false;
+        }
+
+        const auto required_bytes = AlignExtentBytes(logical_size);
+        if (required_bytes == 0)
+        {
+            return false;
+        }
+
+        for (const auto& allocation : committed_spaceman_allocations_)
+        {
+            if (PhysicalRangeContains(allocation.physical_address, allocation.bytes, physical_address, required_bytes))
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    const auto has_allocation_for_physical = [&](std::uint64_t physical_address, std::uint64_t logical_size) -> bool
+    {
+        return has_pending_allocation_for_physical(physical_address, logical_size) ||
+               has_committed_allocation_for_physical(physical_address, logical_size);
     };
 
     std::unordered_map<std::uint64_t, ObjectMapUpdate> effective_object_map = committed_object_map_;
@@ -7265,7 +10057,7 @@ bool MetadataStore::ValidatePendingCommitState() const
         if (update.object_id == 0 ||
             update.xid != checkpoint_xid_ + 1)
         {
-            return false;
+            return fail_pending(L"PendingObjectMapInvalid", update.object_id);
         }
         effective_object_map[update.object_id] = update;
     }
@@ -7285,20 +10077,20 @@ bool MetadataStore::ValidatePendingCommitState() const
     ApfsObjectMapStore object_map_store;
     if (!object_map_store.ValidateEntries(effective_object_entries))
     {
-        return false;
+        return fail_pending(L"ObjectMapValidateEntries");
     }
 
     for (const auto& allocation : pending_spaceman_allocations_)
     {
         if (!is_valid_extent(allocation))
         {
-            return false;
+            return fail_pending(L"PendingAllocationInvalid", allocation.physical_address);
         }
         for (const auto& committed_allocation : committed_spaceman_allocations_)
         {
             if (overlaps(allocation, committed_allocation))
             {
-                return false;
+                return fail_pending(L"PendingAllocationOverlapsCommitted", allocation.physical_address);
             }
         }
     }
@@ -7308,7 +10100,7 @@ bool MetadataStore::ValidatePendingCommitState() const
         {
             if (overlaps(pending_spaceman_allocations_[i], pending_spaceman_allocations_[j]))
             {
-                return false;
+                return fail_pending(L"PendingAllocationOverlap", pending_spaceman_allocations_[i].physical_address);
             }
         }
     }
@@ -7327,7 +10119,7 @@ bool MetadataStore::ValidatePendingCommitState() const
                 continue;
             }
 
-            return false;
+            return fail_pending(L"PendingAllocationDeallocationPartialOverlap", allocation.physical_address);
         }
     }
 
@@ -7344,16 +10136,17 @@ bool MetadataStore::ValidatePendingCommitState() const
         const auto mapped = effective_object_map.find(object_id);
         if (mapped == effective_object_map.end())
         {
-            return false;
+            return fail_pending(L"LiveExtentMissingObjectMap", object_id);
         }
         if (mapped->second.physical_address != inode.data_physical_address ||
             mapped->second.logical_size != inode.logical_size)
         {
-            return false;
+            return fail_pending(L"LiveExtentObjectMapMismatch", object_id);
         }
-        if (!has_allocation_for_physical(inode.data_physical_address, inode.logical_size))
+        if (!has_allocation_for_physical(inode.data_physical_address, inode.logical_size) &&
+            !has_recovered_extent_coverage(inode.data_physical_address, inode.logical_size))
         {
-            return false;
+            return fail_pending(L"LiveExtentMissingAllocation", object_id);
         }
 
         live_extent_addresses.insert(inode.data_physical_address);
@@ -7366,9 +10159,23 @@ bool MetadataStore::ValidatePendingCommitState() const
         {
             continue;
         }
-        if (!has_allocation_for_physical(update.physical_address, update.logical_size))
+        const auto committed_it = committed_object_map_.find(update.object_id);
+        const auto update_matches_committed =
+            committed_it != committed_object_map_.end() &&
+            committed_it->second.physical_address == update.physical_address &&
+            committed_it->second.logical_size == update.logical_size;
+        if (update_matches_committed)
         {
-            return false;
+            if (!has_committed_allocation_for_physical(update.physical_address, update.logical_size) &&
+                !has_recovered_extent_coverage(update.physical_address, update.logical_size))
+            {
+                return fail_pending(L"ObjectMapMissingCommittedAllocation", update.object_id);
+            }
+        }
+        else if (!has_pending_allocation_for_physical(update.physical_address, update.logical_size) &&
+                 !has_recovered_extent_coverage(update.physical_address, update.logical_size))
+        {
+            return fail_pending(L"ObjectMapMissingAllocation", update.object_id);
         }
     }
 
@@ -7377,22 +10184,25 @@ bool MetadataStore::ValidatePendingCommitState() const
     {
         if (!is_valid_extent(deallocation))
         {
-            return false;
+            return fail_pending(L"PendingDeallocationInvalid", deallocation.physical_address);
         }
         if (!seen_deallocations.emplace(deallocation.physical_address, deallocation.bytes).second)
         {
-            return false;
+            return fail_pending(L"PendingDeallocationDuplicate", deallocation.physical_address);
         }
         if (live_extent_addresses.contains(deallocation.physical_address))
         {
-            return false;
+            return fail_pending(L"PendingDeallocationStillLive", deallocation.physical_address);
         }
 
         bool matched = false;
         for (const auto& allocation : committed_spaceman_allocations_)
         {
-            if (allocation.physical_address == deallocation.physical_address &&
-                allocation.bytes == deallocation.bytes)
+            if (PhysicalRangeContains(
+                    allocation.physical_address,
+                    allocation.bytes,
+                    deallocation.physical_address,
+                    deallocation.bytes))
             {
                 matched = true;
                 break;
@@ -7412,7 +10222,14 @@ bool MetadataStore::ValidatePendingCommitState() const
         }
         if (!matched)
         {
-            return false;
+            if (has_recovered_extent_coverage(deallocation.physical_address, deallocation.bytes))
+            {
+                matched = true;
+            }
+        }
+        if (!matched)
+        {
+            return fail_pending(L"DeallocationMissingSourceAllocation", deallocation.physical_address);
         }
     }
 
@@ -7462,7 +10279,7 @@ bool MetadataStore::ValidatePendingCommitState() const
     ApfsSpacemanStore spaceman_store;
     if (!spaceman_store.ValidateState(projected_allocations, projected_free_extents))
     {
-        return false;
+        return fail_pending(L"ProjectedSpacemanInvalid");
     }
 
     for (const auto& record : pending_btree_records_)
@@ -7471,11 +10288,11 @@ bool MetadataStore::ValidatePendingCommitState() const
             record.kind < BtreeRecordKind::Inode ||
             record.kind > BtreeRecordKind::FileExtent)
         {
-            return false;
+            return fail_pending(L"PendingBtreeRecordInvalidKind");
         }
         if (std::to_integer<unsigned char>(record.key.front()) != static_cast<unsigned char>(record.kind))
         {
-            return false;
+            return fail_pending(L"PendingBtreeRecordKindPrefix");
         }
     }
 
@@ -7512,13 +10329,13 @@ bool MetadataStore::ValidatePendingCommitState() const
             volume_tree_projection,
             volume_tree_error))
     {
-        return false;
+        return fail_pending(volume_tree_error.empty() ? L"ProjectedVolumeTreeInvalid" : volume_tree_error);
     }
     if (volume_tree_projection.inode_record_count != expected_non_root_inode_count ||
         volume_tree_projection.directory_entry_record_count != working_directory_links_.size() ||
         volume_tree_projection.extent_record_count != expected_extent_count)
     {
-        return false;
+        return fail_pending(L"ProjectedVolumeTreeCountMismatch");
     }
 
     std::unordered_set<std::string> projected_btree_keys;
@@ -7529,17 +10346,17 @@ bool MetadataStore::ValidatePendingCommitState() const
             record.kind < BtreeRecordKind::Inode ||
             record.kind > BtreeRecordKind::FileExtent)
         {
-            return false;
+            return fail_pending(L"ProjectedBtreeRecordInvalidKind");
         }
         if (std::to_integer<unsigned char>(record.key.front()) != static_cast<unsigned char>(record.kind))
         {
-            return false;
+            return fail_pending(L"ProjectedBtreeRecordKindPrefix");
         }
 
         auto key_blob = BuildBtreeKeyBlob(record.key);
         if (key_blob.empty() || !projected_btree_keys.insert(std::move(key_blob)).second)
         {
-            return false;
+            return fail_pending(L"ProjectedBtreeDuplicateKey");
         }
     }
 
@@ -7570,7 +10387,7 @@ bool MetadataStore::ValidatePendingCommitState() const
         auto inode_key = BuildBtreeKeyBlob(inode_key_record.key);
         if (inode_key.empty() || !expected_btree_keys.insert(std::move(inode_key)).second)
         {
-            return false;
+            return fail_pending(L"ExpectedBtreeInodeDuplicate", object_id);
         }
 
         if (!inode.is_directory &&
@@ -7587,7 +10404,7 @@ bool MetadataStore::ValidatePendingCommitState() const
             auto extent_key = BuildBtreeKeyBlob(extent_key_record.key);
             if (extent_key.empty() || !expected_btree_keys.insert(std::move(extent_key)).second)
             {
-                return false;
+                return fail_pending(L"ExpectedBtreeExtentDuplicate", object_id);
             }
         }
     }
@@ -7603,19 +10420,19 @@ bool MetadataStore::ValidatePendingCommitState() const
         auto directory_key = BuildBtreeKeyBlob(directory_key_record.key);
         if (directory_key.empty() || !expected_btree_keys.insert(std::move(directory_key)).second)
         {
-            return false;
+            return fail_pending(L"ExpectedBtreeDirectoryDuplicate", link.child_object_id);
         }
     }
 
     if (projected_btree_keys.size() != expected_btree_keys.size())
     {
-        return false;
+        return fail_pending(L"ProjectedBtreeSizeMismatch");
     }
     for (const auto& expected_key : expected_btree_keys)
     {
         if (!projected_btree_keys.contains(expected_key))
         {
-            return false;
+            return fail_pending(L"ProjectedBtreeMissingExpectedKey");
         }
     }
 
@@ -7630,7 +10447,7 @@ bool MetadataStore::ValidatePendingCommitState() const
     {
         if (record.tombstone)
         {
-            return false;
+            return fail_pending(L"ProjectedBtreeTombstone");
         }
 
         switch (record.kind)
@@ -7640,11 +10457,11 @@ bool MetadataStore::ValidatePendingCommitState() const
             DecodedBtreeInode decoded{};
             if (!DecodeBtreeInodeRecord(record, decoded))
             {
-                return false;
+                return fail_pending(L"ProjectedBtreeDecodeInode");
             }
             if (!decoded_inodes_by_object.emplace(decoded.object_id, std::move(decoded)).second)
             {
-                return false;
+                return fail_pending(L"ProjectedBtreeDuplicateInode", decoded.object_id);
             }
             break;
         }
@@ -7653,12 +10470,12 @@ bool MetadataStore::ValidatePendingCommitState() const
             DecodedBtreeDirectoryEntry decoded{};
             if (!DecodeBtreeDirectoryRecord(record, decoded))
             {
-                return false;
+                return fail_pending(L"ProjectedBtreeDecodeDirectory");
             }
             auto key = BuildDirectoryEntryIndexKey(decoded.parent_object_id, decoded.entry_name);
             if (!decoded_directory_entries.emplace(std::move(key), std::move(decoded)).second)
             {
-                return false;
+                return fail_pending(L"ProjectedBtreeDuplicateDirectory", decoded.child_object_id);
             }
             break;
         }
@@ -7667,26 +10484,26 @@ bool MetadataStore::ValidatePendingCommitState() const
             DecodedBtreeExtent decoded{};
             if (!DecodeBtreeExtentRecord(record, decoded))
             {
-                return false;
+                return fail_pending(L"ProjectedBtreeDecodeExtent");
             }
             if (decoded.logical_offset != 0)
             {
-                return false;
+                return fail_pending(L"ProjectedBtreeExtentOffset", decoded.object_id);
             }
             if (!decoded_extents_by_object.emplace(decoded.object_id, std::move(decoded)).second)
             {
-                return false;
+                return fail_pending(L"ProjectedBtreeDuplicateExtent", decoded.object_id);
             }
             break;
         }
         default:
-            return false;
+            return fail_pending(L"ProjectedBtreeUnknownKind");
         }
     }
 
     if (decoded_inodes_by_object.size() != expected_non_root_inode_count)
     {
-        return false;
+        return fail_pending(L"ProjectedBtreeInodeCountMismatch");
     }
 
     for (const auto& [object_id, inode] : working_inodes_)
@@ -7699,7 +10516,7 @@ bool MetadataStore::ValidatePendingCommitState() const
         auto decoded_it = decoded_inodes_by_object.find(object_id);
         if (decoded_it == decoded_inodes_by_object.end())
         {
-            return false;
+            return fail_pending(L"ProjectedBtreeMissingDecodedInode", object_id);
         }
         const auto& decoded = decoded_it->second;
         if (decoded.parent_object_id != inode.parent_object_id ||
@@ -7708,27 +10525,31 @@ bool MetadataStore::ValidatePendingCommitState() const
             decoded.data_physical_address != inode.data_physical_address ||
             decoded.name != inode.name)
         {
-            return false;
+            return fail_pending(L"ProjectedBtreeDecodedInodeMismatch", object_id);
         }
         if (decoded.xid == 0 || decoded.xid > target_xid)
         {
-            return false;
+            return fail_pending(L"ProjectedBtreeDecodedInodeXid", object_id);
         }
         if (decoded.parent_object_id == 0 || !working_inodes_.contains(decoded.parent_object_id))
         {
-            return false;
+            return fail_pending(L"ProjectedBtreeDecodedParentMissing", object_id);
         }
         if (auto parent_it = working_inodes_.find(decoded.parent_object_id);
             parent_it == working_inodes_.end() || !parent_it->second.is_directory)
         {
-            return false;
+            return fail_pending(L"ProjectedBtreeDecodedParentNotDirectory", object_id);
         }
 
         if (inode.is_directory || inode.logical_size == 0 || inode.data_physical_address == 0)
         {
-            if (decoded_extents_by_object.contains(object_id))
+            if (decoded_extents_by_object.contains(object_id) ||
+                (!inode.is_directory &&
+                 inode.logical_size > 0 &&
+                 inode.data_physical_address == 0 &&
+                 !committed_read_extents_.contains(object_id)))
             {
-                return false;
+                return fail_pending(L"ProjectedBtreeUnexpectedOrMissingExtent", object_id);
             }
         }
         else
@@ -7736,7 +10557,7 @@ bool MetadataStore::ValidatePendingCommitState() const
             auto extent_it = decoded_extents_by_object.find(object_id);
             if (extent_it == decoded_extents_by_object.end())
             {
-                return false;
+                return fail_pending(L"ProjectedBtreeMissingExtent", object_id);
             }
             const auto& extent = extent_it->second;
             if (extent.physical_address != inode.data_physical_address ||
@@ -7744,25 +10565,25 @@ bool MetadataStore::ValidatePendingCommitState() const
                 extent.xid == 0 ||
                 extent.xid > target_xid)
             {
-                return false;
+                return fail_pending(L"ProjectedBtreeExtentMismatch", object_id);
             }
 
             auto mapped = effective_object_map.find(object_id);
             if (mapped == effective_object_map.end())
             {
-                return false;
+                return fail_pending(L"ProjectedBtreeMissingObjectMap", object_id);
             }
             if (mapped->second.physical_address != extent.physical_address ||
                 mapped->second.logical_size != extent.extent_bytes)
             {
-                return false;
+                return fail_pending(L"ProjectedBtreeObjectMapMismatch", object_id);
             }
         }
     }
 
     if (decoded_directory_entries.size() != working_directory_links_.size())
     {
-        return false;
+        return fail_pending(L"ProjectedBtreeDirectoryCountMismatch");
     }
     for (const auto& link : working_directory_links_)
     {
@@ -7770,14 +10591,14 @@ bool MetadataStore::ValidatePendingCommitState() const
         auto decoded_it = decoded_directory_entries.find(entry_key);
         if (decoded_it == decoded_directory_entries.end())
         {
-            return false;
+            return fail_pending(L"ProjectedBtreeMissingDirectory", link.child_object_id);
         }
         const auto& decoded = decoded_it->second;
         if (decoded.child_object_id != link.child_object_id ||
             decoded.xid == 0 ||
             decoded.xid > target_xid)
         {
-            return false;
+            return fail_pending(L"ProjectedBtreeDirectoryMismatch", link.child_object_id);
         }
 
         auto parent_it = working_inodes_.find(link.parent_object_id);
@@ -7788,7 +10609,7 @@ bool MetadataStore::ValidatePendingCommitState() const
             child_it->second.parent_object_id != link.parent_object_id ||
             child_it->second.name != link.entry_name)
         {
-            return false;
+            return fail_pending(L"ProjectedBtreeDirectoryLinkMismatch", link.child_object_id);
         }
     }
 
@@ -7821,8 +10642,6 @@ bool MetadataStore::PersistObjectMapCheckpoint(std::uint64_t target_xid)
     {
         return false;
     }
-    const auto target_slot = object_map_blocks[
-        static_cast<std::size_t>(target_xid % static_cast<std::uint64_t>(object_map_blocks.size()))];
 
     constexpr std::array<char, 12> kMagic =
     {
@@ -7832,12 +10651,29 @@ bool MetadataStore::PersistObjectMapCheckpoint(std::uint64_t target_xid)
     constexpr std::size_t kEntryBytes = 32;
 
     const auto required_bytes = kHeaderBytes + (committed_object_map_.size() * kEntryBytes);
-    if (required_bytes > static_cast<std::size_t>(block_size_))
+    if (block_size_ == 0 ||
+        object_map_blocks.size() > (std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(block_size_)))
+    {
+        return false;
+    }
+    const auto checkpoint_capacity = object_map_blocks.size() * static_cast<std::size_t>(block_size_);
+    if (required_bytes > checkpoint_capacity ||
+        required_bytes < kHeaderBytes ||
+        (required_bytes - kHeaderBytes) > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))
     {
         return false;
     }
 
-    std::vector<std::byte> block(static_cast<std::size_t>(block_size_), std::byte{0});
+    auto target_slots = SelectWritableChunkedCheckpointBlocks(
+        object_map_blocks,
+        target_xid,
+        (required_bytes + static_cast<std::size_t>(block_size_) - 1) / static_cast<std::size_t>(block_size_));
+    if (target_slots.empty())
+    {
+        return false;
+    }
+
+    std::vector<std::byte> block(required_bytes, std::byte{0});
     for (std::size_t index = 0; index < kMagic.size(); ++index)
     {
         block[index] = static_cast<std::byte>(kMagic[index]);
@@ -7872,7 +10708,7 @@ bool MetadataStore::PersistObjectMapCheckpoint(std::uint64_t target_xid)
     const auto payload_bytes = cursor - kHeaderBytes;
     WriteLe32(block, 24, static_cast<std::uint32_t>(payload_bytes));
     WriteLe32(block, kCheckpointChecksumOffset, ComputeCheckpointChecksum(block, payload_bytes));
-    return WriteBlockByIndexDirect(target_slot, block);
+    return WriteChunkedCheckpointBlocks(object_map_blocks, target_xid, block);
 }
 
 bool MetadataStore::PersistSpacemanCheckpoint(std::uint64_t target_xid)
@@ -7882,8 +10718,6 @@ bool MetadataStore::PersistSpacemanCheckpoint(std::uint64_t target_xid)
     {
         return false;
     }
-    const auto target_slot = spaceman_blocks[
-        static_cast<std::size_t>(target_xid % static_cast<std::uint64_t>(spaceman_blocks.size()))];
 
     constexpr std::array<char, 12> kMagic =
     {
@@ -7892,25 +10726,42 @@ bool MetadataStore::PersistSpacemanCheckpoint(std::uint64_t target_xid)
     constexpr std::size_t kHeaderBytes = kCheckpointHeaderBytes;
     constexpr std::size_t kEntryBytes = 16;
 
-    const auto required_entries = committed_spaceman_allocations_.size() + committed_spaceman_free_extents_.size();
-    const auto required_bytes = kHeaderBytes + (required_entries * kEntryBytes);
-    if (required_bytes > static_cast<std::size_t>(block_size_))
+    auto allocations = committed_spaceman_allocations_;
+    auto free_extents = committed_spaceman_free_extents_;
+    if (!NormalizeSpacemanExtents(allocations) ||
+        !NormalizeSpacemanExtents(free_extents))
     {
         return false;
     }
 
-    auto allocations = committed_spaceman_allocations_;
-    auto free_extents = committed_spaceman_free_extents_;
-    std::sort(allocations.begin(), allocations.end(), [](const SpacemanAllocation& lhs, const SpacemanAllocation& rhs)
+    const auto required_entries = allocations.size() + free_extents.size();
+    if (required_entries > ((std::numeric_limits<std::size_t>::max() - kHeaderBytes) / kEntryBytes) ||
+        required_entries > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))
     {
-        return lhs.physical_address < rhs.physical_address;
-    });
-    std::sort(free_extents.begin(), free_extents.end(), [](const SpacemanAllocation& lhs, const SpacemanAllocation& rhs)
+        return false;
+    }
+    const auto required_bytes = kHeaderBytes + (required_entries * kEntryBytes);
+    if (block_size_ == 0 ||
+        spaceman_blocks.size() > (std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(block_size_)))
     {
-        return lhs.physical_address < rhs.physical_address;
-    });
+        return false;
+    }
+    const auto checkpoint_capacity = spaceman_blocks.size() * static_cast<std::size_t>(block_size_);
+    if (required_bytes > checkpoint_capacity)
+    {
+        return false;
+    }
 
-    std::vector<std::byte> block(static_cast<std::size_t>(block_size_), std::byte{0});
+    auto target_slots = SelectWritableChunkedCheckpointBlocks(
+        spaceman_blocks,
+        target_xid,
+        (required_bytes + static_cast<std::size_t>(block_size_) - 1) / static_cast<std::size_t>(block_size_));
+    if (target_slots.empty())
+    {
+        return false;
+    }
+
+    std::vector<std::byte> block(required_bytes, std::byte{0});
     for (std::size_t index = 0; index < kMagic.size(); ++index)
     {
         block[index] = static_cast<std::byte>(kMagic[index]);
@@ -7935,7 +10786,7 @@ bool MetadataStore::PersistSpacemanCheckpoint(std::uint64_t target_xid)
 
     const auto payload_bytes = cursor - kHeaderBytes;
     WriteLe32(block, kCheckpointChecksumOffset, ComputeCheckpointChecksum(block, payload_bytes));
-    return WriteBlockByIndexDirect(target_slot, block);
+    return WriteChunkedCheckpointBlocks(spaceman_blocks, target_xid, block);
 }
 
 bool MetadataStore::PersistInodeCheckpoint(std::uint64_t target_xid)
@@ -7945,12 +10796,10 @@ bool MetadataStore::PersistInodeCheckpoint(std::uint64_t target_xid)
     {
         return false;
     }
-    const auto target_slot = inode_blocks[
-        static_cast<std::size_t>(target_xid % static_cast<std::uint64_t>(inode_blocks.size()))];
 
     constexpr std::array<char, 12> kMagic =
     {
-        'A', 'P', 'F', 'S', 'R', 'W', 'I', 'N', 'O', 'D', '5', '\0'
+        'A', 'P', 'F', 'S', 'R', 'W', 'I', 'N', 'O', 'D', '6', '\0'
     };
     constexpr std::size_t kHeaderBytes = kCheckpointHeaderBytes;
     constexpr std::size_t kRecordFixedBytes = 60;
@@ -7979,6 +10828,29 @@ bool MetadataStore::PersistInodeCheckpoint(std::uint64_t target_xid)
         return lhs_key < rhs_key;
     });
 
+    const auto should_persist_full_path = [&](const InodeRecord& inode)
+    {
+        if (IsRootPath(inode.full_path))
+        {
+            return false;
+        }
+
+        auto parent_it = committed_inodes_.find(inode.parent_object_id);
+        if (parent_it == committed_inodes_.end())
+        {
+            return true;
+        }
+
+        auto reconstructed_path = parent_it->second.full_path;
+        if (!IsRootPath(reconstructed_path))
+        {
+            reconstructed_path.push_back(L'\\');
+        }
+        reconstructed_path.append(inode.name);
+        reconstructed_path = NormalizePath(reconstructed_path);
+        return reconstructed_path != inode.full_path;
+    };
+
     std::size_t required_bytes = kHeaderBytes;
     for (const auto object_id : object_ids)
     {
@@ -7989,19 +10861,38 @@ bool MetadataStore::PersistInodeCheckpoint(std::uint64_t target_xid)
         }
 
         const auto name_bytes = inode_it->second.name.size() * sizeof(wchar_t);
-        const auto path_bytes = inode_it->second.full_path.size() * sizeof(wchar_t);
+        const auto path_bytes = should_persist_full_path(inode_it->second)
+            ? inode_it->second.full_path.size() * sizeof(wchar_t)
+            : 0;
         if (required_bytes > (std::numeric_limits<std::size_t>::max() - kRecordFixedBytes - name_bytes - path_bytes))
         {
             return false;
         }
         required_bytes += kRecordFixedBytes + name_bytes + path_bytes;
     }
-    if (required_bytes > static_cast<std::size_t>(block_size_))
+    if (block_size_ == 0 ||
+        inode_blocks.size() > (std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(block_size_)))
+    {
+        return false;
+    }
+    const auto checkpoint_capacity = inode_blocks.size() * static_cast<std::size_t>(block_size_);
+    if (required_bytes > checkpoint_capacity ||
+        required_bytes < kHeaderBytes ||
+        (required_bytes - kHeaderBytes) > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))
     {
         return false;
     }
 
-    std::vector<std::byte> block(static_cast<std::size_t>(block_size_), std::byte{0});
+    auto target_slots = SelectWritableChunkedCheckpointBlocks(
+        inode_blocks,
+        target_xid,
+        (required_bytes + static_cast<std::size_t>(block_size_) - 1) / static_cast<std::size_t>(block_size_));
+    if (target_slots.empty())
+    {
+        return false;
+    }
+
+    std::vector<std::byte> block(required_bytes, std::byte{0});
     for (std::size_t index = 0; index < kMagic.size(); ++index)
     {
         block[index] = static_cast<std::byte>(kMagic[index]);
@@ -8027,7 +10918,8 @@ bool MetadataStore::PersistInodeCheckpoint(std::uint64_t target_xid)
         WriteLe64(block, cursor + 40, inode.timestamp_utc);
         WriteLe32(block, cursor + 48, inode.is_directory ? 1u : 0u);
         WriteLe32(block, cursor + 52, static_cast<std::uint32_t>(inode.name.size()));
-        WriteLe32(block, cursor + 56, static_cast<std::uint32_t>(inode.full_path.size()));
+        const auto persist_full_path = should_persist_full_path(inode);
+        WriteLe32(block, cursor + 56, persist_full_path ? static_cast<std::uint32_t>(inode.full_path.size()) : 0u);
         cursor += kRecordFixedBytes;
 
         const auto name_bytes = inode.name.size() * sizeof(wchar_t);
@@ -8037,7 +10929,7 @@ bool MetadataStore::PersistInodeCheckpoint(std::uint64_t target_xid)
             cursor += name_bytes;
         }
 
-        const auto path_bytes = inode.full_path.size() * sizeof(wchar_t);
+        const auto path_bytes = persist_full_path ? inode.full_path.size() * sizeof(wchar_t) : 0;
         if (path_bytes > 0)
         {
             std::memcpy(block.data() + cursor, inode.full_path.data(), path_bytes);
@@ -8048,7 +10940,7 @@ bool MetadataStore::PersistInodeCheckpoint(std::uint64_t target_xid)
     const auto payload_bytes = cursor - kHeaderBytes;
     WriteLe32(block, 24, static_cast<std::uint32_t>(payload_bytes));
     WriteLe32(block, kCheckpointChecksumOffset, ComputeCheckpointChecksum(block, payload_bytes));
-    return WriteBlockByIndexDirect(target_slot, block);
+    return WriteChunkedCheckpointBlocks(inode_blocks, target_xid, block);
 }
 
 bool MetadataStore::PersistBtreeCheckpoint(std::uint64_t target_xid)
@@ -8058,8 +10950,6 @@ bool MetadataStore::PersistBtreeCheckpoint(std::uint64_t target_xid)
     {
         return false;
     }
-    const auto target_slot = btree_blocks[
-        static_cast<std::size_t>(target_xid % static_cast<std::uint64_t>(btree_blocks.size()))];
 
     constexpr std::array<char, 12> kMagic =
     {
@@ -8077,12 +10967,29 @@ bool MetadataStore::PersistBtreeCheckpoint(std::uint64_t target_xid)
         }
         required_bytes += kRecordHeaderBytes + record.key.size() + record.value.size();
     }
-    if (required_bytes > static_cast<std::size_t>(block_size_))
+    if (block_size_ == 0 ||
+        btree_blocks.size() > (std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(block_size_)))
+    {
+        return false;
+    }
+    const auto checkpoint_capacity = btree_blocks.size() * static_cast<std::size_t>(block_size_);
+    if (required_bytes > checkpoint_capacity ||
+        required_bytes < kHeaderBytes ||
+        (required_bytes - kHeaderBytes) > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))
     {
         return false;
     }
 
-    std::vector<std::byte> block(static_cast<std::size_t>(block_size_), std::byte{0});
+    auto target_slots = SelectWritableChunkedCheckpointBlocks(
+        btree_blocks,
+        target_xid,
+        (required_bytes + static_cast<std::size_t>(block_size_) - 1) / static_cast<std::size_t>(block_size_));
+    if (target_slots.empty())
+    {
+        return false;
+    }
+
+    std::vector<std::byte> block(required_bytes, std::byte{0});
     for (std::size_t index = 0; index < kMagic.size(); ++index)
     {
         block[index] = static_cast<std::byte>(kMagic[index]);
@@ -8114,13 +11021,14 @@ bool MetadataStore::PersistBtreeCheckpoint(std::uint64_t target_xid)
     const auto payload_bytes = cursor - kHeaderBytes;
     WriteLe32(block, 24, static_cast<std::uint32_t>(payload_bytes));
     WriteLe32(block, kCheckpointChecksumOffset, ComputeCheckpointChecksum(block, payload_bytes));
-    return WriteBlockByIndexDirect(target_slot, block);
+    return WriteChunkedCheckpointBlocks(btree_blocks, target_xid, block);
 }
 
 bool MetadataStore::PersistReplayCheckpoint(std::uint64_t target_xid)
 {
     auto replay_blocks = ResolveReplayCheckpointBlockIndices();
     if (replay_blocks.empty() ||
+        !AreNativeCheckpointBlocksWritable(replay_blocks) ||
         target_xid == 0 ||
         !last_commit_blob_address_.has_value() ||
         !last_commit_blob_bytes_.has_value() ||
@@ -8179,7 +11087,7 @@ bool MetadataStore::PersistCheckpointSuperblock(std::uint64_t target_xid)
         return false;
     }
 
-    // Offsets are based on apfs_sb layout from Paragon CE apfs_struct.h.
+    // NXSB superblock field offsets used by the native APFS metadata writer.
     constexpr std::size_t kSuperblockBytes = 0x570;
     constexpr std::size_t kMagicOffset = 0x20;
     constexpr std::size_t kBlockSizeOffset = 0x24;
@@ -8262,13 +11170,16 @@ bool MetadataStore::LoadPersistentState()
     persistent_state_loaded_ = true;
     recovery_required_ = false;
     recovery_reason_.clear();
-    const auto disk_loaded_object_map = committed_object_map_;
-    const auto disk_loaded_allocations = committed_spaceman_allocations_;
-    const auto disk_loaded_free_extents = committed_spaceman_free_extents_;
+    auto disk_loaded_object_map = committed_object_map_;
+    auto disk_loaded_allocations = committed_spaceman_allocations_;
+    auto disk_loaded_free_extents = committed_spaceman_free_extents_;
     const auto disk_loaded_btree_records = committed_btree_records_;
-    const auto disk_loaded_last_committed_xid = last_committed_xid_;
-    const auto disk_loaded_next_extent = next_ephemeral_extent_;
-    const auto disk_loaded_checkpoint_xid = checkpoint_xid_;
+    auto disk_loaded_last_committed_xid = last_committed_xid_;
+    auto disk_loaded_next_extent = next_ephemeral_extent_;
+    auto disk_loaded_checkpoint_xid = checkpoint_xid_;
+    const auto native_loaded_inodes = committed_inodes_;
+    const auto native_loaded_path_index = committed_path_index_;
+    const auto native_loaded_directory_links = committed_directory_links_;
     committed_object_map_.clear();
     committed_spaceman_allocations_.clear();
     committed_spaceman_free_extents_.clear();
@@ -8300,9 +11211,472 @@ bool MetadataStore::LoadPersistentState()
     std::optional<int> disk_loaded_replay_priority;
     last_replay_checkpoint_candidate_present_ = false;
     last_replay_checkpoint_pending_window_ = false;
+    const auto reconcile_inode_state_from_btree = [&]() -> bool
+    {
+        if (disk_loaded_btree_checkpoint_records.empty())
+        {
+            return false;
+        }
+
+        std::unordered_map<std::uint64_t, InodeRecord> rebuilt_inodes;
+        std::unordered_map<std::wstring, std::uint64_t> rebuilt_path_index;
+        std::vector<DirectoryLink> rebuilt_directory_links;
+        if (!RebuildInodeStateFromBtreeRecords(
+                disk_loaded_btree_checkpoint_records,
+                rebuilt_inodes,
+                rebuilt_path_index,
+                rebuilt_directory_links))
+        {
+            return false;
+        }
+
+        if (!disk_loaded_inodes.empty() &&
+            rebuilt_inodes.size() <= disk_loaded_inodes.size() &&
+            rebuilt_path_index.size() <= disk_loaded_path_index.size() &&
+            rebuilt_directory_links.size() <= disk_loaded_directory_links.size())
+        {
+            return false;
+        }
+
+        disk_loaded_inodes = std::move(rebuilt_inodes);
+        disk_loaded_path_index = std::move(rebuilt_path_index);
+        disk_loaded_directory_links = std::move(rebuilt_directory_links);
+        if (disk_loaded_btree_last_committed_xid.has_value())
+        {
+            disk_loaded_inode_last_committed_xid = std::max(
+                disk_loaded_inode_last_committed_xid.value_or(0),
+                disk_loaded_btree_last_committed_xid.value());
+        }
+        return true;
+    };
+    const auto reconcile_inode_state_from_native_projection = [&]() -> bool
+    {
+        if (!IsLikelyRawDevicePath(context_.device_path))
+        {
+            return false;
+        }
+
+        NativeApfsVolumeProjection projection{};
+        std::wstring projection_error;
+        if (!NativeApfsReader::TryLoadVolumeProjection(
+                device_,
+                0,
+                projection,
+                projection_error))
+        {
+            if (IsReadTraceEnabled())
+            {
+                std::wcerr << L"[MetadataStore] Native projection rebuild failed"
+                           << L" reason=" << (projection_error.empty() ? L"Unknown" : projection_error)
+                           << std::endl;
+            }
+            return false;
+        }
+        if (projection.inodes.empty() || projection.btree_records.empty())
+        {
+            return false;
+        }
+
+        std::unordered_map<std::uint64_t, InodeRecord> projected_inodes;
+        std::unordered_map<std::wstring, std::uint64_t> projected_path_index;
+        std::vector<DirectoryLink> projected_directory_links;
+        projected_inodes.reserve(projection.inodes.size());
+        projected_path_index.reserve(projection.inodes.size());
+        projected_directory_links.reserve(projection.inodes.size() > 0 ? projection.inodes.size() - 1 : 0);
+        for (const auto& inode : projection.inodes)
+        {
+            if (inode.object_id == 0 || inode.full_path.empty())
+            {
+                return false;
+            }
+
+            projected_inodes[inode.object_id] = inode;
+            projected_path_index[CanonicalPathKey(inode.full_path)] = inode.object_id;
+            if (!IsRootPath(inode.full_path))
+            {
+                projected_directory_links.push_back(DirectoryLink
+                {
+                    inode.parent_object_id,
+                    inode.name,
+                    inode.object_id,
+                    inode.xid
+                });
+            }
+        }
+
+        const auto read_extents_snapshot = committed_read_extents_;
+        committed_read_extents_.clear();
+        for (auto& [object_id, extents] : projection.read_extents_by_inode)
+        {
+            if (!SetCommittedReadExtents(object_id, std::move(extents)))
+            {
+                committed_read_extents_.erase(object_id);
+            }
+        }
+
+        if (!ValidateInodeGraphState(
+                projected_inodes,
+                projected_path_index,
+                projected_directory_links,
+                /*require_root_object=*/true))
+        {
+            committed_read_extents_ = read_extents_snapshot;
+            return false;
+        }
+
+        if (!disk_loaded_inodes.empty() &&
+            projected_inodes.size() <= disk_loaded_inodes.size() &&
+            projection.btree_records.size() <= disk_loaded_btree_checkpoint_records.size())
+        {
+            committed_read_extents_ = read_extents_snapshot;
+            return false;
+        }
+
+        disk_loaded_inodes = std::move(projected_inodes);
+        disk_loaded_path_index = std::move(projected_path_index);
+        disk_loaded_directory_links = std::move(projected_directory_links);
+        disk_loaded_btree_checkpoint_records = std::move(projection.btree_records);
+        disk_loaded_btree_last_committed_xid = std::max(
+            disk_loaded_btree_last_committed_xid.value_or(0),
+            projection.checkpoint_xid);
+        disk_loaded_inode_last_committed_xid = std::max(
+            disk_loaded_inode_last_committed_xid.value_or(0),
+            projection.checkpoint_xid);
+
+        disk_loaded_object_map.clear();
+        for (const auto& [object_id, inode] : disk_loaded_inodes)
+        {
+            if (!inode.is_directory &&
+                inode.data_physical_address != 0 &&
+                inode.logical_size != 0)
+            {
+                disk_loaded_object_map[object_id] = ObjectMapUpdate
+                {
+                    object_id,
+                    inode.data_physical_address,
+                    inode.logical_size,
+                    projection.checkpoint_xid
+                };
+            }
+        }
+        return true;
+    };
+
+    struct ObjectMapCheckpointCandidate
+    {
+        std::uint64_t xid = 0;
+        std::unordered_map<std::uint64_t, ObjectMapUpdate> object_map;
+        std::optional<std::uint64_t> last_committed_xid;
+    };
+    struct SpacemanCheckpointCandidate
+    {
+        std::uint64_t xid = 0;
+        std::vector<SpacemanAllocation> allocations;
+        std::vector<SpacemanAllocation> free_extents;
+        std::uint64_t next_extent = 0;
+        std::uint64_t working_next_extent = 0;
+        std::optional<std::uint64_t> last_committed_xid;
+    };
+    struct InodeCheckpointCandidate
+    {
+        std::uint64_t xid = 0;
+        std::unordered_map<std::uint64_t, InodeRecord> inodes;
+        std::unordered_map<std::wstring, std::uint64_t> path_index;
+        std::vector<DirectoryLink> directory_links;
+        std::optional<std::uint64_t> last_committed_xid;
+    };
+    struct BtreeCheckpointCandidate
+    {
+        std::uint64_t xid = 0;
+        std::vector<BtreeRecord> records;
+        std::optional<std::uint64_t> last_committed_xid;
+    };
+
+    const auto clear_checkpoint_load_scratch = [&]()
+    {
+        committed_object_map_.clear();
+        committed_spaceman_allocations_.clear();
+        committed_spaceman_free_extents_.clear();
+        committed_btree_records_.clear();
+        committed_inodes_.clear();
+        committed_path_index_.clear();
+        committed_directory_links_.clear();
+        working_inodes_.clear();
+        working_path_index_.clear();
+        working_directory_links_.clear();
+        working_spaceman_free_extents_.clear();
+        next_ephemeral_extent_ = disk_loaded_next_extent;
+        working_next_ephemeral_extent_ = disk_loaded_next_extent;
+        last_committed_xid_.reset();
+    };
+
+    const auto require_coherent_native_checkpoint_set = RequiresCanonicalNonFixtureCommitPath();
+    bool coherent_native_checkpoint_selected = false;
+    if (require_coherent_native_checkpoint_set)
+    {
+        std::vector<ObjectMapCheckpointCandidate> object_map_candidates;
+        std::vector<SpacemanCheckpointCandidate> spaceman_candidates;
+        std::vector<InodeCheckpointCandidate> inode_candidates;
+        std::vector<BtreeCheckpointCandidate> btree_candidates;
+
+        for (const auto object_map_block : ResolveObjectMapCheckpointBlockIndices())
+        {
+            std::vector<std::byte> object_map_bytes;
+            if (!ReadBlockByIndexDirect(object_map_block, object_map_bytes))
+            {
+                continue;
+            }
+
+            clear_checkpoint_load_scratch();
+            if (!LoadObjectMapCheckpointBlock(object_map_block, object_map_bytes))
+            {
+                continue;
+            }
+
+            const auto candidate_xid = ReadLe64(object_map_bytes, 12);
+            if (candidate_xid == 0)
+            {
+                continue;
+            }
+            object_map_candidates.push_back(
+                ObjectMapCheckpointCandidate
+                {
+                    candidate_xid,
+                    committed_object_map_,
+                    last_committed_xid_,
+                });
+        }
+
+        for (const auto spaceman_checkpoint_block : ResolveSpacemanCheckpointBlockIndices())
+        {
+            std::vector<std::byte> spaceman_checkpoint_bytes;
+            if (!ReadBlockByIndexDirect(spaceman_checkpoint_block, spaceman_checkpoint_bytes))
+            {
+                continue;
+            }
+
+            clear_checkpoint_load_scratch();
+            if (!LoadSpacemanCheckpointBlock(spaceman_checkpoint_block, spaceman_checkpoint_bytes))
+            {
+                continue;
+            }
+
+            const auto candidate_xid = ReadLe64(spaceman_checkpoint_bytes, 12);
+            if (candidate_xid == 0)
+            {
+                continue;
+            }
+            spaceman_candidates.push_back(
+                SpacemanCheckpointCandidate
+                {
+                    candidate_xid,
+                    committed_spaceman_allocations_,
+                    committed_spaceman_free_extents_,
+                    next_ephemeral_extent_,
+                    working_next_ephemeral_extent_,
+                    last_committed_xid_,
+                });
+        }
+
+        for (const auto inode_checkpoint_block : ResolveInodeCheckpointBlockIndices())
+        {
+            std::vector<std::byte> inode_checkpoint_bytes;
+            if (!ReadBlockByIndexDirect(inode_checkpoint_block, inode_checkpoint_bytes))
+            {
+                continue;
+            }
+
+            clear_checkpoint_load_scratch();
+            if (!LoadInodeCheckpointBlock(inode_checkpoint_block, inode_checkpoint_bytes))
+            {
+                continue;
+            }
+
+            const auto candidate_xid = ReadLe64(inode_checkpoint_bytes, 12);
+            if (candidate_xid == 0)
+            {
+                continue;
+            }
+            inode_candidates.push_back(
+                InodeCheckpointCandidate
+                {
+                    candidate_xid,
+                    committed_inodes_,
+                    committed_path_index_,
+                    committed_directory_links_,
+                    last_committed_xid_,
+                });
+        }
+
+        for (const auto btree_checkpoint_block : ResolveBtreeCheckpointBlockIndices())
+        {
+            std::vector<std::byte> btree_checkpoint_bytes;
+            if (!ReadBlockByIndexDirect(btree_checkpoint_block, btree_checkpoint_bytes))
+            {
+                continue;
+            }
+
+            clear_checkpoint_load_scratch();
+            if (!LoadBtreeCheckpointBlock(btree_checkpoint_block, btree_checkpoint_bytes))
+            {
+                continue;
+            }
+
+            const auto candidate_xid = ReadLe64(btree_checkpoint_bytes, 12);
+            if (candidate_xid == 0)
+            {
+                continue;
+            }
+            btree_candidates.push_back(
+                BtreeCheckpointCandidate
+                {
+                    candidate_xid,
+                    committed_btree_records_,
+                    last_committed_xid_,
+                });
+        }
+
+        clear_checkpoint_load_scratch();
+
+        const auto find_object_map_candidate = [&](std::uint64_t xid) -> const ObjectMapCheckpointCandidate*
+        {
+            for (const auto& candidate : object_map_candidates)
+            {
+                if (candidate.xid == xid)
+                {
+                    return &candidate;
+                }
+            }
+            return nullptr;
+        };
+        const auto find_spaceman_candidate = [&](std::uint64_t xid) -> const SpacemanCheckpointCandidate*
+        {
+            for (const auto& candidate : spaceman_candidates)
+            {
+                if (candidate.xid == xid)
+                {
+                    return &candidate;
+                }
+            }
+            return nullptr;
+        };
+        const auto find_inode_candidate = [&](std::uint64_t xid) -> const InodeCheckpointCandidate*
+        {
+            for (const auto& candidate : inode_candidates)
+            {
+                if (candidate.xid == xid)
+                {
+                    return &candidate;
+                }
+            }
+            return nullptr;
+        };
+        const auto find_btree_candidate = [&](std::uint64_t xid) -> const BtreeCheckpointCandidate*
+        {
+            for (const auto& candidate : btree_candidates)
+            {
+                if (candidate.xid == xid)
+                {
+                    return &candidate;
+                }
+            }
+            return nullptr;
+        };
+
+        std::set<std::uint64_t> candidate_xids;
+        for (const auto& candidate : object_map_candidates)
+        {
+            candidate_xids.insert(candidate.xid);
+        }
+        for (const auto& candidate : spaceman_candidates)
+        {
+            candidate_xids.insert(candidate.xid);
+        }
+        for (const auto& candidate : inode_candidates)
+        {
+            candidate_xids.insert(candidate.xid);
+        }
+        for (const auto& candidate : btree_candidates)
+        {
+            candidate_xids.insert(candidate.xid);
+        }
+
+        std::uint64_t selected_coherent_xid = 0;
+        const ObjectMapCheckpointCandidate* selected_object_map = nullptr;
+        const SpacemanCheckpointCandidate* selected_spaceman = nullptr;
+        const InodeCheckpointCandidate* selected_inode = nullptr;
+        const BtreeCheckpointCandidate* selected_btree = nullptr;
+        for (auto it = candidate_xids.rbegin(); it != candidate_xids.rend(); ++it)
+        {
+            const auto xid = *it;
+            const auto object_map_candidate = find_object_map_candidate(xid);
+            const auto spaceman_candidate = find_spaceman_candidate(xid);
+            const auto inode_candidate = find_inode_candidate(xid);
+            const auto btree_candidate = find_btree_candidate(xid);
+            if (object_map_candidate == nullptr ||
+                spaceman_candidate == nullptr ||
+                inode_candidate == nullptr ||
+                btree_candidate == nullptr)
+            {
+                continue;
+            }
+
+            selected_coherent_xid = xid;
+            selected_object_map = object_map_candidate;
+            selected_spaceman = spaceman_candidate;
+            selected_inode = inode_candidate;
+            selected_btree = btree_candidate;
+            break;
+        }
+
+        if (selected_coherent_xid != 0 &&
+            selected_object_map != nullptr &&
+            selected_spaceman != nullptr &&
+            selected_inode != nullptr &&
+            selected_btree != nullptr)
+        {
+            disk_loaded_object_map = selected_object_map->object_map;
+            disk_loaded_allocations = selected_spaceman->allocations;
+            disk_loaded_free_extents = selected_spaceman->free_extents;
+            disk_loaded_next_extent = std::max(disk_loaded_next_extent, selected_spaceman->next_extent);
+            disk_loaded_inodes = selected_inode->inodes;
+            disk_loaded_path_index = selected_inode->path_index;
+            disk_loaded_directory_links = selected_inode->directory_links;
+            disk_loaded_btree_checkpoint_records = selected_btree->records;
+            disk_loaded_checkpoint_xid = selected_coherent_xid;
+            disk_loaded_last_committed_xid = selected_coherent_xid;
+            disk_loaded_inode_last_committed_xid = selected_inode->last_committed_xid.value_or(selected_coherent_xid);
+            disk_loaded_btree_last_committed_xid = selected_btree->last_committed_xid.value_or(selected_coherent_xid);
+            coherent_native_checkpoint_selected = true;
+        }
+        else
+        {
+            disk_loaded_object_map.clear();
+            disk_loaded_allocations.clear();
+            disk_loaded_free_extents.clear();
+            disk_loaded_inodes.clear();
+            disk_loaded_path_index.clear();
+            disk_loaded_directory_links.clear();
+            disk_loaded_btree_checkpoint_records.clear();
+            disk_loaded_btree_last_committed_xid.reset();
+            disk_loaded_inode_last_committed_xid.reset();
+            disk_loaded_last_committed_xid.reset();
+        }
+
+        if (IsReadTraceEnabled())
+        {
+            std::wcerr << L"[MetadataStore] Coherent native checkpoint selection"
+                       << L" selectedXid=" << selected_coherent_xid
+                       << L" objectMapCandidates=" << object_map_candidates.size()
+                       << L" spacemanCandidates=" << spaceman_candidates.size()
+                       << L" inodeCandidates=" << inode_candidates.size()
+                       << L" btreeCandidates=" << btree_candidates.size()
+                       << std::endl;
+        }
+    }
 
     auto btree_checkpoint_blocks = ResolveBtreeCheckpointBlockIndices();
-    if (!btree_checkpoint_blocks.empty())
+    if (!require_coherent_native_checkpoint_set && !btree_checkpoint_blocks.empty())
     {
         std::uint64_t selected_checkpoint_xid = 0;
         bool selected_checkpoint_valid = false;
@@ -8343,7 +11717,7 @@ bool MetadataStore::LoadPersistentState()
     }
 
     auto inode_checkpoint_blocks = ResolveInodeCheckpointBlockIndices();
-    if (!inode_checkpoint_blocks.empty())
+    if (!require_coherent_native_checkpoint_set && !inode_checkpoint_blocks.empty())
     {
         std::uint64_t selected_checkpoint_xid = 0;
         bool selected_checkpoint_valid = false;
@@ -8400,28 +11774,17 @@ bool MetadataStore::LoadPersistentState()
         working_directory_links_.clear();
     }
 
-    if (disk_loaded_inodes.empty() &&
-        !disk_loaded_btree_checkpoint_records.empty())
+    if (!require_coherent_native_checkpoint_set || !coherent_native_checkpoint_selected)
     {
-        std::unordered_map<std::uint64_t, InodeRecord> rebuilt_inodes;
-        std::unordered_map<std::wstring, std::uint64_t> rebuilt_path_index;
-        std::vector<DirectoryLink> rebuilt_directory_links;
-        if (RebuildInodeStateFromBtreeRecords(
-                disk_loaded_btree_checkpoint_records,
-                rebuilt_inodes,
-                rebuilt_path_index,
-                rebuilt_directory_links))
-        {
-            disk_loaded_inodes = std::move(rebuilt_inodes);
-            disk_loaded_path_index = std::move(rebuilt_path_index);
-            disk_loaded_directory_links = std::move(rebuilt_directory_links);
-            if (disk_loaded_btree_last_committed_xid.has_value())
-            {
-                disk_loaded_inode_last_committed_xid = std::max(
-                    disk_loaded_inode_last_committed_xid.value_or(0),
-                    disk_loaded_btree_last_committed_xid.value());
-            }
-        }
+        reconcile_inode_state_from_btree();
+        reconcile_inode_state_from_native_projection();
+    }
+    if (disk_loaded_inodes.empty() &&
+        !native_loaded_inodes.empty())
+    {
+        disk_loaded_inodes = native_loaded_inodes;
+        disk_loaded_path_index = native_loaded_path_index;
+        disk_loaded_directory_links = native_loaded_directory_links;
     }
 
     auto replay_checkpoint_blocks = ResolveReplayCheckpointBlockIndices();
@@ -8499,6 +11862,239 @@ bool MetadataStore::LoadPersistentState()
         }
     }
 
+    const auto has_disk_replay_commit_blob_metadata_for_checkpoint_load =
+        disk_loaded_replay_target_xid.has_value() &&
+        disk_loaded_replay_commit_blob_address.has_value() &&
+        disk_loaded_replay_commit_blob_bytes.has_value() &&
+        disk_loaded_replay_commit_blob_address.value() > 0 &&
+        disk_loaded_replay_commit_blob_bytes.value() > 0;
+    const auto can_advance_superblock_xid_for_checkpoint_load =
+        loaded_superblock_checkpoint_xid_ < std::numeric_limits<std::uint64_t>::max();
+    const auto disk_replay_pending_window_for_checkpoint_load =
+        has_disk_replay_commit_blob_metadata_for_checkpoint_load &&
+        can_advance_superblock_xid_for_checkpoint_load &&
+        disk_loaded_replay_priority.value_or(0) >= 2 &&
+        disk_loaded_replay_target_xid.value() == (loaded_superblock_checkpoint_xid_ + 1);
+
+    std::optional<std::uint64_t> disk_loaded_native_pending_xid;
+    const auto remember_native_pending_xid = [&](std::uint64_t persisted_xid)
+    {
+        if (can_advance_superblock_xid_for_checkpoint_load &&
+            persisted_xid == (loaded_superblock_checkpoint_xid_ + 1))
+        {
+            disk_loaded_native_pending_xid = std::max(
+                disk_loaded_native_pending_xid.value_or(0),
+                persisted_xid);
+        }
+    };
+    const auto block_matches_magic = [](const std::vector<std::byte>& block, const std::array<char, 12>& magic)
+    {
+        if (block.size() < kCheckpointHeaderBytes)
+        {
+            return false;
+        }
+        for (std::size_t index = 0; index < magic.size(); ++index)
+        {
+            if (std::to_integer<unsigned char>(block[index]) != static_cast<unsigned char>(magic[index]))
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto scan_native_pending_xids = [&](const std::vector<std::uint64_t>& blocks, const std::vector<std::array<char, 12>>& magics)
+    {
+        for (const auto block_index : blocks)
+        {
+            std::vector<std::byte> block;
+            if (!ReadBlockByIndexDirect(block_index, block))
+            {
+                continue;
+            }
+            for (const auto& magic : magics)
+            {
+                if (block_matches_magic(block, magic))
+                {
+                    remember_native_pending_xid(ReadLe64(block, 12));
+                    break;
+                }
+            }
+        }
+    };
+    scan_native_pending_xids(
+        ResolveObjectMapCheckpointBlockIndices(),
+        { { { 'A', 'P', 'F', 'S', 'R', 'W', 'O', 'M', 'A', 'P', '3', '\0' } } });
+    scan_native_pending_xids(
+        ResolveSpacemanCheckpointBlockIndices(),
+        { { { 'A', 'P', 'F', 'S', 'R', 'W', 'S', 'P', 'M', '3', '\0', '\0' } } });
+    scan_native_pending_xids(
+        ResolveInodeCheckpointBlockIndices(),
+        {
+            { { 'A', 'P', 'F', 'S', 'R', 'W', 'I', 'N', 'O', 'D', '4', '\0' } },
+            { { 'A', 'P', 'F', 'S', 'R', 'W', 'I', 'N', 'O', 'D', '5', '\0' } },
+        });
+    scan_native_pending_xids(
+        ResolveBtreeCheckpointBlockIndices(),
+        { { { 'A', 'P', 'F', 'S', 'R', 'W', 'B', 'T', 'R', '5', '\0', '\0' } } });
+
+    if (disk_replay_pending_window_for_checkpoint_load)
+    {
+        const auto target_xid = disk_loaded_replay_target_xid.value();
+        replay_checkpoint_load_xid_ = target_xid;
+
+        std::unordered_map<std::uint64_t, ObjectMapUpdate> selected_object_map;
+        bool selected_object_map_valid = false;
+        for (const auto object_map_block : ResolveObjectMapCheckpointBlockIndices())
+        {
+            std::vector<std::byte> object_map_bytes;
+            if (!ReadBlockByIndexDirect(object_map_block, object_map_bytes))
+            {
+                continue;
+            }
+
+            committed_object_map_.clear();
+            last_committed_xid_ = disk_loaded_last_committed_xid;
+            if (!LoadObjectMapCheckpointBlock(object_map_block, object_map_bytes) ||
+                ReadLe64(object_map_bytes, 12) != target_xid)
+            {
+                continue;
+            }
+
+            selected_object_map = committed_object_map_;
+            selected_object_map_valid = true;
+            break;
+        }
+        if (selected_object_map_valid)
+        {
+            disk_loaded_object_map = std::move(selected_object_map);
+        }
+        committed_object_map_.clear();
+
+        std::vector<SpacemanAllocation> selected_allocations;
+        std::vector<SpacemanAllocation> selected_free_extents;
+        std::uint64_t selected_next_extent = disk_loaded_next_extent;
+        bool selected_spaceman_valid = false;
+        for (const auto spaceman_checkpoint_block : ResolveSpacemanCheckpointBlockIndices())
+        {
+            std::vector<std::byte> spaceman_checkpoint_bytes;
+            if (!ReadBlockByIndexDirect(spaceman_checkpoint_block, spaceman_checkpoint_bytes))
+            {
+                continue;
+            }
+
+            committed_spaceman_allocations_.clear();
+            committed_spaceman_free_extents_.clear();
+            working_spaceman_free_extents_.clear();
+            next_ephemeral_extent_ = disk_loaded_next_extent;
+            working_next_ephemeral_extent_ = disk_loaded_next_extent;
+            last_committed_xid_ = disk_loaded_last_committed_xid;
+            if (!LoadSpacemanCheckpointBlock(spaceman_checkpoint_block, spaceman_checkpoint_bytes) ||
+                ReadLe64(spaceman_checkpoint_bytes, 12) != target_xid)
+            {
+                continue;
+            }
+
+            selected_allocations = committed_spaceman_allocations_;
+            selected_free_extents = committed_spaceman_free_extents_;
+            selected_next_extent = next_ephemeral_extent_;
+            selected_spaceman_valid = true;
+            break;
+        }
+        if (selected_spaceman_valid)
+        {
+            disk_loaded_allocations = std::move(selected_allocations);
+            disk_loaded_free_extents = std::move(selected_free_extents);
+            disk_loaded_next_extent = std::max(disk_loaded_next_extent, selected_next_extent);
+        }
+        committed_spaceman_allocations_.clear();
+        committed_spaceman_free_extents_.clear();
+        working_spaceman_free_extents_.clear();
+
+        std::vector<BtreeRecord> selected_btree_records;
+        std::optional<std::uint64_t> selected_btree_last_committed_xid;
+        bool selected_btree_valid = false;
+        for (const auto btree_checkpoint_block : ResolveBtreeCheckpointBlockIndices())
+        {
+            std::vector<std::byte> btree_checkpoint_bytes;
+            if (!ReadBlockByIndexDirect(btree_checkpoint_block, btree_checkpoint_bytes))
+            {
+                continue;
+            }
+
+            committed_btree_records_.clear();
+            last_committed_xid_ = disk_loaded_last_committed_xid;
+            if (!LoadBtreeCheckpointBlock(btree_checkpoint_block, btree_checkpoint_bytes) ||
+                ReadLe64(btree_checkpoint_bytes, 12) != target_xid)
+            {
+                continue;
+            }
+
+            selected_btree_records = committed_btree_records_;
+            selected_btree_last_committed_xid = last_committed_xid_;
+            selected_btree_valid = true;
+            break;
+        }
+        if (selected_btree_valid)
+        {
+            disk_loaded_btree_checkpoint_records = std::move(selected_btree_records);
+            disk_loaded_btree_last_committed_xid = selected_btree_last_committed_xid;
+        }
+        committed_btree_records_.clear();
+
+        std::unordered_map<std::uint64_t, InodeRecord> selected_inodes;
+        std::unordered_map<std::wstring, std::uint64_t> selected_path_index;
+        std::vector<DirectoryLink> selected_directory_links;
+        std::optional<std::uint64_t> selected_inode_last_committed_xid;
+        bool selected_inode_valid = false;
+        for (const auto inode_checkpoint_block : ResolveInodeCheckpointBlockIndices())
+        {
+            std::vector<std::byte> inode_checkpoint_bytes;
+            if (!ReadBlockByIndexDirect(inode_checkpoint_block, inode_checkpoint_bytes))
+            {
+                continue;
+            }
+
+            committed_inodes_.clear();
+            committed_path_index_.clear();
+            committed_directory_links_.clear();
+            working_inodes_.clear();
+            working_path_index_.clear();
+            working_directory_links_.clear();
+            last_committed_xid_ = disk_loaded_last_committed_xid;
+
+            if (!LoadInodeCheckpointBlock(inode_checkpoint_block, inode_checkpoint_bytes) ||
+                ReadLe64(inode_checkpoint_bytes, 12) != target_xid)
+            {
+                continue;
+            }
+
+            selected_inodes = committed_inodes_;
+            selected_path_index = committed_path_index_;
+            selected_directory_links = committed_directory_links_;
+            selected_inode_last_committed_xid = last_committed_xid_;
+            selected_inode_valid = true;
+            break;
+        }
+        if (selected_inode_valid)
+        {
+            disk_loaded_inodes = std::move(selected_inodes);
+            disk_loaded_path_index = std::move(selected_path_index);
+            disk_loaded_directory_links = std::move(selected_directory_links);
+            disk_loaded_inode_last_committed_xid = selected_inode_last_committed_xid;
+        }
+        committed_inodes_.clear();
+        committed_path_index_.clear();
+        committed_directory_links_.clear();
+        working_inodes_.clear();
+        working_path_index_.clear();
+        working_directory_links_.clear();
+
+        reconcile_inode_state_from_btree();
+        reconcile_inode_state_from_native_projection();
+
+        replay_checkpoint_load_xid_.reset();
+    }
+
     const auto apply_disk_fallback = [&](bool persistent_state_corrupt) -> bool
     {
         const auto require_canonical_non_fixture_commit_path = RequiresCanonicalNonFixtureCommitPath();
@@ -8555,6 +12151,11 @@ bool MetadataStore::LoadPersistentState()
             (!require_canonical_non_fixture_commit_path || disk_replay_pending_window))
         {
             last_committed_xid_ = std::max(last_committed_xid_.value_or(0), disk_loaded_replay_target_xid.value());
+        }
+        else if (disk_loaded_native_pending_xid.has_value() &&
+                 !IsLikelyRawDevicePath(context_.device_path))
+        {
+            last_committed_xid_ = std::max(last_committed_xid_.value_or(0), disk_loaded_native_pending_xid.value());
         }
         committed_inodes_ = disk_loaded_inodes;
         committed_path_index_ = disk_loaded_path_index;
@@ -8621,7 +12222,19 @@ bool MetadataStore::LoadPersistentState()
             recovery_required_ = true;
             recovery_reason_ = L"PersistentStateAheadOfSuperblock";
         }
-        return EnsureRootState();
+        if (!EnsureRootState())
+        {
+            return false;
+        }
+        if (IsLikelyRawDevicePath(context_.device_path))
+        {
+            const auto read_extents_snapshot = committed_read_extents_;
+            if (!RefreshNativeReadExtentProjection())
+            {
+                committed_read_extents_ = read_extents_snapshot;
+            }
+        }
+        return true;
     };
 
     if (RequiresCanonicalNonFixtureCommitPath())
@@ -9263,10 +12876,18 @@ bool MetadataStore::LoadPersistentState()
     working_spaceman_free_extents_ = committed_spaceman_free_extents_;
     working_next_ephemeral_extent_ = next_ephemeral_extent_;
 
-    if (!EnsureRootState())
-    {
-        return false;
-    }
+        if (!EnsureRootState())
+        {
+            return false;
+        }
+        if (IsLikelyRawDevicePath(context_.device_path))
+        {
+            const auto read_extents_snapshot = committed_read_extents_;
+            if (!RefreshNativeReadExtentProjection())
+            {
+                committed_read_extents_ = read_extents_snapshot;
+            }
+        }
 
         return ValidateInodeGraphState(
             committed_inodes_,

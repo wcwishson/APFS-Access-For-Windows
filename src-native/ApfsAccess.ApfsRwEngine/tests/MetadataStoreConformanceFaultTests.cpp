@@ -23,6 +23,8 @@ constexpr std::uint64_t kInitialCheckpointXid = 7;
 constexpr std::uint64_t kSpacemanObjectId = 0x2A;
 constexpr std::uint64_t kVolumeRootObject = 0x54;
 constexpr std::uint32_t kNxsbMagic = 0x4253584E; // NXSB
+constexpr std::uint64_t kNativeCheckpointBandStartBlock = kTotalBlocks - 128;
+constexpr std::uint64_t kNativeSpacemanCheckpointStartBlock = kNativeCheckpointBandStartBlock + 4;
 
 void WriteLe32(std::vector<std::byte>& buffer, std::size_t offset, std::uint32_t value)
 {
@@ -106,6 +108,116 @@ std::optional<std::uint64_t> ReadLe64FromImage(
     }
 
     return value;
+}
+
+std::optional<std::vector<std::byte>> ReadBlockFromImage(
+    const std::filesystem::path& image_path,
+    std::uint64_t block_index)
+{
+    std::vector<std::byte> block(kBlockSize, std::byte{0});
+    std::ifstream input(image_path, std::ios::binary);
+    if (!input.good())
+    {
+        return std::nullopt;
+    }
+
+    const auto offset_bytes = block_index * static_cast<std::uint64_t>(kBlockSize);
+    input.seekg(static_cast<std::streamoff>(offset_bytes), std::ios::beg);
+    if (!input.good())
+    {
+        return std::nullopt;
+    }
+
+    input.read(reinterpret_cast<char*>(block.data()), static_cast<std::streamsize>(block.size()));
+    if (static_cast<std::size_t>(input.gcount()) != block.size())
+    {
+        return std::nullopt;
+    }
+
+    return block;
+}
+
+bool WriteBlockToImage(
+    const std::filesystem::path& image_path,
+    std::uint64_t block_index,
+    const std::vector<std::byte>& block)
+{
+    if (block.size() != kBlockSize)
+    {
+        return false;
+    }
+
+    std::fstream io(image_path, std::ios::binary | std::ios::in | std::ios::out);
+    if (!io.good())
+    {
+        return false;
+    }
+
+    const auto offset_bytes = block_index * static_cast<std::uint64_t>(kBlockSize);
+    io.seekp(static_cast<std::streamoff>(offset_bytes), std::ios::beg);
+    if (!io.good())
+    {
+        return false;
+    }
+
+    io.write(reinterpret_cast<const char*>(block.data()), static_cast<std::streamsize>(block.size()));
+    return io.good();
+}
+
+bool ImageBlockHasCheckpointXid(
+    const std::filesystem::path& image_path,
+    std::uint64_t block_index,
+    const std::array<char, 12>& magic,
+    std::uint64_t xid)
+{
+    auto block = ReadBlockFromImage(image_path, block_index);
+    if (!block.has_value() || block->size() < 20)
+    {
+        return false;
+    }
+
+    for (std::size_t index = 0; index < magic.size(); ++index)
+    {
+        if (std::to_integer<unsigned char>((*block)[index]) != static_cast<unsigned char>(magic[index]))
+        {
+            return false;
+        }
+    }
+
+    std::uint64_t parsed_xid = 0;
+    for (std::size_t index = 0; index < 8; ++index)
+    {
+        parsed_xid |= static_cast<std::uint64_t>(
+            std::to_integer<unsigned char>((*block)[12 + index])) << (index * 8);
+    }
+    return parsed_xid == xid;
+}
+
+bool SeedSpacemanCheckpointAllocation(
+    const std::filesystem::path& image_path,
+    std::uint64_t checkpoint_block,
+    std::uint64_t checkpoint_xid,
+    std::uint64_t allocated_block)
+{
+    constexpr std::array<char, 12> kMagic =
+    {
+        'A', 'P', 'F', 'S', 'R', 'W', 'S', 'P', 'M', '3', '\0', '\0'
+    };
+
+    std::vector<std::byte> block(kBlockSize, std::byte{0});
+    for (std::size_t index = 0; index < kMagic.size(); ++index)
+    {
+        block[index] = static_cast<std::byte>(kMagic[index]);
+    }
+
+    WriteLe64(block, 12, checkpoint_xid);
+    WriteLe32(block, 20, 1);
+    WriteLe32(block, 24, 1);
+    WriteLe64(block, 32, allocated_block * static_cast<std::uint64_t>(kBlockSize));
+    WriteLe64(block, 40, kBlockSize);
+    WriteLe64(block, 48, 0x100ull * static_cast<std::uint64_t>(kBlockSize));
+    WriteLe64(block, 56, 0x100ull * static_cast<std::uint64_t>(kBlockSize));
+    return WriteBlockToImage(image_path, checkpoint_block, block);
 }
 
 std::vector<std::byte> BuildPatternPayload(std::size_t bytes, unsigned char seed)
@@ -562,6 +674,86 @@ bool TestTruncateCheckpointWriteRecovery(const std::filesystem::path& run_root)
             remounted.LastCommittedXid().value_or(0) == (kInitialCheckpointXid + 2),
             "TruncateCheckpointFault: remount should preserve promoted xid");
     }
+
+    return ok;
+}
+
+bool TestSpacemanCheckpointFallsBackWhenPreferredSlotAllocated(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "spaceman_checkpoint_fallback.apfs.img";
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, "SpacemanCheckpointFallback: unable to create synthetic container");
+    }
+
+    constexpr std::array<char, 12> kSpacemanMagic =
+    {
+        'A', 'P', 'F', 'S', 'R', 'W', 'S', 'P', 'M', '3', '\0', '\0'
+    };
+    constexpr std::uint64_t kTargetXid = kInitialCheckpointXid + 1;
+    constexpr std::uint64_t kPreferredSpacemanBlock = kNativeSpacemanCheckpointStartBlock;
+    constexpr std::uint64_t kFallbackSpacemanBlock = kNativeSpacemanCheckpointStartBlock + 1;
+
+    if (!SeedSpacemanCheckpointAllocation(
+            image_path,
+            kPreferredSpacemanBlock,
+            kInitialCheckpointXid,
+            kPreferredSpacemanBlock))
+    {
+        return Require(false, "SpacemanCheckpointFallback: unable to seed spaceman allocation checkpoint");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        L"SpacemanCheckpointFallback",
+    };
+    apfsaccess::rw::MetadataStore store(context);
+    bool ok = true;
+    ok &= Require(store.LoadContainerSuperblocks(), "SpacemanCheckpointFallback: LoadContainerSuperblocks should succeed");
+    ok &= Require(store.LoadObjectMap(), "SpacemanCheckpointFallback: LoadObjectMap should succeed");
+    ok &= Require(store.LoadSpacemanState(), "SpacemanCheckpointFallback: LoadSpacemanState should succeed");
+    ok &= Require(store.PrepareNativeWritePath(), "SpacemanCheckpointFallback: PrepareNativeWritePath should succeed");
+
+    std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+    ConfigurePayloadProvider(store, staged_payloads);
+
+    apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+    create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+    create_file.path = L"\\fallback-slot.txt";
+    ok &= ExpectMutationStatus(
+        store,
+        create_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "SpacemanCheckpointFallback: create file should apply");
+
+    apfsaccess::rw::MetadataStore::MutationRequest write_file{};
+    write_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+    write_file.path = L"\\fallback-slot.txt";
+    write_file.length = 256;
+    ok &= ExpectMutationStatus(
+        store,
+        write_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "SpacemanCheckpointFallback: write file should apply");
+    staged_payloads[L"\\fallback-slot.txt"] = BuildPatternPayload(256, 0x6B);
+
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "SpacemanCheckpointFallback: commit should use another checkpoint slot");
+    ok &= Require(
+        store.LastCommittedXid().value_or(0) == kTargetXid,
+        "SpacemanCheckpointFallback: commit should advance xid");
+    ok &= Require(
+        store.LookupCommittedInodeByPath(L"\\fallback-slot.txt").has_value(),
+        "SpacemanCheckpointFallback: committed inode should remain visible");
+    ok &= Require(
+        !ImageBlockHasCheckpointXid(image_path, kPreferredSpacemanBlock, kSpacemanMagic, kTargetXid),
+        "SpacemanCheckpointFallback: preferred occupied spaceman slot should not be overwritten");
+    ok &= Require(
+        ImageBlockHasCheckpointXid(image_path, kFallbackSpacemanBlock, kSpacemanMagic, kTargetXid),
+        "SpacemanCheckpointFallback: fallback spaceman slot should receive committed checkpoint");
 
     return ok;
 }
@@ -1717,6 +1909,7 @@ int main()
 
     ok &= TestRenameReplaceRollbackBeforePersist(run_root);
     ok &= TestTruncateCheckpointWriteRecovery(run_root);
+    ok &= TestSpacemanCheckpointFallsBackWhenPreferredSlotAllocated(run_root);
     ok &= TestDeleteDirectoryRollbackOnDeviceWriteFault(run_root);
     ok &= TestOversizedWriteMutationIsAtomic(run_root);
     ok &= TestCheckpointFlushFailureRemountSync(run_root);

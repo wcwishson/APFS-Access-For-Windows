@@ -21,7 +21,7 @@ public sealed class MockApfsBackend : IApfsBackend
             true,
             false,
             true,
-            @"\\.\PhysicalDriveMock\Ufsd_Volumes\APFS_Main",
+            @"\\.\PhysicalDriveMock\ApfsAccess_Volumes\APFS_Main",
             SupportsNativeWrite: true,
             WriteBlockReason: null,
             NativeWriteReadiness: NativeWriteReadiness.CommitReady
@@ -33,7 +33,7 @@ public sealed class MockApfsBackend : IApfsBackend
             false,
             false,
             true,
-            @"\\.\PhysicalDriveMock\Ufsd_Volumes\APFS_Archive",
+            @"\\.\PhysicalDriveMock\ApfsAccess_Volumes\APFS_Archive",
             SupportsNativeWrite: false,
             WriteBlockReason: "Mock archive volume is read-only in baseline profile.",
             NativeWriteReadiness: NativeWriteReadiness.Unavailable

@@ -38,8 +38,11 @@ function Normalize-Evidence {
     param([object]$Value)
     $evidence = New-Evidence
     if ($null -ne $Value) {
-        foreach ($k in $evidence.Keys) {
-            if ($Value.PSObject.Properties.Name -contains $k) {
+        foreach ($k in @($evidence.Keys)) {
+            if ($Value -is [System.Collections.IDictionary] -and $Value.Contains($k)) {
+                $evidence[$k] = $Value[$k]
+            }
+            elseif ($Value.PSObject.Properties.Name -contains $k) {
                 $evidence[$k] = $Value.$k
             }
         }

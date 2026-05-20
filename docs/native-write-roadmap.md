@@ -6,6 +6,66 @@
 2. Tray UX remains unchanged (status-only tray with `Quit`).
 3. Write rollout is conservative and gated.
 
+## Paragon-free branch reset (2026-03-09)
+
+### Summary
+
+- Branch goal is now: replace the Paragon stack with self-developed code for unencrypted/basic APFS data volumes while keeping the minimal tray UX and WinFsp-based Explorer integration.
+- The architecture stays the same: service -> native backend -> FsHost -> WinFsp -> self-developed APFS engine.
+- Current repo reality on this branch:
+  - already working: minimal tray/service UX, WinFsp mount host, managed/runtime telemetry, packaging scaffolding, overlay write mode, and the native mutation/recovery engine assets.
+  - landed in this batch: self-developed device/container/volume discovery in `NativeApfsBackend`, raw-device partition-offset handoff into `FsHost`/`MetadataStore`, metadata-backed directory enumeration and file hydration for supported basic volumes, and removal of `NativeApfsUtilPath` / `--apfsutil` from the supported config + publish surface.
+  - still open: real-hardware validation; branch-internal legacy Paragon helper scripts have been removed from the supported repo surface.
+
+### Remaining milestones (Paragon-free track)
+
+#### R1 ? Native Probe & Volume Catalog Cutover
+
+- Status: implemented in code on 2026-03-09; runtime confirmation on real media is still pending.
+- Objective: use self-developed APFS device/container/volume discovery without launching `apfsutil`.
+- Acceptance anchor: `ProbeDevicesAsync` / `ProbeVolumesAsync` produce stable `DeviceInfo`, `VolumeInfo`, `VolumeId`, and `ProfileId` for supported basic volumes using native discovery only.
+- Main files: `src/ApfsAccess.Backend.Native/NativeApfsBackend.cs`, `src/ApfsAccess.Core/ServiceHostOptions.cs`.
+- Main risks: GPT/container-role mapping and profile-id stability across real devices.
+
+#### R2 ? Native Namespace & Read-only Explorer Cutover
+
+- Status: implemented in code on 2026-03-09; real-device Explorer validation is still pending.
+- Objective: make FsHost browse/open/read/copy-out pre-existing APFS content through the native metadata/file-range path.
+- Acceptance anchor: FsHost no longer requires `--apfsutil`; supported read-only mounts enumerate directories and hydrate file content from the native metadata path.
+- Main files: `src-native/ApfsAccess.FsHost/src/main.cpp`, `src-native/ApfsAccess.ApfsRwEngine/include/BlockDevice.h`, `src-native/ApfsAccess.ApfsRwEngine/src/BlockDevice.cpp`, `src-native/ApfsAccess.ApfsRwEngine/include/MetadataStore.h`, `src-native/ApfsAccess.ApfsRwEngine/src/MetadataStore.cpp`.
+- Main risks: arbitrary pre-existing APFS layouts may still expose metadata or extent cases not covered by current browse/read helpers.
+
+#### R3 ? Native Write/Recovery Parity on Basic APFS
+
+- Status: implemented in code on 2026-03-09; native RW-engine validation passed and real-device validation is still pending.
+- Objective: make the existing native mutation engine authoritative for the admitted Explorer write surface on real basic APFS volumes.
+- Acceptance anchor: create/write/overwrite/rename/move/delete/remount persistence all work without Paragon fallback on supported basic data volumes.
+- Main files: `src-native/ApfsAccess.ApfsRwEngine`, `src-native/ApfsAccess.ApfsRwEngine/tests/MetadataStoreConformanceTests.cpp`, `src-native/ApfsAccess.FsHost/src/main.cpp`, `src/ApfsAccess.Backend.Native/NativeApfsBackend.cs`.
+- Main risks: raw-device allocation/replay semantics, recovery behavior across real-disk variation, and unvalidated hardware edge cases until sacrificial-drive testing is complete.
+
+#### R4 ? Packaging, Hardware Validation, and Release Cutover
+
+- Status: in progress.
+- Objective: remove Paragon from the supported product surface and complete real-hardware validation.
+- Acceptance anchor: publish/config flow no longer asks for Paragon binaries, shipped artifacts contain no Paragon dependency, and hardware validation gates are satisfied on sacrificial APFS media.
+- Main files: `build/publish.ps1`, `build/build.ps1`, `scripts/configure_native_ce.ps1`, `scripts/build_beta_pilot.ps1`, `README.md`.
+- Main risks: external pilot time now dominates; the supported pilot path is native-only.
+
+### Implementation log update
+
+- 2026-03-09: re-anchored the branch goal around Paragon-free basic APFS parity while keeping WinFsp and the minimal tray/service UX.
+- 2026-03-09: `NativeApfsBackend` discovery now probes candidate devices directly, understands GPT APFS partitions, and resolves per-volume mount targets with raw-device offsets instead of invoking `apfsutil`.
+- 2026-03-09: `FsHost` now accepts `--device-offset`, boots `MetadataStore` for both read-only and read-write sessions, enumerates directories from committed inode state, and hydrates read-only file content through native metadata/file-range reads.
+- 2026-03-09: `BlockDevice` / `MetadataStore` now honor raw-device base offsets so APFS partitions inside larger physical disks can be mounted without Paragon path translation.
+- 2026-03-09: `MetadataStore::CommitPendingMutations()` now remaps dirty payload descendants across directory rename/move commits, so pending writes survive subtree relocation before flush/commit.
+- 2026-03-09: added `PendingWriteDirectoryRename` conformance coverage for overwrite -> directory rename -> commit -> remount persistence, and `pwsh -NoProfile -File .\scripts\build_rw_engine.ps1 -Configuration Release -RunTests` passed after the fix.
+- 2026-03-09: supported config/publish surface no longer requires `NativeApfsUtilPath` or `--apfsutil`; published guidance now points operators at the native host only.
+- 2026-03-09: `scripts\native_probe.ps1` and `scripts\run_pilot_validation.ps1` now use the self-developed native backend probe path for raw-device discovery and volume selection, removing `apfsutil` from the supported pilot automation flow before hardware testing.
+- 2026-03-09: validation passed for this batch with `pwsh -NoProfile -File .\scripts\build_native_host.ps1 -Configuration Release`, `dotnet test APFSAccess.sln --nologo --verbosity minimal`, and PowerShell parse checks for the updated helper scripts.
+- 2026-05-07: added a safe image-backed preflight path with `SyntheticApfsTestImage`, `ApfsAccess.NativeProbe create-test-image`, and `scripts\create_test_image.ps1`; this creates normal `.apfs.img` files only, refuses raw physical-drive paths/overwrites, and gives the Paragon-free stack a non-destructive milestone before sacrificial hardware testing.
+- 2026-05-18: sacrificial physical APFS USB read-only validation passed through the native stack: the mounted volume exposed 99 files, full copy-out copied 99/99 files with 0 failures, representative SHA-256 checks matched, and no Paragon/apfsutil bridge was used.
+- 2026-05-18: physical APFS write validation remains gated. `scripts\run_pilot_validation.ps1` now defaults to read-only mount/enumerate/copy/hash validation and requires explicit `-AllowDestructiveWriteSmoke` before it enables native write/raw-physical write settings.
+
 ## Current status
 
 ### Latest milestone progress (2026-02-24)
@@ -356,7 +416,7 @@
    - release guidance now distinguishes image-backed in-repo validation from raw-device pilot validation so published artifacts do not imply stable physical-device write.
 43. M7 validation passed and the milestone is complete:
    - `pwsh -NoProfile -File .\build\publish.ps1 -Configuration Release -Runtime win-x64` completed successfully and refreshed the split publish outputs, click-run bundle, and portable launcher bundle.
-   - publish output now includes the current native host, `apfsutil.exe`, native RW engine artifact, pilot runbook, and pilot helper scripts, satisfying the release-surface acceptance criteria without implying stable raw-device write.
+   - publish output now includes the current native host, native RW engine artifact, pilot runbook, and pilot helper scripts without shipping `apfsutil.exe`, satisfying the release-surface acceptance criteria without implying stable raw-device write.
 44. Current project gate after M7:
    - the repo has reached the external-validation boundary: further progress toward the final native-write goal now depends on attaching at least one allow-listed raw APFS device, running the crash/hot-unplug/power-loss matrix, and importing matching macOS mount/read/integrity evidence.
    - until that external evidence exists, `M6` remains the only open milestone and raw physical-device writable validation cannot be completed from this workspace alone.
@@ -446,7 +506,7 @@
      - FsHost now serializes native metadata-store mutation/commit access across callback threads and enforces `--write-commit-timeout` through commit-stage deadline hooks, with fail-closed timeout degradation telemetry (`CommitTimedOut`).
      - Native backend now applies reason-aware fail-closed write gating (`CommitTimedOut`, checkpoint/persist failures, recovery-marker states) with structured gate/diagnostic codes and runtime downgrade markers for post-mount write->read-only transitions.
      - Service/IPC telemetry now carries `RecoveryReason` end-to-end, and runtime compatibility warnings include human-readable explanations for known recovery/commit failure reasons.
-     - MetadataStore now exposes committed inode snapshots plus direct committed file-range reads, enabling FsHost to hydrate files from native committed extents when `apfsutil readraw` cannot provide content.
+     - MetadataStore now exposes committed inode snapshots plus direct committed file-range reads, enabling FsHost to hydrate files from native committed extents without any CLI bridge.
      - FsHost startup now overlays committed inode state onto the in-memory node index after APFS root bootstrap, preserving prior committed native-write state in Explorer view across remounts.
      - FsHost now supports metadata-backed direct-read fallback for file opens/reads in read-only mode when hydrated handle creation is unavailable, using committed extent reads from the native metadata store.
      - Service/config contracts now include raw-physical-write gate controls (`NativeWriteAllowRawPhysicalDevices`, pilot allow-list, integrity-check and crash-replay mode settings), and `WriteGatePolicy` enforces pilot allow-list + raw-device default block.
@@ -615,7 +675,7 @@
     - FsHost semantics coverage now includes a regression proving post-downgrade sidecar JSON still emits canonical gate failure fields when recovery reason is canonical.
     - Canonical non-fixture disk-fallback recovery latching now distinguishes sidecar-present and sidecar-missing states: pending replay windows still win (`ReplayCheckpointPendingWindow`), while sidecar-missing ahead-of-superblock xid drift now fail-closes as `PersistentStateAheadOfSuperblock` before replay evaluation.
     - Native fault/conformance suites are green again after this fallback refinement (`scripts/build_rw_engine.ps1 -Configuration Release -RunTests`), including scaffold/non-fixture replay rejection and sidecar-missing canonical fail-closed scenarios.
-    - Native backend volume parsing now normalizes APFS role tokens (`role=...`, `role = ...`, `role ...`) and trims trailing role annotations consistently, preventing false volume drops from `apfsutil` formatting variance.
+    - Native backend volume parsing now normalizes APFS role tokens (`role=...`, `role = ...`, `role ...`) and trims trailing role annotations consistently, preventing false volume drops from legacy probe formatting variance.
     - Write-unsupported feature detection now classifies `role=system` as `SealedSystemVolume` and keeps `role=data` volumes discoverable for native write eligibility evaluation; parsing coverage includes explicit `role = system` and `role = data` regressions.
     - FsHost `CB_Flush` shutdown-drain gating now uses an in-place optional external mutation scope (no temporary-scope assignment), preventing double-release/underflow risk in active mutation callback accounting during successful write-enabled flushes.
     - FsHost semantics coverage now includes shutdown-drain flush behavior and successful write-enabled flush scope-release regressions, locking callback accounting and flush availability semantics across read-only/write-enabled modes.
@@ -636,4 +696,5 @@
 ## Remaining milestone
 
 1. M6 external pilot evidence closure (`hot-unplug`, crash/power-loss replay, macOS mount/read/integrity import, promotion evaluation) on a real allow-listed raw APFS device.
-   - Automation support added on `2026-03-06`: `Build_APFS_Access_Beta.bat`, `Run_APFS_Pilot_Validation.bat`, `scripts/build_beta_pilot.ps1`, and `scripts/run_pilot_validation.ps1` now provide one-click beta publish plus one-click Windows smoke/remount validation with a zipped feedback bundle. The launcher auto-discovers APFS raw drives, rewrites click-run pilot config, seeds a temporary session-local pilot-only evidence ledger so a fresh raw profile can enter a writable smoke run, captures status/diagnostics, and emits a structured validation report. Real crash/hot-unplug/power-loss/macOS evidence remains the only manual boundary.
+    - Automation support added on `2026-03-06`: `Build_APFS_Access_Beta.bat`, `Run_APFS_Pilot_Validation.bat`, `scripts/build_beta_pilot.ps1`, and `scripts/run_pilot_validation.ps1` now provide one-click beta publish plus one-click Windows smoke/remount validation with a zipped feedback bundle. The launcher auto-discovers APFS raw drives, rewrites click-run pilot config, seeds a temporary session-local pilot-only evidence ledger so a fresh raw profile can enter a writable smoke run, captures status/diagnostics, and emits a structured validation report. Real crash/hot-unplug/power-loss/macOS evidence remains the only manual boundary.
+    - Before that physical boundary, use `scripts\create_test_image.ps1` plus `scripts\native_probe.ps1 -DeviceId .\artifacts\test-images\apfsaccess-test.apfs.img -AsJson` to validate the file-backed synthetic image path without touching any existing disk data.

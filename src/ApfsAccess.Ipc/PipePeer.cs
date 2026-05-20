@@ -59,7 +59,19 @@ public sealed class PipePeer : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        _writer.Dispose();
+        try
+        {
+            _writer.Dispose();
+        }
+        catch (ObjectDisposedException)
+        {
+            // The peer may have already closed the pipe; disposal should stay idempotent.
+        }
+        catch (IOException)
+        {
+            // Treat disconnects during cleanup as normal pipe shutdown.
+        }
+
         _reader.Dispose();
         _writeLock.Dispose();
         await _stream.DisposeAsync().ConfigureAwait(false);

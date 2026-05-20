@@ -5,7 +5,12 @@ param(
     [int]$DeviceDiscoveryTimeoutSeconds = 45,
     [int]$MountTimeoutSeconds = 120,
     [int]$RemountTimeoutSeconds = 120,
-    [bool]$UseBootstrapEvidence = $true,
+    [bool]$UseBootstrapEvidence = $false,
+    [switch]$AllowDestructiveWriteSmoke,
+    [int]$ReadOnlySampleFileLimit = 2048,
+    [UInt64]$ReadOnlyCopyByteLimit = 1GB,
+    [switch]$SkipReadOnlyCopy,
+    [switch]$KeepMounted,
     [switch]$KeepConfiguredAppSettings
 )
 
@@ -98,26 +103,6 @@ function Assert-PathExists {
     }
 }
 
-function Invoke-ApfsUtilCommand {
-    param(
-        [string]$ApfsUtilPath,
-        [string]$CommandName,
-        [string]$Target
-    )
-
-    $lines = & $ApfsUtilPath $CommandName $Target 2>&1 | ForEach-Object { $_.ToString() }
-    $text = ($lines -join [Environment]::NewLine).Trim()
-    $exitCode = if ($null -ne $global:LASTEXITCODE) { [int]$global:LASTEXITCODE } else { 0 }
-
-    [pscustomobject]@{
-        CommandName = $CommandName
-        Target = $Target
-        ExitCode = $exitCode
-        Text = $text
-        Success = ($exitCode -eq 0) -or ([regex]::IsMatch($text, "APFS:\s*$CommandName\s+returns\s+0\b", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase))
-    }
-}
-
 function Convert-SizeLabel {
     param([UInt64]$Bytes)
 
@@ -147,43 +132,112 @@ function Get-DiskInventory {
     }
 }
 
+function Get-PhysicalDriveNumber {
+    param([string]$DeviceId)
+
+    if ([string]::IsNullOrWhiteSpace($DeviceId)) {
+        return $null
+    }
+
+    $match = [regex]::Match($DeviceId.Trim(), '(?i)physicaldrive(?<number>\d+)$')
+    if (-not $match.Success) {
+        return $null
+    }
+
+    [int]$match.Groups['number'].Value
+}
+
+function Invoke-NativeProbe {
+    param(
+        [string]$ProbeScriptPath,
+        [string]$DeviceId,
+        [int]$MaxPhysicalDriveIndex
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($DeviceId)) {
+        $json = (& $ProbeScriptPath -DeviceId $DeviceId.Trim() -AsJson | Out-String).Trim()
+    }
+    else {
+        $json = (& $ProbeScriptPath -MaxPhysicalDriveIndex ([Math]::Max(0, $MaxPhysicalDriveIndex)) -AsJson | Out-String).Trim()
+    }
+    if ([string]::IsNullOrWhiteSpace($json)) {
+        throw "Native probe returned no JSON."
+    }
+
+    [pscustomobject]@{
+        RawJson = $json
+        Payload = $json | ConvertFrom-Json -Depth 20
+    }
+}
+
 function Get-ApfsDevices {
     param(
-        [string]$ApfsUtilPath,
-        [int]$DiscoveryTimeoutSeconds
+        [string]$ProbeScriptPath,
+        [int]$DiscoveryTimeoutSeconds,
+        [string]$RequestedDeviceId = ""
     )
 
     $deadline = (Get-Date).AddSeconds([Math]::Max(1, $DiscoveryTimeoutSeconds))
     do {
+        $diskInventory = @(Get-DiskInventory)
+        $maxDiskNumber = 8
+        if ($diskInventory.Count -gt 0) {
+            $measuredMax = ($diskInventory | Measure-Object -Property Number -Maximum).Maximum
+            if ($null -ne $measuredMax) {
+                $maxDiskNumber = [Math]::Max(0, [int]$measuredMax)
+            }
+        }
+
+        $probe = Invoke-NativeProbe -ProbeScriptPath $ProbeScriptPath -DeviceId $RequestedDeviceId -MaxPhysicalDriveIndex $maxDiskNumber
         $devices = New-Object System.Collections.Generic.List[object]
-        foreach ($disk in Get-DiskInventory) {
-            $candidateDeviceId = "\\.\PhysicalDrive$($disk.Number)"
-            $probe = Invoke-ApfsUtilCommand -ApfsUtilPath $ApfsUtilPath -CommandName "enumroot" -Target $candidateDeviceId
-            if (-not $probe.Success) {
-                continue
+        foreach ($device in @($probe.Payload.devices)) {
+            $diskNumber = Get-PhysicalDriveNumber -DeviceId ([string]$device.deviceId)
+            $disk = $null
+            if ($null -ne $diskNumber) {
+                $disk = @($diskInventory | Where-Object { [int]$_.Number -eq $diskNumber } | Select-Object -First 1)
+                if ($disk.Count -gt 0) {
+                    $disk = $disk[0]
+                }
+                else {
+                    $disk = $null
+                }
             }
 
-            $sizeBytes = if ($disk.PSObject.Properties.Name -contains "Size") {
+            $sizeBytes = if ($null -ne $disk -and $disk.PSObject.Properties.Name -contains "Size") {
                 [UInt64]$disk.Size
             }
             else {
                 [UInt64]0
             }
 
+            $friendlyName = if ($null -ne $disk -and $disk.PSObject.Properties.Name -contains "FriendlyName" -and -not [string]::IsNullOrWhiteSpace([string]$disk.FriendlyName)) {
+                [string]$disk.FriendlyName
+            }
+            elseif ($device.PSObject.Properties.Name -contains "displayName" -and -not [string]::IsNullOrWhiteSpace([string]$device.displayName)) {
+                [string]$device.displayName
+            }
+            elseif ($null -ne $diskNumber) {
+                "PhysicalDrive$diskNumber"
+            }
+            else {
+                [string]$device.deviceId
+            }
+
             $devices.Add([pscustomobject]@{
-                DiskNumber = [int]$disk.Number
-                DeviceId = $candidateDeviceId
-                FriendlyName = if ($disk.PSObject.Properties.Name -contains "FriendlyName" -and -not [string]::IsNullOrWhiteSpace([string]$disk.FriendlyName)) { [string]$disk.FriendlyName } else { "PhysicalDrive$($disk.Number)" }
-                SerialNumber = if ($disk.PSObject.Properties.Name -contains "SerialNumber") { [string]$disk.SerialNumber } else { "" }
-                BusType = if ($disk.PSObject.Properties.Name -contains "BusType") { [string]$disk.BusType } else { "Unknown" }
+                DiskNumber = if ($null -ne $diskNumber) { [int]$diskNumber } else { -1 }
+                DeviceId = [string]$device.deviceId
+                FriendlyName = $friendlyName
+                SerialNumber = if ($null -ne $disk -and $disk.PSObject.Properties.Name -contains "SerialNumber") { [string]$disk.SerialNumber } else { "" }
+                BusType = if ($null -ne $disk -and $disk.PSObject.Properties.Name -contains "BusType") { [string]$disk.BusType } else { "Unknown" }
                 SizeBytes = $sizeBytes
                 SizeLabel = Convert-SizeLabel -Bytes $sizeBytes
-                ProbeOutput = $probe.Text
+                Volumes = @($device.volumes)
+                ProbeOutput = (ConvertTo-PrettyJson -InputObject $device)
             })
         }
 
         if ($devices.Count -gt 0) {
-            return @($devices)
+            return @($devices | Sort-Object DeviceId)
         }
 
         if ((Get-Date) -lt $deadline) {
@@ -195,71 +249,37 @@ function Get-ApfsDevices {
     @()
 }
 
-function Parse-VolumeNames {
-    param([string]$RawText)
-
-    $names = New-Object System.Collections.Generic.List[string]
-    foreach ($rawLine in ($RawText -split "\r?\n")) {
-        $line = $rawLine.Trim()
-        if ([string]::IsNullOrWhiteSpace($line)) {
-            continue
-        }
-        if ($line -match '^APFS:\s*listsubvolumes\b' -or
-            $line -match '^APFS:\s*enumroot\b' -or
-            $line -match '^APFS:\s*\w+\s+returns\s+\d+\b') {
-            continue
-        }
-
-        $candidate = ""
-        $quoted = [regex]::Match($line, "'([^']+)'")
-        if ($quoted.Success) {
-            $candidate = $quoted.Groups[1].Value.Trim()
-        }
-        else {
-            $candidate = [regex]::Replace($line, '^(?:Volume\s*\[\d+\]|\[\d+\]|[-*])\s*:?\s*', '')
-            $candidate = [regex]::Replace($candidate, '\([^)]*\)', ' ')
-            $candidate = [regex]::Replace($candidate, '\brole\s*=\s*\S+\b', ' ', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-            $candidate = [regex]::Replace($candidate, '\brole\s+\S+\b', ' ', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-            $candidate = [regex]::Replace($candidate, '\s+', ' ').Trim()
-        }
-
-        if ([string]::IsNullOrWhiteSpace($candidate)) {
-            continue
-        }
-        if ($candidate -match '^(subvolumes?|volumes?)\b' -and $candidate -notmatch '\\') {
-            continue
-        }
-
-        $names.Add($candidate)
-    }
-
-    if ($names.Count -eq 0) {
-        return @("Main")
-    }
-
-    @($names | Sort-Object -Unique)
-}
-
 function Get-ApfsVolumes {
-    param(
-        [string]$ApfsUtilPath,
-        [string]$ResolvedDeviceId
+    param([pscustomobject]$ResolvedDevice)
+
+    $volumes = @(
+        foreach ($volume in @($ResolvedDevice.Volumes)) {
+            $volumeName = [string]$volume.volumeName
+            [pscustomobject]@{
+                VolumeName = $volumeName
+                VolumeId = [string]$volume.volumeId
+                ProfileId = if ($volume.PSObject.Properties.Name -contains "profileId" -and -not [string]::IsNullOrWhiteSpace([string]$volume.profileId)) {
+                    [string]$volume.profileId
+                }
+                else {
+                    "raw::$(Normalize-Token $ResolvedDevice.DeviceId)::$(Normalize-Token $volumeName)"
+                }
+                SupportsReadWrite = [bool]$volume.supportsReadWrite
+                SupportsNativeWrite = [bool]$volume.supportsNativeWrite
+                NativeWriteReadiness = [string]$volume.nativeWriteReadiness
+                WriteBlockReason = if ($volume.PSObject.Properties.Name -contains "writeBlockReason") { [string]$volume.writeBlockReason } else { "" }
+                WriteIncompatibilities = if ($volume.PSObject.Properties.Name -contains "writeIncompatibilities") { @($volume.writeIncompatibilities) } else { @() }
+                WriteUnsupportedFeatures = if ($volume.PSObject.Properties.Name -contains "writeUnsupportedFeatures") { @($volume.writeUnsupportedFeatures) } else { @() }
+            }
+        }
     )
 
-    $probe = Invoke-ApfsUtilCommand -ApfsUtilPath $ApfsUtilPath -CommandName "listsubvolumes" -Target $ResolvedDeviceId
-    $names = Parse-VolumeNames -RawText $probe.Text
-
     [pscustomobject]@{
-        Volumes = @(
-            foreach ($name in $names) {
-                [pscustomobject]@{
-                    VolumeName = $name
-                    VolumeId = "$ResolvedDeviceId|$name"
-                    ProfileId = "raw::$(Normalize-Token $ResolvedDeviceId)::$(Normalize-Token $name)"
-                }
-            }
-        )
-        ProbeOutput = $probe.Text
+        Volumes = $volumes
+        ProbeOutput = ConvertTo-PrettyJson -InputObject ([ordered]@{
+            deviceId = $ResolvedDevice.DeviceId
+            volumes = $volumes
+        })
     }
 }
 
@@ -336,7 +356,7 @@ function Resolve-MountPointFromStatus {
     }
 
     $newRoots = @($mountPoints | Where-Object { $_ -notin $BaselineRoots })
-    $candidates = if ($newRoots.Count -gt 0) { $newRoots } else { $mountPoints }
+    $candidates = @(if ($newRoots.Count -gt 0) { $newRoots } else { $mountPoints })
 
     if ($candidates.Count -eq 1) {
         return $candidates[0]
@@ -404,13 +424,13 @@ function Disconnect-StatusPipe {
     }
 
     if ($Pipe.PSObject.Properties.Name -contains "Writer" -and $null -ne $Pipe.Writer) {
-        $Pipe.Writer.Dispose()
+        try { $Pipe.Writer.Dispose() } catch {}
     }
     if ($Pipe.PSObject.Properties.Name -contains "Reader" -and $null -ne $Pipe.Reader) {
-        $Pipe.Reader.Dispose()
+        try { $Pipe.Reader.Dispose() } catch {}
     }
     if ($Pipe.PSObject.Properties.Name -contains "Client" -and $null -ne $Pipe.Client) {
-        $Pipe.Client.Dispose()
+        try { $Pipe.Client.Dispose() } catch {}
     }
 }
 
@@ -422,11 +442,20 @@ function Read-PipeEnvelope {
     )
 
     try {
-        $task = $Pipe.Reader.ReadLineAsync()
+        if (-not ($Pipe.PSObject.Properties.Name -contains "PendingReadTask")) {
+            $Pipe | Add-Member -NotePropertyName PendingReadTask -NotePropertyValue $null
+        }
+
+        if ($null -eq $Pipe.PendingReadTask) {
+            $Pipe.PendingReadTask = $Pipe.Reader.ReadLineAsync()
+        }
+
+        $task = $Pipe.PendingReadTask
         if (-not $task.Wait($TimeoutMilliseconds)) {
             return $null
         }
 
+        $Pipe.PendingReadTask = $null
         $line = $task.Result
         if ($null -eq $line) {
             return $null
@@ -436,6 +465,14 @@ function Read-PipeEnvelope {
         return $line | ConvertFrom-Json -Depth 20
     }
     catch {
+        if ($Pipe.PSObject.Properties.Name -contains "PendingReadTask") {
+            try {
+                if ($null -ne $Pipe.PendingReadTask -and $Pipe.PendingReadTask.IsCompleted) {
+                    $Pipe.PendingReadTask = $null
+                }
+            }
+            catch {}
+        }
         return $null
     }
 }
@@ -470,10 +507,21 @@ function Wait-ForMountedStatus {
     }
 
     if ($null -ne $lastStatus) {
-        return $lastStatus
+        $state = if ($lastStatus.PSObject.Properties.Name -contains "state") { [string]$lastStatus.state } else { "unknown" }
+        $lastError = if ($lastStatus.PSObject.Properties.Name -contains "lastError") { [string]$lastStatus.lastError } else { "" }
+        $warnings = if ($lastStatus.PSObject.Properties.Name -contains "warnings" -and $null -ne $lastStatus.warnings) {
+            (@($lastStatus.warnings) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }) -join "; "
+        }
+        else {
+            ""
+        }
+        $details = @("state=$state")
+        if (-not [string]::IsNullOrWhiteSpace($lastError)) { $details += "lastError=$lastError" }
+        if (-not [string]::IsNullOrWhiteSpace($warnings)) { $details += "warnings=$warnings" }
+        throw "Timed out waiting for a mounted APFS volume with a drive letter ($($details -join ', '))."
     }
 
-    throw "Timed out waiting for a mounted APFS volume."
+    throw "Timed out waiting for a mounted APFS volume with a drive letter."
 }
 
 function Send-QuitRequest {
@@ -496,28 +544,56 @@ function Send-QuitRequest {
 }
 
 function Stop-ApfsProcesses {
-    $pipe = $null
+    $expectedRoot = $null
     try {
-        $pipe = Connect-StatusPipe -PipeName "ApfsAccess.Tray.v1" -TimeoutSeconds 2
-        Send-QuitRequest -Pipe $pipe
-        Start-Sleep -Seconds 2
+        $rootVariable = Get-Variable -Name appRoot -Scope Script -ErrorAction SilentlyContinue
+        if ($null -ne $rootVariable -and -not [string]::IsNullOrWhiteSpace([string]$rootVariable.Value)) {
+            $expectedRoot = (Resolve-Path -LiteralPath ([string]$rootVariable.Value)).Path
+        }
     }
     catch {
-    }
-    finally {
-        Disconnect-StatusPipe -Pipe $pipe
+        $expectedRoot = $null
     }
 
-    Get-Process -Name "ApfsAccess.Tray", "ApfsAccess.Service", "ApfsAccess.FsHost" -ErrorAction SilentlyContinue |
-        Stop-Process -Force -ErrorAction SilentlyContinue
+    $processes = @(
+        Get-Process -Name "ApfsAccess.Tray", "ApfsAccess.Service", "ApfsAccess.FsHost" -ErrorAction SilentlyContinue |
+            Where-Object {
+                [string]::IsNullOrWhiteSpace($expectedRoot) -or
+                ($_.Path -and $_.Path.StartsWith($expectedRoot, [System.StringComparison]::OrdinalIgnoreCase))
+            }
+    )
 
-    Start-Sleep -Seconds 2
+    foreach ($process in $processes) {
+        try {
+            Stop-Process -Id $process.Id -Force -ErrorAction Stop
+        }
+        catch {
+        }
+    }
+
+    $deadline = (Get-Date).AddSeconds(8)
+    do {
+        $remaining = @(
+            Get-Process -Name "ApfsAccess.Tray", "ApfsAccess.Service", "ApfsAccess.FsHost" -ErrorAction SilentlyContinue |
+                Where-Object {
+                    [string]::IsNullOrWhiteSpace($expectedRoot) -or
+                    ($_.Path -and $_.Path.StartsWith($expectedRoot, [System.StringComparison]::OrdinalIgnoreCase))
+                }
+        )
+
+        if ($remaining.Count -eq 0) {
+            return
+        }
+
+        Start-Sleep -Milliseconds 250
+    }
+    while ((Get-Date) -lt $deadline)
 }
 
 function Start-ApfsApplication {
     param([string]$TrayExePath)
 
-    Start-Process -FilePath $TrayExePath -WorkingDirectory (Split-Path -Parent $TrayExePath) -PassThru
+    Start-Process -FilePath $TrayExePath -WorkingDirectory (Split-Path -Parent $TrayExePath) -WindowStyle Hidden -PassThru
 }
 
 function New-BlankEvidenceRecord {
@@ -570,7 +646,8 @@ function Set-PilotAppSettings {
         [string]$AppSettingsPath,
         [string]$ResolvedDeviceId,
         [string]$ResolvedVolumeId,
-        [string]$EvidenceStorePath
+        [string]$EvidenceStorePath,
+        [bool]$AllowDestructiveWriteSmoke
     )
 
     $root = Get-Content -LiteralPath $AppSettingsPath -Raw | ConvertFrom-Json
@@ -580,19 +657,29 @@ function Set-PilotAppSettings {
 
     $service = $root.Service
     $service.BackendMode = "Native"
-    $service.NativeApfsUtilPath = "apfsutil.exe"
+    if ($service.PSObject.Properties.Name -contains 'NativeApfsUtilPath') {
+        $null = $service.PSObject.Properties.Remove('NativeApfsUtilPath')
+    }
     $service.NativeFsHostPath = "ApfsAccess.FsHost.exe"
     $service.NativeDeviceCandidates = @($ResolvedDeviceId)
     $service.NativeAutoDiscoverPhysicalDrives = $false
-    $service.EnableNativeWrite = $true
-    $service.WriteRolloutChannel = "Pilot"
+    $service.EnableNativeWrite = [bool]$AllowDestructiveWriteSmoke
+    $service.WriteRolloutChannel = if ($AllowDestructiveWriteSmoke) { "Pilot" } else { "Disabled" }
     $service.WriteSafetyLevel = "Conservative"
-    $service.WriteBackendMode = "Native"
+    $service.WriteBackendMode = if ($AllowDestructiveWriteSmoke) { "Native" } else { "Disabled" }
     $service.AllowWriteOnUnsupportedFeatures = $false
-    $service.NativeWriteAllowRawPhysicalDevices = $true
-    $service.NativeWritePilotVolumeAllowList = @($ResolvedVolumeId)
-    $service.NativeWritePromotionPolicy = "PilotHardware"
-    $service.NativeWriteHardwarePilotDeviceAllowList = @($ResolvedDeviceId)
+    $service.NativeWriteAllowRawPhysicalDevices = [bool]$AllowDestructiveWriteSmoke
+    $service.NativeWriteCrashReplayMode = if ($AllowDestructiveWriteSmoke) { "ReplayIfSafe" } else { "FailClosed" }
+    if ($AllowDestructiveWriteSmoke) {
+        $service.NativeWritePilotVolumeAllowList = @($ResolvedVolumeId)
+        $service.NativeWritePromotionPolicy = "PilotHardware"
+        $service.NativeWriteHardwarePilotDeviceAllowList = @($ResolvedDeviceId)
+    }
+    else {
+        $service.NativeWritePilotVolumeAllowList = @()
+        $service.NativeWritePromotionPolicy = "ScaffoldOnly"
+        $service.NativeWriteHardwarePilotDeviceAllowList = @()
+    }
     $service.NativeWriteEvidenceStorePath = $EvidenceStorePath
     $service.NativeWriteAllowRuntimeEvidenceSeedForRawPhysicalDevices = $false
     $service.NativeWriteEvidenceSeedCrashFaultPasses = 0
@@ -683,6 +770,164 @@ function Invoke-SmokeTest {
     }
 }
 
+function Get-RelativePathSafe {
+    param(
+        [string]$BasePath,
+        [string]$Path
+    )
+
+    try {
+        return [System.IO.Path]::GetRelativePath($BasePath, $Path)
+    }
+    catch {
+        return [System.IO.Path]::GetFileName($Path)
+    }
+}
+
+function Get-ReadOnlyFileCandidates {
+    param(
+        [string]$MountPoint,
+        [int]$SampleFileLimit
+    )
+
+    $limit = [Math]::Max(1, $SampleFileLimit)
+    $timeoutMs = 120000
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $env:ComSpec
+    $psi.Arguments = "/d /c dir /a:-d /s /b ""$MountPoint"""
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+
+    $process = [System.Diagnostics.Process]::Start($psi)
+    if ($null -eq $process) {
+        throw "Read-only enumeration could not start cmd.exe."
+    }
+
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit($timeoutMs)) {
+        try { $process.Kill($true) } catch {}
+        throw "Read-only enumeration timed out after $([int]($timeoutMs / 1000)) seconds."
+    }
+
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
+    if ($process.ExitCode -ne 0 -and -not [string]::IsNullOrWhiteSpace($stderr)) {
+        throw "Read-only enumeration failed: $stderr"
+    }
+
+    $paths = @(
+        $stdout -split "(`r`n|`n|`r)" |
+            ForEach-Object { [string]$_ } |
+            Where-Object { $_ -notmatch "^(`r`n|`n|`r)$" } |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Sort-Object -Unique |
+            Select-Object -First $limit
+    )
+
+    @(
+        foreach ($path in $paths) {
+            try {
+                $info = [System.IO.FileInfo]::new($path)
+                if ($info.Exists) {
+                    [pscustomobject]@{
+                        FullName = $info.FullName
+                        Length = [UInt64]$info.Length
+                    }
+                }
+            }
+            catch {
+                throw "Read-only enumeration found an inaccessible file '$path': $($_.Exception.Message)"
+            }
+        }
+    )
+}
+
+function Invoke-ReadOnlyValidation {
+    param(
+        [string]$MountPoint,
+        [string]$SessionRoot,
+        [int]$SampleFileLimit,
+        [UInt64]$CopyByteLimit,
+        [bool]$SkipCopy
+    )
+
+    $normalizedMount = Normalize-MountPoint $MountPoint
+    if (-not (Test-Path -LiteralPath $normalizedMount)) {
+        throw "Mount point is not accessible: $normalizedMount"
+    }
+
+    $copyRoot = Join-Path $SessionRoot "read-only-copyout"
+    Write-Info "Enumerating files from read-only mount $normalizedMount."
+    $files = @(Get-ReadOnlyFileCandidates -MountPoint $normalizedMount -SampleFileLimit $SampleFileLimit)
+    Write-Info "Enumerated $($files.Count) read-only file candidates."
+
+    $copied = New-Object System.Collections.Generic.List[object]
+    $hashChecks = New-Object System.Collections.Generic.List[object]
+    [UInt64]$bytesCopied = 0
+    $copyLimitReached = $false
+
+    if (-not $SkipCopy) {
+        New-Item -ItemType Directory -Force -Path $copyRoot | Out-Null
+        Write-Info "Copying read-only sample files and verifying SHA-256 hashes."
+        foreach ($file in $files) {
+            $length = [UInt64]$file.Length
+            if (($bytesCopied + $length) -gt $CopyByteLimit) {
+                $copyLimitReached = $true
+                break
+            }
+
+            $relative = Get-RelativePathSafe -BasePath $normalizedMount -Path $file.FullName
+            $destination = Join-Path $copyRoot $relative
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+            Copy-Item -LiteralPath $file.FullName -Destination $destination -Force -ErrorAction Stop
+            $bytesCopied += $length
+
+            $sourceHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+            $copyHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash
+            $hashMatch = [string]::Equals($sourceHash, $copyHash, [System.StringComparison]::OrdinalIgnoreCase)
+            if (-not $hashMatch) {
+                throw "Read-only copy hash mismatch for '$relative'."
+            }
+
+            $copied.Add([ordered]@{
+                relativePath = $relative
+                sizeBytes = [UInt64]$file.Length
+                sha256 = $sourceHash
+            })
+
+            if (($copied.Count % 25) -eq 0) {
+                Write-Info "Copied and verified $($copied.Count) files so far."
+            }
+        }
+        Write-Info "Copied and verified $($copied.Count) files."
+    }
+
+    foreach ($file in @($files | Select-Object -First ([Math]::Min(16, $files.Count)))) {
+        $hashChecks.Add([ordered]@{
+            relativePath = Get-RelativePathSafe -BasePath $normalizedMount -Path $file.FullName
+            sizeBytes = [UInt64]$file.Length
+            sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+        })
+    }
+
+    [ordered]@{
+        mode = "ReadOnly"
+        mountPoint = $normalizedMount
+        enumeratedFileCount = $files.Count
+        copiedFileCount = $copied.Count
+        copiedBytes = $bytesCopied
+        copyLimitBytes = $CopyByteLimit
+        copyLimitReached = $copyLimitReached
+        copyRoot = if ($SkipCopy) { $null } else { $copyRoot }
+        sampleHashes = $hashChecks.ToArray()
+        copiedFiles = $copied.ToArray()
+    }
+}
+
 function Test-SmokePersistence {
     param(
         [string]$MountPoint,
@@ -743,15 +988,19 @@ function New-ValidationReport {
         [string]$ProfileId,
         [string]$VolumeId,
         [bool]$HardwarePilotPassed,
-        [bool]$BootstrapSeeded
+        [bool]$BootstrapSeeded,
+        [bool]$DestructiveWriteSmoke
     )
 
     $generatedUtc = [DateTime]::UtcNow.ToString("o")
-    $hardwareNotes = if ($BootstrapSeeded) {
-        "Automated Windows smoke + remount run succeeded. Session used a temporary local bootstrap evidence ledger to unlock writable testing for feedback only."
+    $hardwareNotes = if (-not $DestructiveWriteSmoke) {
+        "Automated read-only mount, enumeration, copy-out, and hash validation succeeded. No APFS writes were attempted."
+    }
+    elseif ($BootstrapSeeded) {
+        "Automated Windows write smoke + remount run succeeded. Session used a temporary local bootstrap evidence ledger to unlock writable testing for feedback only."
     }
     else {
-        "Automated Windows smoke + remount run succeeded without temporary bootstrap evidence."
+        "Automated Windows write smoke + remount run succeeded without temporary bootstrap evidence."
     }
 
     Write-JsonFile -Path $ReportPath -InputObject ([ordered]@{
@@ -759,6 +1008,7 @@ function New-ValidationReport {
         profileId = $ProfileId
         volumeId = $VolumeId
         bootstrapSeeded = $BootstrapSeeded
+        destructiveWriteSmoke = $DestructiveWriteSmoke
         results = @(
             [ordered]@{ profileId = $ProfileId; volumeId = $VolumeId; scenario = "CrashFault"; passed = $false; count = 1; validatedUtc = $null; notes = "manual crash-fault validation still required" },
             [ordered]@{ profileId = $ProfileId; volumeId = $VolumeId; scenario = "CrashStageMatrix"; passed = $false; count = 1; validatedUtc = $null; notes = "manual crash-stage matrix validation still required" },
@@ -779,6 +1029,17 @@ function Copy-IfExists {
     )
 
     if (-not (Test-Path -LiteralPath $SourcePath)) {
+        return
+    }
+
+    $resolvedSource = (Resolve-Path -LiteralPath $SourcePath).Path
+    $resolvedDestination = if (Test-Path -LiteralPath $DestinationPath) {
+        (Resolve-Path -LiteralPath $DestinationPath).Path
+    }
+    else {
+        [System.IO.Path]::GetFullPath($DestinationPath)
+    }
+    if ([string]::Equals($resolvedSource, $resolvedDestination, [System.StringComparison]::OrdinalIgnoreCase)) {
         return
     }
 
@@ -816,14 +1077,14 @@ function New-ArchiveFromSession {
 $appRoot = Resolve-AppRoot -RequestedRoot $BundleRoot
 $appSettingsPath = Join-Path $appRoot "appsettings.json"
 $trayExePath = Join-Path $appRoot "ApfsAccess.Tray.exe"
-$apfsUtilPath = Join-Path $appRoot "apfsutil.exe"
+$nativeProbeScriptPath = Join-Path $PSScriptRoot "native_probe.ps1"
 $fsHostPath = Join-Path $appRoot "ApfsAccess.FsHost.exe"
 $scriptsRoot = Join-Path $appRoot "scripts"
 $evaluateScriptPath = Join-Path $scriptsRoot "evaluate_write_promotion.ps1"
 
 Assert-PathExists -Path $appSettingsPath -Description "appsettings.json"
 Assert-PathExists -Path $trayExePath -Description "ApfsAccess.Tray.exe"
-Assert-PathExists -Path $apfsUtilPath -Description "apfsutil.exe"
+Assert-PathExists -Path $nativeProbeScriptPath -Description "native_probe.ps1"
 Assert-PathExists -Path $fsHostPath -Description "ApfsAccess.FsHost.exe"
 Assert-PathExists -Path $evaluateScriptPath -Description "evaluate_write_promotion.ps1"
 
@@ -835,8 +1096,8 @@ $summaryPath = Join-Path $sessionRoot "summary.json"
 $statusLogPath = Join-Path $sessionRoot "status-log.jsonl"
 $diskInventoryPath = Join-Path $sessionRoot "disk-inventory.json"
 $appSettingsBackupPath = Join-Path $sessionRoot "appsettings.original.json"
-$enumrootPath = Join-Path $sessionRoot "apfsutil-enumroot.txt"
-$listsubvolumesPath = Join-Path $sessionRoot "apfsutil-listsubvolumes.txt"
+$deviceProbePath = Join-Path $sessionRoot "native-probe-devices.json"
+$volumeProbePath = Join-Path $sessionRoot "native-probe-volumes.json"
 $preflightPath = Join-Path $sessionRoot "preflight.json"
 $postflightPath = Join-Path $sessionRoot "postflight.json"
 $validationReportPath = Join-Path $sessionRoot "validation-report.json"
@@ -852,8 +1113,11 @@ $summary = [ordered]@{
     appRoot = $appRoot
     status = "InProgress"
     bootstrapEvidence = $UseBootstrapEvidence
+    destructiveWriteSmoke = [bool]$AllowDestructiveWriteSmoke
+    keepMounted = [bool]$KeepMounted
     warnings = @(
         "Use only a sacrificial APFS drive for this validation flow.",
+        "Default pilot validation is read-only and does not write to APFS media.",
         "The generated validation report does not replace manual crash, hot-unplug, power-loss, or macOS validation."
     )
     manualFollowUps = @(
@@ -870,6 +1134,12 @@ $restoredAppSettings = $false
 
 try {
     Write-Info "APFS pilot automation is starting."
+    if ($AllowDestructiveWriteSmoke) {
+        Write-Warning "Destructive raw-device write smoke is enabled. This must only be used on sacrificial APFS media after write-safety blockers are cleared."
+    }
+    else {
+        Write-Info "Read-only validation mode is active. The script will not write to the APFS volume."
+    }
     Write-Info "This flow will reconfigure the published beta bundle temporarily and collect a feedback archive."
 
     $summary.originalAppSettingsPath = $appSettingsBackupPath
@@ -877,7 +1147,7 @@ try {
 
     Stop-ApfsProcesses
 
-    $disks = Get-ApfsDevices -ApfsUtilPath $apfsUtilPath -DiscoveryTimeoutSeconds $DeviceDiscoveryTimeoutSeconds
+    $disks = Get-ApfsDevices -ProbeScriptPath $nativeProbeScriptPath -DiscoveryTimeoutSeconds $DeviceDiscoveryTimeoutSeconds -RequestedDeviceId $DeviceId
     if ($disks.Count -eq 0) {
         throw "No APFS raw physical drive was detected. Connect the sacrificial APFS drive and rerun this launcher."
     }
@@ -916,10 +1186,10 @@ try {
         sizeBytes = $selectedDisk.SizeBytes
         sizeLabel = $selectedDisk.SizeLabel
     }
-    $selectedDisk.ProbeOutput | Set-Content -LiteralPath $enumrootPath -Encoding utf8
+    $selectedDisk.ProbeOutput | Set-Content -LiteralPath $deviceProbePath -Encoding utf8
 
-    $volumeProbe = Get-ApfsVolumes -ApfsUtilPath $apfsUtilPath -ResolvedDeviceId $selectedDisk.DeviceId
-    $volumeProbe.ProbeOutput | Set-Content -LiteralPath $listsubvolumesPath -Encoding utf8
+    $volumeProbe = Get-ApfsVolumes -ResolvedDevice $selectedDisk
+    $volumeProbe.ProbeOutput | Set-Content -LiteralPath $volumeProbePath -Encoding utf8
 
     $selectedVolume = if (-not [string]::IsNullOrWhiteSpace($VolumeName)) {
         $match = @($volumeProbe.Volumes | Where-Object { $_.VolumeName -ieq $VolumeName.Trim() })
@@ -941,11 +1211,14 @@ try {
         profileId = $selectedVolume.ProfileId
     }
 
-    $serviceOptions = Set-PilotAppSettings -AppSettingsPath $appSettingsPath -ResolvedDeviceId $selectedDisk.DeviceId -ResolvedVolumeId $selectedVolume.VolumeId -EvidenceStorePath $evidenceStorePath
+    $serviceOptions = Set-PilotAppSettings -AppSettingsPath $appSettingsPath -ResolvedDeviceId $selectedDisk.DeviceId -ResolvedVolumeId $selectedVolume.VolumeId -EvidenceStorePath $evidenceStorePath -AllowDestructiveWriteSmoke ([bool]$AllowDestructiveWriteSmoke)
     Copy-Item -LiteralPath $appSettingsPath -Destination $pilotAppSettingsPath -Force
-    if ($UseBootstrapEvidence) {
+    if ($UseBootstrapEvidence -and $AllowDestructiveWriteSmoke) {
         Write-Info "Seeding a temporary session-local PilotHardware evidence ledger to unlock the writable smoke run."
         Write-JsonFile -Path $evidenceStorePath -InputObject (New-BootstrapEvidenceLedger -ServiceOptions $serviceOptions -ProfileId $selectedVolume.ProfileId -VolumeId $selectedVolume.VolumeId)
+    }
+    elseif ($UseBootstrapEvidence) {
+        Write-Info "Bootstrap evidence was requested but ignored in read-only validation mode."
     }
 
     $summary.evidenceStorePath = $serviceOptions.NativeWriteEvidenceStorePath
@@ -959,6 +1232,7 @@ try {
     $statusPipe = Connect-StatusPipe -PipeName "ApfsAccess.Tray.v1" -TimeoutSeconds 25
     $firstStatus = Wait-ForMountedStatus -Pipe $statusPipe -TimeoutSeconds $MountTimeoutSeconds -StatusLogPath $statusLogPath
     $firstMountPoint = Resolve-MountPointFromStatus -Status $firstStatus -BaselineRoots $baselineRoots -PreferredVolumeName $selectedVolume.VolumeName
+    Write-Info "Mounted APFS volume at $firstMountPoint."
     $summary.firstMount = [ordered]@{
         state = $firstStatus.state
         mountPoints = @($firstStatus.mountPoints)
@@ -975,45 +1249,53 @@ try {
     if ([string]::IsNullOrWhiteSpace($firstMountPoint)) {
         throw "The app mounted an APFS volume but the drive letter could not be resolved."
     }
-    if (-not [bool]$firstStatus.writeEnabled) {
-        throw "The APFS volume mounted read-only. Review preflight.json, status-log.jsonl, and diagnostics in the feedback archive."
+    if ($AllowDestructiveWriteSmoke) {
+        if (-not [bool]$firstStatus.writeEnabled) {
+            throw "The APFS volume mounted read-only. Review preflight.json, status-log.jsonl, and diagnostics in the feedback archive."
+        }
+
+        $smoke = Invoke-SmokeTest -MountPoint $firstMountPoint -SessionId $sessionId
+        $summary.smoke = $smoke
+
+        Disconnect-StatusPipe -Pipe $statusPipe
+        $statusPipe = $null
+
+        $rootsBeforeRemount = Get-DriveRoots
+        Stop-ApfsProcesses
+
+        Write-Info "Restarting the beta app to verify remount persistence."
+        $null = Start-ApfsApplication -TrayExePath $trayExePath
+        $statusPipe = Connect-StatusPipe -PipeName "ApfsAccess.Tray.v1" -TimeoutSeconds 25
+        $remountStatus = Wait-ForMountedStatus -Pipe $statusPipe -TimeoutSeconds $RemountTimeoutSeconds -StatusLogPath $statusLogPath
+        $remountPoint = Resolve-MountPointFromStatus -Status $remountStatus -BaselineRoots $rootsBeforeRemount -PreferredVolumeName $selectedVolume.VolumeName
+        $verification = Test-SmokePersistence -MountPoint $remountPoint -SmokeResult $smoke
+
+        $summary.remount = [ordered]@{
+            state = $remountStatus.state
+            mountPoints = @($remountStatus.mountPoints)
+            writeEnabled = [bool]$remountStatus.writeEnabled
+            nativeWriteValidationState = $remountStatus.nativeWriteValidationState
+            nativeWriteReadiness = $remountStatus.nativeWriteReadiness
+            nativeWriteSafetyState = $remountStatus.nativeWriteSafetyState
+            lastError = $remountStatus.lastError
+            warnings = @($remountStatus.warnings)
+            compatibilityWarnings = @($remountStatus.compatibilityWarnings)
+            mountPoint = $remountPoint
+        }
+        $summary.verification = $verification
+
+        New-ValidationReport -ReportPath $validationReportPath -ProfileId $selectedVolume.ProfileId -VolumeId $selectedVolume.VolumeId -HardwarePilotPassed ([bool]$verification.success) -BootstrapSeeded $UseBootstrapEvidence -DestructiveWriteSmoke ([bool]$AllowDestructiveWriteSmoke)
+        $summary.postflight = Invoke-PromotionEvaluation -EvaluateScriptPath $evaluateScriptPath -AppSettingsPath $appSettingsPath -ProfileId $selectedVolume.ProfileId -OutputPath $postflightPath
+
+        if (-not [bool]$verification.success) {
+            throw (($verification.messages | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join " ")
+        }
     }
-
-    $smoke = Invoke-SmokeTest -MountPoint $firstMountPoint -SessionId $sessionId
-    $summary.smoke = $smoke
-
-    Disconnect-StatusPipe -Pipe $statusPipe
-    $statusPipe = $null
-
-    $rootsBeforeRemount = Get-DriveRoots
-    Stop-ApfsProcesses
-
-    Write-Info "Restarting the beta app to verify remount persistence."
-    $null = Start-ApfsApplication -TrayExePath $trayExePath
-    $statusPipe = Connect-StatusPipe -PipeName "ApfsAccess.Tray.v1" -TimeoutSeconds 25
-    $remountStatus = Wait-ForMountedStatus -Pipe $statusPipe -TimeoutSeconds $RemountTimeoutSeconds -StatusLogPath $statusLogPath
-    $remountPoint = Resolve-MountPointFromStatus -Status $remountStatus -BaselineRoots $rootsBeforeRemount -PreferredVolumeName $selectedVolume.VolumeName
-    $verification = Test-SmokePersistence -MountPoint $remountPoint -SmokeResult $smoke
-
-    $summary.remount = [ordered]@{
-        state = $remountStatus.state
-        mountPoints = @($remountStatus.mountPoints)
-        writeEnabled = [bool]$remountStatus.writeEnabled
-        nativeWriteValidationState = $remountStatus.nativeWriteValidationState
-        nativeWriteReadiness = $remountStatus.nativeWriteReadiness
-        nativeWriteSafetyState = $remountStatus.nativeWriteSafetyState
-        lastError = $remountStatus.lastError
-        warnings = @($remountStatus.warnings)
-        compatibilityWarnings = @($remountStatus.compatibilityWarnings)
-        mountPoint = $remountPoint
-    }
-    $summary.verification = $verification
-
-    New-ValidationReport -ReportPath $validationReportPath -ProfileId $selectedVolume.ProfileId -VolumeId $selectedVolume.VolumeId -HardwarePilotPassed ([bool]$verification.success) -BootstrapSeeded $UseBootstrapEvidence
-    $summary.postflight = Invoke-PromotionEvaluation -EvaluateScriptPath $evaluateScriptPath -AppSettingsPath $appSettingsPath -ProfileId $selectedVolume.ProfileId -OutputPath $postflightPath
-
-    if (-not [bool]$verification.success) {
-        throw (($verification.messages | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join " ")
+    else {
+        $readOnlyValidation = Invoke-ReadOnlyValidation -MountPoint $firstMountPoint -SessionRoot $sessionRoot -SampleFileLimit $ReadOnlySampleFileLimit -CopyByteLimit $ReadOnlyCopyByteLimit -SkipCopy ([bool]$SkipReadOnlyCopy)
+        $summary.readOnlyValidation = $readOnlyValidation
+        New-ValidationReport -ReportPath $validationReportPath -ProfileId $selectedVolume.ProfileId -VolumeId $selectedVolume.VolumeId -HardwarePilotPassed $true -BootstrapSeeded $false -DestructiveWriteSmoke $false
+        $summary.postflight = Invoke-PromotionEvaluation -EvaluateScriptPath $evaluateScriptPath -AppSettingsPath $appSettingsPath -ProfileId $selectedVolume.ProfileId -OutputPath $postflightPath
     }
 
     $summary.status = "Complete"
@@ -1036,7 +1318,15 @@ finally {
     }
 
     Copy-IfExists -SourcePath $appSettingsPath -DestinationPath $finalAppSettingsPath
-    Stop-ApfsProcesses
+    if ($KeepMounted -and $summary.status -eq "Complete") {
+        $summary.keptMounted = $true
+        $summary.keptMountedNote = "APFS Access processes were left running so the mounted APFS drive remains visible in Explorer."
+        Write-Info "Keeping APFS Access running so the mounted drive remains visible in Explorer."
+    }
+    else {
+        $summary.keptMounted = $false
+        Stop-ApfsProcesses
+    }
     Export-DiagnosticsBundle -SessionRoot $sessionRoot -EvidenceStorePath $evidenceStorePath
     $summary.appSettingsRestored = $restoredAppSettings
     $summary.feedbackArchivePath = $archivePath
@@ -1047,7 +1337,12 @@ finally {
 
 if ($summary.status -eq "Complete") {
     Write-Host ""
-    Write-Info "Smoke test passed and a feedback archive was created."
+    if ($AllowDestructiveWriteSmoke) {
+        Write-Info "Write smoke test passed and a feedback archive was created."
+    }
+    else {
+        Write-Info "Read-only validation passed and a feedback archive was created."
+    }
     Write-Host "         archive : $archivePath"
     Write-Host "         summary : $summaryPath"
     Write-Host "         note    : crash/hot-unplug/power-loss/macOS validation still remains manual."

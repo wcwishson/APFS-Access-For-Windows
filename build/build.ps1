@@ -15,10 +15,6 @@ if (Test-Path -LiteralPath $vcvars) {
     $cmd = '"' + $vcvars + '" >nul && cd /d "' + $repoRoot + '" && pwsh -NoProfile -File .\scripts\build_native_host.ps1 -Configuration ' + $Configuration + ' -Generator "NMake Makefiles" -SkipIfUnavailable'
     cmd /c $cmd
 
-    Write-Host "[build] building Paragon apfsutil (best-effort)..."
-    $cmdApfs = '"' + $vcvars + '" >nul && cd /d "' + $repoRoot + '" && pwsh -NoProfile -File .\scripts\build_paragon_apfsutil.ps1 -BuildType ' + $Configuration + ' -Generator "NMake Makefiles" -SkipIfUnavailable'
-    cmd /c $cmdApfs
-
     Write-Host "[build] building native RW engine scaffold (best-effort)..."
     $cmdRw = '"' + $vcvars + '" >nul && cd /d "' + $repoRoot + '" && pwsh -NoProfile -File .\scripts\build_rw_engine.ps1 -Configuration ' + $Configuration + ' -Generator "NMake Makefiles" -SkipIfUnavailable'
     cmd /c $cmdRw

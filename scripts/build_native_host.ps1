@@ -110,11 +110,21 @@ if ([string]::IsNullOrWhiteSpace($hostExe)) {
     }
 }
 
-Copy-Item -LiteralPath $hostExe -Destination (Join-Path $OutputDir "ApfsAccess.FsHost.exe") -Force
+try {
+    Copy-Item -LiteralPath $hostExe -Destination (Join-Path $OutputDir "ApfsAccess.FsHost.exe") -Force
+}
+catch {
+    Write-Warning "ApfsAccess.FsHost.exe could not be copied into the artifacts output directory because the file is locked. The build output is still available at $hostExe."
+}
 
 $candidatePdb = [System.IO.Path]::ChangeExtension($hostExe, ".pdb")
 if (Test-Path -LiteralPath $candidatePdb) {
-    Copy-Item -LiteralPath $candidatePdb -Destination (Join-Path $OutputDir "ApfsAccess.FsHost.pdb") -Force
+    try {
+        Copy-Item -LiteralPath $candidatePdb -Destination (Join-Path $OutputDir "ApfsAccess.FsHost.pdb") -Force
+    }
+    catch {
+        Write-Warning "ApfsAccess.FsHost.pdb could not be copied into the artifacts output directory because the file is locked."
+    }
 }
 
 Write-Host "[native-build] success: $(Join-Path $OutputDir "ApfsAccess.FsHost.exe")"

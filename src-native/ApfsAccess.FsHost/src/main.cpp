@@ -9,6 +9,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <objbase.h>
 #include <memory>
 #include <mutex>
 #include <limits>
@@ -22,6 +23,7 @@
 #include <windows.h>
 #include <winternl.h>
 #include <sddl.h>
+#include <shlobj.h>
 #ifndef PNTSTATUS
 typedef NTSTATUS* PNTSTATUS;
 #endif
@@ -41,7 +43,7 @@ struct Arguments
     std::wstring mount;
     std::wstring lifetime_file;
     std::wstring status_file;
-    std::wstring apfsutil;
+    std::uint64_t device_offset_bytes = 0;
     std::wstring write_safety_level = L"Conservative";
     std::wstring write_backend = L"Disabled";
     int write_commit_timeout_seconds = 15;
@@ -108,6 +110,7 @@ struct OpenContext
     bool write_open = false;
     bool delete_on_cleanup = false;
     bool metadata_read_fallback = false;
+    bool cleanup_seen = false;
 };
 
 struct WinFspApi
@@ -198,6 +201,10 @@ struct MountContext
     std::optional<std::uint64_t> runtime_last_commit_xid;
     std::wstring runtime_recovery_reason;
     std::wstring runtime_last_recovery_action;
+    std::uint32_t reported_allocation_unit_bytes = 4096;
+    std::optional<std::uint64_t> reported_total_size_bytes;
+    std::optional<std::uint64_t> reported_free_size_bytes;
+    std::atomic<bool> mount_ready{false};
     std::mutex mutex;
     std::atomic<bool> shutdown_drain_active{false};
     std::atomic<std::uint32_t> active_external_mutation_callbacks{0};
@@ -216,6 +223,10 @@ struct MountContext
 #endif
 };
 
+#ifdef APFSACCESS_HAS_RW_ENGINE
+bool MergeCommittedInodeStateIntoNodeIndex(MountContext* c);
+#endif
+
 struct MutationCallbackScope
 {
     explicit MutationCallbackScope(MountContext* context)
@@ -228,6 +239,12 @@ struct MutationCallbackScope
 private:
     std::unique_lock<std::mutex> lock_;
 };
+
+bool WriteHostStatusFile(
+    const MountContext& context,
+    bool recovery_active = false,
+    std::optional<std::uint64_t> last_commit_xid = std::nullopt
+);
 
 struct ExternalMutationRequestScope
 {
@@ -242,6 +259,7 @@ struct ExternalMutationRequestScope
         if (acquired_ && context_)
         {
             context_->active_external_mutation_callbacks.fetch_sub(1, std::memory_order_acq_rel);
+            (void)WriteHostStatusFile(*context_, context_->recovery_active, context_->runtime_last_commit_xid);
         }
     }
 
@@ -279,6 +297,9 @@ private:
 
 bool IsMutationWriteEnabled(const MountContext* c);
 NTSTATUS HandleMutationWriteDisabled(MountContext* c, const wchar_t* operation);
+#ifdef APFSACCESS_HAS_RW_ENGINE
+void RefreshReportedVolumeInfoFromMetadata(MountContext& ctx);
+#endif
 
 std::atomic<bool> g_exit{false};
 
@@ -463,6 +484,16 @@ std::wstring NormalizePath(const std::wstring& in)
     }
     std::wstring p = in;
     std::replace(p.begin(), p.end(), L'/', L'\\');
+    if (p.size() >= 2 &&
+        ((p[0] >= L'A' && p[0] <= L'Z') || (p[0] >= L'a' && p[0] <= L'z')) &&
+        p[1] == L':')
+    {
+        p.erase(0, 2);
+        if (p.empty())
+        {
+            return L"\\";
+        }
+    }
     if (p.front() != L'\\')
     {
         p.insert(p.begin(), L'\\');
@@ -508,6 +539,66 @@ bool IsDescendantPath(const std::wstring& candidate_path, const std::wstring& an
     return candidate_key.rfind(ancestor_prefix, 0) == 0;
 }
 
+bool IsRecycleBinPath(const std::wstring& path)
+{
+    const auto key = Key(path);
+    constexpr const wchar_t* kRecycleBinRoot = L"\\$recycle.bin";
+    return key == kRecycleBinRoot ||
+           key.rfind(std::wstring(kRecycleBinRoot) + L"\\", 0) == 0;
+}
+
+UINT32 BuildFileAttributes(const Node& node, bool read_only)
+{
+    UINT32 attributes = node.is_directory
+        ? FILE_ATTRIBUTE_DIRECTORY
+        : FILE_ATTRIBUTE_ARCHIVE;
+
+    if (IsRecycleBinPath(node.path))
+    {
+        attributes |= FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+    }
+
+    if (!node.is_directory && read_only)
+    {
+        attributes |= FILE_ATTRIBUTE_READONLY;
+    }
+
+    return attributes;
+}
+
+std::uint32_t StableHashUtf16(std::uint32_t hash, const std::wstring& value)
+{
+    // FNV-1a over UTF-16 code units is enough for a stable Windows volume serial.
+    constexpr std::uint32_t kFnvPrime = 16777619u;
+    for (const auto ch : value)
+    {
+        const auto code = static_cast<std::uint32_t>(ch);
+        hash ^= (code & 0xffu);
+        hash *= kFnvPrime;
+        hash ^= ((code >> 8) & 0xffu);
+        hash *= kFnvPrime;
+    }
+    return hash;
+}
+
+std::uint32_t BuildStableVolumeSerial(const Arguments& args)
+{
+    constexpr std::uint32_t kFnvOffset = 2166136261u;
+    constexpr std::uint32_t kFnvPrime = 16777619u;
+
+    auto hash = StableHashUtf16(kFnvOffset, args.device);
+    hash ^= L'|';
+    hash *= kFnvPrime;
+    hash = StableHashUtf16(hash, args.volume);
+    for (int shift = 0; shift < 64; shift += 8)
+    {
+        hash ^= static_cast<std::uint32_t>((args.device_offset_bytes >> shift) & 0xffu);
+        hash *= kFnvPrime;
+    }
+
+    return hash == 0 ? 1u : hash;
+}
+
 bool EqualsIgnoreCase(const std::wstring& a, const std::wstring& b)
 {
     return _wcsicmp(a.c_str(), b.c_str()) == 0;
@@ -544,6 +635,11 @@ bool IsRecoveryPolicyFailClosed(const std::wstring& value)
     }
 
     return !_wcsicmp(value.c_str(), L"FailClosed");
+}
+
+bool IsCrashReplayModeReplayIfSafe(const std::wstring& value)
+{
+    return !_wcsicmp(value.c_str(), L"ReplayIfSafe");
 }
 
 bool ParseBoolToken(const std::wstring& value, bool fallback)
@@ -654,6 +750,19 @@ DWORD ResolveHydrationDesiredAccess(bool mutation_enabled, UINT32 granted_access
     return desired_access;
 }
 
+DWORD ResolveHydrationShareMode(bool mutation_enabled, UINT32 granted_access, bool write_open)
+{
+    UNREFERENCED_PARAMETER(mutation_enabled);
+    UNREFERENCED_PARAMETER(granted_access);
+    UNREFERENCED_PARAMETER(write_open);
+
+    // User-mode APFS writes are staged through the host before being committed
+    // to the physical device. Keep the local hydration handle maximally
+    // shareable so shell previewers, indexers and Office lock-file probes do
+    // not mistake the staging handle for an application-level file lock.
+    return FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+}
+
 void InitializeOpenAccess(OpenContext* open_ctx, UINT32 granted_access)
 {
     if (!open_ctx)
@@ -671,6 +780,29 @@ void InitializeOpenAccess(OpenContext* open_ctx, UINT32 granted_access)
     open_ctx->allow_set_file_size = open_ctx->allow_write_data || open_ctx->allow_append_data;
     open_ctx->allow_delete = (normalized & DELETE) != 0;
     open_ctx->allow_delete_child = (normalized & FILE_DELETE_CHILD) != 0;
+}
+
+PSECURITY_DESCRIPTOR BuildWritableVolumeSecurityDescriptor(ULONG* descriptor_size)
+{
+    if (descriptor_size)
+    {
+        *descriptor_size = 0;
+    }
+
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    // APFS does not persist Windows ACLs. Present a permissive removable-drive
+    // style descriptor so Explorer and Office shell extensions can create
+    // files/templates without interpreting the mount as read-only to the user.
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;BU)(A;;FA;;;AU)(A;;FA;;;WD)",
+            SDDL_REVISION_1,
+            &descriptor,
+            descriptor_size))
+    {
+        return nullptr;
+    }
+
+    return descriptor;
 }
 
 struct RecoveryMarkerState
@@ -905,6 +1037,10 @@ bool IsCanonicalGateFailureReason(const std::wstring& reason)
 
     return !_wcsicmp(reason.c_str(), L"CanonicalPathNotActive") ||
            !_wcsicmp(reason.c_str(), L"CanonicalStateNotLoaded") ||
+           !_wcsicmp(reason.c_str(), L"CanonicalVolumeStateLoadFailed") ||
+           !_wcsicmp(reason.c_str(), L"CanonicalObjectMapStateInvalid") ||
+           !_wcsicmp(reason.c_str(), L"CanonicalSpacemanStateInvalid") ||
+           !_wcsicmp(reason.c_str(), L"CanonicalVolumeTreeStateInvalid") ||
            !_wcsicmp(reason.c_str(), L"NativeWriteNotReady") ||
            !_wcsicmp(reason.c_str(), L"WriteDeviceNotAllowed") ||
            !_wcsicmp(reason.c_str(), L"CommitPathNotReady") ||
@@ -1248,6 +1384,34 @@ std::string ResolveCommitBlobMagicStatus(const MountContext& context)
     return {};
 }
 
+std::wstring ResolveIntegrityFailureReasonStatus(const MountContext& context)
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
+    if (context.metadata_store)
+    {
+        return context.metadata_store->LastIntegrityFailureReason();
+    }
+#else
+    (void)context;
+#endif
+    return {};
+}
+
+std::optional<std::uint64_t> ResolveIntegrityFailureObjectIdStatus(const MountContext& context)
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
+    if (context.metadata_store)
+    {
+        return context.metadata_store->LastIntegrityFailureObjectId();
+    }
+#else
+    (void)context;
+#endif
+    return std::nullopt;
+}
+
 std::wstring ResolveNativeWriteSafetyStateStatus(const MountContext& context)
 {
     if (!context.args.readwrite)
@@ -1341,10 +1505,38 @@ int ResolveDirtyTransactionCountStatus(const MountContext& context)
 #endif
 }
 
+struct NativeMetadataCounts
+{
+    std::size_t committed_objects = 0;
+    std::size_t committed_inodes = 0;
+    std::size_t committed_btree_records = 0;
+    std::size_t committed_allocations = 0;
+    std::size_t committed_free_extents = 0;
+};
+
+NativeMetadataCounts ResolveNativeMetadataCounts(const MountContext& context)
+{
+    NativeMetadataCounts counts{};
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
+    if (context.metadata_store)
+    {
+        counts.committed_objects = context.metadata_store->CommittedObjectCount();
+        counts.committed_inodes = context.metadata_store->CommittedInodeCount();
+        counts.committed_btree_records = context.metadata_store->CommittedBtreeRecordCount();
+        counts.committed_allocations = context.metadata_store->CommittedAllocationCount();
+        counts.committed_free_extents = context.metadata_store->CommittedFreeExtentCount();
+    }
+#else
+    (void)context;
+#endif
+    return counts;
+}
+
 bool WriteHostStatusFile(
     const MountContext& context,
-    bool recovery_active = false,
-    std::optional<std::uint64_t> last_commit_xid = std::nullopt
+    bool recovery_active,
+    std::optional<std::uint64_t> last_commit_xid
 )
 {
     if (context.args.status_file.empty())
@@ -1380,10 +1572,14 @@ bool WriteHostStatusFile(
         const auto commit_stage = ResolveCommitStageStatus(context);
         const auto replay_stage = ResolveReplayStageStatus(context);
         const auto commit_blob_magic = ResolveCommitBlobMagicStatus(context);
+        const auto integrity_failure_reason = ResolveIntegrityFailureReasonStatus(context);
+        const auto integrity_failure_object_id = ResolveIntegrityFailureObjectIdStatus(context);
         const auto safety_state = EscapeJson(WideToUtf8(ResolveNativeWriteSafetyStateStatus(context)));
         const auto recovery_reason = ResolveRecoveryReasonStatus(context, recovery_active);
         const auto recovery_action = ResolveLastRecoveryActionStatus(context);
         const auto dirty_tx = ResolveDirtyTransactionCountStatus(context);
+        const auto metadata_counts = ResolveNativeMetadataCounts(context);
+        const auto mount_ready = context.mount_ready.load(std::memory_order_acquire);
         const auto shutdown_drain_active = context.shutdown_drain_active.load(std::memory_order_acquire);
         const auto in_flight_mutations = context.active_external_mutation_callbacks.load(std::memory_order_acquire);
         const auto host_pid = static_cast<unsigned long>(GetCurrentProcessId());
@@ -1465,6 +1661,26 @@ bool WriteHostStatusFile(
             out << "null";
         }
 
+        out << ",\"integrityFailureReason\":";
+        if (!integrity_failure_reason.empty())
+        {
+            out << "\"" << EscapeJson(WideToUtf8(integrity_failure_reason)) << "\"";
+        }
+        else
+        {
+            out << "null";
+        }
+
+        out << ",\"integrityFailureObjectId\":";
+        if (integrity_failure_object_id.has_value())
+        {
+            out << *integrity_failure_object_id;
+        }
+        else
+        {
+            out << "null";
+        }
+
         out
             << ",\"nativeWriteSafetyState\":\"" << safety_state
             << "\",\"recoveryActive\":" << (recovery_active ? "true" : "false")
@@ -1500,7 +1716,13 @@ bool WriteHostStatusFile(
             out << "null";
         }
 
+        out << ",\"committedObjectCount\":" << metadata_counts.committed_objects;
+        out << ",\"committedInodeCount\":" << metadata_counts.committed_inodes;
+        out << ",\"committedBtreeRecordCount\":" << metadata_counts.committed_btree_records;
+        out << ",\"committedAllocationCount\":" << metadata_counts.committed_allocations;
+        out << ",\"committedFreeExtentCount\":" << metadata_counts.committed_free_extents;
         out << ",\"dirtyTransactionCount\":" << std::max(0, dirty_tx);
+        out << ",\"mountReady\":" << (mount_ready ? "true" : "false");
         out << ",\"shutdownDrainActive\":" << (shutdown_drain_active ? "true" : "false");
         out << ",\"inFlightMutationCallbacks\":" << in_flight_mutations;
         out << ",\"hostPid\":" << host_pid;
@@ -1607,6 +1829,26 @@ std::wstring Join(const std::wstring& parent, const std::wstring& name)
     return p == L"\\" ? L"\\" + name : p + L"\\" + name;
 }
 
+std::wstring NormalizeRenameTargetPath(const std::wstring& source_path, const std::wstring& raw_target)
+{
+    std::wstring target = raw_target;
+    std::replace(target.begin(), target.end(), L'/', L'\\');
+    while (target.size() > 1 && target.back() == L'\\')
+    {
+        target.pop_back();
+    }
+    if (target.empty())
+    {
+        return L"\\";
+    }
+    if (target.front() == L'\\')
+    {
+        return NormalizePath(target);
+    }
+
+    return NormalizePath(Join(Parent(source_path), target));
+}
+
 std::wstring LeafName(const std::wstring& path)
 {
     auto normalized = NormalizePath(path);
@@ -1630,7 +1872,7 @@ std::wstring ApfsRoot(const Arguments& a)
     {
         p.push_back(L'/');
     }
-    p += L"Ufsd_Volumes/";
+    p += L"ApfsAccess_Volumes/";
     p += a.volume;
     return p;
 }
@@ -1699,18 +1941,7 @@ bool ParseEnumLine(const std::string& line, DirEntry& e)
 void FillInfo(const Node& n, bool read_only, FSP_FSCTL_FILE_INFO* i)
 {
     std::memset(i, 0, sizeof(*i));
-    if (n.is_directory)
-    {
-        i->FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
-    }
-    else
-    {
-        i->FileAttributes = FILE_ATTRIBUTE_ARCHIVE;
-        if (read_only)
-        {
-            i->FileAttributes |= FILE_ATTRIBUTE_READONLY;
-        }
-    }
+    i->FileAttributes = BuildFileAttributes(n, read_only);
     i->FileSize = n.is_directory ? 0 : n.file_size;
     i->AllocationSize = n.is_directory ? 0 : ((n.file_size + 4095ull) / 4096ull) * 4096ull;
     const auto timestamp = ToFileTimeValue(n.timestamp);
@@ -1718,6 +1949,54 @@ void FillInfo(const Node& n, bool read_only, FSP_FSCTL_FILE_INFO* i)
     i->LastAccessTime = timestamp;
     i->LastWriteTime = timestamp;
     i->ChangeTime = timestamp;
+}
+
+std::optional<UINT16> DirectoryInfoSizeForName(const std::wstring& name)
+{
+    const size_t name_bytes = name.size() * sizeof(WCHAR);
+    const size_t entry_size = FIELD_OFFSET(FSP_FSCTL_DIR_INFO, FileNameBuf) + name_bytes;
+    if (entry_size > static_cast<size_t>(std::numeric_limits<UINT16>::max()))
+    {
+        return std::nullopt;
+    }
+
+    return static_cast<UINT16>(entry_size);
+}
+
+void FillDirectoryInfo(FSP_FSCTL_DIR_INFO* dir_info, const Node& node, const std::wstring& name, bool read_only)
+{
+    if (!dir_info)
+    {
+        return;
+    }
+
+    const auto size = DirectoryInfoSizeForName(name);
+    if (!size)
+    {
+        return;
+    }
+
+    dir_info->Size = *size;
+    FillInfo(node, read_only, &dir_info->FileInfo);
+    const size_t name_bytes = name.size() * sizeof(WCHAR);
+    if (name_bytes > 0)
+    {
+        std::memcpy(dir_info->FileNameBuf, name.data(), name_bytes);
+    }
+    dir_info->FileNameBuf[name.size()] = L'\0';
+}
+
+std::vector<unsigned char> BuildDirectoryInfoBuffer(const Node& node, const std::wstring& name, bool read_only)
+{
+    const auto size = DirectoryInfoSizeForName(name);
+    if (!size)
+    {
+        return {};
+    }
+
+    std::vector<unsigned char> buffer(static_cast<size_t>(*size) + sizeof(WCHAR), 0);
+    FillDirectoryInfo(reinterpret_cast<FSP_FSCTL_DIR_INFO*>(buffer.data()), node, name, read_only);
+    return buffer;
 }
 
 std::shared_ptr<Node> TryGetNodeLocked(MountContext* c, const std::wstring& path)
@@ -1900,6 +2179,26 @@ void LatchDeleteOnCleanupLocked(MountContext* c, OpenContext* open_ctx)
     RefreshDeletePendingStateLocked(c, node);
 }
 
+void ReleaseOpenContextAccountingLocked(MountContext* c, OpenContext* open_ctx)
+{
+    if (!c || !open_ctx || !open_ctx->node || open_ctx->cleanup_seen)
+    {
+        return;
+    }
+
+    if (open_ctx->node->open_handle_count > 0)
+    {
+        --open_ctx->node->open_handle_count;
+    }
+    if (open_ctx->write_open && open_ctx->node->write_handle_count > 0)
+    {
+        --open_ctx->node->write_handle_count;
+    }
+
+    open_ctx->cleanup_seen = true;
+    RefreshDeletePendingStateLocked(c, open_ctx->node);
+}
+
 NTSTATUS ValidateDeleteEligibilityLocked(
     MountContext* c,
     const std::shared_ptr<Node>& node,
@@ -1921,12 +2220,6 @@ NTSTATUS ValidateDeleteEligibilityLocked(
     if (node->is_directory && !node->children.empty())
     {
         return STATUS_DIRECTORY_NOT_EMPTY;
-    }
-
-    const std::uint32_t current_handle = (current_open && current_open->node == node) ? 1u : 0u;
-    if (node->open_handle_count > current_handle)
-    {
-        return STATUS_SHARING_VIOLATION;
     }
 
     return STATUS_SUCCESS;
@@ -2010,54 +2303,16 @@ bool EnsureDirectoryLoaded(MountContext* c, const std::shared_ptr<Node>& dir)
         }
     }
 
-    std::string output;
-    DWORD code = 0;
-    if (!RunProcessCapture(c->args.apfsutil, { L"enumfolder", dir->apfs_path }, output, code) || code != 0)
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (c->metadata_store)
     {
-        return false;
+        (void)MergeCommittedInodeStateIntoNodeIndex(c);
+        std::lock_guard<std::mutex> lock(c->mutex);
+        return dir->loaded;
     }
+#endif
 
-    std::vector<DirEntry> entries;
-    std::istringstream stream(output);
-    std::string line;
-    while (std::getline(stream, line))
-    {
-        DirEntry e{};
-        if (ParseEnumLine(line, e))
-        {
-            entries.push_back(std::move(e));
-        }
-    }
-
-    FILETIME now{}; GetSystemTimeAsFileTime(&now);
-    std::lock_guard<std::mutex> lock(c->mutex);
-    if (dir->loaded)
-    {
-        return true;
-    }
-
-    dir->children.clear();
-    dir->children.reserve(entries.size());
-    for (const auto& e : entries)
-    {
-        auto child_path = Join(dir->path, e.name);
-        auto node = TryGetNodeLocked(c, child_path);
-        if (!node)
-        {
-            node = std::make_shared<Node>();
-            c->nodes.emplace(Key(child_path), node);
-        }
-        node->path = child_path;
-        node->apfs_path = ApfsChild(dir->apfs_path, e.name);
-        node->is_directory = e.is_directory;
-        node->file_size = e.is_directory ? 0 : e.file_size;
-        node->timestamp = now;
-        dir->children.push_back(e.name);
-    }
-
-    std::sort(dir->children.begin(), dir->children.end(), [](const std::wstring& a, const std::wstring& b) { return _wcsicmp(a.c_str(), b.c_str()) < 0; });
-    dir->loaded = true;
-    return true;
+    return false;
 }
 
 std::shared_ptr<Node> FindNode(MountContext* c, const std::wstring& path)
@@ -2171,15 +2426,6 @@ bool EnsureHydrated(MountContext* c, const std::shared_ptr<Node>& n, bool allow_
         return hydrate_from_bytes(payload);
     };
 #endif
-
-    if (!n->apfs_path.empty())
-    {
-        DWORD code = 0;
-        if (RunProcessToFile(c->args.apfsutil, { L"readraw", n->apfs_path }, file, code) && code == 0)
-        {
-            return true;
-        }
-    }
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
     if (try_hydrate_from_metadata())
@@ -2752,6 +2998,7 @@ bool RecordNativeMutationBestEffort(
     request.timestamp_utc = timestamp_utc;
 
     apfsaccess::rw::MetadataStore::MutationStatus status = apfsaccess::rw::MetadataStore::MutationStatus::NotReady;
+    std::wstring failure_reason;
     {
         std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
         const auto dirty_limit = static_cast<std::size_t>(std::max(1, c->args.write_max_dirty_transactions));
@@ -2762,6 +3009,10 @@ bool RecordNativeMutationBestEffort(
         }
 
         status = c->metadata_store->StageMutation(request);
+        if (status != apfsaccess::rw::MetadataStore::MutationStatus::Applied)
+        {
+            failure_reason = c->metadata_store->LastMutationFailureReason();
+        }
     }
 
     if (status != apfsaccess::rw::MetadataStore::MutationStatus::Applied)
@@ -2788,8 +3039,12 @@ bool RecordNativeMutationBestEffort(
         std::wcerr << L"[FsHost] RW native-mutation warning: failed to apply mutation operation for path '"
             << path
             << L"' (status="
-            << status_text
-            << L")."
+            << status_text;
+        if (!failure_reason.empty())
+        {
+            std::wcerr << L", reason=" << failure_reason;
+        }
+        std::wcerr << L")."
             << std::endl;
         return false;
     }
@@ -2799,6 +3054,36 @@ bool RecordNativeMutationBestEffort(
         std::wcerr << L"[FsHost] RW native-mutation warning: failed to persist recovery marker state." << std::endl;
     }
     return true;
+}
+
+NTSTATUS BlockNativeMutationAfterStagingFailure(MountContext* c, const wchar_t* operation)
+{
+    if (!c)
+    {
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    }
+
+    c->recovery_active = true;
+    c->runtime_recovery_reason = L"NativeMutationStagingFailed";
+    c->runtime_last_recovery_action = L"DowngradedAfterMutationStagingFailure";
+    if (IsRecoveryPolicyFailClosed(c->args.write_recovery_policy))
+    {
+        c->write_degraded = true;
+        c->native_write_enabled = false;
+        c->overlay_write_enabled = false;
+    }
+
+    std::wcerr << L"[FsHost] RW mutation blocked";
+    if (operation && *operation)
+    {
+        std::wcerr << L" (" << operation << L")";
+    }
+    std::wcerr << L": native APFS metadata staging failed; live write was rejected to avoid non-persistent Explorer-only state."
+               << std::endl;
+
+    (void)UpdateRecoveryMarkerBestEffort(c, true);
+    (void)WriteHostStatusFile(*c, c->recovery_active, c->runtime_last_commit_xid);
+    return STATUS_MEDIA_WRITE_PROTECTED;
 }
 #endif
 
@@ -3051,11 +3336,41 @@ NTSTATUS CommitNativeMutationsBestEffort(MountContext* c, const wchar_t* origin)
     }
 }
 
+bool HasPendingNativeMutations(MountContext* c)
+{
+    if (!c || !c->metadata_store)
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
+    return c->metadata_store->PendingMutationCount() > 0;
+}
+
+NTSTATUS CommitNativeMutationsOnFlushBestEffort(MountContext* c)
+{
+    if (!c || !IsNativeWriteEnabled(c) || !c->metadata_store)
+    {
+        return STATUS_SUCCESS;
+    }
+
+    if (!HasPendingNativeMutations(c))
+    {
+        return STATUS_SUCCESS;
+    }
+
+    return CommitNativeMutationsBestEffort(c, L"Flush");
+}
+
 void FinalizeMutationJournalBestEffort(MountContext* c, const wchar_t* origin)
 {
     if (!CommitMutationJournalBestEffort(c))
     {
         std::wcerr << L"[FsHost] RW journal warning: failed to finalize transaction journal during " << origin << L"." << std::endl;
+    }
+    if (c)
+    {
+        (void)WriteHostStatusFile(*c, c->recovery_active, c->runtime_last_commit_xid);
     }
 }
 #endif
@@ -3148,13 +3463,13 @@ bool EnsureParentDirectoryLoaded(MountContext* c, const std::wstring& path)
     return EnsureDirectoryLoaded(c, parent);
 }
 
-bool CanRemoveNodeRecursiveLocked(MountContext* c, const std::shared_ptr<Node>& node)
+bool CanRemoveNodeRecursiveLocked(MountContext* c, const std::shared_ptr<Node>& node, bool allow_open_file_node = false)
 {
     if (!c || !node)
     {
         return false;
     }
-    if (node->open_handle_count != 0)
+    if (node->open_handle_count != 0 && !(allow_open_file_node && !node->is_directory))
     {
         return false;
     }
@@ -3165,7 +3480,7 @@ bool CanRemoveNodeRecursiveLocked(MountContext* c, const std::shared_ptr<Node>& 
     for (const auto& child_name : node->children)
     {
         auto child = TryGetNodeLocked(c, Join(node->path, child_name));
-        if (child && !CanRemoveNodeRecursiveLocked(c, child))
+        if (child && !CanRemoveNodeRecursiveLocked(c, child, false))
         {
             return false;
         }
@@ -3181,6 +3496,10 @@ bool HasRenameOpenHandleConflictLocked(
     if (!c || !source)
     {
         return true;
+    }
+    if (!source->is_directory)
+    {
+        return false;
     }
 
     for (const auto& [_, candidate] : c->nodes)
@@ -3208,13 +3527,13 @@ bool HasRenameOpenHandleConflictLocked(
     return false;
 }
 
-bool RemoveNodeRecursiveLocked(MountContext* c, const std::shared_ptr<Node>& node)
+bool RemoveNodeRecursiveLocked(MountContext* c, const std::shared_ptr<Node>& node, bool allow_open_file_node = false)
 {
     if (!c || !node)
     {
         return false;
     }
-    if (!CanRemoveNodeRecursiveLocked(c, node))
+    if (!CanRemoveNodeRecursiveLocked(c, node, allow_open_file_node))
     {
         return false;
     }
@@ -3225,7 +3544,7 @@ bool RemoveNodeRecursiveLocked(MountContext* c, const std::shared_ptr<Node>& nod
             auto child = TryGetNodeLocked(c, Join(node->path, child_name));
             if (child)
             {
-                RemoveNodeRecursiveLocked(c, child);
+                RemoveNodeRecursiveLocked(c, child, false);
             }
         }
     }
@@ -3289,13 +3608,83 @@ void ReindexNodePathsLocked(MountContext* c, const std::shared_ptr<Node>& node, 
 
 MountContext* Ctx(FSP_FILE_SYSTEM* fs) { return fs ? (MountContext*)fs->UserContext : nullptr; }
 
+std::wstring BuildExplorerVolumeLabel(const std::wstring& volume)
+{
+    auto label = volume.empty() ? std::wstring(L"APFS") : volume;
+    if (label.size() > 31)
+    {
+        label.resize(31);
+    }
+    return label;
+}
+
+std::uint64_t AlignDownToAllocationUnit(std::uint64_t value, std::uint64_t allocation_unit)
+{
+    if (allocation_unit <= 1 || value == 0)
+    {
+        return value;
+    }
+    return value - (value % allocation_unit);
+}
+
 NTSTATUS CB_GetVolumeInfo(FSP_FILE_SYSTEM* fs, FSP_FSCTL_VOLUME_INFO* v)
 {
     auto* c = Ctx(fs);
     if (!c || !v) return STATUS_INVALID_PARAMETER;
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    RefreshReportedVolumeInfoFromMetadata(*c);
+#endif
     std::memset(v, 0, sizeof(*v));
-    v->TotalSize = 1ull << 40;
-    v->FreeSize = IsMutationWriteEnabled(c) ? (1ull << 39) : 0;
+    std::optional<std::uint64_t> total_size = c->reported_total_size_bytes;
+    std::optional<std::uint64_t> free_size = c->reported_free_size_bytes;
+    std::uint64_t allocation_unit = c->reported_allocation_unit_bytes != 0
+        ? c->reported_allocation_unit_bytes
+        : 4096;
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    {
+        std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
+        if (c->metadata_store)
+        {
+            if (const auto block_size = c->metadata_store->BlockSizeBytes();
+                block_size.has_value() && block_size.value() != 0)
+            {
+                allocation_unit = block_size.value();
+            }
+            if (const auto metadata_total_size = c->metadata_store->TotalSizeBytes();
+                metadata_total_size.has_value())
+            {
+                total_size = metadata_total_size;
+            }
+            if (const auto metadata_free_size = c->metadata_store->FreeSizeBytes();
+                metadata_free_size.has_value() && metadata_free_size.value() > 0)
+            {
+                free_size = metadata_free_size;
+            }
+        }
+    }
+#endif
+
+    if (total_size.has_value())
+    {
+        total_size = AlignDownToAllocationUnit(total_size.value(), allocation_unit);
+    }
+    if (free_size.has_value())
+    {
+        free_size = AlignDownToAllocationUnit(free_size.value(), allocation_unit);
+    }
+    if (total_size.has_value() && free_size.has_value() && free_size.value() > total_size.value())
+    {
+        free_size = total_size;
+    }
+    if (total_size.has_value() && (!free_size.has_value() || free_size.value() == 0))
+    {
+        // Prefer a usable Explorer capacity bar over reporting an unknown/zero
+        // free space while the richer APFS spaceman state is still unavailable.
+        free_size = total_size;
+    }
+
+    v->TotalSize = total_size.value_or(0);
+    v->FreeSize = free_size.value_or(0);
     auto label = c->label.substr(0, 31);
     v->VolumeLabelLength = (UINT16)(label.size() * sizeof(WCHAR));
     if (!label.empty()) std::memcpy(v->VolumeLabel, label.data(), label.size() * sizeof(WCHAR));
@@ -3445,7 +3834,7 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
         o->file = CreateFileW(
             hydrated.wstring().c_str(),
             desired_access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ResolveHydrationShareMode(IsMutationWriteEnabled(c), granted_access, o->write_open),
             nullptr,
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL,
@@ -3459,6 +3848,30 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
             return STATUS_UNSUCCESSFUL;
         }
     }
+
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (IsNativeWriteEnabled(c) &&
+        !RecordNativeMutationBestEffort(
+            c,
+            request_directory
+                ? apfsaccess::rw::MetadataStore::MutationOperation::CreateDirectory
+                : apfsaccess::rw::MetadataStore::MutationOperation::CreateFile,
+            path))
+    {
+        if (!node->is_directory && o->file != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(o->file);
+            o->file = INVALID_HANDLE_VALUE;
+        }
+        delete o;
+        std::lock_guard<std::mutex> lock(c->mutex);
+        RemoveChildName(parent_node->children, name);
+        std::error_code ec;
+        std::filesystem::remove(HydrationPath(c, *node), ec);
+        c->nodes.erase(Key(path));
+        return BlockNativeMutationAfterStagingFailure(c, L"Create");
+    }
+#endif
 
     {
         std::lock_guard<std::mutex> lock(c->mutex);
@@ -3477,12 +3890,6 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
         request_directory
             ? apfsaccess::rw::TransactionManager::MutationKind::CreateDirectory
             : apfsaccess::rw::TransactionManager::MutationKind::CreateFile,
-        path);
-    (void)RecordNativeMutationBestEffort(
-        c,
-        request_directory
-            ? apfsaccess::rw::MetadataStore::MutationOperation::CreateDirectory
-            : apfsaccess::rw::MetadataStore::MutationOperation::CreateFile,
         path);
 #endif
     return STATUS_SUCCESS;
@@ -3515,10 +3922,30 @@ NTSTATUS CB_Overwrite(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, BOOLEAN, UINT64 al
         return STATUS_ACCESS_DENIED;
     }
 
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (IsNativeWriteEnabled(c) &&
+        !RecordNativeMutationBestEffort(
+            c,
+            apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize,
+            o->node->path,
+            L"",
+            0,
+            allocation_size))
+    {
+        return BlockNativeMutationAfterStagingFailure(c, L"Overwrite");
+    }
+#endif
+
     LARGE_INTEGER target{};
     target.QuadPart = allocation_size;
     if (!SetFilePointerEx(o->file, target, nullptr, FILE_BEGIN) || !SetEndOfFile(o->file))
     {
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        if (IsNativeWriteEnabled(c))
+        {
+            (void)BlockNativeMutationAfterStagingFailure(c, L"Overwrite");
+        }
+#endif
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -3532,13 +3959,6 @@ NTSTATUS CB_Overwrite(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, BOOLEAN, UINT64 al
     RecordMutationBestEffort(
         c,
         apfsaccess::rw::TransactionManager::MutationKind::SetFileSize,
-        o->node->path,
-        L"",
-        0,
-        allocation_size);
-    (void)RecordNativeMutationBestEffort(
-        c,
-        apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize,
         o->node->path,
         L"",
         0,
@@ -3601,6 +4021,21 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
         write_len = (ULONG)(current_size - off);
     }
 
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (IsNativeWriteEnabled(c) &&
+        !RecordNativeMutationBestEffort(
+            c,
+            apfsaccess::rw::MetadataStore::MutationOperation::Write,
+            o->node->path,
+            L"",
+            off,
+            write_len))
+    {
+        *done = 0;
+        return BlockNativeMutationAfterStagingFailure(c, L"Write");
+    }
+#endif
+
     OVERLAPPED ov{};
     ov.Offset = (DWORD)(off & 0xffffffffull);
     ov.OffsetHigh = (DWORD)(off >> 32);
@@ -3608,6 +4043,12 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
     if (!WriteFile(o->file, buf, write_len, &written, &ov))
     {
         *done = 0;
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        if (IsNativeWriteEnabled(c))
+        {
+            (void)BlockNativeMutationAfterStagingFailure(c, L"Write");
+        }
+#endif
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -3626,13 +4067,6 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
     RecordMutationBestEffort(
         c,
         apfsaccess::rw::TransactionManager::MutationKind::Write,
-        o->node->path,
-        L"",
-        off,
-        written);
-    (void)RecordNativeMutationBestEffort(
-        c,
-        apfsaccess::rw::MetadataStore::MutationOperation::Write,
         o->node->path,
         L"",
         off,
@@ -3688,6 +4122,22 @@ NTSTATUS CB_SetBasicInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, UINT64 creation
         stamp.HighPart = now.dwHighDateTime;
     }
 
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (IsNativeWriteEnabled(c) &&
+        !RecordNativeMutationBestEffort(
+            c,
+            apfsaccess::rw::MetadataStore::MutationOperation::SetBasicInfo,
+            o->node->path,
+            L"",
+            0,
+            0,
+            false,
+            stamp.QuadPart))
+    {
+        return BlockNativeMutationAfterStagingFailure(c, L"SetBasicInfo");
+    }
+#endif
+
     {
         std::lock_guard<std::mutex> lock(c->mutex);
         o->node->timestamp.dwLowDateTime = stamp.LowPart;
@@ -3699,15 +4149,12 @@ NTSTATUS CB_SetBasicInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, UINT64 creation
         c,
         apfsaccess::rw::TransactionManager::MutationKind::SetBasicInfo,
         o->node->path);
-    (void)RecordNativeMutationBestEffort(
-        c,
-        apfsaccess::rw::MetadataStore::MutationOperation::SetBasicInfo,
-        o->node->path,
-        L"",
-        0,
-        0,
-        false,
-        stamp.QuadPart);
+    const auto native_commit_status = CommitNativeMutationsBestEffort(c, L"SetBasicInfo");
+    if (!NT_SUCCESS(native_commit_status))
+    {
+        return native_commit_status;
+    }
+    FinalizeMutationJournalBestEffort(c, L"SetBasicInfo");
 #endif
     return STATUS_SUCCESS;
 }
@@ -3739,10 +4186,30 @@ NTSTATUS CB_SetFileSize(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT64 size, BOOLEAN, FS
         return STATUS_UNSUCCESSFUL;
     }
 
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (IsNativeWriteEnabled(c) &&
+        !RecordNativeMutationBestEffort(
+            c,
+            apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize,
+            o->node->path,
+            L"",
+            0,
+            size))
+    {
+        return BlockNativeMutationAfterStagingFailure(c, L"SetFileSize");
+    }
+#endif
+
     LARGE_INTEGER target{};
     target.QuadPart = size;
     if (!SetFilePointerEx(o->file, target, nullptr, FILE_BEGIN) || !SetEndOfFile(o->file))
     {
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        if (IsNativeWriteEnabled(c))
+        {
+            (void)BlockNativeMutationAfterStagingFailure(c, L"SetFileSize");
+        }
+#endif
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -3760,13 +4227,12 @@ NTSTATUS CB_SetFileSize(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT64 size, BOOLEAN, FS
         L"",
         0,
         size);
-    (void)RecordNativeMutationBestEffort(
-        c,
-        apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize,
-        o->node->path,
-        L"",
-        0,
-        size);
+    const auto native_commit_status = CommitNativeMutationsBestEffort(c, L"SetFileSize");
+    if (!NT_SUCCESS(native_commit_status))
+    {
+        return native_commit_status;
+    }
+    FinalizeMutationJournalBestEffort(c, L"SetFileSize");
 #endif
     return STATUS_SUCCESS;
 }
@@ -3931,7 +4397,7 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
     }
 
     auto old_path = NormalizePath(old_name);
-    auto new_path = NormalizePath(new_name);
+    auto new_path = NormalizeRenameTargetPath(old_path, new_name);
     if (old_path == L"\\" || new_path == L"\\")
     {
         return STATUS_ACCESS_DENIED;
@@ -4012,152 +4478,169 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
     auto old_leaf = old_path.substr(old_path.find_last_of(L'\\') + 1);
     auto new_leaf = new_path.substr(new_path.find_last_of(L'\\') + 1);
 
-    std::lock_guard<std::mutex> lock(c->mutex);
-    auto node = TryGetNodeLocked(c, old_path);
-    if (!node)
     {
-        node = current_open ? current_open->node : nullptr;
-    }
-    if (!node)
-    {
-        return STATUS_OBJECT_NAME_NOT_FOUND;
-    }
-    if (Key(node->path) != Key(old_path))
-    {
-        // Prevent stale source-handle fallback from renaming an unrelated node.
-        return STATUS_OBJECT_NAME_NOT_FOUND;
-    }
-    const bool has_open_context = current_open && current_open->node;
-    const bool context_is_source = has_open_context && current_open->node == node;
-    const bool context_is_old_parent =
-        has_open_context &&
-        current_open->node->is_directory &&
-        Key(current_open->node->path) == Key(old_parent_path);
-    const bool context_is_new_parent =
-        has_open_context &&
-        current_open->node->is_directory &&
-        Key(current_open->node->path) == Key(new_parent_path);
+        std::lock_guard<std::mutex> lock(c->mutex);
+        auto node = TryGetNodeLocked(c, old_path);
+        if (!node)
+        {
+            node = current_open ? current_open->node : nullptr;
+        }
+        if (!node)
+        {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        if (Key(node->path) != Key(old_path))
+        {
+            // Prevent stale source-handle fallback from renaming an unrelated node.
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        const bool has_open_context = current_open && current_open->node;
+        const bool context_is_source = has_open_context && current_open->node == node;
+        const bool context_is_old_parent =
+            has_open_context &&
+            current_open->node->is_directory &&
+            Key(current_open->node->path) == Key(old_parent_path);
+        const bool context_is_new_parent =
+            has_open_context &&
+            current_open->node->is_directory &&
+            Key(current_open->node->path) == Key(new_parent_path);
 
-    if (has_open_context &&
-        !context_is_source &&
-        !context_is_old_parent &&
-        !context_is_new_parent)
-    {
-        return STATUS_INVALID_PARAMETER;
-    }
+        if (has_open_context &&
+            !context_is_source &&
+            !context_is_old_parent &&
+            !context_is_new_parent)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
 
-    if (context_is_source)
-    {
-        if (!current_open->allow_delete)
+        if (context_is_source)
         {
-            return STATUS_ACCESS_DENIED;
-        }
-        if (Key(old_parent_path) != Key(new_parent_path))
-        {
-            return STATUS_ACCESS_DENIED;
-        }
-    }
-    else if (context_is_old_parent)
-    {
-        if (!current_open->allow_delete_child)
-        {
-            return STATUS_ACCESS_DENIED;
-        }
-        if (!context_is_new_parent)
-        {
-            return STATUS_ACCESS_DENIED;
-        }
-        if (!HasDirectoryInsertPermission(current_open, node->is_directory))
-        {
-            return STATUS_ACCESS_DENIED;
-        }
-    }
-    else if (context_is_new_parent)
-    {
-        if (!HasDirectoryInsertPermission(current_open, node->is_directory))
-        {
-            return STATUS_ACCESS_DENIED;
-        }
-        if (replace_if_exists && !current_open->allow_delete_child)
-        {
-            return STATUS_ACCESS_DENIED;
-        }
-    }
-    if (IsDeleteBlockedStateLocked(node))
-    {
-        return STATUS_DELETE_PENDING;
-    }
-    if (node->path == L"\\")
-    {
-        return STATUS_ACCESS_DENIED;
-    }
-    if (node->is_directory &&
-        (Key(new_parent_path) == Key(old_path) || IsDescendantPath(new_parent_path, old_path)))
-    {
-        return STATUS_ACCESS_DENIED;
-    }
-    if (HasRenameOpenHandleConflictLocked(c, node, current_open))
-    {
-        return STATUS_SHARING_VIOLATION;
-    }
-
-    auto old_parent = TryGetNodeLocked(c, old_parent_path);
-    auto new_parent = TryGetNodeLocked(c, new_parent_path);
-    if (!old_parent || !new_parent || !old_parent->is_directory || !new_parent->is_directory)
-    {
-        return STATUS_OBJECT_PATH_NOT_FOUND;
-    }
-    if (IsDeleteBlockedStateLocked(old_parent) || IsDeleteBlockedStateLocked(new_parent))
-    {
-        return STATUS_DELETE_PENDING;
-    }
-
-    auto existing = TryGetNodeLocked(c, new_path);
-    if (existing && existing != node)
-    {
-        if (has_open_context)
-        {
-            const bool can_replace_with_context =
-                context_is_new_parent &&
-                current_open->allow_delete_child &&
-                IsDirectChildPath(current_open->node->path, new_path);
-            if (!can_replace_with_context)
+            if (!current_open->allow_delete)
             {
                 return STATUS_ACCESS_DENIED;
             }
         }
-        if (IsDeleteBlockedStateLocked(existing))
+        else if (context_is_old_parent)
+        {
+            if (!current_open->allow_delete_child)
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+            if (!context_is_new_parent)
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+            if (!HasDirectoryInsertPermission(current_open, node->is_directory))
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+        }
+        else if (context_is_new_parent)
+        {
+            if (!HasDirectoryInsertPermission(current_open, node->is_directory))
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+            if (replace_if_exists && !current_open->allow_delete_child)
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+        }
+        if (IsDeleteBlockedStateLocked(node))
         {
             return STATUS_DELETE_PENDING;
         }
-        if (!replace_if_exists)
-        {
-            return STATUS_OBJECT_NAME_COLLISION;
-        }
-        if (existing->is_directory != node->is_directory)
+        if (node->path == L"\\")
         {
             return STATUS_ACCESS_DENIED;
         }
-        if (existing->is_directory && !existing->loaded)
+        if (node->is_directory &&
+            (Key(new_parent_path) == Key(old_path) || IsDescendantPath(new_parent_path, old_path)))
         {
-            return STATUS_UNSUCCESSFUL;
+            return STATUS_ACCESS_DENIED;
         }
-        if (existing->is_directory && !existing->children.empty())
-        {
-            return STATUS_DIRECTORY_NOT_EMPTY;
-        }
-        if (!CanRemoveNodeRecursiveLocked(c, existing))
+        if (HasRenameOpenHandleConflictLocked(c, node, current_open))
         {
             return STATUS_SHARING_VIOLATION;
         }
-        RemoveNodeRecursiveLocked(c, existing);
-        RemoveChildName(new_parent->children, new_leaf);
-    }
 
-    RemoveChildName(old_parent->children, old_leaf);
-    AddChildName(new_parent->children, new_leaf);
-    ReindexNodePathsLocked(c, node, old_path, new_path);
-    node->timestamp = UtcNow();
+        auto old_parent = TryGetNodeLocked(c, old_parent_path);
+        auto new_parent = TryGetNodeLocked(c, new_parent_path);
+        if (!old_parent || !new_parent || !old_parent->is_directory || !new_parent->is_directory)
+        {
+            return STATUS_OBJECT_PATH_NOT_FOUND;
+        }
+        if (IsDeleteBlockedStateLocked(old_parent) || IsDeleteBlockedStateLocked(new_parent))
+        {
+            return STATUS_DELETE_PENDING;
+        }
+
+        auto existing = TryGetNodeLocked(c, new_path);
+        if (existing && existing != node)
+        {
+            if (has_open_context)
+            {
+                const bool can_replace_with_context =
+                    context_is_new_parent &&
+                    current_open->allow_delete_child &&
+                    IsDirectChildPath(current_open->node->path, new_path);
+                if (!can_replace_with_context)
+                {
+                    return STATUS_ACCESS_DENIED;
+                }
+            }
+            if (IsDeleteBlockedStateLocked(existing))
+            {
+                return STATUS_DELETE_PENDING;
+            }
+            if (!replace_if_exists)
+            {
+                return STATUS_OBJECT_NAME_COLLISION;
+            }
+            if (existing->is_directory != node->is_directory)
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+            if (existing->is_directory && !existing->loaded)
+            {
+                return STATUS_UNSUCCESSFUL;
+            }
+            if (existing->is_directory && !existing->children.empty())
+            {
+                return STATUS_DIRECTORY_NOT_EMPTY;
+            }
+            if (existing->is_directory && !CanRemoveNodeRecursiveLocked(c, existing))
+            {
+                return STATUS_SHARING_VIOLATION;
+            }
+        }
+
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        if (IsNativeWriteEnabled(c) &&
+            !RecordNativeMutationBestEffort(
+                c,
+                apfsaccess::rw::MetadataStore::MutationOperation::Rename,
+                old_path,
+                new_path,
+                0,
+                0,
+                replace_if_exists != FALSE))
+        {
+            return BlockNativeMutationAfterStagingFailure(c, L"Rename");
+        }
+#endif
+
+        if (existing && existing != node)
+        {
+            RemoveNodeRecursiveLocked(c, existing);
+            RemoveChildName(new_parent->children, new_leaf);
+        }
+
+        RemoveChildName(old_parent->children, old_leaf);
+        AddChildName(new_parent->children, new_leaf);
+        ReindexNodePathsLocked(c, node, old_path, new_path);
+        node->timestamp = UtcNow();
+    }
 #ifdef APFSACCESS_HAS_RW_ENGINE
     RecordMutationBestEffort(
         c,
@@ -4167,14 +4650,12 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
         0,
         0,
         replace_if_exists != FALSE);
-    (void)RecordNativeMutationBestEffort(
-        c,
-        apfsaccess::rw::MetadataStore::MutationOperation::Rename,
-        old_path,
-        new_path,
-        0,
-        0,
-        replace_if_exists != FALSE);
+    const auto native_commit_status = CommitNativeMutationsBestEffort(c, L"Rename");
+    if (!NT_SUCCESS(native_commit_status))
+    {
+        return native_commit_status;
+    }
+    FinalizeMutationJournalBestEffort(c, L"Rename");
 #endif
     return STATUS_SUCCESS;
 }
@@ -4193,11 +4674,15 @@ NTSTATUS CB_SetSecurity(FSP_FILE_SYSTEM* fs, PVOID, SECURITY_INFORMATION, PSECUR
         return STATUS_VOLUME_DISMOUNTED;
     }
 
-    if (IsMutationWriteEnabled(c))
+    if (!IsMutationWriteEnabled(c))
     {
-        return STATUS_NOT_SUPPORTED;
+        return HandleMutationWriteDisabled(c, L"SetSecurity");
     }
-    return HandleMutationWriteDisabled(c, L"SetSecurity");
+
+    // APFS Access does not persist Windows ACLs into APFS metadata. Treat ACL
+    // writes as a supported no-op so common shell/Office workflows do not fall
+    // back to read-only behavior after copying files onto the mount.
+    return STATUS_SUCCESS;
 }
 
 VOID CB_Cleanup(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, ULONG flags)
@@ -4209,6 +4694,17 @@ VOID CB_Cleanup(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, ULONG flags)
         return;
     }
     MutationCallbackScope mutation_scope(c);
+
+    if (o->file != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(o->file);
+        o->file = INVALID_HANDLE_VALUE;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        ReleaseOpenContextAccountingLocked(c, o);
+    }
 
     if ((flags & FspCleanupDelete) != 0 && IsMutationWriteEnabled(c))
     {
@@ -4239,8 +4735,15 @@ VOID CB_Cleanup(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, ULONG flags)
             auto node = TryGetNodeLocked(c, path);
             if (node)
             {
-                const auto status = ValidateDeleteEligibilityLocked(c, node, o);
-                if (!NT_SUCCESS(status))
+                if (IsDeleteBlockedStateLocked(node) && !o->delete_on_cleanup)
+                {
+                    return;
+                }
+                if (node->path == L"\\")
+                {
+                    return;
+                }
+                if (node->is_directory && !node->children.empty())
                 {
                     return;
                 }
@@ -4271,6 +4774,7 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
     if (c && o->node)
     {
         std::lock_guard<std::mutex> lock(c->mutex);
+        const bool remove_requested_on_close = o->delete_on_cleanup || o->node->delete_latched;
         if (o->delete_on_cleanup)
         {
             had_delete_on_cleanup = true;
@@ -4280,20 +4784,33 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
             }
             o->delete_on_cleanup = false;
         }
-        if (o->node->open_handle_count > 0)
-        {
-            --o->node->open_handle_count;
-        }
-        if (o->write_open && o->node->write_handle_count > 0)
-        {
-            --o->node->write_handle_count;
-        }
+        ReleaseOpenContextAccountingLocked(c, o);
         RefreshDeletePendingStateLocked(c, o->node);
 
-        if (IsDeleteBlockedStateLocked(o->node) && o->node->open_handle_count == 0 && o->node->path != L"\\" &&
-            CanRemoveNodeRecursiveLocked(c, o->node))
+        const bool can_remove_now = o->node->path != L"\\" &&
+            CanRemoveNodeRecursiveLocked(c, o->node);
+        if (remove_requested_on_close && can_remove_now)
         {
             deleted_path = o->node->path;
+#ifdef APFSACCESS_HAS_RW_ENGINE
+            bool native_delete_staged = true;
+            if (IsNativeWriteEnabled(c))
+            {
+                native_delete_staged = RecordNativeMutationBestEffort(
+                    c,
+                    apfsaccess::rw::MetadataStore::MutationOperation::Delete,
+                    deleted_path);
+            }
+            if (!native_delete_staged)
+            {
+                (void)BlockNativeMutationAfterStagingFailure(c, L"Delete");
+                o->node->delete_latched = false;
+                o->node->delete_pending = false;
+                RefreshDeletePendingStateLocked(c, o->node);
+            }
+            else
+#endif
+            {
             auto parent_path = Parent(deleted_path);
             auto leaf = deleted_path.substr(deleted_path.find_last_of(L'\\') + 1);
             auto parent = TryGetNodeLocked(c, parent_path);
@@ -4302,6 +4819,13 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
                 RemoveChildName(parent->children, leaf);
             }
             emit_delete_mutation = RemoveNodeRecursiveLocked(c, o->node);
+            if (emit_delete_mutation)
+            {
+                o->node->delete_latched = false;
+                o->node->delete_pending = false;
+                o->node->delete_intent_count = 0;
+            }
+            }
         }
     }
 
@@ -4312,13 +4836,9 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
             c,
             apfsaccess::rw::TransactionManager::MutationKind::Delete,
             deleted_path);
-        (void)RecordNativeMutationBestEffort(
-            c,
-            apfsaccess::rw::MetadataStore::MutationOperation::Delete,
-            deleted_path);
     }
 
-    if (c && IsMutationWriteEnabled(c) && (o->write_open || had_delete_on_cleanup || emit_delete_mutation))
+    if (c && IsMutationWriteEnabled(c) && emit_delete_mutation)
     {
         const auto close_commit_status = CommitNativeMutationsBestEffort(c, L"Close");
         if (!NT_SUCCESS(close_commit_status))
@@ -4423,15 +4943,6 @@ NTSTATUS CB_Flush(FSP_FILE_SYSTEM* fs, PVOID ctx, FSP_FSCTL_FILE_INFO* info)
         }
     }
 
-#ifdef APFSACCESS_HAS_RW_ENGINE
-    const auto native_commit_status = CommitNativeMutationsBestEffort(c, L"Flush");
-    if (!NT_SUCCESS(native_commit_status))
-    {
-        return native_commit_status;
-    }
-    FinalizeMutationJournalBestEffort(c, L"Flush");
-#endif
-
     FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
     return STATUS_SUCCESS;
 }
@@ -4454,18 +4965,7 @@ NTSTATUS CB_GetSecurityByName(FSP_FILE_SYSTEM* fs, PWSTR file_name, PUINT32 attr
     }
     if (attrs)
     {
-        if (n->is_directory)
-        {
-            *attrs = FILE_ATTRIBUTE_DIRECTORY;
-        }
-        else
-        {
-            *attrs = FILE_ATTRIBUTE_ARCHIVE;
-            if (!IsMutationWriteEnabled(c))
-            {
-                *attrs |= FILE_ATTRIBUTE_READONLY;
-            }
-        }
+        *attrs = BuildFileAttributes(*n, !IsMutationWriteEnabled(c));
     }
     if (!sd || *sz < c->sd_size) { *sz = c->sd_size; return STATUS_BUFFER_OVERFLOW; }
     std::memcpy(sd, c->sd, c->sd_size);
@@ -4559,7 +5059,7 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
             o->file = CreateFileW(
                 pth.wstring().c_str(),
                 desired_access,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ResolveHydrationShareMode(mutation_enabled, granted_access, o->write_open),
                 nullptr,
                 OPEN_EXISTING,
                 FILE_ATTRIBUTE_NORMAL,
@@ -4636,38 +5136,40 @@ NTSTATUS CB_ReadDirectory(FSP_FILE_SYSTEM* fs, PVOID dir_ctx, PWSTR, PWSTR marke
         return STATUS_NO_SUCH_FILE;
     }
 
-    std::vector<std::wstring> names;
+    struct DirectoryEntrySnapshot
+    {
+        std::wstring name;
+        std::shared_ptr<Node> node;
+    };
+
+    std::vector<DirectoryEntrySnapshot> entries;
     {
         std::lock_guard<std::mutex> lock(c->mutex);
-        names = o->node->children;
+        entries.reserve(o->node->children.size());
+        for (const auto& name : o->node->children)
+        {
+            auto child = TryGetNodeLocked(c, Join(o->node->path, name));
+            if (child)
+            {
+                entries.push_back({ name, child });
+            }
+        }
     }
 
     auto mk = marker ? std::wstring(marker) : std::wstring();
-    for (const auto& name : names)
+    const auto read_only = !IsMutationWriteEnabled(c);
+    for (const auto& entry : entries)
     {
-        if (!mk.empty() && _wcsicmp(name.c_str(), mk.c_str()) <= 0)
+        if (!mk.empty() && _wcsicmp(entry.name.c_str(), mk.c_str()) <= 0)
         {
             continue;
         }
-        auto child = FindNode(c, Join(o->node->path, name));
-        if (!child)
+        auto tmp = BuildDirectoryInfoBuffer(*entry.node, entry.name, read_only);
+        if (tmp.empty())
         {
             continue;
         }
-        auto name_bytes = (ULONG)(name.size() * sizeof(WCHAR));
-        auto sz = sizeof(FSP_FSCTL_DIR_INFO) + (size_t)name_bytes;
-        if (sz > (size_t)std::numeric_limits<UINT16>::max())
-        {
-            continue;
-        }
-        std::vector<unsigned char> tmp(sz, 0);
         auto* d = (FSP_FSCTL_DIR_INFO*)tmp.data();
-        d->Size = (UINT16)sz;
-        FillInfo(*child, !IsMutationWriteEnabled(c), &d->FileInfo);
-        if (name_bytes > 0)
-        {
-            std::memcpy(d->FileNameBuf, name.data(), name_bytes);
-        }
         if (!c->api.AddDir(d, buffer, length, done))
         {
             return STATUS_SUCCESS;
@@ -4687,7 +5189,7 @@ bool ParseArgs(int argc, wchar_t** argv, Arguments& a)
         else if (IsOption(arg, L"--mount")) a.mount = NextArgValue(i, argc, argv);
         else if (IsOption(arg, L"--lifetime-file")) a.lifetime_file = NextArgValue(i, argc, argv);
         else if (IsOption(arg, L"--status-file")) a.status_file = NextArgValue(i, argc, argv);
-        else if (IsOption(arg, L"--apfsutil")) a.apfsutil = NextArgValue(i, argc, argv);
+        else if (IsOption(arg, L"--device-offset")) { try { a.device_offset_bytes = static_cast<std::uint64_t>(std::stoull(NextArgValue(i, argc, argv))); } catch (...) { return false; } }
         else if (IsOption(arg, L"--readonly")) a.readonly = true;
         else if (IsOption(arg, L"--readwrite")) a.readwrite = true;
         else if (IsOption(arg, L"--write-safety-level")) a.write_safety_level = NextArgValue(i, argc, argv);
@@ -4714,15 +5216,155 @@ bool ParseArgs(int argc, wchar_t** argv, Arguments& a)
         else if (IsOption(arg, L"--validation-last-profile-id")) a.validation_last_profile_id = NextArgValue(i, argc, argv);
         else if (IsOption(arg, L"--allow-raw-physical-write")) a.allow_raw_physical_write = true;
     }
-    if (a.apfsutil.empty()) { auto* p = _wgetenv(L"APFSUTIL_PATH"); if (p) a.apfsutil = p; }
     if (!a.mount.empty() && a.mount.size() >= 2 && a.mount[1] == L':') a.mount = std::wstring(1, (wchar_t)towupper(a.mount[0])) + L":";
     bool has_mode = a.readonly || a.readwrite;
     return !a.device.empty() && !a.volume.empty() && !a.mount.empty() && has_mode && !(a.readonly && a.readwrite);
 }
 
+bool IsDriveLetterMountPoint(const std::wstring& mount)
+{
+    return mount.size() == 2 &&
+           mount[1] == L':' &&
+           std::iswalpha(mount[0]) != 0;
+}
+
+std::wstring BuildWinFspMountPoint(const std::wstring& mount)
+{
+    if (IsDriveLetterMountPoint(mount))
+    {
+        // A plain "X:" mount created by an elevated process is local to that
+        // elevated logon namespace. Use Mount Manager syntax so normal Explorer
+        // windows see the drive under This PC.
+        return L"\\\\.\\" + std::wstring(1, static_cast<wchar_t>(std::towupper(mount[0]))) + L":";
+    }
+
+    return mount;
+}
+
+void NotifyShellDriveAdded(const std::wstring& mount)
+{
+    if (!IsDriveLetterMountPoint(mount))
+    {
+        return;
+    }
+
+    const auto letter_index = static_cast<unsigned int>(std::towupper(mount[0]) - L'A');
+    if (letter_index >= 26)
+    {
+        return;
+    }
+
+    const ULONG_PTR drive_mask = static_cast<ULONG_PTR>(1) << letter_index;
+    const std::wstring root_path = std::wstring(1, static_cast<wchar_t>(std::towupper(mount[0]))) + L":\\";
+    SHChangeNotify(SHCNE_DRIVEADD, SHCNF_DWORD, reinterpret_cast<LPCVOID>(drive_mask), nullptr);
+    SHChangeNotify(SHCNE_DRIVEADDGUI, SHCNF_DWORD, reinterpret_cast<LPCVOID>(drive_mask), nullptr);
+    SHChangeNotify(SHCNE_MEDIAINSERTED, SHCNF_DWORD, reinterpret_cast<LPCVOID>(drive_mask), nullptr);
+    SHChangeNotify(SHCNE_FREESPACE, SHCNF_DWORD, reinterpret_cast<LPCVOID>(drive_mask), nullptr);
+    SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, root_path.c_str(), nullptr);
+    SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSH, root_path.c_str(), nullptr);
+    SHChangeNotify(SHCNE_FREESPACE, SHCNF_DWORD | SHCNF_FLUSH, reinterpret_cast<LPCVOID>(drive_mask), nullptr);
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+    SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSH, L"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", nullptr);
+}
+
+#ifdef APFSACCESS_HAS_RW_ENGINE
+std::optional<std::uint64_t> ResolveCleanRecoveryCheckpointXid(
+    std::optional<std::uint64_t> committed_xid,
+    std::optional<std::uint64_t> checkpoint_xid)
+{
+    if (committed_xid.has_value() && checkpoint_xid.has_value())
+    {
+        return std::max(committed_xid.value(), checkpoint_xid.value());
+    }
+
+    if (committed_xid.has_value())
+    {
+        return committed_xid;
+    }
+
+    return checkpoint_xid;
+}
+
+std::optional<std::uint64_t> ResolveCleanRecoveryCheckpointXid(
+    const apfsaccess::rw::MetadataStore& metadata_store)
+{
+    return ResolveCleanRecoveryCheckpointXid(
+        metadata_store.LastCommittedXid(),
+        metadata_store.CheckpointXid());
+}
+
+void ClearRecoveredMarkerIfClean(MountContext& ctx, const std::wstring& action)
+{
+    if (!ctx.pending_native_writes || !ctx.metadata_store)
+    {
+        return;
+    }
+
+    if (ctx.metadata_store->IsRecoveryRequired())
+    {
+        return;
+    }
+
+    auto committed_xid = ResolveCleanRecoveryCheckpointXid(*ctx.metadata_store);
+    if (!committed_xid.has_value())
+    {
+        return;
+    }
+
+    if (ctx.runtime_last_commit_xid.has_value() &&
+        ctx.runtime_last_commit_xid.value() > committed_xid.value())
+    {
+        return;
+    }
+
+    ctx.pending_native_writes = false;
+    ctx.recovery_active = false;
+    ctx.write_degraded = false;
+    ctx.runtime_recovery_reason.clear();
+    ctx.runtime_last_recovery_action = action;
+    ctx.runtime_last_commit_xid = committed_xid;
+    if (ctx.args.readwrite && IsWriteBackendMode(ctx.args.write_backend, L"Native"))
+    {
+        ctx.native_write_enabled = true;
+        ctx.overlay_write_enabled = false;
+    }
+
+    (void)UpdateRecoveryMarkerBestEffort(&ctx, false);
+    std::wcerr << L"[FsHost] Recovery marker reconciled against APFS checkpoint xid "
+        << committed_xid.value()
+        << L"; native write path may proceed."
+        << std::endl;
+}
+
+void RefreshReportedVolumeInfoFromMetadata(MountContext& ctx)
+{
+    std::lock_guard<std::mutex> metadata_lock(ctx.metadata_mutex);
+    if (!ctx.metadata_store)
+    {
+        return;
+    }
+
+    if (const auto block_size = ctx.metadata_store->BlockSizeBytes();
+        block_size.has_value() && block_size.value() != 0)
+    {
+        ctx.reported_allocation_unit_bytes = block_size.value();
+    }
+    if (const auto total_size = ctx.metadata_store->TotalSizeBytes();
+        total_size.has_value())
+    {
+        ctx.reported_total_size_bytes = total_size;
+    }
+    if (const auto free_size = ctx.metadata_store->FreeSizeBytes();
+        free_size.has_value())
+    {
+        ctx.reported_free_size_bytes = free_size;
+    }
+}
+#endif
+
 void PrintUsage()
 {
-    std::wcerr << L"Usage: ApfsAccess.FsHost --device <path> --volume <name-or-id> --mount <X:> (--readonly|--readwrite) [--apfsutil <path>] [--lifetime-file <file>] [--status-file <file>] [--write-backend <Disabled|Overlay|Native>] [--write-safety-level <mode>] [--write-commit-timeout <seconds>] [--write-max-dirty-transactions <count>] [--write-recovery-policy <mode>] [--write-crash-replay-mode <FailClosed|ReplayIfSafe>] [--write-require-canonical-commit <true|false>] [--write-integrity-check-on-mount <true|false>] [--allow-legacy-scaffold-for-fixtures <true|false>] [--write-disallow-scaffold-commit-on-non-fixture <true|false>] [--write-reject-scaffold-replay-blob-on-non-fixture <true|false>] [--write-require-canonical-replay-candidate-on-non-fixture <true|false>] [--validation-crash-fault-passes <count>] [--validation-crash-stage-matrix-passes <count>] [--validation-hardware-pilot-passes <count>] [--validation-hot-unplug-passes <count>] [--validation-macos-validation-passes <count>] [--validation-macos-consistency-passes <count>] [--validation-power-loss-replay-passes <count>] [--validation-power-loss-pass-verified <true|false>] [--validation-last-validated-utc <iso-8601>] [--validation-last-profile-id <id>] [--allow-raw-physical-write]" << std::endl;
+    std::wcerr << L"Usage: ApfsAccess.FsHost --device <path> [--device-offset <bytes>] --volume <name-or-id> --mount <X:> (--readonly|--readwrite) [--lifetime-file <file>] [--status-file <file>] [--write-backend <Disabled|Overlay|Native>] [--write-safety-level <mode>] [--write-commit-timeout <seconds>] [--write-max-dirty-transactions <count>] [--write-recovery-policy <mode>] [--write-crash-replay-mode <FailClosed|ReplayIfSafe>] [--write-require-canonical-commit <true|false>] [--write-integrity-check-on-mount <true|false>] [--allow-legacy-scaffold-for-fixtures <true|false>] [--write-disallow-scaffold-commit-on-non-fixture <true|false>] [--write-reject-scaffold-replay-blob-on-non-fixture <true|false>] [--write-require-canonical-replay-candidate-on-non-fixture <true|false>] [--validation-crash-fault-passes <count>] [--validation-crash-stage-matrix-passes <count>] [--validation-hardware-pilot-passes <count>] [--validation-hot-unplug-passes <count>] [--validation-macos-validation-passes <count>] [--validation-macos-consistency-passes <count>] [--validation-power-loss-replay-passes <count>] [--validation-power-loss-pass-verified <true|false>] [--validation-last-validated-utc <iso-8601>] [--validation-last-profile-id <id>] [--allow-raw-physical-write]" << std::endl;
 }
 
 BOOL WINAPI CtrlHandler(DWORD type)
@@ -4765,12 +5407,6 @@ int wmain(int argc, wchar_t** argv)
         return 6;
     }
 #endif
-    if (args.apfsutil.empty() || !std::filesystem::exists(args.apfsutil))
-    {
-        std::wcerr << L"[FsHost] apfsutil was not found. Configure --apfsutil or APFSUTIL_PATH." << std::endl;
-        return 3;
-    }
-
     MountContext ctx{};
     ctx.args = args;
     if (!InitializeSessionPaths(&ctx))
@@ -4834,12 +5470,19 @@ int wmain(int argc, wchar_t** argv)
                 ctx.runtime_recovery_reason = L"RecoveryMarkerDirty";
                 ctx.runtime_last_recovery_action = L"RecoveryMarkerDetected";
                 std::wcerr << L"[FsHost] Recovery marker detected: previous write session was not finalized cleanly." << std::endl;
-                if (ctx.native_write_enabled && IsRecoveryPolicyFailClosed(args.write_recovery_policy))
+                const auto replay_if_safe = IsCrashReplayModeReplayIfSafe(args.write_crash_replay_mode);
+                if (ctx.native_write_enabled &&
+                    IsRecoveryPolicyFailClosed(args.write_recovery_policy) &&
+                    !replay_if_safe)
                 {
                     ctx.write_degraded = true;
                     ctx.native_write_enabled = false;
                     ctx.overlay_write_enabled = false;
                     std::wcerr << L"[FsHost] Recovery policy is FailClosed; mounting in degraded read-only mode." << std::endl;
+                }
+                else if (ctx.native_write_enabled && replay_if_safe)
+                {
+                    std::wcerr << L"[FsHost] Recovery policy is FailClosed with ReplayIfSafe; native recovery will be attempted before write mode is downgraded." << std::endl;
                 }
                 else if (ctx.native_write_enabled)
                 {
@@ -4866,7 +5509,6 @@ int wmain(int argc, wchar_t** argv)
 #endif
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
-    if (args.readwrite)
     {
         apfsaccess::rw::MetadataStore::VolumeContext rw_context
         {
@@ -4878,7 +5520,8 @@ int wmain(int argc, wchar_t** argv)
             args.allow_legacy_scaffold_for_fixtures,
             args.write_disallow_scaffold_commit_on_non_fixture,
             args.write_reject_scaffold_replay_blob_on_non_fixture,
-            args.write_require_canonical_replay_candidate_on_non_fixture
+            args.write_require_canonical_replay_candidate_on_non_fixture,
+            args.device_offset_bytes
         };
         ctx.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
         ctx.metadata_store->SetFilePayloadProvider(
@@ -4924,16 +5567,33 @@ int wmain(int argc, wchar_t** argv)
             const auto block_size = ctx.metadata_store->BlockSizeBytes().value_or(0);
             const auto total_blocks = ctx.metadata_store->TotalBlocks().value_or(0);
             const auto checkpoint_xid = ctx.metadata_store->CheckpointXid().value_or(0);
+            RefreshReportedVolumeInfoFromMetadata(ctx);
             std::wcerr << L"[FsHost] RW engine bootstrap ready (blockSize=" << block_size
                 << L", totalBlocks=" << total_blocks
                 << L", checkpointXid=" << checkpoint_xid << L")." << std::endl;
 
             if (!ctx.metadata_store->LoadVolumeState())
             {
-                std::wcerr << L"[FsHost] RW engine bootstrap warning: volume state not ready; native APFS write path remains unavailable." << std::endl;
+                RefreshReportedVolumeInfoFromMetadata(ctx);
+                ctx.recovery_active = true;
+                ctx.runtime_recovery_reason = ctx.metadata_store->RecoveryReason();
+                if (ctx.runtime_recovery_reason.empty())
+                {
+                    ctx.runtime_recovery_reason = L"VolumeStateLoadFailed";
+                }
+                ctx.runtime_last_recovery_action = L"BootstrapVolumeStateUnavailable";
+                std::wcerr << L"[FsHost] RW engine bootstrap warning: volume state not ready (reason="
+                    << ctx.runtime_recovery_reason
+                    << L"); native APFS metadata enumeration remains unavailable."
+                    << std::endl;
+            }
+            else if (!args.readwrite)
+            {
+                RefreshReportedVolumeInfoFromMetadata(ctx);
             }
             else if (ctx.native_write_enabled && !ctx.metadata_store->PrepareNativeWritePath())
             {
+                RefreshReportedVolumeInfoFromMetadata(ctx);
                 ctx.recovery_active = true;
                 ctx.runtime_recovery_reason = ctx.metadata_store->RecoveryReason();
                 if (ctx.runtime_recovery_reason.empty())
@@ -4953,6 +5613,7 @@ int wmain(int argc, wchar_t** argv)
             }
             else
             {
+                RefreshReportedVolumeInfoFromMetadata(ctx);
                 const auto recovery_before_replay = ctx.metadata_store->IsRecoveryRequired();
                 const auto replay_result = ctx.metadata_store->ReplayOrRecover();
                 if (!replay_result)
@@ -4984,6 +5645,11 @@ int wmain(int argc, wchar_t** argv)
                     ctx.runtime_recovery_reason.clear();
                     ctx.runtime_last_recovery_action = L"ReplayApplied";
                     std::wcerr << L"[FsHost] RW recovery replay applied successfully; checkpoint state reconciled." << std::endl;
+                    ClearRecoveredMarkerIfClean(ctx, L"RecoveryMarkerClearedAfterReplay");
+                }
+                else if (replay_result)
+                {
+                    ClearRecoveredMarkerIfClean(ctx, L"RecoveryMarkerClearedAfterReplay");
                 }
 
                 if (ctx.metadata_store->IsRecoveryRequired())
@@ -5009,7 +5675,7 @@ int wmain(int argc, wchar_t** argv)
 
         if (ctx.metadata_store)
         {
-            auto committed_xid = ctx.metadata_store->LastCommittedXid();
+            auto committed_xid = ResolveCleanRecoveryCheckpointXid(*ctx.metadata_store);
             if (committed_xid.has_value())
             {
                 ctx.runtime_last_commit_xid = committed_xid;
@@ -5025,7 +5691,8 @@ int wmain(int argc, wchar_t** argv)
         return 4;
     }
 
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;WD)", SDDL_REVISION_1, &ctx.sd, &ctx.sd_size))
+    ctx.sd = BuildWritableVolumeSecurityDescriptor(&ctx.sd_size);
+    if (!ctx.sd)
     {
         std::wcerr << L"[FsHost] Failed to build security descriptor." << std::endl;
         return 5;
@@ -5038,13 +5705,6 @@ int wmain(int argc, wchar_t** argv)
     root->is_directory = true;
     root->timestamp = now;
     ctx.nodes.emplace(Key(root->path), root);
-
-    if (!EnsureDirectoryLoaded(&ctx, root))
-    {
-        std::wcerr << L"[FsHost] Unable to enumerate APFS root path: " << root->apfs_path << std::endl;
-        if (ctx.sd) LocalFree(ctx.sd);
-        return 5;
-    }
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
     if (ctx.metadata_store && MergeCommittedInodeStateIntoNodeIndex(&ctx))
@@ -5061,24 +5721,64 @@ int wmain(int argc, wchar_t** argv)
     }
 #endif
 
-    ctx.label = L"APFS_" + args.volume + (IsMutationWriteEnabled(&ctx) ? L"_RWX" : L"_RO");
-    if (ctx.label.size() > 31) ctx.label.resize(31);
+    if (!EnsureDirectoryLoaded(&ctx, root))
+    {
+        if (ctx.runtime_recovery_reason.empty())
+        {
+#ifdef APFSACCESS_HAS_RW_ENGINE
+            if (ctx.metadata_store)
+            {
+                ctx.runtime_recovery_reason = ctx.metadata_store->RecoveryReason();
+            }
+#endif
+            if (ctx.runtime_recovery_reason.empty())
+            {
+                ctx.runtime_recovery_reason = L"RootEnumerationUnavailable";
+            }
+        }
+        ctx.recovery_active = true;
+        if (ctx.runtime_last_recovery_action.empty())
+        {
+            ctx.runtime_last_recovery_action = L"MountStartupBlocked";
+        }
+        (void)WriteHostStatusFile(ctx, ctx.recovery_active, ctx.runtime_last_commit_xid);
+        std::wcerr << L"[FsHost] Unable to enumerate APFS root path from native metadata state (reason="
+            << ctx.runtime_recovery_reason
+            << L")."
+            << std::endl;
+        if (ctx.sd) LocalFree(ctx.sd);
+        return 5;
+    }
+
+    ctx.label = BuildExplorerVolumeLabel(args.volume);
 
     FSP_FSCTL_VOLUME_PARAMS vp{};
     vp.Version = sizeof(FSP_FSCTL_VOLUME_PARAMS);
-    vp.SectorSize = 4096;
+    vp.SectorSize = static_cast<UINT16>(ctx.reported_allocation_unit_bytes != 0
+        ? ctx.reported_allocation_unit_bytes
+        : 4096);
     vp.SectorsPerAllocationUnit = 1;
     vp.MaxComponentLength = 255;
     vp.VolumeCreationTime = ((UINT64)now.dwHighDateTime << 32) | now.dwLowDateTime;
-    vp.VolumeSerialNumber = (UINT32)(GetTickCount64() & 0xffffffffu);
-    vp.FileInfoTimeout = 1000;
+    vp.VolumeSerialNumber = BuildStableVolumeSerial(ctx.args);
+    vp.FileInfoTimeout = 2000;
+    vp.VolumeInfoTimeoutValid = 1;
+    vp.VolumeInfoTimeout = 2000;
+    vp.DirInfoTimeoutValid = 1;
+    vp.DirInfoTimeout = 2000;
+    vp.SecurityTimeoutValid = 1;
+    vp.SecurityTimeout = 2000;
     vp.CaseSensitiveSearch = 0;
     vp.CasePreservedNames = 1;
     vp.UnicodeOnDisk = 1;
-    vp.PersistentAcls = 1;
+    vp.PersistentAcls = 0;
+    vp.SupportsPosixUnlinkRename = 1;
     vp.ReadOnlyVolume = IsMutationWriteEnabled(&ctx) ? 0 : 1;
-    vp.PostCleanupWhenModifiedOnly = 1;
-    std::wcsncpy(vp.FileSystemName, L"APFSACCESS", sizeof(vp.FileSystemName) / sizeof(WCHAR) - 1);
+    vp.PostCleanupWhenModifiedOnly = 0;
+    vp.FlushAndPurgeOnCleanup = 1;
+    vp.PostDispositionWhenNecessaryOnly = 1;
+    vp.UmFileContextIsUserContext2 = 1;
+    wcscpy_s(vp.FileSystemName, sizeof(vp.FileSystemName) / sizeof(WCHAR), L"APFS");
 
     FSP_FILE_SYSTEM_INTERFACE iface{};
     iface.GetVolumeInfo = CB_GetVolumeInfo;
@@ -5110,7 +5810,7 @@ int wmain(int argc, wchar_t** argv)
     }
 
     ctx.fs->UserContext = &ctx;
-    auto m = args.mount;
+    auto m = BuildWinFspMountPoint(args.mount);
     st = ctx.api.SetMount(ctx.fs, m.data());
     if (!NT_SUCCESS(st))
     {
@@ -5118,7 +5818,6 @@ int wmain(int argc, wchar_t** argv)
         ctx.api.Delete(ctx.fs);
         return 7;
     }
-
     st = ctx.api.Start(ctx.fs, 1);
     if (!NT_SUCCESS(st))
     {
@@ -5126,6 +5825,9 @@ int wmain(int argc, wchar_t** argv)
         ctx.api.Delete(ctx.fs);
         return 8;
     }
+    ctx.mount_ready.store(true, std::memory_order_release);
+    (void)WriteHostStatusFile(ctx, ctx.recovery_active, ctx.runtime_last_commit_xid);
+    NotifyShellDriveAdded(args.mount);
 
     if (args.lifetime_file.empty())
     {

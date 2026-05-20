@@ -112,6 +112,32 @@ bool ReadBytesFromImage(
     return true;
 }
 
+bool WriteBytesToImage(
+    const std::filesystem::path& image_path,
+    std::uint64_t offset_bytes,
+    const std::vector<std::byte>& bytes)
+{
+    if (bytes.empty())
+    {
+        return true;
+    }
+
+    std::fstream io(image_path, std::ios::binary | std::ios::in | std::ios::out);
+    if (!io.good())
+    {
+        return false;
+    }
+
+    io.seekp(static_cast<std::streamoff>(offset_bytes), std::ios::beg);
+    if (!io.good())
+    {
+        return false;
+    }
+
+    io.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    return io.good();
+}
+
 std::vector<std::byte> BuildPatternPayload(std::size_t bytes, unsigned char seed)
 {
     std::vector<std::byte> payload(bytes, std::byte{0});
@@ -204,6 +230,13 @@ bool ExpectCommitStatus(
     {
         std::cerr << "[DEBUG] commit status for '" << message << "': "
                   << CommitStatusToString(status) << std::endl;
+        std::cerr << "[DEBUG] commit stage for '" << message << "': "
+                  << store.LastCommitStage() << std::endl;
+        const auto recovery_reason = store.RecoveryReason();
+        if (!recovery_reason.empty())
+        {
+            std::wcerr << L"[DEBUG] recovery reason: " << recovery_reason << std::endl;
+        }
         return Require(false, message);
     }
     return true;
@@ -814,6 +847,160 @@ bool TestDirectorySubtreeRenameObjectMapConformance(const std::filesystem::path&
     return ok;
 }
 
+bool TestPendingWriteDirectoryRenamePersistenceConformance(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "pending_write_directory_rename.apfs.img";
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, "PendingWriteDirectoryRename: unable to create synthetic container");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        L"PendingWriteDirectoryRename",
+    };
+    bool ok = true;
+    const auto baseline_payload = BuildPatternPayload(1024, 0x34);
+    const auto renamed_payload = BuildPatternPayload(2048, 0x9A);
+
+    {
+        apfsaccess::rw::MetadataStore store(context);
+        ok &= Require(store.LoadContainerSuperblocks(), "PendingWriteDirectoryRename: LoadContainerSuperblocks should succeed");
+        ok &= Require(store.LoadObjectMap(), "PendingWriteDirectoryRename: LoadObjectMap should succeed");
+        ok &= Require(store.LoadSpacemanState(), "PendingWriteDirectoryRename: LoadSpacemanState should succeed");
+        ok &= Require(store.PrepareNativeWritePath(), "PendingWriteDirectoryRename: PrepareNativeWritePath should succeed");
+
+        std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+        ConfigurePayloadProvider(store, staged_payloads);
+
+        apfsaccess::rw::MetadataStore::MutationRequest create_directory{};
+        create_directory.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateDirectory;
+        create_directory.path = L"\\Source";
+        ok &= ExpectMutationStatus(
+            store,
+            create_directory,
+            apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "PendingWriteDirectoryRename: create \\Source should apply");
+
+        create_directory.path = L"\\Source\\Nested";
+        ok &= ExpectMutationStatus(
+            store,
+            create_directory,
+            apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "PendingWriteDirectoryRename: create nested directory should apply");
+
+        apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+        create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+        create_file.path = L"\\Source\\Nested\\dirty.bin";
+        ok &= ExpectMutationStatus(
+            store,
+            create_file,
+            apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "PendingWriteDirectoryRename: create dirty file should apply");
+
+        apfsaccess::rw::MetadataStore::MutationRequest write_file{};
+        write_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+        write_file.path = L"\\Source\\Nested\\dirty.bin";
+        write_file.length = baseline_payload.size();
+        ok &= ExpectMutationStatus(
+            store,
+            write_file,
+            apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "PendingWriteDirectoryRename: initial write should apply");
+        staged_payloads[L"\\Source\\Nested\\dirty.bin"] = baseline_payload;
+
+        ok &= ExpectCommitStatus(
+            store,
+            apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+            "PendingWriteDirectoryRename: baseline commit should succeed");
+
+        staged_payloads.clear();
+        write_file.length = renamed_payload.size();
+        ok &= ExpectMutationStatus(
+            store,
+            write_file,
+            apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "PendingWriteDirectoryRename: overwrite before rename should apply");
+        staged_payloads[L"\\Source\\Nested\\dirty.bin"] = renamed_payload;
+
+        apfsaccess::rw::MetadataStore::MutationRequest rename_directory{};
+        rename_directory.operation = apfsaccess::rw::MetadataStore::MutationOperation::Rename;
+        rename_directory.path = L"\\Source";
+        rename_directory.secondary_path = L"\\Moved";
+        ok &= ExpectMutationStatus(
+            store,
+            rename_directory,
+            apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "PendingWriteDirectoryRename: directory rename should apply");
+
+        staged_payloads[L"\\Moved\\Nested\\dirty.bin"] = renamed_payload;
+        staged_payloads.erase(L"\\Source\\Nested\\dirty.bin");
+
+        ok &= ExpectCommitStatus(
+            store,
+            apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+            "PendingWriteDirectoryRename: rename commit should succeed");
+
+        ok &= Require(
+            !store.LookupCommittedInodeByPath(L"\\Source\\Nested\\dirty.bin").has_value(),
+            "PendingWriteDirectoryRename: old path should be absent after rename commit");
+        auto renamed_inode = store.LookupCommittedInodeByPath(L"\\Moved\\Nested\\dirty.bin");
+        ok &= Require(renamed_inode.has_value(), "PendingWriteDirectoryRename: renamed file should exist after commit");
+        if (renamed_inode.has_value())
+        {
+            ok &= Require(
+                renamed_inode->logical_size == renamed_payload.size(),
+                "PendingWriteDirectoryRename: renamed file logical size should match overwrite");
+        }
+
+        std::vector<std::byte> committed_payload;
+        ok &= Require(
+            store.ReadCommittedFileRange(
+                L"\\Moved\\Nested\\dirty.bin",
+                0,
+                renamed_payload.size(),
+                committed_payload),
+            "PendingWriteDirectoryRename: committed payload should be readable after rename");
+        ok &= Require(
+            committed_payload == renamed_payload,
+            "PendingWriteDirectoryRename: committed payload should follow renamed descendant");
+    }
+
+    {
+        apfsaccess::rw::MetadataStore remounted(context);
+        ok &= Require(remounted.LoadContainerSuperblocks(), "PendingWriteDirectoryRename: remount LoadContainerSuperblocks should succeed");
+        ok &= Require(remounted.PrepareNativeWritePath(), "PendingWriteDirectoryRename: remount PrepareNativeWritePath should succeed");
+        ok &= Require(!remounted.IsRecoveryRequired(), "PendingWriteDirectoryRename: remount should not require recovery");
+        ok &= Require(remounted.IsCommitPathReady(), "PendingWriteDirectoryRename: remount commit path should remain ready");
+        ok &= Require(
+            !remounted.LookupCommittedInodeByPath(L"\\Source\\Nested\\dirty.bin").has_value(),
+            "PendingWriteDirectoryRename: remount old path should stay absent");
+        auto remounted_inode = remounted.LookupCommittedInodeByPath(L"\\Moved\\Nested\\dirty.bin");
+        ok &= Require(remounted_inode.has_value(), "PendingWriteDirectoryRename: remount renamed file should exist");
+        if (remounted_inode.has_value())
+        {
+            ok &= Require(
+                remounted_inode->logical_size == renamed_payload.size(),
+                "PendingWriteDirectoryRename: remount logical size should match overwrite");
+        }
+
+        std::vector<std::byte> remounted_payload;
+        ok &= Require(
+            remounted.ReadCommittedFileRange(
+                L"\\Moved\\Nested\\dirty.bin",
+                0,
+                renamed_payload.size(),
+                remounted_payload),
+            "PendingWriteDirectoryRename: remount payload should be readable");
+        ok &= Require(
+            remounted_payload == renamed_payload,
+            "PendingWriteDirectoryRename: remount payload should preserve renamed descendant bytes");
+    }
+
+    return ok;
+}
+
 bool TestBtreeCanonicalizationConformance(const std::filesystem::path& run_root)
 {
     const auto image_path = run_root / "btree_canonical.apfs.img";
@@ -917,6 +1104,202 @@ bool TestBtreeCanonicalizationConformance(const std::filesystem::path& run_root)
         !store.LookupCommittedInodeByPath(L"\\canonical.txt").has_value() &&
             !store.LookupCommittedInodeByPath(L"\\renamed-canonical.txt").has_value(),
         "BtreeCanonical: deleted file path should not remain in committed inode projection");
+
+    return ok;
+}
+
+bool TestCommittedReadExtentsConformance(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "read_extents.apfs.img";
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, "ReadExtents: unable to create synthetic container");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        L"ReadExtents",
+    };
+    apfsaccess::rw::MetadataStore store(context);
+    bool ok = true;
+    ok &= Require(store.LoadContainerSuperblocks(), "ReadExtents: LoadContainerSuperblocks should succeed");
+    ok &= Require(store.LoadObjectMap(), "ReadExtents: LoadObjectMap should succeed");
+    ok &= Require(store.LoadSpacemanState(), "ReadExtents: LoadSpacemanState should succeed");
+    ok &= Require(store.PrepareNativeWritePath(), "ReadExtents: PrepareNativeWritePath should succeed");
+
+    std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+    ConfigurePayloadProvider(store, staged_payloads);
+
+    apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+    create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+    create_file.path = L"\\fragmented.bin";
+    ok &= ExpectMutationStatus(
+        store,
+        create_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "ReadExtents: create file should apply");
+
+    apfsaccess::rw::MetadataStore::MutationRequest write_file{};
+    write_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+    write_file.path = L"\\fragmented.bin";
+    write_file.length = 8192;
+    ok &= ExpectMutationStatus(
+        store,
+        write_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "ReadExtents: write file should apply");
+
+    const auto placeholder_payload = BuildPatternPayload(8192, 0x8A);
+    staged_payloads[L"\\fragmented.bin"] = placeholder_payload;
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "ReadExtents: commit should succeed");
+
+    auto inode = store.LookupCommittedInodeByPath(L"\\fragmented.bin");
+    ok &= Require(inode.has_value(), "ReadExtents: committed inode should exist");
+    if (!inode.has_value())
+    {
+        return false;
+    }
+
+    constexpr std::uint64_t first_extent_address = 700ull * kBlockSize;
+    constexpr std::uint64_t second_extent_address = 702ull * kBlockSize;
+    const auto first_payload = BuildPatternPayload(1024, 0x10);
+    const auto second_payload = BuildPatternPayload(2048, 0x70);
+    ok &= Require(
+        WriteBytesToImage(image_path, first_extent_address, first_payload),
+        "ReadExtents: first payload extent should be written to fixture");
+    ok &= Require(
+        WriteBytesToImage(image_path, second_extent_address, second_payload),
+        "ReadExtents: second payload extent should be written to fixture");
+    ok &= Require(
+        store.SetCommittedReadExtents(
+            inode->object_id,
+            {
+                { 0, first_extent_address, first_payload.size() },
+                { 0, first_extent_address, first_payload.size() },
+                { 4096, second_extent_address, second_payload.size() },
+            }),
+        "ReadExtents: committed read extent table should accept sorted fragments and exact duplicates");
+
+    std::vector<std::byte> whole;
+    ok &= Require(
+        store.ReadCommittedFileRange(L"\\fragmented.bin", 0, 6144, whole),
+        "ReadExtents: fragmented range should read successfully");
+    ok &= Require(whole.size() == 6144, "ReadExtents: fragmented read should preserve requested logical length");
+    ok &= Require(
+        std::equal(first_payload.begin(), first_payload.end(), whole.begin()),
+        "ReadExtents: first extent bytes should match");
+    ok &= Require(
+        std::all_of(whole.begin() + 1024, whole.begin() + 4096, [](std::byte value)
+        {
+            return value == std::byte{0};
+        }),
+        "ReadExtents: sparse gap should be zero-filled");
+    ok &= Require(
+        std::equal(second_payload.begin(), second_payload.end(), whole.begin() + 4096),
+        "ReadExtents: second extent bytes should match");
+
+    std::vector<std::byte> second_window;
+    ok &= Require(
+        store.ReadCommittedFileRange(L"\\fragmented.bin", 4608, 512, second_window),
+        "ReadExtents: read wholly inside second extent should succeed");
+    ok &= Require(
+        second_window.size() == 512 &&
+            std::equal(second_window.begin(), second_window.end(), second_payload.begin() + 512),
+        "ReadExtents: second extent window should match");
+
+    std::vector<std::byte> eof_window;
+    ok &= Require(
+        store.ReadCommittedFileRange(L"\\fragmented.bin", 6144, 4096, eof_window),
+        "ReadExtents: EOF-clamped fragmented read should succeed");
+    ok &= Require(eof_window.size() == 2048, "ReadExtents: EOF read should clamp to logical file size");
+    ok &= Require(
+        std::all_of(eof_window.begin(), eof_window.end(), [](std::byte value)
+        {
+            return value == std::byte{0};
+        }),
+        "ReadExtents: missing tail extent should zero-fill within logical size");
+
+    return ok;
+}
+
+bool TestCommittedZeroReadExtentConformance(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "zero_read_extents.apfs.img";
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, "ZeroReadExtents: unable to create synthetic container");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        L"ZeroReadExtents",
+    };
+    apfsaccess::rw::MetadataStore store(context);
+    bool ok = true;
+    ok &= Require(store.LoadContainerSuperblocks(), "ZeroReadExtents: LoadContainerSuperblocks should succeed");
+    ok &= Require(store.LoadObjectMap(), "ZeroReadExtents: LoadObjectMap should succeed");
+    ok &= Require(store.LoadSpacemanState(), "ZeroReadExtents: LoadSpacemanState should succeed");
+    ok &= Require(store.PrepareNativeWritePath(), "ZeroReadExtents: PrepareNativeWritePath should succeed");
+
+    std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+    ConfigurePayloadProvider(store, staged_payloads);
+
+    apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+    create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+    create_file.path = L"\\zero-backed.bin";
+    ok &= ExpectMutationStatus(
+        store,
+        create_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "ZeroReadExtents: create file should apply");
+
+    apfsaccess::rw::MetadataStore::MutationRequest write_file{};
+    write_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+    write_file.path = L"\\zero-backed.bin";
+    write_file.length = 4096;
+    ok &= ExpectMutationStatus(
+        store,
+        write_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "ZeroReadExtents: write file should apply");
+
+    staged_payloads[L"\\zero-backed.bin"] = BuildPatternPayload(4096, 0x11);
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "ZeroReadExtents: commit should succeed");
+
+    auto inode = store.LookupCommittedInodeByPath(L"\\zero-backed.bin");
+    ok &= Require(inode.has_value(), "ZeroReadExtents: committed inode should exist");
+    if (!inode.has_value())
+    {
+        return false;
+    }
+
+    ok &= Require(
+        store.SetCommittedReadExtents(
+            inode->object_id,
+            {
+                { 0, 0, 4096 },
+            }),
+        "ZeroReadExtents: committed read extent table should accept zero physical address extents");
+
+    std::vector<std::byte> payload;
+    ok &= Require(
+        store.ReadCommittedFileRange(L"\\zero-backed.bin", 0, 4096, payload),
+        "ZeroReadExtents: zero physical extent should read successfully");
+    ok &= Require(payload.size() == 4096, "ZeroReadExtents: zero extent should preserve logical length");
+    ok &= Require(
+        std::all_of(payload.begin(), payload.end(), [](std::byte value)
+        {
+            return value == std::byte{0};
+        }),
+        "ZeroReadExtents: zero physical extent should return zero-filled bytes");
 
     return ok;
 }
@@ -1285,7 +1668,10 @@ int main()
     ok &= TestDirectoryAndDeleteConformance(run_root);
     ok &= TestTruncateConformance(run_root);
     ok &= TestDirectorySubtreeRenameObjectMapConformance(run_root);
+    ok &= TestPendingWriteDirectoryRenamePersistenceConformance(run_root);
     ok &= TestBtreeCanonicalizationConformance(run_root);
+    ok &= TestCommittedReadExtentsConformance(run_root);
+    ok &= TestCommittedZeroReadExtentConformance(run_root);
     ok &= TestObjectMapDeltaCanonicalizationConformance(run_root);
     ok &= TestEphemeralCreateDeleteConformance(run_root);
     ok &= TestObjectIdMonotonicAllocationConformance(run_root);

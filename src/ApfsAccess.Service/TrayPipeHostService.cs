@@ -8,6 +8,7 @@ public sealed class TrayPipeHostService : BackgroundService
 {
     private readonly ILogger<TrayPipeHostService> _logger;
     private readonly RuntimeStatusPublisher _statusPublisher;
+    private readonly ApfsMountWorker _mountWorker;
     private readonly IHostApplicationLifetime _applicationLifetime;
     private readonly NamedPipeMessageServer _server;
     private readonly ConcurrentDictionary<Guid, PipePeer> _clients = new();
@@ -15,11 +16,13 @@ public sealed class TrayPipeHostService : BackgroundService
     public TrayPipeHostService(
         ILogger<TrayPipeHostService> logger,
         RuntimeStatusPublisher statusPublisher,
+        ApfsMountWorker mountWorker,
         IHostApplicationLifetime applicationLifetime
     )
     {
         _logger = logger;
         _statusPublisher = statusPublisher;
+        _mountWorker = mountWorker;
         _applicationLifetime = applicationLifetime;
         _server = new NamedPipeMessageServer(ApfsPipeConstants.PipeName);
     }
@@ -81,6 +84,17 @@ public sealed class TrayPipeHostService : BackgroundService
                         );
                         await peer.SendAsync(ack, cancellationToken).ConfigureAwait(false);
                         _applicationLifetime.StopApplication();
+                        break;
+                    }
+                    case ApfsMessageTypes.EjectRequested:
+                    {
+                        var result = await _mountWorker.EjectAllAsync(cancellationToken).ConfigureAwait(false);
+                        var ack = PipeMessageCodec.Create(
+                            ApfsMessageTypes.Ack,
+                            new AckPayload(result.Success, result.Message),
+                            message.RequestId
+                        );
+                        await peer.SendAsync(ack, cancellationToken).ConfigureAwait(false);
                         break;
                     }
                     case ApfsMessageTypes.Ping:

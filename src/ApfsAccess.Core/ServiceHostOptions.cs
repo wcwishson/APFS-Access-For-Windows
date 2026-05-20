@@ -6,8 +6,6 @@ public sealed class ServiceHostOptions
 
     public string BackendMode { get; set; } = "Mock";
 
-    public string? NativeApfsUtilPath { get; set; }
-
     public string? NativeFsHostPath { get; set; }
 
     public string[] NativeDeviceCandidates { get; set; } = [];

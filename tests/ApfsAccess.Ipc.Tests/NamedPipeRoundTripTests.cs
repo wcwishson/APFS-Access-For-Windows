@@ -83,4 +83,33 @@ public sealed class NamedPipeRoundTripTests
         await RunOneSessionAsync("first");
         await RunOneSessionAsync("second");
     }
+
+    [Fact]
+    public async Task ServerCompletesCleanly_WhenClientDisconnectsBeforePeerDispose()
+    {
+        var pipeName = $"ApfsAccess.Disconnect.{Guid.NewGuid():N}";
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var server = new NamedPipeMessageServer(pipeName);
+        var serverTask = server.RunAsync(async (peer, token) =>
+        {
+            var incoming = await peer.ReadMessageAsync(token);
+            Assert.NotNull(incoming);
+            handled.SetResult();
+        }, cts.Token);
+
+        var client = await NamedPipeMessageClient.ConnectAsync(pipeName, 2000, cts.Token);
+        var ping = PipeMessageCodec.Create(
+            ApfsMessageTypes.Ping,
+            new PingPayload(DateTime.UtcNow),
+            requestId: "disconnect-first"
+        );
+        await client.SendAsync(ping, cts.Token);
+        await client.DisposeAsync();
+
+        await handled.Task.WaitAsync(cts.Token);
+        await cts.CancelAsync();
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
 }

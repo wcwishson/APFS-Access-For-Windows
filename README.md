@@ -9,7 +9,7 @@ Windows APFS access app with service + tray architecture and a native WinFsp mou
 - `src/ApfsAccess.Core` - shared contracts/models/policy.
 - `src/ApfsAccess.Ipc` - named pipe JSON protocol.
 - `src/ApfsAccess.Backend.Mock` - deterministic attach/detach simulation.
-- `src/ApfsAccess.Backend.Native` - Paragon CE probing + native host orchestration.
+- `src/ApfsAccess.Backend.Native` - native APFS discovery, policy, and host orchestration.
 - `src-native/ApfsAccess.FsHost` - native per-volume mount host process.
 
 ## Build
@@ -27,13 +27,12 @@ pwsh -NoProfile -File .\build\publish.ps1 -Configuration Release -Runtime win-x6
 Artifacts:
 
 - `artifacts/publish/click-run/ApfsAccess.Tray.exe`
+- `artifacts/publish/click-run/Run_APFS_Access_Silent.vbs`
 - `artifacts/publish/click-run/Run_APFS_Access.bat`
-- `artifacts/publish/click-run/Run_APFS_Pilot_Validation.bat`
 - `artifacts/publish/portable/APFSAccess.Portable.exe`
 - `APFSAccess_Portable.exe` (project root single-file launcher)
 - `Run_APFS_Access.bat` (project root launcher)
 - `Build_APFS_Access_Beta.bat` (project root one-click beta build)
-- `Run_APFS_Pilot_Validation.bat` (project root one-click external pilot launcher)
 
 ## One-click beta + feedback flow
 
@@ -43,23 +42,7 @@ Build the beta bundle:
 .\Build_APFS_Access_Beta.bat
 ```
 
-After build, connect a sacrificial APFS drive and launch the pilot smoke flow:
-
-```powershell
-.\Run_APFS_Pilot_Validation.bat
-```
-
-What the pilot launcher automates:
-
-- APFS raw-drive discovery and volume selection.
-- Temporary click-run `appsettings.json` reconfiguration for native pilot mode.
-- Session-local pilot bootstrap evidence seeding so a fresh raw device can enter a writable smoke run without touching the real global evidence ledger.
-- App launch, mount detection, writable smoke operations (`CreateDirectory`, `Write`, `SetBasicInfo`, `Rename`, `SetFileSize`, `Delete`), restart/remount verification, and feedback archive creation.
-
-Feedback output:
-
-- `artifacts/publish/click-run/pilot-feedback/<timestamp>.zip`
-- the archive contains status logs, appsettings snapshot, local evidence snapshot, promotion evaluations, `apfsutil` probe output, validation-report template/results, and copied diagnostics from `%TEMP%\ApfsAccess\...`
+Hardware/pilot validation remains a manual branch task for now. Use the native host build plus the bundled validation/report scripts once you have a sacrificial APFS device ready.
 
 Manual validation boundary:
 
@@ -78,6 +61,11 @@ Portable launcher notes:
 - If `winget` is unavailable, it falls back to official download/install links and guides the user.
 - You can copy this one `.exe` to another folder/PC.
 
+Quiet startup notes:
+
+- For normal app use, double-click `Run_APFS_Access.bat` or `Run_APFS_Access_Silent.vbs`; the launcher starts the tray app without leaving a visible terminal window.
+- Set `APFSACCESS_VISIBLE_CONSOLE=1` before running `Run_APFS_Access.bat` only when troubleshooting startup output.
+
 ## Prerequisites
 
 ```powershell
@@ -92,23 +80,16 @@ pwsh -NoProfile -File .\scripts\install_prereqs.ps1 -ForDeveloperBuild
 
 ## Native backend setup
 
-1. Build Paragon CE `apfsutil.exe`:
-
-```powershell
-pwsh -NoProfile -File .\scripts\build_paragon_apfsutil.ps1
-```
-
-2. Build native mount host:
+1. Build native mount host:
 
 ```powershell
 pwsh -NoProfile -File .\scripts\build_native_host.ps1 -Configuration Release
 ```
 
-3. Configure published `appsettings.json`:
+2. Configure published `appsettings.json`:
 
 ```powershell
 pwsh -NoProfile -File .\scripts\configure_native_ce.ps1 `
-  -ApfsUtilPath "C:\path\to\apfsutil.exe" `
   -NativeFsHostPath "C:\path\to\ApfsAccess.FsHost.exe" `
   -DeviceCandidates "\\.\PhysicalDrive1"
 ```
@@ -117,7 +98,6 @@ Enable experimental overlay write-path testing:
 
 ```powershell
 pwsh -NoProfile -File .\scripts\configure_native_ce.ps1 `
-  -ApfsUtilPath "C:\path\to\apfsutil.exe" `
   -NativeFsHostPath "C:\path\to\ApfsAccess.FsHost.exe" `
   -DeviceCandidates "\\.\PhysicalDrive1" `
   -EnableNativeWrite `
@@ -129,7 +109,6 @@ Enable experimental native-mutation pipeline testing:
 
 ```powershell
 pwsh -NoProfile -File .\scripts\configure_native_ce.ps1 `
-  -ApfsUtilPath "C:\path\to\apfsutil.exe" `
   -NativeFsHostPath "C:\path\to\ApfsAccess.FsHost.exe" `
   -DeviceCandidates "\\.\PhysicalDrive1" `
   -EnableNativeWrite `
@@ -137,14 +116,29 @@ pwsh -NoProfile -File .\scripts\configure_native_ce.ps1 `
   -WriteBackendMode Native
 ```
 
+Safe image-backed smoke test before physical media:
+
+```powershell
+pwsh -NoProfile -File .\scripts\create_test_image.ps1 `
+  -Path .\artifacts\test-images\apfsaccess-test.apfs.img `
+  -SizeMiB 64
+
+pwsh -NoProfile -File .\scripts\native_probe.ps1 `
+  -DeviceId .\artifacts\test-images\apfsaccess-test.apfs.img `
+  -AsJson
+```
+
+This creates a normal file only, refuses to overwrite existing files, and refuses raw `\\.\PhysicalDrive*` paths. It is a safe APFS Access validation image, not a macOS-compatible `mkfs.apfs` formatter output.
+
 ## Current status and limits
 
 - CE integration is read-only.
 - Encrypted APFS volumes are skipped.
 - Native host now mounts through WinFsp callbacks (no full-volume mirror step).
-- File payloads are hydrated on-demand via `apfsutil readraw` when files are opened/read.
+- Directory traversal and file payload hydration now use the native APFS metadata/file-range path for supported basic volumes.
 - Default mode is read-only; copy-out from APFS to Windows filesystems is supported.
-- Native `listsubvolumes` parsing now preserves unquoted multi-word volume names (for example `Macintosh HD - Data`) instead of tokenizing by spaces.
+- Physical APFS USB read-only validation passed on 2026-05-18: the native stack mounted the sacrificial APFS volume, enumerated all 99 files, copied out 99/99 files with 0 failures, and matched representative SHA-256 hashes.
+- Native probe flow now discovers raw APFS devices and volumes without `apfsutil`, preserving stable `raw::<device>::<volume>` evidence profile ids for pilot tooling.
 - Native probe parsing now emits write-incompatibility hints for read-only and special-role APFS volumes (`role=preboot|recovery|vm`) to keep native write gating explicit.
 - Experimental write paths are available as:
   - `WriteBackendMode=Overlay` (session overlay, non-persistent).
@@ -155,7 +149,9 @@ pwsh -NoProfile -File .\scripts\configure_native_ce.ps1 `
 - In `WriteBackendMode=Native`:
   - FsHost stages write mutations into the native metadata store and commits on `Flush`.
   - Payload bytes are sourced from hydrated files and written to allocated extents during commit.
-  - Native commit/replay semantics are covered by the current in-repo native validation chain; raw physical APFS devices remain pilot-only until external crash/hot-unplug/power-loss/macOS evidence is collected.
+- Native commit/replay semantics are covered by the current in-repo native validation chain; raw physical APFS devices remain pilot-only until external crash/hot-unplug/power-loss/macOS evidence is collected.
+- Synthetic image-backed validation can now create a disposable `.apfs.img` file and probe it through the native backend before touching physical media; this does not replace real hardware/macOS validation.
+- Physical APFS write operations remain blocked by default. Do not run raw-device create/write/rename/delete validation until canonical allocation/spaceman safety and write-promotion evidence are complete.
 
 ## Native write status
 

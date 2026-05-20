@@ -29,6 +29,7 @@ public sealed class TrayApplicationContextPrioritizationTests
     [InlineData("CanonicalCommitNotReady", 0)]
     [InlineData("FixtureCompatibilityPathActive", 0)]
     [InlineData("ScaffoldCommitBlobActive", 0)]
+    [InlineData("IntegrityMissingAllocationMap", 1)]
     [InlineData("ReplayCheckpointPendingWindow", 1)]
     [InlineData("ReplayCheckpointNotPendingWindow", 1)]
     [InlineData("ReplayCanonicalCandidateMissing", 1)]
@@ -46,6 +47,7 @@ public sealed class TrayApplicationContextPrioritizationTests
     [InlineData("Write blocked (reason=CanonicalCommitNotReady)", 0)]
     [InlineData("Write blocked (reason=FixtureCompatibilityPathActive)", 0)]
     [InlineData("Write blocked (reason=ScaffoldCommitBlobActive)", 0)]
+    [InlineData("Write blocked (reason=IntegrityMissingAllocationMap)", 1)]
     [InlineData("Write blocked (reason=ReplayCheckpointPendingWindow)", 1)]
     [InlineData("Write blocked (reason=ReplayCheckpointNotPendingWindow)", 1)]
     [InlineData("Write blocked (reason=ReplayCanonicalCandidateMissing)", 1)]
@@ -146,6 +148,26 @@ public sealed class TrayApplicationContextPrioritizationTests
         Assert.Null(primary);
     }
 
+    [Theory]
+    [InlineData(RuntimeState.MountedRw, "APFS Access: mounted RW (1)")]
+    [InlineData(RuntimeState.MountedRo, "APFS Access: mounted RO (1)")]
+    public void BuildNotifyIconText_LabelsMountedAccessMode(RuntimeState state, string expected)
+    {
+        var payload = new StatusChangedPayload(
+            State: state,
+            MountPoints: ["P:\\"],
+            LastError: null,
+            TimestampUtc: DateTime.UtcNow,
+            Warnings: Array.Empty<string>(),
+            WriteEnabled: state == RuntimeState.MountedRw,
+            CompatibilityWarnings: Array.Empty<string>(),
+            RecoveryActive: false);
+
+        var text = InvokeBuildNotifyIconText(payload);
+
+        Assert.Equal(expected, text);
+    }
+
     private static string? InvokeTryExtractReasonTokenFromWarning(string? warning)
     {
         var method = typeof(TrayApplicationContext).GetMethod(
@@ -188,5 +210,16 @@ public sealed class TrayApplicationContextPrioritizationTests
 
         var result = method!.Invoke(null, [payload]);
         return result as string;
+    }
+
+    private static string InvokeBuildNotifyIconText(StatusChangedPayload payload)
+    {
+        var method = typeof(TrayApplicationContext).GetMethod(
+            "BuildNotifyIconText",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+
+        var result = method!.Invoke(null, [payload]);
+        return Assert.IsType<string>(result);
     }
 }

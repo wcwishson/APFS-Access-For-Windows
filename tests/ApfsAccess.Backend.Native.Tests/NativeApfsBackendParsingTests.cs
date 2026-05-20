@@ -304,6 +304,7 @@ public sealed class NativeApfsBackendParsingTests
     [InlineData("CommitInodeRoundTripFailed", "NativeWriteCommitPersistFailed", "RecoveryFailClosedCommitPersistFailed")]
     [InlineData("CommitBtreeRoundTripFailed", "NativeWriteCommitPersistFailed", "RecoveryFailClosedCommitPersistFailed")]
     [InlineData("IntegrityCheckFailedOnMount", "NativeWriteIntegrityCheckFailed", "RecoveryFailClosedIntegrity")]
+    [InlineData("IntegrityMissingAllocationMap", "NativeWriteIntegrityMissingAllocationMap", "RecoveryFailClosedIntegrityAllocationMap")]
     [InlineData("PersistentStateAheadOfSuperblock", "NativeWriteReplayFailed", "RecoveryFailClosedReplay")]
     [InlineData("PersistentStateBehindSuperblock", "NativeWriteReplayFailed", "RecoveryFailClosedReplay")]
     [InlineData("ReplayIntegrityCheckFailed", "NativeWriteReplayFailed", "RecoveryFailClosedReplay")]
@@ -328,6 +329,10 @@ public sealed class NativeApfsBackendParsingTests
     [InlineData("DirtyTransactionLimitExceeded", "NativeWriteDirtyTransactionLimitExceeded", "RecoveryFailClosedDirtyLimit")]
     [InlineData("CanonicalPathNotActive", "NativeWriteCanonicalPathNotActive", "RecoveryFailClosedCanonicalPath")]
     [InlineData("CanonicalStateNotLoaded", "NativeWriteCanonicalGateFailure", "RecoveryFailClosedCanonicalGate")]
+    [InlineData("CanonicalVolumeStateLoadFailed", "NativeWriteCanonicalGateFailure", "RecoveryFailClosedCanonicalGate")]
+    [InlineData("CanonicalObjectMapStateInvalid", "NativeWriteCanonicalGateFailure", "RecoveryFailClosedCanonicalGate")]
+    [InlineData("CanonicalSpacemanStateInvalid", "NativeWriteCanonicalGateFailure", "RecoveryFailClosedCanonicalGate")]
+    [InlineData("CanonicalVolumeTreeStateInvalid", "NativeWriteCanonicalGateFailure", "RecoveryFailClosedCanonicalGate")]
     [InlineData("NativeWriteNotReady", "NativeWriteCanonicalGateFailure", "RecoveryFailClosedCanonicalGate")]
     [InlineData("WriteDeviceNotAllowed", "NativeWriteCanonicalGateFailure", "RecoveryFailClosedCanonicalGate")]
     [InlineData("CommitPathNotReady", "NativeWriteCanonicalGateFailure", "RecoveryFailClosedCanonicalGate")]
@@ -632,7 +637,7 @@ public sealed class NativeApfsBackendParsingTests
                 SupportsReadWrite: true,
                 IsEncrypted: false,
                 SupportsExplorerMount: true,
-                NativeVolumePath: @"\\.\PhysicalDrive3\Ufsd_Volumes\Main",
+                NativeVolumePath: @"\\.\PhysicalDrive3\ApfsAccess_Volumes\Main",
                 SupportsNativeWrite: true,
                 WriteBlockReason: null,
                 WriteIncompatibilities: Array.Empty<string>(),
@@ -667,7 +672,7 @@ public sealed class NativeApfsBackendParsingTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: @"C:\fixtures\sample.apfs.img\Ufsd_Volumes\Main",
+            NativeVolumePath: @"C:\fixtures\sample.apfs.img\ApfsAccess_Volumes\Main",
             SupportsNativeWrite: true,
             WriteBlockReason: null,
             WriteIncompatibilities: Array.Empty<string>(),
@@ -717,7 +722,7 @@ public sealed class NativeApfsBackendParsingTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: @"\\.\PhysicalDrive5\Ufsd_Volumes\Main",
+            NativeVolumePath: @"\\.\PhysicalDrive5\ApfsAccess_Volumes\Main",
             SupportsNativeWrite: true,
             WriteBlockReason: null,
             WriteIncompatibilities: Array.Empty<string>(),
@@ -763,7 +768,7 @@ public sealed class NativeApfsBackendParsingTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: @"\\.\PhysicalDrive7\Ufsd_Volumes\Main",
+            NativeVolumePath: @"\\.\PhysicalDrive7\ApfsAccess_Volumes\Main",
             SupportsNativeWrite: true,
             WriteBlockReason: null,
             WriteIncompatibilities: Array.Empty<string>(),
@@ -815,7 +820,7 @@ public sealed class NativeApfsBackendParsingTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: @"C:\fixtures\sample.apfs.img\Ufsd_Volumes\Main",
+            NativeVolumePath: @"C:\fixtures\sample.apfs.img\ApfsAccess_Volumes\Main",
             SupportsNativeWrite: true,
             WriteBlockReason: null,
             WriteIncompatibilities: Array.Empty<string>(),
@@ -917,7 +922,7 @@ public sealed class NativeApfsBackendParsingTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: $@"{deviceId}\Ufsd_Volumes\Main",
+            NativeVolumePath: $@"{deviceId}\ApfsAccess_Volumes\Main",
             SupportsNativeWrite: true,
             WriteBlockReason: null,
             WriteIncompatibilities: Array.Empty<string>(),
@@ -1093,7 +1098,7 @@ public sealed class NativeApfsBackendParsingTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: @"\\.\PhysicalDrive3\Ufsd_Volumes\Main",
+            NativeVolumePath: @"\\.\PhysicalDrive3\ApfsAccess_Volumes\Main",
             SupportsNativeWrite: true,
             WriteBlockReason: null,
             WriteIncompatibilities: Array.Empty<string>(),
@@ -1152,7 +1157,7 @@ public sealed class NativeApfsBackendParsingTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: @"C:\fixtures\sample.apfs.img\Ufsd_Volumes\Main",
+            NativeVolumePath: @"C:\fixtures\sample.apfs.img\ApfsAccess_Volumes\Main",
             SupportsNativeWrite: true,
             WriteBlockReason: null,
             WriteIncompatibilities: Array.Empty<string>(),
@@ -1211,7 +1216,7 @@ public sealed class NativeApfsBackendParsingTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: @"\\.\PhysicalDrive5\Ufsd_Volumes\Main",
+            NativeVolumePath: @"\\.\PhysicalDrive5\ApfsAccess_Volumes\Main",
             SupportsNativeWrite: true,
             WriteBlockReason: null,
             WriteIncompatibilities: Array.Empty<string>(),
@@ -1274,7 +1279,7 @@ public sealed class NativeApfsBackendParsingTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: @"\\.\PhysicalDrive7\Ufsd_Volumes\Main",
+            NativeVolumePath: @"\\.\PhysicalDrive7\ApfsAccess_Volumes\Main",
             SupportsNativeWrite: true,
             WriteBlockReason: null,
             WriteIncompatibilities: Array.Empty<string>(),
@@ -1341,7 +1346,7 @@ public sealed class NativeApfsBackendParsingTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: @"\\.\PhysicalDrive17\Ufsd_Volumes\Main",
+            NativeVolumePath: @"\\.\PhysicalDrive17\ApfsAccess_Volumes\Main",
             SupportsNativeWrite: true,
             WriteBlockReason: null,
             WriteIncompatibilities: Array.Empty<string>(),
@@ -1406,7 +1411,7 @@ public sealed class NativeApfsBackendParsingTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: @"\\.\PhysicalDrive27\Ufsd_Volumes\Main",
+            NativeVolumePath: @"\\.\PhysicalDrive27\ApfsAccess_Volumes\Main",
             SupportsNativeWrite: true,
             WriteBlockReason: null,
             WriteIncompatibilities: Array.Empty<string>(),
@@ -1473,7 +1478,7 @@ public sealed class NativeApfsBackendParsingTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: @"\\.\PhysicalDrive8\Ufsd_Volumes\Main",
+            NativeVolumePath: @"\\.\PhysicalDrive8\ApfsAccess_Volumes\Main",
             SupportsNativeWrite: true,
             WriteBlockReason: null,
             WriteIncompatibilities: Array.Empty<string>(),
@@ -1539,7 +1544,7 @@ public sealed class NativeApfsBackendParsingTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: @"\\.\PhysicalDrive18\Ufsd_Volumes\Main",
+            NativeVolumePath: @"\\.\PhysicalDrive18\ApfsAccess_Volumes\Main",
             SupportsNativeWrite: true,
             WriteBlockReason: null,
             WriteIncompatibilities: Array.Empty<string>(),
@@ -1892,6 +1897,39 @@ public sealed class NativeApfsBackendParsingTests
     }
 
     [Fact]
+    public void GetFailClosedReasonForRuntimeStatus_IgnoresStaleReplayTelemetry_WhenCanonicalNativeStatusIsHealthy()
+    {
+        var status = CreateHostRuntimeStatusRaw(
+            writeBackend: "Native",
+            commitModel: NativeWriteCommitModel.CanonicalApfsCheckpoint,
+            nativeWriteReadiness: NativeWriteReadiness.CommitReady,
+            recoveryActive: false,
+            recoveryReason: null,
+            lastCommitXid: 1344,
+            nativeWriteSafetyState: NativeWriteSafetyState.PilotReadWrite,
+            lastRecoveryAction: null,
+            dirtyTransactionCount: 0,
+            nativeWriteValidationState: NativeWriteValidationState.CanonicalImageValidated,
+            commitBlobMagic: "APFSRWCANON3",
+            canonicalPathActive: true,
+            canonicalGateFailure: null);
+        SetHostRuntimeStatusReplayTelemetry(
+            status,
+            replayCheckpointCandidatePresent: true,
+            replayCheckpointPendingWindow: false);
+
+        Assert.Null(
+            InvokeGetFailClosedReasonForRuntimeStatus(
+                status,
+                "FailClosed",
+                128,
+                isFixtureImage: false,
+                disallowScaffoldCommitOnNonFixture: true,
+                rejectScaffoldReplayBlobOnNonFixture: true,
+                requireCanonicalReplayCandidateOnNonFixture: true));
+    }
+
+    [Fact]
     public void GetFailClosedReasonForRuntimeStatus_PrioritizesNonFixtureCanonicalSafetySignalsOverGenericRecoveryReason()
     {
         var fixtureCompatibilityStatus = CreateHostRuntimeStatusRaw(
@@ -1997,6 +2035,37 @@ public sealed class NativeApfsBackendParsingTests
                 disallowScaffoldCommitOnNonFixture: false,
                 rejectScaffoldReplayBlobOnNonFixture: false,
                 requireCanonicalReplayCandidateOnNonFixture: false));
+    }
+
+    [Fact]
+    public void GetFailClosedReasonForRuntimeStatus_PreservesIntegrityAllocationMapReason_OnNonFixture()
+    {
+        var status = CreateHostRuntimeStatusRaw(
+            writeBackend: "Native",
+            commitModel: NativeWriteCommitModel.CanonicalApfsCheckpoint,
+            nativeWriteReadiness: NativeWriteReadiness.RecoveryMode,
+            recoveryActive: true,
+            recoveryReason: "IntegrityMissingAllocationMap",
+            lastCommitXid: 1452,
+            nativeWriteSafetyState: NativeWriteSafetyState.RecoveryBlocked,
+            lastRecoveryAction: "BootstrapIntegrityMissingAllocationMap",
+            dirtyTransactionCount: 0,
+            nativeWriteValidationState: NativeWriteValidationState.CanonicalImageValidated,
+            fixtureCompatibilityPathActive: false,
+            usesScaffoldCommitBlob: false,
+            canonicalPathActive: null,
+            canonicalGateFailure: null);
+
+        Assert.Equal(
+            "IntegrityMissingAllocationMap",
+            InvokeGetFailClosedReasonForRuntimeStatus(
+                status,
+                "FailClosed",
+                128,
+                isFixtureImage: false,
+                disallowScaffoldCommitOnNonFixture: true,
+                rejectScaffoldReplayBlobOnNonFixture: true,
+                requireCanonicalReplayCandidateOnNonFixture: true));
     }
 
     [Fact]
@@ -2902,7 +2971,7 @@ public sealed class NativeApfsBackendParsingTests
             SupportsReadWrite: true,
             IsEncrypted: false,
             SupportsExplorerMount: true,
-            NativeVolumePath: @"C:\fixtures\sample.apfs.img\Ufsd_Volumes\Main",
+            NativeVolumePath: @"C:\fixtures\sample.apfs.img\ApfsAccess_Volumes\Main",
             SupportsNativeWrite: true,
             WriteBlockReason: null,
             WriteIncompatibilities: Array.Empty<string>(),

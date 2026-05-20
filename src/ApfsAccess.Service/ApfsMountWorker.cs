@@ -12,6 +12,8 @@ public sealed class ApfsMountWorker : BackgroundService
     private readonly RuntimeStatusPublisher _statusPublisher;
     private readonly IOptionsMonitor<ServiceHostOptions> _optionsMonitor;
     private readonly HashSet<string> _mountedOnce = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _userEjectedVolumeIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly SemaphoreSlim _mountOperationLock = new(1, 1);
     private static readonly HashSet<string> ValidationEvidenceRecoveryReasons = new(StringComparer.OrdinalIgnoreCase)
     {
         "ValidationEvidenceInsufficient",
@@ -31,6 +33,10 @@ public sealed class ApfsMountWorker : BackgroundService
     private static readonly string[] ExplicitCanonicalGateRecoveryReasons =
     [
         "CanonicalStateNotLoaded",
+        "CanonicalVolumeStateLoadFailed",
+        "CanonicalObjectMapStateInvalid",
+        "CanonicalSpacemanStateInvalid",
+        "CanonicalVolumeTreeStateInvalid",
         "NativeWriteNotReady",
         "WriteDeviceNotAllowed",
         "CommitPathNotReady",
@@ -40,6 +46,7 @@ public sealed class ApfsMountWorker : BackgroundService
     ];
     private static readonly string[] HighPriorityReplayRecoveryReasons =
     [
+        "IntegrityMissingAllocationMap",
         "ReplayCheckpointPendingWindow",
         "ReplayCheckpointNotPendingWindow",
         "ReplayCanonicalCandidateMissing",
@@ -123,6 +130,19 @@ public sealed class ApfsMountWorker : BackgroundService
 
     private async Task RunCycleAsync(CancellationToken cancellationToken)
     {
+        await _mountOperationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await RunCycleCoreAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _mountOperationLock.Release();
+        }
+    }
+
+    private async Task RunCycleCoreAsync(CancellationToken cancellationToken)
+    {
         var options = _optionsMonitor.CurrentValue;
         var warnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var compatibilityWarnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -170,6 +190,14 @@ public sealed class ApfsMountWorker : BackgroundService
                     );
                 }
             }
+        }
+
+        var disconnectedEjectedVolumes = _userEjectedVolumeIds
+            .Where(volumeId => !discoveredVolumeById.ContainsKey(volumeId))
+            .ToArray();
+        foreach (var volumeId in disconnectedEjectedVolumes)
+        {
+            _userEjectedVolumeIds.Remove(volumeId);
         }
 
         var mounted = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
@@ -228,6 +256,12 @@ public sealed class ApfsMountWorker : BackgroundService
                 continue;
             }
 
+            if (_userEjectedVolumeIds.Contains(volume.VolumeId))
+            {
+                warnings.Add($"'{volume.VolumeName}' is safely ejected; unplug and reinsert it to mount again.");
+                continue;
+            }
+
             if (!options.NativeAutoRemountOnReconnect && _mountedOnce.Contains(volume.VolumeId))
             {
                 warnings.Add($"Auto-remount disabled for '{volume.VolumeName}' after prior disconnect.");
@@ -269,6 +303,45 @@ public sealed class ApfsMountWorker : BackgroundService
 
         var refreshedMounts = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
         PublishFromMounts(refreshedMounts, firstMountError, warnings, compatibilityWarnings);
+    }
+
+    public async Task<(bool Success, string Message)> EjectAllAsync(CancellationToken cancellationToken)
+    {
+        await _mountOperationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var warnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var mountedBeforeEject = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+            await UnmountAllAsync(cancellationToken, warnings).ConfigureAwait(false);
+            var remaining = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+            var remainingIds = remaining.Select(static x => x.VolumeId).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var mount in mountedBeforeEject)
+            {
+                if (!remainingIds.Contains(mount.VolumeId))
+                {
+                    _userEjectedVolumeIds.Add(mount.VolumeId);
+                }
+            }
+            PublishFromMounts(remaining, null, warnings, Array.Empty<string>());
+
+            if (remaining.Count == 0 && warnings.Count == 0)
+            {
+                return (true, "All APFS drives were safely ejected.");
+            }
+
+            if (remaining.Count == 0)
+            {
+                return (false, string.Join(" ", warnings));
+            }
+
+            var stillMounted = string.Join(", ", remaining.Select(static x => x.MountPoint));
+            var detail = warnings.Count == 0 ? string.Empty : $" {string.Join(" ", warnings)}";
+            return (false, $"Some APFS drives are still mounted: {stillMounted}.{detail}");
+        }
+        finally
+        {
+            _mountOperationLock.Release();
+        }
     }
 
     private async Task<(bool Success, string? Error, string? Warning, string? CompatibilityWarning)> TryMountAsync(
@@ -768,6 +841,7 @@ public sealed class ApfsMountWorker : BackgroundService
             "PersistentStateLoadFailed" => "persistent state could not be loaded for native write",
             "RootStateInvalid" => "root inode/path state failed validation",
             "IntegrityCheckFailedOnMount" => "mount-time integrity checks failed",
+            "IntegrityMissingAllocationMap" => "APFS allocation map proof is missing for physical-media write mode",
             "PersistentStateAheadOfSuperblock" => "persistent state checkpoint is ahead of superblock checkpoint and requires replay",
             "PersistentStateBehindSuperblock" => "persistent state checkpoint is behind superblock checkpoint and requires conservative recovery",
             "RecoveryLoadVolumeStateFailed" => "recovery could not load volume state",
@@ -788,6 +862,10 @@ public sealed class ApfsMountWorker : BackgroundService
             "RecoveryRequired" => "native recovery is required before writes can continue",
             "CanonicalPathNotActive" => "canonical path proof was missing (no explicit canonicalPathActive=true signal)",
             "CanonicalStateNotLoaded" => "canonical state was not fully loaded and canonical gate blocked writable mode",
+            "CanonicalVolumeStateLoadFailed" => "canonical volume state could not be loaded for writable mode",
+            "CanonicalObjectMapStateInvalid" => "canonical object-map state failed validation for writable mode",
+            "CanonicalSpacemanStateInvalid" => "canonical spaceman/free-space state failed validation for writable mode",
+            "CanonicalVolumeTreeStateInvalid" => "canonical volume tree state failed validation for writable mode",
             "NativeWriteNotReady" => "native write path was not ready and canonical gate blocked writable mode",
             "WriteDeviceNotAllowed" => "device was not allow-listed for canonical writable mode",
             "CommitPathNotReady" => "commit-path readiness failed canonical gate checks",

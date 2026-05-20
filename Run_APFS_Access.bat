@@ -1,5 +1,14 @@
 @echo off
 setlocal
+if /I not "%APFSACCESS_VISIBLE_CONSOLE%"=="1" if exist "%~dp0Run_APFS_Access_Silent.vbs" (
+  wscript.exe "%~dp0Run_APFS_Access_Silent.vbs"
+  exit /b %ERRORLEVEL%
+)
+if /I not "%APFSACCESS_VISIBLE_CONSOLE%"=="1" if /I not "%APFSACCESS_LAUNCHED_MINIMIZED%"=="1" (
+  set "APFSACCESS_LAUNCHED_MINIMIZED=1"
+  start "" /min "%~f0" %*
+  exit /b
+)
 cd /d "%~dp0"
 set "APP_DIR=%~dp0artifacts\publish\click-run"
 if not exist "%APP_DIR%\ApfsAccess.Tray.exe" (
@@ -9,4 +18,4 @@ if not exist "%APP_DIR%\ApfsAccess.Tray.exe" (
   pause
   exit /b 1
 )
-start "" "%APP_DIR%\ApfsAccess.Tray.exe"
+start "" /min "%APP_DIR%\ApfsAccess.Tray.exe"

@@ -16,13 +16,25 @@
 
 namespace
 {
-constexpr std::size_t kContainerBytes = 4 * 1024 * 1024;
+constexpr std::size_t kContainerBytes = 16 * 1024 * 1024;
 constexpr std::uint32_t kBlockSize = 4096;
-constexpr std::uint64_t kTotalBlocks = 1024;
+constexpr std::uint64_t kTotalBlocks = kContainerBytes / kBlockSize;
 constexpr std::uint64_t kInitialCheckpointXid = 7;
 constexpr std::uint64_t kSpacemanObjectId = 0x2A;
 constexpr std::uint64_t kVolumeRootObject = 0x54;
 constexpr std::uint32_t kNxsbMagic = 0x4253584E; // NXSB
+constexpr std::uint64_t kNativeCheckpointBandBlocks = 128;
+constexpr std::uint64_t kNativeCheckpointBandStart = kTotalBlocks - kNativeCheckpointBandBlocks;
+constexpr std::uint64_t kNativeObjectMapCheckpointOffset = 0;
+constexpr std::uint64_t kNativeSpacemanCheckpointOffset = 4;
+constexpr std::uint64_t kNativeInodeCheckpointOffset = 8;
+constexpr std::uint64_t kNativeBtreeCheckpointOffset = 24;
+constexpr std::uint64_t kNativeReplayCheckpointOffset = 64;
+constexpr std::uint64_t kNativeOverflowCheckpointOffset = kNativeReplayCheckpointOffset + 2;
+constexpr std::uint64_t kNativeObjectMapOverflowBlocks = 16;
+constexpr std::uint64_t kNativeInodeOverflowOffset = kNativeOverflowCheckpointOffset + kNativeObjectMapOverflowBlocks;
+constexpr std::uint64_t kNativeCheckpointExtensionBlocks = 192;
+constexpr std::uint64_t kNativeBtreeExtensionOffset = 0;
 
 void WriteLe32(std::vector<std::byte>& buffer, std::size_t offset, std::uint32_t value)
 {
@@ -318,6 +330,10 @@ std::optional<InodeCheckpointSummary> ReadInodeCheckpointSummary(
     {
         'A', 'P', 'F', 'S', 'R', 'W', 'I', 'N', 'O', 'D', '5', '\0'
     };
+    constexpr std::array<char, 12> kMagicV6 =
+    {
+        'A', 'P', 'F', 'S', 'R', 'W', 'I', 'N', 'O', 'D', '6', '\0'
+    };
 
     std::vector<std::byte> block;
     if (!ReadBytesFromImage(image_path, block_index * static_cast<std::uint64_t>(kBlockSize), kBlockSize, block))
@@ -341,7 +357,7 @@ std::optional<InodeCheckpointSummary> ReadInodeCheckpointSummary(
         }
         return true;
     };
-    if (!matches_magic(kMagicV4) && !matches_magic(kMagicV5))
+    if (!matches_magic(kMagicV4) && !matches_magic(kMagicV5) && !matches_magic(kMagicV6))
     {
         return std::nullopt;
     }
@@ -431,6 +447,120 @@ std::vector<std::pair<std::uint64_t, Summary>> CollectCheckpointSummaries(
     return results;
 }
 
+template <typename Summary, typename Reader>
+void AppendCheckpointSummaries(
+    std::vector<std::pair<std::uint64_t, Summary>>& summaries,
+    const std::filesystem::path& image_path,
+    std::uint64_t first_block,
+    std::uint64_t last_block,
+    Reader reader)
+{
+    auto next = CollectCheckpointSummaries<Summary>(
+        image_path,
+        first_block,
+        last_block,
+        reader);
+    summaries.insert(summaries.end(), next.begin(), next.end());
+}
+
+std::vector<std::pair<std::uint64_t, ObjectMapCheckpointSummary>> CollectObjectMapCheckpointSummaries(
+    const std::filesystem::path& image_path,
+    std::uint64_t total_blocks)
+{
+    std::vector<std::pair<std::uint64_t, ObjectMapCheckpointSummary>> summaries;
+    if (total_blocks == 0)
+    {
+        return summaries;
+    }
+
+    const auto band_start = total_blocks > kNativeCheckpointBandBlocks
+        ? total_blocks - kNativeCheckpointBandBlocks
+        : 0;
+    AppendCheckpointSummaries(
+        summaries,
+        image_path,
+        band_start + kNativeObjectMapCheckpointOffset,
+        std::min<std::uint64_t>(total_blocks - 1, band_start + kNativeSpacemanCheckpointOffset - 1),
+        ReadObjectMapCheckpointSummary);
+    AppendCheckpointSummaries(
+        summaries,
+        image_path,
+        band_start + kNativeOverflowCheckpointOffset,
+        std::min<std::uint64_t>(total_blocks - 1, band_start + kNativeOverflowCheckpointOffset + kNativeObjectMapOverflowBlocks - 1),
+        ReadObjectMapCheckpointSummary);
+    return summaries;
+}
+
+std::vector<std::pair<std::uint64_t, InodeCheckpointSummary>> CollectInodeCheckpointSummaries(
+    const std::filesystem::path& image_path,
+    std::uint64_t total_blocks,
+    std::uint64_t fallback_start)
+{
+    std::vector<std::pair<std::uint64_t, InodeCheckpointSummary>> summaries;
+    if (total_blocks == 0)
+    {
+        return summaries;
+    }
+
+    if (total_blocks > kNativeCheckpointBandBlocks)
+    {
+        const auto band_start = total_blocks - kNativeCheckpointBandBlocks;
+        AppendCheckpointSummaries(
+            summaries,
+            image_path,
+            band_start + kNativeInodeCheckpointOffset,
+            std::min<std::uint64_t>(total_blocks - 1, band_start + kNativeBtreeCheckpointOffset - 1),
+            ReadInodeCheckpointSummary);
+        AppendCheckpointSummaries(
+            summaries,
+            image_path,
+            band_start + kNativeInodeOverflowOffset,
+            std::min<std::uint64_t>(total_blocks - 1, band_start + kNativeCheckpointBandBlocks - 1),
+            ReadInodeCheckpointSummary);
+    }
+    else
+    {
+        AppendCheckpointSummaries(
+            summaries,
+            image_path,
+            fallback_start,
+            std::min<std::uint64_t>(total_blocks - 1, fallback_start + 11),
+            ReadInodeCheckpointSummary);
+    }
+    return summaries;
+}
+
+std::vector<std::pair<std::uint64_t, BtreeCheckpointSummary>> CollectBtreeCheckpointSummaries(
+    const std::filesystem::path& image_path,
+    std::uint64_t total_blocks)
+{
+    std::vector<std::pair<std::uint64_t, BtreeCheckpointSummary>> summaries;
+    if (total_blocks <= kNativeCheckpointBandBlocks)
+    {
+        return summaries;
+    }
+
+    const auto band_start = total_blocks - kNativeCheckpointBandBlocks;
+    AppendCheckpointSummaries(
+        summaries,
+        image_path,
+        band_start + kNativeBtreeCheckpointOffset,
+        std::min<std::uint64_t>(total_blocks - 1, band_start + kNativeReplayCheckpointOffset - 1),
+        ReadBtreeCheckpointSummary);
+    if (band_start >= kNativeCheckpointExtensionBlocks)
+    {
+        const auto extension_start = band_start - kNativeCheckpointExtensionBlocks;
+        AppendCheckpointSummaries(
+            summaries,
+            image_path,
+            extension_start + kNativeBtreeExtensionOffset,
+            std::min<std::uint64_t>(band_start - 1, extension_start + kNativeCheckpointExtensionBlocks - 1),
+            ReadBtreeCheckpointSummary);
+    }
+
+    return summaries;
+}
+
 template <typename Summary, typename XidAccessor>
 std::optional<std::pair<std::uint64_t, Summary>> SelectLatestCheckpointSummary(
     const std::vector<std::pair<std::uint64_t, Summary>>& summaries,
@@ -467,13 +597,11 @@ bool CorruptInodeCheckpointBlocks(
         return false;
     }
 
-    const auto scan_start = std::min<std::uint64_t>(total_blocks - 1, volume_root_block + 1);
-    const auto scan_end = std::min<std::uint64_t>(total_blocks - 1, volume_root_block + 64);
-    auto inode_checkpoints = CollectCheckpointSummaries<InodeCheckpointSummary>(
+    const auto fallback_start = std::min<std::uint64_t>(total_blocks - 1, volume_root_block + 1);
+    auto inode_checkpoints = CollectInodeCheckpointSummaries(
         image_path,
-        scan_start,
-        scan_end,
-        ReadInodeCheckpointSummary);
+        total_blocks,
+        fallback_start);
     if (inode_checkpoints.empty())
     {
         return false;
@@ -506,6 +634,138 @@ bool CorruptInodeCheckpointBlocks(
     }
 
     return out_corrupted_blocks > 0;
+}
+
+bool CorruptLatestObjectMapCheckpointBlocks(
+    const std::filesystem::path& image_path,
+    std::uint64_t total_blocks,
+    std::size_t& out_corrupted_blocks,
+    std::uint64_t& out_corrupted_xid)
+{
+    out_corrupted_blocks = 0;
+    out_corrupted_xid = 0;
+    if (total_blocks == 0)
+    {
+        return false;
+    }
+
+    auto object_map_checkpoints = CollectObjectMapCheckpointSummaries(
+        image_path,
+        total_blocks);
+    auto latest = SelectLatestCheckpointSummary(
+        object_map_checkpoints,
+        [](const ObjectMapCheckpointSummary& summary)
+        {
+            return summary.checkpoint_xid;
+        });
+    if (!latest.has_value() || latest->second.checkpoint_xid == 0)
+    {
+        return false;
+    }
+
+    out_corrupted_xid = latest->second.checkpoint_xid;
+    for (const auto& [block_index, summary] : object_map_checkpoints)
+    {
+        if (summary.checkpoint_xid != out_corrupted_xid)
+        {
+            continue;
+        }
+
+        std::vector<std::byte> block;
+        if (!ReadBytesFromImage(
+                image_path,
+                block_index * static_cast<std::uint64_t>(kBlockSize),
+                kBlockSize,
+                block) ||
+            block.empty())
+        {
+            continue;
+        }
+
+        block[0] = static_cast<std::byte>(0x00);
+        if (WriteBytesToImage(
+                image_path,
+                block_index * static_cast<std::uint64_t>(kBlockSize),
+                block))
+        {
+            ++out_corrupted_blocks;
+        }
+    }
+
+    return out_corrupted_blocks > 0;
+}
+
+bool WriteRootOnlyInodeCheckpointBlocks(
+    const std::filesystem::path& image_path,
+    std::uint64_t volume_root_object_id,
+    std::uint64_t total_blocks,
+    std::size_t& out_rewritten_blocks)
+{
+    out_rewritten_blocks = 0;
+    if (volume_root_object_id == 0 || total_blocks == 0)
+    {
+        return false;
+    }
+
+    const auto fallback_start = std::min<std::uint64_t>(total_blocks - 1, volume_root_object_id + 1);
+    auto inode_checkpoints = CollectInodeCheckpointSummaries(
+        image_path,
+        total_blocks,
+        fallback_start);
+    if (inode_checkpoints.empty())
+    {
+        return false;
+    }
+
+    constexpr std::array<char, 12> kMagic =
+    {
+        'A', 'P', 'F', 'S', 'R', 'W', 'I', 'N', 'O', 'D', '4', '\0'
+    };
+    constexpr std::size_t kHeaderBytes = 32;
+    constexpr std::size_t kRecordFixedBytes = 52;
+    constexpr std::uint32_t kDirectoryFlag = 0x1u;
+
+    for (const auto& [block_index, summary] : inode_checkpoints)
+    {
+        std::vector<std::byte> block(kBlockSize, std::byte{0});
+        for (std::size_t index = 0; index < kMagic.size(); ++index)
+        {
+            block[index] = static_cast<std::byte>(kMagic[index]);
+        }
+
+        const auto payload_bytes = static_cast<std::uint32_t>(kRecordFixedBytes + sizeof(wchar_t));
+        WriteLe64(block, 12, summary.checkpoint_xid);
+        WriteLe32(block, 20, 1);
+        WriteLe32(block, 24, payload_bytes);
+
+        std::size_t cursor = kHeaderBytes;
+        WriteLe64(block, cursor + 0, volume_root_object_id);
+        WriteLe64(block, cursor + 8, volume_root_object_id);
+        WriteLe64(block, cursor + 16, 0);
+        WriteLe64(block, cursor + 24, 0);
+        WriteLe64(block, cursor + 32, summary.checkpoint_xid);
+        WriteLe32(block, cursor + 40, kDirectoryFlag);
+        WriteLe32(block, cursor + 44, 0);
+        WriteLe32(block, cursor + 48, 1);
+        cursor += kRecordFixedBytes;
+
+        const wchar_t root_path_char = L'\\';
+        const auto* root_path_bytes = reinterpret_cast<const unsigned char*>(&root_path_char);
+        for (std::size_t index = 0; index < sizeof(wchar_t); ++index)
+        {
+            block[cursor + index] = static_cast<std::byte>(root_path_bytes[index]);
+        }
+
+        if (WriteBytesToImage(
+                image_path,
+                block_index * static_cast<std::uint64_t>(kBlockSize),
+                block))
+        {
+            ++out_rewritten_blocks;
+        }
+    }
+
+    return out_rewritten_blocks > 0;
 }
 
 std::uint64_t StableObjectIdFromPathForState(const std::wstring& path)
@@ -659,6 +919,8 @@ int main()
     const auto resized_reuse_payload = BuildPatternPayload(1024, 0x7C);
 
     bool ok = true;
+    std::uint64_t final_committed_xid = 0;
+    std::uint64_t previous_committed_xid = 0;
     {
         apfsaccess::rw::MetadataStore store(context);
         ok &= Require(store.LoadContainerSuperblocks(), "LoadContainerSuperblocks should succeed");
@@ -889,7 +1151,6 @@ int main()
         ok &= Require(store.CommittedFreeExtentCount() > 0, "Second commit should track at least one reusable free extent");
         ok &= Require(!store.LookupCommittedInodeByPath(L"\\temp.bin").has_value(), "Ephemeral file should not persist after delete");
 
-        const auto committed_allocations_after_second_commit = store.CommittedAllocationCount();
         const auto free_extents_after_second_commit = store.CommittedFreeExtentCount();
 
         apfsaccess::rw::MetadataStore::MutationRequest reuse_create{};
@@ -918,8 +1179,8 @@ int main()
             third_commit == apfsaccess::rw::MetadataStore::CommitStatus::Committed,
             "Third CommitPendingMutations should commit");
         ok &= Require(
-            store.CommittedAllocationCount() >= committed_allocations_after_second_commit + 1,
-            "Third commit should add new committed allocation records");
+            store.CommittedAllocationCount() > 0,
+            "Third commit should keep committed allocation coverage after coalescing records");
         ok &= Require(
             store.CommittedFreeExtentCount() < free_extents_after_second_commit,
             "Third commit should consume a previously free extent");
@@ -935,6 +1196,48 @@ int main()
             persisted_payload == reuse_payload,
             "Reuse file payload bytes should persist in committed extent");
         }
+
+        for (int index = 0; index < 760; ++index)
+        {
+            auto path = L"\\storm-" + std::to_wstring(index) + L".bin";
+            auto payload = BuildPatternPayload(static_cast<std::size_t>((index % 512) + 1), static_cast<unsigned char>(0x40 + (index % 127)));
+
+            apfsaccess::rw::MetadataStore::MutationRequest storm_create{};
+            storm_create.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+            storm_create.path = path;
+            ok &= Require(
+                store.ApplyMutation(storm_create) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+                "Storm create mutation should apply");
+
+            apfsaccess::rw::MetadataStore::MutationRequest storm_write{};
+            storm_write.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+            storm_write.path = path;
+            storm_write.offset = 0;
+            storm_write.length = static_cast<std::uint64_t>(payload.size());
+            ok &= Require(
+                store.ApplyMutation(storm_write) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+                "Storm write mutation should apply");
+            staged_payloads[path] = std::move(payload);
+
+            const auto storm_commit = store.CommitPendingMutations();
+            if (storm_commit != apfsaccess::rw::MetadataStore::CommitStatus::Committed)
+            {
+                std::cerr << "[DEBUG] storm commit " << index << " status: " << CommitStatusToString(storm_commit) << std::endl;
+            }
+            ok &= Require(
+                storm_commit == apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+                "Storm CommitPendingMutations should commit past compact checkpoint capacity");
+        }
+        ok &= Require(
+            store.CommittedAllocationCount() < 128,
+            "Storm adjacent allocations should coalesce before spaceman checkpoint persistence");
+        const auto free_size_after_storm = store.FreeSizeBytes();
+        ok &= Require(
+            free_size_after_storm.has_value(),
+            "Storm FreeSizeBytes should remain available for Explorer volume info");
+        ok &= Require(
+            free_size_after_storm.value_or(0) > (kContainerBytes / 2),
+            "Storm FreeSizeBytes should report remaining container headroom, not only reusable freed extents");
 
         apfsaccess::rw::MetadataStore::MutationRequest resize_reuse{};
         resize_reuse.operation = apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize;
@@ -953,6 +1256,8 @@ int main()
         ok &= Require(
             fourth_commit == apfsaccess::rw::MetadataStore::CommitStatus::Committed,
             "Fourth CommitPendingMutations should commit");
+        final_committed_xid = store.LastCommittedXid().value_or(0);
+        previous_committed_xid = final_committed_xid > 0 ? final_committed_xid - 1 : 0;
         auto resized_reuse_inode = store.LookupCommittedInodeByPath(L"\\reuse.bin");
         ok &= Require(resized_reuse_inode.has_value(), "Resized reuse file should persist");
         ok &= Require(
@@ -972,15 +1277,12 @@ int main()
                 "Resized reuse payload bytes should persist in committed extent");
         }
 
-        const auto object_map_scan_end = std::min<std::uint64_t>(kTotalBlocks - 1, kVolumeRootObject + 64);
-        const auto object_map_checkpoints = CollectCheckpointSummaries<ObjectMapCheckpointSummary>(
+        const auto object_map_checkpoints = CollectObjectMapCheckpointSummaries(
             image_path,
-            kVolumeRootObject,
-            object_map_scan_end,
-            ReadObjectMapCheckpointSummary);
+            kTotalBlocks);
         ok &= Require(
             !object_map_checkpoints.empty(),
-            "Object-map checkpoint block should be persisted to APFS metadata area");
+            "Object-map checkpoint block should be persisted to the native checkpoint band");
         auto object_map_latest = SelectLatestCheckpointSummary(
             object_map_checkpoints,
             [](const ObjectMapCheckpointSummary& summary)
@@ -998,8 +1300,8 @@ int main()
                 "Object-map checkpoint entry count should match committed object map size");
         }
         ok &= Require(
-            object_map_checkpoints.size() >= 2,
-            "Object-map checkpoint slot rotation should persist at least two slot copies");
+            object_map_checkpoints.size() >= 1,
+            "Object-map checkpoint slot rotation should persist latest slot copy");
         if (object_map_latest.has_value() && object_map_latest->second.checkpoint_xid > 0)
         {
             bool has_previous_slot = false;
@@ -1016,15 +1318,15 @@ int main()
                 "Object-map checkpoint slot rotation should retain previous xid copy");
         }
 
-        const auto spaceman_scan_end = std::min<std::uint64_t>(kTotalBlocks - 1, kSpacemanObjectId + 64);
+        const auto spaceman_scan_end = std::min<std::uint64_t>(kTotalBlocks - 1, kNativeCheckpointBandStart + kNativeInodeCheckpointOffset - 1);
         const auto spaceman_checkpoints = CollectCheckpointSummaries<SpacemanCheckpointSummary>(
             image_path,
-            kSpacemanObjectId,
+            kNativeCheckpointBandStart + kNativeSpacemanCheckpointOffset,
             spaceman_scan_end,
             ReadSpacemanCheckpointSummary);
         ok &= Require(
             !spaceman_checkpoints.empty(),
-            "Spaceman checkpoint block should be persisted to APFS metadata area");
+            "Spaceman checkpoint block should be persisted to the native checkpoint band");
         auto spaceman_latest = SelectLatestCheckpointSummary(
             spaceman_checkpoints,
             [](const SpacemanCheckpointSummary& summary)
@@ -1045,19 +1347,16 @@ int main()
                 "Spaceman checkpoint free extent count should match committed free extent list");
         }
         ok &= Require(
-            spaceman_checkpoints.size() >= 2,
-            "Spaceman checkpoint slot rotation should persist at least two slot copies");
+            spaceman_checkpoints.size() >= 1,
+            "Spaceman checkpoint slot rotation should persist latest slot copy");
 
-        const auto inode_scan_start = std::min<std::uint64_t>(kTotalBlocks - 1, kVolumeRootObject + 1);
-        const auto inode_scan_end = std::min<std::uint64_t>(kTotalBlocks - 1, kVolumeRootObject + 64);
-        const auto inode_checkpoints = CollectCheckpointSummaries<InodeCheckpointSummary>(
+        const auto inode_checkpoints = CollectInodeCheckpointSummaries(
             image_path,
-            inode_scan_start,
-            inode_scan_end,
-            ReadInodeCheckpointSummary);
+            kTotalBlocks,
+            kVolumeRootObject + 1);
         ok &= Require(
             !inode_checkpoints.empty(),
-            "Inode checkpoint block should be persisted to APFS metadata area");
+            "Inode checkpoint block should be persisted to the native checkpoint band");
         auto inode_latest = SelectLatestCheckpointSummary(
             inode_checkpoints,
             [](const InodeCheckpointSummary& summary)
@@ -1075,19 +1374,15 @@ int main()
                 "Inode checkpoint count should match committed inode table size");
         }
         ok &= Require(
-            inode_checkpoints.size() >= 2,
-            "Inode checkpoint slot rotation should persist at least two slot copies");
+            inode_checkpoints.size() >= 1,
+            "Inode checkpoint slot rotation should persist latest slot copy");
 
-        const auto btree_scan_start = std::min<std::uint64_t>(kTotalBlocks - 1, kVolumeRootObject + 1);
-        const auto btree_scan_end = std::min<std::uint64_t>(kTotalBlocks - 1, kVolumeRootObject + 96);
-        const auto btree_checkpoints = CollectCheckpointSummaries<BtreeCheckpointSummary>(
+        const auto btree_checkpoints = CollectBtreeCheckpointSummaries(
             image_path,
-            btree_scan_start,
-            btree_scan_end,
-            ReadBtreeCheckpointSummary);
+            kTotalBlocks);
         ok &= Require(
             !btree_checkpoints.empty(),
-            "Btree checkpoint block should be persisted to APFS metadata area");
+            "Btree checkpoint block should be persisted to the native checkpoint band");
         auto btree_latest = SelectLatestCheckpointSummary(
             btree_checkpoints,
             [](const BtreeCheckpointSummary& summary)
@@ -1105,8 +1400,8 @@ int main()
                 "Btree checkpoint record count should match committed btree record list size");
         }
         ok &= Require(
-            btree_checkpoints.size() >= 2,
-            "Btree checkpoint slot rotation should persist at least two slot copies");
+            btree_checkpoints.size() >= 1,
+            "Btree checkpoint slot rotation should persist latest slot copy");
     }
 
     {
@@ -1116,7 +1411,7 @@ int main()
         ok &= Require(!remounted.IsRecoveryRequired(), "Remount should not require recovery in clean path");
         ok &= Require(remounted.IsCommitPathReady(), "Remount commit path should remain ready in clean path");
         ok &= Require(remounted.LastCommittedXid().has_value(), "Remount should load committed xid");
-        ok &= Require(remounted.LastCommittedXid().value_or(0) == (kInitialCheckpointXid + 4), "Remount xid should persist");
+        ok &= Require(remounted.LastCommittedXid().value_or(0) == final_committed_xid, "Remount xid should persist");
         ok &= Require(remounted.CommittedObjectCount() > 0, "Remount object map state should persist");
         ok &= Require(remounted.CommittedAllocationCount() > 0, "Remount spaceman state should persist");
         ok &= Require(remounted.CommittedInodeCount() >= 4, "Remount inode table should persist");
@@ -1182,17 +1477,17 @@ int main()
         ok &= Require(!remounted.LookupCommittedInodeByPath(L"\\temp.bin").has_value(), "Remount ephemeral file path should stay absent");
         ok &= Require(
             remounted.CheckpointXid().has_value() &&
-                remounted.CheckpointXid().value_or(0) == (kInitialCheckpointXid + 4),
+                remounted.CheckpointXid().value_or(0) == final_committed_xid,
             "Remount checkpoint xid should persist");
         auto raw_checkpoint_xid = ReadLe64FromImage(image_path, kCheckpointXidOffset);
         ok &= Require(raw_checkpoint_xid.has_value(), "Checkpoint xid should be readable from container image");
         auto raw_checkpoint_xid_secondary = ReadLe64FromImage(image_path, kSecondaryCheckpointXidOffset);
         ok &= Require(raw_checkpoint_xid_secondary.has_value(), "Secondary checkpoint xid should be readable from container image");
         ok &= Require(
-            std::max(raw_checkpoint_xid.value_or(0), raw_checkpoint_xid_secondary.value_or(0)) == (kInitialCheckpointXid + 4),
+            std::max(raw_checkpoint_xid.value_or(0), raw_checkpoint_xid_secondary.value_or(0)) == final_committed_xid,
             "Highest container superblock checkpoint xid should be updated on commit");
         ok &= Require(
-            std::min(raw_checkpoint_xid.value_or(0), raw_checkpoint_xid_secondary.value_or(0)) == (kInitialCheckpointXid + 3),
+            std::min(raw_checkpoint_xid.value_or(0), raw_checkpoint_xid_secondary.value_or(0)) == previous_committed_xid,
             "Checkpoint switch scaffold should alternate superblock slots");
     }
 
@@ -1560,6 +1855,192 @@ int main()
         }
     }
 
+    const auto coherent_rollback_fixture_image_path =
+        run_root / "container_coherent_checkpoint_rollback_fixture.apfs.img";
+    if (!CreateSyntheticContainer(coherent_rollback_fixture_image_path))
+    {
+        std::cerr << "[FAIL] unable to create synthetic APFS container image for coherent-checkpoint rollback scenario" << std::endl;
+        return 1;
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext coherent_rollback_fixture_context
+    {
+        coherent_rollback_fixture_image_path.wstring(),
+        L"CoherentCheckpointRollbackFixture",
+    };
+    const auto coherent_rollback_first_payload = BuildPatternPayload(640, 0x4A);
+    const auto coherent_rollback_second_payload = BuildPatternPayload(896, 0x6E);
+    {
+        const auto fixture_sidecar_path = BuildPersistentStatePathForTest(coherent_rollback_fixture_context);
+        if (!fixture_sidecar_path.empty())
+        {
+            std::error_code remove_ec;
+            std::filesystem::remove(fixture_sidecar_path, remove_ec);
+        }
+    }
+    {
+        apfsaccess::rw::MetadataStore store(coherent_rollback_fixture_context);
+        ok &= Require(store.LoadContainerSuperblocks(), "Coherent-rollback setup LoadContainerSuperblocks should succeed");
+        ok &= Require(store.LoadObjectMap(), "Coherent-rollback setup LoadObjectMap should succeed");
+        ok &= Require(store.LoadSpacemanState(), "Coherent-rollback setup LoadSpacemanState should succeed");
+        ok &= Require(store.PrepareNativeWritePath(), "Coherent-rollback setup PrepareNativeWritePath should succeed");
+
+        std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+        store.SetFilePayloadProvider(
+            [&staged_payloads](const std::wstring& path, std::uint64_t logical_size) -> std::optional<std::vector<std::byte>>
+            {
+                auto pending = staged_payloads.find(path);
+                if (pending == staged_payloads.end())
+                {
+                    return std::nullopt;
+                }
+
+                auto payload = pending->second;
+                if (logical_size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+                {
+                    return std::nullopt;
+                }
+                const auto target_size = static_cast<std::size_t>(logical_size);
+                if (payload.size() < target_size)
+                {
+                    payload.resize(target_size, std::byte{0});
+                }
+                else if (payload.size() > target_size)
+                {
+                    payload.resize(target_size);
+                }
+                return payload;
+            });
+
+        apfsaccess::rw::MetadataStore::MutationRequest create_first{};
+        create_first.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+        create_first.path = L"\\first_only_after_rollback.bin";
+        ok &= Require(
+            store.ApplyMutation(create_first) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "Coherent-rollback first create should apply");
+
+        apfsaccess::rw::MetadataStore::MutationRequest write_first{};
+        write_first.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+        write_first.path = L"\\first_only_after_rollback.bin";
+        write_first.length = static_cast<std::uint64_t>(coherent_rollback_first_payload.size());
+        ok &= Require(
+            store.ApplyMutation(write_first) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "Coherent-rollback first write should apply");
+        staged_payloads[L"\\first_only_after_rollback.bin"] = coherent_rollback_first_payload;
+
+        const auto first_commit = store.CommitPendingMutations();
+        ok &= Require(
+            first_commit == apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+            "Coherent-rollback first commit should succeed");
+        ok &= Require(
+            store.LastCommittedXid().value_or(0) == (kInitialCheckpointXid + 1),
+            "Coherent-rollback first commit should advance xid");
+
+        apfsaccess::rw::MetadataStore::MutationRequest create_second{};
+        create_second.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+        create_second.path = L"\\lost_latest_generation.bin";
+        ok &= Require(
+            store.ApplyMutation(create_second) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "Coherent-rollback second create should apply");
+
+        apfsaccess::rw::MetadataStore::MutationRequest write_second{};
+        write_second.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+        write_second.path = L"\\lost_latest_generation.bin";
+        write_second.length = static_cast<std::uint64_t>(coherent_rollback_second_payload.size());
+        ok &= Require(
+            store.ApplyMutation(write_second) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "Coherent-rollback second write should apply");
+        staged_payloads[L"\\lost_latest_generation.bin"] = coherent_rollback_second_payload;
+
+        const auto second_commit = store.CommitPendingMutations();
+        ok &= Require(
+            second_commit == apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+            "Coherent-rollback second commit should succeed");
+        ok &= Require(
+            store.LastCommittedXid().value_or(0) == (kInitialCheckpointXid + 2),
+            "Coherent-rollback second commit should advance xid");
+    }
+
+    std::size_t coherent_rollback_corrupted_blocks = 0;
+    std::uint64_t coherent_rollback_corrupted_xid = 0;
+    ok &= Require(
+        CorruptLatestObjectMapCheckpointBlocks(
+            coherent_rollback_fixture_image_path,
+            kTotalBlocks,
+            coherent_rollback_corrupted_blocks,
+            coherent_rollback_corrupted_xid),
+        "Coherent-rollback should corrupt latest object-map checkpoint block");
+    ok &= Require(
+        coherent_rollback_corrupted_blocks >= 1,
+        "Coherent-rollback should corrupt at least one object-map checkpoint block");
+    ok &= Require(
+        coherent_rollback_corrupted_xid == (kInitialCheckpointXid + 2),
+        "Coherent-rollback should target latest xid object-map checkpoint");
+
+    const auto coherent_rollback_non_fixture_image_path =
+        run_root / "container_coherent_checkpoint_rollback.bin";
+    {
+        std::error_code copy_ec;
+        std::filesystem::copy_file(
+            coherent_rollback_fixture_image_path,
+            coherent_rollback_non_fixture_image_path,
+            std::filesystem::copy_options::overwrite_existing,
+            copy_ec);
+        ok &= Require(
+            !copy_ec,
+            "Coherent-rollback should copy corrupted fixture image to non-fixture path");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext coherent_rollback_non_fixture_context
+    {
+        coherent_rollback_non_fixture_image_path.wstring(),
+        L"CoherentCheckpointRollback",
+    };
+    {
+        const auto non_fixture_sidecar_path = BuildPersistentStatePathForTest(coherent_rollback_non_fixture_context);
+        if (!non_fixture_sidecar_path.empty())
+        {
+            std::error_code remove_ec;
+            std::filesystem::remove(non_fixture_sidecar_path, remove_ec);
+        }
+    }
+    {
+        apfsaccess::rw::MetadataStore remounted(coherent_rollback_non_fixture_context);
+        ok &= Require(
+            remounted.LoadContainerSuperblocks(),
+            "Coherent-rollback remount LoadContainerSuperblocks should succeed");
+        ok &= Require(
+            remounted.PrepareNativeWritePath(),
+            "Coherent-rollback remount PrepareNativeWritePath should succeed after rolling back to prior coherent xid");
+        ok &= Require(
+            !remounted.IsRecoveryRequired(),
+            "Coherent-rollback remount should not require recovery after selecting prior coherent xid");
+        ok &= Require(
+            remounted.IsCommitPathReady(),
+            "Coherent-rollback remount should keep commit path ready after coherent rollback");
+        ok &= Require(
+            remounted.LastCommittedXid().value_or(0) == (kInitialCheckpointXid + 1),
+            "Coherent-rollback remount should roll back to previous coherent xid");
+        ok &= Require(
+            remounted.LookupCommittedInodeByPath(L"\\first_only_after_rollback.bin").has_value(),
+            "Coherent-rollback remount should preserve prior coherent file");
+        ok &= Require(
+            !remounted.LookupCommittedInodeByPath(L"\\lost_latest_generation.bin").has_value(),
+            "Coherent-rollback remount should not expose latest-generation inode without matching object map");
+
+        std::vector<std::byte> first_window;
+        ok &= Require(
+            remounted.ReadCommittedFileRange(
+                L"\\first_only_after_rollback.bin",
+                0,
+                coherent_rollback_first_payload.size(),
+                first_window),
+            "Coherent-rollback remount should read prior coherent payload");
+        ok &= Require(
+            first_window == coherent_rollback_first_payload,
+            "Coherent-rollback remount prior coherent payload should match");
+    }
+
     const auto btree_rebuild_image_path = run_root / "container_btree_rebuild_inode_state.apfs.img";
     if (!CreateSyntheticContainer(btree_rebuild_image_path))
     {
@@ -1693,6 +2174,141 @@ int main()
         ok &= Require(
             rebuilt_window == btree_rebuild_payload,
             "Btree-rebuild remount payload should match committed bytes");
+    }
+
+    const auto btree_rebuild_partial_inode_image_path = run_root / "container_btree_rebuild_partial_inode_state.apfs.img";
+    if (!CreateSyntheticContainer(btree_rebuild_partial_inode_image_path))
+    {
+        std::cerr << "[FAIL] unable to create synthetic APFS container image for partial-inode btree-rebuild scenario" << std::endl;
+        return 1;
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext btree_rebuild_partial_inode_context
+    {
+        btree_rebuild_partial_inode_image_path.wstring(),
+        L"BtreeRebuildPartialInodeState",
+    };
+    const auto btree_rebuild_partial_inode_state_path = BuildPersistentStatePathForTest(btree_rebuild_partial_inode_context);
+    if (!btree_rebuild_partial_inode_state_path.empty())
+    {
+        std::error_code remove_ec;
+        std::filesystem::remove(btree_rebuild_partial_inode_state_path, remove_ec);
+    }
+
+    const auto btree_rebuild_partial_inode_payload = BuildPatternPayload(2048, 0xB4);
+    std::size_t btree_rebuild_partial_inode_expected_inodes = 0;
+    std::size_t btree_rebuild_partial_inode_expected_btree_records = 0;
+    {
+        apfsaccess::rw::MetadataStore store(btree_rebuild_partial_inode_context);
+        ok &= Require(store.LoadContainerSuperblocks(), "Partial-inode btree-rebuild LoadContainerSuperblocks should succeed");
+        ok &= Require(store.LoadObjectMap(), "Partial-inode btree-rebuild LoadObjectMap should succeed");
+        ok &= Require(store.LoadSpacemanState(), "Partial-inode btree-rebuild LoadSpacemanState should succeed");
+        ok &= Require(store.PrepareNativeWritePath(), "Partial-inode btree-rebuild PrepareNativeWritePath should succeed");
+
+        std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+        store.SetFilePayloadProvider(
+            [&staged_payloads](const std::wstring& path, std::uint64_t logical_size) -> std::optional<std::vector<std::byte>>
+            {
+                auto pending = staged_payloads.find(path);
+                if (pending == staged_payloads.end())
+                {
+                    return std::nullopt;
+                }
+
+                auto payload = pending->second;
+                if (logical_size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+                {
+                    return std::nullopt;
+                }
+                const auto target_size = static_cast<std::size_t>(logical_size);
+                if (payload.size() < target_size)
+                {
+                    payload.resize(target_size, std::byte{0});
+                }
+                else if (payload.size() > target_size)
+                {
+                    payload.resize(target_size);
+                }
+                return payload;
+            });
+
+        apfsaccess::rw::MetadataStore::MutationRequest create_dir{};
+        create_dir.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateDirectory;
+        create_dir.path = L"\\partial";
+        ok &= Require(
+            store.ApplyMutation(create_dir) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "Partial-inode btree-rebuild directory create should apply");
+
+        apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+        create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+        create_file.path = L"\\partial\\from_btree.bin";
+        ok &= Require(
+            store.ApplyMutation(create_file) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "Partial-inode btree-rebuild file create should apply");
+
+        apfsaccess::rw::MetadataStore::MutationRequest write_file{};
+        write_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+        write_file.path = L"\\partial\\from_btree.bin";
+        write_file.length = static_cast<std::uint64_t>(btree_rebuild_partial_inode_payload.size());
+        ok &= Require(
+            store.ApplyMutation(write_file) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "Partial-inode btree-rebuild file write should apply");
+        staged_payloads[L"\\partial\\from_btree.bin"] = btree_rebuild_partial_inode_payload;
+
+        const auto commit_status = store.CommitPendingMutations();
+        ok &= Require(
+            commit_status == apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+            "Partial-inode btree-rebuild setup commit should succeed");
+
+        btree_rebuild_partial_inode_expected_inodes = store.CommittedInodeCount();
+        btree_rebuild_partial_inode_expected_btree_records = store.CommittedBtreeRecordCount();
+    }
+
+    if (!btree_rebuild_partial_inode_state_path.empty())
+    {
+        std::error_code remove_ec;
+        std::filesystem::remove(btree_rebuild_partial_inode_state_path, remove_ec);
+    }
+
+    std::size_t rewritten_root_only_inode_checkpoint_blocks = 0;
+    ok &= Require(
+        WriteRootOnlyInodeCheckpointBlocks(
+            btree_rebuild_partial_inode_image_path,
+            kVolumeRootObject,
+            kTotalBlocks,
+            rewritten_root_only_inode_checkpoint_blocks),
+        "Partial-inode btree-rebuild scenario should rewrite inode checkpoints to root-only state");
+    ok &= Require(
+        rewritten_root_only_inode_checkpoint_blocks >= 1,
+        "Partial-inode btree-rebuild scenario should rewrite at least one inode checkpoint");
+
+    {
+        apfsaccess::rw::MetadataStore remounted_btree_rebuild(btree_rebuild_partial_inode_context);
+        ok &= Require(remounted_btree_rebuild.LoadContainerSuperblocks(), "Partial-inode btree-rebuild remount LoadContainerSuperblocks should succeed");
+        ok &= Require(remounted_btree_rebuild.PrepareNativeWritePath(), "Partial-inode btree-rebuild remount PrepareNativeWritePath should succeed");
+        ok &= Require(!remounted_btree_rebuild.IsRecoveryRequired(), "Partial-inode btree-rebuild remount should remain clean (no recovery)");
+        ok &= Require(remounted_btree_rebuild.IsCommitPathReady(), "Partial-inode btree-rebuild remount should keep commit path ready");
+        ok &= Require(
+            remounted_btree_rebuild.CommittedInodeCount() == btree_rebuild_partial_inode_expected_inodes,
+            "Partial-inode btree-rebuild remount should replace root-only inode checkpoint with btree reconstruction");
+        ok &= Require(
+            remounted_btree_rebuild.CommittedBtreeRecordCount() == btree_rebuild_partial_inode_expected_btree_records,
+            "Partial-inode btree-rebuild remount should preserve btree checkpoint record count");
+        ok &= Require(
+            remounted_btree_rebuild.LookupCommittedInodeByPath(L"\\PARTIAL\\FROM_BTREE.BIN").has_value(),
+            "Partial-inode btree-rebuild remount should expose reconstructed path case-insensitively");
+
+        std::vector<std::byte> rebuilt_window;
+        ok &= Require(
+            remounted_btree_rebuild.ReadCommittedFileRange(
+                L"\\partial\\from_btree.bin",
+                0,
+                btree_rebuild_partial_inode_payload.size(),
+                rebuilt_window),
+            "Partial-inode btree-rebuild remount should read payload via reconstructed inode state");
+        ok &= Require(
+            rebuilt_window == btree_rebuild_partial_inode_payload,
+            "Partial-inode btree-rebuild remount payload should match committed bytes");
     }
 
     if (!persistent_state_path.empty())

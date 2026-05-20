@@ -38,10 +38,39 @@ bool IsFaultSwitchEnabled(const wchar_t* variable_name)
            _wcsicmp(value, L"true") == 0 ||
            _wcsicmp(value, L"yes") == 0;
 }
+
+std::uint64_t AlignDown(std::uint64_t value, std::uint64_t alignment)
+{
+    if (alignment == 0)
+    {
+        return value;
+    }
+
+    return value - (value % alignment);
+}
+
+std::uint64_t AlignUp(std::uint64_t value, std::uint64_t alignment)
+{
+    if (alignment == 0)
+    {
+        return value;
+    }
+    if (value == 0)
+    {
+        return 0;
+    }
+    if (value > (std::numeric_limits<std::uint64_t>::max() - (alignment - 1)))
+    {
+        return 0;
+    }
+
+    return AlignDown(value + alignment - 1, alignment);
+}
 } // namespace
 
-BlockDevice::BlockDevice(std::wstring path)
+BlockDevice::BlockDevice(std::wstring path, std::uint64_t base_offset_bytes)
     : path_(std::move(path))
+    , base_offset_bytes_(base_offset_bytes)
 {
 }
 
@@ -107,22 +136,51 @@ bool BlockDevice::Read(std::uint64_t offset_bytes, std::size_t size_bytes, std::
         return false;
     }
 
-    out_buffer.resize(size_bytes, std::byte{});
-    OVERLAPPED overlapped{};
-    overlapped.Offset = static_cast<DWORD>(offset_bytes & 0xFFFFFFFFull);
-    overlapped.OffsetHigh = static_cast<DWORD>(offset_bytes >> 32);
+    if (offset_bytes > (std::numeric_limits<std::uint64_t>::max() - base_offset_bytes_))
+    {
+        return false;
+    }
+    offset_bytes += base_offset_bytes_;
+
+    const auto block_size = static_cast<std::uint64_t>(LogicalBlockSizeLocked());
+    const auto aligned_offset = AlignDown(offset_bytes, block_size);
+    const auto prefix_bytes = static_cast<std::size_t>(offset_bytes - aligned_offset);
+    if (size_bytes > (std::numeric_limits<std::uint64_t>::max() - static_cast<std::uint64_t>(prefix_bytes)))
+    {
+        return false;
+    }
+    const auto requested_window = static_cast<std::uint64_t>(prefix_bytes) + static_cast<std::uint64_t>(size_bytes);
+    const auto aligned_size_u64 = AlignUp(requested_window, block_size);
+    if (aligned_size_u64 == 0 || aligned_size_u64 > static_cast<std::uint64_t>(std::numeric_limits<DWORD>::max()))
+    {
+        return false;
+    }
+    const auto aligned_size = static_cast<std::size_t>(aligned_size_u64);
+
+    LARGE_INTEGER target{};
+    target.QuadPart = static_cast<LONGLONG>(aligned_offset);
+    if (!SetFilePointerEx(handle_, target, nullptr, FILE_BEGIN))
+    {
+        return false;
+    }
 
     DWORD bytes_read = 0;
-    if (!ReadFile(handle_, out_buffer.data(), static_cast<DWORD>(size_bytes), &bytes_read, &overlapped))
+    std::vector<std::byte> aligned_buffer(aligned_size, std::byte{});
+    if (!ReadFile(handle_, aligned_buffer.data(), static_cast<DWORD>(aligned_buffer.size()), &bytes_read, nullptr))
     {
         out_buffer.clear();
         return false;
     }
-
-    if (bytes_read != size_bytes)
+    if (bytes_read < prefix_bytes)
     {
-        out_buffer.resize(bytes_read);
+        return false;
     }
+
+    const auto available = static_cast<std::size_t>(bytes_read) - prefix_bytes;
+    const auto bytes_to_copy = std::min(size_bytes, available);
+    out_buffer.assign(
+        aligned_buffer.begin() + static_cast<std::vector<std::byte>::difference_type>(prefix_bytes),
+        aligned_buffer.begin() + static_cast<std::vector<std::byte>::difference_type>(prefix_bytes + bytes_to_copy));
     return true;
 }
 
@@ -147,17 +205,67 @@ bool BlockDevice::Write(std::uint64_t offset_bytes, const std::vector<std::byte>
         return false;
     }
 
-    OVERLAPPED overlapped{};
-    overlapped.Offset = static_cast<DWORD>(offset_bytes & 0xFFFFFFFFull);
-    overlapped.OffsetHigh = static_cast<DWORD>(offset_bytes >> 32);
+    if (offset_bytes > (std::numeric_limits<std::uint64_t>::max() - base_offset_bytes_))
+    {
+        return false;
+    }
+    offset_bytes += base_offset_bytes_;
 
-    DWORD bytes_written = 0;
-    if (!WriteFile(handle_, buffer.data(), static_cast<DWORD>(buffer.size()), &bytes_written, &overlapped))
+    const auto block_size = static_cast<std::uint64_t>(LogicalBlockSizeLocked());
+    const auto aligned_offset = AlignDown(offset_bytes, block_size);
+    const auto prefix_bytes = static_cast<std::size_t>(offset_bytes - aligned_offset);
+    if (buffer.size() > (std::numeric_limits<std::uint64_t>::max() - static_cast<std::uint64_t>(prefix_bytes)))
+    {
+        return false;
+    }
+    const auto requested_window = static_cast<std::uint64_t>(prefix_bytes) + static_cast<std::uint64_t>(buffer.size());
+    const auto aligned_size_u64 = AlignUp(requested_window, block_size);
+    if (aligned_size_u64 == 0 || aligned_size_u64 > static_cast<std::uint64_t>(std::numeric_limits<DWORD>::max()))
+    {
+        return false;
+    }
+    const auto aligned_size = static_cast<std::size_t>(aligned_size_u64);
+
+    const bool already_aligned =
+        prefix_bytes == 0 &&
+        static_cast<std::uint64_t>(buffer.size()) == aligned_size_u64;
+    LARGE_INTEGER target{};
+    target.QuadPart = static_cast<LONGLONG>(aligned_offset);
+    if (!SetFilePointerEx(handle_, target, nullptr, FILE_BEGIN))
     {
         return false;
     }
 
-    return bytes_written == buffer.size();
+    const std::byte* write_buffer = buffer.data();
+    std::size_t write_size = buffer.size();
+    std::vector<std::byte> aligned_buffer;
+    if (!already_aligned)
+    {
+        aligned_buffer.assign(aligned_size, std::byte{});
+        DWORD bytes_read = 0;
+        if (!ReadFile(handle_, aligned_buffer.data(), static_cast<DWORD>(aligned_buffer.size()), &bytes_read, nullptr) ||
+            bytes_read != aligned_buffer.size())
+        {
+            return false;
+        }
+        std::copy(buffer.begin(), buffer.end(), aligned_buffer.begin() + static_cast<std::vector<std::byte>::difference_type>(prefix_bytes));
+        write_buffer = aligned_buffer.data();
+        write_size = aligned_buffer.size();
+
+        target.QuadPart = static_cast<LONGLONG>(aligned_offset);
+        if (!SetFilePointerEx(handle_, target, nullptr, FILE_BEGIN))
+        {
+            return false;
+        }
+    }
+
+    DWORD bytes_written = 0;
+    if (!WriteFile(handle_, write_buffer, static_cast<DWORD>(write_size), &bytes_written, nullptr))
+    {
+        return false;
+    }
+
+    return bytes_written == write_size;
 }
 
 bool BlockDevice::Flush()
@@ -259,6 +367,14 @@ bool BlockDevice::QueryGeometryLocked(Geometry& geometry) const
         geometry.total_bytes = static_cast<std::uint64_t>(disk_geometry.DiskSize.QuadPart);
         geometry.logical_block_size = std::max<std::uint32_t>(512u, disk_geometry.Geometry.BytesPerSector);
         geometry.physical_block_size = geometry.logical_block_size;
+        if (geometry.total_bytes > base_offset_bytes_)
+        {
+            geometry.total_bytes -= base_offset_bytes_;
+        }
+        else
+        {
+            geometry.total_bytes = 0;
+        }
         return geometry.total_bytes > 0;
     }
 
@@ -274,9 +390,41 @@ bool BlockDevice::QueryGeometryLocked(Geometry& geometry) const
         nullptr))
     {
         geometry.total_bytes = static_cast<std::uint64_t>(length_info.Length.QuadPart);
+        if (geometry.total_bytes > base_offset_bytes_)
+        {
+            geometry.total_bytes -= base_offset_bytes_;
+        }
+        else
+        {
+            geometry.total_bytes = 0;
+        }
         return geometry.total_bytes > 0;
     }
 
+    if (geometry.total_bytes > base_offset_bytes_)
+    {
+        geometry.total_bytes -= base_offset_bytes_;
+    }
+    else
+    {
+        geometry.total_bytes = 0;
+    }
+
     return geometry.total_bytes > 0;
+}
+
+std::uint32_t BlockDevice::LogicalBlockSizeLocked() const
+{
+    if (!geometry_cached_)
+    {
+        Geometry geometry{};
+        if (QueryGeometryLocked(geometry))
+        {
+            geometry_cache_ = geometry;
+            geometry_cached_ = true;
+        }
+    }
+
+    return std::max<std::uint32_t>(512u, geometry_cache_.logical_block_size);
 }
 } // namespace apfsaccess::rw
