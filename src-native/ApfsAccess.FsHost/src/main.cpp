@@ -2112,22 +2112,26 @@ bool HasChildName(const std::vector<std::wstring>& children, const std::wstring&
 
 void AddChildName(std::vector<std::wstring>& children, const std::wstring& name)
 {
-    if (!HasChildName(children, name))
-    {
-        children.push_back(name);
-    }
-    std::sort(children.begin(), children.end(), [](const std::wstring& a, const std::wstring& b)
+    auto it = std::lower_bound(children.begin(), children.end(), name, [](const std::wstring& a, const std::wstring& b)
     {
         return _wcsicmp(a.c_str(), b.c_str()) < 0;
     });
+    if (it == children.end() || !EqualsIgnoreCase(*it, name))
+    {
+        children.insert(it, name);
+    }
 }
 
 void RemoveChildName(std::vector<std::wstring>& children, const std::wstring& name)
 {
-    children.erase(std::remove_if(children.begin(), children.end(), [&](const std::wstring& existing)
+    auto it = std::lower_bound(children.begin(), children.end(), name, [](const std::wstring& a, const std::wstring& b)
     {
-        return EqualsIgnoreCase(existing, name);
-    }), children.end());
+        return _wcsicmp(a.c_str(), b.c_str()) < 0;
+    });
+    if (it != children.end() && EqualsIgnoreCase(*it, name))
+    {
+        children.erase(it);
+    }
 }
 
 void UpdateDeletePendingVisibilityLocked(MountContext* c, const std::shared_ptr<Node>& node)
@@ -5216,13 +5220,22 @@ NTSTATUS CB_ReadDirectory(FSP_FILE_SYSTEM* fs, PVOID dir_ctx, PWSTR, PWSTR marke
 
     auto mk = marker ? std::wstring(marker) : std::wstring();
     const auto read_only = !IsMutationWriteEnabled(c);
-    for (const auto& entry : entries)
+    auto start_it = entries.begin();
+    if (!mk.empty())
     {
-        if (!mk.empty() && _wcsicmp(entry.name.c_str(), mk.c_str()) <= 0)
+        start_it = std::lower_bound(entries.begin(), entries.end(), mk, [](const DirectoryEntrySnapshot& entry, const std::wstring& value)
         {
-            continue;
+            return _wcsicmp(entry.name.c_str(), value.c_str()) < 0;
+        });
+        while (start_it != entries.end() && _wcsicmp(start_it->name.c_str(), mk.c_str()) <= 0)
+        {
+            ++start_it;
         }
-        auto tmp = BuildDirectoryInfoBuffer(*entry.node, entry.name, read_only);
+    }
+
+    for (auto it = start_it; it != entries.end(); ++it)
+    {
+        auto tmp = BuildDirectoryInfoBuffer(*it->node, it->name, read_only);
         if (tmp.empty())
         {
             continue;

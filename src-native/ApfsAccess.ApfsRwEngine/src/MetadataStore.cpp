@@ -7985,25 +7985,35 @@ std::optional<MetadataStore::InodeRecord> MetadataStore::LookupCommittedInodeByP
 
 std::vector<MetadataStore::InodeRecord> MetadataStore::SnapshotCommittedInodes() const
 {
-    std::vector<InodeRecord> snapshot;
+    struct SnapshotEntry
+    {
+        std::wstring path_key;
+        const InodeRecord* inode = nullptr;
+    };
+
+    std::vector<SnapshotEntry> snapshot;
     snapshot.reserve(committed_inodes_.size());
     for (const auto& [_, inode] : committed_inodes_)
     {
-        snapshot.push_back(inode);
+        snapshot.push_back(SnapshotEntry{ CanonicalPathKey(inode.full_path), &inode });
     }
 
-    std::sort(snapshot.begin(), snapshot.end(), [](const InodeRecord& lhs, const InodeRecord& rhs)
+    std::sort(snapshot.begin(), snapshot.end(), [](const SnapshotEntry& lhs, const SnapshotEntry& rhs)
     {
-        const auto lhs_key = CanonicalPathKey(lhs.full_path);
-        const auto rhs_key = CanonicalPathKey(rhs.full_path);
-        if (lhs_key == rhs_key)
+        if (lhs.path_key == rhs.path_key)
         {
-            return lhs.object_id < rhs.object_id;
+            return lhs.inode->object_id < rhs.inode->object_id;
         }
-        return lhs_key < rhs_key;
+        return lhs.path_key < rhs.path_key;
     });
 
-    return snapshot;
+    std::vector<InodeRecord> result;
+    result.reserve(snapshot.size());
+    for (auto& item : snapshot)
+    {
+        result.push_back(*item.inode);
+    }
+    return result;
 }
 
 bool MetadataStore::SetCommittedReadExtents(std::uint64_t object_id, std::vector<FileExtent> extents)
@@ -8620,6 +8630,8 @@ bool MetadataStore::ValidateInodeGraphState(
 
     std::unordered_map<std::wstring, std::uint64_t> canonical_paths;
     canonical_paths.reserve(inode_table.size());
+    std::unordered_map<std::uint64_t, std::wstring> path_keys_by_object_id;
+    path_keys_by_object_id.reserve(inode_table.size());
     std::size_t root_count = 0;
     for (const auto& [object_id, inode] : inode_table)
     {
@@ -8649,6 +8661,7 @@ bool MetadataStore::ValidateInodeGraphState(
             TraceGraphFailure(L"CanonicalPathCollision", object_id);
             return false;
         }
+        path_keys_by_object_id.emplace(object_id, path_key);
 
         auto indexed_it = path_index.find(path_key);
         if (indexed_it == path_index.end() || indexed_it->second != object_id)
@@ -8688,7 +8701,9 @@ bool MetadataStore::ValidateInodeGraphState(
                 return false;
             }
 
-            if (CanonicalPathKey(ParentPath(inode.full_path)) != CanonicalPathKey(parent_it->second.full_path))
+            const auto parent_path_key = CanonicalPathKey(ParentPath(inode.full_path));
+            const auto parent_full_path_key = CanonicalPathKey(parent_it->second.full_path);
+            if (parent_path_key != parent_full_path_key)
             {
                 TraceGraphFailure(L"ParentPathMismatch", object_id);
                 return false;
@@ -8717,6 +8732,66 @@ bool MetadataStore::ValidateInodeGraphState(
         }
     }
 
+    enum class AncestryState : std::uint8_t
+    {
+        Visiting = 1,
+        Valid = 2
+    };
+
+    std::unordered_map<std::uint64_t, AncestryState> ancestry_state;
+    ancestry_state.reserve(inode_table.size());
+    const auto validate_ancestry = [&](std::uint64_t object_id) -> bool
+    {
+        if (auto cached_it = ancestry_state.find(object_id); cached_it != ancestry_state.end())
+        {
+            return cached_it->second == AncestryState::Valid;
+        }
+
+        std::vector<std::uint64_t> visited;
+        visited.reserve(8);
+        auto cursor = object_id;
+        while (true)
+        {
+            auto [state_it, inserted] = ancestry_state.emplace(cursor, AncestryState::Visiting);
+            if (!inserted)
+            {
+                if (state_it->second == AncestryState::Valid)
+                {
+                    break;
+                }
+
+                TraceGraphFailure(L"AncestryCycle", object_id);
+                return false;
+            }
+
+            visited.push_back(cursor);
+
+            auto current_it = inode_table.find(cursor);
+            if (current_it == inode_table.end())
+            {
+                TraceGraphFailure(L"AncestryMissingInode", object_id);
+                return false;
+            }
+
+            if (IsRootPath(current_it->second.full_path))
+            {
+                break;
+            }
+
+            cursor = current_it->second.parent_object_id;
+        }
+
+        for (const auto visited_object_id : visited)
+        {
+            ancestry_state[visited_object_id] = AncestryState::Valid;
+        }
+        if (auto cursor_it = ancestry_state.find(cursor); cursor_it != ancestry_state.end())
+        {
+            cursor_it->second = AncestryState::Valid;
+        }
+        return true;
+    };
+
     if (require_root_object && root_count != 1)
     {
         TraceGraphFailure(L"RootCount");
@@ -8737,7 +8812,9 @@ bool MetadataStore::ValidateInodeGraphState(
             return false;
         }
 
-        if (path_key != CanonicalPathKey(inode_it->second.full_path))
+        const auto path_key_it = path_keys_by_object_id.find(object_id);
+        if (path_key_it == path_keys_by_object_id.end() ||
+            path_key != path_key_it->second)
         {
             TraceGraphFailure(L"PathIndexKeyMismatch", object_id);
             return false;
@@ -8817,38 +8894,8 @@ bool MetadataStore::ValidateInodeGraphState(
 
     for (const auto& [object_id, inode] : inode_table)
     {
-        std::unordered_set<std::uint64_t> seen;
-        seen.reserve(inode_table.size());
-
-        auto cursor = object_id;
-        bool reached_root = false;
-        for (std::size_t steps = 0; steps <= inode_table.size(); ++steps)
+        if (!validate_ancestry(object_id))
         {
-            if (!seen.emplace(cursor).second)
-            {
-                TraceGraphFailure(L"AncestryCycle", object_id);
-                return false;
-            }
-
-            auto current_it = inode_table.find(cursor);
-            if (current_it == inode_table.end())
-            {
-                TraceGraphFailure(L"AncestryMissingInode", object_id);
-                return false;
-            }
-
-            if (IsRootPath(current_it->second.full_path))
-            {
-                reached_root = true;
-                break;
-            }
-
-            cursor = current_it->second.parent_object_id;
-        }
-
-        if (!reached_root)
-        {
-            TraceGraphFailure(L"AncestryNoRoot", object_id);
             return false;
         }
     }
@@ -10806,65 +10853,60 @@ bool MetadataStore::PersistInodeCheckpoint(std::uint64_t target_xid)
     constexpr std::size_t kHeaderBytes = kCheckpointHeaderBytes;
     constexpr std::size_t kRecordFixedBytes = 60;
 
-    std::vector<std::uint64_t> object_ids;
-    object_ids.reserve(committed_inodes_.size());
-    for (const auto& [object_id, _] : committed_inodes_)
+    struct SnapshotEntry
     {
-        object_ids.push_back(object_id);
-    }
-    std::sort(object_ids.begin(), object_ids.end(), [&](std::uint64_t lhs, std::uint64_t rhs)
-    {
-        const auto lhs_it = committed_inodes_.find(lhs);
-        const auto rhs_it = committed_inodes_.find(rhs);
-        if (lhs_it == committed_inodes_.end() || rhs_it == committed_inodes_.end())
-        {
-            return lhs < rhs;
-        }
-
-        const auto lhs_key = CanonicalPathKey(lhs_it->second.full_path);
-        const auto rhs_key = CanonicalPathKey(rhs_it->second.full_path);
-        if (lhs_key == rhs_key)
-        {
-            return lhs < rhs;
-        }
-        return lhs_key < rhs_key;
-    });
-
-    const auto should_persist_full_path = [&](const InodeRecord& inode)
-    {
-        if (IsRootPath(inode.full_path))
-        {
-            return false;
-        }
-
-        auto parent_it = committed_inodes_.find(inode.parent_object_id);
-        if (parent_it == committed_inodes_.end())
-        {
-            return true;
-        }
-
-        auto reconstructed_path = parent_it->second.full_path;
-        if (!IsRootPath(reconstructed_path))
-        {
-            reconstructed_path.push_back(L'\\');
-        }
-        reconstructed_path.append(inode.name);
-        reconstructed_path = NormalizePath(reconstructed_path);
-        return reconstructed_path != inode.full_path;
+        std::wstring path_key;
+        const InodeRecord* inode = nullptr;
+        bool persist_full_path = false;
     };
 
-    std::size_t required_bytes = kHeaderBytes;
-    for (const auto object_id : object_ids)
+    std::vector<SnapshotEntry> snapshot;
+    snapshot.reserve(committed_inodes_.size());
+    for (const auto& [_, inode] : committed_inodes_)
     {
-        auto inode_it = committed_inodes_.find(object_id);
-        if (inode_it == committed_inodes_.end())
+        SnapshotEntry entry{};
+        entry.path_key = CanonicalPathKey(inode.full_path);
+        entry.inode = &inode;
+
+        if (!IsRootPath(inode.full_path))
         {
-            return false;
+            auto parent_it = committed_inodes_.find(inode.parent_object_id);
+            if (parent_it == committed_inodes_.end())
+            {
+                entry.persist_full_path = true;
+                snapshot.push_back(std::move(entry));
+                continue;
+            }
+
+            auto reconstructed_path = parent_it->second.full_path;
+            if (!IsRootPath(reconstructed_path))
+            {
+                reconstructed_path.push_back(L'\\');
+            }
+            reconstructed_path.append(inode.name);
+            reconstructed_path = NormalizePath(reconstructed_path);
+            entry.persist_full_path = reconstructed_path != inode.full_path;
         }
 
-        const auto name_bytes = inode_it->second.name.size() * sizeof(wchar_t);
-        const auto path_bytes = should_persist_full_path(inode_it->second)
-            ? inode_it->second.full_path.size() * sizeof(wchar_t)
+        snapshot.push_back(std::move(entry));
+    }
+
+    std::sort(snapshot.begin(), snapshot.end(), [](const SnapshotEntry& lhs, const SnapshotEntry& rhs)
+    {
+        if (lhs.path_key == rhs.path_key)
+        {
+            return lhs.inode->object_id < rhs.inode->object_id;
+        }
+        return lhs.path_key < rhs.path_key;
+    });
+
+    std::size_t required_bytes = kHeaderBytes;
+    for (const auto& entry : snapshot)
+    {
+        const auto& inode = *entry.inode;
+        const auto name_bytes = inode.name.size() * sizeof(wchar_t);
+        const auto path_bytes = entry.persist_full_path
+            ? inode.full_path.size() * sizeof(wchar_t)
             : 0;
         if (required_bytes > (std::numeric_limits<std::size_t>::max() - kRecordFixedBytes - name_bytes - path_bytes))
         {
@@ -10900,18 +10942,12 @@ bool MetadataStore::PersistInodeCheckpoint(std::uint64_t target_xid)
         block[index] = static_cast<std::byte>(kMagic[index]);
     }
     WriteLe64(block, 12, target_xid);
-    WriteLe32(block, 20, static_cast<std::uint32_t>(object_ids.size()));
+    WriteLe32(block, 20, static_cast<std::uint32_t>(snapshot.size()));
 
     std::size_t cursor = kHeaderBytes;
-    for (const auto object_id : object_ids)
+    for (const auto& entry : snapshot)
     {
-        auto inode_it = committed_inodes_.find(object_id);
-        if (inode_it == committed_inodes_.end())
-        {
-            return false;
-        }
-
-        const auto& inode = inode_it->second;
+        const auto& inode = *entry.inode;
         WriteLe64(block, cursor + 0, inode.object_id);
         WriteLe64(block, cursor + 8, inode.parent_object_id);
         WriteLe64(block, cursor + 16, inode.logical_size);
@@ -10920,8 +10956,7 @@ bool MetadataStore::PersistInodeCheckpoint(std::uint64_t target_xid)
         WriteLe64(block, cursor + 40, inode.timestamp_utc);
         WriteLe32(block, cursor + 48, inode.is_directory ? 1u : 0u);
         WriteLe32(block, cursor + 52, static_cast<std::uint32_t>(inode.name.size()));
-        const auto persist_full_path = should_persist_full_path(inode);
-        WriteLe32(block, cursor + 56, persist_full_path ? static_cast<std::uint32_t>(inode.full_path.size()) : 0u);
+        WriteLe32(block, cursor + 56, entry.persist_full_path ? static_cast<std::uint32_t>(inode.full_path.size()) : 0u);
         cursor += kRecordFixedBytes;
 
         const auto name_bytes = inode.name.size() * sizeof(wchar_t);
@@ -10931,7 +10966,7 @@ bool MetadataStore::PersistInodeCheckpoint(std::uint64_t target_xid)
             cursor += name_bytes;
         }
 
-        const auto path_bytes = persist_full_path ? inode.full_path.size() * sizeof(wchar_t) : 0;
+        const auto path_bytes = entry.persist_full_path ? inode.full_path.size() * sizeof(wchar_t) : 0;
         if (path_bytes > 0)
         {
             std::memcpy(block.data() + cursor, inode.full_path.data(), path_bytes);
