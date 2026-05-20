@@ -146,10 +146,8 @@ public sealed class PilotScriptTests
         var reasons = first.GetProperty("configReasons").EnumerateArray().Select(x => x.GetString()).ToArray();
 
         Assert.False(first.GetProperty("eligible").GetBoolean());
-        Assert.Contains("NativeWriteDisabled", reasons);
-        Assert.Contains("RolloutBlocked", reasons);
-        Assert.Contains("RawPhysicalWriteBlocked", reasons);
-        Assert.Contains("PromotionPolicyBlocked", reasons);
+        Assert.Single(reasons);
+        Assert.Contains("HardwarePilotAllowListMissing", reasons);
     }
 
     [Fact]
@@ -339,7 +337,7 @@ public sealed class PilotScriptTests
     }
 
     [Fact]
-    public void AppSettings_DefaultToNativeReadOnlyAutoDiscovery()
+    public void AppSettings_DefaultToNativePilotWriteWithSafetyGates()
     {
         var appSettingsPath = Path.Combine(RepoRoot, "src", "ApfsAccess.Service", "appsettings.json");
         using var document = JsonDocument.Parse(File.ReadAllText(appSettingsPath));
@@ -348,9 +346,12 @@ public sealed class PilotScriptTests
         Assert.Equal("Native", service.GetProperty("BackendMode").GetString());
         Assert.True(service.GetProperty("NativeAutoDiscoverPhysicalDrives").GetBoolean());
         Assert.Empty(service.GetProperty("NativeDeviceCandidates").EnumerateArray());
-        Assert.False(service.GetProperty("EnableNativeWrite").GetBoolean());
-        Assert.Equal("Disabled", service.GetProperty("WriteBackendMode").GetString());
-        Assert.False(service.GetProperty("NativeWriteAllowRawPhysicalDevices").GetBoolean());
+        Assert.True(service.GetProperty("EnableNativeWrite").GetBoolean());
+        Assert.Equal("Pilot", service.GetProperty("WriteRolloutChannel").GetString());
+        Assert.Equal("Native", service.GetProperty("WriteBackendMode").GetString());
+        Assert.True(service.GetProperty("NativeWriteAllowRawPhysicalDevices").GetBoolean());
+        Assert.Equal("PilotHardware", service.GetProperty("NativeWritePromotionPolicy").GetString());
+        Assert.Empty(service.GetProperty("NativeWriteHardwarePilotDeviceAllowList").EnumerateArray());
     }
 
     [Fact]
