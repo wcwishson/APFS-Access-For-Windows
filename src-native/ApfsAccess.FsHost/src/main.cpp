@@ -308,6 +308,17 @@ std::atomic<bool> g_exit{false};
 
 bool IsOption(const wchar_t* a, const wchar_t* n) { return a && _wcsicmp(a, n) == 0; }
 
+bool IsHostCommitTraceEnabled()
+{
+    static const bool enabled = []()
+    {
+        wchar_t value[8]{};
+        const auto chars = GetEnvironmentVariableW(L"APFSACCESS_TRACE_COMMITS", value, static_cast<DWORD>(std::size(value)));
+        return chars > 0 && value[0] != L'\0' && value[0] != L'0';
+    }();
+    return enabled;
+}
+
 std::wstring NextArgValue(int& i, int argc, wchar_t** argv)
 {
     if (i + 1 >= argc)
@@ -3223,14 +3234,18 @@ NTSTATUS CommitNativeMutationsBestEffort(MountContext* c, const wchar_t* origin)
     std::wstring metadata_recovery_reason;
     bool metadata_recovery_required = false;
     bool canonical_ready_before_commit = false;
+    bool require_canonical_gate = false;
+    std::string final_commit_stage;
+    const auto commit_started_tick = static_cast<std::uint64_t>(GetTickCount64());
     {
         std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
         ArmCommitDeadline(c);
-        const auto require_canonical_gate = RequiresCanonicalMutationGate(c->args);
+        require_canonical_gate = RequiresCanonicalMutationGate(c->args);
         canonical_ready_before_commit = c->metadata_store->IsCanonicalCommitReady();
         commit_status = require_canonical_gate
             ? c->metadata_store->CommitCanonicalTransaction()
             : c->metadata_store->CommitTransaction();
+        final_commit_stage = c->metadata_store->LastCommitStage();
         committed_xid = c->metadata_store->LastCommittedXid();
         metadata_recovery_reason = c->metadata_store->RecoveryReason();
         metadata_recovery_required = c->metadata_store->IsRecoveryRequired();
@@ -3243,7 +3258,21 @@ NTSTATUS CommitNativeMutationsBestEffort(MountContext* c, const wchar_t* origin)
         }
         ClearCommitDeadline(c);
     }
+    const auto commit_finished_tick = static_cast<std::uint64_t>(GetTickCount64());
+    const auto commit_duration_ms = commit_finished_tick >= commit_started_tick
+        ? commit_finished_tick - commit_started_tick
+        : 0;
     const auto commit_timed_out = c->commit_timeout_latched.exchange(false, std::memory_order_relaxed);
+    if (IsHostCommitTraceEnabled())
+    {
+        std::wcerr << L"[FsHost] RW native-commit timing"
+                   << L" origin=" << origin
+                   << L" status=" << static_cast<int>(commit_status)
+                   << L" durationMs=" << commit_duration_ms
+                   << L" canonicalGate=" << (require_canonical_gate ? L"true" : L"false")
+                   << L" finalStage=" << Utf8ToWide(final_commit_stage)
+                   << std::endl;
+    }
     if (commit_timed_out &&
         commit_status != apfsaccess::rw::MetadataStore::CommitStatus::Committed &&
         commit_status != apfsaccess::rw::MetadataStore::CommitStatus::NothingToCommit)

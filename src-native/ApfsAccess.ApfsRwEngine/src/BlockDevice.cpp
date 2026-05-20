@@ -156,6 +156,9 @@ bool BlockDevice::Read(std::uint64_t offset_bytes, std::size_t size_bytes, std::
         return false;
     }
     const auto aligned_size = static_cast<std::size_t>(aligned_size_u64);
+    const bool already_aligned =
+        prefix_bytes == 0 &&
+        static_cast<std::uint64_t>(size_bytes) == aligned_size_u64;
 
     LARGE_INTEGER target{};
     target.QuadPart = static_cast<LONGLONG>(aligned_offset);
@@ -165,7 +168,19 @@ bool BlockDevice::Read(std::uint64_t offset_bytes, std::size_t size_bytes, std::
     }
 
     DWORD bytes_read = 0;
-    read_scratch_buffer_.assign(aligned_size, std::byte{});
+    if (already_aligned)
+    {
+        out_buffer.resize(size_bytes);
+        if (!ReadFile(handle_, out_buffer.data(), static_cast<DWORD>(out_buffer.size()), &bytes_read, nullptr))
+        {
+            out_buffer.clear();
+            return false;
+        }
+        out_buffer.resize(static_cast<std::size_t>(bytes_read));
+        return true;
+    }
+
+    read_scratch_buffer_.resize(aligned_size);
     if (!ReadFile(handle_, read_scratch_buffer_.data(), static_cast<DWORD>(read_scratch_buffer_.size()), &bytes_read, nullptr))
     {
         out_buffer.clear();
@@ -240,7 +255,7 @@ bool BlockDevice::Write(std::uint64_t offset_bytes, const std::vector<std::byte>
     std::size_t write_size = buffer.size();
     if (!already_aligned)
     {
-        write_scratch_buffer_.assign(aligned_size, std::byte{});
+        write_scratch_buffer_.resize(aligned_size);
         DWORD bytes_read = 0;
         if (!ReadFile(handle_, write_scratch_buffer_.data(), static_cast<DWORD>(write_scratch_buffer_.size()), &bytes_read, nullptr) ||
             bytes_read != write_scratch_buffer_.size())

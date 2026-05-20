@@ -3112,33 +3112,26 @@ bool MetadataStore::RefreshNativeReadExtentProjection()
         return false;
     }
 
-    std::unordered_map<std::wstring, std::uint64_t> native_path_to_object_id;
-    native_path_to_object_id.reserve(projection.inodes.size());
+    std::unordered_map<std::uint64_t, const InodeRecord*> native_inode_by_object_id;
+    native_inode_by_object_id.reserve(projection.inodes.size());
     for (const auto& inode : projection.inodes)
     {
         if (!inode.is_directory && inode.logical_size > 0)
         {
-            native_path_to_object_id[CanonicalPathKey(inode.full_path)] = inode.object_id;
+            native_inode_by_object_id[inode.object_id] = &inode;
         }
     }
 
     for (auto& [native_object_id, extents] : projection.read_extents_by_inode)
     {
-        auto native_inode_it = std::find_if(
-            projection.inodes.begin(),
-            projection.inodes.end(),
-            [native_object_id](const InodeRecord& inode)
-            {
-                return inode.object_id == native_object_id;
-            });
-        if (native_inode_it == projection.inodes.end() ||
-            native_inode_it->is_directory ||
-            native_inode_it->logical_size == 0)
+        const auto native_inode_it = native_inode_by_object_id.find(native_object_id);
+        if (native_inode_it == native_inode_by_object_id.end())
         {
             continue;
         }
+        const auto& native_inode = *native_inode_it->second;
 
-        const auto path_key = CanonicalPathKey(native_inode_it->full_path);
+        const auto path_key = CanonicalPathKey(native_inode.full_path);
         const auto committed_path_it = committed_path_index_.find(path_key);
         if (committed_path_it == committed_path_index_.end())
         {
@@ -3148,7 +3141,7 @@ bool MetadataStore::RefreshNativeReadExtentProjection()
         const auto committed_inode_it = committed_inodes_.find(committed_path_it->second);
         if (committed_inode_it == committed_inodes_.end() ||
             committed_inode_it->second.is_directory ||
-            committed_inode_it->second.logical_size != native_inode_it->logical_size)
+            committed_inode_it->second.logical_size != native_inode.logical_size)
         {
             continue;
         }
@@ -8080,6 +8073,11 @@ bool MetadataStore::SetCommittedReadExtents(std::uint64_t object_id, std::vector
     return true;
 }
 
+bool ExtentEndsBeforeOrAt(const MetadataStore::FileExtent& extent, std::uint64_t logical_offset)
+{
+    return extent.logical_offset + extent.bytes <= logical_offset;
+}
+
 bool MetadataStore::ReadCommittedFileRange(
     const std::wstring& path,
     std::uint64_t offset,
@@ -8111,14 +8109,18 @@ bool MetadataStore::ReadCommittedFileRange(
         out_payload.assign(available_bytes, std::byte{0});
         const auto request_begin = offset;
         const auto request_end = offset + static_cast<std::uint64_t>(available_bytes);
-        for (const auto& extent : extents_it->second)
+        const auto& extents = extents_it->second;
+        auto extent_it = std::lower_bound(
+            extents.begin(),
+            extents.end(),
+            request_begin,
+            ExtentEndsBeforeOrAt);
+        std::vector<std::byte> chunk;
+        for (; extent_it != extents.end(); ++extent_it)
         {
+            const auto& extent = *extent_it;
             const auto extent_begin = extent.logical_offset;
             const auto extent_end = extent.logical_offset + extent.bytes;
-            if (extent_end <= request_begin)
-            {
-                continue;
-            }
             if (extent_begin >= request_end)
             {
                 break;
@@ -8142,7 +8144,7 @@ bool MetadataStore::ReadCommittedFileRange(
             }
             const auto physical_offset = extent.physical_address + (chunk_begin - extent_begin);
 
-            std::vector<std::byte> chunk;
+            chunk.clear();
             if (!device_.Read(physical_offset, chunk_bytes, chunk) ||
                 chunk.size() > chunk_bytes)
             {
