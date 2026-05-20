@@ -54,6 +54,8 @@ private:
     mutable bool writable_ = false;
     mutable bool geometry_cached_ = false;
     mutable Geometry geometry_cache_{};
+    mutable std::vector<std::byte> read_scratch_buffer_;
+    mutable std::vector<std::byte> write_scratch_buffer_;
     mutable std::mutex mutex_;
 };
 } // namespace apfsaccess::rw

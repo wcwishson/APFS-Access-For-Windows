@@ -695,17 +695,17 @@ bool NativeApfsReader::ReadBtreeRecords(
 
     std::queue<std::uint64_t> pending;
     pending.push(root_block);
-    std::vector<std::uint64_t> visited;
+    std::unordered_set<std::uint64_t> visited;
+    visited.reserve(4096);
 
     while (!pending.empty())
     {
         const auto block_index = pending.front();
         pending.pop();
-        if (std::find(visited.begin(), visited.end(), block_index) != visited.end())
+        if (!visited.insert(block_index).second)
         {
             continue;
         }
-        visited.push_back(block_index);
         if (visited.size() > 4096)
         {
             return false;
@@ -1146,7 +1146,7 @@ bool NativeApfsReader::ProjectFileSystemTree(
                         child.child_id,
                         xid,
                         false));
-                if (IsDirectoryDrec(child.flags) || raw_inodes.contains(child.child_id))
+                if (IsDirectoryDrec(child.flags))
                 {
                     pending.push({ child.child_id, child_path });
                 }

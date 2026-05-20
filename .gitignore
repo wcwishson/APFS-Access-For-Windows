@@ -15,6 +15,7 @@ Run_APFS_Access_Silent.vbs
 *.nupkg
 
 # Native build products and intermediates
+build/ApfsAccess.*/
 src-native/**/build/
 src-native/**/out/
 src-native/**/*.ilk

@@ -165,8 +165,8 @@ bool BlockDevice::Read(std::uint64_t offset_bytes, std::size_t size_bytes, std::
     }
 
     DWORD bytes_read = 0;
-    std::vector<std::byte> aligned_buffer(aligned_size, std::byte{});
-    if (!ReadFile(handle_, aligned_buffer.data(), static_cast<DWORD>(aligned_buffer.size()), &bytes_read, nullptr))
+    read_scratch_buffer_.assign(aligned_size, std::byte{});
+    if (!ReadFile(handle_, read_scratch_buffer_.data(), static_cast<DWORD>(read_scratch_buffer_.size()), &bytes_read, nullptr))
     {
         out_buffer.clear();
         return false;
@@ -179,8 +179,8 @@ bool BlockDevice::Read(std::uint64_t offset_bytes, std::size_t size_bytes, std::
     const auto available = static_cast<std::size_t>(bytes_read) - prefix_bytes;
     const auto bytes_to_copy = std::min(size_bytes, available);
     out_buffer.assign(
-        aligned_buffer.begin() + static_cast<std::vector<std::byte>::difference_type>(prefix_bytes),
-        aligned_buffer.begin() + static_cast<std::vector<std::byte>::difference_type>(prefix_bytes + bytes_to_copy));
+        read_scratch_buffer_.begin() + static_cast<std::vector<std::byte>::difference_type>(prefix_bytes),
+        read_scratch_buffer_.begin() + static_cast<std::vector<std::byte>::difference_type>(prefix_bytes + bytes_to_copy));
     return true;
 }
 
@@ -238,19 +238,18 @@ bool BlockDevice::Write(std::uint64_t offset_bytes, const std::vector<std::byte>
 
     const std::byte* write_buffer = buffer.data();
     std::size_t write_size = buffer.size();
-    std::vector<std::byte> aligned_buffer;
     if (!already_aligned)
     {
-        aligned_buffer.assign(aligned_size, std::byte{});
+        write_scratch_buffer_.assign(aligned_size, std::byte{});
         DWORD bytes_read = 0;
-        if (!ReadFile(handle_, aligned_buffer.data(), static_cast<DWORD>(aligned_buffer.size()), &bytes_read, nullptr) ||
-            bytes_read != aligned_buffer.size())
+        if (!ReadFile(handle_, write_scratch_buffer_.data(), static_cast<DWORD>(write_scratch_buffer_.size()), &bytes_read, nullptr) ||
+            bytes_read != write_scratch_buffer_.size())
         {
             return false;
         }
-        std::copy(buffer.begin(), buffer.end(), aligned_buffer.begin() + static_cast<std::vector<std::byte>::difference_type>(prefix_bytes));
-        write_buffer = aligned_buffer.data();
-        write_size = aligned_buffer.size();
+        std::copy(buffer.begin(), buffer.end(), write_scratch_buffer_.begin() + static_cast<std::vector<std::byte>::difference_type>(prefix_bytes));
+        write_buffer = write_scratch_buffer_.data();
+        write_size = write_scratch_buffer_.size();
 
         target.QuadPart = static_cast<LONGLONG>(aligned_offset);
         if (!SetFilePointerEx(handle_, target, nullptr, FILE_BEGIN))

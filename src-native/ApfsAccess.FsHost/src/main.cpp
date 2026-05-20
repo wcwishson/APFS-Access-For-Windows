@@ -201,6 +201,9 @@ struct MountContext
     std::optional<std::uint64_t> runtime_last_commit_xid;
     std::wstring runtime_recovery_reason;
     std::wstring runtime_last_recovery_action;
+    std::string last_status_write_contents;
+    std::optional<bool> last_recovery_marker_dirty;
+    std::optional<std::uint64_t> last_recovery_marker_commit_xid;
     std::uint32_t reported_allocation_unit_bytes = 4096;
     std::optional<std::uint64_t> reported_total_size_bytes;
     std::optional<std::uint64_t> reported_free_size_bytes;
@@ -241,7 +244,7 @@ private:
 };
 
 bool WriteHostStatusFile(
-    const MountContext& context,
+    MountContext& context,
     bool recovery_active = false,
     std::optional<std::uint64_t> last_commit_xid = std::nullopt
 );
@@ -859,8 +862,16 @@ bool TryLoadRecoveryMarkerState(const std::filesystem::path& marker_path, Recove
     return true;
 }
 
-bool PersistRecoveryMarkerState(const std::filesystem::path& marker_path, const RecoveryMarkerState& state)
+bool PersistRecoveryMarkerState(MountContext* context, const std::filesystem::path& marker_path, const RecoveryMarkerState& state)
 {
+    if (context &&
+        context->last_recovery_marker_dirty.has_value() &&
+        context->last_recovery_marker_dirty.value() == state.dirty &&
+        context->last_recovery_marker_commit_xid == state.last_commit_xid)
+    {
+        return true;
+    }
+
     try
     {
         if (marker_path.has_parent_path())
@@ -881,7 +892,17 @@ bool PersistRecoveryMarkerState(const std::filesystem::path& marker_path, const 
             out << *state.last_commit_xid;
         }
         out << "\n";
-        return out.good();
+        if (!out.good())
+        {
+            return false;
+        }
+
+        if (context)
+        {
+            context->last_recovery_marker_dirty = state.dirty;
+            context->last_recovery_marker_commit_xid = state.last_commit_xid;
+        }
+        return true;
     }
     catch (...)
     {
@@ -1534,7 +1555,7 @@ NativeMetadataCounts ResolveNativeMetadataCounts(const MountContext& context)
 }
 
 bool WriteHostStatusFile(
-    const MountContext& context,
+    MountContext& context,
     bool recovery_active,
     std::optional<std::uint64_t> last_commit_xid
 )
@@ -1543,21 +1564,9 @@ bool WriteHostStatusFile(
     {
         return true;
     }
-
     try
     {
-        auto status_path = std::filesystem::path(context.args.status_file);
-        if (status_path.has_parent_path())
-        {
-            std::filesystem::create_directories(status_path.parent_path());
-        }
-
-        std::ofstream out(status_path, std::ios::binary | std::ios::trunc);
-        if (!out.good())
-        {
-            return false;
-        }
-
+        std::ostringstream buffer;
         const auto write_backend = EscapeJson(WideToUtf8(ResolveWriteBackendStatus(context)));
         const auto commit_model = EscapeJson(WideToUtf8(ResolveNativeWriteCommitModelStatus(context)));
         const auto readiness = EscapeJson(WideToUtf8(ResolveNativeWriteReadinessStatus(context)));
@@ -1583,149 +1592,149 @@ bool WriteHostStatusFile(
         const auto shutdown_drain_active = context.shutdown_drain_active.load(std::memory_order_acquire);
         const auto in_flight_mutations = context.active_external_mutation_callbacks.load(std::memory_order_acquire);
         const auto host_pid = static_cast<unsigned long>(GetCurrentProcessId());
-        out << "{\"writeBackend\":\"" << write_backend
-            << "\",\"commitModel\":\"" << commit_model
-            << "\",\"nativeWriteReadiness\":\"" << readiness
-            << "\",\"nativeWriteValidationState\":\"" << validation_state
-            << "\",\"fixtureLegacyFallbackActive\":" << (fixture_legacy_fallback_active ? "true" : "false")
-            << ",\"fixtureCompatibilityPathActive\":" << (fixture_compatibility_path_active ? "true" : "false")
-            << ",\"usesScaffoldCommitBlob\":" << (uses_scaffold_commit_blob ? "true" : "false")
-            << ",\"canonicalPathActive\":";
+        buffer << "{\"writeBackend\":\"" << write_backend
+               << "\",\"commitModel\":\"" << commit_model
+               << "\",\"nativeWriteReadiness\":\"" << readiness
+               << "\",\"nativeWriteValidationState\":\"" << validation_state
+               << "\",\"fixtureLegacyFallbackActive\":" << (fixture_legacy_fallback_active ? "true" : "false")
+               << ",\"fixtureCompatibilityPathActive\":" << (fixture_compatibility_path_active ? "true" : "false")
+               << ",\"usesScaffoldCommitBlob\":" << (uses_scaffold_commit_blob ? "true" : "false")
+               << ",\"canonicalPathActive\":";
 
         if (canonical_path_active.has_value())
         {
-            out << (canonical_path_active.value() ? "true" : "false");
+            buffer << (canonical_path_active.value() ? "true" : "false");
         }
         else
         {
-            out << "null";
+            buffer << "null";
         }
 
-        out << ",\"canonicalGateFailure\":";
+        buffer << ",\"canonicalGateFailure\":";
         if (!canonical_gate_failure.empty())
         {
-            out << "\"" << EscapeJson(WideToUtf8(canonical_gate_failure)) << "\"";
+            buffer << "\"" << EscapeJson(WideToUtf8(canonical_gate_failure)) << "\"";
         }
         else
         {
-            out << "null";
+            buffer << "null";
         }
 
-        out << ",\"replayCheckpointCandidatePresent\":";
+        buffer << ",\"replayCheckpointCandidatePresent\":";
         if (replay_checkpoint_candidate_present.has_value())
         {
-            out << (replay_checkpoint_candidate_present.value() ? "true" : "false");
+            buffer << (replay_checkpoint_candidate_present.value() ? "true" : "false");
         }
         else
         {
-            out << "null";
+            buffer << "null";
         }
 
-        out << ",\"replayCheckpointPendingWindow\":";
+        buffer << ",\"replayCheckpointPendingWindow\":";
         if (replay_checkpoint_pending_window.has_value())
         {
-            out << (replay_checkpoint_pending_window.value() ? "true" : "false");
+            buffer << (replay_checkpoint_pending_window.value() ? "true" : "false");
         }
         else
         {
-            out << "null";
+            buffer << "null";
         }
 
-        out << ",\"commitStage\":";
+        buffer << ",\"commitStage\":";
         if (!commit_stage.empty())
         {
-            out << "\"" << EscapeJson(commit_stage) << "\"";
+            buffer << "\"" << EscapeJson(commit_stage) << "\"";
         }
         else
         {
-            out << "null";
+            buffer << "null";
         }
 
-        out << ",\"replayStage\":";
+        buffer << ",\"replayStage\":";
         if (!replay_stage.empty())
         {
-            out << "\"" << EscapeJson(replay_stage) << "\"";
+            buffer << "\"" << EscapeJson(replay_stage) << "\"";
         }
         else
         {
-            out << "null";
+            buffer << "null";
         }
 
-        out << ",\"commitBlobMagic\":";
+        buffer << ",\"commitBlobMagic\":";
         if (!commit_blob_magic.empty())
         {
-            out << "\"" << EscapeJson(commit_blob_magic) << "\"";
+            buffer << "\"" << EscapeJson(commit_blob_magic) << "\"";
         }
         else
         {
-            out << "null";
+            buffer << "null";
         }
 
-        out << ",\"integrityFailureReason\":";
+        buffer << ",\"integrityFailureReason\":";
         if (!integrity_failure_reason.empty())
         {
-            out << "\"" << EscapeJson(WideToUtf8(integrity_failure_reason)) << "\"";
+            buffer << "\"" << EscapeJson(WideToUtf8(integrity_failure_reason)) << "\"";
         }
         else
         {
-            out << "null";
+            buffer << "null";
         }
 
-        out << ",\"integrityFailureObjectId\":";
+        buffer << ",\"integrityFailureObjectId\":";
         if (integrity_failure_object_id.has_value())
         {
-            out << *integrity_failure_object_id;
+            buffer << *integrity_failure_object_id;
         }
         else
         {
-            out << "null";
+            buffer << "null";
         }
 
-        out
+        buffer
             << ",\"nativeWriteSafetyState\":\"" << safety_state
             << "\",\"recoveryActive\":" << (recovery_active ? "true" : "false")
             << ",\"recoveryReason\":";
 
         if (!recovery_reason.empty())
         {
-            out << "\"" << EscapeJson(WideToUtf8(recovery_reason)) << "\"";
+            buffer << "\"" << EscapeJson(WideToUtf8(recovery_reason)) << "\"";
         }
         else
         {
-            out << "null";
+            buffer << "null";
         }
 
-        out << ",\"lastRecoveryAction\":";
+        buffer << ",\"lastRecoveryAction\":";
         if (!recovery_action.empty())
         {
-            out << "\"" << EscapeJson(WideToUtf8(recovery_action)) << "\"";
+            buffer << "\"" << EscapeJson(WideToUtf8(recovery_action)) << "\"";
         }
         else
         {
-            out << "null";
+            buffer << "null";
         }
 
-        out << ",\"lastCommitXid\":";
+        buffer << ",\"lastCommitXid\":";
 
         if (last_commit_xid.has_value())
         {
-            out << *last_commit_xid;
+            buffer << *last_commit_xid;
         }
         else
         {
-            out << "null";
+            buffer << "null";
         }
 
-        out << ",\"committedObjectCount\":" << metadata_counts.committed_objects;
-        out << ",\"committedInodeCount\":" << metadata_counts.committed_inodes;
-        out << ",\"committedBtreeRecordCount\":" << metadata_counts.committed_btree_records;
-        out << ",\"committedAllocationCount\":" << metadata_counts.committed_allocations;
-        out << ",\"committedFreeExtentCount\":" << metadata_counts.committed_free_extents;
-        out << ",\"dirtyTransactionCount\":" << std::max(0, dirty_tx);
-        out << ",\"mountReady\":" << (mount_ready ? "true" : "false");
-        out << ",\"shutdownDrainActive\":" << (shutdown_drain_active ? "true" : "false");
-        out << ",\"inFlightMutationCallbacks\":" << in_flight_mutations;
-        out << ",\"hostPid\":" << host_pid;
+        buffer << ",\"committedObjectCount\":" << metadata_counts.committed_objects;
+        buffer << ",\"committedInodeCount\":" << metadata_counts.committed_inodes;
+        buffer << ",\"committedBtreeRecordCount\":" << metadata_counts.committed_btree_records;
+        buffer << ",\"committedAllocationCount\":" << metadata_counts.committed_allocations;
+        buffer << ",\"committedFreeExtentCount\":" << metadata_counts.committed_free_extents;
+        buffer << ",\"dirtyTransactionCount\":" << std::max(0, dirty_tx);
+        buffer << ",\"mountReady\":" << (mount_ready ? "true" : "false");
+        buffer << ",\"shutdownDrainActive\":" << (shutdown_drain_active ? "true" : "false");
+        buffer << ",\"inFlightMutationCallbacks\":" << in_flight_mutations;
+        buffer << ",\"hostPid\":" << host_pid;
         const auto crash_fault_passes = std::max(0, context.args.validation_crash_fault_passes);
         const auto crash_stage_matrix_passes = std::max(0, context.args.validation_crash_stage_matrix_passes);
         const auto hardware_pilot_passes = std::max(0, context.args.validation_hardware_pilot_passes);
@@ -1749,35 +1758,60 @@ bool WriteHostStatusFile(
 
         if (has_validation_evidence)
         {
-            out << ",\"validationCrashFaultPasses\":" << crash_fault_passes;
-            out << ",\"validationCrashStageMatrixPasses\":" << crash_stage_matrix_passes;
-            out << ",\"validationHardwarePilotPasses\":" << hardware_pilot_passes;
-            out << ",\"validationHotUnplugPasses\":" << hot_unplug_passes;
-            out << ",\"validationMacOsValidationPasses\":" << macos_validation_passes;
-            out << ",\"validationMacOsConsistencyPasses\":" << macos_consistency_passes;
-            out << ",\"validationPowerLossReplayPasses\":" << power_loss_replay_passes;
-            out << ",\"validationPowerLossPassVerified\":" << (power_loss_pass_verified ? "true" : "false");
-            out << ",\"validationLastValidatedUtc\":";
+            buffer << ",\"validationCrashFaultPasses\":" << crash_fault_passes;
+            buffer << ",\"validationCrashStageMatrixPasses\":" << crash_stage_matrix_passes;
+            buffer << ",\"validationHardwarePilotPasses\":" << hardware_pilot_passes;
+            buffer << ",\"validationHotUnplugPasses\":" << hot_unplug_passes;
+            buffer << ",\"validationMacOsValidationPasses\":" << macos_validation_passes;
+            buffer << ",\"validationMacOsConsistencyPasses\":" << macos_consistency_passes;
+            buffer << ",\"validationPowerLossReplayPasses\":" << power_loss_replay_passes;
+            buffer << ",\"validationPowerLossPassVerified\":" << (power_loss_pass_verified ? "true" : "false");
+            buffer << ",\"validationLastValidatedUtc\":";
             if (has_last_validated_utc)
             {
-                out << "\"" << EscapeJson(WideToUtf8(context.args.validation_last_validated_utc)) << "\"";
+                buffer << "\"" << EscapeJson(WideToUtf8(context.args.validation_last_validated_utc)) << "\"";
             }
             else
             {
-                out << "null";
+                buffer << "null";
             }
-            out << ",\"validationLastValidationProfileId\":";
+            buffer << ",\"validationLastValidationProfileId\":";
             if (has_last_profile_id)
             {
-                out << "\"" << EscapeJson(WideToUtf8(context.args.validation_last_profile_id)) << "\"";
+                buffer << "\"" << EscapeJson(WideToUtf8(context.args.validation_last_profile_id)) << "\"";
             }
             else
             {
-                out << "null";
+                buffer << "null";
             }
         }
-        out << "}";
-        return out.good();
+        buffer << "}";
+        const auto contents = buffer.str();
+        if (context.last_status_write_contents == contents)
+        {
+            return true;
+        }
+
+        auto status_path = std::filesystem::path(context.args.status_file);
+        if (status_path.has_parent_path())
+        {
+            std::filesystem::create_directories(status_path.parent_path());
+        }
+
+        std::ofstream out(status_path, std::ios::binary | std::ios::trunc);
+        if (!out.good())
+        {
+            return false;
+        }
+
+        out.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+        if (!out.good())
+        {
+            return false;
+        }
+
+        context.last_status_write_contents = contents;
+        return true;
     }
     catch (...)
     {
@@ -2945,7 +2979,7 @@ bool UpdateRecoveryMarkerBestEffort(MountContext* c, bool dirty)
     RecoveryMarkerState marker{};
     marker.dirty = c->pending_native_writes;
     marker.last_commit_xid = c->runtime_last_commit_xid;
-    return PersistRecoveryMarkerState(c->recovery_marker_file, marker);
+    return PersistRecoveryMarkerState(c, c->recovery_marker_file, marker);
 }
 
 void LatchDirtyTransactionLimitExceeded(MountContext* c, std::size_t dirty_limit)
@@ -4149,11 +4183,6 @@ NTSTATUS CB_SetBasicInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, UINT64 creation
         c,
         apfsaccess::rw::TransactionManager::MutationKind::SetBasicInfo,
         o->node->path);
-    const auto native_commit_status = CommitNativeMutationsBestEffort(c, L"SetBasicInfo");
-    if (!NT_SUCCESS(native_commit_status))
-    {
-        return native_commit_status;
-    }
     FinalizeMutationJournalBestEffort(c, L"SetBasicInfo");
 #endif
     return STATUS_SUCCESS;
@@ -5463,6 +5492,8 @@ int wmain(int argc, wchar_t** argv)
         {
             ctx.pending_native_writes = marker_state.dirty;
             ctx.runtime_last_commit_xid = marker_state.last_commit_xid;
+            ctx.last_recovery_marker_dirty = marker_state.dirty;
+            ctx.last_recovery_marker_commit_xid = marker_state.last_commit_xid;
 
             if (marker_state.dirty)
             {
