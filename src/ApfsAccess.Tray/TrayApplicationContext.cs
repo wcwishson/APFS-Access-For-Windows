@@ -12,23 +12,6 @@ public sealed class TrayApplicationContext : ApplicationContext
     private static readonly TimeSpan ServiceStartThrottle = TimeSpan.FromSeconds(4);
     private static readonly TimeSpan EjectRequestTimeout = TimeSpan.FromSeconds(130);
     private static readonly object DiagnosticLogSync = new();
-    private static readonly string[] ExplicitCanonicalGateRecoveryReasons =
-    [
-        "CanonicalStateNotLoaded",
-        "NativeWriteNotReady",
-        "WriteDeviceNotAllowed",
-        "CommitPathNotReady",
-        "CanonicalCommitNotReady",
-        "FixtureCompatibilityPathActive",
-        "ScaffoldCommitBlobActive",
-    ];
-    private static readonly string[] HighPriorityReplayRecoveryReasons =
-    [
-        "IntegrityMissingAllocationMap",
-        "ReplayCheckpointPendingWindow",
-        "ReplayCheckpointNotPendingWindow",
-        "ReplayCanonicalCandidateMissing",
-    ];
 
     private readonly SynchronizationContext _uiContext;
     private readonly Control _uiInvoker = new();
@@ -908,7 +891,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         foreach (var warning in (payload.CompatibilityWarnings ?? Array.Empty<string>())
                      .Concat(payload.Warnings ?? Array.Empty<string>()))
         {
-            var parsed = TryExtractReasonTokenFromWarning(warning);
+            var parsed = NativeWriteRecoveryReasons.TryExtractReasonToken(warning);
             if (!string.IsNullOrWhiteSpace(parsed))
             {
                 candidates.Add(parsed);
@@ -917,87 +900,20 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         return candidates
             .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(static x => GetRecoveryReasonPriority(x))
+            .OrderBy(static x => NativeWriteRecoveryReasons.GetPriority(x))
             .ThenBy(x => x, StringComparer.OrdinalIgnoreCase)
             .FirstOrDefault();
     }
 
     private static int GetWarningPriority(string warning)
     {
-        var reason = TryExtractReasonTokenFromWarning(warning);
+        var reason = NativeWriteRecoveryReasons.TryExtractReasonToken(warning);
         if (!string.IsNullOrWhiteSpace(reason))
         {
-            return GetRecoveryReasonPriority(reason);
+            return NativeWriteRecoveryReasons.GetPriority(reason);
         }
 
         return int.MaxValue;
-    }
-
-    private static int GetRecoveryReasonPriority(string? recoveryReason)
-    {
-        if (string.IsNullOrWhiteSpace(recoveryReason))
-        {
-            return int.MaxValue;
-        }
-
-        var normalized = recoveryReason.Trim();
-        if (ExplicitCanonicalGateRecoveryReasons.Any(x => string.Equals(x, normalized, StringComparison.OrdinalIgnoreCase)))
-        {
-            return 0;
-        }
-
-        if (HighPriorityReplayRecoveryReasons.Any(x => string.Equals(x, normalized, StringComparison.OrdinalIgnoreCase)))
-        {
-            return 1;
-        }
-
-        if (string.Equals(normalized, "CanonicalPathNotActive", StringComparison.OrdinalIgnoreCase))
-        {
-            return 2;
-        }
-
-        return 3;
-    }
-
-    private static string? TryExtractReasonTokenFromWarning(string? warning)
-    {
-        if (string.IsNullOrWhiteSpace(warning))
-        {
-            return null;
-        }
-
-        var text = warning.AsSpan();
-        const string marker = "reason=";
-        var index = warning.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
-        if (index < 0)
-        {
-            return null;
-        }
-
-        var cursor = index + marker.Length;
-        while (cursor < text.Length && char.IsWhiteSpace(text[cursor]))
-        {
-            cursor++;
-        }
-
-        var start = cursor;
-        while (cursor < text.Length)
-        {
-            var ch = text[cursor];
-            if (char.IsLetterOrDigit(ch) || ch == '_')
-            {
-                cursor++;
-                continue;
-            }
-            break;
-        }
-
-        if (cursor <= start)
-        {
-            return null;
-        }
-
-        return warning[start..cursor];
     }
 
     private Dictionary<RuntimeState, Icon> LoadIcons()

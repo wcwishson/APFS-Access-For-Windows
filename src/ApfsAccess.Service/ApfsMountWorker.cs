@@ -16,44 +16,6 @@ public sealed class ApfsMountWorker : BackgroundService
     private readonly Dictionary<string, int> _missingVolumeProbeCounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _mountOperationLock = new(1, 1);
     private const int MissingVolumeUnmountThreshold = 2;
-    private static readonly HashSet<string> ValidationEvidenceRecoveryReasons = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "ValidationEvidenceInsufficient",
-        "ValidationCrashFaultEvidenceInsufficient",
-        "ValidationCrashStageMatrixEvidenceInsufficient",
-        "ValidationHardwarePilotEvidenceInsufficient",
-        "ValidationHotUnplugEvidenceInsufficient",
-        "ValidationCrossOsEvidenceInsufficient",
-        "ValidationMacOsEvidenceInsufficient",
-        "ValidationMacOsConsistencyEvidenceInsufficient",
-        "ValidationPowerLossReplayEvidenceInsufficient",
-        "ValidationPowerLossEvidenceInsufficient",
-        "ValidationCanonicalEvidenceInsufficient",
-        "ValidationHardwarePilotEvidenceStale",
-        "ValidationStableEvidenceStale",
-    };
-    private static readonly string[] ExplicitCanonicalGateRecoveryReasons =
-    [
-        "CanonicalStateNotLoaded",
-        "CanonicalVolumeStateLoadFailed",
-        "CanonicalObjectMapStateInvalid",
-        "CanonicalSpacemanStateInvalid",
-        "CanonicalVolumeTreeStateInvalid",
-        "NativeWriteNotReady",
-        "WriteDeviceNotAllowed",
-        "CommitPathNotReady",
-        "CanonicalCommitNotReady",
-        "FixtureCompatibilityPathActive",
-        "ScaffoldCommitBlobActive",
-    ];
-    private static readonly string[] HighPriorityReplayRecoveryReasons =
-    [
-        "IntegrityMissingAllocationMap",
-        "ReplayCheckpointPendingWindow",
-        "ReplayCheckpointNotPendingWindow",
-        "ReplayCanonicalCandidateMissing",
-    ];
-
     public ApfsMountWorker(
         ILogger<ApfsMountWorker> logger,
         IApfsBackend backend,
@@ -768,7 +730,7 @@ public sealed class ApfsMountWorker : BackgroundService
                 Mount = x,
                 EffectiveRecoveryReason = ResolveMountRecoveryReason(x),
             })
-            .OrderBy(x => GetRecoveryReasonPriority(x.EffectiveRecoveryReason))
+            .OrderBy(x => NativeWriteRecoveryReasons.GetPriority(x.EffectiveRecoveryReason))
             .ThenBy(x => x.Mount.MountPoint, StringComparer.OrdinalIgnoreCase))
         {
             var mount = mountEntry.Mount;
@@ -865,7 +827,7 @@ public sealed class ApfsMountWorker : BackgroundService
 
         var diagnosticReason = (mount.NativeWriteDiagnostics ?? Array.Empty<NativeWriteDiagnostic>())
             .Where(static x => !string.IsNullOrWhiteSpace(x.RecoveryReason))
-            .OrderBy(static x => GetRecoveryReasonPriority(x.RecoveryReason))
+            .OrderBy(static x => NativeWriteRecoveryReasons.GetPriority(x.RecoveryReason))
             .ThenByDescending(static x => x.IsFailClosed)
             .ThenBy(x => x.Code, StringComparer.OrdinalIgnoreCase)
             .Select(static x => x.RecoveryReason!.Trim())
@@ -896,32 +858,6 @@ public sealed class ApfsMountWorker : BackgroundService
             : diagnosticAction;
     }
 
-    private static int GetRecoveryReasonPriority(string? recoveryReason)
-    {
-        if (string.IsNullOrWhiteSpace(recoveryReason))
-        {
-            return int.MaxValue;
-        }
-
-        var normalized = recoveryReason.Trim();
-        if (ExplicitCanonicalGateRecoveryReasons.Any(x => string.Equals(x, normalized, StringComparison.OrdinalIgnoreCase)))
-        {
-            return 0;
-        }
-
-        if (HighPriorityReplayRecoveryReasons.Any(x => string.Equals(x, normalized, StringComparison.OrdinalIgnoreCase)))
-        {
-            return 1;
-        }
-
-        if (string.Equals(normalized, "CanonicalPathNotActive", StringComparison.OrdinalIgnoreCase))
-        {
-            return 2;
-        }
-
-        return 3;
-    }
-
     private static int GetCompatibilityWarningPriority(string warning)
     {
         if (string.IsNullOrWhiteSpace(warning))
@@ -929,30 +865,10 @@ public sealed class ApfsMountWorker : BackgroundService
             return int.MaxValue;
         }
 
-        foreach (var reason in ExplicitCanonicalGateRecoveryReasons)
+        var reason = NativeWriteRecoveryReasons.TryExtractReasonToken(warning);
+        if (!string.IsNullOrWhiteSpace(reason))
         {
-            if (warning.Contains($"reason={reason}", StringComparison.OrdinalIgnoreCase))
-            {
-                return 0;
-            }
-        }
-
-        if (warning.Contains("reason=CanonicalPathNotActive", StringComparison.OrdinalIgnoreCase))
-        {
-            return 2;
-        }
-
-        foreach (var reason in HighPriorityReplayRecoveryReasons)
-        {
-            if (warning.Contains($"reason={reason}", StringComparison.OrdinalIgnoreCase))
-            {
-                return 1;
-            }
-        }
-
-        if (warning.Contains("reason=", StringComparison.OrdinalIgnoreCase))
-        {
-            return 3;
+            return NativeWriteRecoveryReasons.GetPriority(reason);
         }
 
         return 4;
@@ -1042,7 +958,7 @@ public sealed class ApfsMountWorker : BackgroundService
 
     private static string BuildValidationEvidenceDetailSuffix(MountedVolumeState mount, ServiceHostOptions options)
     {
-        if (!IsValidationEvidenceRecoveryReason(mount.RecoveryReason))
+        if (!NativeWriteRecoveryReasons.IsValidationEvidenceReason(mount.RecoveryReason))
         {
             return string.Empty;
         }
@@ -1095,16 +1011,6 @@ public sealed class ApfsMountWorker : BackgroundService
                $"lastValidatedUtc={FormatValidationLastValidatedUtc(evidence.LastValidatedUtc)}, " +
                $"profile={evidence.LastValidationProfileId ?? "n/a"}, " +
                $"maxAgeDays={maxEvidenceAgeDays}, stale={(stale ? "true" : "false")})";
-    }
-
-    private static bool IsValidationEvidenceRecoveryReason(string? recoveryReason)
-    {
-        if (string.IsNullOrWhiteSpace(recoveryReason))
-        {
-            return false;
-        }
-
-        return ValidationEvidenceRecoveryReasons.Contains(recoveryReason.Trim());
     }
 
     private static NativeWriteValidationState ResolveRequiredValidationStateForPromotionPolicy(string? promotionPolicy)
@@ -1359,7 +1265,7 @@ public sealed class ApfsMountWorker : BackgroundService
                 EffectiveRecoveryReason = ResolveMountRecoveryReason(x),
             })
             .Where(static x => !string.IsNullOrWhiteSpace(x.EffectiveRecoveryReason))
-            .OrderBy(x => GetRecoveryReasonPriority(x.EffectiveRecoveryReason))
+            .OrderBy(x => NativeWriteRecoveryReasons.GetPriority(x.EffectiveRecoveryReason))
             .ThenByDescending(static x => (int)x.Mount.NativeWriteReadiness)
             .ThenBy(x => x.Mount.MountPoint, StringComparer.OrdinalIgnoreCase)
             .FirstOrDefault();
@@ -1398,7 +1304,7 @@ public sealed class ApfsMountWorker : BackgroundService
                     EffectiveRecoveryReason = ResolveMountRecoveryReason(x),
                 })
                 .Where(static x => !string.IsNullOrWhiteSpace(x.EffectiveRecoveryReason))
-                .OrderBy(x => GetRecoveryReasonPriority(x.EffectiveRecoveryReason))
+                .OrderBy(x => NativeWriteRecoveryReasons.GetPriority(x.EffectiveRecoveryReason))
                 .ThenByDescending(static x => (int)x.Mount.NativeWriteReadiness)
                 .ThenBy(x => x.Mount.MountPoint, StringComparer.OrdinalIgnoreCase)
                 .Select(x => ResolveMountRecoveryAction(x.Mount, x.EffectiveRecoveryReason))

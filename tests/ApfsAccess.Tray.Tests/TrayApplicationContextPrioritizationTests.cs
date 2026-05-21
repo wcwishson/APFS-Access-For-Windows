@@ -15,9 +15,9 @@ public sealed class TrayApplicationContextPrioritizationTests
     [InlineData("Write blocked", null)]
     [InlineData("", null)]
     [InlineData(null, null)]
-    public void TryExtractReasonTokenFromWarning_ParsesSupportedReasonPattern(string? warning, string? expected)
+    public void NativeWriteRecoveryReasons_ParsesSupportedReasonPattern(string? warning, string? expected)
     {
-        var actual = InvokeTryExtractReasonTokenFromWarning(warning);
+        var actual = NativeWriteRecoveryReasons.TryExtractReasonToken(warning);
         Assert.Equal(expected, actual);
     }
 
@@ -37,9 +37,9 @@ public sealed class TrayApplicationContextPrioritizationTests
     [InlineData("WriteGateBlocked", 3)]
     [InlineData("", int.MaxValue)]
     [InlineData(null, int.MaxValue)]
-    public void GetRecoveryReasonPriority_PrioritizesCanonicalGateReasons(string? recoveryReason, int expected)
+    public void NativeWriteRecoveryReasons_PrioritizesCanonicalGateReasons(string? recoveryReason, int expected)
     {
-        var actual = InvokeGetRecoveryReasonPriority(recoveryReason);
+        var actual = NativeWriteRecoveryReasons.GetPriority(recoveryReason);
         Assert.Equal(expected, actual);
     }
 
@@ -269,28 +269,6 @@ public sealed class TrayApplicationContextPrioritizationTests
             candidates);
 
         Assert.True(isCurrent);
-    }
-
-    private static string? InvokeTryExtractReasonTokenFromWarning(string? warning)
-    {
-        var method = typeof(TrayApplicationContext).GetMethod(
-            "TryExtractReasonTokenFromWarning",
-            BindingFlags.NonPublic | BindingFlags.Static);
-        Assert.NotNull(method);
-
-        var result = method!.Invoke(null, [warning]);
-        return result as string;
-    }
-
-    private static int InvokeGetRecoveryReasonPriority(string? recoveryReason)
-    {
-        var method = typeof(TrayApplicationContext).GetMethod(
-            "GetRecoveryReasonPriority",
-            BindingFlags.NonPublic | BindingFlags.Static);
-        Assert.NotNull(method);
-
-        var result = method!.Invoke(null, [recoveryReason]);
-        return Assert.IsType<int>(result);
     }
 
     private static int InvokeGetWarningPriority(string warning)

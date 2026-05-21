@@ -366,6 +366,25 @@ public sealed class NativeApfsBackendParsingTests
         Assert.Equal(expectedGateState, gateState);
     }
 
+    [Theory]
+    [InlineData("RwWithRoFallback", "Native write backend is not in CommitReady state. Falling back to read-only mount.")]
+    [InlineData("StrictReadWrite", "Native write backend is not in CommitReady state. Write mount was blocked.")]
+    public void BuildWriteBlockedMountError_OnlyMentionsFallbackWhenConfigured(
+        string readWriteMode,
+        string expected)
+    {
+        using var backend = new NativeApfsBackend(new ServiceHostOptions
+        {
+            ReadWriteMode = readWriteMode,
+        });
+
+        var actual = InvokeBuildWriteBlockedMountError(
+            backend,
+            "Native write backend is not in CommitReady state.");
+
+        Assert.Equal(expected, actual);
+    }
+
     [Fact]
     public void BuildNativeWriteDiagnostics_EmitsValidationGateDiagnosticForValidationReason()
     {
@@ -3234,6 +3253,17 @@ public sealed class NativeApfsBackendParsingTests
             .Select(static item => Assert.IsType<NativeWriteDiagnostic>(item))
             .ToArray();
         return diagnostics;
+    }
+
+    private static string InvokeBuildWriteBlockedMountError(NativeApfsBackend backend, string detail)
+    {
+        var method = typeof(NativeApfsBackend).GetMethod(
+            "BuildWriteBlockedMountError",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var result = method!.Invoke(backend, [detail]);
+        return Assert.IsType<string>(result);
     }
 
     private sealed record ParsedVolumeRowProjection(

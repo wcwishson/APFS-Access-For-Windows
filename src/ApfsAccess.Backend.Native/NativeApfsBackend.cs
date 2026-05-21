@@ -148,20 +148,20 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
 
         if (string.IsNullOrWhiteSpace(_nativeFsHostPath) || !File.Exists(_nativeFsHostPath))
         {
-                return new MountResult(
-                    Success: false,
-                    MountPoint: null,
-                    Error: "Native mount host executable was not found. Build ApfsAccess.FsHost.exe and set Service.NativeFsHostPath.",
+            return new MountResult(
+                Success: false,
+                MountPoint: null,
+                Error: "APFS mount component is missing or not installed.",
                 EffectiveAccessMode: MountAccessMode.ReadOnly,
                 DiagnosticCode: "FsHostMissing",
-                    IsReadOnly: true,
-                    WriteEnabled: false,
-                    SafetyGateState: "HostMissing",
-                    WriteBackend: NormalizeWriteBackendName(_options.WriteBackendMode),
-                    NativeWriteReadiness: NativeWriteReadiness.Unavailable,
-                    NativeWriteSafetyState: NativeWriteSafetyState.ReadOnlyFallback
-                );
-            }
+                IsReadOnly: true,
+                WriteEnabled: false,
+                SafetyGateState: "HostMissing",
+                WriteBackend: NormalizeWriteBackendName(_options.WriteBackendMode),
+                NativeWriteReadiness: NativeWriteReadiness.Unavailable,
+                NativeWriteSafetyState: NativeWriteSafetyState.ReadOnlyFallback
+            );
+        }
 
         if (request.AccessMode == MountAccessMode.ReadWrite &&
             !IsWriteBackendMode(_options.WriteBackendMode, "Overlay") &&
@@ -176,20 +176,20 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 diagnosticCode: "WriteBackendDisabled",
                 error: "Write backend mode is disabled. Set Service.WriteBackendMode=Overlay or Native for experimental write-path testing."
             );
-                return new MountResult(
-                    Success: false,
-                    MountPoint: null,
-                    Error: "Write backend mode is disabled. Set Service.WriteBackendMode=Overlay or Native for experimental write-path testing.",
+            return new MountResult(
+                Success: false,
+                MountPoint: null,
+                Error: "Write backend mode is disabled. Set Service.WriteBackendMode=Overlay or Native for experimental write-path testing.",
                 EffectiveAccessMode: MountAccessMode.ReadOnly,
                 DiagnosticCode: "WriteBackendDisabled",
                 IsReadOnly: true,
-                    WriteEnabled: false,
-                    SafetyGateState: gateState,
-                    WriteBackend: "Disabled",
-                    NativeWriteReadiness: NativeWriteReadiness.Unavailable,
-                    NativeWriteSafetyState: NativeWriteSafetyState.ReadOnlyFallback
-                );
-            }
+                WriteEnabled: false,
+                SafetyGateState: gateState,
+                WriteBackend: "Disabled",
+                NativeWriteReadiness: NativeWriteReadiness.Unavailable,
+                NativeWriteSafetyState: NativeWriteSafetyState.ReadOnlyFallback
+            );
+        }
 
         var mountPoint = NormalizeMountPoint(request.DriveLetter);
         var startupTimeout = TimeSpan.FromSeconds(Math.Clamp(_options.NativeHostStartupTimeoutSeconds, 2, 60));
@@ -305,7 +305,8 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                     return new MountResult(
                         Success: false,
                         MountPoint: null,
-                        Error: $"Write-gate policy blocked writable mount ({writeGateDetail}). Falling back to read-only mount.",
+                        Error: BuildWriteBlockedMountError(
+                            $"Write-gate policy blocked writable mount ({writeGateDetail})"),
                         EffectiveAccessMode: MountAccessMode.ReadOnly,
                         DiagnosticCode: recoveryDiagnosticCode,
                         IsReadOnly: true,
@@ -420,8 +421,8 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 return new MountResult(
                     Success: false,
                     MountPoint: null,
-                    Error: $"Native write recovery policy blocked write mount; falling back to read-only " +
-                           $"(reason={failClosedReason}; detail={recoveryExplanation}).",
+                    Error: BuildWriteBlockedMountError(
+                        $"APFS write mode paused to protect the drive (reason={failClosedReason}; detail={recoveryExplanation})"),
                     EffectiveAccessMode: MountAccessMode.ReadOnly,
                     DiagnosticCode: recoveryDiagnosticCode,
                     IsReadOnly: true,
@@ -482,7 +483,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 return new MountResult(
                     Success: false,
                     MountPoint: null,
-                    Error: "Native write backend is not using canonical APFS checkpoint commit model. Falling back to read-only mount.",
+                    Error: BuildWriteBlockedMountError("Native write backend is not using canonical APFS checkpoint commit model"),
                     EffectiveAccessMode: MountAccessMode.ReadOnly,
                     DiagnosticCode: "NativeWriteCommitModelNotCanonical",
                     IsReadOnly: true,
@@ -603,7 +604,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 return new MountResult(
                     Success: false,
                     MountPoint: null,
-                    Error: "Native write backend is not yet on canonical production commit path for non-fixture media; falling back to read-only mount.",
+                    Error: BuildWriteBlockedMountError("Native write backend is not yet on canonical production commit path for non-fixture media"),
                     EffectiveAccessMode: MountAccessMode.ReadOnly,
                     DiagnosticCode: "NativeWriteScaffoldCommitBlobActive",
                     IsReadOnly: true,
@@ -664,7 +665,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 return new MountResult(
                     Success: false,
                     MountPoint: null,
-                    Error: "Native write backend is not in CommitReady state. Falling back to read-only mount.",
+                    Error: BuildWriteBlockedMountError("Native write backend is not in CommitReady state"),
                     EffectiveAccessMode: MountAccessMode.ReadOnly,
                     DiagnosticCode: "NativeWriteNotCommitReady",
                     IsReadOnly: true,
@@ -793,7 +794,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 return new MountResult(
                     Success: false,
                     MountPoint: null,
-                    Error: $"{errorMessage} Falling back to read-only mount.",
+                    Error: BuildWriteBlockedMountError(errorMessage),
                     EffectiveAccessMode: MountAccessMode.ReadOnly,
                     DiagnosticCode: diagnosticCode,
                     IsReadOnly: true,
@@ -3446,6 +3447,17 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         return (nowUtc - lastValidatedUtc) > TimeSpan.FromDays(maxEvidenceAgeDays);
     }
 
+    private string BuildWriteBlockedMountError(string detail)
+    {
+        var normalizedDetail = string.IsNullOrWhiteSpace(detail)
+            ? "APFS write mode paused to protect the drive"
+            : detail.Trim().TrimEnd('.');
+
+        return string.Equals(_options.ReadWriteMode, "RwWithRoFallback", StringComparison.OrdinalIgnoreCase)
+            ? $"{normalizedDetail}. Falling back to read-only mount."
+            : $"{normalizedDetail}. Write mount was blocked.";
+    }
+
     private string BuildValidationEvidenceDiagnosticDetail(
         VolumeInfo volume,
         NativeWriteValidationState requiredValidationState,
@@ -3520,25 +3532,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     }
 
     private static bool IsValidationEvidenceFailClosedReason(string? recoveryReason)
-    {
-        return NormalizeRecoveryReason(recoveryReason) switch
-        {
-            "ValidationEvidenceInsufficient" => true,
-            "ValidationCrashFaultEvidenceInsufficient" => true,
-            "ValidationCrashStageMatrixEvidenceInsufficient" => true,
-            "ValidationHardwarePilotEvidenceInsufficient" => true,
-            "ValidationHotUnplugEvidenceInsufficient" => true,
-            "ValidationCrossOsEvidenceInsufficient" => true,
-            "ValidationMacOsEvidenceInsufficient" => true,
-            "ValidationMacOsConsistencyEvidenceInsufficient" => true,
-            "ValidationPowerLossReplayEvidenceInsufficient" => true,
-            "ValidationPowerLossEvidenceInsufficient" => true,
-            "ValidationCanonicalEvidenceInsufficient" => true,
-            "ValidationHardwarePilotEvidenceStale" => true,
-            "ValidationStableEvidenceStale" => true,
-            _ => false,
-        };
-    }
+        => NativeWriteRecoveryReasons.IsValidationEvidenceReason(recoveryReason);
 
     private static IReadOnlyList<NativeWriteDiagnostic> BuildNativeWriteDiagnostics(
         MountAccessMode effectiveAccessMode,
@@ -4768,118 +4762,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     }
 
     private static string? NormalizeRecoveryReason(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return null;
-        }
-
-        var trimmed = value.Trim();
-        var canonicalTokenBuilder = new StringBuilder(trimmed.Length);
-        foreach (var ch in trimmed)
-        {
-            if (char.IsLetterOrDigit(ch))
-            {
-                canonicalTokenBuilder.Append(char.ToLowerInvariant(ch));
-            }
-        }
-
-        var canonicalToken = canonicalTokenBuilder.ToString();
-        return canonicalToken switch
-        {
-            "committimedout" => "CommitTimedOut",
-            "commitnotwritable" => "CommitNotWritable",
-            "commitmodelnotcanonical" => "CommitModelNotCanonical",
-            "fixturelegacyfallbackactive" => "FixtureLegacyFallbackActive",
-            "fixturecompatibilitypathactive" => "FixtureCompatibilityPathActive",
-            "scaffoldcommitblobactive" => "ScaffoldCommitBlobActive",
-            "commitnotready" => "CommitNotReady",
-            "commitallocationfailed" => "CommitAllocationFailed",
-            "commitinvariantfailed" => "CommitInvariantFailed",
-            "commitpersistorflushfailed" => "CommitPersistOrFlushFailed",
-            "commitinterruptedbeforeobjectmappersist" => "CommitInterruptedBeforeObjectMapPersist",
-            "commitobjectmappersistfailed" => "CommitObjectMapPersistFailed",
-            "commitobjectmaproundtripfailed" => "CommitObjectMapRoundTripFailed",
-            "commitinterruptedbeforespacemanpersist" => "CommitInterruptedBeforeSpacemanPersist",
-            "commitspacemanpersistfailed" => "CommitSpacemanPersistFailed",
-            "commitspacemanroundtripfailed" => "CommitSpacemanRoundTripFailed",
-            "commitinterruptedbeforeinodepersist" => "CommitInterruptedBeforeInodePersist",
-            "commitinodepersistfailed" => "CommitInodePersistFailed",
-            "commitinoderoundtripfailed" => "CommitInodeRoundTripFailed",
-            "commitinterruptedbeforebtreepersist" => "CommitInterruptedBeforeBtreePersist",
-            "commitbtreepersistfailed" => "CommitBtreePersistFailed",
-            "commitbtreeroundtripfailed" => "CommitBtreeRoundTripFailed",
-            "commitinterruptedbeforereplaypersist" => "CommitInterruptedBeforeReplayPersist",
-            "commitreplaypersistfailed" => "CommitReplayPersistFailed",
-            "commitinterruptedbeforereplayroundtripverify" => "CommitInterruptedBeforeReplayRoundTripVerify",
-            "commitreplayroundtripfailed" => "CommitReplayRoundTripFailed",
-            "commitinterruptedbeforecheckpointswitch" => "CommitInterruptedBeforeCheckpointSwitch",
-            "commitcheckpointwritefailed" => "CommitCheckpointWriteFailed",
-            "commitinterruptedbeforecheckpointroundtripverify" => "CommitInterruptedBeforeCheckpointRoundTripVerify",
-            "commitcheckpointroundtripfailed" => "CommitCheckpointRoundTripFailed",
-            "commitinterruptedbeforecheckpointflush" => "CommitInterruptedBeforeCheckpointFlush",
-            "commitcheckpointflushfailed" => "CommitCheckpointFlushFailed",
-            "nativewritebootstrapfailed" => "NativeWriteBootstrapFailed",
-            "containerstateloadfailed" => "ContainerStateLoadFailed",
-            "objectmaploadfailed" => "ObjectMapLoadFailed",
-            "spacemanstateloadfailed" => "SpacemanStateLoadFailed",
-            "volumestateloadfailed" => "VolumeStateLoadFailed",
-            "persistentstateloadfailed" => "PersistentStateLoadFailed",
-            "rootstateinvalid" => "RootStateInvalid",
-            "integritycheckfailedonmount" => "IntegrityCheckFailedOnMount",
-            "integritymissingallocationmap" => "IntegrityMissingAllocationMap",
-            "missingallocation" => "IntegrityMissingAllocationMap",
-            "missingallocationmap" => "IntegrityMissingAllocationMap",
-            "persistentstateaheadofsuperblock" => "PersistentStateAheadOfSuperblock",
-            "persistentstatebehindsuperblock" => "PersistentStateBehindSuperblock",
-            "recoveryloadvolumestatefailed" => "RecoveryLoadVolumeStateFailed",
-            "recoverypersistentstateloadfailed" => "RecoveryPersistentStateLoadFailed",
-            "replayintegritycheckfailed" => "ReplayIntegrityCheckFailed",
-            "replaymetadatastatemissing" => "ReplayMetadataStateMissing",
-            "replaycanonicalcandidatemissing" => "ReplayCanonicalCandidateMissing",
-            "replaycheckpointpendingwindow" => "ReplayCheckpointPendingWindow",
-            "replaycheckpointnotpendingwindow" => "ReplayCheckpointNotPendingWindow",
-            "replayxidwindowinvalid" => "ReplayXidWindowInvalid",
-            "replaycommitblobinvalid" => "ReplayCommitBlobInvalid",
-            "replaycommitblobreadfailed" => "ReplayCommitBlobReadFailed",
-            "replayinterruptedbeforecheckpointswitch" => "ReplayInterruptedBeforeCheckpointSwitch",
-            "replaycheckpointwritefailed" => "ReplayCheckpointWriteFailed",
-            "replayinterruptedbeforecheckpointflush" => "ReplayInterruptedBeforeCheckpointFlush",
-            "replaycheckpointflushfailed" => "ReplayCheckpointFlushFailed",
-            "recoverymarkerdirty" => "RecoveryMarkerDirty",
-            "recoveryrequired" => "RecoveryRequired",
-            "dirtytransactionlimitexceeded" => "DirtyTransactionLimitExceeded",
-            "nativemutationstagingfailed" => "NativeMutationStagingFailed",
-            "canonicalpathnotactive" => "CanonicalPathNotActive",
-            "canonical path not active" => "CanonicalPathNotActive",
-            "canonicalgatefailure" => "CanonicalPathNotActive",
-            "canonicalstatenotloaded" => "CanonicalStateNotLoaded",
-            "canonicalvolumestateloadfailed" => "CanonicalVolumeStateLoadFailed",
-            "canonicalobjectmapstateinvalid" => "CanonicalObjectMapStateInvalid",
-            "canonicalspacemanstateinvalid" => "CanonicalSpacemanStateInvalid",
-            "canonicalvolumetreestateinvalid" => "CanonicalVolumeTreeStateInvalid",
-            "nativewritenotready" => "NativeWriteNotReady",
-            "writedevicenotallowed" => "WriteDeviceNotAllowed",
-            "commitpathnotready" => "CommitPathNotReady",
-            "canonicalcommitnotready" => "CanonicalCommitNotReady",
-            "validationevidenceinsufficient" => "ValidationEvidenceInsufficient",
-            "validationcrashfaultevidenceinsufficient" => "ValidationCrashFaultEvidenceInsufficient",
-            "validationcrashstagematrixevidenceinsufficient" => "ValidationCrashStageMatrixEvidenceInsufficient",
-            "validationhardwarepilotevidenceinsufficient" => "ValidationHardwarePilotEvidenceInsufficient",
-            "validationhotunplugevidenceinsufficient" => "ValidationHotUnplugEvidenceInsufficient",
-            "validationcrossosevidenceinsufficient" => "ValidationCrossOsEvidenceInsufficient",
-            "validationmacosevidenceinsufficient" => "ValidationMacOsEvidenceInsufficient",
-            "validationmacosconsistencyevidenceinsufficient" => "ValidationMacOsConsistencyEvidenceInsufficient",
-            "validationpowerlossreplayevidenceinsufficient" => "ValidationPowerLossReplayEvidenceInsufficient",
-            "validationpowerlossevidenceinsufficient" => "ValidationPowerLossEvidenceInsufficient",
-            "validationcanonicalevidenceinsufficient" => "ValidationCanonicalEvidenceInsufficient",
-            "validationhardwarepilotevidencestale" => "ValidationHardwarePilotEvidenceStale",
-            "validationstableevidencestale" => "ValidationStableEvidenceStale",
-            "writegateblocked" => "WriteGateBlocked",
-            "writegatepolicyblocked" => "WriteGateBlocked",
-            _ => trimmed,
-        };
-    }
+        => NativeWriteRecoveryReasons.Normalize(value);
 
     private static bool ShouldFailClosedForRuntimeStatus(HostRuntimeStatus status, string? recoveryPolicy)
     {

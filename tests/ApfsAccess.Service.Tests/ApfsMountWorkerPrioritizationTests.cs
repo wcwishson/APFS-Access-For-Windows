@@ -23,9 +23,9 @@ public sealed class ApfsMountWorkerPrioritizationTests
     [InlineData("WriteGateBlocked", 3)]
     [InlineData("", int.MaxValue)]
     [InlineData(null, int.MaxValue)]
-    public void GetRecoveryReasonPriority_PrioritizesCanonicalGateReasons(string? recoveryReason, int expected)
+    public void NativeWriteRecoveryReasons_PrioritizesCanonicalGateReasons(string? recoveryReason, int expected)
     {
-        var actual = InvokeGetRecoveryReasonPriority(recoveryReason);
+        var actual = NativeWriteRecoveryReasons.GetPriority(recoveryReason);
         Assert.Equal(expected, actual);
     }
 
@@ -531,17 +531,6 @@ public sealed class ApfsMountWorkerPrioritizationTests
         var result = method!.Invoke(null, [mounts, options]);
         Assert.NotNull(result);
         return Assert.IsAssignableFrom<IReadOnlyList<string>>(result);
-    }
-
-    private static int InvokeGetRecoveryReasonPriority(string? recoveryReason)
-    {
-        var method = typeof(ApfsMountWorker).GetMethod(
-            "GetRecoveryReasonPriority",
-            BindingFlags.NonPublic | BindingFlags.Static);
-        Assert.NotNull(method);
-
-        var result = method!.Invoke(null, [recoveryReason]);
-        return Assert.IsType<int>(result);
     }
 
     private static int InvokeGetCompatibilityWarningPriority(string warning)
