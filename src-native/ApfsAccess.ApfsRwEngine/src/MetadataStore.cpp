@@ -4644,21 +4644,25 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
 
         const auto requested_end = request.offset + request.length;
         const auto target_logical_size = std::max<std::uint64_t>(inode->logical_size, requested_end);
-        auto extent = AllocateExtent(target_logical_size);
-        if (!extent.has_value())
-        {
-            return MutationStatus::AllocationFailed;
-        }
-
-        if (!StageSpacemanAllocation(*extent, target_logical_size))
-        {
-            return MutationStatus::AllocationFailed;
-        }
-
         auto& inode_ref = working_inodes_[inode->object_id];
         const auto previous_physical = inode_ref.data_physical_address;
         const auto previous_size = inode_ref.logical_size;
-        inode_ref.data_physical_address = *extent;
+        auto next_physical = previous_physical;
+        if (next_physical == 0 || target_logical_size > previous_size)
+        {
+            auto extent = AllocateExtent(target_logical_size);
+            if (!extent.has_value())
+            {
+                return MutationStatus::AllocationFailed;
+            }
+            if (!StageSpacemanAllocation(*extent, target_logical_size))
+            {
+                return MutationStatus::AllocationFailed;
+            }
+            next_physical = *extent;
+        }
+
+        inode_ref.data_physical_address = next_physical;
         inode_ref.logical_size = target_logical_size;
         inode_ref.xid = target_xid;
         if (!StageObjectMapUpdate(inode_ref.object_id, inode_ref.data_physical_address, inode_ref.logical_size))
@@ -4667,14 +4671,22 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         }
         if (previous_physical != 0 && previous_physical != inode_ref.data_physical_address && previous_size > 0)
         {
-            if (!StageSpacemanDeallocation(previous_physical, previous_size))
+            const auto released_pending_extent = ReleasePendingSpacemanAllocation(previous_physical, previous_size);
+            if (!released_pending_extent && !StageSpacemanDeallocation(previous_physical, previous_size))
             {
                 return MutationStatus::AllocationFailed;
             }
-            stage_extent_record(inode_ref.object_id, 0, previous_physical, previous_size, true);
+            if (!released_pending_extent)
+            {
+                stage_extent_record(inode_ref.object_id, 0, previous_physical, previous_size, true);
+            }
         }
         stage_extent_record(inode_ref.object_id, 0, inode_ref.data_physical_address, inode_ref.logical_size, false);
         stage_inode_record(inode_ref, false);
+        CoalescePendingWriteMutation(inode_ref.object_id, request);
+        CoalescePendingBtreeFileMetadata(inode_ref.object_id);
+        mutation_applied = true;
+        return MutationStatus::Applied;
         break;
     }
     case MutationOperation::SetFileSize:
@@ -4716,11 +4728,15 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
                 previous_size > 0 &&
                 previous_physical != *extent)
             {
-                if (!StageSpacemanDeallocation(previous_physical, previous_size))
+                const auto released_pending_extent = ReleasePendingSpacemanAllocation(previous_physical, previous_size);
+                if (!released_pending_extent && !StageSpacemanDeallocation(previous_physical, previous_size))
                 {
                     return MutationStatus::AllocationFailed;
                 }
-                stage_extent_record(inode_ref.object_id, 0, previous_physical, previous_size, true);
+                if (!released_pending_extent)
+                {
+                    stage_extent_record(inode_ref.object_id, 0, previous_physical, previous_size, true);
+                }
             }
 
             inode_ref.data_physical_address = *extent;
@@ -9312,6 +9328,106 @@ bool MetadataStore::StageSpacemanDeallocation(std::uint64_t physical_address, st
         aligned_bytes
     });
     return true;
+}
+
+bool MetadataStore::ReleasePendingSpacemanAllocation(std::uint64_t physical_address, std::uint64_t bytes)
+{
+    if (!IsNativeWriteReady() || physical_address == 0 || bytes == 0)
+    {
+        return false;
+    }
+
+    const auto aligned_bytes = AlignExtentBytes(bytes);
+    if (aligned_bytes == 0)
+    {
+        return false;
+    }
+
+    for (auto it = pending_spaceman_allocations_.begin(); it != pending_spaceman_allocations_.end(); ++it)
+    {
+        if (it->physical_address != physical_address || it->bytes != aligned_bytes)
+        {
+            continue;
+        }
+
+        pending_spaceman_allocations_.erase(it);
+        return FreeExtent(physical_address, aligned_bytes);
+    }
+
+    return false;
+}
+
+void MetadataStore::CoalescePendingWriteMutation(std::uint64_t object_id, const MutationRequest& request)
+{
+    pending_mutations_.erase(
+        std::remove_if(
+            pending_mutations_.begin(),
+            pending_mutations_.end(),
+            [&](const MutationRequest& pending)
+            {
+                if (pending.operation != MutationOperation::Write)
+                {
+                    return false;
+                }
+
+                auto inode = LookupWorkingInode(NormalizePath(pending.path));
+                return inode.has_value() && inode->object_id == object_id;
+            }),
+        pending_mutations_.end());
+
+    pending_mutations_.push_back(request);
+}
+
+void MetadataStore::CoalescePendingBtreeFileMetadata(std::uint64_t object_id)
+{
+    const auto is_live_file_metadata_for_object = [&](const BtreeRecord& record)
+    {
+        if (record.tombstone)
+        {
+            return false;
+        }
+
+        switch (record.kind)
+        {
+        case BtreeRecordKind::Inode:
+        {
+            DecodedBtreeInode decoded{};
+            return DecodeBtreeInodeRecord(record, decoded) &&
+                   !decoded.is_directory &&
+                   decoded.object_id == object_id;
+        }
+        case BtreeRecordKind::FileExtent:
+        {
+            DecodedBtreeExtent decoded{};
+            return DecodeBtreeExtentRecord(record, decoded) &&
+                   decoded.object_id == object_id;
+        }
+        default:
+            return false;
+        }
+    };
+
+    bool kept_inode = false;
+    bool kept_extent = false;
+    for (auto it = pending_btree_records_.rbegin(); it != pending_btree_records_.rend();)
+    {
+        if (!is_live_file_metadata_for_object(*it))
+        {
+            ++it;
+            continue;
+        }
+
+        const auto keep =
+            (it->kind == BtreeRecordKind::Inode && !std::exchange(kept_inode, true)) ||
+            (it->kind == BtreeRecordKind::FileExtent && !std::exchange(kept_extent, true));
+        if (keep)
+        {
+            ++it;
+            continue;
+        }
+
+        it = std::reverse_iterator(pending_btree_records_.erase(std::next(it).base()));
+    }
 }
 
 std::uint64_t MetadataStore::AlignExtentBytes(std::uint64_t bytes) const noexcept

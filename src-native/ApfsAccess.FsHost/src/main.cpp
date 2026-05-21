@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cctype>
@@ -99,6 +100,9 @@ struct OpenContext
     std::shared_ptr<Node> node;
     HANDLE file = INVALID_HANDLE_VALUE;
     UINT32 granted_access = 0;
+    bool named_stream = false;
+    std::wstring stream_name;
+    std::uint64_t stream_size = 0;
     bool allow_read_data = false;
     bool allow_list_directory = false;
     bool allow_write_data = false;
@@ -113,6 +117,13 @@ struct OpenContext
     bool cleanup_seen = false;
 };
 
+struct NamedStreamPath
+{
+    std::wstring base_path;
+    std::wstring stream_name;
+    bool is_named_stream = false;
+};
+
 struct WinFspApi
 {
     using PFN_Create = NTSTATUS (*)(PWSTR, const FSP_FSCTL_VOLUME_PARAMS *, const FSP_FILE_SYSTEM_INTERFACE *, FSP_FILE_SYSTEM **);
@@ -121,6 +132,7 @@ struct WinFspApi
     using PFN_Start = NTSTATUS (*)(FSP_FILE_SYSTEM *, ULONG);
     using PFN_Stop = VOID (*)(FSP_FILE_SYSTEM *);
     using PFN_AddDir = BOOLEAN (*)(FSP_FSCTL_DIR_INFO *, PVOID, ULONG, PULONG);
+    using PFN_AddStream = BOOLEAN (*)(FSP_FSCTL_STREAM_INFO *, PVOID, ULONG, PULONG);
 
     HMODULE dll = nullptr;
     PFN_Create Create = nullptr;
@@ -129,6 +141,7 @@ struct WinFspApi
     PFN_Start Start = nullptr;
     PFN_Stop Stop = nullptr;
     PFN_AddDir AddDir = nullptr;
+    PFN_AddStream AddStream = nullptr;
 
     bool Load(std::wstring& err)
     {
@@ -165,6 +178,7 @@ struct WinFspApi
             err = L"winfsp-x64.dll missing required exports.";
             return false;
         }
+        (void)load(AddStream, "FspFileSystemAddStreamInfo");
         return true;
     }
 };
@@ -215,6 +229,7 @@ struct MountContext
     // Serialize mutating callback flows to avoid namespace/delete-intent interleaving races.
     std::mutex mutation_callback_mutex;
     std::unordered_map<std::wstring, std::shared_ptr<Node>> nodes;
+    std::unordered_map<std::wstring, std::unordered_map<std::wstring, std::uint64_t>> named_stream_sizes;
 #ifdef APFSACCESS_HAS_RW_ENGINE
     mutable std::mutex metadata_mutex;
     mutable std::mutex commit_mutex;
@@ -303,6 +318,7 @@ bool IsMutationWriteEnabled(const MountContext* c);
 NTSTATUS HandleMutationWriteDisabled(MountContext* c, const wchar_t* operation);
 #ifdef APFSACCESS_HAS_RW_ENGINE
 void RefreshReportedVolumeInfoFromMetadata(MountContext& ctx);
+void ConfigureVolumeParamsForExplorer(MountContext& ctx, const FILETIME& now, FSP_FSCTL_VOLUME_PARAMS& vp);
 #endif
 
 std::atomic<bool> g_exit{false};
@@ -525,6 +541,90 @@ std::wstring Key(std::wstring p)
     p = NormalizePath(p);
     std::transform(p.begin(), p.end(), p.begin(), [](wchar_t c) { return (wchar_t)towlower(c); });
     return p;
+}
+
+std::wstring ToLowerInvariant(std::wstring value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t c) { return (wchar_t)towlower(c); });
+    return value;
+}
+
+std::wstring CanonicalStreamName(std::wstring stream_name)
+{
+    if (stream_name.empty())
+    {
+        return L"";
+    }
+
+    if (stream_name.front() != L':')
+    {
+        stream_name.insert(stream_name.begin(), L':');
+    }
+
+    const std::wstring lower = ToLowerInvariant(stream_name);
+    constexpr const wchar_t* kDataSuffix = L":$DATA";
+    constexpr std::size_t kDataSuffixLength = 6;
+    const std::wstring data_suffix_lower = ToLowerInvariant(kDataSuffix);
+    if (lower.size() < kDataSuffixLength ||
+        lower.compare(lower.size() - kDataSuffixLength, kDataSuffixLength, data_suffix_lower) != 0)
+    {
+        stream_name += kDataSuffix;
+    }
+
+    return stream_name;
+}
+
+std::wstring StreamNameForWin32Path(const std::wstring& canonical_stream_name)
+{
+    auto name = canonical_stream_name;
+    if (!name.empty() && name.front() == L':')
+    {
+        name.erase(name.begin());
+    }
+
+    const std::wstring lower = ToLowerInvariant(name);
+    constexpr const wchar_t* kDataSuffix = L":$DATA";
+    constexpr std::size_t kDataSuffixLength = 6;
+    const std::wstring data_suffix_lower = ToLowerInvariant(kDataSuffix);
+    if (lower.size() >= kDataSuffixLength &&
+        lower.compare(lower.size() - kDataSuffixLength, kDataSuffixLength, data_suffix_lower) == 0)
+    {
+        name.resize(name.size() - kDataSuffixLength);
+    }
+
+    return name;
+}
+
+NamedStreamPath SplitNamedStreamPath(const std::wstring& raw_path)
+{
+    NamedStreamPath result{};
+    const auto path = NormalizePath(raw_path);
+    const auto leaf_start = path.find_last_of(L'\\');
+    const auto search_start = leaf_start == std::wstring::npos ? 0 : leaf_start + 1;
+    const auto colon = path.find(L':', search_start);
+    if (colon == std::wstring::npos)
+    {
+        result.base_path = path;
+        return result;
+    }
+
+    const auto stream_name = path.substr(colon);
+    const auto canonical_stream_name = CanonicalStreamName(stream_name);
+    if (canonical_stream_name.empty() || canonical_stream_name == L"::$DATA")
+    {
+        result.base_path = path.substr(0, colon);
+        return result;
+    }
+
+    result.base_path = path.substr(0, colon);
+    result.stream_name = canonical_stream_name;
+    result.is_named_stream = true;
+    return result;
+}
+
+bool LooksLikeNamedStreamArtifactName(const std::wstring& name)
+{
+    return SplitNamedStreamPath(L"\\" + name).is_named_stream;
 }
 
 bool IsDescendantPath(const std::wstring& candidate_path, const std::wstring& ancestor_path)
@@ -2107,6 +2207,11 @@ bool HasDeletePendingAncestorLocked(MountContext* c, const std::wstring& path)
 
 std::shared_ptr<Node> TryGetVisibleNodeLocked(MountContext* c, const std::wstring& path)
 {
+    if (LooksLikeNamedStreamArtifactName(LeafName(path)))
+    {
+        return {};
+    }
+
     auto node = TryGetNodeLocked(c, path);
     if (!node || IsDeleteBlockedStateLocked(node) || HasDeletePendingAncestorLocked(c, path))
     {
@@ -2414,6 +2519,78 @@ std::filesystem::path HydrationPath(MountContext* c, const Node& n)
     std::error_code ec;
     std::filesystem::create_directories(root, ec);
     return root / (std::to_wstring(hash) + L".bin");
+}
+
+std::wstring HydrationStreamPath(MountContext* c, const Node& n, const std::wstring& canonical_stream_name)
+{
+    auto stream_name = StreamNameForWin32Path(canonical_stream_name);
+    if (stream_name.empty())
+    {
+        return L"";
+    }
+
+    return HydrationPath(c, n).wstring() + L":" + stream_name;
+}
+
+std::uint64_t FileSizeFromHandle(HANDLE file)
+{
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return 0;
+    }
+
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart < 0)
+    {
+        return 0;
+    }
+
+    return static_cast<std::uint64_t>(size.QuadPart);
+}
+
+void RememberNamedStreamSizeLocked(
+    MountContext* c,
+    const std::wstring& base_path,
+    const std::wstring& canonical_stream_name,
+    std::uint64_t size)
+{
+    if (!c)
+    {
+        return;
+    }
+
+    const auto stream_key = CanonicalStreamName(canonical_stream_name);
+    if (stream_key.empty())
+    {
+        return;
+    }
+
+    c->named_stream_sizes[Key(base_path)][stream_key] = size;
+}
+
+std::uint64_t RememberNamedStreamSizeFromHandleLocked(
+    MountContext* c,
+    const std::shared_ptr<Node>& node,
+    const std::wstring& canonical_stream_name,
+    HANDLE file)
+{
+    const auto size = FileSizeFromHandle(file);
+    if (node)
+    {
+        RememberNamedStreamSizeLocked(c, node->path, canonical_stream_name, size);
+    }
+
+    return size;
+}
+
+void ForgetNamedStreamsLocked(MountContext* c, const std::wstring& base_path)
+{
+    if (!c)
+    {
+        return;
+    }
+
+    c->named_stream_sizes.erase(Key(base_path));
 }
 
 bool EnsureHydrated(MountContext* c, const std::shared_ptr<Node>& n, bool allow_empty_placeholder = false)
@@ -3010,6 +3187,8 @@ bool UpdateRecoveryMarkerBestEffort(MountContext* c, bool dirty)
     return PersistRecoveryMarkerState(c, c->recovery_marker_file, marker);
 }
 
+NTSTATUS CommitNativeMutationsBestEffort(MountContext* c, const wchar_t* origin);
+
 void LatchDirtyTransactionLimitExceeded(MountContext* c, std::size_t dirty_limit)
 {
     if (!c)
@@ -3033,6 +3212,40 @@ void LatchDirtyTransactionLimitExceeded(MountContext* c, std::size_t dirty_limit
         << std::endl;
     (void)UpdateRecoveryMarkerBestEffort(c, true);
     (void)WriteHostStatusFile(*c, c->recovery_active, c->runtime_last_commit_xid);
+}
+
+bool DrainNativeMutationsForDirtyLimit(MountContext* c, std::size_t dirty_limit, const wchar_t* origin)
+{
+    if (!c || !IsNativeWriteEnabled(c) || !c->metadata_store)
+    {
+        return true;
+    }
+
+    {
+        std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
+        if (c->metadata_store->PendingMutationCount() < dirty_limit)
+        {
+            return true;
+        }
+    }
+
+    std::wcerr << L"[FsHost] RW native-mutation: pending mutation limit reached ("
+        << dirty_limit
+        << L"); draining commit before accepting more writes."
+        << std::endl;
+
+    const auto status = CommitNativeMutationsBestEffort(c, origin);
+    if (NT_SUCCESS(status))
+    {
+        return true;
+    }
+
+    std::wcerr << L"[FsHost] RW native-mutation warning: dirty-limit drain failed with status 0x"
+        << std::hex << static_cast<unsigned long>(status) << std::dec
+        << L"."
+        << std::endl;
+    LatchDirtyTransactionLimitExceeded(c, dirty_limit);
+    return false;
 }
 
 bool RecordNativeMutationBestEffort(
@@ -3061,9 +3274,14 @@ bool RecordNativeMutationBestEffort(
 
     apfsaccess::rw::MetadataStore::MutationStatus status = apfsaccess::rw::MetadataStore::MutationStatus::NotReady;
     std::wstring failure_reason;
+    const auto dirty_limit = static_cast<std::size_t>(std::max(1, c->args.write_max_dirty_transactions));
+    if (!DrainNativeMutationsForDirtyLimit(c, dirty_limit, L"DirtyLimit"))
+    {
+        return false;
+    }
+
     {
         std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
-        const auto dirty_limit = static_cast<std::size_t>(std::max(1, c->args.write_max_dirty_transactions));
         if (c->metadata_store->PendingMutationCount() >= dirty_limit)
         {
             LatchDirtyTransactionLimitExceeded(c, dirty_limit);
@@ -3126,8 +3344,14 @@ NTSTATUS BlockNativeMutationAfterStagingFailure(MountContext* c, const wchar_t* 
     }
 
     c->recovery_active = true;
-    c->runtime_recovery_reason = L"NativeMutationStagingFailed";
-    c->runtime_last_recovery_action = L"DowngradedAfterMutationStagingFailure";
+    if (c->runtime_recovery_reason.empty())
+    {
+        c->runtime_recovery_reason = L"NativeMutationStagingFailed";
+    }
+    if (c->runtime_last_recovery_action.empty())
+    {
+        c->runtime_last_recovery_action = L"DowngradedAfterMutationStagingFailure";
+    }
     if (IsRecoveryPolicyFailClosed(c->args.write_recovery_policy))
     {
         c->write_degraded = true;
@@ -3632,6 +3856,7 @@ bool RemoveNodeRecursiveLocked(MountContext* c, const std::shared_ptr<Node>& nod
     {
         std::error_code ec;
         std::filesystem::remove(HydrationPath(c, *node), ec);
+        ForgetNamedStreamsLocked(c, node->path);
     }
     c->nodes.erase(Key(node->path));
     return true;
@@ -3657,6 +3882,14 @@ void ReindexNodePathsLocked(MountContext* c, const std::shared_ptr<Node>& node, 
 
     if (!node->is_directory)
     {
+        auto stream_map = c->named_stream_sizes.find(old_key);
+        if (stream_map != c->named_stream_sizes.end())
+        {
+            auto streams = std::move(stream_map->second);
+            c->named_stream_sizes.erase(stream_map);
+            c->named_stream_sizes[new_key] = std::move(streams);
+        }
+
         std::error_code ec;
         Node old_node{};
         old_node.path = old_path;
@@ -3776,6 +4009,144 @@ NTSTATUS CB_SetVolumeLabel(FSP_FILE_SYSTEM*, PWSTR, FSP_FSCTL_VOLUME_INFO*)
     return STATUS_MEDIA_WRITE_PROTECTED;
 }
 
+NTSTATUS CB_GetStreamInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buffer, ULONG length, PULONG transferred)
+{
+    if (!buffer || !transferred)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    *transferred = 0;
+    auto* c = Ctx(fs);
+    auto* o = static_cast<OpenContext*>(ctx);
+    if (!c || !o || !o->node)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (o->node->is_directory)
+    {
+        return STATUS_SUCCESS;
+    }
+
+    const auto add_stream_info = [&](FSP_FSCTL_STREAM_INFO* stream_info) -> bool
+    {
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+        if (!stream_info)
+        {
+            return true;
+        }
+        if (stream_info->Size == 0 ||
+            stream_info->Size < sizeof(FSP_FSCTL_STREAM_INFO) ||
+            stream_info->Size > (std::numeric_limits<ULONG>::max() - *transferred) ||
+            *transferred > length ||
+            stream_info->Size > (length - *transferred))
+        {
+            return false;
+        }
+
+        std::memcpy(static_cast<std::byte*>(buffer) + *transferred, stream_info, stream_info->Size);
+        *transferred += stream_info->Size;
+        return true;
+#else
+        if (!c->api.AddStream)
+        {
+            return false;
+        }
+        return !!c->api.AddStream(stream_info, buffer, length, transferred);
+#endif
+    };
+
+    const auto add_named_stream = [&](const std::wstring& stream_name, std::uint64_t stream_size) -> bool
+    {
+        const auto name_bytes = stream_name.size() * sizeof(WCHAR);
+        const auto entry_size = sizeof(FSP_FSCTL_STREAM_INFO) + name_bytes;
+        if (entry_size > static_cast<std::size_t>(std::numeric_limits<UINT16>::max()))
+        {
+            return false;
+        }
+
+        std::vector<std::byte> stream_storage(entry_size);
+        auto* stream_info = reinterpret_cast<FSP_FSCTL_STREAM_INFO*>(stream_storage.data());
+        stream_info->Size = static_cast<UINT16>(entry_size);
+        stream_info->StreamSize = stream_size;
+        stream_info->StreamAllocationSize = ((stream_size + 4095ull) / 4096ull) * 4096ull;
+        if (name_bytes > 0)
+        {
+            std::memcpy(stream_info->StreamNameBuf, stream_name.data(), name_bytes);
+        }
+
+        return add_stream_info(stream_info);
+    };
+
+    if (!add_named_stream(L"::$DATA", o->node->file_size))
+    {
+        return STATUS_BUFFER_OVERFLOW;
+    }
+
+    std::vector<std::pair<std::wstring, std::uint64_t>> streams;
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        const auto stream_bucket = c->named_stream_sizes.find(Key(o->node->path));
+        if (stream_bucket != c->named_stream_sizes.end())
+        {
+            for (const auto& [stream_name, stream_size] : stream_bucket->second)
+            {
+                streams.emplace_back(CanonicalStreamName(stream_name), stream_size);
+            }
+        }
+    }
+
+    for (const auto& [stream_name, stream_size] : streams)
+    {
+        if (!add_named_stream(stream_name, stream_size))
+        {
+            return STATUS_BUFFER_OVERFLOW;
+        }
+    }
+
+    if (!add_stream_info(nullptr))
+    {
+        return STATUS_BUFFER_OVERFLOW;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+void ConfigureVolumeParamsForExplorer(MountContext& ctx, const FILETIME& now, FSP_FSCTL_VOLUME_PARAMS& vp)
+{
+    vp = {};
+    vp.Version = sizeof(FSP_FSCTL_VOLUME_PARAMS);
+    vp.SectorSize = static_cast<UINT16>(ctx.reported_allocation_unit_bytes != 0
+        ? ctx.reported_allocation_unit_bytes
+        : 4096);
+    vp.SectorsPerAllocationUnit = 1;
+    vp.MaxComponentLength = 255;
+    vp.VolumeCreationTime = ((UINT64)now.dwHighDateTime << 32) | now.dwLowDateTime;
+    vp.VolumeSerialNumber = BuildStableVolumeSerial(ctx.args);
+    vp.FileInfoTimeout = 2000;
+    vp.VolumeInfoTimeoutValid = 1;
+    vp.VolumeInfoTimeout = 2000;
+    vp.DirInfoTimeoutValid = 1;
+    vp.DirInfoTimeout = 2000;
+    vp.SecurityTimeoutValid = 1;
+    vp.SecurityTimeout = 2000;
+    vp.StreamInfoTimeoutValid = 1;
+    vp.StreamInfoTimeout = 2000;
+    vp.CaseSensitiveSearch = 0;
+    vp.CasePreservedNames = 1;
+    vp.UnicodeOnDisk = 1;
+    vp.PersistentAcls = 0;
+    vp.NamedStreams = 1;
+    vp.SupportsPosixUnlinkRename = 1;
+    vp.ReadOnlyVolume = IsMutationWriteEnabled(&ctx) ? 0 : 1;
+    vp.PostCleanupWhenModifiedOnly = 0;
+    vp.FlushAndPurgeOnCleanup = 1;
+    vp.PostDispositionWhenNecessaryOnly = 1;
+    vp.UmFileContextIsUserContext2 = 1;
+    wcscpy_s(vp.FileSystemName, sizeof(vp.FileSystemName) / sizeof(WCHAR), L"APFS");
+}
+
 NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UINT32 granted_access, UINT32, PSECURITY_DESCRIPTOR, UINT64, PVOID* out_ctx, FSP_FSCTL_FILE_INFO* info)
 {
     auto* c = Ctx(fs);
@@ -3799,6 +4170,77 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
     }
 
     auto path = NormalizePath(file_name ? std::wstring(file_name) : L"\\");
+    auto stream_path = SplitNamedStreamPath(path);
+    if (stream_path.is_named_stream)
+    {
+        if ((create_options & FILE_DIRECTORY_FILE) != 0)
+        {
+            return STATUS_NOT_A_DIRECTORY;
+        }
+
+        auto base_node = FindNode(c, stream_path.base_path);
+        if (!base_node)
+        {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        if (IsDeleteBlockedStateLocked(base_node))
+        {
+            return STATUS_DELETE_PENDING;
+        }
+        if (base_node->is_directory)
+        {
+            return STATUS_FILE_IS_A_DIRECTORY;
+        }
+        if (!EnsureHydrated(c, base_node, true))
+        {
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        auto* o = new (std::nothrow) OpenContext();
+        if (!o)
+        {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        o->node = base_node;
+        o->named_stream = true;
+        o->stream_name = stream_path.stream_name;
+        InitializeOpenAccess(o, granted_access);
+        o->write_open = true;
+        const auto desired_access = ResolveHydrationDesiredAccess(
+            IsMutationWriteEnabled(c),
+            granted_access,
+            true);
+        const auto stream_storage_path = HydrationStreamPath(c, *base_node, stream_path.stream_name);
+        o->file = CreateFileW(
+            stream_storage_path.c_str(),
+            desired_access,
+            ResolveHydrationShareMode(IsMutationWriteEnabled(c), granted_access, o->write_open),
+            nullptr,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (o->file == INVALID_HANDLE_VALUE)
+        {
+            delete o;
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            ++base_node->open_handle_count;
+            if (o->write_open)
+            {
+                ++base_node->write_handle_count;
+            }
+            o->stream_size = RememberNamedStreamSizeFromHandleLocked(c, base_node, stream_path.stream_name, o->file);
+            FillInfo(*base_node, !IsMutationWriteEnabled(c), info);
+        }
+
+        *out_ctx = o;
+        return STATUS_SUCCESS;
+    }
+
     if (path == L"\\")
     {
         return STATUS_OBJECT_NAME_COLLISION;
@@ -4002,6 +4444,24 @@ NTSTATUS CB_Overwrite(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, BOOLEAN, UINT64 al
         return STATUS_ACCESS_DENIED;
     }
 
+    if (o->named_stream)
+    {
+        LARGE_INTEGER target{};
+        target.QuadPart = allocation_size;
+        if (!SetFilePointerEx(o->file, target, nullptr, FILE_BEGIN) || !SetEndOfFile(o->file))
+        {
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            o->stream_size = allocation_size;
+            RememberNamedStreamSizeLocked(c, o->node->path, o->stream_name, allocation_size);
+            FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
+        }
+        return STATUS_SUCCESS;
+    }
+
 #ifdef APFSACCESS_HAS_RW_ENGINE
     if (IsNativeWriteEnabled(c) &&
         !RecordNativeMutationBestEffort(
@@ -4070,7 +4530,7 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
         return STATUS_ACCESS_DENIED;
     }
 
-    auto current_size = o->node->file_size;
+    auto current_size = o->named_stream ? o->stream_size : o->node->file_size;
     if (write_to_end_of_file)
     {
         off = current_size;
@@ -4099,6 +4559,32 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
     if (constrained_io && (off + static_cast<std::uint64_t>(len)) > current_size)
     {
         write_len = (ULONG)(current_size - off);
+    }
+
+    if (o->named_stream)
+    {
+        OVERLAPPED ov{};
+        ov.Offset = (DWORD)(off & 0xffffffffull);
+        ov.OffsetHigh = (DWORD)(off >> 32);
+        DWORD written = 0;
+        if (!WriteFile(o->file, buf, write_len, &written, &ov))
+        {
+            *done = 0;
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        {
+            const auto write_end = off + static_cast<std::uint64_t>(written);
+            std::lock_guard<std::mutex> lock(c->mutex);
+            o->stream_size = std::max<std::uint64_t>(o->stream_size, write_end);
+            RememberNamedStreamSizeLocked(c, o->node->path, o->stream_name, o->stream_size);
+            if (info)
+            {
+                FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
+            }
+        }
+        *done = written;
+        return STATUS_SUCCESS;
     }
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
@@ -4176,6 +4662,12 @@ NTSTATUS CB_SetBasicInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, UINT64 creation
     if (!o->allow_set_basic_info)
     {
         return STATUS_ACCESS_DENIED;
+    }
+
+    if (o->named_stream)
+    {
+        FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
+        return STATUS_SUCCESS;
     }
 
     ULARGE_INTEGER stamp{};
@@ -4259,6 +4751,24 @@ NTSTATUS CB_SetFileSize(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT64 size, BOOLEAN, FS
     if (o->file == INVALID_HANDLE_VALUE)
     {
         return STATUS_UNSUCCESSFUL;
+    }
+
+    if (o->named_stream)
+    {
+        LARGE_INTEGER target{};
+        target.QuadPart = size;
+        if (!SetFilePointerEx(o->file, target, nullptr, FILE_BEGIN) || !SetEndOfFile(o->file))
+        {
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            o->stream_size = size;
+            RememberNamedStreamSizeLocked(c, o->node->path, o->stream_name, size);
+            FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
+        }
+        return STATUS_SUCCESS;
     }
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
@@ -4772,6 +5282,11 @@ VOID CB_Cleanup(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, ULONG flags)
 
     if (o->file != INVALID_HANDLE_VALUE)
     {
+        if (o->named_stream)
+        {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            o->stream_size = RememberNamedStreamSizeFromHandleLocked(c, o->node, o->stream_name, o->file);
+        }
         CloseHandle(o->file);
         o->file = INVALID_HANDLE_VALUE;
     }
@@ -4839,6 +5354,11 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
     MutationCallbackScope mutation_scope(c);
     if (o->file != INVALID_HANDLE_VALUE)
     {
+        if (o->named_stream)
+        {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            o->stream_size = RememberNamedStreamSizeFromHandleLocked(c, o->node, o->stream_name, o->file);
+        }
         CloseHandle(o->file);
         o->file = INVALID_HANDLE_VALUE;
     }
@@ -5008,6 +5528,19 @@ NTSTATUS CB_Flush(FSP_FILE_SYSTEM* fs, PVOID ctx, FSP_FSCTL_FILE_INFO* info)
     if (!o) return STATUS_SUCCESS;
     if (!c || !o->node || !info) return STATUS_INVALID_PARAMETER;
     MutationCallbackScope mutation_scope(c);
+
+    if (o->named_stream)
+    {
+        if (o->file != INVALID_HANDLE_VALUE)
+        {
+            FlushFileBuffers(o->file);
+            std::lock_guard<std::mutex> lock(c->mutex);
+            o->stream_size = RememberNamedStreamSizeFromHandleLocked(c, o->node, o->stream_name, o->file);
+        }
+        FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
+        return STATUS_SUCCESS;
+    }
+
     std::optional<ExternalMutationRequestScope> mutation_request_scope;
     if (IsMutationWriteEnabled(c))
     {
@@ -5018,6 +5551,17 @@ NTSTATUS CB_Flush(FSP_FILE_SYSTEM* fs, PVOID ctx, FSP_FSCTL_FILE_INFO* info)
         }
     }
 
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (c && IsMutationWriteEnabled(c))
+    {
+        const auto native_commit_status = CommitNativeMutationsOnFlushBestEffort(c);
+        if (!NT_SUCCESS(native_commit_status))
+        {
+            return native_commit_status;
+        }
+        FinalizeMutationJournalBestEffort(c, L"Flush");
+    }
+#endif
     FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
     return STATUS_SUCCESS;
 }
@@ -5027,12 +5571,14 @@ NTSTATUS CB_GetSecurityByName(FSP_FILE_SYSTEM* fs, PWSTR file_name, PUINT32 attr
     auto* c = Ctx(fs);
     if (!c || !sz) return STATUS_INVALID_PARAMETER;
     auto p = NormalizePath(file_name ? std::wstring(file_name) : L"\\");
-    auto n = FindNode(c, p);
+    auto stream_path = SplitNamedStreamPath(p);
+    auto lookup_path = stream_path.is_named_stream ? stream_path.base_path : p;
+    auto n = FindNode(c, lookup_path);
     if (!n)
     {
         std::lock_guard<std::mutex> lock(c->mutex);
-        auto hidden = TryGetNodeLocked(c, p);
-        if ((hidden && IsDeleteBlockedStateLocked(hidden)) || HasDeletePendingAncestorLocked(c, p))
+        auto hidden = TryGetNodeLocked(c, lookup_path);
+        if ((hidden && IsDeleteBlockedStateLocked(hidden)) || HasDeletePendingAncestorLocked(c, lookup_path))
         {
             return STATUS_DELETE_PENDING;
         }
@@ -5071,12 +5617,14 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
     }
 
     auto p = NormalizePath(file_name ? std::wstring(file_name) : L"\\");
-    auto n = FindNode(c, p);
+    auto stream_path = SplitNamedStreamPath(p);
+    auto lookup_path = stream_path.is_named_stream ? stream_path.base_path : p;
+    auto n = FindNode(c, lookup_path);
     if (!n)
     {
         std::lock_guard<std::mutex> lock(c->mutex);
-        auto hidden = TryGetNodeLocked(c, p);
-        if ((hidden && IsDeleteBlockedStateLocked(hidden)) || HasDeletePendingAncestorLocked(c, p))
+        auto hidden = TryGetNodeLocked(c, lookup_path);
+        if ((hidden && IsDeleteBlockedStateLocked(hidden)) || HasDeletePendingAncestorLocked(c, lookup_path))
         {
             return STATUS_DELETE_PENDING;
         }
@@ -5119,6 +5667,8 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     o->node = n;
+    o->named_stream = stream_path.is_named_stream;
+    o->stream_name = stream_path.stream_name;
     InitializeOpenAccess(o, granted_access);
     if (!n->is_directory)
     {
@@ -5130,13 +5680,18 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
 
         if (EnsureHydrated(c, n, false))
         {
-            auto pth = HydrationPath(c, *n);
+            auto pth = o->named_stream
+                ? std::filesystem::path(HydrationStreamPath(c, *n, o->stream_name))
+                : HydrationPath(c, *n);
+            const auto creation_disposition = (o->named_stream && mutation_access_requested)
+                ? OPEN_ALWAYS
+                : OPEN_EXISTING;
             o->file = CreateFileW(
                 pth.wstring().c_str(),
                 desired_access,
                 ResolveHydrationShareMode(mutation_enabled, granted_access, o->write_open),
                 nullptr,
-                OPEN_EXISTING,
+                creation_disposition,
                 FILE_ATTRIBUTE_NORMAL,
                 nullptr);
         }
@@ -5176,6 +5731,12 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
         {
             delete o;
             return STATUS_IO_DEVICE_ERROR;
+        }
+
+        if (o->named_stream)
+        {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            o->stream_size = RememberNamedStreamSizeFromHandleLocked(c, n, o->stream_name, o->file);
         }
     }
 
@@ -5223,6 +5784,11 @@ NTSTATUS CB_ReadDirectory(FSP_FILE_SYSTEM* fs, PVOID dir_ctx, PWSTR, PWSTR marke
         entries.reserve(o->node->children.size());
         for (const auto& name : o->node->children)
         {
+            if (LooksLikeNamedStreamArtifactName(name))
+            {
+                continue;
+            }
+
             auto child = TryGetNodeLocked(c, Join(o->node->path, name));
             if (child)
             {
@@ -5864,32 +6430,7 @@ int wmain(int argc, wchar_t** argv)
     ctx.label = BuildExplorerVolumeLabel(args.volume);
 
     FSP_FSCTL_VOLUME_PARAMS vp{};
-    vp.Version = sizeof(FSP_FSCTL_VOLUME_PARAMS);
-    vp.SectorSize = static_cast<UINT16>(ctx.reported_allocation_unit_bytes != 0
-        ? ctx.reported_allocation_unit_bytes
-        : 4096);
-    vp.SectorsPerAllocationUnit = 1;
-    vp.MaxComponentLength = 255;
-    vp.VolumeCreationTime = ((UINT64)now.dwHighDateTime << 32) | now.dwLowDateTime;
-    vp.VolumeSerialNumber = BuildStableVolumeSerial(ctx.args);
-    vp.FileInfoTimeout = 2000;
-    vp.VolumeInfoTimeoutValid = 1;
-    vp.VolumeInfoTimeout = 2000;
-    vp.DirInfoTimeoutValid = 1;
-    vp.DirInfoTimeout = 2000;
-    vp.SecurityTimeoutValid = 1;
-    vp.SecurityTimeout = 2000;
-    vp.CaseSensitiveSearch = 0;
-    vp.CasePreservedNames = 1;
-    vp.UnicodeOnDisk = 1;
-    vp.PersistentAcls = 0;
-    vp.SupportsPosixUnlinkRename = 1;
-    vp.ReadOnlyVolume = IsMutationWriteEnabled(&ctx) ? 0 : 1;
-    vp.PostCleanupWhenModifiedOnly = 0;
-    vp.FlushAndPurgeOnCleanup = 1;
-    vp.PostDispositionWhenNecessaryOnly = 1;
-    vp.UmFileContextIsUserContext2 = 1;
-    wcscpy_s(vp.FileSystemName, sizeof(vp.FileSystemName) / sizeof(WCHAR), L"APFS");
+    ConfigureVolumeParamsForExplorer(ctx, now, vp);
 
     FSP_FILE_SYSTEM_INTERFACE iface{};
     iface.GetVolumeInfo = CB_GetVolumeInfo;
@@ -5911,6 +6452,7 @@ int wmain(int argc, wchar_t** argv)
     iface.GetSecurity = CB_GetSecurity;
     iface.SetSecurity = CB_SetSecurity;
     iface.SetDelete = CB_SetDelete;
+    iface.GetStreamInfo = CB_GetStreamInfo;
     iface.ReadDirectory = CB_ReadDirectory;
 
     NTSTATUS st = ctx.api.Create(const_cast<PWSTR>(L"" FSP_FSCTL_DISK_DEVICE_NAME), &vp, &iface, &ctx.fs);

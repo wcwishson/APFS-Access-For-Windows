@@ -225,6 +225,36 @@ public sealed class TrayApplicationContextPrioritizationTests
         Assert.True(timeout >= TimeSpan.FromSeconds(125));
     }
 
+    [Fact]
+    public void IsCurrentServiceExecutablePath_RejectsDifferentPortablePayload()
+    {
+        var candidates = new[]
+        {
+            @"C:\Users\guosen\AppData\Local\ApfsAccessPortable\payload-NEW\ApfsAccess.Service.exe",
+        };
+
+        var isCurrent = InvokeIsCurrentServiceExecutablePath(
+            @"C:\Users\guosen\AppData\Local\ApfsAccessPortable\payload-OLD\ApfsAccess.Service.exe",
+            candidates);
+
+        Assert.False(isCurrent);
+    }
+
+    [Fact]
+    public void IsCurrentServiceExecutablePath_AcceptsMatchingPayloadWithCaseDifferences()
+    {
+        var candidates = new[]
+        {
+            @"C:\Users\guosen\AppData\Local\ApfsAccessPortable\payload-NEW\ApfsAccess.Service.exe",
+        };
+
+        var isCurrent = InvokeIsCurrentServiceExecutablePath(
+            @"c:\users\guosen\appdata\local\apfsaccessportable\payload-new\apfsaccess.service.exe",
+            candidates);
+
+        Assert.True(isCurrent);
+    }
+
     private static string? InvokeTryExtractReasonTokenFromWarning(string? warning)
     {
         var method = typeof(TrayApplicationContext).GetMethod(
@@ -300,5 +330,16 @@ public sealed class TrayApplicationContextPrioritizationTests
 
         var result = field!.GetValue(null);
         return Assert.IsType<TimeSpan>(result);
+    }
+
+    private static bool InvokeIsCurrentServiceExecutablePath(string? executablePath, IEnumerable<string> candidates)
+    {
+        var method = typeof(TrayApplicationContext).GetMethod(
+            "IsCurrentServiceExecutablePath",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+
+        var result = method!.Invoke(null, [executablePath, candidates]);
+        return Assert.IsType<bool>(result);
     }
 }

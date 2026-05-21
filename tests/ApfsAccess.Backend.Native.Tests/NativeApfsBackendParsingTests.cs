@@ -327,6 +327,7 @@ public sealed class NativeApfsBackendParsingTests
     [InlineData("ScaffoldCommitBlobActive", "NativeWriteScaffoldCommitBlobActive", "RecoveryFailClosedScaffoldCommitBlob")]
     [InlineData("RecoveryMarkerDirty", "NativeWriteRecoveryMarkerDirty", "RecoveryFailClosedMarkerDirty")]
     [InlineData("DirtyTransactionLimitExceeded", "NativeWriteDirtyTransactionLimitExceeded", "RecoveryFailClosedDirtyLimit")]
+    [InlineData("NativeMutationStagingFailed", "NativeWriteMutationStagingFailed", "RecoveryFailClosedMutationStaging")]
     [InlineData("CanonicalPathNotActive", "NativeWriteCanonicalPathNotActive", "RecoveryFailClosedCanonicalPath")]
     [InlineData("CanonicalStateNotLoaded", "NativeWriteCanonicalGateFailure", "RecoveryFailClosedCanonicalGate")]
     [InlineData("CanonicalVolumeStateLoadFailed", "NativeWriteCanonicalGateFailure", "RecoveryFailClosedCanonicalGate")]
@@ -1678,6 +1679,33 @@ public sealed class NativeApfsBackendParsingTests
             shutdownDrainActive: false,
             inFlightMutationCallbacks: 0);
         Assert.Null(InvokeGetFailClosedReasonForRuntimeStatus(highDirtyOverlayStatus, "FailClosed", 128));
+    }
+
+    [Fact]
+    public void GetFailClosedReasonForRuntimeStatus_PreservesExplicitStagingFailureBeforeCanonicalModelMismatch()
+    {
+        var stagingFailureStatus = CreateHostRuntimeStatusRaw(
+            writeBackend: "Native",
+            commitModel: NativeWriteCommitModel.ScaffoldCheckpoint,
+            nativeWriteReadiness: NativeWriteReadiness.Degraded,
+            recoveryActive: true,
+            recoveryReason: "NativeMutationStagingFailed",
+            lastCommitXid: 4839,
+            nativeWriteSafetyState: NativeWriteSafetyState.RecoveryBlocked,
+            lastRecoveryAction: "DowngradedAfterMutationStagingFailure",
+            dirtyTransactionCount: 128,
+            nativeWriteValidationState: NativeWriteValidationState.Scaffold);
+
+        Assert.Equal(
+            "NativeMutationStagingFailed",
+            InvokeGetFailClosedReasonForRuntimeStatus(
+                stagingFailureStatus,
+                "FailClosed",
+                128,
+                isFixtureImage: false,
+                disallowScaffoldCommitOnNonFixture: true,
+                rejectScaffoldReplayBlobOnNonFixture: true,
+                requireCanonicalReplayCandidateOnNonFixture: true));
     }
 
     [Fact]

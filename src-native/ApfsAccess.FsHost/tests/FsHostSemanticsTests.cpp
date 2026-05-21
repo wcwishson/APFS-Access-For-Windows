@@ -2849,6 +2849,52 @@ bool TestFlushReleasesExternalMutationScopeAfterSuccessfulWriteEnabledFlush()
         "Successful flush should release the external mutation callback scope");
 }
 
+bool TestFlushFinalizesPendingMutationJournal()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    context.tx_manager = std::make_unique<apfsaccess::rw::TransactionManager>(L"Conservative");
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"flush_journal.txt");
+    auto file = MakeNode(L"\\flush_journal.txt", false, false);
+    context.nodes.emplace(Key(file->path), file);
+
+    if (!RecordMutationBestEffort(
+            &context,
+            apfsaccess::rw::TransactionManager::MutationKind::Write,
+            L"\\flush_journal.txt",
+            L"",
+            0,
+            4096))
+    {
+        return Require(false, "Flush journal test should stage a pending transaction mutation");
+    }
+    if (!Require(context.tx_manager->PendingMutationCount() == 1, "Flush journal test should start with one pending mutation"))
+    {
+        return false;
+    }
+
+    OpenContext open_context{};
+    open_context.node = file;
+
+    auto fs = BuildFileSystem(&context);
+    FSP_FSCTL_FILE_INFO info{};
+    const auto status = CB_Flush(&fs, &open_context, &info);
+    if (!Require(status == STATUS_SUCCESS, "Flush should succeed while draining a pending transaction journal"))
+    {
+        return false;
+    }
+
+    return Require(
+        context.tx_manager->PendingMutationCount() == 0 &&
+        context.tx_manager->CurrentState() == apfsaccess::rw::TransactionManager::State::Idle,
+        "Flush should finalize pending mutation journal entries before returning success");
+}
+
 bool TestMutatingCallbacksFailWriteProtectedWhenWriteDisabled()
 {
     MountContext context{};
@@ -5235,12 +5281,15 @@ bool TestBuildWinFspMountPointUsesGlobalDriveForExplorer()
 
 bool TestVolumeParamsUseExplorerFriendlyCleanupFlags()
 {
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    context.args.volume = L"Main";
+    context.reported_allocation_unit_bytes = 4096;
+
     FSP_FSCTL_VOLUME_PARAMS params{};
-    params.PostCleanupWhenModifiedOnly = 0;
-    params.FlushAndPurgeOnCleanup = 1;
-    params.PostDispositionWhenNecessaryOnly = 1;
-    params.SupportsPosixUnlinkRename = 1;
-    params.PersistentAcls = 0;
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+    ConfigureVolumeParamsForExplorer(context, now, params);
 
     if (!Require(params.PostCleanupWhenModifiedOnly == 0, "Volume params should deliver cleanup for every user handle so Explorer/Office locks clear promptly"))
     {
@@ -5259,6 +5308,270 @@ bool TestVolumeParamsUseExplorerFriendlyCleanupFlags()
         return false;
     }
     return Require(params.PersistentAcls == 0, "Volume params should not advertise persistent ACLs while APFS Access returns synthetic security descriptors");
+}
+
+bool TestNamedStreamCopyCompatibility()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    context.args.volume = L"Main";
+    context.reported_allocation_unit_bytes = 4096;
+    SeedRoot(context);
+
+    auto file = MakeNode(L"\\Antigravity-x64.exe", false, false);
+    file->file_size = 143772040;
+    context.nodes.emplace(Key(file->path), file);
+
+    OpenContext open_context{};
+    open_context.node = file;
+    auto fs = BuildFileSystem(&context);
+
+    std::array<std::byte, 256> buffer{};
+    ULONG transferred = 0;
+    const auto status = CB_GetStreamInfo(
+        &fs,
+        &open_context,
+        buffer.data(),
+        static_cast<ULONG>(buffer.size()),
+        &transferred);
+    if (!Require(status == STATUS_SUCCESS, "GetStreamInfo should succeed so Explorer can copy files with source metadata streams without warning"))
+    {
+        return false;
+    }
+    if (!Require(transferred > 0, "GetStreamInfo should report at least the default data stream"))
+    {
+        return false;
+    }
+
+    const auto* stream_info = reinterpret_cast<const FSP_FSCTL_STREAM_INFO*>(buffer.data());
+    if (!Require(stream_info->StreamSize == file->file_size, "Default stream info should report file size"))
+    {
+        return false;
+    }
+
+    const auto stream_name_chars = (stream_info->Size - sizeof(FSP_FSCTL_STREAM_INFO)) / sizeof(WCHAR);
+    const std::wstring stream_name(stream_info->StreamNameBuf, stream_name_chars);
+    if (!Require(stream_name == L"::$DATA", "Default stream info should use the Windows default data stream name"))
+    {
+        return false;
+    }
+
+    FSP_FSCTL_VOLUME_PARAMS volume_params{};
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+    ConfigureVolumeParamsForExplorer(context, now, volume_params);
+    return Require(volume_params.NamedStreams == 1, "Volume params should advertise named stream compatibility to Explorer");
+}
+
+bool TestNamedStreamCreateDoesNotCreateVisibleApfsFile()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    context.args.volume = L"Main";
+    context.reported_allocation_unit_bytes = 4096;
+    SeedRoot(context);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"Antigravity-x64.exe");
+    auto file = MakeNode(L"\\Antigravity-x64.exe", false, false);
+    file->file_size = 12;
+    context.nodes.emplace(Key(file->path), file);
+
+    auto fs = BuildFileSystem(&context);
+    PVOID out_ctx = nullptr;
+    FSP_FSCTL_FILE_INFO info{};
+    const auto create_status = CB_Create(
+        &fs,
+        const_cast<PWSTR>(L"\\Antigravity-x64.exe:LH.Identifier"),
+        FILE_NON_DIRECTORY_FILE,
+        FILE_WRITE_DATA | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES,
+        0,
+        nullptr,
+        0,
+        &out_ctx,
+        &info);
+    if (!Require(create_status == STATUS_SUCCESS, "Named stream create should succeed for Explorer metadata copy compatibility"))
+    {
+        return false;
+    }
+    if (!Require(out_ctx != nullptr, "Named stream create should return an open context"))
+    {
+        return false;
+    }
+
+    const std::array<char, 11> payload{ 'p', 'r', 'o', 'b', 'e', '-', 's', 't', 'r', 'e', 'a' };
+    ULONG done = 0;
+    const auto write_status = CB_Write(
+        &fs,
+        out_ctx,
+        const_cast<char*>(payload.data()),
+        0,
+        static_cast<ULONG>(payload.size()),
+        FALSE,
+        FALSE,
+        &done,
+        &info);
+    if (!Require(write_status == STATUS_SUCCESS, "Named stream write should succeed"))
+    {
+        return false;
+    }
+    if (!Require(done == payload.size(), "Named stream write should report all bytes written"))
+    {
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(context.mutex);
+        if (!Require(TryGetNodeLocked(&context, L"\\Antigravity-x64.exe:LH.Identifier") == nullptr, "Named stream writes must not create visible APFS colon-named files"))
+        {
+            return false;
+        }
+        if (!Require(std::find(root->children.begin(), root->children.end(), L"Antigravity-x64.exe:LH.Identifier") == root->children.end(), "Named stream writes must not add colon-named directory entries"))
+        {
+            return false;
+        }
+        if (!Require(file->file_size == 12, "Named stream writes must not change the base file size"))
+        {
+            return false;
+        }
+    }
+
+    CB_Close(&fs, out_ctx);
+
+    PVOID stream_read_ctx = nullptr;
+    FSP_FSCTL_FILE_INFO read_info{};
+    const auto open_status = CB_Open(
+        &fs,
+        const_cast<PWSTR>(L"\\Antigravity-x64.exe:LH.Identifier"),
+        FILE_NON_DIRECTORY_FILE,
+        FILE_READ_DATA,
+        &stream_read_ctx,
+        &read_info);
+    if (!Require(open_status == STATUS_SUCCESS, "Named stream reopen should succeed for Explorer metadata copy round-trips"))
+    {
+        return false;
+    }
+
+    std::array<char, 16> read_payload{};
+    ULONG read_done = 0;
+    const auto read_status = CB_Read(
+        &fs,
+        stream_read_ctx,
+        read_payload.data(),
+        0,
+        static_cast<ULONG>(payload.size()),
+        &read_done);
+    if (!Require(read_status == STATUS_SUCCESS, "Named stream read should succeed after reopen"))
+    {
+        CB_Close(&fs, stream_read_ctx);
+        return false;
+    }
+    if (!Require(read_done == payload.size(), "Named stream read should return all bytes written"))
+    {
+        CB_Close(&fs, stream_read_ctx);
+        return false;
+    }
+    if (!Require(std::equal(payload.begin(), payload.end(), read_payload.begin()), "Named stream payload should round-trip through the hydration sidecar"))
+    {
+        CB_Close(&fs, stream_read_ctx);
+        return false;
+    }
+    CB_Close(&fs, stream_read_ctx);
+
+    OpenContext base_open{};
+    base_open.node = file;
+    std::array<std::byte, 512> stream_buffer{};
+    ULONG transferred = 0;
+    const auto stream_status = CB_GetStreamInfo(
+        &fs,
+        &base_open,
+        stream_buffer.data(),
+        static_cast<ULONG>(stream_buffer.size()),
+        &transferred);
+    if (!Require(stream_status == STATUS_SUCCESS, "GetStreamInfo should succeed after writing a named stream"))
+    {
+        return false;
+    }
+
+    bool found_named_stream = false;
+    ULONG cursor = 0;
+    while (cursor < transferred)
+    {
+        const auto* stream_info = reinterpret_cast<const FSP_FSCTL_STREAM_INFO*>(stream_buffer.data() + cursor);
+        if (stream_info->Size < sizeof(FSP_FSCTL_STREAM_INFO) ||
+            stream_info->Size > transferred - cursor)
+        {
+            return Require(false, "Stream info entries should be packed with valid sizes");
+        }
+
+        const auto name_chars = (stream_info->Size - sizeof(FSP_FSCTL_STREAM_INFO)) / sizeof(WCHAR);
+        const std::wstring stream_name(stream_info->StreamNameBuf, name_chars);
+        if (stream_name == L":LH.Identifier:$DATA")
+        {
+            found_named_stream = stream_info->StreamSize == payload.size();
+        }
+        cursor += stream_info->Size;
+    }
+
+    return Require(found_named_stream, "GetStreamInfo should enumerate the named metadata stream attached to the base file");
+}
+
+bool TestLegacyNamedStreamArtifactsAreHidden()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    context.args.volume = L"Main";
+    SeedRoot(context);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    const std::wstring artifact_name = L"ANTIGRAVITY.EXE:LH.Identifier";
+    AddChildName(root->children, artifact_name);
+    auto artifact = MakeNode(L"\\" + artifact_name, false, false);
+    artifact->file_size = 108;
+    context.nodes.emplace(Key(artifact->path), artifact);
+
+    {
+        std::lock_guard<std::mutex> lock(context.mutex);
+        if (!Require(TryGetVisibleNodeLocked(&context, artifact->path) == nullptr, "Legacy colon-named stream artifacts should not resolve as visible APFS files"))
+        {
+            return false;
+        }
+    }
+
+    OpenContext dir_context{};
+    dir_context.node = root;
+    dir_context.allow_list_directory = true;
+    auto fs = BuildFileSystem(&context);
+    context.api.AddDir = [](FSP_FSCTL_DIR_INFO* dir_info, PVOID, ULONG, PULONG done) -> BOOLEAN
+    {
+        if (!dir_info)
+        {
+            return TRUE;
+        }
+
+        if (done)
+        {
+            *done += dir_info->Size;
+        }
+        return TRUE;
+    };
+
+    std::array<std::byte, 512> buffer{};
+    ULONG transferred = 0;
+    const auto read_status = CB_ReadDirectory(
+        &fs,
+        &dir_context,
+        nullptr,
+        nullptr,
+        buffer.data(),
+        static_cast<ULONG>(buffer.size()),
+        &transferred);
+    if (!Require(read_status == STATUS_SUCCESS, "Directory enumeration should succeed when legacy stream artifacts are present"))
+    {
+        return false;
+    }
+
+    return Require(transferred == 0, "Directory enumeration should hide legacy colon-named stream artifact files");
 }
 
 bool TestNormalizePathStripsDriveQualifiedRoot()
@@ -5512,6 +5825,22 @@ bool RunSelectedTest(const std::string& name)
     {
         return TestStableVolumeSerialDependsOnVolumeIdentityNotProcessUptime();
     }
+    if (name == "flush-finalizes-pending-journal")
+    {
+        return TestFlushFinalizesPendingMutationJournal();
+    }
+    if (name == "named-stream-copy-compatibility")
+    {
+        return TestNamedStreamCopyCompatibility();
+    }
+    if (name == "named-stream-hidden-metadata")
+    {
+        return TestNamedStreamCreateDoesNotCreateVisibleApfsFile();
+    }
+    if (name == "legacy-named-stream-artifacts-hidden")
+    {
+        return TestLegacyNamedStreamArtifactsAreHidden();
+    }
 
     std::cerr << "[FAIL] Unknown selected FsHost semantics test: " << name << std::endl;
     return false;
@@ -5609,6 +5938,7 @@ int main(int argc, char** argv)
     ok &= TestFlushRejectedWhenShutdownDrainActive();
     ok &= TestFlushAllowedWhenWriteDisabledDuringShutdownDrain();
     ok &= TestFlushReleasesExternalMutationScopeAfterSuccessfulWriteEnabledFlush();
+    ok &= TestFlushFinalizesPendingMutationJournal();
     ok &= TestMutatingCallbacksFailWriteProtectedWhenWriteDisabled();
     ok &= TestSetSecurityIsNoopWhenWriteEnabled();
     ok &= TestDefaultSecurityDescriptorGrantsUsersWriteAccess();
@@ -5643,6 +5973,9 @@ int main(int argc, char** argv)
     ok &= TestParseArgsParsesStrictNonFixtureControlOverrides();
     ok &= TestBuildWinFspMountPointUsesGlobalDriveForExplorer();
     ok &= TestVolumeParamsUseExplorerFriendlyCleanupFlags();
+    ok &= TestNamedStreamCopyCompatibility();
+    ok &= TestNamedStreamCreateDoesNotCreateVisibleApfsFile();
+    ok &= TestLegacyNamedStreamArtifactsAreHidden();
     ok &= TestNormalizePathStripsDriveQualifiedRoot();
     ok &= TestStableVolumeSerialDependsOnVolumeIdentityNotProcessUptime();
     ok &= TestVolumeInfoFallbackKeepsExplorerCapacityBarUsable();

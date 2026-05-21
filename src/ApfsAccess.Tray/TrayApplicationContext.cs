@@ -231,19 +231,58 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         _lastServiceStartAttemptUtc = nowUtc;
 
+        var serviceCandidates = GetServiceExeCandidates().ToArray();
         try
         {
-            if (Process.GetProcessesByName("ApfsAccess.Service").Length > 0)
+            var runningServices = Process.GetProcessesByName("ApfsAccess.Service");
+            if (runningServices.Any(process =>
+                    IsCurrentServiceExecutablePath(TryGetProcessExecutablePath(process), serviceCandidates)))
             {
+                DisposeProcesses(runningServices);
                 return;
             }
+
+            var knownStaleServices = runningServices
+                .Where(process => !string.IsNullOrWhiteSpace(TryGetProcessExecutablePath(process)))
+                .ToArray();
+            if (knownStaleServices.Length > 0)
+            {
+                LogDiagnostic(
+                    $"Found {knownStaleServices.Length} stale service process(es) from another payload; requesting clean shutdown before starting current service.");
+                if (!TrySendQuitAsync().GetAwaiter().GetResult())
+                {
+                    LogDiagnostic("Stale service shutdown request was not acknowledged; delaying service replacement.");
+                    DisposeProcesses(runningServices);
+                    return;
+                }
+
+                WaitForProcessesToExit(knownStaleServices, TimeSpan.FromSeconds(12));
+                DisposeProcesses(runningServices);
+
+                runningServices = Process.GetProcessesByName("ApfsAccess.Service");
+                if (runningServices.Any(process =>
+                        IsCurrentServiceExecutablePath(TryGetProcessExecutablePath(process), serviceCandidates)))
+                {
+                    DisposeProcesses(runningServices);
+                    return;
+                }
+
+                if (runningServices.Length > 0)
+                {
+                    LogDiagnostic("Stale service process is still running after shutdown request; current service start postponed.");
+                    DisposeProcesses(runningServices);
+                    return;
+                }
+            }
+
+            DisposeProcesses(runningServices);
         }
         catch
         {
             // If process enumeration fails, continue and attempt process start by path.
         }
 
-        foreach (var candidate in GetServiceExeCandidates())
+        foreach (var candidate in serviceCandidates)
         {
             if (!File.Exists(candidate))
             {
@@ -278,6 +317,103 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         // Legacy split publish layout.
         yield return Path.GetFullPath(Path.Combine(baseDir, "..", "service", "ApfsAccess.Service.exe"));
+    }
+
+    private static bool IsCurrentServiceExecutablePath(string? executablePath, IEnumerable<string> serviceExeCandidates)
+    {
+        if (string.IsNullOrWhiteSpace(executablePath))
+        {
+            return false;
+        }
+
+        string normalizedExecutablePath;
+        try
+        {
+            normalizedExecutablePath = Path.GetFullPath(executablePath);
+        }
+        catch
+        {
+            normalizedExecutablePath = executablePath.Trim();
+        }
+
+        foreach (var candidate in serviceExeCandidates)
+        {
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                continue;
+            }
+
+            string normalizedCandidate;
+            try
+            {
+                normalizedCandidate = Path.GetFullPath(candidate);
+            }
+            catch
+            {
+                normalizedCandidate = candidate.Trim();
+            }
+
+            if (string.Equals(normalizedExecutablePath, normalizedCandidate, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static string? TryGetProcessExecutablePath(Process process)
+    {
+        try
+        {
+            return process.MainModule?.FileName;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static void WaitForProcessesToExit(IEnumerable<Process> processes, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        foreach (var process in processes)
+        {
+            try
+            {
+                if (process.HasExited)
+                {
+                    continue;
+                }
+
+                var remaining = deadline - DateTime.UtcNow;
+                if (remaining <= TimeSpan.Zero)
+                {
+                    return;
+                }
+
+                process.WaitForExit((int)Math.Min(remaining.TotalMilliseconds, int.MaxValue));
+            }
+            catch
+            {
+                // Best-effort replacement guard; startup retry loop will try again.
+            }
+        }
+    }
+
+    private static void DisposeProcesses(IEnumerable<Process> processes)
+    {
+        foreach (var process in processes)
+        {
+            try
+            {
+                process.Dispose();
+            }
+            catch
+            {
+                // Ignore process disposal failures.
+            }
+        }
     }
 
     private async Task<bool> TrySendQuitAsync()

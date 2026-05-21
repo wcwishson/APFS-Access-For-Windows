@@ -926,6 +926,39 @@ public sealed class NativeApfsBackendRuntimeStatusTests
     }
 
     [Fact]
+    public async Task ReadHostRuntimeStatusAsync_CanonicalizesNativeMutationStagingFailureReason()
+    {
+        using var statusFile = new TemporaryStatusFile("""
+            {
+              "writeBackend": "Disabled",
+              "commitModel": "ScaffoldCheckpoint",
+              "nativeWriteReadiness": "Degraded",
+              "nativeWriteSafetyState": "ReadOnlyFallback",
+              "recoveryActive": true,
+              "recoveryReason": " native mutation staging failed ",
+              "lastRecoveryAction": "DowngradedAfterMutationStagingFailure",
+              "lastCommitXid": 4839,
+              "dirtyTransactionCount": 128
+            }
+            """);
+
+        var status = await InvokeReadHostRuntimeStatusAsync(
+            statusFilePath: statusFile.Path,
+            accessMode: MountAccessMode.ReadWrite,
+            configuredWriteBackend: "Native",
+            timeout: TimeSpan.FromMilliseconds(220));
+
+        Assert.Equal("Native", status.WriteBackend);
+        Assert.Equal(NativeWriteReadiness.Degraded, status.NativeWriteReadiness);
+        Assert.True(status.RecoveryActive);
+        Assert.Equal("NativeMutationStagingFailed", status.RecoveryReason);
+        Assert.Equal("DowngradedAfterMutationStagingFailure", status.LastRecoveryAction);
+        Assert.Equal((ulong)4839, status.LastCommitXid);
+        Assert.Equal(128, status.DirtyTransactionCount);
+        Assert.Equal(NativeWriteSafetyState.RecoveryBlocked, status.NativeWriteSafetyState);
+    }
+
+    [Fact]
     public async Task ReadHostRuntimeStatusAsync_MalformedJsonFallsBackAfterTimeout()
     {
         using var statusFile = new TemporaryStatusFile("{ \"writeBackend\": \"Native\"");

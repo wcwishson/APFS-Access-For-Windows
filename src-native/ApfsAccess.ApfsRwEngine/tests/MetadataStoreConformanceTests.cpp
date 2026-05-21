@@ -1001,6 +1001,186 @@ bool TestPendingWriteDirectoryRenamePersistenceConformance(const std::filesystem
     return ok;
 }
 
+bool TestSequentialWriteBurstCoalescesPendingMetadataConformance(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "sequential_write_burst.apfs.img";
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, "SequentialWriteBurst: unable to create synthetic container");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        L"SequentialWriteBurst",
+    };
+
+    apfsaccess::rw::MetadataStore store(context);
+    bool ok = true;
+    ok &= Require(store.LoadContainerSuperblocks(), "SequentialWriteBurst: LoadContainerSuperblocks should succeed");
+    ok &= Require(store.LoadObjectMap(), "SequentialWriteBurst: LoadObjectMap should succeed");
+    ok &= Require(store.LoadSpacemanState(), "SequentialWriteBurst: LoadSpacemanState should succeed");
+    ok &= Require(store.PrepareNativeWritePath(), "SequentialWriteBurst: PrepareNativeWritePath should succeed");
+
+    const auto payload = BuildPatternPayload(128 * 4096, 0x7B);
+    std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+    ConfigurePayloadProvider(store, staged_payloads);
+
+    apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+    create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+    create_file.path = L"\\large-copy.bin";
+    ok &= ExpectMutationStatus(
+        store,
+        create_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "SequentialWriteBurst: create large-copy file should apply");
+
+    apfsaccess::rw::MetadataStore::MutationRequest set_size{};
+    set_size.operation = apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize;
+    set_size.path = L"\\large-copy.bin";
+    set_size.length = payload.size();
+    ok &= ExpectMutationStatus(
+        store,
+        set_size,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "SequentialWriteBurst: initial final-size preallocation should apply");
+
+    apfsaccess::rw::MetadataStore::MutationRequest write_file{};
+    write_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+    write_file.path = L"\\large-copy.bin";
+    write_file.length = 4096;
+    for (std::size_t offset = 0; offset < payload.size(); offset += 4096)
+    {
+        write_file.offset = offset;
+        ok &= ExpectMutationStatus(
+            store,
+            write_file,
+            apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "SequentialWriteBurst: staged sequential write chunk should apply");
+    }
+    staged_payloads[L"\\large-copy.bin"] = payload;
+
+    ok &= Require(
+        store.PendingMutationCount() < 16,
+        "SequentialWriteBurst: chunked writes should coalesce below the dirty transaction limit");
+    ok &= Require(
+        store.PendingObjectMapUpdateCount() == 1,
+        "SequentialWriteBurst: chunked writes should keep one pending object-map update for the target file");
+    ok &= Require(
+        store.PendingAllocationCount() <= 2,
+        "SequentialWriteBurst: chunked writes should not allocate a fresh full-file extent for every chunk");
+    ok &= Require(
+        store.PendingDeallocationCount() == 0,
+        "SequentialWriteBurst: chunked writes inside preallocated size should not stage extent churn deallocations");
+    ok &= Require(
+        store.PendingBtreeRecordCount() < 16,
+        "SequentialWriteBurst: chunked writes should keep pending btree metadata compact");
+
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "SequentialWriteBurst: coalesced burst commit should succeed");
+
+    std::vector<std::byte> committed_payload;
+    ok &= Require(
+        store.ReadCommittedFileRange(
+            L"\\large-copy.bin",
+            0,
+            payload.size(),
+            committed_payload),
+        "SequentialWriteBurst: committed payload should be readable");
+    ok &= Require(
+        committed_payload == payload,
+        "SequentialWriteBurst: committed payload should match staged large copy");
+
+    return ok;
+}
+
+bool TestStreamingLargeCopyWithoutPreallocationCoalescesPendingMetadataConformance(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "streaming_large_copy.apfs.img";
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, "StreamingLargeCopy: unable to create synthetic container");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        L"StreamingLargeCopy",
+    };
+
+    apfsaccess::rw::MetadataStore store(context);
+    bool ok = true;
+    ok &= Require(store.LoadContainerSuperblocks(), "StreamingLargeCopy: LoadContainerSuperblocks should succeed");
+    ok &= Require(store.LoadObjectMap(), "StreamingLargeCopy: LoadObjectMap should succeed");
+    ok &= Require(store.LoadSpacemanState(), "StreamingLargeCopy: LoadSpacemanState should succeed");
+    ok &= Require(store.PrepareNativeWritePath(), "StreamingLargeCopy: PrepareNativeWritePath should succeed");
+
+    const auto payload = BuildPatternPayload(128 * 4096, 0x91);
+    std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+    ConfigurePayloadProvider(store, staged_payloads);
+
+    apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+    create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+    create_file.path = L"\\streamed-installer.exe";
+    ok &= ExpectMutationStatus(
+        store,
+        create_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "StreamingLargeCopy: create streamed file should apply");
+
+    apfsaccess::rw::MetadataStore::MutationRequest write_file{};
+    write_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+    write_file.path = L"\\streamed-installer.exe";
+    write_file.length = 4096;
+    for (std::size_t offset = 0; offset < payload.size(); offset += 4096)
+    {
+        write_file.offset = offset;
+        ok &= ExpectMutationStatus(
+            store,
+            write_file,
+            apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "StreamingLargeCopy: staged streaming write chunk should apply");
+    }
+    staged_payloads[L"\\streamed-installer.exe"] = payload;
+
+    ok &= Require(
+        store.PendingMutationCount() < 16,
+        "StreamingLargeCopy: streamed writes should coalesce below the dirty transaction limit");
+    ok &= Require(
+        store.PendingObjectMapUpdateCount() == 1,
+        "StreamingLargeCopy: streamed writes should keep one pending object-map update for the target file");
+    ok &= Require(
+        store.PendingAllocationCount() <= 2,
+        "StreamingLargeCopy: streamed growth should not retain every intermediate file extent allocation");
+    ok &= Require(
+        store.PendingDeallocationCount() == 0,
+        "StreamingLargeCopy: intermediate uncommitted growth extents should be released without staged deallocation churn");
+    ok &= Require(
+        store.PendingBtreeRecordCount() < 16,
+        "StreamingLargeCopy: streamed writes should keep pending btree metadata compact");
+
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "StreamingLargeCopy: coalesced streaming copy commit should succeed");
+
+    std::vector<std::byte> committed_payload;
+    ok &= Require(
+        store.ReadCommittedFileRange(
+            L"\\streamed-installer.exe",
+            0,
+            payload.size(),
+            committed_payload),
+        "StreamingLargeCopy: committed payload should be readable");
+    ok &= Require(
+        committed_payload == payload,
+        "StreamingLargeCopy: committed payload should match staged streaming copy");
+
+    return ok;
+}
+
 bool TestBtreeCanonicalizationConformance(const std::filesystem::path& run_root)
 {
     const auto image_path = run_root / "btree_canonical.apfs.img";
@@ -1669,6 +1849,8 @@ int main()
     ok &= TestTruncateConformance(run_root);
     ok &= TestDirectorySubtreeRenameObjectMapConformance(run_root);
     ok &= TestPendingWriteDirectoryRenamePersistenceConformance(run_root);
+    ok &= TestSequentialWriteBurstCoalescesPendingMetadataConformance(run_root);
+    ok &= TestStreamingLargeCopyWithoutPreallocationCoalescesPendingMetadataConformance(run_root);
     ok &= TestBtreeCanonicalizationConformance(run_root);
     ok &= TestCommittedReadExtentsConformance(run_root);
     ok &= TestCommittedZeroReadExtentConformance(run_root);

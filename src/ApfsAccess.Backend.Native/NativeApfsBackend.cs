@@ -4399,6 +4399,67 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         };
     }
 
+    private static bool ShouldPreserveExplicitRecoveryReasonBeforeCanonicalGate(string? normalizedRecoveryReason)
+    {
+        return normalizedRecoveryReason is
+            "NativeMutationStagingFailed" or
+            "DirtyTransactionLimitExceeded" or
+            "CommitTimedOut" or
+            "CommitNotWritable" or
+            "CommitNotReady" or
+            "CommitAllocationFailed" or
+            "CommitInvariantFailed" or
+            "CommitPersistOrFlushFailed" or
+            "CommitInterruptedBeforeObjectMapPersist" or
+            "CommitObjectMapPersistFailed" or
+            "CommitObjectMapRoundTripFailed" or
+            "CommitInterruptedBeforeSpacemanPersist" or
+            "CommitSpacemanPersistFailed" or
+            "CommitSpacemanRoundTripFailed" or
+            "CommitInterruptedBeforeInodePersist" or
+            "CommitInodePersistFailed" or
+            "CommitInodeRoundTripFailed" or
+            "CommitInterruptedBeforeBtreePersist" or
+            "CommitBtreePersistFailed" or
+            "CommitBtreeRoundTripFailed" or
+            "CommitInterruptedBeforeReplayPersist" or
+            "CommitReplayPersistFailed" or
+            "CommitInterruptedBeforeReplayRoundTripVerify" or
+            "CommitReplayRoundTripFailed" or
+            "CommitInterruptedBeforeCheckpointSwitch" or
+            "CommitCheckpointWriteFailed" or
+            "CommitInterruptedBeforeCheckpointRoundTripVerify" or
+            "CommitCheckpointRoundTripFailed" or
+            "CommitInterruptedBeforeCheckpointFlush" or
+            "CommitCheckpointFlushFailed" or
+            "NativeWriteBootstrapFailed" or
+            "ContainerStateLoadFailed" or
+            "ObjectMapLoadFailed" or
+            "SpacemanStateLoadFailed" or
+            "VolumeStateLoadFailed" or
+            "PersistentStateLoadFailed" or
+            "RootStateInvalid" or
+            "IntegrityCheckFailedOnMount" or
+            "IntegrityMissingAllocationMap" or
+            "PersistentStateAheadOfSuperblock" or
+            "PersistentStateBehindSuperblock" or
+            "RecoveryLoadVolumeStateFailed" or
+            "RecoveryPersistentStateLoadFailed" or
+            "ReplayIntegrityCheckFailed" or
+            "ReplayMetadataStateMissing" or
+            "ReplayCanonicalCandidateMissing" or
+            "ReplayCheckpointPendingWindow" or
+            "ReplayCheckpointNotPendingWindow" or
+            "ReplayXidWindowInvalid" or
+            "ReplayCommitBlobInvalid" or
+            "ReplayCommitBlobReadFailed" or
+            "ReplayInterruptedBeforeCheckpointSwitch" or
+            "ReplayCheckpointWriteFailed" or
+            "ReplayInterruptedBeforeCheckpointFlush" or
+            "ReplayCheckpointFlushFailed" or
+            "RecoveryMarkerDirty";
+    }
+
     private static string NormalizeWriteBackendName(string? value)
     {
         var normalized = value?.Trim();
@@ -4715,6 +4776,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             "recoverymarkerdirty" => "RecoveryMarkerDirty",
             "recoveryrequired" => "RecoveryRequired",
             "dirtytransactionlimitexceeded" => "DirtyTransactionLimitExceeded",
+            "nativemutationstagingfailed" => "NativeMutationStagingFailed",
             "canonicalpathnotactive" => "CanonicalPathNotActive",
             "canonical path not active" => "CanonicalPathNotActive",
             "canonicalgatefailure" => "CanonicalPathNotActive",
@@ -4766,6 +4828,10 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     {
         var normalizedRecoveryReason = NormalizeRecoveryReason(status.RecoveryReason);
         var normalizedCanonicalGateFailure = NormalizeRecoveryReason(status.CanonicalGateFailure);
+        if (ShouldPreserveExplicitRecoveryReasonBeforeCanonicalGate(normalizedRecoveryReason))
+        {
+            return normalizedRecoveryReason;
+        }
 
         if (status.FixtureLegacyFallbackActive)
         {
@@ -4880,6 +4946,13 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         var isNativeBackend = string.Equals(status.WriteBackend, "Native", StringComparison.OrdinalIgnoreCase);
         var isNativeNonFixture = isNativeBackend && !isFixtureImage;
         var normalizedRecoveryReason = NormalizeRecoveryReason(status.RecoveryReason);
+        if (normalizedRecoveryReason is not null &&
+            ShouldPreserveExplicitRecoveryReasonBeforeCanonicalGate(normalizedRecoveryReason))
+        {
+            return IsRecoveryPolicyFailClosed(recoveryPolicy) || isNativeNonFixture
+                ? normalizedRecoveryReason
+                : null;
+        }
         if (isNativeBackend && status.FixtureLegacyFallbackActive)
         {
             if (isNativeNonFixture || IsRecoveryPolicyFailClosed(recoveryPolicy))
@@ -4995,6 +5068,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             "RecoveryMarkerDirty" => "RecoveryFailClosedMarkerDirty",
             "RecoveryRequired" => "RecoveryFailClosedRecoveryRequired",
             "DirtyTransactionLimitExceeded" => "RecoveryFailClosedDirtyLimit",
+            "NativeMutationStagingFailed" => "RecoveryFailClosedMutationStaging",
             "CanonicalPathNotActive" => "RecoveryFailClosedCanonicalPath",
             "CanonicalStateNotLoaded" => "RecoveryFailClosedCanonicalGate",
             "CanonicalVolumeStateLoadFailed" => "RecoveryFailClosedCanonicalGate",
@@ -5087,6 +5161,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             "RecoveryMarkerDirty" => "NativeWriteRecoveryMarkerDirty",
             "RecoveryRequired" => "NativeWriteRecoveryRequired",
             "DirtyTransactionLimitExceeded" => "NativeWriteDirtyTransactionLimitExceeded",
+            "NativeMutationStagingFailed" => "NativeWriteMutationStagingFailed",
             "CanonicalPathNotActive" => "NativeWriteCanonicalPathNotActive",
             "CanonicalStateNotLoaded" => "NativeWriteCanonicalGateFailure",
             "CanonicalVolumeStateLoadFailed" => "NativeWriteCanonicalGateFailure",
@@ -5179,6 +5254,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             "RecoveryMarkerDirty" => "a previous write session ended before cleanup finished",
             "RecoveryRequired" => "native recovery is required before writes can resume",
             "DirtyTransactionLimitExceeded" => "pending native-write dirty transaction count exceeded the configured safety limit",
+            "NativeMutationStagingFailed" => "native metadata staging failed while processing a file operation",
             "CanonicalPathNotActive" => "canonical non-fixture native write path proof was not active and write mode was blocked",
             "CanonicalStateNotLoaded" => "canonical non-fixture write path state was not fully loaded; explicit canonical gate blocked writable mode",
             "CanonicalVolumeStateLoadFailed" => "canonical volume state could not be loaded for non-fixture writable mode",
@@ -5479,6 +5555,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             "RecoveryMarkerDirty" => "RecoveryMarkerDetected",
             "RecoveryRequired" => "RecoveryRequiredBlock",
             "DirtyTransactionLimitExceeded" => "DowngradedAfterDirtyTransactionLimit",
+            "NativeMutationStagingFailed" => "DowngradedAfterMutationStagingFailure",
             "CanonicalPathNotActive" => "DowngradedAfterCanonicalPathProofMissing",
             "CanonicalStateNotLoaded" => "DowngradedAfterCanonicalGateFailure",
             "CanonicalVolumeStateLoadFailed" => "DowngradedAfterCanonicalGateFailure",
