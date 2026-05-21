@@ -290,6 +290,7 @@ private:
     [[nodiscard]] bool StageObjectMapUpdate(std::uint64_t object_id, std::uint64_t physical_address, std::uint64_t logical_size);
     [[nodiscard]] bool StageSpacemanAllocation(std::uint64_t physical_address, std::uint64_t bytes);
     [[nodiscard]] bool StageSpacemanDeallocation(std::uint64_t physical_address, std::uint64_t bytes);
+    [[nodiscard]] bool HasPendingSpacemanAllocation(std::uint64_t physical_address, std::uint64_t bytes) const;
     [[nodiscard]] bool ReleasePendingSpacemanAllocation(std::uint64_t physical_address, std::uint64_t bytes);
     void CoalescePendingWriteMutation(std::uint64_t object_id, const MutationRequest& request);
     void CoalescePendingBtreeFileMetadata(std::uint64_t object_id);

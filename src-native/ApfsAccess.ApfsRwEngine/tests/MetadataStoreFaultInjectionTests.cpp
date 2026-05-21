@@ -234,6 +234,42 @@ bool CorruptSuperblockCheckpointXids(
     return output.good();
 }
 
+bool ReadBytesFromImage(
+    const std::filesystem::path& image_path,
+    std::uint64_t offset_bytes,
+    std::size_t bytes_to_read,
+    std::vector<std::byte>& out_bytes)
+{
+    out_bytes.clear();
+    if (bytes_to_read == 0 ||
+        offset_bytes > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))
+    {
+        return false;
+    }
+
+    std::ifstream input(image_path, std::ios::binary);
+    if (!input.good())
+    {
+        return false;
+    }
+
+    input.seekg(static_cast<std::streamoff>(offset_bytes), std::ios::beg);
+    if (!input.good())
+    {
+        return false;
+    }
+
+    out_bytes.resize(bytes_to_read);
+    input.read(reinterpret_cast<char*>(out_bytes.data()), static_cast<std::streamsize>(out_bytes.size()));
+    if (static_cast<std::size_t>(input.gcount()) != out_bytes.size())
+    {
+        out_bytes.clear();
+        return false;
+    }
+
+    return true;
+}
+
 std::uint64_t StableObjectIdFromPath(std::wstring_view path)
 {
     constexpr std::uint64_t kFnvOffset = 1469598103934665603ull;
@@ -4877,6 +4913,43 @@ bool Require(bool condition, const std::string& message)
     return true;
 }
 
+std::vector<std::byte> BuildRepeatedPayload(std::size_t bytes, unsigned char value)
+{
+    return std::vector<std::byte>(bytes, static_cast<std::byte>(value));
+}
+
+void ConfigurePayloadProvider(
+    apfsaccess::rw::MetadataStore& store,
+    std::unordered_map<std::wstring, std::vector<std::byte>>& staged_payloads)
+{
+    store.SetFilePayloadProvider(
+        [&staged_payloads](const std::wstring& path, std::uint64_t logical_size) -> std::optional<std::vector<std::byte>>
+        {
+            auto pending = staged_payloads.find(path);
+            if (pending == staged_payloads.end())
+            {
+                return std::nullopt;
+            }
+
+            if (logical_size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+            {
+                return std::nullopt;
+            }
+
+            auto payload = pending->second;
+            const auto target_size = static_cast<std::size_t>(logical_size);
+            if (payload.size() < target_size)
+            {
+                payload.resize(target_size, std::byte{0});
+            }
+            else if (payload.size() > target_size)
+            {
+                payload.resize(target_size);
+            }
+            return payload;
+        });
+}
+
 bool IsReplayCommitBlobRejectedReason(const std::wstring& reason)
 {
     return reason == L"ScaffoldCommitBlobActive" ||
@@ -4928,6 +5001,90 @@ int main()
     };
 
     bool ok = true;
+    const auto cow_overwrite_image_path = run_root / "container_cow_overwrite.apfs.img";
+    if (!CreateSyntheticContainer(cow_overwrite_image_path))
+    {
+        std::cerr << "[FAIL] unable to create synthetic APFS container image for COW overwrite scenario" << std::endl;
+        return 1;
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext cow_overwrite_context
+    {
+        cow_overwrite_image_path.wstring(),
+        L"CowOverwrite",
+    };
+    {
+        constexpr auto kCowOverwritePath = L"\\cow-overwrite.bin";
+        const auto baseline_payload = BuildRepeatedPayload(4096, 0x5A);
+        const auto rewritten_payload = BuildRepeatedPayload(4096, 0xA5);
+        std::uint64_t baseline_physical_address = 0;
+        std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+
+        apfsaccess::rw::MetadataStore store(cow_overwrite_context);
+        ok &= Require(store.LoadContainerSuperblocks(), "COW overwrite: LoadContainerSuperblocks should succeed");
+        ok &= Require(store.LoadObjectMap(), "COW overwrite: LoadObjectMap should succeed");
+        ok &= Require(store.LoadSpacemanState(), "COW overwrite: LoadSpacemanState should succeed");
+        ok &= Require(store.PrepareNativeWritePath(), "COW overwrite: PrepareNativeWritePath should succeed");
+        ConfigurePayloadProvider(store, staged_payloads);
+
+        apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+        create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+        create_file.path = kCowOverwritePath;
+        ok &= Require(
+            store.ApplyMutation(create_file) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "COW overwrite: create file should apply");
+
+        apfsaccess::rw::MetadataStore::MutationRequest write_file{};
+        write_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+        write_file.path = kCowOverwritePath;
+        write_file.length = static_cast<std::uint64_t>(baseline_payload.size());
+        ok &= Require(
+            store.ApplyMutation(write_file) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "COW overwrite: initial write should apply");
+        staged_payloads[kCowOverwritePath] = baseline_payload;
+        ok &= Require(
+            store.CommitPendingMutations() == apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+            "COW overwrite: baseline commit should succeed");
+        const auto baseline_inode = store.LookupCommittedInodeByPath(kCowOverwritePath);
+        ok &= Require(
+            baseline_inode.has_value() && baseline_inode->data_physical_address != 0,
+            "COW overwrite: baseline inode should have a committed physical extent");
+        if (baseline_inode.has_value())
+        {
+            baseline_physical_address = baseline_inode->data_physical_address;
+        }
+
+        write_file.length = static_cast<std::uint64_t>(rewritten_payload.size());
+        ok &= Require(
+            store.ApplyMutation(write_file) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "COW overwrite: same-size rewrite should apply");
+        staged_payloads[kCowOverwritePath] = rewritten_payload;
+        store.SetCommitStageHook([](std::string_view stage)
+        {
+            return stage != "before-checkpoint-switch";
+        });
+
+        const auto interrupted_commit = store.CommitPendingMutations();
+        ok &= Require(
+            interrupted_commit == apfsaccess::rw::MetadataStore::CommitStatus::PersistFailed,
+            "COW overwrite: interrupted rewrite should fail before checkpoint switch");
+        ok &= Require(
+            store.IsRecoveryRequired(),
+            "COW overwrite: interrupted rewrite should latch recovery-required state");
+
+        std::vector<std::byte> old_extent_bytes_after_interruption;
+        ok &= Require(
+            ReadBytesFromImage(
+                cow_overwrite_image_path,
+                baseline_physical_address,
+                baseline_payload.size(),
+                old_extent_bytes_after_interruption),
+            "COW overwrite: old committed extent should still be readable after interrupted rewrite");
+        ok &= Require(
+            old_extent_bytes_after_interruption == baseline_payload,
+            "COW overwrite: interrupted same-size rewrite must not overwrite the old committed extent");
+    }
+
     {
         apfsaccess::rw::MetadataStore store(context);
         ok &= Require(store.LoadContainerSuperblocks(), "LoadContainerSuperblocks should succeed");

@@ -4648,7 +4648,11 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         const auto previous_physical = inode_ref.data_physical_address;
         const auto previous_size = inode_ref.logical_size;
         auto next_physical = previous_physical;
-        if (next_physical == 0 || target_logical_size > previous_size)
+        const auto previous_extent_is_pending =
+            previous_physical != 0 &&
+            previous_size > 0 &&
+            HasPendingSpacemanAllocation(previous_physical, previous_size);
+        if (next_physical == 0 || target_logical_size > previous_size || !previous_extent_is_pending)
         {
             auto extent = AllocateExtent(target_logical_size);
             if (!extent.has_value())
@@ -9328,6 +9332,29 @@ bool MetadataStore::StageSpacemanDeallocation(std::uint64_t physical_address, st
         aligned_bytes
     });
     return true;
+}
+
+bool MetadataStore::HasPendingSpacemanAllocation(std::uint64_t physical_address, std::uint64_t bytes) const
+{
+    if (physical_address == 0 || bytes == 0)
+    {
+        return false;
+    }
+
+    const auto aligned_bytes = AlignExtentBytes(bytes);
+    if (aligned_bytes == 0)
+    {
+        return false;
+    }
+
+    return std::any_of(
+        pending_spaceman_allocations_.begin(),
+        pending_spaceman_allocations_.end(),
+        [&](const SpacemanAllocation& allocation)
+        {
+            return allocation.physical_address == physical_address &&
+                   allocation.bytes == aligned_bytes;
+        });
 }
 
 bool MetadataStore::ReleasePendingSpacemanAllocation(std::uint64_t physical_address, std::uint64_t bytes)
