@@ -271,6 +271,56 @@ public sealed class PilotScriptTests
     }
 
     [Fact]
+    public void PhysicalRwValidation_IncludesExplorerWorkflowIntegrityMode()
+    {
+        var script = File.ReadAllText(Path.Combine(RepoRoot, "scripts", "run_physical_rw_validation.ps1"));
+
+        Assert.Contains("[ValidateSet(\"Smoke\", \"Storm\", \"ExplorerWorkflow\", \"VerifyManifest\")]", script);
+        Assert.Contains("Invoke-ExplorerWorkflow", script);
+        Assert.Contains("explorer-format-copy-hash", script);
+        Assert.Contains("explorer-rename-move-cut-paste", script);
+        Assert.Contains("explorer-recycle-delete-restore", script);
+        Assert.Contains("explorer-final-hash-sweep", script);
+        Assert.Contains("Get-FileHash -Algorithm SHA256", script);
+    }
+
+    [Fact]
+    public void PhysicalRwValidation_ScriptParses()
+    {
+        var scriptPath = Path.Combine(RepoRoot, "scripts", "run_physical_rw_validation.ps1");
+        var command =
+            "$errors = $null; " +
+            $"[System.Management.Automation.PSParser]::Tokenize((Get-Content -LiteralPath '{scriptPath}' -Raw), [ref]$errors) | Out-Null; " +
+            "if ($errors -and $errors.Count -gt 0) { $errors | ConvertTo-Json -Compress; exit 1 }";
+
+        var result = RunPowerShellCommand(command);
+
+        Assert.True(
+            result.ExitCode == 0,
+            $"run_physical_rw_validation.ps1 has PowerShell parse errors.{Environment.NewLine}{result.Stdout}{Environment.NewLine}{result.Stderr}");
+    }
+
+    [Fact]
+    public void PhysicalRwValidation_CaseOnlyRenameUsesCaseSensitiveEntryCheck()
+    {
+        var script = File.ReadAllText(Path.Combine(RepoRoot, "scripts", "run_physical_rw_validation.ps1"));
+
+        Assert.Contains("function Assert-ExplorerCaseOnlyRename", script);
+        Assert.Contains("[switch]$CaseOnlyRename", script);
+        Assert.Contains("$_.Name -ceq $DestinationLeaf", script);
+        Assert.Contains("$_.Name -ceq $SourceLeaf", script);
+        Assert.Contains("-CaseOnlyRename", script);
+
+        var caseOnlyRenameStart = script.IndexOf("-Name \"case-only-rename\"", StringComparison.Ordinal);
+        Assert.True(caseOnlyRenameStart >= 0, "The Explorer workflow should include a case-only rename operation.");
+        var caseOnlyRenameEnd = script.IndexOf("Add-TrackedExplorerFile -Path $caseRenamed", caseOnlyRenameStart, StringComparison.Ordinal);
+        Assert.True(caseOnlyRenameEnd > caseOnlyRenameStart, "The case-only rename operation block should be locatable.");
+        var caseOnlyRenameBlock = script[caseOnlyRenameStart..caseOnlyRenameEnd];
+        Assert.Contains("-CaseOnlyRename", caseOnlyRenameBlock);
+        Assert.DoesNotContain("-SourceRemoved", caseOnlyRenameBlock);
+    }
+
+    [Fact]
     public void RunPilotValidation_KeepMountedLeavesSuccessfulMountAvailableForExplorer()
     {
         var script = File.ReadAllText(Path.Combine(RepoRoot, "scripts", "run_pilot_validation.ps1"));

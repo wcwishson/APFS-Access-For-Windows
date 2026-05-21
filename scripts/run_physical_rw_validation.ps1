@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("Smoke", "Storm", "VerifyManifest")]
+    [ValidateSet("Smoke", "Storm", "ExplorerWorkflow", "VerifyManifest")]
     [string]$Mode = "Smoke",
 
     [string]$MountRoot = "E:\",
@@ -240,6 +240,44 @@ function Assert-HashEqual {
     return $expectedHash
 }
 
+function Assert-HostStatusHealthy {
+    param(
+        [string]$Path,
+        [string]$Label
+    )
+
+    $status = Assert-HostStatusReady -Path $Path
+    if ($null -eq $status) {
+        return $null
+    }
+
+    if ($status.PSObject.Properties.Name -contains "mountReady" -and $status.mountReady -eq $false) {
+        throw "Native host is not mount-ready after ${Label}: $($status | ConvertTo-Json -Compress)"
+    }
+    if ($status.PSObject.Properties.Name -contains "writeBackend" -and $status.writeBackend -ne "Native") {
+        throw "Native host left native backend after ${Label}: $($status | ConvertTo-Json -Compress)"
+    }
+    if ($status.PSObject.Properties.Name -contains "nativeWriteReadiness" -and $status.nativeWriteReadiness -ne "CommitReady") {
+        throw "Native host is not CommitReady after ${Label}: $($status | ConvertTo-Json -Compress)"
+    }
+
+    return $status
+}
+
+function New-TextFixtureFile {
+    param(
+        [string]$Path,
+        [string]$Text
+    )
+
+    $dir = [System.IO.Path]::GetDirectoryName($Path)
+    if (-not [string]::IsNullOrWhiteSpace($dir) -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    }
+
+    Set-Content -LiteralPath $Path -Value $Text -Encoding utf8
+}
+
 function New-ValidationResults {
     param(
         [string]$SelectedMode,
@@ -256,6 +294,7 @@ function New-ValidationResults {
         manifest = $ManifestPath
         phases = @()
         benchmarks = @()
+        operations = @()
         files = @()
         samples = @()
         deletedPaths = @()
@@ -348,6 +387,505 @@ function Invoke-ManifestVerification {
         hostStatus = $status
         verifiedUtc = [DateTime]::UtcNow.ToString("o")
     }
+}
+
+function Invoke-ExplorerWorkflow {
+    param(
+        [string]$NormalizedMountRoot,
+        [string]$ScratchDirectory,
+        [string]$ManifestPath,
+        [UInt64]$RequestedLargeFileBytes,
+        [string]$StatusFilePath
+    )
+
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $apfsRoot = Join-Path $NormalizedMountRoot ("apfs-access-explorer-{0}" -f $stamp)
+    $ntfsRoot = Join-Path $ScratchDirectory ("apfs-access-explorer-{0}" -f $stamp)
+    $results = New-ValidationResults -SelectedMode "ExplorerWorkflow" -ApfsRoot $apfsRoot -NtfsRoot $ntfsRoot -ManifestPath $ManifestPath
+    $trackedFiles = New-Object System.Collections.Generic.List[object]
+    $deletedPaths = New-Object System.Collections.Generic.List[string]
+    $requireStatusFile = -not [string]::IsNullOrWhiteSpace($StatusFilePath)
+
+    function Add-TrackedExplorerFile {
+        param(
+            [string]$Path,
+            [UInt64]$Size,
+            [string]$Hash,
+            [string]$Label
+        )
+
+        $trackedFiles.Add([ordered]@{
+            path = $Path
+            size = $Size
+            hash = $Hash
+            label = $Label
+        })
+    }
+
+    function Get-ExplorerStatusSnapshot {
+        param([string]$Label)
+
+        if (-not $requireStatusFile) {
+            return $null
+        }
+
+        return Assert-HostStatusHealthy -Path $StatusFilePath -Label $Label
+    }
+
+    function Add-ExplorerOperation {
+        param(
+            [string]$Name,
+            [string]$SourcePath,
+            [string]$DestinationPath,
+            [UInt64]$Bytes,
+            [string]$Sha256Before,
+            [string]$Sha256After,
+            [TimeSpan]$Elapsed,
+            [object]$StatusBefore,
+            [object]$StatusAfter,
+            [object]$Detail = $null
+        )
+
+        $results.operations += [ordered]@{
+            name = $Name
+            sourcePath = $SourcePath
+            destinationPath = $DestinationPath
+            bytes = $Bytes
+            sha256Before = $Sha256Before
+            sha256After = $Sha256After
+            elapsedMs = [Math]::Round($Elapsed.TotalMilliseconds, 3)
+            statusBefore = $StatusBefore
+            statusAfter = $StatusAfter
+            detail = $Detail
+            at = (Get-Date).ToString("o")
+        }
+    }
+
+    function Invoke-ExplorerHashOperation {
+        param(
+            [string]$Name,
+            [string]$SourcePath,
+            [string]$DestinationPath,
+            [scriptblock]$Operation,
+            [switch]$SourceRemoved,
+            [switch]$CaseOnlyRename,
+            [object]$Detail = $null
+        )
+
+        if (-not (Test-Path -LiteralPath $SourcePath)) {
+            throw "Explorer workflow source is missing before ${Name}: $SourcePath"
+        }
+
+        $sourceItem = Get-Item -LiteralPath $SourcePath
+        $sourceSize = [UInt64]$sourceItem.Length
+        $sourceHash = Get-Sha256 -Path $SourcePath
+        $statusBefore = Get-ExplorerStatusSnapshot -Label "${Name} before"
+        $elapsed = Measure-Phase {
+            . $Operation
+        }
+        if (-not (Test-Path -LiteralPath $DestinationPath)) {
+            throw "Explorer workflow destination is missing after ${Name}: $DestinationPath"
+        }
+        Wait-Size -Path $DestinationPath -Size $sourceSize | Out-Null
+        $destinationHash = Get-Sha256 -Path $DestinationPath
+        if ($sourceHash -ne $destinationHash) {
+            throw "Explorer workflow hash mismatch for ${Name}: $sourceHash vs $destinationHash"
+        }
+        if ($SourceRemoved -and (Test-Path -LiteralPath $SourcePath)) {
+            throw "Explorer workflow source still exists after ${Name}: $SourcePath"
+        }
+        if ($CaseOnlyRename) {
+            Assert-ExplorerCaseOnlyRename -SourcePath $SourcePath -DestinationPath $DestinationPath -Label $Name
+        }
+        $statusAfter = Get-ExplorerStatusSnapshot -Label "${Name} after"
+        Add-ExplorerOperation `
+            -Name $Name `
+            -SourcePath $SourcePath `
+            -DestinationPath $DestinationPath `
+            -Bytes $sourceSize `
+            -Sha256Before $sourceHash `
+            -Sha256After $destinationHash `
+            -Elapsed $elapsed `
+            -StatusBefore $statusBefore `
+            -StatusAfter $statusAfter `
+            -Detail $Detail
+        return [ordered]@{
+            path = $DestinationPath
+            size = $sourceSize
+            hash = $destinationHash
+            elapsed = $elapsed
+        }
+    }
+
+    function Assert-ExplorerCaseOnlyRename {
+        param(
+            [string]$SourcePath,
+            [string]$DestinationPath,
+            [string]$Label
+        )
+
+        $sourceParent = [System.IO.Path]::GetDirectoryName($SourcePath)
+        $destinationParent = [System.IO.Path]::GetDirectoryName($DestinationPath)
+        if (-not [string]::Equals($sourceParent, $destinationParent, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Explorer workflow case-only rename parent mismatch for ${Label}: $SourcePath -> $DestinationPath"
+        }
+
+        $sourceLeaf = [System.IO.Path]::GetFileName($SourcePath)
+        $destinationLeaf = [System.IO.Path]::GetFileName($DestinationPath)
+        $entries = @(Get-ChildItem -LiteralPath $destinationParent -Force)
+        if (-not ($entries | Where-Object { $_.Name -ceq $DestinationLeaf })) {
+            throw "Explorer workflow case-only rename destination entry missing for ${Label}: $DestinationPath"
+        }
+        if ($entries | Where-Object { $_.Name -ceq $SourceLeaf }) {
+            throw "Explorer workflow case-only rename source casing still present for ${Label}: $SourcePath"
+        }
+    }
+
+    function Invoke-ExplorerDeleteOperation {
+        param(
+            [string]$Name,
+            [string]$Path,
+            [scriptblock]$Operation,
+            [object]$Detail = $null
+        )
+
+        if (-not (Test-Path -LiteralPath $Path)) {
+            throw "Explorer workflow delete source is missing before ${Name}: $Path"
+        }
+
+        $item = Get-Item -LiteralPath $Path
+        $bytes = if ($item.PSIsContainer) { [UInt64]0 } else { [UInt64]$item.Length }
+        $hash = if ($item.PSIsContainer) { $null } else { Get-Sha256 -Path $Path }
+        $statusBefore = Get-ExplorerStatusSnapshot -Label "${Name} before"
+        $elapsed = Measure-Phase {
+            . $Operation
+        }
+        if (Test-Path -LiteralPath $Path) {
+            throw "Explorer workflow delete target still exists after ${Name}: $Path"
+        }
+        $statusAfter = Get-ExplorerStatusSnapshot -Label "${Name} after"
+        Add-ExplorerOperation `
+            -Name $Name `
+            -SourcePath $Path `
+            -DestinationPath "" `
+            -Bytes $bytes `
+            -Sha256Before $hash `
+            -Sha256After "" `
+            -Elapsed $elapsed `
+            -StatusBefore $statusBefore `
+            -StatusAfter $statusAfter `
+            -Detail $Detail
+        $deletedPaths.Add($Path)
+    }
+
+    try {
+        if (-not $requireStatusFile) {
+            throw "ExplorerWorkflow mode requires -StatusFile so it can verify native RW health before and after user-facing operations."
+        }
+
+        $disk = Get-ApfsLogicalDisk -NormalizedMountRoot $NormalizedMountRoot
+        $status = Get-ExplorerStatusSnapshot -Label "explorer preflight"
+        Add-Phase -Results $results -Name "preflight" -State "passed" -Detail ([ordered]@{
+            deviceId = $disk.DeviceID
+            fileSystem = $disk.FileSystem
+            volumeName = $disk.VolumeName
+            size = $disk.Size
+            freeSpace = $disk.FreeSpace
+            hostPid = if ($null -eq $status) { $null } else { $status.hostPid }
+        })
+
+        New-Item -ItemType Directory -Force -Path $ntfsRoot | Out-Null
+        New-Item -ItemType Directory -Force -Path $apfsRoot | Out-Null
+        Wait-Path -Path $apfsRoot | Out-Null
+        Get-ExplorerStatusSnapshot -Label "root create" | Out-Null
+
+        $unicodeFolder = "unicode-" + [string][char]0x6587 + [string][char]0x4EF6 + "-" + [char]::ConvertFromUtf32(0x1F680)
+        foreach ($dir in @("format-copy", "rename-move", "cut-paste", "delete-direct", "recycle", "nested\a\b", "case-test", "long", $unicodeFolder)) {
+            $target = Join-Path $apfsRoot $dir
+            New-Item -ItemType Directory -Force -Path $target | Out-Null
+            Wait-Path -Path $target | Out-Null
+        }
+        Add-Phase -Results $results -Name "explorer-folder-create" -State "passed"
+
+        $formatFixtures = @(
+            @{ Name = "empty.bin"; Bytes = [UInt64]0; Seed = 1 },
+            @{ Name = "one-byte.dat"; Bytes = [UInt64]1; Seed = 2 },
+            @{ Name = "edge-4095.png"; Bytes = [UInt64]4095; Seed = 3 },
+            @{ Name = "edge-4096.docx"; Bytes = [UInt64]4096; Seed = 4 },
+            @{ Name = "edge-4097.xlsx"; Bytes = [UInt64]4097; Seed = 5 },
+            @{ Name = "archive.zip"; Bytes = [UInt64]65536; Seed = 6 },
+            @{ Name = "installer.exe"; Bytes = [UInt64]8388608; Seed = 7 }
+        )
+
+        $formatMetric = [ordered]@{ bytes = [UInt64]0; files = 0 }
+        $formatElapsed = Measure-Phase {
+            foreach ($fixture in $formatFixtures) {
+                $source = Join-Path $ntfsRoot ([string]$fixture.Name)
+                $destination = Join-Path (Join-Path $apfsRoot "format-copy") ([string]$fixture.Name)
+                New-PatternFile -Path $source -Bytes ([UInt64]$fixture.Bytes) -Seed ([int]$fixture.Seed)
+                $copyResult = Invoke-ExplorerHashOperation `
+                    -Name "copy-in-$($fixture.Name)" `
+                    -SourcePath $source `
+                    -DestinationPath $destination `
+                    -Operation { Copy-Item -LiteralPath $source -Destination $destination -Force } `
+                    -Detail ([ordered]@{ extension = [System.IO.Path]::GetExtension([string]$fixture.Name) })
+                $roundTrip = Join-Path $ntfsRoot ("roundtrip-" + [string]$fixture.Name)
+                Invoke-ExplorerHashOperation `
+                    -Name "copy-back-$($fixture.Name)" `
+                    -SourcePath $destination `
+                    -DestinationPath $roundTrip `
+                    -Operation { Copy-Item -LiteralPath $destination -Destination $roundTrip -Force } `
+                    -Detail ([ordered]@{ extension = [System.IO.Path]::GetExtension([string]$fixture.Name) }) | Out-Null
+                Add-TrackedExplorerFile -Path $destination -Size ([UInt64]$fixture.Bytes) -Hash ([string]$copyResult.hash) -Label ([string]$fixture.Name)
+                $formatMetric.bytes += [UInt64](([UInt64]$fixture.Bytes) * 2)
+                $formatMetric.files++
+            }
+
+            $textSource = Join-Path $ntfsRoot "notes with spaces.txt"
+            $textDestination = Join-Path (Join-Path $apfsRoot $unicodeFolder) "notes with spaces.txt"
+            New-TextFixtureFile -Path $textSource -Text "APFS Access Explorer workflow text fixture"
+            $textResult = Invoke-ExplorerHashOperation `
+                -Name "copy-in-text-unicode-path" `
+                -SourcePath $textSource `
+                -DestinationPath $textDestination `
+                -Operation { Copy-Item -LiteralPath $textSource -Destination $textDestination -Force } `
+                -Detail ([ordered]@{ unicodeFolder = $unicodeFolder })
+            Add-TrackedExplorerFile -Path $textDestination -Size ([UInt64](Get-Item -LiteralPath $textDestination).Length) -Hash ([string]$textResult.hash) -Label "text-unicode-path"
+            $formatMetric.bytes += [UInt64]((Get-Item -LiteralPath $textDestination).Length * 2)
+            $formatMetric.files++
+        }
+        Add-BenchmarkMetric -Results $results -Name "explorer-format-copy-hash" -Elapsed $formatElapsed -Bytes $formatMetric.bytes -Files $formatMetric.files
+        Add-Phase -Results $results -Name "explorer-format-copy-hash" -State "passed" -Detail ([ordered]@{ files = $formatMetric.files })
+        Get-ExplorerStatusSnapshot -Label "format copy hash" | Out-Null
+
+        $renameSource = Join-Path $ntfsRoot "rename-source.bin"
+        $renameApfs = Join-Path (Join-Path $apfsRoot "rename-move") "rename-source.bin"
+        $renamedApfs = Join-Path (Join-Path $apfsRoot "rename-move") "renamed from explorer.bin"
+        $movedApfs = Join-Path (Join-Path $apfsRoot "nested\a\b") "moved from explorer.bin"
+        $movedOut = Join-Path $ntfsRoot "moved-out-from-apfs.bin"
+        $movedBack = Join-Path (Join-Path $apfsRoot "cut-paste") "moved-back-from-ntfs.bin"
+        $renameElapsed = Measure-Phase {
+            New-PatternFile -Path $renameSource -Bytes 2097152 -Seed 31
+            $renameCopy = Invoke-ExplorerHashOperation `
+                -Name "rename-workflow-copy-in" `
+                -SourcePath $renameSource `
+                -DestinationPath $renameApfs `
+                -Operation { Copy-Item -LiteralPath $renameSource -Destination $renameApfs -Force }
+            Invoke-ExplorerHashOperation `
+                -Name "rename-workflow-rename" `
+                -SourcePath $renameApfs `
+                -DestinationPath $renamedApfs `
+                -Operation { Rename-Item -LiteralPath $renameApfs -NewName ([System.IO.Path]::GetFileName($renamedApfs)) } `
+                -SourceRemoved | Out-Null
+            Invoke-ExplorerHashOperation `
+                -Name "rename-workflow-internal-move" `
+                -SourcePath $renamedApfs `
+                -DestinationPath $movedApfs `
+                -Operation { Move-Item -LiteralPath $renamedApfs -Destination $movedApfs } `
+                -SourceRemoved | Out-Null
+            Invoke-ExplorerHashOperation `
+                -Name "rename-workflow-move-out" `
+                -SourcePath $movedApfs `
+                -DestinationPath $movedOut `
+                -Operation { Move-Item -LiteralPath $movedApfs -Destination $movedOut } `
+                -SourceRemoved | Out-Null
+            Invoke-ExplorerHashOperation `
+                -Name "rename-workflow-move-back" `
+                -SourcePath $movedOut `
+                -DestinationPath $movedBack `
+                -Operation { Move-Item -LiteralPath $movedOut -Destination $movedBack } `
+                -SourceRemoved | Out-Null
+            Add-TrackedExplorerFile -Path $movedBack -Size 2097152 -Hash ([string]$renameCopy.hash) -Label "rename-move-cut-paste"
+        }
+        Add-BenchmarkMetric -Results $results -Name "explorer-rename-move-cut-paste" -Elapsed $renameElapsed -Bytes ([UInt64](2097152 * 4)) -Files 1
+        Add-Phase -Results $results -Name "explorer-rename-move-cut-paste" -State "passed"
+        Get-ExplorerStatusSnapshot -Label "rename move cut paste" | Out-Null
+
+        $caseSource = Join-Path (Join-Path $apfsRoot "case-test") "caseonly.txt"
+        New-TextFixtureFile -Path $caseSource -Text "case-only rename fixture"
+        $caseRenamed = Join-Path (Join-Path $apfsRoot "case-test") "CaseOnly.txt"
+        $caseResult = Invoke-ExplorerHashOperation `
+            -Name "case-only-rename" `
+            -SourcePath $caseSource `
+            -DestinationPath $caseRenamed `
+            -Operation { Rename-Item -LiteralPath $caseSource -NewName "CaseOnly.txt" } `
+            -CaseOnlyRename
+        Add-TrackedExplorerFile -Path $caseRenamed -Size ([UInt64](Get-Item -LiteralPath $caseRenamed).Length) -Hash ([string]$caseResult.hash) -Label "case-only-rename"
+        Add-Phase -Results $results -Name "explorer-case-only-rename" -State "passed"
+
+        $directDelete = Join-Path (Join-Path $apfsRoot "delete-direct") "permanent-delete.bin"
+        New-PatternFile -Path $directDelete -Bytes 196608 -Seed 41
+        Wait-Size -Path $directDelete -Size 196608 | Out-Null
+        Invoke-ExplorerDeleteOperation `
+            -Name "direct-delete-file" `
+            -Path $directDelete `
+            -Operation { Remove-Item -LiteralPath $directDelete -Force }
+        Add-Phase -Results $results -Name "explorer-direct-delete" -State "passed"
+
+        $recycleRoot = Join-Path $apfsRoot '$RECYCLE.BIN'
+        $sidRoot = Join-Path $recycleRoot 'S-1-5-21-1000-1000-1000-1001'
+        New-Item -ItemType Directory -Force -Path $sidRoot | Out-Null
+        $recycleSource = Join-Path (Join-Path $apfsRoot "recycle") "recycle-me.bin"
+        $recycleRestore = Join-Path (Join-Path $apfsRoot "recycle") "recycle-restored.bin"
+        $recyclePayload = Join-Path $sidRoot '$RCODEX01.bin'
+        $recycleInfo = Join-Path $sidRoot '$ICODEX01.bin'
+        $recycleElapsed = Measure-Phase {
+            New-PatternFile -Path $recycleSource -Bytes 262144 -Seed 55
+            Wait-Size -Path $recycleSource -Size 262144 | Out-Null
+            New-TextFixtureFile -Path $recycleInfo -Text "APFS Access recycle metadata placeholder"
+            Invoke-ExplorerHashOperation `
+                -Name "recycle-move-to-bin" `
+                -SourcePath $recycleSource `
+                -DestinationPath $recyclePayload `
+                -Operation { Move-Item -LiteralPath $recycleSource -Destination $recyclePayload } `
+                -SourceRemoved | Out-Null
+            $recycleRestoreResult = Invoke-ExplorerHashOperation `
+                -Name "recycle-restore" `
+                -SourcePath $recyclePayload `
+                -DestinationPath $recycleRestore `
+                -Operation { Move-Item -LiteralPath $recyclePayload -Destination $recycleRestore } `
+                -SourceRemoved
+            Invoke-ExplorerDeleteOperation `
+                -Name "recycle-delete-metadata" `
+                -Path $recycleInfo `
+                -Operation { Remove-Item -LiteralPath $recycleInfo -Force }
+            Add-TrackedExplorerFile -Path $recycleRestore -Size 262144 -Hash ([string]$recycleRestoreResult.hash) -Label "recycle-restore"
+            $deletedPaths.Add($recyclePayload)
+        }
+        Add-BenchmarkMetric -Results $results -Name "explorer-recycle-delete-restore" -Elapsed $recycleElapsed -Bytes ([UInt64](262144 * 2)) -Files 1
+        Add-Phase -Results $results -Name "explorer-recycle-delete-restore" -State "passed"
+        Get-ExplorerStatusSnapshot -Label "recycle workflow" | Out-Null
+
+        $smallTreeRoot = Join-Path $apfsRoot "many-small-files"
+        $smallTreeSourceRoot = Join-Path $ntfsRoot "many-small-source"
+        New-Item -ItemType Directory -Force -Path $smallTreeRoot, $smallTreeSourceRoot | Out-Null
+        $smallTreeMetric = [ordered]@{ bytes = [UInt64]0; files = 0 }
+        $smallTreeElapsed = Measure-Phase {
+            for ($index = 0; $index -lt 48; $index++) {
+                $subdir = "bucket_{0:D2}" -f [int]($index / 12)
+                $sourceDir = Join-Path $smallTreeSourceRoot $subdir
+                $destinationDir = Join-Path $smallTreeRoot $subdir
+                New-Item -ItemType Directory -Force -Path $sourceDir, $destinationDir | Out-Null
+                $size = [UInt64](($index * 137) % 8192)
+                $source = Join-Path $sourceDir ("small_{0:D3}.bin" -f $index)
+                $destination = Join-Path $destinationDir ("small_{0:D3}.bin" -f $index)
+                New-PatternFile -Path $source -Bytes $size -Seed (80 + $index)
+                $smallResult = Invoke-ExplorerHashOperation `
+                    -Name ("many-small-copy-{0:D3}" -f $index) `
+                    -SourcePath $source `
+                    -DestinationPath $destination `
+                    -Operation { Copy-Item -LiteralPath $source -Destination $destination -Force } `
+                    -Detail ([ordered]@{ bucket = $subdir })
+                if (($index % 7) -eq 0) {
+                    Add-TrackedExplorerFile -Path $destination -Size $size -Hash ([string]$smallResult.hash) -Label ("many-small-{0:D3}" -f $index)
+                }
+                $smallTreeMetric.bytes += [UInt64]($size * 2)
+                $smallTreeMetric.files++
+            }
+        }
+        Add-BenchmarkMetric -Results $results -Name "explorer-many-small-files" -Elapsed $smallTreeElapsed -Bytes $smallTreeMetric.bytes -Files $smallTreeMetric.files
+        Add-Phase -Results $results -Name "explorer-many-small-files" -State "passed" -Detail ([ordered]@{ files = $smallTreeMetric.files })
+
+        $longName = ("long-name-" + ("n" * 150) + ".bin")
+        $longSource = Join-Path $ntfsRoot "long-name-source.bin"
+        $longDestination = Join-Path (Join-Path $apfsRoot "long") $longName
+        New-PatternFile -Path $longSource -Bytes 131072 -Seed 92
+        $longResult = Invoke-ExplorerHashOperation `
+            -Name "long-name-copy" `
+            -SourcePath $longSource `
+            -DestinationPath $longDestination `
+            -Operation { Copy-Item -LiteralPath $longSource -Destination $longDestination -Force } `
+            -Detail ([ordered]@{ fileNameLength = $longName.Length })
+        Add-TrackedExplorerFile -Path $longDestination -Size 131072 -Hash ([string]$longResult.hash) -Label "long-name"
+        Add-Phase -Results $results -Name "explorer-long-name" -State "passed" -Detail ([ordered]@{ fileNameLength = $longName.Length })
+
+        if ($RequestedLargeFileBytes -gt 0) {
+            $largeBytes = [UInt64][Math]::Max([double]$RequestedLargeFileBytes, [double]67108864)
+            $largeSource = Join-Path $ntfsRoot ("explorer-large-{0}.bin" -f $largeBytes)
+            $largeDestination = Join-Path $apfsRoot ("explorer-large-{0}.bin" -f $largeBytes)
+            $largeRoundTrip = Join-Path $ntfsRoot ("explorer-large-{0}-roundtrip.bin" -f $largeBytes)
+            $largeMetric = [ordered]@{ hash = $null }
+            $largeElapsed = Measure-Phase {
+                New-PatternFile -Path $largeSource -Bytes $largeBytes -Seed 71
+                $largeResult = Invoke-ExplorerHashOperation `
+                    -Name "large-copy-in" `
+                    -SourcePath $largeSource `
+                    -DestinationPath $largeDestination `
+                    -Operation { Copy-Item -LiteralPath $largeSource -Destination $largeDestination -Force }
+                Invoke-ExplorerHashOperation `
+                    -Name "large-copy-back" `
+                    -SourcePath $largeDestination `
+                    -DestinationPath $largeRoundTrip `
+                    -Operation { Copy-Item -LiteralPath $largeDestination -Destination $largeRoundTrip -Force } | Out-Null
+                $largeMetric.hash = [string]$largeResult.hash
+                Add-TrackedExplorerFile -Path $largeDestination -Size $largeBytes -Hash $largeMetric.hash -Label "large-file"
+            }
+            Add-BenchmarkMetric -Results $results -Name "explorer-large-file-roundtrip" -Elapsed $largeElapsed -Bytes ([UInt64]($largeBytes * 2)) -Files 1
+            Add-Phase -Results $results -Name "explorer-large-file-roundtrip" -State "passed" -Detail ([ordered]@{ size = $largeBytes; hash = $largeMetric.hash })
+        }
+
+        $sweepElapsed = Measure-Phase {
+            foreach ($entry in $trackedFiles) {
+                if (-not (Test-Path -LiteralPath ([string]$entry.path))) {
+                    throw "Tracked Explorer workflow file is missing: $($entry.path)"
+                }
+                $item = Get-Item -LiteralPath ([string]$entry.path)
+                if ([UInt64]$item.Length -ne [UInt64]$entry.size) {
+                    throw "Tracked Explorer workflow size mismatch: $($entry.path)"
+                }
+                $hash = Get-Sha256 -Path ([string]$entry.path)
+                if ($hash -ne [string]$entry.hash) {
+                    throw "Tracked Explorer workflow SHA-256 mismatch: $($entry.path)"
+                }
+                $roundTrip = Join-Path $ntfsRoot ("final-sweep-" + [guid]::NewGuid().ToString("N") + ".bin")
+                Copy-Item -LiteralPath ([string]$entry.path) -Destination $roundTrip -Force
+                if ((Get-Sha256 -Path $roundTrip) -ne [string]$entry.hash) {
+                    throw "Final sweep copy-back SHA-256 mismatch: $($entry.path)"
+                }
+            }
+            foreach ($deleted in $deletedPaths) {
+                if (Test-Path -LiteralPath $deleted) {
+                    throw "Deleted Explorer workflow path unexpectedly exists: $deleted"
+                }
+            }
+        }
+        Add-BenchmarkMetric -Results $results -Name "explorer-final-hash-sweep" -Elapsed $sweepElapsed -Files $trackedFiles.Count
+        Add-Phase -Results $results -Name "explorer-final-hash-sweep" -State "passed" -Detail ([ordered]@{ files = $trackedFiles.Count; deletedPaths = $deletedPaths.Count })
+
+        $postStatus = Assert-HostStatusHealthy -Path $StatusFilePath -Label "explorer final sweep"
+        Add-Phase -Results $results -Name "post-status" -State "passed" -Detail $postStatus
+        $results.files = $trackedFiles.ToArray()
+        $results.deletedPaths = $deletedPaths.ToArray()
+        $results.status = "passed"
+
+        if ($Cleanup) {
+            if ($apfsRoot.StartsWith($NormalizedMountRoot, [StringComparison]::OrdinalIgnoreCase) -and
+                ([System.IO.Path]::GetFileName($apfsRoot)).StartsWith("apfs-access-explorer-", [StringComparison]::OrdinalIgnoreCase)) {
+                Remove-Item -LiteralPath $apfsRoot -Recurse -Force
+                $results.cleanup = "removed-apfs-test-root"
+            }
+            else {
+                throw "Refusing cleanup outside generated APFS test root: $apfsRoot"
+            }
+        }
+    }
+    catch {
+        $results.status = "failed"
+        $results.errors += [ordered]@{
+            message = $_.Exception.Message
+            at = (Get-Date).ToString("o")
+            scriptStack = $_.ScriptStackTrace
+        }
+        try {
+            if (-not [string]::IsNullOrWhiteSpace($StatusFilePath)) {
+                $results.hostStatus = Get-Content -LiteralPath $StatusFilePath -Raw | ConvertFrom-Json
+            }
+        }
+        catch {
+        }
+    }
+
+    return $results
 }
 
 function Invoke-PhysicalWorkload {
@@ -680,14 +1218,24 @@ if ($Mode -eq "VerifyManifest") {
 }
 
 $manifestPath = Join-Path $OutputDir ("physical-rw-{0}-{1}.json" -f $Mode.ToLowerInvariant(), (Get-Date -Format "yyyyMMdd-HHmmss"))
-$result = Invoke-PhysicalWorkload `
-    -SelectedMode $Mode `
-    -NormalizedMountRoot $normalizedMountRoot `
-    -ScratchDirectory $ScratchRoot `
-    -ManifestPath $manifestPath `
-    -RequestedFileCount $FileCount `
-    -RequestedLargeFileBytes $LargeFileBytes `
-    -StatusFilePath $StatusFile
+if ($Mode -eq "ExplorerWorkflow") {
+    $result = Invoke-ExplorerWorkflow `
+        -NormalizedMountRoot $normalizedMountRoot `
+        -ScratchDirectory $ScratchRoot `
+        -ManifestPath $manifestPath `
+        -RequestedLargeFileBytes $LargeFileBytes `
+        -StatusFilePath $StatusFile
+}
+else {
+    $result = Invoke-PhysicalWorkload `
+        -SelectedMode $Mode `
+        -NormalizedMountRoot $normalizedMountRoot `
+        -ScratchDirectory $ScratchRoot `
+        -ManifestPath $manifestPath `
+        -RequestedFileCount $FileCount `
+        -RequestedLargeFileBytes $LargeFileBytes `
+        -StatusFilePath $StatusFile
+}
 
 $result.manifest = [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path $manifestPath))
 Write-JsonFile -Path $manifestPath -InputObject $result
