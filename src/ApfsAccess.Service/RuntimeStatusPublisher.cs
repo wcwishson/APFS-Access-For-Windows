@@ -14,6 +14,7 @@ public sealed class RuntimeStatusPublisher
         Array.Empty<string>(),
         WriteEnabled: false,
         CompatibilityWarnings: Array.Empty<string>(),
+        MountedVolumes: Array.Empty<MountedVolumeDisplay>(),
         WriteBackend: "Disabled",
         CommitModel: NativeWriteCommitModel.ScaffoldCheckpoint,
         NativeWriteReadiness: NativeWriteReadiness.Unavailable,

@@ -18,6 +18,16 @@ public sealed class PipeMessageCodecTests
                 new[] { "Sample warning" },
                 WriteEnabled: true,
                 CompatibilityWarnings: new[] { "Sample compatibility warning" },
+                MountedVolumes:
+                [
+                    new MountedVolumeDisplay(
+                        VolumeId: @"\\.\PhysicalDrive3|Main",
+                        MountPoint: "X:\\",
+                        VolumeName: "Main",
+                        DeviceId: @"\\.\PhysicalDrive3",
+                        DeviceDisplayName: "Sample USB Device",
+                        AccessMode: MountAccessMode.ReadWrite),
+                ],
                 WriteBackend: "Native",
                 NativeWriteReadiness: NativeWriteReadiness.CommitReady,
                 NativeWriteEngineState: NativeWriteEngineState.Transactional,
@@ -83,6 +93,10 @@ public sealed class PipeMessageCodecTests
         Assert.NotNull(payload);
         Assert.Equal(RuntimeState.MountedRw, payload!.State);
         Assert.Equal(2, payload.MountPoints.Count);
+        Assert.NotNull(payload.MountedVolumes);
+        var mountedVolume = Assert.Single(payload.MountedVolumes!);
+        Assert.Equal(@"\\.\PhysicalDrive3|Main", mountedVolume.VolumeId);
+        Assert.Equal("Sample USB Device", mountedVolume.DeviceDisplayName);
         Assert.Single(payload.Warnings);
         Assert.True(payload.WriteEnabled);
         Assert.Single(payload.CompatibilityWarnings);
@@ -113,6 +127,33 @@ public sealed class PipeMessageCodecTests
         Assert.Equal("ValidationCrashFaultEvidenceInsufficient", payload.NativeWriteDiagnostics[0].RecoveryReason);
         Assert.Equal("CrashFault", payload.NativeWriteDiagnostics[0].ValidationScenario);
         Assert.Equal("snapshot-0001", payload.NativeWriteDiagnostics[0].EvidenceSnapshotId);
+    }
+
+    [Fact]
+    public void SerializeAndDeserialize_RoundTripsRefreshRequestPayload()
+    {
+        var source = PipeMessageCodec.Create(
+            ApfsMessageTypes.RefreshRequested,
+            new RefreshRequestedPayload(
+                Requester: "tester",
+                TimestampUtc: DateTime.UtcNow,
+                ClearUserEjectedVolumes: true),
+            requestId: "refresh-1"
+        );
+
+        var json = PipeMessageCodec.Serialize(source);
+        var success = PipeMessageCodec.TryDeserialize(json, out var deserialized);
+
+        Assert.True(success);
+        Assert.NotNull(deserialized);
+        Assert.Equal(ApfsMessageTypes.RefreshRequested, deserialized!.Type);
+        Assert.Equal("refresh-1", deserialized.RequestId);
+
+        var payloadSuccess = PipeMessageCodec.TryGetPayload<RefreshRequestedPayload>(deserialized, out var payload);
+        Assert.True(payloadSuccess);
+        Assert.NotNull(payload);
+        Assert.Equal("tester", payload!.Requester);
+        Assert.True(payload.ClearUserEjectedVolumes);
     }
 
     [Fact]

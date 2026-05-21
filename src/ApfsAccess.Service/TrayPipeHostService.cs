@@ -88,7 +88,24 @@ public sealed class TrayPipeHostService : BackgroundService
                     }
                     case ApfsMessageTypes.EjectRequested:
                     {
-                        var result = await _mountWorker.EjectAllAsync(cancellationToken).ConfigureAwait(false);
+                        PipeMessageCodec.TryGetPayload<EjectRequestedPayload>(message, out var payload);
+                        var result = await _mountWorker
+                            .EjectAsync(payload?.VolumeId, cancellationToken)
+                            .ConfigureAwait(false);
+                        var ack = PipeMessageCodec.Create(
+                            ApfsMessageTypes.Ack,
+                            new AckPayload(result.Success, result.Message),
+                            message.RequestId
+                        );
+                        await peer.SendAsync(ack, cancellationToken).ConfigureAwait(false);
+                        break;
+                    }
+                    case ApfsMessageTypes.RefreshRequested:
+                    {
+                        PipeMessageCodec.TryGetPayload<RefreshRequestedPayload>(message, out var payload);
+                        var result = await _mountWorker
+                            .RefreshAsync(payload?.ClearUserEjectedVolumes == true, cancellationToken)
+                            .ConfigureAwait(false);
                         var ack = PipeMessageCodec.Create(
                             ApfsMessageTypes.Ack,
                             new AckPayload(result.Success, result.Message),

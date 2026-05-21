@@ -1146,10 +1146,7 @@ bool NativeApfsReader::ProjectFileSystemTree(
                         child.child_id,
                         xid,
                         false));
-                if (IsDirectoryDrec(child.flags))
-                {
-                    pending.push({ child.child_id, child_path });
-                }
+                pending.push({ child.child_id, child_path });
             }
         }
     }

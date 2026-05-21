@@ -1,12 +1,17 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using ApfsAccess.Core;
 using ApfsAccess.Ipc;
 
 namespace ApfsAccess.Tray;
 
+public sealed record EjectMenuDescriptor(string Text, string? VolumeId);
+
 public sealed class TrayApplicationContext : ApplicationContext
 {
     private static readonly TimeSpan ServiceStartThrottle = TimeSpan.FromSeconds(4);
+    private static readonly TimeSpan EjectRequestTimeout = TimeSpan.FromSeconds(130);
+    private static readonly object DiagnosticLogSync = new();
     private static readonly string[] ExplicitCanonicalGateRecoveryReasons =
     [
         "CanonicalStateNotLoaded",
@@ -26,19 +31,25 @@ public sealed class TrayApplicationContext : ApplicationContext
     ];
 
     private readonly SynchronizationContext _uiContext;
+    private readonly Control _uiInvoker = new();
     private readonly NotifyIcon _notifyIcon;
     private readonly ToolStripMenuItem _ejectItem;
     private readonly List<Icon> _ownedIcons = [];
     private readonly Dictionary<RuntimeState, Icon> _iconByState;
     private readonly HashSet<string> _shownWarnings = new(StringComparer.OrdinalIgnoreCase);
     private readonly CancellationTokenSource _shutdownCts = new();
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<AckPayload>> _pendingAcks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _statusPeerSync = new();
 
+    private PipePeer? _statusPeer;
     private bool _exitRequested;
+    private bool _startupRefreshRequested;
     private DateTime _lastServiceStartAttemptUtc = DateTime.MinValue;
 
     public TrayApplicationContext()
     {
         _uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+        _ = _uiInvoker.Handle;
 
         _iconByState = LoadIcons();
 
@@ -86,15 +97,20 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private async void OnEjectClicked(object? sender, EventArgs e)
     {
-        _ = sender;
         _ = e;
-        await RequestEjectAsync().ConfigureAwait(false);
+        var volumeId = sender is ToolStripMenuItem { Tag: string taggedVolumeId } &&
+                       !string.IsNullOrWhiteSpace(taggedVolumeId)
+            ? taggedVolumeId
+            : null;
+        LogDiagnostic($"Eject click received. volumeId='{volumeId ?? "<all>"}'");
+        await RequestEjectAsync(volumeId).ConfigureAwait(false);
     }
 
-    private async Task RequestEjectAsync()
+    private async Task RequestEjectAsync(string? volumeId)
     {
         PostToUi(() => _ejectItem.Enabled = false);
-        var (success, message) = await TrySendEjectAsync().ConfigureAwait(false);
+        var (success, message) = await TrySendEjectAsync(volumeId).ConfigureAwait(false);
+        LogDiagnostic($"Eject request completed. success={success}; message='{message ?? string.Empty}'");
         PostToUi(() =>
         {
             _ejectItem.Enabled = true;
@@ -135,20 +151,40 @@ public sealed class TrayApplicationContext : ApplicationContext
                     .ConnectAsync(ApfsPipeConstants.PipeName, timeoutMilliseconds: 1500, cancellationToken)
                     .ConfigureAwait(false);
 
-                while (!cancellationToken.IsCancellationRequested)
+                try
                 {
-                    var message = await peer.ReadMessageAsync(cancellationToken).ConfigureAwait(false);
-                    if (message is null)
+                    if (!await TryPrimeStatusFromServiceAsync(peer, cancellationToken).ConfigureAwait(false))
                     {
-                        break;
+                        continue;
                     }
 
-                    if (message.Type == ApfsMessageTypes.StatusChanged &&
-                        PipeMessageCodec.TryGetPayload<StatusChangedPayload>(message, out var status) &&
-                        status is not null)
+                    SetStatusPeer(peer);
+                    await RequestStartupRefreshOnceAsync(peer, cancellationToken).ConfigureAwait(false);
+
+                    while (!cancellationToken.IsCancellationRequested)
                     {
-                        PostToUi(() => UpdateUi(status));
+                        var message = await peer.ReadMessageAsync(cancellationToken).ConfigureAwait(false);
+                        if (message is null)
+                        {
+                            break;
+                        }
+
+                        if (message.Type == ApfsMessageTypes.StatusChanged &&
+                            PipeMessageCodec.TryGetPayload<StatusChangedPayload>(message, out var status) &&
+                            status is not null)
+                        {
+                            PostToUi(() => UpdateUi(status));
+                        }
+                        else if (message.Type == ApfsMessageTypes.Ack)
+                        {
+                            CompletePendingAck(message);
+                        }
                     }
+                }
+                finally
+                {
+                    ClearStatusPeer(peer);
+                    CompleteAllPendingAcks("The APFS Access service connection closed before it answered.");
                 }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -294,11 +330,111 @@ public sealed class TrayApplicationContext : ApplicationContext
         return false;
     }
 
-    private async Task<(bool Success, string? Message)> TrySendEjectAsync()
+    private async Task RequestStartupRefreshOnceAsync(PipePeer peer, CancellationToken cancellationToken)
+    {
+        if (_startupRefreshRequested)
+        {
+            return;
+        }
+
+        _startupRefreshRequested = true;
+        var requestId = Guid.NewGuid().ToString("N");
+        var refreshMessage = PipeMessageCodec.Create(
+            ApfsMessageTypes.RefreshRequested,
+            new RefreshRequestedPayload(
+                Environment.UserName,
+                DateTime.UtcNow,
+                ClearUserEjectedVolumes: true),
+            requestId
+        );
+
+        await peer.SendAsync(refreshMessage, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<bool> TryPrimeStatusFromServiceAsync(PipePeer peer, CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var message = await peer.ReadMessageAsync(cancellationToken).ConfigureAwait(false);
+            if (message is null)
+            {
+                return false;
+            }
+
+            if (message.Type != ApfsMessageTypes.StatusChanged)
+            {
+                continue;
+            }
+
+            if (!PipeMessageCodec.TryGetPayload<StatusChangedPayload>(message, out var status) || status is null)
+            {
+                continue;
+            }
+
+            PostToUi(() => UpdateUi(status));
+            return true;
+        }
+
+        return false;
+    }
+
+    private async Task<(bool Success, string? Message)> TrySendEjectAsync(string? volumeId = null)
+    {
+        var statusPeer = GetStatusPeer();
+        if (statusPeer is not null)
+        {
+            try
+            {
+                return await TrySendEjectOnStatusChannelAsync(statusPeer, volumeId).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException)
+            {
+                LogDiagnostic($"Status-channel eject failed before ACK wait; falling back to transient pipe. {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        return await TrySendEjectOnTransientPipeAsync(volumeId).ConfigureAwait(false);
+    }
+
+    private async Task<(bool Success, string? Message)> TrySendEjectOnStatusChannelAsync(PipePeer peer, string? volumeId)
+    {
+        var requestId = Guid.NewGuid().ToString("N");
+        var pending = new TaskCompletionSource<AckPayload>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_pendingAcks.TryAdd(requestId, pending))
+        {
+            return (false, "Could not request eject: duplicate request id.");
+        }
+
+        using var timeoutCts = new CancellationTokenSource(EjectRequestTimeout);
+        try
+        {
+            var ejectMessage = PipeMessageCodec.Create(
+                ApfsMessageTypes.EjectRequested,
+                new EjectRequestedPayload(Environment.UserName, DateTime.UtcNow, volumeId),
+                requestId
+            );
+
+            LogDiagnostic($"Sending eject over status channel. requestId={requestId}; volumeId='{volumeId ?? "<all>"}'");
+            await peer.SendAsync(ejectMessage, timeoutCts.Token).ConfigureAwait(false);
+            var ack = await pending.Task.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+            return (ack.Success, ack.Message);
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
+        {
+            LogDiagnostic($"Timed out waiting for status-channel eject ACK. requestId={requestId}");
+            return (false, "Timed out waiting for APFS Access to eject drives.");
+        }
+        finally
+        {
+            _pendingAcks.TryRemove(requestId, out _);
+        }
+    }
+
+    private async Task<(bool Success, string? Message)> TrySendEjectOnTransientPipeAsync(string? volumeId = null)
     {
         var requestId = Guid.NewGuid().ToString("N");
 
-        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var timeoutCts = new CancellationTokenSource(EjectRequestTimeout);
         try
         {
             await using var peer = await NamedPipeMessageClient
@@ -307,10 +443,11 @@ public sealed class TrayApplicationContext : ApplicationContext
 
             var ejectMessage = PipeMessageCodec.Create(
                 ApfsMessageTypes.EjectRequested,
-                new EjectRequestedPayload(Environment.UserName, DateTime.UtcNow),
+                new EjectRequestedPayload(Environment.UserName, DateTime.UtcNow, volumeId),
                 requestId
             );
 
+            LogDiagnostic($"Sending eject over transient pipe. requestId={requestId}; volumeId='{volumeId ?? "<all>"}'");
             await peer.SendAsync(ejectMessage, timeoutCts.Token).ConfigureAwait(false);
 
             while (!timeoutCts.Token.IsCancellationRequested)
@@ -329,6 +466,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 
                 if (PipeMessageCodec.TryGetPayload<AckPayload>(response, out var ack) && ack is not null)
                 {
+                    LogDiagnostic($"Transient eject ACK received. requestId={requestId}; success={ack.Success}; message='{ack.Message ?? string.Empty}'");
                     return (ack.Success, ack.Message);
                 }
 
@@ -337,10 +475,72 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
         catch (Exception ex)
         {
+            LogDiagnostic($"Transient eject request failed. requestId={requestId}; {ex.GetType().Name}: {ex.Message}");
             return (false, $"Could not request eject: {ex.Message}");
         }
 
+        LogDiagnostic($"Timed out waiting for transient eject ACK. requestId={requestId}");
         return (false, "Timed out waiting for APFS Access to eject drives.");
+    }
+
+    private void CompletePendingAck(PipeEnvelope message)
+    {
+        if (string.IsNullOrWhiteSpace(message.RequestId) ||
+            !_pendingAcks.TryRemove(message.RequestId, out var pending))
+        {
+            return;
+        }
+
+        if (PipeMessageCodec.TryGetPayload<AckPayload>(message, out var ack) && ack is not null)
+        {
+            LogDiagnostic($"Status-channel ACK received. requestId={message.RequestId}; success={ack.Success}; message='{ack.Message ?? string.Empty}'");
+            pending.TrySetResult(ack);
+            return;
+        }
+
+        pending.TrySetResult(new AckPayload(false, "The service returned an unreadable eject response."));
+    }
+
+    private void CompleteAllPendingAcks(string message)
+    {
+        foreach (var requestId in _pendingAcks.Keys.ToArray())
+        {
+            if (_pendingAcks.TryRemove(requestId, out var pending))
+            {
+                pending.TrySetResult(new AckPayload(false, message));
+            }
+        }
+    }
+
+    private PipePeer? GetStatusPeer()
+    {
+        lock (_statusPeerSync)
+        {
+            return _statusPeer;
+        }
+    }
+
+    private void SetStatusPeer(PipePeer peer)
+    {
+        lock (_statusPeerSync)
+        {
+            _statusPeer = peer;
+        }
+
+        LogDiagnostic("Status pipe connected.");
+    }
+
+    private void ClearStatusPeer(PipePeer peer)
+    {
+        lock (_statusPeerSync)
+        {
+            if (ReferenceEquals(_statusPeer, peer))
+            {
+                _statusPeer = null;
+            }
+        }
+
+        LogDiagnostic("Status pipe disconnected.");
     }
 
     private void SetDisconnectedUi()
@@ -366,8 +566,41 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
 
         _notifyIcon.Text = text;
-        _ejectItem.Enabled = payload.MountPoints.Count > 0;
+        UpdateEjectMenu(payload);
         ShowWarnings(payload);
+    }
+
+    private void UpdateEjectMenu(StatusChangedPayload payload)
+    {
+        var descriptors = BuildEjectMenuDescriptors(payload);
+        _ejectItem.DropDownItems.Clear();
+        _ejectItem.Tag = null;
+        _ejectItem.Enabled = descriptors.Count > 0;
+
+        if (descriptors.Count == 0)
+        {
+            _ejectItem.Text = "Eject APFS drives";
+            return;
+        }
+
+        if (descriptors.Count == 1)
+        {
+            var descriptor = descriptors[0];
+            _ejectItem.Text = descriptor.Text;
+            _ejectItem.Tag = descriptor.VolumeId;
+            return;
+        }
+
+        _ejectItem.Text = $"Eject APFS drives ({descriptors.Count})";
+        foreach (var descriptor in descriptors)
+        {
+            var child = new ToolStripMenuItem(descriptor.Text)
+            {
+                Tag = descriptor.VolumeId,
+            };
+            child.Click += OnEjectClicked;
+            _ejectItem.DropDownItems.Add(child);
+        }
     }
 
     private static string BuildNotifyIconText(StatusChangedPayload payload)
@@ -419,6 +652,80 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
 
         return text;
+    }
+
+    private static IReadOnlyList<EjectMenuDescriptor> BuildEjectMenuDescriptors(StatusChangedPayload payload)
+    {
+        if (payload.MountedVolumes is { Count: > 0 })
+        {
+            return payload.MountedVolumes
+                .Where(static volume => !string.IsNullOrWhiteSpace(volume.MountPoint))
+                .OrderBy(static volume => NormalizeDriveLabel(volume.MountPoint), StringComparer.OrdinalIgnoreCase)
+                .Select(static volume => new EjectMenuDescriptor(
+                    BuildEjectMenuText(volume),
+                    volume.VolumeId))
+                .ToArray();
+        }
+
+        return (payload.MountPoints ?? Array.Empty<string>())
+            .Where(static mountPoint => !string.IsNullOrWhiteSpace(mountPoint))
+            .OrderBy(static mountPoint => NormalizeDriveLabel(mountPoint), StringComparer.OrdinalIgnoreCase)
+            .Select(static mountPoint => new EjectMenuDescriptor(
+                $"Eject APFS drive {NormalizeDriveLabel(mountPoint)}",
+                null))
+            .ToArray();
+    }
+
+    private static string BuildEjectMenuText(MountedVolumeDisplay volume)
+    {
+        var deviceName = !string.IsNullOrWhiteSpace(volume.DeviceDisplayName)
+            ? volume.DeviceDisplayName.Trim()
+            : !string.IsNullOrWhiteSpace(volume.DeviceId)
+                ? volume.DeviceId.Trim()
+                : "APFS drive";
+        var drive = NormalizeDriveLabel(volume.MountPoint);
+        var volumeName = !string.IsNullOrWhiteSpace(volume.VolumeName)
+            ? volume.VolumeName.Trim()
+            : "APFS";
+
+        return $"Eject {deviceName} ({drive}, {volumeName})";
+    }
+
+    private static string NormalizeDriveLabel(string? mountPoint)
+    {
+        if (string.IsNullOrWhiteSpace(mountPoint))
+        {
+            return "?";
+        }
+
+        var trimmed = mountPoint.Trim();
+        if (trimmed.Length >= 2 && trimmed[1] == ':')
+        {
+            return $"{char.ToUpperInvariant(trimmed[0])}:";
+        }
+
+        return trimmed.TrimEnd('\\');
+    }
+
+    private static void LogDiagnostic(string message)
+    {
+        try
+        {
+            var logDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "ApfsAccess");
+            Directory.CreateDirectory(logDir);
+            var logPath = Path.Combine(logDir, "tray-diagnostics.log");
+            var line = $"{DateTimeOffset.Now:O} [pid:{Environment.ProcessId}] {message}{Environment.NewLine}";
+            lock (DiagnosticLogSync)
+            {
+                File.AppendAllText(logPath, line);
+            }
+        }
+        catch
+        {
+            // Diagnostics must never affect tray behavior.
+        }
     }
 
     private void ShowWarnings(StatusChangedPayload payload)
@@ -603,6 +910,18 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private void PostToUi(Action action)
     {
+        if (_uiInvoker.IsDisposed)
+        {
+            action();
+            return;
+        }
+
+        if (_uiInvoker.IsHandleCreated)
+        {
+            _uiInvoker.BeginInvoke(action);
+            return;
+        }
+
         _uiContext.Post(_ => action(), null);
     }
 
@@ -618,6 +937,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
 
         _shutdownCts.Dispose();
+        _uiInvoker.Dispose();
         base.ExitThreadCore();
     }
 }

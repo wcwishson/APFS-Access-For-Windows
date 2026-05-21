@@ -13,6 +13,7 @@ public sealed record StatusChangedPayload(
     IReadOnlyList<string> Warnings,
     bool WriteEnabled,
     IReadOnlyList<string> CompatibilityWarnings,
+    IReadOnlyList<MountedVolumeDisplay>? MountedVolumes = null,
     string WriteBackend = "Disabled",
     NativeWriteCommitModel CommitModel = NativeWriteCommitModel.ScaffoldCheckpoint,
     NativeWriteReadiness NativeWriteReadiness = NativeWriteReadiness.Unavailable,
@@ -34,10 +35,25 @@ public sealed record StatusChangedPayload(
 
 public sealed record QuitRequestedPayload(string Requester, DateTime TimestampUtc);
 
-public sealed record EjectRequestedPayload(string Requester, DateTime TimestampUtc);
+public sealed record EjectRequestedPayload(string Requester, DateTime TimestampUtc, string? VolumeId = null);
+
+public sealed record RefreshRequestedPayload(
+    string Requester,
+    DateTime TimestampUtc,
+    bool ClearUserEjectedVolumes = false
+);
 
 public sealed record AckPayload(bool Success, string? Message);
 
 public sealed record PingPayload(DateTime TimestampUtc);
 
 public sealed record PongPayload(DateTime TimestampUtc);
+
+public sealed record MountedVolumeDisplay(
+    string VolumeId,
+    string MountPoint,
+    string VolumeName,
+    string DeviceId,
+    string DeviceDisplayName,
+    MountAccessMode AccessMode
+);

@@ -2311,6 +2311,162 @@ int main()
             "Partial-inode btree-rebuild remount payload should match committed bytes");
     }
 
+    const auto non_fixture_partial_inode_fixture_image_path =
+        run_root / "container_non_fixture_partial_inode_state_seed.apfs.img";
+    if (!CreateSyntheticContainer(non_fixture_partial_inode_fixture_image_path))
+    {
+        std::cerr << "[FAIL] unable to create synthetic APFS container image for non-fixture partial-inode scenario" << std::endl;
+        return 1;
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext non_fixture_partial_inode_fixture_context
+    {
+        non_fixture_partial_inode_fixture_image_path.wstring(),
+        L"NonFixturePartialInodeSeed",
+    };
+    const auto non_fixture_partial_inode_fixture_state_path =
+        BuildPersistentStatePathForTest(non_fixture_partial_inode_fixture_context);
+    if (!non_fixture_partial_inode_fixture_state_path.empty())
+    {
+        std::error_code remove_ec;
+        std::filesystem::remove(non_fixture_partial_inode_fixture_state_path, remove_ec);
+    }
+
+    const auto non_fixture_partial_inode_payload = BuildPatternPayload(4096, 0x7C);
+    std::size_t non_fixture_partial_inode_expected_inodes = 0;
+    std::size_t non_fixture_partial_inode_expected_btree_records = 0;
+    {
+        apfsaccess::rw::MetadataStore store(non_fixture_partial_inode_fixture_context);
+        ok &= Require(store.LoadContainerSuperblocks(), "Non-fixture partial-inode LoadContainerSuperblocks should succeed");
+        ok &= Require(store.LoadObjectMap(), "Non-fixture partial-inode LoadObjectMap should succeed");
+        ok &= Require(store.LoadSpacemanState(), "Non-fixture partial-inode LoadSpacemanState should succeed");
+        ok &= Require(store.PrepareNativeWritePath(), "Non-fixture partial-inode PrepareNativeWritePath should succeed");
+
+        std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+        store.SetFilePayloadProvider(
+            [&staged_payloads](const std::wstring& path, std::uint64_t logical_size) -> std::optional<std::vector<std::byte>>
+            {
+                auto pending = staged_payloads.find(path);
+                if (pending == staged_payloads.end())
+                {
+                    return std::nullopt;
+                }
+
+                auto payload = pending->second;
+                if (logical_size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+                {
+                    return std::nullopt;
+                }
+                const auto target_size = static_cast<std::size_t>(logical_size);
+                if (payload.size() < target_size)
+                {
+                    payload.resize(target_size, std::byte{0});
+                }
+                else if (payload.size() > target_size)
+                {
+                    payload.resize(target_size);
+                }
+                return payload;
+            });
+
+        apfsaccess::rw::MetadataStore::MutationRequest create_dir{};
+        create_dir.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateDirectory;
+        create_dir.path = L"\\strict";
+        ok &= Require(
+            store.ApplyMutation(create_dir) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "Non-fixture partial-inode directory create should apply");
+
+        apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+        create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+        create_file.path = L"\\strict\\from_btree.bin";
+        ok &= Require(
+            store.ApplyMutation(create_file) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "Non-fixture partial-inode file create should apply");
+
+        apfsaccess::rw::MetadataStore::MutationRequest write_file{};
+        write_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+        write_file.path = L"\\strict\\from_btree.bin";
+        write_file.length = static_cast<std::uint64_t>(non_fixture_partial_inode_payload.size());
+        ok &= Require(
+            store.ApplyMutation(write_file) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "Non-fixture partial-inode file write should apply");
+        staged_payloads[L"\\strict\\from_btree.bin"] = non_fixture_partial_inode_payload;
+
+        const auto commit_status = store.CommitPendingMutations();
+        ok &= Require(
+            commit_status == apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+            "Non-fixture partial-inode setup commit should succeed");
+
+        non_fixture_partial_inode_expected_inodes = store.CommittedInodeCount();
+        non_fixture_partial_inode_expected_btree_records = store.CommittedBtreeRecordCount();
+    }
+
+    const auto non_fixture_partial_inode_image_path = run_root / "container_non_fixture_partial_inode_state.bin";
+    {
+        std::error_code copy_ec;
+        std::filesystem::copy_file(
+            non_fixture_partial_inode_fixture_image_path,
+            non_fixture_partial_inode_image_path,
+            std::filesystem::copy_options::overwrite_existing,
+            copy_ec);
+        ok &= Require(
+            !copy_ec,
+            "Non-fixture partial-inode scenario should copy fixture seed image to non-fixture path");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext non_fixture_partial_inode_context
+    {
+        non_fixture_partial_inode_image_path.wstring(),
+        L"NonFixturePartialInodeState",
+    };
+    const auto non_fixture_partial_inode_state_path = BuildPersistentStatePathForTest(non_fixture_partial_inode_context);
+    if (!non_fixture_partial_inode_state_path.empty())
+    {
+        std::error_code remove_ec;
+        std::filesystem::remove(non_fixture_partial_inode_state_path, remove_ec);
+    }
+
+    std::size_t non_fixture_rewritten_root_only_inode_blocks = 0;
+    ok &= Require(
+        WriteRootOnlyInodeCheckpointBlocks(
+            non_fixture_partial_inode_image_path,
+            kVolumeRootObject,
+            kTotalBlocks,
+            non_fixture_rewritten_root_only_inode_blocks),
+        "Non-fixture partial-inode scenario should rewrite inode checkpoints to root-only state");
+    ok &= Require(
+        non_fixture_rewritten_root_only_inode_blocks >= 1,
+        "Non-fixture partial-inode scenario should rewrite at least one inode checkpoint");
+
+    {
+        apfsaccess::rw::MetadataStore remounted(non_fixture_partial_inode_context);
+        ok &= Require(remounted.LoadContainerSuperblocks(), "Non-fixture partial-inode remount LoadContainerSuperblocks should succeed");
+        ok &= Require(remounted.PrepareNativeWritePath(), "Non-fixture partial-inode remount PrepareNativeWritePath should succeed via btree reconstruction");
+        ok &= Require(!remounted.IsRecoveryRequired(), "Non-fixture partial-inode remount should remain clean after btree reconstruction");
+        ok &= Require(remounted.IsCommitPathReady(), "Non-fixture partial-inode remount should keep commit path ready");
+        ok &= Require(
+            remounted.CommittedInodeCount() == non_fixture_partial_inode_expected_inodes,
+            "Non-fixture partial-inode remount should replace root-only inode checkpoint with btree reconstruction");
+        ok &= Require(
+            remounted.CommittedBtreeRecordCount() == non_fixture_partial_inode_expected_btree_records,
+            "Non-fixture partial-inode remount should preserve btree checkpoint record count");
+        ok &= Require(
+            remounted.LookupCommittedInodeByPath(L"\\STRICT\\FROM_BTREE.BIN").has_value(),
+            "Non-fixture partial-inode remount should expose reconstructed path case-insensitively");
+
+        std::vector<std::byte> rebuilt_window;
+        ok &= Require(
+            remounted.ReadCommittedFileRange(
+                L"\\strict\\from_btree.bin",
+                0,
+                non_fixture_partial_inode_payload.size(),
+                rebuilt_window),
+            "Non-fixture partial-inode remount should read payload via reconstructed inode state");
+        ok &= Require(
+            rebuilt_window == non_fixture_partial_inode_payload,
+            "Non-fixture partial-inode remount payload should match committed bytes");
+    }
+
     if (!persistent_state_path.empty())
     {
         std::error_code remove_ec;

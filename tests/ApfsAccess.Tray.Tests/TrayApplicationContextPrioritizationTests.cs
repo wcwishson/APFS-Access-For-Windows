@@ -168,6 +168,63 @@ public sealed class TrayApplicationContextPrioritizationTests
         Assert.Equal(expected, text);
     }
 
+    [Fact]
+    public void BuildEjectMenuDescriptors_UsesDeviceNameDriveAndVolume()
+    {
+        var payload = new StatusChangedPayload(
+            State: RuntimeState.MountedRw,
+            MountPoints: ["E:\\"],
+            LastError: null,
+            TimestampUtc: DateTime.UtcNow,
+            Warnings: Array.Empty<string>(),
+            WriteEnabled: true,
+            CompatibilityWarnings: Array.Empty<string>(),
+            MountedVolumes:
+            [
+                new MountedVolumeDisplay(
+                    VolumeId: @"\\.\PhysicalDrive2|Main",
+                    MountPoint: "E:\\",
+                    VolumeName: "Main",
+                    DeviceId: @"\\.\PhysicalDrive2",
+                    DeviceDisplayName: "Samsung Flash Drive FIT USB Device",
+                    AccessMode: MountAccessMode.ReadWrite)
+            ]);
+
+        var descriptors = InvokeBuildEjectMenuDescriptors(payload);
+
+        var descriptor = Assert.Single(descriptors);
+        Assert.Equal(@"\\.\PhysicalDrive2|Main", descriptor.VolumeId);
+        Assert.Equal("Eject Samsung Flash Drive FIT USB Device (E:, Main)", descriptor.Text);
+    }
+
+    [Fact]
+    public void BuildEjectMenuDescriptors_FallsBackToMountPointWhenMountedVolumeDetailsMissing()
+    {
+        var payload = new StatusChangedPayload(
+            State: RuntimeState.MountedRo,
+            MountPoints: ["E:\\"],
+            LastError: null,
+            TimestampUtc: DateTime.UtcNow,
+            Warnings: Array.Empty<string>(),
+            WriteEnabled: false,
+            CompatibilityWarnings: Array.Empty<string>(),
+            MountedVolumes: Array.Empty<MountedVolumeDisplay>());
+
+        var descriptors = InvokeBuildEjectMenuDescriptors(payload);
+
+        var descriptor = Assert.Single(descriptors);
+        Assert.Null(descriptor.VolumeId);
+        Assert.Equal("Eject APFS drive E:", descriptor.Text);
+    }
+
+    [Fact]
+    public void EjectRequestTimeout_CoversBackendStopAndDriveRemovalBudget()
+    {
+        var timeout = InvokeEjectRequestTimeout();
+
+        Assert.True(timeout >= TimeSpan.FromSeconds(125));
+    }
+
     private static string? InvokeTryExtractReasonTokenFromWarning(string? warning)
     {
         var method = typeof(TrayApplicationContext).GetMethod(
@@ -221,5 +278,27 @@ public sealed class TrayApplicationContextPrioritizationTests
 
         var result = method!.Invoke(null, [payload]);
         return Assert.IsType<string>(result);
+    }
+
+    private static IReadOnlyList<EjectMenuDescriptor> InvokeBuildEjectMenuDescriptors(StatusChangedPayload payload)
+    {
+        var method = typeof(TrayApplicationContext).GetMethod(
+            "BuildEjectMenuDescriptors",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+
+        var result = method!.Invoke(null, [payload]);
+        return Assert.IsAssignableFrom<IReadOnlyList<EjectMenuDescriptor>>(result);
+    }
+
+    private static TimeSpan InvokeEjectRequestTimeout()
+    {
+        var field = typeof(TrayApplicationContext).GetField(
+            "EjectRequestTimeout",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(field);
+
+        var result = field!.GetValue(null);
+        return Assert.IsType<TimeSpan>(result);
     }
 }

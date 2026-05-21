@@ -122,7 +122,7 @@ public sealed class ServiceHostOptions
 
     public int NativeHostStartupTimeoutSeconds { get; set; } = 8;
 
-    public int NativeHostStopTimeoutSeconds { get; set; } = 5;
+    public int NativeHostStopTimeoutSeconds { get; set; } = 30;
 
     public string ReadWriteMode { get; set; } = "RwWithRoFallback";
 

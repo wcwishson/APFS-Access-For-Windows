@@ -5,6 +5,7 @@ public static class ApfsMessageTypes
     public const string StatusChanged = "StatusChanged";
     public const string QuitRequested = "QuitRequested";
     public const string EjectRequested = "EjectRequested";
+    public const string RefreshRequested = "RefreshRequested";
     public const string Ack = "Ack";
     public const string Ping = "Ping";
     public const string Pong = "Pong";

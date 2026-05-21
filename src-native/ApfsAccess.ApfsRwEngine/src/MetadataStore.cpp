@@ -11685,6 +11685,7 @@ bool MetadataStore::LoadPersistentState()
             disk_loaded_inode_last_committed_xid = selected_inode->last_committed_xid.value_or(selected_coherent_xid);
             disk_loaded_btree_last_committed_xid = selected_btree->last_committed_xid.value_or(selected_coherent_xid);
             coherent_native_checkpoint_selected = true;
+            reconcile_inode_state_from_btree();
         }
         else
         {

@@ -5338,6 +5338,28 @@ void NotifyShellDriveAdded(const std::wstring& mount)
     SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSH, L"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", nullptr);
 }
 
+void NotifyShellDriveRemoved(const std::wstring& mount)
+{
+    if (!IsDriveLetterMountPoint(mount))
+    {
+        return;
+    }
+
+    const auto letter_index = static_cast<unsigned int>(std::towupper(mount[0]) - L'A');
+    if (letter_index >= 26)
+    {
+        return;
+    }
+
+    const ULONG_PTR drive_mask = static_cast<ULONG_PTR>(1) << letter_index;
+    const std::wstring root_path = std::wstring(1, static_cast<wchar_t>(std::towupper(mount[0]))) + L":\\";
+    SHChangeNotify(SHCNE_MEDIAREMOVED, SHCNF_DWORD, reinterpret_cast<LPCVOID>(drive_mask), nullptr);
+    SHChangeNotify(SHCNE_DRIVEREMOVED, SHCNF_DWORD | SHCNF_FLUSH, reinterpret_cast<LPCVOID>(drive_mask), nullptr);
+    SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSH, root_path.c_str(), nullptr);
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+    SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSH, L"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", nullptr);
+}
+
 #ifdef APFSACCESS_HAS_RW_ENGINE
 std::optional<std::uint64_t> ResolveCleanRecoveryCheckpointXid(
     std::optional<std::uint64_t> committed_xid,
@@ -5935,6 +5957,7 @@ int wmain(int argc, wchar_t** argv)
     }
 #endif
     ctx.api.Delete(ctx.fs);
+    NotifyShellDriveRemoved(args.mount);
     if (ctx.sd) LocalFree(ctx.sd);
     return 0;
 }

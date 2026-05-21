@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;
+using Microsoft.Win32.SafeHandles;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -73,6 +74,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     private readonly ConcurrentDictionary<string, NativeWriteValidationEvidence> _validationEvidenceByVolumeId = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, NativeWriteValidationEvidence> _validationEvidenceByProfileId = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _lastPromotedEvidenceSessionByProfileId = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, string> _deviceDisplayNameById = new(StringComparer.OrdinalIgnoreCase);
     private readonly string _writeDiagnosticsRoot = Path.Combine(Path.GetTempPath(), "ApfsAccess", "write-diagnostics");
 
     public NativeApfsBackend(ServiceHostOptions options)
@@ -99,11 +101,13 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             if (discovered is not null)
             {
                 _deviceDiscoveryCache[candidate] = discovered;
+                _deviceDisplayNameById[discovered.DeviceId] = discovered.DisplayName;
                 devices.Add(new DeviceInfo(discovered.DeviceId, discovered.DisplayName, true));
             }
             else
             {
                 _deviceDiscoveryCache.TryRemove(candidate, out _);
+                _deviceDisplayNameById.TryRemove(candidate, out _);
             }
         }
 
@@ -123,6 +127,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         }
 
         _deviceDiscoveryCache[deviceId] = discovered;
+        _deviceDisplayNameById[discovered.DeviceId] = discovered.DisplayName;
 
         var volumes = discovered.Volumes
             .Select(discoveredVolume => CreateDiscoveredVolumeInfo(deviceId, discoveredVolume))
@@ -828,10 +833,13 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 replayCheckpointPendingWindow: hostRuntimeStatus.ReplayCheckpointPendingWindow);
 
             _hosts[mountPoint] = hostState;
-                _mounts[mountPoint] = new MountedVolumeState(
+            _mounts[mountPoint] = new MountedVolumeState(
                     volume.VolumeId,
                     mountPoint,
                     effectiveAccess,
+                    VolumeName: volume.VolumeName,
+                    DeviceId: volume.DeviceId,
+                    DeviceDisplayName: ResolveDeviceDisplayName(volume.DeviceId),
                     WriteBackend: writeBackend,
                     CommitModel: commitModel,
                     NativeWriteReadiness: nativeWriteReadiness,
@@ -916,7 +924,6 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         {
             CleanupExitedHosts_NoLock();
 
-            _mounts.TryRemove(normalizedMountPoint, out _);
             if (!_hosts.TryRemove(normalizedMountPoint, out var hostState))
             {
                 return new UnmountResult(
@@ -926,16 +933,30 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 );
             }
 
-            var stopped = await StopHostProcessAsync(hostState, cancellationToken).ConfigureAwait(false);
-            if (!stopped)
+            var stopResult = await StopHostProcessAsync(hostState, cancellationToken).ConfigureAwait(false);
+            var unmounted = stopResult.ProcessExited && await WaitForDriveRemovalAsync(
+                normalizedMountPoint,
+                TimeSpan.FromSeconds(Math.Clamp(_options.NativeHostStopTimeoutSeconds, 1, 60)),
+                cancellationToken).ConfigureAwait(false);
+
+            if (!unmounted)
             {
+                if (!stopResult.ProcessExited)
+                {
+                    _hosts[normalizedMountPoint] = hostState;
+                }
+
                 return new UnmountResult(
                     false,
                     normalizedMountPoint,
-                    $"FsHost for '{normalizedMountPoint}' did not stop cleanly before timeout."
+                    stopResult.ProcessExited
+                        ? $"Mount point '{normalizedMountPoint}' remained visible after FsHost stopped."
+                        : $"FsHost for '{normalizedMountPoint}' did not stop cleanly before timeout."
                 );
             }
 
+            _mounts.TryRemove(normalizedMountPoint, out _);
+            NotifyShellDriveRemoved(normalizedMountPoint);
             return new UnmountResult(true, normalizedMountPoint, null);
         }
         finally
@@ -1537,14 +1558,15 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         return new HostProcessState(process, lifetimeFilePath, statusFilePath, accessMode, _options.WriteBackendMode);
     }
 
-    private async Task<bool> StopHostProcessAsync(HostProcessState host, CancellationToken cancellationToken)
+    private async Task<HostStopResult> StopHostProcessAsync(HostProcessState host, CancellationToken cancellationToken)
     {
         TrySignalHostStop(host);
 
-        var timeout = TimeSpan.FromSeconds(Math.Clamp(_options.NativeHostStopTimeoutSeconds, 1, 30));
+        var timeout = TimeSpan.FromSeconds(Math.Clamp(_options.NativeHostStopTimeoutSeconds, 1, 60));
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutCts.CancelAfter(timeout);
 
+        HostStopResult result;
         try
         {
             if (!host.Process.HasExited)
@@ -1552,15 +1574,17 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 await host.Process.WaitForExitAsync(timeoutCts.Token).ConfigureAwait(false);
             }
 
-            return true;
+            result = new HostStopResult(ProcessExited: true, ForcedKill: false);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
+            var forcedKill = false;
             try
             {
                 if (!host.Process.HasExited)
                 {
                     host.Process.Kill(entireProcessTree: true);
+                    forcedKill = true;
                     await host.Process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
                 }
             }
@@ -1569,12 +1593,17 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 // Best-effort force-kill.
             }
 
-            return false;
+            result = new HostStopResult(ProcessExited: host.Process.HasExited, ForcedKill: forcedKill);
         }
         finally
         {
-            CleanupHostResources(host);
+            if (host.Process.HasExited)
+            {
+                CleanupHostResources(host);
+            }
         }
+
+        return result;
     }
 
     private static async Task<bool> WaitForMountOrExitAsync(
@@ -1622,6 +1651,55 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         }
 
         return false;
+    }
+
+    private static async Task<bool> WaitForDriveRemovalAsync(
+        string mountPoint,
+        TimeSpan timeout,
+        CancellationToken cancellationToken
+    )
+    {
+        var startedAt = Stopwatch.GetTimestamp();
+        var timeoutTicks = timeout.Ticks;
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            if (!IsDriveVisible(mountPoint))
+            {
+                return true;
+            }
+
+            if (Stopwatch.GetElapsedTime(startedAt).Ticks >= timeoutTicks)
+            {
+                return false;
+            }
+
+            await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+        }
+
+        return false;
+    }
+
+    private static void NotifyShellDriveRemoved(string mountPoint)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var normalized = NormalizeMountPoint(mountPoint);
+        if (normalized.Length < 2 || normalized[1] != ':')
+        {
+            return;
+        }
+
+        var letterIndex = char.ToUpperInvariant(normalized[0]) - 'A';
+        if (letterIndex is < 0 or >= 26)
+        {
+            return;
+        }
+
+        Win32ShellChangeNotify.NotifyDriveRemoved(letterIndex, normalized);
     }
 
     private static async Task<bool> IsHostMountReadyAsync(
@@ -1750,6 +1828,180 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             string lpDeviceName,
             StringBuilder lpTargetPath,
             int ucchMax);
+    }
+
+    private static class Win32ShellChangeNotify
+    {
+        private const int ShcneDriveRemoved = 0x00000080;
+        private const int ShcneMediaRemoved = 0x00000040;
+        private const int ShcneUpdateDir = 0x00001000;
+        private const int ShcneAssocChanged = 0x08000000;
+        private const uint ShcnfDword = 0x0003;
+        private const uint ShcnfPathW = 0x0005;
+        private const uint ShcnfIdList = 0x0000;
+        private const uint ShcnfFlush = 0x1000;
+
+        public static void NotifyDriveRemoved(int zeroBasedLetterIndex, string rootPath)
+        {
+            try
+            {
+                var driveMask = (nint)(1 << zeroBasedLetterIndex);
+                SHChangeNotify(ShcneMediaRemoved, ShcnfDword, driveMask, 0);
+                SHChangeNotify(ShcneDriveRemoved, ShcnfDword | ShcnfFlush, driveMask, 0);
+                SHChangeNotify(ShcneUpdateDir, ShcnfPathW | ShcnfFlush, rootPath, null);
+                SHChangeNotify(ShcneAssocChanged, ShcnfIdList, 0, 0);
+            }
+            catch
+            {
+                // Best-effort Explorer refresh.
+            }
+        }
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        private static extern void SHChangeNotify(
+            int wEventId,
+            uint uFlags,
+            nint dwItem1,
+            nint dwItem2);
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        private static extern void SHChangeNotify(
+            int wEventId,
+            uint uFlags,
+            string? dwItem1,
+            string? dwItem2);
+    }
+
+    private static class Win32StorageDescriptor
+    {
+        private const uint GenericRead = 0x80000000;
+        private const uint FileShareRead = 0x00000001;
+        private const uint FileShareWrite = 0x00000002;
+        private const uint FileShareDelete = 0x00000004;
+        private const uint OpenExisting = 3;
+        private const uint FileAttributeNormal = 0x00000080;
+        private const uint IoctlStorageQueryProperty = 0x002D1400;
+        private const int StorageDeviceProperty = 0;
+        private const int PropertyStandardQuery = 0;
+        private const int DescriptorBufferLength = 4096;
+
+        public static string? TryGetPhysicalDriveDisplayName(string devicePath)
+        {
+            if (string.IsNullOrWhiteSpace(devicePath) || !OperatingSystem.IsWindows())
+            {
+                return null;
+            }
+
+            var normalizedPath = devicePath.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase)
+                ? @"\\.\" + devicePath[4..]
+                : devicePath;
+
+            try
+            {
+                using var handle = CreateFileW(
+                    normalizedPath,
+                    GenericRead,
+                    FileShareRead | FileShareWrite | FileShareDelete,
+                    nint.Zero,
+                    OpenExisting,
+                    FileAttributeNormal,
+                    nint.Zero);
+                if (handle.IsInvalid)
+                {
+                    return null;
+                }
+
+                var query = new StoragePropertyQuery
+                {
+                    PropertyId = StorageDeviceProperty,
+                    QueryType = PropertyStandardQuery,
+                };
+                var buffer = new byte[DescriptorBufferLength];
+                var success = DeviceIoControl(
+                    handle,
+                    IoctlStorageQueryProperty,
+                    ref query,
+                    Marshal.SizeOf<StoragePropertyQuery>(),
+                    buffer,
+                    buffer.Length,
+                    out var bytesReturned,
+                    nint.Zero);
+                if (!success || bytesReturned < 36)
+                {
+                    return null;
+                }
+
+                var vendor = ReadDescriptorString(buffer, 12);
+                var product = ReadDescriptorString(buffer, 16);
+                var combined = string.Join(
+                    " ",
+                    new[] { vendor, product }
+                        .Where(static value => !string.IsNullOrWhiteSpace(value))
+                        .Select(static value => value!.Trim()))
+                    .Trim();
+                return string.IsNullOrWhiteSpace(combined) ? null : combined;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string? ReadDescriptorString(byte[] buffer, int offsetFieldIndex)
+        {
+            if (buffer.Length < offsetFieldIndex + sizeof(uint))
+            {
+                return null;
+            }
+
+            var offset = BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(offsetFieldIndex, sizeof(uint)));
+            if (offset == 0 || offset >= buffer.Length)
+            {
+                return null;
+            }
+
+            var end = (int)offset;
+            while (end < buffer.Length && buffer[end] != 0)
+            {
+                end++;
+            }
+
+            if (end <= offset)
+            {
+                return null;
+            }
+
+            return Encoding.ASCII.GetString(buffer, (int)offset, end - (int)offset).Trim();
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct StoragePropertyQuery
+        {
+            public int PropertyId;
+            public int QueryType;
+            public byte AdditionalParameters;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(
+            string lpFileName,
+            uint dwDesiredAccess,
+            uint dwShareMode,
+            nint lpSecurityAttributes,
+            uint dwCreationDisposition,
+            uint dwFlagsAndAttributes,
+            nint hTemplateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool DeviceIoControl(
+            SafeFileHandle hDevice,
+            uint dwIoControlCode,
+            ref StoragePropertyQuery lpInBuffer,
+            int nInBufferSize,
+            byte[] lpOutBuffer,
+            int nOutBufferSize,
+            out uint lpBytesReturned,
+            nint lpOverlapped);
     }
 
     private void CleanupExitedHosts_NoLock()
@@ -1982,11 +2234,6 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             return null;
         }
 
-        if (_deviceDiscoveryCache.TryGetValue(deviceId, out var cachedDevice))
-        {
-            return cachedDevice;
-        }
-
         var discoveredVolumes = DiscoverVolumes(deviceId);
         if (discoveredVolumes.Count == 0)
         {
@@ -1994,10 +2241,39 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         }
 
         var displayName = IsRawPhysicalDevicePath(deviceId)
-            ? $"APFS Device ({deviceId})"
+            ? BuildDeviceDisplayName(deviceId)
             : $"APFS Image ({Path.GetFileName(deviceId)})";
 
         return new DiscoveredDevice(deviceId, displayName, discoveredVolumes);
+    }
+
+    private string ResolveDeviceDisplayName(string deviceId)
+    {
+        if (_deviceDisplayNameById.TryGetValue(deviceId, out var cached) &&
+            !string.IsNullOrWhiteSpace(cached))
+        {
+            return cached;
+        }
+
+        var resolved = BuildDeviceDisplayName(deviceId);
+        _deviceDisplayNameById[deviceId] = resolved;
+        return resolved;
+    }
+
+    private static string BuildDeviceDisplayName(string deviceId)
+    {
+        if (!IsRawPhysicalDevicePath(deviceId))
+        {
+            var fileName = Path.GetFileName(deviceId);
+            return string.IsNullOrWhiteSpace(fileName)
+                ? $"APFS Image ({deviceId})"
+                : $"APFS Image ({fileName})";
+        }
+
+        var storageDescriptorName = Win32StorageDescriptor.TryGetPhysicalDriveDisplayName(deviceId);
+        return string.IsNullOrWhiteSpace(storageDescriptorName)
+            ? $"APFS Device ({deviceId})"
+            : storageDescriptorName;
     }
 
     private IReadOnlyList<DiscoveredVolume> DiscoverVolumes(string deviceId)
@@ -5859,6 +6135,8 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         MountAccessMode RequestedAccessMode,
         string? ConfiguredWriteBackend
     );
+
+    private sealed record HostStopResult(bool ProcessExited, bool ForcedKill);
 
     private sealed record HostRuntimeStatus(
         string WriteBackend,

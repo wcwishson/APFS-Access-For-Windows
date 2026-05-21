@@ -37,6 +37,29 @@ public sealed class SyntheticApfsTestImageTests
     }
 
     [Fact]
+    public async Task ProbeDevices_DropsCachedImage_WhenBackingFileDisappears()
+    {
+        using var temp = TempDirectory.Create();
+        var imagePath = Path.Combine(temp.Path, "hot-unplug.apfs.img");
+        SyntheticApfsTestImage.Create(imagePath, sizeMiB: 4);
+
+        using var backend = new NativeApfsBackend(new ServiceHostOptions
+        {
+            BackendMode = "Native",
+            NativeDeviceCandidates = [imagePath],
+            NativeAutoDiscoverPhysicalDrives = false,
+        });
+
+        var initialDevices = await backend.ProbeDevicesAsync(CancellationToken.None);
+        Assert.Single(initialDevices);
+
+        File.Delete(imagePath);
+
+        var devicesAfterRemoval = await backend.ProbeDevicesAsync(CancellationToken.None);
+        Assert.Empty(devicesAfterRemoval);
+    }
+
+    [Fact]
     public void Create_RefusesToOverwriteExistingFile()
     {
         using var temp = TempDirectory.Create();
