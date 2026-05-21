@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <windows.h>
+#include <winioctl.h>
 #include <winternl.h>
 #include <sddl.h>
 #include <shlobj.h>
@@ -2867,22 +2868,6 @@ bool EnsureHydrated(MountContext* c, const std::shared_ptr<Node>& n, bool allow_
         return true;
     }
 
-    const auto hydrate_from_bytes = [&](const std::vector<std::byte>& payload) -> bool
-    {
-        std::filesystem::create_directories(file.parent_path());
-        std::ofstream out(file, std::ios::binary | std::ios::trunc);
-        if (!out.good())
-        {
-            return false;
-        }
-
-        if (!payload.empty())
-        {
-            out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
-        }
-        return out.good();
-    };
-
 #ifdef APFSACCESS_HAS_RW_ENGINE
     const auto try_hydrate_from_metadata = [&]() -> bool
     {
@@ -2891,7 +2876,6 @@ bool EnsureHydrated(MountContext* c, const std::shared_ptr<Node>& n, bool allow_
             return false;
         }
 
-        std::vector<std::byte> payload;
         std::uint64_t logical_size = 0;
         {
             std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
@@ -2902,28 +2886,107 @@ bool EnsureHydrated(MountContext* c, const std::shared_ptr<Node>& n, bool allow_
             }
 
             logical_size = inode->logical_size;
-            if (logical_size == 0)
+        }
+
+        if (logical_size > static_cast<std::uint64_t>(std::numeric_limits<LONGLONG>::max()))
+        {
+            return false;
+        }
+
+        std::filesystem::create_directories(file.parent_path());
+        HANDLE hydrated = CreateFileW(
+            file.wstring().c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (hydrated == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        ScopeExit close_hydrated
+        {
+            [hydrated]()
             {
-                payload.clear();
+                CloseHandle(hydrated);
             }
-            else if (logical_size <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+        };
+
+        DWORD ignored_bytes_returned = 0;
+        (void)DeviceIoControl(
+            hydrated,
+            FSCTL_SET_SPARSE,
+            nullptr,
+            0,
+            nullptr,
+            0,
+            &ignored_bytes_returned,
+            nullptr);
+
+        constexpr std::size_t kHydrationChunkBytes = 64 * 1024;
+        std::uint64_t offset = 0;
+        while (offset < logical_size)
+        {
+            const auto remaining = logical_size - offset;
+            const auto chunk_bytes = static_cast<std::size_t>(std::min<std::uint64_t>(
+                remaining,
+                static_cast<std::uint64_t>(kHydrationChunkBytes)));
+            std::vector<std::byte> chunk;
             {
-                if (!c->metadata_store->ReadCommittedFileRange(
-                    n->path,
-                    0,
-                    static_cast<std::size_t>(logical_size),
-                    payload))
+                std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
+                if (!c->metadata_store->ReadCommittedFileRange(n->path, offset, chunk_bytes, chunk))
                 {
                     return false;
                 }
             }
-            else
+            if (chunk.size() > chunk_bytes)
             {
                 return false;
             }
+            if (chunk.size() < chunk_bytes)
+            {
+                chunk.resize(chunk_bytes, std::byte{0});
+            }
+
+            const auto has_non_zero = std::any_of(
+                chunk.begin(),
+                chunk.end(),
+                [](std::byte value)
+                {
+                    return value != std::byte{0};
+                });
+            if (has_non_zero)
+            {
+                LARGE_INTEGER target{};
+                target.QuadPart = static_cast<LONGLONG>(offset);
+                if (!SetFilePointerEx(hydrated, target, nullptr, FILE_BEGIN))
+                {
+                    return false;
+                }
+
+                DWORD written = 0;
+                if (!WriteFile(
+                        hydrated,
+                        chunk.data(),
+                        static_cast<DWORD>(chunk.size()),
+                        &written,
+                        nullptr) ||
+                    written != chunk.size())
+                {
+                    return false;
+                }
+            }
+
+            offset += chunk_bytes;
         }
 
-        return hydrate_from_bytes(payload);
+        LARGE_INTEGER target_size{};
+        target_size.QuadPart = static_cast<LONGLONG>(logical_size);
+        return SetFilePointerEx(hydrated, target_size, nullptr, FILE_BEGIN) &&
+               SetEndOfFile(hydrated);
     };
 #endif
 
@@ -6211,8 +6274,28 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
             granted_access,
             false);
         o->write_open = mutation_enabled && mutation_access_requested;
+        bool can_read_from_metadata = false;
 
-        if (EnsureHydrated(c, n, false))
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        if (!mutation_enabled && !o->named_stream && c->metadata_store)
+        {
+            std::vector<std::byte> probe_bytes;
+            {
+                std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
+                can_read_from_metadata = c->metadata_store->ReadCommittedFileRange(
+                    n->path,
+                    0,
+                    static_cast<std::size_t>(0),
+                    probe_bytes);
+            }
+        }
+#endif
+
+        if (can_read_from_metadata)
+        {
+            o->metadata_read_fallback = true;
+        }
+        else if (EnsureHydrated(c, n, false))
         {
             auto pth = o->named_stream
                 ? std::filesystem::path(HydrationStreamPath(c, *n, o->stream_name))
@@ -6233,8 +6316,7 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
         if (o->file == INVALID_HANDLE_VALUE && !mutation_enabled)
         {
 #ifdef APFSACCESS_HAS_RW_ENGINE
-            bool can_read_from_metadata = false;
-            if (c->metadata_store)
+            if (!can_read_from_metadata && !o->named_stream && c->metadata_store)
             {
                 std::vector<std::byte> probe_bytes;
                 {

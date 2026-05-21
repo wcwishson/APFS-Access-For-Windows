@@ -8,6 +8,7 @@
 #include <iterator>
 #include <memory>
 #include <algorithm>
+#include <unordered_map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -17,6 +18,13 @@
 
 namespace
 {
+constexpr std::uint32_t kSyntheticApfsBlockSize = 4096;
+constexpr std::uint64_t kSyntheticApfsTotalBlocks = 1024;
+constexpr std::uint64_t kSyntheticApfsInitialCheckpointXid = 7;
+constexpr std::uint64_t kSyntheticApfsSpacemanObjectId = 0x2A;
+constexpr std::uint64_t kSyntheticApfsVolumeRootObject = 0x54;
+constexpr std::uint32_t kSyntheticApfsNxsbMagic = 0x4253584E; // NXSB
+
 bool Require(bool condition, const char* message)
 {
     if (!condition)
@@ -26,6 +34,84 @@ bool Require(bool condition, const char* message)
     }
 
     return true;
+}
+
+void WriteLe32ForTest(std::vector<std::byte>& buffer, std::size_t offset, std::uint32_t value)
+{
+    if (offset + 4 > buffer.size())
+    {
+        return;
+    }
+
+    buffer[offset + 0] = static_cast<std::byte>(value & 0xffu);
+    buffer[offset + 1] = static_cast<std::byte>((value >> 8) & 0xffu);
+    buffer[offset + 2] = static_cast<std::byte>((value >> 16) & 0xffu);
+    buffer[offset + 3] = static_cast<std::byte>((value >> 24) & 0xffu);
+}
+
+void WriteLe64ForTest(std::vector<std::byte>& buffer, std::size_t offset, std::uint64_t value)
+{
+    if (offset + 8 > buffer.size())
+    {
+        return;
+    }
+
+    for (int i = 0; i < 8; ++i)
+    {
+        buffer[offset + static_cast<std::size_t>(i)] = static_cast<std::byte>((value >> (i * 8)) & 0xffu);
+    }
+}
+
+bool CreateSyntheticApfsContainerForTest(const std::filesystem::path& image_path)
+{
+    std::vector<std::byte> bytes(
+        static_cast<std::size_t>(kSyntheticApfsBlockSize * kSyntheticApfsTotalBlocks),
+        std::byte{0});
+    const auto write_superblock = [&](std::size_t base_offset, std::uint64_t checkpoint_xid)
+    {
+        WriteLe64ForTest(bytes, base_offset + 0x10, checkpoint_xid);
+        WriteLe32ForTest(bytes, base_offset + 0x20, kSyntheticApfsNxsbMagic);
+        WriteLe32ForTest(bytes, base_offset + 0x24, kSyntheticApfsBlockSize);
+        WriteLe64ForTest(bytes, base_offset + 0x28, kSyntheticApfsTotalBlocks);
+        WriteLe64ForTest(bytes, base_offset + 0x98, kSyntheticApfsSpacemanObjectId);
+        WriteLe64ForTest(bytes, base_offset + 0xA0, kSyntheticApfsVolumeRootObject);
+    };
+
+    write_superblock(0, kSyntheticApfsInitialCheckpointXid);
+    write_superblock(kSyntheticApfsBlockSize, kSyntheticApfsInitialCheckpointXid);
+
+    std::ofstream out(image_path, std::ios::binary | std::ios::trunc);
+    if (!out.good())
+    {
+        return false;
+    }
+
+    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    return out.good();
+}
+
+std::vector<std::byte> BuildPatternPayloadForTest(std::size_t bytes, unsigned char seed)
+{
+    std::vector<std::byte> payload(bytes, std::byte{0});
+    for (std::size_t i = 0; i < payload.size(); ++i)
+    {
+        payload[i] = static_cast<std::byte>((seed + static_cast<unsigned char>(i & 0xffu)) & 0xffu);
+    }
+    return payload;
+}
+
+std::uint64_t GetAllocatedBytesForTest(const std::filesystem::path& path)
+{
+    DWORD high = 0;
+    SetLastError(ERROR_SUCCESS);
+    const DWORD low = GetCompressedFileSizeW(path.wstring().c_str(), &high);
+    const auto error = GetLastError();
+    if (low == INVALID_FILE_SIZE && error != ERROR_SUCCESS)
+    {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+
+    return (static_cast<std::uint64_t>(high) << 32) | low;
 }
 
 std::shared_ptr<Node> MakeNode(const std::wstring& path, bool is_directory, bool delete_pending = false)
@@ -5679,6 +5765,409 @@ bool TestLoadHydratedPayloadReadsExistingHydrationWhenHydrateDisabled()
 #endif
 }
 
+bool TestReadOnlyOpenUsesMetadataRangeReadWithoutHydration()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    MountContext context{};
+    context.args.volume = L"Main";
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+    if (!Require(PrepareUnitHydrationRoot(context, L"metadata-range-read-open"), "Metadata range-read open test should prepare cache root"))
+    {
+        return false;
+    }
+
+    std::error_code ec;
+    const auto image_path = context.session_root / "metadata-range-read.apfs.img";
+    if (!Require(CreateSyntheticApfsContainerForTest(image_path), "Metadata range-read open test should create synthetic APFS image"))
+    {
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext rw_context
+    {
+        image_path.wstring(),
+        L"Main",
+    };
+    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+    context.metadata_store->SetFilePayloadProvider(
+        [&staged_payloads](const std::wstring& path, std::uint64_t logical_size) -> std::optional<std::vector<std::byte>>
+        {
+            auto pending = staged_payloads.find(path);
+            if (pending == staged_payloads.end())
+            {
+                return std::nullopt;
+            }
+
+            auto payload = pending->second;
+            const auto target_size = static_cast<std::size_t>(logical_size);
+            if (payload.size() < target_size)
+            {
+                payload.resize(target_size, std::byte{0});
+            }
+            else if (payload.size() > target_size)
+            {
+                payload.resize(target_size);
+            }
+            return payload;
+        });
+
+    {
+        std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
+        if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Metadata range-read open test should load container superblocks") ||
+            !Require(context.metadata_store->LoadObjectMap(), "Metadata range-read open test should load object map") ||
+            !Require(context.metadata_store->LoadSpacemanState(), "Metadata range-read open test should load spaceman state") ||
+            !Require(context.metadata_store->PrepareNativeWritePath(), "Metadata range-read open test should prepare native write path"))
+        {
+            std::filesystem::remove_all(context.session_root, ec);
+            return false;
+        }
+
+        apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+        create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+        create_file.path = L"\\large.bin";
+        if (!Require(
+                context.metadata_store->ApplyMutation(create_file) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+                "Metadata range-read open test should create committed file"))
+        {
+            std::filesystem::remove_all(context.session_root, ec);
+            return false;
+        }
+
+        auto committed_payload = BuildPatternPayloadForTest(128 * 1024, 0x41);
+        staged_payloads[L"\\large.bin"] = committed_payload;
+        apfsaccess::rw::MetadataStore::MutationRequest write_file{};
+        write_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+        write_file.path = L"\\large.bin";
+        write_file.length = committed_payload.size();
+        if (!Require(
+                context.metadata_store->ApplyMutation(write_file) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+                "Metadata range-read open test should stage committed payload") ||
+            !Require(
+                context.metadata_store->CommitPendingMutations() == apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+                "Metadata range-read open test should commit payload"))
+        {
+            std::filesystem::remove_all(context.session_root, ec);
+            return false;
+        }
+    }
+
+    if (!Require(MergeCommittedInodeStateIntoNodeIndex(&context), "Metadata range-read open test should merge committed inode state"))
+    {
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    auto node = FindNode(&context, L"\\large.bin");
+    if (!Require(node != nullptr, "Metadata range-read open test should expose committed file node"))
+    {
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    const auto hydration_path = HydrationPath(&context, *node);
+    std::filesystem::remove(hydration_path, ec);
+    ec.clear();
+
+    auto fs = BuildFileSystem(&context);
+    PVOID out_ctx = nullptr;
+    FSP_FSCTL_FILE_INFO info{};
+    const auto open_status = CB_Open(
+        &fs,
+        const_cast<PWSTR>(L"\\large.bin"),
+        FILE_NON_DIRECTORY_FILE,
+        FILE_READ_DATA,
+        &out_ctx,
+        &info);
+    if (!Require(open_status == STATUS_SUCCESS, "Read-only open should succeed from committed metadata without hydration") ||
+        !Require(out_ctx != nullptr, "Read-only metadata open should return an open context"))
+    {
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    auto* open_context = reinterpret_cast<OpenContext*>(out_ctx);
+    if (!Require(open_context->metadata_read_fallback, "Read-only committed open should use metadata range-read fallback") ||
+        !Require(open_context->file == INVALID_HANDLE_VALUE, "Read-only committed open should not open a hydration file handle") ||
+        !Require(!std::filesystem::exists(hydration_path, ec), "Read-only committed open should not create a hydration file"))
+    {
+        CB_Close(&fs, out_ctx);
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    std::array<char, 64> buffer{};
+    ULONG read_done = 0;
+    const auto read_offset = static_cast<UINT64>(4096);
+    const auto read_status = CB_Read(
+        &fs,
+        out_ctx,
+        buffer.data(),
+        read_offset,
+        static_cast<ULONG>(buffer.size()),
+        &read_done);
+    if (!Require(read_status == STATUS_SUCCESS, "Metadata range-read open should read requested range") ||
+        !Require(read_done == buffer.size(), "Metadata range-read open should return requested byte count"))
+    {
+        CB_Close(&fs, out_ctx);
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    const auto expected_payload = BuildPatternPayloadForTest(128 * 1024, 0x41);
+    for (std::size_t index = 0; index < buffer.size(); ++index)
+    {
+        const auto expected = expected_payload[static_cast<std::size_t>(read_offset) + index];
+        if (!Require(static_cast<std::byte>(static_cast<unsigned char>(buffer[index])) == expected, "Metadata range-read open should preserve committed bytes"))
+        {
+            CB_Close(&fs, out_ctx);
+            std::filesystem::remove_all(context.session_root, ec);
+            return false;
+        }
+    }
+
+    CB_Close(&fs, out_ctx);
+    std::filesystem::remove_all(context.session_root, ec);
+    return true;
+#else
+    return true;
+#endif
+}
+
+bool TestWritableOpenHydratesSparseMetadataWithoutDenseCache()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    MountContext context{};
+    context.args.volume = L"Main";
+    context.args.readwrite = true;
+    context.args.write_backend = L"Overlay";
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+    if (!Require(PrepareUnitHydrationRoot(context, L"sparse-writable-hydration"), "Sparse writable hydration test should prepare cache root"))
+    {
+        return false;
+    }
+
+    std::error_code ec;
+    const auto image_path = context.session_root / "sparse-writable-hydration.apfs.img";
+    if (!Require(CreateSyntheticApfsContainerForTest(image_path), "Sparse writable hydration test should create synthetic APFS image"))
+    {
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext rw_context
+    {
+        image_path.wstring(),
+        L"Main",
+    };
+    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+    context.metadata_store->SetFilePayloadProvider(
+        [&staged_payloads](const std::wstring& path, std::uint64_t logical_size) -> std::optional<std::vector<std::byte>>
+        {
+            auto pending = staged_payloads.find(path);
+            if (pending == staged_payloads.end())
+            {
+                return std::nullopt;
+            }
+
+            auto payload = pending->second;
+            payload.resize(static_cast<std::size_t>(logical_size), std::byte{0});
+            return payload;
+        });
+
+    constexpr std::size_t logical_size = 512 * 1024;
+    constexpr std::uint64_t sparse_offset = (512ull * 1024ull) - 4096ull;
+    const auto sparse_tail_payload = BuildPatternPayloadForTest(4096, 0xA7);
+
+    {
+        std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
+        if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Sparse writable hydration test should load container superblocks") ||
+            !Require(context.metadata_store->LoadObjectMap(), "Sparse writable hydration test should load object map") ||
+            !Require(context.metadata_store->LoadSpacemanState(), "Sparse writable hydration test should load spaceman state") ||
+            !Require(context.metadata_store->PrepareNativeWritePath(), "Sparse writable hydration test should prepare native write path"))
+        {
+            std::filesystem::remove_all(context.session_root, ec);
+            return false;
+        }
+
+        apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+        create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+        create_file.path = L"\\sparse.bin";
+        if (!Require(
+                context.metadata_store->ApplyMutation(create_file) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+                "Sparse writable hydration test should create committed file"))
+        {
+            std::filesystem::remove_all(context.session_root, ec);
+            return false;
+        }
+
+        staged_payloads[L"\\sparse.bin"] = std::vector<std::byte>(logical_size, std::byte{0});
+        apfsaccess::rw::MetadataStore::MutationRequest write_file{};
+        write_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+        write_file.path = L"\\sparse.bin";
+        write_file.length = logical_size;
+        if (!Require(
+                context.metadata_store->ApplyMutation(write_file) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+                "Sparse writable hydration test should stage committed size") ||
+            !Require(
+                context.metadata_store->CommitPendingMutations() == apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+                "Sparse writable hydration test should commit initial payload"))
+        {
+            std::filesystem::remove_all(context.session_root, ec);
+            return false;
+        }
+
+        auto inode = context.metadata_store->LookupCommittedInodeByPath(L"\\sparse.bin");
+        if (!Require(inode.has_value(), "Sparse writable hydration test should find committed sparse inode"))
+        {
+            std::filesystem::remove_all(context.session_root, ec);
+            return false;
+        }
+        constexpr std::uint64_t sparse_tail_physical = 800ull * kSyntheticApfsBlockSize;
+        std::fstream image_io(image_path, std::ios::binary | std::ios::in | std::ios::out);
+        if (!Require(image_io.good(), "Sparse writable hydration test should reopen image for tail extent"))
+        {
+            std::filesystem::remove_all(context.session_root, ec);
+            return false;
+        }
+        image_io.seekp(static_cast<std::streamoff>(sparse_tail_physical), std::ios::beg);
+        image_io.write(
+            reinterpret_cast<const char*>(sparse_tail_payload.data()),
+            static_cast<std::streamsize>(sparse_tail_payload.size()));
+        if (!Require(image_io.good(), "Sparse writable hydration test should write tail extent"))
+        {
+            std::filesystem::remove_all(context.session_root, ec);
+            return false;
+        }
+        image_io.close();
+        if (!Require(
+                context.metadata_store->SetCommittedReadExtents(
+                    inode->object_id,
+                    {
+                        { sparse_offset, sparse_tail_physical, sparse_tail_payload.size() },
+                    }),
+                "Sparse writable hydration test should install sparse committed extent"))
+        {
+            std::filesystem::remove_all(context.session_root, ec);
+            return false;
+        }
+    }
+
+    if (!Require(MergeCommittedInodeStateIntoNodeIndex(&context), "Sparse writable hydration test should merge committed inode state"))
+    {
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    auto node = FindNode(&context, L"\\sparse.bin");
+    if (!Require(node != nullptr, "Sparse writable hydration test should expose committed node"))
+    {
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    const auto hydration_path = HydrationPath(&context, *node);
+    std::filesystem::remove(hydration_path, ec);
+    ec.clear();
+
+    auto fs = BuildFileSystem(&context);
+    PVOID out_ctx = nullptr;
+    FSP_FSCTL_FILE_INFO info{};
+    const auto open_status = CB_Open(
+        &fs,
+        const_cast<PWSTR>(L"\\sparse.bin"),
+        FILE_NON_DIRECTORY_FILE,
+        FILE_READ_DATA | FILE_WRITE_DATA,
+        &out_ctx,
+        &info);
+    if (!Require(open_status == STATUS_SUCCESS, "Writable sparse committed open should hydrate cache successfully") ||
+        !Require(out_ctx != nullptr, "Writable sparse committed open should return an open context"))
+    {
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    auto* open_context = reinterpret_cast<OpenContext*>(out_ctx);
+    if (!Require(open_context->file != INVALID_HANDLE_VALUE, "Writable sparse committed open should use a local hydration handle") ||
+        !Require(!open_context->metadata_read_fallback, "Writable sparse committed open should not use read-only metadata fallback"))
+    {
+        CB_Close(&fs, out_ctx);
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    std::array<char, 32> zero_window{};
+    ULONG zero_done = 0;
+    const auto zero_status = CB_Read(
+        &fs,
+        out_ctx,
+        zero_window.data(),
+        0,
+        static_cast<ULONG>(zero_window.size()),
+        &zero_done);
+    if (!Require(zero_status == STATUS_SUCCESS && zero_done == zero_window.size(), "Writable sparse hydration should read leading sparse zeros") ||
+        !Require(std::all_of(zero_window.begin(), zero_window.end(), [](char value) { return value == 0; }), "Writable sparse hydration should zero-fill sparse leading range"))
+    {
+        CB_Close(&fs, out_ctx);
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    std::array<char, 64> tail_window{};
+    ULONG tail_done = 0;
+    const auto tail_status = CB_Read(
+        &fs,
+        out_ctx,
+        tail_window.data(),
+        sparse_offset,
+        static_cast<ULONG>(tail_window.size()),
+        &tail_done);
+    if (!Require(tail_status == STATUS_SUCCESS && tail_done == tail_window.size(), "Writable sparse hydration should read materialized tail extent"))
+    {
+        CB_Close(&fs, out_ctx);
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+    for (std::size_t index = 0; index < tail_window.size(); ++index)
+    {
+        if (!Require(
+                static_cast<std::byte>(static_cast<unsigned char>(tail_window[index])) == sparse_tail_payload[index],
+                "Writable sparse hydration should preserve tail extent bytes"))
+        {
+            CB_Close(&fs, out_ctx);
+            std::filesystem::remove_all(context.session_root, ec);
+            return false;
+        }
+    }
+
+    CB_Close(&fs, out_ctx);
+
+    const auto allocated_bytes = GetAllocatedBytesForTest(hydration_path);
+    if (!Require(allocated_bytes != std::numeric_limits<std::uint64_t>::max(), "Sparse writable hydration test should read allocated cache size"))
+    {
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+    if (!Require(allocated_bytes < static_cast<std::uint64_t>(logical_size / 2), "Writable sparse hydration should keep local cache sparse instead of dense"))
+    {
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    std::filesystem::remove_all(context.session_root, ec);
+    return true;
+#else
+    return true;
+#endif
+}
+
 bool TestParseArgsDefaultsStrictNonFixtureControls()
 {
     std::vector<std::wstring> raw_args
@@ -6353,6 +6842,14 @@ bool RunSelectedTest(const std::string& name)
     {
         return TestRenameReplaceRollsBackHydrationWhenNativeCommitFails();
     }
+    if (name == "metadata-read-open-no-hydration")
+    {
+        return TestReadOnlyOpenUsesMetadataRangeReadWithoutHydration();
+    }
+    if (name == "writable-sparse-hydration")
+    {
+        return TestWritableOpenHydratesSparseMetadataWithoutDenseCache();
+    }
 
     std::cerr << "[FAIL] Unknown selected FsHost semantics test: " << name << std::endl;
     return false;
@@ -6486,6 +6983,8 @@ int main(int argc, char** argv)
     ok &= TestConcurrentSharedParentRenameAndSiblingDeleteCloseIsConsistent();
     ok &= TestLoadHydratedPayloadWithoutHydrationReturnsNullWhenHydrateDisabled();
     ok &= TestLoadHydratedPayloadReadsExistingHydrationWhenHydrateDisabled();
+    ok &= TestReadOnlyOpenUsesMetadataRangeReadWithoutHydration();
+    ok &= TestWritableOpenHydratesSparseMetadataWithoutDenseCache();
     ok &= TestParseArgsDefaultsStrictNonFixtureControls();
     ok &= TestParseArgsParsesStrictNonFixtureControlOverrides();
     ok &= TestBuildWinFspMountPointUsesGlobalDriveForExplorer();
