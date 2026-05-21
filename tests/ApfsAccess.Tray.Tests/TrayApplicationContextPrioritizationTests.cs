@@ -226,6 +226,22 @@ public sealed class TrayApplicationContextPrioritizationTests
     }
 
     [Fact]
+    public void ResetEjectMenu_DisablesAndClearsStaleEntries()
+    {
+        using var menuItem = new ToolStripMenuItem("Eject stale");
+        menuItem.Enabled = true;
+        menuItem.Tag = @"\\.\PhysicalDrive2|Main";
+        menuItem.DropDownItems.Add(new ToolStripMenuItem("Eject stale child"));
+
+        InvokeResetEjectMenu(menuItem);
+
+        Assert.False(menuItem.Enabled);
+        Assert.Null(menuItem.Tag);
+        Assert.Equal("Eject APFS drives", menuItem.Text);
+        Assert.Empty(menuItem.DropDownItems);
+    }
+
+    [Fact]
     public void IsCurrentServiceExecutablePath_RejectsDifferentPortablePayload()
     {
         var candidates = new[]
@@ -330,6 +346,16 @@ public sealed class TrayApplicationContextPrioritizationTests
 
         var result = field!.GetValue(null);
         return Assert.IsType<TimeSpan>(result);
+    }
+
+    private static void InvokeResetEjectMenu(ToolStripMenuItem menuItem)
+    {
+        var method = typeof(TrayApplicationContext).GetMethod(
+            "ResetEjectMenu",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+
+        method!.Invoke(null, [menuItem]);
     }
 
     private static bool InvokeIsCurrentServiceExecutablePath(string? executablePath, IEnumerable<string> candidates)

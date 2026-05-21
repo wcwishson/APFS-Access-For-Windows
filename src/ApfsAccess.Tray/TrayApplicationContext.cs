@@ -660,6 +660,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         _notifyIcon.Icon = _iconByState[RuntimeState.Error];
         _notifyIcon.Text = "APFS Access: service disconnected";
+        ResetEjectMenu(_ejectItem);
     }
 
     private void UpdateUi(StatusChangedPayload payload)
@@ -692,7 +693,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         if (descriptors.Count == 0)
         {
-            _ejectItem.Text = "Eject APFS drives";
+            ResetEjectMenu(_ejectItem);
             return;
         }
 
@@ -714,6 +715,14 @@ public sealed class TrayApplicationContext : ApplicationContext
             child.Click += OnEjectClicked;
             _ejectItem.DropDownItems.Add(child);
         }
+    }
+
+    private static void ResetEjectMenu(ToolStripMenuItem ejectItem)
+    {
+        ejectItem.DropDownItems.Clear();
+        ejectItem.Tag = null;
+        ejectItem.Text = "Eject APFS drives";
+        ejectItem.Enabled = false;
     }
 
     private static string BuildNotifyIconText(StatusChangedPayload payload)

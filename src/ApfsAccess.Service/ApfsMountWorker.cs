@@ -13,7 +13,9 @@ public sealed class ApfsMountWorker : BackgroundService
     private readonly IOptionsMonitor<ServiceHostOptions> _optionsMonitor;
     private readonly HashSet<string> _mountedOnce = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _userEjectedVolumeIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _missingVolumeProbeCounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _mountOperationLock = new(1, 1);
+    private const int MissingVolumeUnmountThreshold = 2;
     private static readonly HashSet<string> ValidationEvidenceRecoveryReasons = new(StringComparer.OrdinalIgnoreCase)
     {
         "ValidationEvidenceInsufficient",
@@ -150,21 +152,6 @@ public sealed class ApfsMountWorker : BackgroundService
         var devices = await _backend.ProbeDevicesAsync(cancellationToken).ConfigureAwait(false);
         var connectedDevices = devices.Where(x => x.IsConnected).ToArray();
 
-        if (connectedDevices.Length == 0)
-        {
-            _userEjectedVolumeIds.Clear();
-            await UnmountAllAsync(cancellationToken, warnings).ConfigureAwait(false);
-            Publish(
-                RuntimeState.Idle,
-                Array.Empty<MountedVolumeState>(),
-                null,
-                warnings.ToArray(),
-                writeEnabled: false,
-                compatibilityWarnings: compatibilityWarnings.ToArray()
-            );
-            return;
-        }
-
         var discoveredVolumeById = new Dictionary<string, VolumeInfo>(StringComparer.OrdinalIgnoreCase);
         foreach (var device in connectedDevices)
         {
@@ -193,12 +180,15 @@ public sealed class ApfsMountWorker : BackgroundService
             }
         }
 
-        var disconnectedEjectedVolumes = _userEjectedVolumeIds
-            .Where(volumeId => !discoveredVolumeById.ContainsKey(volumeId))
-            .ToArray();
-        foreach (var volumeId in disconnectedEjectedVolumes)
+        if (discoveredVolumeById.Count > 0)
         {
-            _userEjectedVolumeIds.Remove(volumeId);
+            var disconnectedEjectedVolumes = _userEjectedVolumeIds
+                .Where(volumeId => !discoveredVolumeById.ContainsKey(volumeId))
+                .ToArray();
+            foreach (var volumeId in disconnectedEjectedVolumes)
+            {
+                _userEjectedVolumeIds.Remove(volumeId);
+            }
         }
 
         var mounted = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
@@ -208,6 +198,17 @@ public sealed class ApfsMountWorker : BackgroundService
             warnings,
             cancellationToken
         ).ConfigureAwait(false);
+
+        if (connectedDevices.Length == 0)
+        {
+            if (mounted.Count == 0)
+            {
+                _userEjectedVolumeIds.Clear();
+            }
+
+            PublishFromMounts(mounted, null, warnings, compatibilityWarnings);
+            return;
+        }
 
         if (!options.AutoMountEnabled)
         {
@@ -277,6 +278,7 @@ public sealed class ApfsMountWorker : BackgroundService
             {
                 mountedVolumeIds.Add(volume.VolumeId);
                 _mountedOnce.Add(volume.VolumeId);
+                _missingVolumeProbeCounts.Remove(volume.VolumeId);
                 if (!string.IsNullOrWhiteSpace(warning))
                 {
                     warnings.Add(warning);
@@ -585,6 +587,19 @@ public sealed class ApfsMountWorker : BackgroundService
         {
             if (discovered.Contains(mount.VolumeId))
             {
+                _missingVolumeProbeCounts.Remove(mount.VolumeId);
+                remaining.Add(mount);
+                continue;
+            }
+
+            _missingVolumeProbeCounts.TryGetValue(mount.VolumeId, out var misses);
+            misses++;
+            _missingVolumeProbeCounts[mount.VolumeId] = misses;
+            if (misses < MissingVolumeUnmountThreshold)
+            {
+                warnings.Add(
+                    $"APFS drive '{BuildMountDisplayName(mount)}' was not seen in this scan; waiting for another scan before unmounting."
+                );
                 remaining.Add(mount);
                 continue;
             }
@@ -606,6 +621,7 @@ public sealed class ApfsMountWorker : BackgroundService
             }
             else
             {
+                _missingVolumeProbeCounts.Remove(mount.VolumeId);
                 _logger.LogInformation(
                     "Unmounted stale mount {MountPoint} (volume {VolumeId}).",
                     mount.MountPoint,

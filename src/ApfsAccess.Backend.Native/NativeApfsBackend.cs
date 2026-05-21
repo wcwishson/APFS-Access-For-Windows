@@ -194,6 +194,8 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         var mountPoint = NormalizeMountPoint(request.DriveLetter);
         var startupTimeout = TimeSpan.FromSeconds(Math.Clamp(_options.NativeHostStartupTimeoutSeconds, 2, 60));
         var resolvedVolume = await ResolveVolumeAsync(request.VolumeId, cancellationToken).ConfigureAwait(false);
+        HostProcessState? pendingHostState = null;
+        var hostRegistered = false;
 
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -211,6 +213,20 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                     IsReadOnly: true,
                     WriteEnabled: false,
                     SafetyGateState: "MountPointBusy"
+                );
+            }
+
+            if (IsDriveVisible(mountPoint))
+            {
+                return new MountResult(
+                    Success: false,
+                    MountPoint: null,
+                    Error: $"Mount point '{mountPoint}' is still visible in Explorer. Close Explorer windows or files and try eject again before remounting.",
+                    EffectiveAccessMode: MountAccessMode.ReadOnly,
+                    DiagnosticCode: "MountPointStillVisible",
+                    IsReadOnly: true,
+                    WriteEnabled: false,
+                    SafetyGateState: "MountPointStillVisible"
                 );
             }
 
@@ -324,7 +340,8 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 }
             }
 
-            var hostState = StartHostProcess(volume, mountPoint, request.AccessMode);
+            pendingHostState = StartHostProcess(volume, mountPoint, request.AccessMode);
+            var hostState = pendingHostState;
             var started = await WaitForMountOrExitAsync(
                 hostState.Process,
                 mountPoint,
@@ -338,6 +355,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             if (!started)
             {
                 await StopHostProcessAsync(hostState, CancellationToken.None).ConfigureAwait(false);
+                pendingHostState = null;
                 return new MountResult(
                     Success: false,
                     MountPoint: null,
@@ -388,6 +406,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 var recoveryExplanation = DescribeRecoveryReason(failClosedReason);
 
                 await StopHostProcessAsync(hostState, CancellationToken.None).ConfigureAwait(false);
+                pendingHostState = null;
                 WriteWriteSessionMarker(
                     requestedVolumeId: request.VolumeId,
                     requestedAccessMode: request.AccessMode,
@@ -451,6 +470,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 hostRuntimeStatus.CommitModel != NativeWriteCommitModel.CanonicalApfsCheckpoint)
             {
                 await StopHostProcessAsync(hostState, CancellationToken.None).ConfigureAwait(false);
+                pendingHostState = null;
                 WriteWriteSessionMarker(
                     requestedVolumeId: request.VolumeId,
                     requestedAccessMode: request.AccessMode,
@@ -510,6 +530,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 hostRuntimeStatus.FixtureLegacyFallbackActive)
             {
                 await StopHostProcessAsync(hostState, CancellationToken.None).ConfigureAwait(false);
+                pendingHostState = null;
                 WriteWriteSessionMarker(
                     requestedVolumeId: request.VolumeId,
                     requestedAccessMode: request.AccessMode,
@@ -570,6 +591,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 !IsFixtureImagePath(volume.DeviceId))
             {
                 await StopHostProcessAsync(hostState, CancellationToken.None).ConfigureAwait(false);
+                pendingHostState = null;
                 WriteWriteSessionMarker(
                     requestedVolumeId: request.VolumeId,
                     requestedAccessMode: request.AccessMode,
@@ -630,6 +652,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 hostRuntimeStatus.NativeWriteReadiness != NativeWriteReadiness.CommitReady)
             {
                 await StopHostProcessAsync(hostState, CancellationToken.None).ConfigureAwait(false);
+                pendingHostState = null;
                 WriteWriteSessionMarker(
                     requestedVolumeId: request.VolumeId,
                     requestedAccessMode: request.AccessMode,
@@ -739,6 +762,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 validationPolicyFailClosedReason is not null)
             {
                 await StopHostProcessAsync(hostState, CancellationToken.None).ConfigureAwait(false);
+                pendingHostState = null;
 
                 var promotionPolicy = string.IsNullOrWhiteSpace(_options.NativeWritePromotionPolicy)
                     ? "ScaffoldOnly"
@@ -833,6 +857,8 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 replayCheckpointPendingWindow: hostRuntimeStatus.ReplayCheckpointPendingWindow);
 
             _hosts[mountPoint] = hostState;
+            hostRegistered = true;
+            pendingHostState = null;
             _mounts[mountPoint] = new MountedVolumeState(
                     volume.VolumeId,
                     mountPoint,
@@ -892,6 +918,11 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         }
         catch (Exception ex)
         {
+            if (pendingHostState is not null && !hostRegistered)
+            {
+                await StopHostProcessAsync(pendingHostState, CancellationToken.None).ConfigureAwait(false);
+            }
+
             return new MountResult(
                 Success: false,
                 MountPoint: null,
@@ -926,6 +957,26 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
 
             if (!_hosts.TryRemove(normalizedMountPoint, out var hostState))
             {
+                if (_mounts.ContainsKey(normalizedMountPoint))
+                {
+                    var removed = await WaitForDriveRemovalAsync(
+                        normalizedMountPoint,
+                        TimeSpan.FromSeconds(Math.Clamp(_options.NativeHostStopTimeoutSeconds, 1, 60)),
+                        cancellationToken).ConfigureAwait(false);
+                    if (removed)
+                    {
+                        _mounts.TryRemove(normalizedMountPoint, out _);
+                        NotifyShellDriveRemoved(normalizedMountPoint);
+                        return new UnmountResult(true, normalizedMountPoint, null);
+                    }
+
+                    return new UnmountResult(
+                        false,
+                        normalizedMountPoint,
+                        $"Mount point '{normalizedMountPoint}' remained visible after FsHost stopped. Close Explorer windows or files and try eject again."
+                    );
+                }
+
                 return new UnmountResult(
                     false,
                     normalizedMountPoint,
@@ -950,7 +1001,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                     false,
                     normalizedMountPoint,
                     stopResult.ProcessExited
-                        ? $"Mount point '{normalizedMountPoint}' remained visible after FsHost stopped."
+                        ? $"Mount point '{normalizedMountPoint}' remained visible after FsHost stopped. Close Explorer windows or files and try eject again."
                         : $"FsHost for '{normalizedMountPoint}' did not stop cleanly before timeout."
                 );
             }
@@ -2022,8 +2073,30 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
 
             if (_hosts.TryRemove(kvp.Key, out var host))
             {
-                _mounts.TryRemove(kvp.Key, out _);
+                if (!_mounts.ContainsKey(kvp.Key) || !IsDriveVisible(kvp.Key))
+                {
+                    _mounts.TryRemove(kvp.Key, out _);
+                }
+
                 CleanupHostResources(host);
+            }
+        }
+
+        CleanupDetachedMounts_NoLock();
+    }
+
+    private void CleanupDetachedMounts_NoLock()
+    {
+        foreach (var kvp in _mounts.ToArray())
+        {
+            if (_hosts.ContainsKey(kvp.Key) || IsDriveVisible(kvp.Key))
+            {
+                continue;
+            }
+
+            if (_mounts.TryRemove(kvp.Key, out _))
+            {
+                NotifyShellDriveRemoved(kvp.Key);
             }
         }
     }

@@ -54,7 +54,7 @@ public sealed class ApfsMountWorkerAutoMountTests
     }
 
     [Fact]
-    public async Task Eject_TreatsSuccessfulUnmountAsSafeWhenMountStateRefreshLags()
+    public async Task Eject_FailsAndKeepsMountVisibleWhenDriveLetterStillExists()
     {
         var backend = new ControllableBackend { KeepStaleMountAfterUnmount = true };
         var statusPublisher = new RuntimeStatusPublisher();
@@ -65,12 +65,41 @@ public sealed class ApfsMountWorkerAutoMountTests
 
         var eject = await worker.EjectAsync(ControllableBackend.VolumeId, CancellationToken.None);
 
-        Assert.True(eject.Success);
-        Assert.Contains("safely ejected", eject.Message, StringComparison.OrdinalIgnoreCase);
-        Assert.Empty(statusPublisher.Latest.MountPoints);
+        Assert.False(eject.Success);
+        Assert.Contains("still mounted", eject.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(["R:\\"], statusPublisher.Latest.MountPoints);
         Assert.Contains(
             statusPublisher.Latest.Warnings,
-            warning => warning.Contains("unplug and reinsert", StringComparison.OrdinalIgnoreCase));
+            warning => warning.Contains("remained visible", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(
+            statusPublisher.Latest.Warnings,
+            warning => warning.Contains("close Explorer windows", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task RunCycle_DebouncesOneMissingDeviceScanBeforeUnmounting()
+    {
+        var backend = new ControllableBackend();
+        var statusPublisher = new RuntimeStatusPublisher();
+        var worker = CreateWorker(backend, statusPublisher);
+
+        await InvokeRunCycleAsync(worker);
+        Assert.Single(await backend.GetMountStateAsync(CancellationToken.None));
+
+        backend.IsConnected = false;
+        backend.ClearMountsWhenDisconnected = false;
+        await InvokeRunCycleAsync(worker);
+
+        Assert.Single(await backend.GetMountStateAsync(CancellationToken.None));
+        Assert.Equal(["R:\\"], statusPublisher.Latest.MountPoints);
+        Assert.Contains(
+            statusPublisher.Latest.Warnings,
+            warning => warning.Contains("waiting for another scan", StringComparison.OrdinalIgnoreCase));
+
+        await InvokeRunCycleAsync(worker);
+
+        Assert.Empty(await backend.GetMountStateAsync(CancellationToken.None));
+        Assert.Empty(statusPublisher.Latest.MountPoints);
     }
 
     [Fact]
@@ -153,6 +182,10 @@ public sealed class ApfsMountWorkerAutoMountTests
 
         public bool KeepStaleMountAfterUnmount { get; init; }
 
+        public bool ClearMountsWhenDisconnected { get; set; } = true;
+
+        private readonly Dictionary<string, int> _unmountAttemptsByMountPoint = new(StringComparer.OrdinalIgnoreCase);
+
         private readonly HashSet<string> _unmountedMountPoints = new(StringComparer.OrdinalIgnoreCase);
 
         public int MountAttempts { get; private set; }
@@ -213,19 +246,23 @@ public sealed class ApfsMountWorkerAutoMountTests
         {
             cancellationToken.ThrowIfCancellationRequested();
             _unmountedMountPoints.Add(mountPoint);
-            if (!KeepStaleMountAfterUnmount)
+            _unmountAttemptsByMountPoint.TryGetValue(mountPoint, out var attempts);
+            _unmountAttemptsByMountPoint[mountPoint] = attempts + 1;
+            if (!KeepStaleMountAfterUnmount || attempts > 0)
             {
                 _mounts.Remove(mountPoint);
             }
 
-            return Task.FromResult(new UnmountResult(true, mountPoint, null));
+            return Task.FromResult(_mounts.ContainsKey(mountPoint)
+                ? new UnmountResult(false, mountPoint, $"Mount point '{mountPoint}' remained visible after FsHost stopped. Close Explorer windows or files and try eject again.")
+                : new UnmountResult(true, mountPoint, null));
         }
 
         public Task<IReadOnlyList<MountedVolumeState>> GetMountStateAsync(CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
             GetMountStateCalls++;
-            if (!IsConnected)
+            if (!IsConnected && ClearMountsWhenDisconnected)
             {
                 _mounts.Clear();
             }
