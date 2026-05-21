@@ -73,21 +73,61 @@ public sealed class ApfsMountWorkerAutoMountTests
             warning => warning.Contains("unplug and reinsert", StringComparison.OrdinalIgnoreCase));
     }
 
+    [Fact]
+    public async Task RunCycle_ReusesMountStateInsteadOfPollingNativeStatusRepeatedly()
+    {
+        var backend = new ControllableBackend();
+        var worker = CreateWorker(backend);
+
+        await InvokeRunCycleAsync(worker);
+
+        Assert.Equal(2, backend.GetMountStateCalls);
+    }
+
+    [Fact]
+    public async Task RunCycle_WhenAutoMountDisabled_PollsMountStateOnlyOnce()
+    {
+        var backend = new ControllableBackend();
+        var worker = CreateWorker(
+            backend,
+            new RuntimeStatusPublisher(),
+            new ServiceHostOptions
+            {
+                AutoMountEnabled = false,
+                EnableNativeWrite = false,
+                ReadWriteMode = "RwWithRoFallback",
+            });
+
+        await InvokeRunCycleAsync(worker);
+
+        Assert.Equal(1, backend.GetMountStateCalls);
+        Assert.Equal(0, backend.MountAttempts);
+    }
+
     private static ApfsMountWorker CreateWorker(IApfsBackend backend)
         => CreateWorker(backend, new RuntimeStatusPublisher());
 
     private static ApfsMountWorker CreateWorker(IApfsBackend backend, RuntimeStatusPublisher statusPublisher)
+        => CreateWorker(
+            backend,
+            statusPublisher,
+            new ServiceHostOptions
+            {
+                AutoMountEnabled = true,
+                EnableNativeWrite = false,
+                ReadWriteMode = "RwWithRoFallback",
+            });
+
+    private static ApfsMountWorker CreateWorker(
+        IApfsBackend backend,
+        RuntimeStatusPublisher statusPublisher,
+        ServiceHostOptions options)
         => new(
             NullLogger<ApfsMountWorker>.Instance,
             backend,
             new FixedMountPolicy('R'),
             statusPublisher,
-            new FixedOptionsMonitor(new ServiceHostOptions
-            {
-                AutoMountEnabled = true,
-                EnableNativeWrite = false,
-                ReadWriteMode = "RwWithRoFallback",
-            })
+            new FixedOptionsMonitor(options)
         );
 
     private static async Task InvokeRunCycleAsync(ApfsMountWorker worker)
@@ -116,6 +156,8 @@ public sealed class ApfsMountWorkerAutoMountTests
         private readonly HashSet<string> _unmountedMountPoints = new(StringComparer.OrdinalIgnoreCase);
 
         public int MountAttempts { get; private set; }
+
+        public int GetMountStateCalls { get; private set; }
 
         public Task<IReadOnlyList<DeviceInfo>> ProbeDevicesAsync(CancellationToken cancellationToken)
         {
@@ -182,6 +224,7 @@ public sealed class ApfsMountWorkerAutoMountTests
         public Task<IReadOnlyList<MountedVolumeState>> GetMountStateAsync(CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            GetMountStateCalls++;
             if (!IsConnected)
             {
                 _mounts.Clear();

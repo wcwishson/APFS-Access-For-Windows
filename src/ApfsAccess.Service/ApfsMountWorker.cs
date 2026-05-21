@@ -202,7 +202,7 @@ public sealed class ApfsMountWorker : BackgroundService
         }
 
         var mounted = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
-        await UnmountMissingVolumesAsync(
+        mounted = await UnmountMissingVolumesAsync(
             mounted,
             discoveredVolumeById.Keys,
             warnings,
@@ -211,12 +211,10 @@ public sealed class ApfsMountWorker : BackgroundService
 
         if (!options.AutoMountEnabled)
         {
-            var current = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
-            PublishFromMounts(current, null, warnings, compatibilityWarnings);
+            PublishFromMounts(mounted, null, warnings, compatibilityWarnings);
             return;
         }
 
-        mounted = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
         var mountedVolumeIds = new HashSet<string>(mounted.Select(x => x.VolumeId), StringComparer.OrdinalIgnoreCase);
         var usedLetters = new HashSet<char>(
             mounted
@@ -574,7 +572,7 @@ public sealed class ApfsMountWorker : BackgroundService
         return unmounted;
     }
 
-    private async Task UnmountMissingVolumesAsync(
+    private async Task<IReadOnlyList<MountedVolumeState>> UnmountMissingVolumesAsync(
         IReadOnlyList<MountedVolumeState> mounted,
         IEnumerable<string> discoveredVolumeIds,
         HashSet<string> warnings,
@@ -582,10 +580,12 @@ public sealed class ApfsMountWorker : BackgroundService
     )
     {
         var discovered = discoveredVolumeIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var remaining = new List<MountedVolumeState>(mounted.Count);
         foreach (var mount in mounted)
         {
             if (discovered.Contains(mount.VolumeId))
             {
+                remaining.Add(mount);
                 continue;
             }
 
@@ -602,6 +602,7 @@ public sealed class ApfsMountWorker : BackgroundService
                 {
                     warnings.Add($"Stale unmount failed for '{mount.MountPoint}': {result.Error}");
                 }
+                remaining.Add(mount);
             }
             else
             {
@@ -612,6 +613,8 @@ public sealed class ApfsMountWorker : BackgroundService
                 );
             }
         }
+
+        return remaining;
     }
 
     private static char? TryGetDriveLetter(MountedVolumeState state)

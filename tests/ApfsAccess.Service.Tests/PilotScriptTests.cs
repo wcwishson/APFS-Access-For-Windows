@@ -254,6 +254,23 @@ public sealed class PilotScriptTests
     }
 
     [Fact]
+    public void PhysicalRwValidation_RecordsBenchmarkMetricsForPerformancePhases()
+    {
+        var script = File.ReadAllText(Path.Combine(RepoRoot, "scripts", "run_physical_rw_validation.ps1"));
+
+        Assert.Contains("function Measure-Phase", script);
+        Assert.Contains("elapsedMs", script);
+        Assert.Contains("megabytesPerSecond", script);
+        Assert.Contains("filesPerSecond", script);
+        Assert.Contains("Add-BenchmarkMetric -Results $results -Name \"copy-read-hash\"", script);
+        Assert.Contains("Add-BenchmarkMetric -Results $results -Name \"direct-apfs-write\"", script);
+        Assert.Contains("Add-BenchmarkMetric -Results $results -Name \"recursive-copy\"", script);
+        Assert.Contains("Add-BenchmarkMetric -Results $results -Name \"storm-create-copy\"", script);
+        Assert.Contains("Add-BenchmarkMetric -Results $results -Name \"large-file-roundtrip\"", script);
+        Assert.Contains("$Results.benchmarks += $metric", script);
+    }
+
+    [Fact]
     public void RunPilotValidation_KeepMountedLeavesSuccessfulMountAvailableForExplorer()
     {
         var script = File.ReadAllText(Path.Combine(RepoRoot, "scripts", "run_pilot_validation.ps1"));
@@ -262,6 +279,26 @@ public sealed class PilotScriptTests
         Assert.Contains("if ($KeepMounted -and $summary.status -eq \"Complete\")", script);
         Assert.Contains("APFS Access processes were left running so the mounted APFS drive remains visible in Explorer.", script);
         Assert.Contains("Stop-ApfsProcesses", script);
+    }
+
+    [Fact]
+    public void TrayStartup_DoesNotRequestDuplicateRefreshAfterInitialStatus()
+    {
+        var traySource = File.ReadAllText(Path.Combine(RepoRoot, "src", "ApfsAccess.Tray", "TrayApplicationContext.cs"));
+
+        Assert.DoesNotContain("RequestStartupRefreshOnceAsync", traySource);
+        Assert.DoesNotContain("ClearUserEjectedVolumes: true", traySource);
+    }
+
+    [Fact]
+    public void TrayPipeHost_CoalescesStatusBroadcastBursts()
+    {
+        var serviceSource = File.ReadAllText(Path.Combine(RepoRoot, "src", "ApfsAccess.Service", "TrayPipeHostService.cs"));
+
+        Assert.Contains("_pendingBroadcast = payload", serviceSource);
+        Assert.Contains("_broadcastPumpActive", serviceSource);
+        Assert.Contains("BroadcastLatestStatusAsync", serviceSource);
+        Assert.DoesNotContain("_ = BroadcastStatusAsync(payload)", serviceSource);
     }
 
     [Fact]

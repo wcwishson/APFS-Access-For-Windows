@@ -43,7 +43,6 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private PipePeer? _statusPeer;
     private bool _exitRequested;
-    private bool _startupRefreshRequested;
     private DateTime _lastServiceStartAttemptUtc = DateTime.MinValue;
 
     public TrayApplicationContext()
@@ -159,7 +158,6 @@ public sealed class TrayApplicationContext : ApplicationContext
                     }
 
                     SetStatusPeer(peer);
-                    await RequestStartupRefreshOnceAsync(peer, cancellationToken).ConfigureAwait(false);
 
                     while (!cancellationToken.IsCancellationRequested)
                     {
@@ -328,27 +326,6 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
 
         return false;
-    }
-
-    private async Task RequestStartupRefreshOnceAsync(PipePeer peer, CancellationToken cancellationToken)
-    {
-        if (_startupRefreshRequested)
-        {
-            return;
-        }
-
-        _startupRefreshRequested = true;
-        var requestId = Guid.NewGuid().ToString("N");
-        var refreshMessage = PipeMessageCodec.Create(
-            ApfsMessageTypes.RefreshRequested,
-            new RefreshRequestedPayload(
-                Environment.UserName,
-                DateTime.UtcNow,
-                ClearUserEjectedVolumes: true),
-            requestId
-        );
-
-        await peer.SendAsync(refreshMessage, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<bool> TryPrimeStatusFromServiceAsync(PipePeer peer, CancellationToken cancellationToken)

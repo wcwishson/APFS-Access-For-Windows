@@ -64,6 +64,46 @@ function Add-Phase {
     }
 }
 
+function Measure-Phase {
+    param(
+        [scriptblock]$ScriptBlock
+    )
+
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        . $ScriptBlock
+    }
+    finally {
+        $watch.Stop()
+    }
+    return $watch.Elapsed
+}
+
+function Add-BenchmarkMetric {
+    param(
+        [hashtable]$Results,
+        [string]$Name,
+        [TimeSpan]$Elapsed,
+        [UInt64]$Bytes = 0,
+        [int]$Files = 0,
+        [object]$Detail = $null
+    )
+
+    $elapsedSeconds = [Math]::Max($Elapsed.TotalSeconds, 0.001)
+    $metric = [ordered]@{
+        name = $Name
+        elapsedMs = [Math]::Round($Elapsed.TotalMilliseconds, 3)
+        bytes = $Bytes
+        files = $Files
+        megabytesPerSecond = if ($Bytes -gt 0) { [Math]::Round(($Bytes / 1MB) / $elapsedSeconds, 3) } else { $null }
+        filesPerSecond = if ($Files -gt 0) { [Math]::Round($Files / $elapsedSeconds, 3) } else { $null }
+        detail = $Detail
+        at = (Get-Date).ToString("o")
+    }
+
+    $Results.benchmarks += $metric
+}
+
 function Normalize-MountRoot {
     param([string]$Path)
 
@@ -215,6 +255,7 @@ function New-ValidationResults {
         ntfsRoot = $NtfsRoot
         manifest = $ManifestPath
         phases = @()
+        benchmarks = @()
         files = @()
         samples = @()
         deletedPaths = @()
@@ -353,30 +394,39 @@ function Invoke-PhysicalWorkload {
             $sizes += @(5242880, 8388608, 16777216)
         }
 
-        for ($index = 0; $index -lt $sizes.Count; $index++) {
-            $size = [UInt64]$sizes[$index]
-            $source = Join-Path $ntfsRoot ("src_{0:D2}_{1}.bin" -f $index, $size)
-            New-PatternFile -Path $source -Bytes $size -Seed (17 + $index)
-            $destination = Join-Path $apfsRoot ("alpha\size_{0:D2}_{1}.bin" -f $index, $size)
-            Copy-Item -LiteralPath $source -Destination $destination -Force
-            Wait-Size -Path $destination -Size $size | Out-Null
-            $hash = Assert-HashEqual -ExpectedPath $source -ActualPath $destination -Label "NTFS to APFS $size"
-            $roundTrip = Join-Path $ntfsRoot ("roundtrip_{0:D2}_{1}.bin" -f $index, $size)
-            Copy-Item -LiteralPath $destination -Destination $roundTrip -Force
-            Wait-Size -Path $roundTrip -Size $size | Out-Null
-            Assert-HashEqual -ExpectedPath $source -ActualPath $roundTrip -Label "APFS to NTFS $size" | Out-Null
-            $results.files += [ordered]@{ path = $destination; size = $size; hash = $hash }
+        $copyReadHashMetric = [ordered]@{ bytes = [UInt64]0 }
+        $copyReadHashElapsed = Measure-Phase {
+            for ($index = 0; $index -lt $sizes.Count; $index++) {
+                $size = [UInt64]$sizes[$index]
+                $source = Join-Path $ntfsRoot ("src_{0:D2}_{1}.bin" -f $index, $size)
+                New-PatternFile -Path $source -Bytes $size -Seed (17 + $index)
+                $destination = Join-Path $apfsRoot ("alpha\size_{0:D2}_{1}.bin" -f $index, $size)
+                Copy-Item -LiteralPath $source -Destination $destination -Force
+                Wait-Size -Path $destination -Size $size | Out-Null
+                $hash = Assert-HashEqual -ExpectedPath $source -ActualPath $destination -Label "NTFS to APFS $size"
+                $roundTrip = Join-Path $ntfsRoot ("roundtrip_{0:D2}_{1}.bin" -f $index, $size)
+                Copy-Item -LiteralPath $destination -Destination $roundTrip -Force
+                Wait-Size -Path $roundTrip -Size $size | Out-Null
+                Assert-HashEqual -ExpectedPath $source -ActualPath $roundTrip -Label "APFS to NTFS $size" | Out-Null
+                $results.files += [ordered]@{ path = $destination; size = $size; hash = $hash }
+                $copyReadHashMetric.bytes += [UInt64]($size * 2)
+            }
         }
+        Add-BenchmarkMetric -Results $results -Name "copy-read-hash" -Elapsed $copyReadHashElapsed -Bytes $copyReadHashMetric.bytes -Files $sizes.Count
         Add-Phase -Results $results -Name "copy-read-hash" -State "passed" -Detail ([ordered]@{ count = $sizes.Count })
 
         $direct = Join-Path $apfsRoot "beta\direct-write.bin"
-        New-PatternFile -Path $direct -Bytes 3145728 -Seed 93
-        Wait-Size -Path $direct -Size 3145728 | Out-Null
         $directRoundTrip = Join-Path $ntfsRoot "direct-write-roundtrip.bin"
-        Copy-Item -LiteralPath $direct -Destination $directRoundTrip -Force
-        Wait-Size -Path $directRoundTrip -Size 3145728 | Out-Null
-        $directHash = Assert-HashEqual -ExpectedPath $direct -ActualPath $directRoundTrip -Label "direct APFS write"
-        $results.files += [ordered]@{ path = $direct; size = 3145728; hash = $directHash }
+        $directMetric = [ordered]@{ hash = $null }
+        $directElapsed = Measure-Phase {
+            New-PatternFile -Path $direct -Bytes 3145728 -Seed 93
+            Wait-Size -Path $direct -Size 3145728 | Out-Null
+            Copy-Item -LiteralPath $direct -Destination $directRoundTrip -Force
+            Wait-Size -Path $directRoundTrip -Size 3145728 | Out-Null
+            $directMetric.hash = Assert-HashEqual -ExpectedPath $direct -ActualPath $directRoundTrip -Label "direct APFS write"
+        }
+        $results.files += [ordered]@{ path = $direct; size = 3145728; hash = $directMetric.hash }
+        Add-BenchmarkMetric -Results $results -Name "direct-apfs-write" -Elapsed $directElapsed -Bytes ([UInt64](3145728 * 2)) -Files 1
         Add-Phase -Results $results -Name "direct-apfs-write" -State "passed"
 
         $renamed = Join-Path $apfsRoot "beta\renamed direct write.bin"
@@ -415,10 +465,13 @@ function Invoke-PhysicalWorkload {
         New-PatternFile -Path (Join-Path $treeSource "a\b\deep.bin") -Bytes 23456 -Seed 6
         "hello apfs access" | Set-Content -LiteralPath (Join-Path $treeSource "a\note.txt") -Encoding utf8
         $treeDestination = Join-Path $apfsRoot "copied-tree"
-        Copy-Item -LiteralPath $treeSource -Destination $treeDestination -Recurse -Force
-        Wait-Path -Path (Join-Path $treeDestination "a\b\deep.bin") | Out-Null
-        Assert-HashEqual -ExpectedPath (Join-Path $treeSource "root.bin") -ActualPath (Join-Path $treeDestination "root.bin") -Label "recursive root file" | Out-Null
-        Assert-HashEqual -ExpectedPath (Join-Path $treeSource "a\b\deep.bin") -ActualPath (Join-Path $treeDestination "a\b\deep.bin") -Label "recursive deep file" | Out-Null
+        $recursiveElapsed = Measure-Phase {
+            Copy-Item -LiteralPath $treeSource -Destination $treeDestination -Recurse -Force
+            Wait-Path -Path (Join-Path $treeDestination "a\b\deep.bin") | Out-Null
+            Assert-HashEqual -ExpectedPath (Join-Path $treeSource "root.bin") -ActualPath (Join-Path $treeDestination "root.bin") -Label "recursive root file" | Out-Null
+            Assert-HashEqual -ExpectedPath (Join-Path $treeSource "a\b\deep.bin") -ActualPath (Join-Path $treeDestination "a\b\deep.bin") -Label "recursive deep file" | Out-Null
+        }
+        Add-BenchmarkMetric -Results $results -Name "recursive-copy" -Elapsed $recursiveElapsed -Bytes ([UInt64](12345 + 23456)) -Files 3
         Add-Phase -Results $results -Name "recursive-copy" -State "passed"
 
         $deleteFile = Join-Path $apfsRoot "delete-me\delete-this.bin"
@@ -459,30 +512,35 @@ function Invoke-PhysicalWorkload {
             $stormRoot = Join-Path $apfsRoot "storm"
             New-Item -ItemType Directory -Force -Path $stormRoot | Out-Null
             $sampleMap = @{}
-            for ($index = 0; $index -lt $RequestedFileCount; $index++) {
-                $bucket = "bucket_{0:D2}" -f [int]($index / 25)
-                $bucketPath = Join-Path $stormRoot $bucket
-                if (-not (Test-Path -LiteralPath $bucketPath)) {
-                    New-Item -ItemType Directory -Force -Path $bucketPath | Out-Null
-                    Wait-Path -Path $bucketPath | Out-Null
-                }
-                $size = [UInt64]((($index * 7919) % 262144) + (($index % 7) * 4096))
-                if (($index % 23) -eq 0) {
-                    $size = 0
-                }
-                $source = Join-Path $ntfsRoot ("storm_src_{0:D4}.bin" -f $index)
-                New-PatternFile -Path $source -Bytes $size -Seed (41 + $index)
-                $destination = Join-Path $bucketPath ("f_{0:D4}.bin" -f $index)
-                Copy-Item -LiteralPath $source -Destination $destination -Force
-                Wait-Size -Path $destination -Size $size | Out-Null
-                if (($index % 19) -eq 0) {
-                    $hash = Assert-HashEqual -ExpectedPath $source -ActualPath $destination -Label "storm sample $index"
-                    $sampleMap[$destination] = [ordered]@{ size = $size; hash = $hash }
-                }
-                if (($index % 40) -eq 0) {
-                    Assert-HostStatusReady -Path $StatusFilePath | Out-Null
+            $stormCreateMetric = [ordered]@{ bytes = [UInt64]0 }
+            $stormCreateElapsed = Measure-Phase {
+                for ($index = 0; $index -lt $RequestedFileCount; $index++) {
+                    $bucket = "bucket_{0:D2}" -f [int]($index / 25)
+                    $bucketPath = Join-Path $stormRoot $bucket
+                    if (-not (Test-Path -LiteralPath $bucketPath)) {
+                        New-Item -ItemType Directory -Force -Path $bucketPath | Out-Null
+                        Wait-Path -Path $bucketPath | Out-Null
+                    }
+                    $size = [UInt64]((($index * 7919) % 262144) + (($index % 7) * 4096))
+                    if (($index % 23) -eq 0) {
+                        $size = 0
+                    }
+                    $source = Join-Path $ntfsRoot ("storm_src_{0:D4}.bin" -f $index)
+                    New-PatternFile -Path $source -Bytes $size -Seed (41 + $index)
+                    $destination = Join-Path $bucketPath ("f_{0:D4}.bin" -f $index)
+                    Copy-Item -LiteralPath $source -Destination $destination -Force
+                    Wait-Size -Path $destination -Size $size | Out-Null
+                    $stormCreateMetric.bytes += $size
+                    if (($index % 19) -eq 0) {
+                        $hash = Assert-HashEqual -ExpectedPath $source -ActualPath $destination -Label "storm sample $index"
+                        $sampleMap[$destination] = [ordered]@{ size = $size; hash = $hash }
+                    }
+                    if (($index % 40) -eq 0) {
+                        Assert-HostStatusReady -Path $StatusFilePath | Out-Null
+                    }
                 }
             }
+            Add-BenchmarkMetric -Results $results -Name "storm-create-copy" -Elapsed $stormCreateElapsed -Bytes $stormCreateMetric.bytes -Files $RequestedFileCount
             Add-Phase -Results $results -Name "storm-create-copy" -State "passed" -Detail ([ordered]@{ fileCount = $RequestedFileCount; sampleCount = $sampleMap.Count })
 
             for ($index = 0; $index -lt $RequestedFileCount; $index += 5) {
@@ -556,16 +614,20 @@ function Invoke-PhysicalWorkload {
 
         if ($RequestedLargeFileBytes -gt 0) {
             $largeSource = Join-Path $ntfsRoot ("large-{0}.bin" -f $RequestedLargeFileBytes)
-            New-PatternFile -Path $largeSource -Bytes $RequestedLargeFileBytes -Seed 211
             $largeDestination = Join-Path $apfsRoot ("large-{0}.bin" -f $RequestedLargeFileBytes)
-            Copy-Item -LiteralPath $largeSource -Destination $largeDestination -Force
-            Wait-Size -Path $largeDestination -Size $RequestedLargeFileBytes -Seconds 300 | Out-Null
-            $largeHash = Assert-HashEqual -ExpectedPath $largeSource -ActualPath $largeDestination -Label "large APFS file"
             $largeRoundTrip = Join-Path $ntfsRoot ("large-{0}-roundtrip.bin" -f $RequestedLargeFileBytes)
-            Copy-Item -LiteralPath $largeDestination -Destination $largeRoundTrip -Force
-            Assert-HashEqual -ExpectedPath $largeSource -ActualPath $largeRoundTrip -Label "large APFS round-trip" | Out-Null
-            $results.files += [ordered]@{ path = $largeDestination; size = $RequestedLargeFileBytes; hash = $largeHash }
-            Add-Phase -Results $results -Name "large-file-roundtrip" -State "passed" -Detail ([ordered]@{ size = $RequestedLargeFileBytes; hash = $largeHash })
+            $largeMetric = [ordered]@{ hash = $null }
+            $largeElapsed = Measure-Phase {
+                New-PatternFile -Path $largeSource -Bytes $RequestedLargeFileBytes -Seed 211
+                Copy-Item -LiteralPath $largeSource -Destination $largeDestination -Force
+                Wait-Size -Path $largeDestination -Size $RequestedLargeFileBytes -Seconds 300 | Out-Null
+                $largeMetric.hash = Assert-HashEqual -ExpectedPath $largeSource -ActualPath $largeDestination -Label "large APFS file"
+                Copy-Item -LiteralPath $largeDestination -Destination $largeRoundTrip -Force
+                Assert-HashEqual -ExpectedPath $largeSource -ActualPath $largeRoundTrip -Label "large APFS round-trip" | Out-Null
+            }
+            $results.files += [ordered]@{ path = $largeDestination; size = $RequestedLargeFileBytes; hash = $largeMetric.hash }
+            Add-BenchmarkMetric -Results $results -Name "large-file-roundtrip" -Elapsed $largeElapsed -Bytes ([UInt64]($RequestedLargeFileBytes * 2)) -Files 1
+            Add-Phase -Results $results -Name "large-file-roundtrip" -State "passed" -Detail ([ordered]@{ size = $RequestedLargeFileBytes; hash = $largeMetric.hash })
         }
 
         $postStatus = Assert-HostStatusReady -Path $StatusFilePath

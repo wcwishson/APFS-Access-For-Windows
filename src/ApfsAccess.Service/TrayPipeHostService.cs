@@ -12,6 +12,9 @@ public sealed class TrayPipeHostService : BackgroundService
     private readonly IHostApplicationLifetime _applicationLifetime;
     private readonly NamedPipeMessageServer _server;
     private readonly ConcurrentDictionary<Guid, PipePeer> _clients = new();
+    private readonly object _broadcastSync = new();
+    private StatusChangedPayload? _pendingBroadcast;
+    private bool _broadcastPumpActive;
 
     public TrayPipeHostService(
         ILogger<TrayPipeHostService> logger,
@@ -154,27 +157,53 @@ public sealed class TrayPipeHostService : BackgroundService
 
     private void OnStatusChanged(StatusChangedPayload payload)
     {
-        _ = BroadcastStatusAsync(payload);
-    }
-
-    private async Task BroadcastStatusAsync(StatusChangedPayload payload)
-    {
-        if (_clients.IsEmpty)
+        lock (_broadcastSync)
         {
-            return;
+            _pendingBroadcast = payload;
+            if (_broadcastPumpActive)
+            {
+                return;
+            }
+
+            _broadcastPumpActive = true;
         }
 
-        var message = PipeMessageCodec.Create(ApfsMessageTypes.StatusChanged, payload);
-        foreach (var kvp in _clients.ToArray())
+        _ = BroadcastLatestStatusAsync();
+    }
+
+    private async Task BroadcastLatestStatusAsync()
+    {
+        while (true)
         {
-            try
+            StatusChangedPayload? payload;
+            lock (_broadcastSync)
             {
-                await kvp.Value.SendAsync(message, CancellationToken.None).ConfigureAwait(false);
+                payload = _pendingBroadcast;
+                _pendingBroadcast = null;
+                if (payload is null)
+                {
+                    _broadcastPumpActive = false;
+                    return;
+                }
             }
-            catch (Exception ex)
+
+            if (_clients.IsEmpty)
             {
-                _logger.LogDebug(ex, "Failed to push status to client {ClientId}", kvp.Key);
-                _clients.TryRemove(kvp.Key, out _);
+                continue;
+            }
+
+            var message = PipeMessageCodec.Create(ApfsMessageTypes.StatusChanged, payload);
+            foreach (var kvp in _clients.ToArray())
+            {
+                try
+                {
+                    await kvp.Value.SendAsync(message, CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Failed to push status to client {ClientId}", kvp.Key);
+                    _clients.TryRemove(kvp.Key, out _);
+                }
             }
         }
     }

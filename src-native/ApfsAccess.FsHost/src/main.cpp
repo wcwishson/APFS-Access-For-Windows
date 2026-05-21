@@ -202,6 +202,7 @@ struct MountContext
     std::wstring runtime_recovery_reason;
     std::wstring runtime_last_recovery_action;
     std::string last_status_write_contents;
+    std::mutex status_file_mutex;
     std::optional<bool> last_recovery_marker_dirty;
     std::optional<std::uint64_t> last_recovery_marker_commit_xid;
     std::uint32_t reported_allocation_unit_bytes = 4096;
@@ -1798,6 +1799,8 @@ bool WriteHostStatusFile(
         }
         buffer << "}";
         const auto contents = buffer.str();
+
+        std::lock_guard<std::mutex> status_file_lock(context.status_file_mutex);
         if (context.last_status_write_contents == contents)
         {
             return true;
@@ -2031,17 +2034,27 @@ void FillDirectoryInfo(FSP_FSCTL_DIR_INFO* dir_info, const Node& node, const std
     dir_info->FileNameBuf[name.size()] = L'\0';
 }
 
-std::vector<unsigned char> BuildDirectoryInfoBuffer(const Node& node, const std::wstring& name, bool read_only)
+bool AddDirectoryEntry(
+    const WinFspApi& api,
+    const Node& node,
+    const std::wstring& name,
+    bool read_only,
+    PVOID buffer,
+    ULONG length,
+    PULONG done,
+    std::vector<unsigned char>& scratch
+)
 {
     const auto size = DirectoryInfoSizeForName(name);
     if (!size)
     {
-        return {};
+        return true;
     }
 
-    std::vector<unsigned char> buffer(static_cast<size_t>(*size) + sizeof(WCHAR), 0);
-    FillDirectoryInfo(reinterpret_cast<FSP_FSCTL_DIR_INFO*>(buffer.data()), node, name, read_only);
-    return buffer;
+    scratch.assign(static_cast<size_t>(*size) + sizeof(WCHAR), 0);
+    auto* dir_info = reinterpret_cast<FSP_FSCTL_DIR_INFO*>(scratch.data());
+    FillDirectoryInfo(dir_info, node, name, read_only);
+    return api.AddDir(dir_info, buffer, length, done);
 }
 
 std::shared_ptr<Node> TryGetNodeLocked(MountContext* c, const std::wstring& path)
@@ -5233,15 +5246,18 @@ NTSTATUS CB_ReadDirectory(FSP_FILE_SYSTEM* fs, PVOID dir_ctx, PWSTR, PWSTR marke
         }
     }
 
+    std::vector<unsigned char> dir_info_scratch;
     for (auto it = start_it; it != entries.end(); ++it)
     {
-        auto tmp = BuildDirectoryInfoBuffer(*it->node, it->name, read_only);
-        if (tmp.empty())
-        {
-            continue;
-        }
-        auto* d = (FSP_FSCTL_DIR_INFO*)tmp.data();
-        if (!c->api.AddDir(d, buffer, length, done))
+        if (!AddDirectoryEntry(
+            c->api,
+            *it->node,
+            it->name,
+            read_only,
+            buffer,
+            length,
+            done,
+            dir_info_scratch))
         {
             return STATUS_SUCCESS;
         }

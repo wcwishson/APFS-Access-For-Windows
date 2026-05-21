@@ -383,14 +383,36 @@ bool TestRenameRelativeTargetStaysInSourceParent()
 bool TestDirectoryInfoBufferNullTerminatesNameAndReportsUnterminatedSize()
 {
     auto node = MakeNode(L"\\alpha", true, false);
-    auto buffer = BuildDirectoryInfoBuffer(*node, L"alpha", true);
-    if (!Require(!buffer.empty(), "Directory info buffer should be created for a normal file name"))
+    std::vector<unsigned char> buffer;
+    auto add_dir = [](FSP_FSCTL_DIR_INFO* dir_info, PVOID, ULONG, PULONG done) -> BOOLEAN
+    {
+        if (!dir_info)
+        {
+            return TRUE;
+        }
+
+        if (done)
+        {
+            *done += dir_info->Size;
+        }
+        return TRUE;
+    };
+    WinFspApi api{};
+    api.AddDir = add_dir;
+    ULONG done = 0;
+    if (!Require(
+            AddDirectoryEntry(api, *node, L"alpha", true, nullptr, 0, &done, buffer),
+            "Directory info entry should be accepted for a normal file name"))
+    {
+        return false;
+    }
+    if (!Require(!buffer.empty(), "Directory info scratch buffer should be populated for a normal file name"))
     {
         return false;
     }
 
-    auto* dir_info = reinterpret_cast<FSP_FSCTL_DIR_INFO*>(buffer.data());
     const auto expected_size = FIELD_OFFSET(FSP_FSCTL_DIR_INFO, FileNameBuf) + 5 * sizeof(WCHAR);
+    auto* dir_info = reinterpret_cast<FSP_FSCTL_DIR_INFO*>(buffer.data());
     if (!Require(dir_info->Size == expected_size, "Directory info Size should exclude the defensive trailing NUL"))
     {
         return false;
