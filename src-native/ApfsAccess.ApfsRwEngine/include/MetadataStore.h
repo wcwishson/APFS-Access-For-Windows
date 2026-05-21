@@ -119,6 +119,12 @@ public:
         std::uint64_t bytes = 0;
     };
 
+    struct FileMutationExtents
+    {
+        std::vector<FileExtent> file_extents;
+        std::vector<SpacemanAllocation> allocations;
+    };
+
     struct VolumeContext
     {
         std::wstring device_path;
@@ -290,6 +296,8 @@ private:
     [[nodiscard]] bool StageObjectMapUpdate(std::uint64_t object_id, std::uint64_t physical_address, std::uint64_t logical_size);
     [[nodiscard]] bool StageSpacemanAllocation(std::uint64_t physical_address, std::uint64_t bytes);
     [[nodiscard]] bool StageSpacemanDeallocation(std::uint64_t physical_address, std::uint64_t bytes);
+    [[nodiscard]] std::optional<FileMutationExtents> CommittedFileExtentsForMutation(const InodeRecord& inode) const;
+    [[nodiscard]] bool StageCommittedFileExtentDeallocations(const FileMutationExtents& extents);
     [[nodiscard]] bool HasPendingSpacemanAllocation(std::uint64_t physical_address, std::uint64_t bytes) const;
     [[nodiscard]] bool ReleasePendingSpacemanAllocation(std::uint64_t physical_address, std::uint64_t bytes);
     void CoalescePendingWriteMutation(std::uint64_t object_id, const MutationRequest& request);

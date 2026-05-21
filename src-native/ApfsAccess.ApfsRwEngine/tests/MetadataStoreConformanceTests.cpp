@@ -275,6 +275,69 @@ void ConfigurePayloadProvider(
         });
 }
 
+bool CreateAndCommitFile(
+    apfsaccess::rw::MetadataStore& store,
+    std::unordered_map<std::wstring, std::vector<std::byte>>& staged_payloads,
+    const std::wstring& path,
+    std::size_t payload_bytes,
+    unsigned char payload_seed,
+    const std::string& label)
+{
+    apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+    create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+    create_file.path = path;
+    if (!ExpectMutationStatus(
+            store,
+            create_file,
+            apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            label + ": create file should apply"))
+    {
+        return false;
+    }
+
+    apfsaccess::rw::MetadataStore::MutationRequest write_file{};
+    write_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+    write_file.path = path;
+    write_file.length = static_cast<std::uint64_t>(payload_bytes);
+    if (!ExpectMutationStatus(
+            store,
+            write_file,
+            apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            label + ": write file should apply"))
+    {
+        return false;
+    }
+
+    staged_payloads[path] = BuildPatternPayload(payload_bytes, payload_seed);
+    return ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        label + ": commit should succeed");
+}
+
+bool InstallFragmentedReadExtents(
+    apfsaccess::rw::MetadataStore& store,
+    const std::wstring& path,
+    std::uint64_t first_extent_address,
+    const std::string& label)
+{
+    auto inode = store.LookupCommittedInodeByPath(path);
+    if (!Require(inode.has_value(), label + ": committed inode should exist"))
+    {
+        return false;
+    }
+
+    return Require(
+        store.SetCommittedReadExtents(
+            inode->object_id,
+            {
+                { 0, first_extent_address, 4096 },
+                { 4096, first_extent_address + (2ull * kBlockSize), 4096 },
+                { 8192, first_extent_address + (4ull * kBlockSize), 4096 },
+            }),
+        label + ": committed read extents should be installed");
+}
+
 bool TestRenameReplaceConformance(const std::filesystem::path& run_root)
 {
     const auto image_path = run_root / "rename_replace.apfs.img";
@@ -1484,6 +1547,178 @@ bool TestCommittedZeroReadExtentConformance(const std::filesystem::path& run_roo
     return ok;
 }
 
+bool TestFragmentedReadExtentMutationAccountingConformance(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "fragmented_extent_accounting.apfs.img";
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, "FragmentedExtentAccounting: unable to create synthetic container");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        L"FragmentedExtentAccounting",
+        true,
+    };
+    apfsaccess::rw::MetadataStore store(context);
+    bool ok = true;
+    ok &= Require(store.LoadContainerSuperblocks(), "FragmentedExtentAccounting: LoadContainerSuperblocks should succeed");
+    ok &= Require(store.LoadObjectMap(), "FragmentedExtentAccounting: LoadObjectMap should succeed");
+    ok &= Require(store.LoadSpacemanState(), "FragmentedExtentAccounting: LoadSpacemanState should succeed");
+    ok &= Require(store.PrepareNativeWritePath(), "FragmentedExtentAccounting: PrepareNativeWritePath should succeed");
+
+    std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+    ConfigurePayloadProvider(store, staged_payloads);
+
+    ok &= CreateAndCommitFile(
+        store,
+        staged_payloads,
+        L"\\fragmented-delete.bin",
+        12288,
+        0x51,
+        "FragmentedExtentAccounting/delete");
+    ok &= InstallFragmentedReadExtents(
+        store,
+        L"\\fragmented-delete.bin",
+        512ull * kBlockSize,
+        "FragmentedExtentAccounting/delete");
+
+    apfsaccess::rw::MetadataStore::MutationRequest delete_file{};
+    delete_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::Delete;
+    delete_file.path = L"\\fragmented-delete.bin";
+    ok &= ExpectMutationStatus(
+        store,
+        delete_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "FragmentedExtentAccounting: delete should apply");
+    ok &= Require(
+        store.PendingDeallocationCount() >= 3,
+        "FragmentedExtentAccounting: delete should stage every committed read extent for deallocation");
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "FragmentedExtentAccounting: delete commit should succeed");
+    ok &= Require(
+        !store.LookupCommittedInodeByPath(L"\\fragmented-delete.bin").has_value(),
+        "FragmentedExtentAccounting: deleted file should leave committed inode view");
+
+    ok &= CreateAndCommitFile(
+        store,
+        staged_payloads,
+        L"\\fragmented-overwrite.bin",
+        12288,
+        0x61,
+        "FragmentedExtentAccounting/overwrite");
+    ok &= InstallFragmentedReadExtents(
+        store,
+        L"\\fragmented-overwrite.bin",
+        532ull * kBlockSize,
+        "FragmentedExtentAccounting/overwrite");
+    const auto dealloc_before_overwrite = store.PendingDeallocationCount();
+    apfsaccess::rw::MetadataStore::MutationRequest overwrite_file{};
+    overwrite_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+    overwrite_file.path = L"\\fragmented-overwrite.bin";
+    overwrite_file.length = 12288;
+    ok &= ExpectMutationStatus(
+        store,
+        overwrite_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "FragmentedExtentAccounting: overwrite should apply");
+    ok &= Require(
+        store.PendingDeallocationCount() >= dealloc_before_overwrite + 3,
+        "FragmentedExtentAccounting: overwrite should stage every old committed read extent for deallocation");
+    staged_payloads[L"\\fragmented-overwrite.bin"] = BuildPatternPayload(12288, 0x71);
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "FragmentedExtentAccounting: overwrite commit should succeed");
+    ok &= Require(
+        store.LookupCommittedInodeByPath(L"\\fragmented-overwrite.bin").has_value(),
+        "FragmentedExtentAccounting: overwritten file should stay visible");
+
+    ok &= CreateAndCommitFile(
+        store,
+        staged_payloads,
+        L"\\fragmented-truncate.bin",
+        12288,
+        0x81,
+        "FragmentedExtentAccounting/truncate");
+    ok &= InstallFragmentedReadExtents(
+        store,
+        L"\\fragmented-truncate.bin",
+        552ull * kBlockSize,
+        "FragmentedExtentAccounting/truncate");
+    const auto dealloc_before_truncate = store.PendingDeallocationCount();
+    apfsaccess::rw::MetadataStore::MutationRequest truncate_file{};
+    truncate_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize;
+    truncate_file.path = L"\\fragmented-truncate.bin";
+    truncate_file.length = 0;
+    ok &= ExpectMutationStatus(
+        store,
+        truncate_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "FragmentedExtentAccounting: truncate should apply");
+    ok &= Require(
+        store.PendingDeallocationCount() >= dealloc_before_truncate + 3,
+        "FragmentedExtentAccounting: truncate should stage every old committed read extent for deallocation");
+    staged_payloads.erase(L"\\fragmented-truncate.bin");
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "FragmentedExtentAccounting: truncate commit should succeed");
+    const auto truncated = store.LookupCommittedInodeByPath(L"\\fragmented-truncate.bin");
+    ok &= Require(
+        truncated.has_value() &&
+            truncated->logical_size == 0 &&
+            truncated->data_physical_address == 0,
+        "FragmentedExtentAccounting: truncated file should be zero-sized and extentless");
+
+    ok &= CreateAndCommitFile(
+        store,
+        staged_payloads,
+        L"\\fragmented-destination.bin",
+        12288,
+        0x91,
+        "FragmentedExtentAccounting/rename-destination");
+    ok &= InstallFragmentedReadExtents(
+        store,
+        L"\\fragmented-destination.bin",
+        572ull * kBlockSize,
+        "FragmentedExtentAccounting/rename-destination");
+    ok &= CreateAndCommitFile(
+        store,
+        staged_payloads,
+        L"\\fragmented-source.bin",
+        4096,
+        0xA1,
+        "FragmentedExtentAccounting/rename-source");
+    const auto dealloc_before_rename_replace = store.PendingDeallocationCount();
+    apfsaccess::rw::MetadataStore::MutationRequest rename_replace{};
+    rename_replace.operation = apfsaccess::rw::MetadataStore::MutationOperation::Rename;
+    rename_replace.path = L"\\fragmented-source.bin";
+    rename_replace.secondary_path = L"\\fragmented-destination.bin";
+    rename_replace.replace_if_exists = true;
+    ok &= ExpectMutationStatus(
+        store,
+        rename_replace,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "FragmentedExtentAccounting: rename replace should apply");
+    ok &= Require(
+        store.PendingDeallocationCount() >= dealloc_before_rename_replace + 3,
+        "FragmentedExtentAccounting: rename replace should stage every replaced read extent for deallocation");
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "FragmentedExtentAccounting: rename replace commit should succeed");
+    ok &= Require(
+        !store.LookupCommittedInodeByPath(L"\\fragmented-source.bin").has_value() &&
+            store.LookupCommittedInodeByPath(L"\\fragmented-destination.bin").has_value(),
+        "FragmentedExtentAccounting: rename replace namespace should persist");
+
+    return ok;
+}
+
 bool TestObjectMapDeltaCanonicalizationConformance(const std::filesystem::path& run_root)
 {
     const auto image_path = run_root / "object_map_delta_canonical.apfs.img";
@@ -1854,6 +2089,7 @@ int main()
     ok &= TestBtreeCanonicalizationConformance(run_root);
     ok &= TestCommittedReadExtentsConformance(run_root);
     ok &= TestCommittedZeroReadExtentConformance(run_root);
+    ok &= TestFragmentedReadExtentMutationAccountingConformance(run_root);
     ok &= TestObjectMapDeltaCanonicalizationConformance(run_root);
     ok &= TestEphemeralCreateDeleteConformance(run_root);
     ok &= TestObjectIdMonotonicAllocationConformance(run_root);

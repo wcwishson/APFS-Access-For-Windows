@@ -4542,6 +4542,24 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
             target_xid,
             tombstone));
     };
+    const auto stage_committed_file_extents_for_removal = [&](const InodeRecord& inode) -> bool
+    {
+        auto extents = CommittedFileExtentsForMutation(inode);
+        if (!extents.has_value() || !StageCommittedFileExtentDeallocations(extents.value()))
+        {
+            return false;
+        }
+        for (const auto& extent : extents->file_extents)
+        {
+            stage_extent_record(
+                inode.object_id,
+                extent.logical_offset,
+                extent.physical_address,
+                extent.bytes,
+                true);
+        }
+        return true;
+    };
 
     switch (request.operation)
     {
@@ -4588,13 +4606,12 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
             working_path_index_.erase(CanonicalPathKey(normalized_path));
             working_inodes_.erase(existing->object_id);
             stage_directory_record(existing->parent_object_id, existing->name, existing->object_id, true);
-            if (!existing->is_directory && existing->data_physical_address != 0 && existing->logical_size > 0)
+            if (!existing->is_directory && existing->logical_size > 0)
             {
-                if (!StageSpacemanDeallocation(existing->data_physical_address, existing->logical_size))
+                if (!stage_committed_file_extents_for_removal(*existing))
                 {
                     return MutationStatus::AllocationFailed;
                 }
-                stage_extent_record(existing->object_id, 0, existing->data_physical_address, existing->logical_size, true);
             }
             stage_inode_record(*existing, true);
             if (!StageObjectMapUpdate(existing->object_id, 0, 0))
@@ -4651,6 +4668,7 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         const auto previous_extent_is_pending =
             previous_physical != 0 &&
             previous_size > 0 &&
+            !committed_read_extents_.contains(inode_ref.object_id) &&
             HasPendingSpacemanAllocation(previous_physical, previous_size);
         if (next_physical == 0 || target_logical_size > previous_size || !previous_extent_is_pending)
         {
@@ -4676,13 +4694,9 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         if (previous_physical != 0 && previous_physical != inode_ref.data_physical_address && previous_size > 0)
         {
             const auto released_pending_extent = ReleasePendingSpacemanAllocation(previous_physical, previous_size);
-            if (!released_pending_extent && !StageSpacemanDeallocation(previous_physical, previous_size))
+            if (!released_pending_extent && !stage_committed_file_extents_for_removal(*inode))
             {
                 return MutationStatus::AllocationFailed;
-            }
-            if (!released_pending_extent)
-            {
-                stage_extent_record(inode_ref.object_id, 0, previous_physical, previous_size, true);
             }
         }
         stage_extent_record(inode_ref.object_id, 0, inode_ref.data_physical_address, inode_ref.logical_size, false);
@@ -4708,11 +4722,10 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         {
             if (previous_physical != 0 && previous_size > 0)
             {
-                if (!StageSpacemanDeallocation(previous_physical, previous_size))
+                if (!stage_committed_file_extents_for_removal(*inode))
                 {
                     return MutationStatus::AllocationFailed;
                 }
-                stage_extent_record(inode_ref.object_id, 0, previous_physical, previous_size, true);
             }
             inode_ref.data_physical_address = 0;
         }
@@ -4732,14 +4745,12 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
                 previous_size > 0 &&
                 previous_physical != *extent)
             {
-                const auto released_pending_extent = ReleasePendingSpacemanAllocation(previous_physical, previous_size);
-                if (!released_pending_extent && !StageSpacemanDeallocation(previous_physical, previous_size))
+                const auto released_pending_extent =
+                    !committed_read_extents_.contains(inode_ref.object_id) &&
+                    ReleasePendingSpacemanAllocation(previous_physical, previous_size);
+                if (!released_pending_extent && !stage_committed_file_extents_for_removal(*inode))
                 {
                     return MutationStatus::AllocationFailed;
-                }
-                if (!released_pending_extent)
-                {
-                    stage_extent_record(inode_ref.object_id, 0, previous_physical, previous_size, true);
                 }
             }
 
@@ -4820,19 +4831,12 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
                 working_inodes_.erase(destination_inode->object_id);
                 stage_directory_record(destination_inode->parent_object_id, destination_inode->name, destination_inode->object_id, true);
                 if (!destination_inode->is_directory &&
-                    destination_inode->data_physical_address != 0 &&
                     destination_inode->logical_size > 0)
                 {
-                    if (!StageSpacemanDeallocation(destination_inode->data_physical_address, destination_inode->logical_size))
+                    if (!stage_committed_file_extents_for_removal(*destination_inode))
                     {
                         return MutationStatus::AllocationFailed;
                     }
-                    stage_extent_record(
-                        destination_inode->object_id,
-                        0,
-                        destination_inode->data_physical_address,
-                        destination_inode->logical_size,
-                        true);
                 }
                 stage_inode_record(*destination_inode, true);
                 if (!StageObjectMapUpdate(destination_inode->object_id, 0, 0))
@@ -4954,13 +4958,12 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         working_path_index_.erase(CanonicalPathKey(normalized_path));
         working_inodes_.erase(inode->object_id);
         stage_directory_record(inode->parent_object_id, inode->name, inode->object_id, true);
-        if (!inode->is_directory && inode->data_physical_address != 0 && inode->logical_size > 0)
+        if (!inode->is_directory && inode->logical_size > 0)
         {
-            if (!StageSpacemanDeallocation(inode->data_physical_address, inode->logical_size))
+            if (!stage_committed_file_extents_for_removal(*inode))
             {
                 return MutationStatus::AllocationFailed;
             }
-            stage_extent_record(inode->object_id, 0, inode->data_physical_address, inode->logical_size, true);
         }
         stage_inode_record(*inode, true);
 
@@ -9331,6 +9334,163 @@ bool MetadataStore::StageSpacemanDeallocation(std::uint64_t physical_address, st
         physical_address,
         aligned_bytes
     });
+    return true;
+}
+
+std::optional<MetadataStore::FileMutationExtents> MetadataStore::CommittedFileExtentsForMutation(const InodeRecord& inode) const
+{
+    FileMutationExtents result{};
+    if (inode.is_directory || inode.logical_size == 0)
+    {
+        return result;
+    }
+
+    if (auto extents_it = committed_read_extents_.find(inode.object_id);
+        extents_it != committed_read_extents_.end())
+    {
+        result.file_extents.reserve(extents_it->second.size());
+        result.allocations.reserve(extents_it->second.size() + (inode.data_physical_address == 0 ? 0 : 1));
+        for (const auto& extent : extents_it->second)
+        {
+            if (extent.bytes == 0 ||
+                extent.logical_offset > (std::numeric_limits<std::uint64_t>::max() - extent.bytes) ||
+                extent.logical_offset >= inode.logical_size)
+            {
+                return std::nullopt;
+            }
+
+            const auto logical_tail = inode.logical_size - extent.logical_offset;
+            const auto logical_bytes = std::min(extent.bytes, logical_tail);
+            if (logical_bytes == 0)
+            {
+                return std::nullopt;
+            }
+
+            result.file_extents.push_back(
+                {
+                    extent.logical_offset,
+                    extent.physical_address,
+                    logical_bytes,
+                });
+
+            if (extent.physical_address == 0)
+            {
+                continue;
+            }
+
+            const auto aligned_bytes = AlignExtentBytes(logical_bytes);
+            if (aligned_bytes == 0 ||
+                extent.physical_address > (std::numeric_limits<std::uint64_t>::max() - aligned_bytes))
+            {
+                return std::nullopt;
+            }
+            result.allocations.push_back({ extent.physical_address, aligned_bytes });
+        }
+
+        if (!result.file_extents.empty())
+        {
+            std::sort(
+                result.file_extents.begin(),
+                result.file_extents.end(),
+                [](const FileExtent& lhs, const FileExtent& rhs)
+                {
+                    if (lhs.logical_offset == rhs.logical_offset)
+                    {
+                        return lhs.physical_address < rhs.physical_address;
+                    }
+                    return lhs.logical_offset < rhs.logical_offset;
+                });
+        }
+
+        std::uint64_t previous_end = 0;
+        bool has_previous = false;
+        for (const auto& extent : result.file_extents)
+        {
+            const auto extent_end = extent.logical_offset + extent.bytes;
+            if (has_previous && extent.logical_offset < previous_end)
+            {
+                return std::nullopt;
+            }
+            previous_end = extent_end;
+            has_previous = true;
+        }
+
+        if (result.file_extents.empty() && inode.data_physical_address == 0)
+        {
+            return result;
+        }
+
+        if (inode.data_physical_address != 0)
+        {
+            const auto aligned_bytes = AlignExtentBytes(inode.logical_size);
+            if (aligned_bytes == 0 ||
+                inode.data_physical_address > (std::numeric_limits<std::uint64_t>::max() - aligned_bytes))
+            {
+                return std::nullopt;
+            }
+
+            const auto covered_by_projection = std::any_of(
+                result.allocations.begin(),
+                result.allocations.end(),
+                [&](const SpacemanAllocation& allocation)
+                {
+                    return PhysicalRangeContains(
+                        allocation.physical_address,
+                        allocation.bytes,
+                        inode.data_physical_address,
+                        aligned_bytes);
+                });
+            if (!covered_by_projection)
+            {
+                result.file_extents.push_back(
+                    {
+                        0,
+                        inode.data_physical_address,
+                        inode.logical_size,
+                    });
+                result.allocations.push_back({ inode.data_physical_address, aligned_bytes });
+            }
+        }
+
+        if (!NormalizeSpacemanExtents(result.allocations))
+        {
+            return std::nullopt;
+        }
+        return result;
+    }
+
+    if (inode.data_physical_address == 0)
+    {
+        return result;
+    }
+
+    const auto aligned_bytes = AlignExtentBytes(inode.logical_size);
+    if (aligned_bytes == 0 ||
+        inode.data_physical_address > (std::numeric_limits<std::uint64_t>::max() - aligned_bytes))
+    {
+        return std::nullopt;
+    }
+
+    result.file_extents.push_back(
+        {
+            0,
+            inode.data_physical_address,
+            inode.logical_size,
+        });
+    result.allocations.push_back({ inode.data_physical_address, aligned_bytes });
+    return result;
+}
+
+bool MetadataStore::StageCommittedFileExtentDeallocations(const FileMutationExtents& extents)
+{
+    for (const auto& allocation : extents.allocations)
+    {
+        if (!StageSpacemanDeallocation(allocation.physical_address, allocation.bytes))
+        {
+            return false;
+        }
+    }
+
     return true;
 }
 
