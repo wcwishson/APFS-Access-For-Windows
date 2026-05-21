@@ -4961,6 +4961,115 @@ bool IsReplayCommitBlobRejectedReason(const std::wstring& reason)
            reason == L"ReplayCanonicalCandidateMissing" ||
            reason == L"ReplayCheckpointNotPendingWindow";
 }
+
+bool RunTornDeviceWriteScenario(
+    const std::filesystem::path& run_root,
+    const std::wstring& fault_mode,
+    std::string_view fault_stage,
+    std::string_view label)
+{
+    const auto label_text = std::string(label);
+    const auto image_path = run_root / ("container_torn_write_" + label_text + ".apfs.img");
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, label_text + ": unable to create synthetic APFS container image");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        std::wstring(L"TornWrite") + std::wstring(fault_mode),
+    };
+    bool ok = true;
+    {
+        std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+        apfsaccess::rw::MetadataStore store(context);
+        ok &= Require(store.LoadContainerSuperblocks(), label_text + ": LoadContainerSuperblocks should succeed");
+        ok &= Require(store.LoadObjectMap(), label_text + ": LoadObjectMap should succeed");
+        ok &= Require(store.LoadSpacemanState(), label_text + ": LoadSpacemanState should succeed");
+        ok &= Require(store.PrepareNativeWritePath(), label_text + ": PrepareNativeWritePath should succeed");
+        ConfigurePayloadProvider(store, staged_payloads);
+
+        apfsaccess::rw::MetadataStore::MutationRequest create_baseline{};
+        create_baseline.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+        create_baseline.path = L"\\baseline.bin";
+        ok &= Require(
+            store.ApplyMutation(create_baseline) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            label_text + ": baseline create should apply");
+
+        apfsaccess::rw::MetadataStore::MutationRequest write_baseline{};
+        write_baseline.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+        write_baseline.path = L"\\baseline.bin";
+        write_baseline.length = 4096;
+        ok &= Require(
+            store.ApplyMutation(write_baseline) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            label_text + ": baseline write should apply");
+        staged_payloads[L"\\baseline.bin"] = BuildRepeatedPayload(4096, 0x3A);
+        ok &= Require(
+            store.CommitPendingMutations() == apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+            label_text + ": baseline commit should succeed");
+
+        apfsaccess::rw::MetadataStore::MutationRequest create_faulted{};
+        create_faulted.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+        create_faulted.path = L"\\faulted.bin";
+        ok &= Require(
+            store.ApplyMutation(create_faulted) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            label_text + ": faulted create should apply");
+
+        apfsaccess::rw::MetadataStore::MutationRequest write_faulted{};
+        write_faulted.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+        write_faulted.path = L"\\faulted.bin";
+        write_faulted.length = 8192;
+        ok &= Require(
+            store.ApplyMutation(write_faulted) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            label_text + ": faulted write should apply");
+        staged_payloads[L"\\faulted.bin"] = BuildRepeatedPayload(8192, 0xC7);
+
+        bool armed_fault = false;
+        std::optional<ScopedEnvironmentVariable> scoped_fault;
+        store.SetCommitStageHook([&](std::string_view stage)
+        {
+            if (!armed_fault && stage == fault_stage)
+            {
+                scoped_fault.emplace(L"APFSACCESS_RW_FAULT_WRITE", fault_mode);
+                armed_fault = true;
+            }
+            return true;
+        });
+
+        const auto commit_status = store.CommitPendingMutations();
+        ok &= Require(armed_fault, label_text + ": write fault should be armed at requested commit stage");
+        ok &= Require(
+            commit_status == apfsaccess::rw::MetadataStore::CommitStatus::PersistFailed,
+            label_text + ": torn write commit should fail with PersistFailed");
+        ok &= Require(
+            store.LastCommittedXid().value_or(0) == (kInitialCheckpointXid + 1),
+            label_text + ": torn write should not advance committed xid in memory");
+        ok &= Require(
+            store.PendingMutationCount() > 0,
+            label_text + ": torn write should retain pending mutations for conservative handling");
+    }
+
+    {
+        apfsaccess::rw::MetadataStore remounted(context);
+        ok &= Require(remounted.LoadContainerSuperblocks(), label_text + ": remount LoadContainerSuperblocks should succeed");
+        ok &= Require(remounted.PrepareNativeWritePath(), label_text + ": remount PrepareNativeWritePath should succeed");
+        ok &= Require(
+            remounted.CheckpointXid().value_or(0) == (kInitialCheckpointXid + 1),
+            label_text + ": remount should keep last coherent checkpoint xid");
+        ok &= Require(
+            remounted.LookupCommittedInodeByPath(L"\\baseline.bin").has_value(),
+            label_text + ": baseline file should remain visible after remount");
+        ok &= Require(
+            !remounted.LookupCommittedInodeByPath(L"\\faulted.bin").has_value(),
+            label_text + ": faulted file should not become visible after torn write remount");
+        ok &= Require(
+            !remounted.IsRecoveryRequired(),
+            label_text + ": torn write before checkpoint promotion should not require recovery on remount");
+    }
+
+    return ok;
+}
 } // namespace
 
 int main()
@@ -5001,6 +5110,42 @@ int main()
     };
 
     bool ok = true;
+    ok &= RunTornDeviceWriteScenario(
+        run_root,
+        L"zero-bytes",
+        "before-payload-device-write",
+        "payload-zero-bytes");
+    ok &= RunTornDeviceWriteScenario(
+        run_root,
+        L"first-sector",
+        "before-payload-device-write",
+        "payload-first-sector");
+    ok &= RunTornDeviceWriteScenario(
+        run_root,
+        L"first-half",
+        "before-payload-device-write",
+        "payload-first-half");
+    ok &= RunTornDeviceWriteScenario(
+        run_root,
+        L"all-except-last-sector",
+        "before-payload-device-write",
+        "payload-all-except-last-sector");
+    ok &= RunTornDeviceWriteScenario(
+        run_root,
+        L"corrupt-one-byte",
+        "before-payload-device-write",
+        "payload-corrupt-one-byte");
+    ok &= RunTornDeviceWriteScenario(
+        run_root,
+        L"first-half",
+        "before-commit-blob-device-write",
+        "commit-blob-first-half");
+    ok &= RunTornDeviceWriteScenario(
+        run_root,
+        L"corrupt-one-byte",
+        "before-commit-blob-device-write",
+        "commit-blob-corrupt-one-byte");
+
     const auto cow_overwrite_image_path = run_root / "container_cow_overwrite.apfs.img";
     if (!CreateSyntheticContainer(cow_overwrite_image_path))
     {

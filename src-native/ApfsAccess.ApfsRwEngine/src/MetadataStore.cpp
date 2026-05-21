@@ -5228,6 +5228,12 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         return CommitStatus::PersistFailed;
     }
 
+    if (!pending_payload_writes.empty() && !AllowCommitStage("before-payload-device-write"))
+    {
+        rollback_commit_extent_stage();
+        return CommitStatus::PersistFailed;
+    }
+
     for (const auto& payload_write : pending_payload_writes)
     {
         if (!device_.Write(payload_write.physical_address, payload_write.bytes))
@@ -5237,6 +5243,11 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         }
     }
 
+    if (!AllowCommitStage("before-commit-blob-device-write"))
+    {
+        rollback_commit_extent_stage();
+        return CommitStatus::PersistFailed;
+    }
     if (!device_.Write(*commit_extent, commit_blob))
     {
         rollback_commit_extent_stage();

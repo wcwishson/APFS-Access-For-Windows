@@ -5,6 +5,8 @@
 #include <cwchar>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <string_view>
 #include <utility>
 
 #include <winioctl.h>
@@ -37,6 +39,42 @@ bool IsFaultSwitchEnabled(const wchar_t* variable_name)
     return _wcsicmp(value, L"1") == 0 ||
            _wcsicmp(value, L"true") == 0 ||
            _wcsicmp(value, L"yes") == 0;
+}
+
+std::optional<std::wstring> ReadFaultMode(const wchar_t* variable_name)
+{
+    if (variable_name == nullptr || *variable_name == L'\0')
+    {
+        return std::nullopt;
+    }
+
+    wchar_t* raw_value = nullptr;
+    std::size_t raw_length = 0;
+    if (_wdupenv_s(&raw_value, &raw_length, variable_name) != 0 || raw_value == nullptr)
+    {
+        return std::nullopt;
+    }
+    std::unique_ptr<wchar_t, decltype(&std::free)> guard(raw_value, &std::free);
+    const auto* value = raw_value;
+
+    while (*value == L' ' || *value == L'\t')
+    {
+        ++value;
+    }
+    if (*value == L'\0' ||
+        _wcsicmp(value, L"0") == 0 ||
+        _wcsicmp(value, L"false") == 0 ||
+        _wcsicmp(value, L"no") == 0)
+    {
+        return std::nullopt;
+    }
+
+    return std::wstring(value);
+}
+
+bool IsFaultMode(std::wstring_view actual, const wchar_t* expected)
+{
+    return _wcsicmp(std::wstring(actual).c_str(), expected) == 0;
 }
 
 std::uint64_t AlignDown(std::uint64_t value, std::uint64_t alignment)
@@ -209,7 +247,12 @@ bool BlockDevice::Write(std::uint64_t offset_bytes, const std::vector<std::byte>
     {
         return false;
     }
-    if (IsFaultSwitchEnabled(L"APFSACCESS_RW_FAULT_WRITE"))
+    const auto fault_mode = ReadFaultMode(L"APFSACCESS_RW_FAULT_WRITE");
+    if (fault_mode.has_value() &&
+        (IsFaultMode(*fault_mode, L"1") ||
+         IsFaultMode(*fault_mode, L"true") ||
+         IsFaultMode(*fault_mode, L"yes") ||
+         IsFaultMode(*fault_mode, L"fail")))
     {
         return false;
     }
@@ -273,13 +316,68 @@ bool BlockDevice::Write(std::uint64_t offset_bytes, const std::vector<std::byte>
         }
     }
 
-    DWORD bytes_written = 0;
-    if (!WriteFile(handle_, write_buffer, static_cast<DWORD>(write_size), &bytes_written, nullptr))
+    const auto write_failure = [&]() -> bool
+    {
+        DWORD bytes_written = 0;
+        if (!WriteFile(handle_, write_buffer, static_cast<DWORD>(write_size), &bytes_written, nullptr))
+        {
+            return false;
+        }
+
+        return bytes_written == write_size;
+    };
+
+    if (!fault_mode.has_value())
+    {
+        return write_failure();
+    }
+
+    if (IsFaultMode(*fault_mode, L"zero-bytes"))
     {
         return false;
     }
 
-    return bytes_written == write_size;
+    if (IsFaultMode(*fault_mode, L"first-sector") ||
+        IsFaultMode(*fault_mode, L"first-half") ||
+        IsFaultMode(*fault_mode, L"all-except-last-sector") ||
+        IsFaultMode(*fault_mode, L"corrupt-one-byte"))
+    {
+        std::vector<std::byte> fault_buffer(write_buffer, write_buffer + write_size);
+        std::size_t fault_write_size = fault_buffer.size();
+        if (IsFaultMode(*fault_mode, L"first-sector"))
+        {
+            fault_write_size = std::min<std::size_t>(fault_write_size, static_cast<std::size_t>(block_size));
+        }
+        else if (IsFaultMode(*fault_mode, L"first-half"))
+        {
+            fault_write_size = std::max<std::size_t>(1, fault_write_size / 2);
+        }
+        else if (IsFaultMode(*fault_mode, L"all-except-last-sector"))
+        {
+            if (fault_write_size <= static_cast<std::size_t>(block_size))
+            {
+                fault_write_size = 0;
+            }
+            else
+            {
+                fault_write_size -= static_cast<std::size_t>(block_size);
+            }
+        }
+        else
+        {
+            fault_buffer.front() ^= std::byte{0xff};
+        }
+
+        DWORD bytes_written = 0;
+        if (fault_write_size > 0 &&
+            !WriteFile(handle_, fault_buffer.data(), static_cast<DWORD>(fault_write_size), &bytes_written, nullptr))
+        {
+            return false;
+        }
+        return false;
+    }
+
+    return false;
 }
 
 bool BlockDevice::Flush()
