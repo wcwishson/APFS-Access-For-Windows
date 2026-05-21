@@ -6555,6 +6555,595 @@ bool TestLegacyNamedStreamArtifactsAreHidden()
     return Require(transferred == 0, "Directory enumeration should hide legacy colon-named stream artifact files");
 }
 
+bool TestMissingNamedStreamOpenFailsCleanlyWithoutBaseBytes()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    context.args.volume = L"Main";
+    if (!Require(PrepareUnitHydrationRoot(context, L"missing-named-stream"), "Missing named stream test should prepare cache root"))
+    {
+        return false;
+    }
+    SeedRoot(context);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"document.docx");
+    auto file = MakeNode(L"\\document.docx", false, false);
+    const auto base_payload = BuildPatternPayloadForTest(64, 0x41);
+    file->file_size = base_payload.size();
+    context.nodes.emplace(Key(file->path), file);
+    if (!Require(WriteFileBytes(HydrationPath(&context, *file), base_payload), "Missing named stream test should seed base file bytes"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    auto fs = BuildFileSystem(&context);
+    const std::array<const wchar_t*, 3> missing_streams
+    {
+        L"\\document.docx:Zone.Identifier",
+        L"\\document.docx:LH.Identifier",
+        L"\\document.docx:AFP_AfpInfo"
+    };
+
+    for (const auto* stream_path : missing_streams)
+    {
+        PVOID out_ctx = nullptr;
+        FSP_FSCTL_FILE_INFO info{};
+        const auto status = CB_Open(
+            &fs,
+            const_cast<PWSTR>(stream_path),
+            FILE_NON_DIRECTORY_FILE,
+            FILE_READ_DATA,
+            &out_ctx,
+            &info);
+        if (!Require(status == STATUS_OBJECT_NAME_NOT_FOUND, "Missing ADS read-only open should report object-not-found, not device failure"))
+        {
+            if (out_ctx)
+            {
+                CB_Close(&fs, out_ctx);
+            }
+            std::error_code ec;
+            std::filesystem::remove_all(context.session_root, ec);
+            return false;
+        }
+        if (!Require(out_ctx == nullptr, "Missing ADS read-only open should not allocate an open context"))
+        {
+            std::error_code ec;
+            std::filesystem::remove_all(context.session_root, ec);
+            return false;
+        }
+        if (!Require(file->open_handle_count == 0, "Missing ADS read-only probes should not leak base-file open handles"))
+        {
+            std::error_code ec;
+            std::filesystem::remove_all(context.session_root, ec);
+            return false;
+        }
+    }
+
+    PVOID base_ctx = nullptr;
+    FSP_FSCTL_FILE_INFO info{};
+    const auto base_open = CB_Open(
+        &fs,
+        const_cast<PWSTR>(L"\\document.docx"),
+        FILE_NON_DIRECTORY_FILE,
+        FILE_READ_DATA,
+        &base_ctx,
+        &info);
+    if (!Require(base_open == STATUS_SUCCESS, "Base file should still open after missing ADS probes") ||
+        !Require(base_ctx != nullptr, "Base file open should return a context"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    std::array<char, 64> read_buffer{};
+    ULONG read_done = 0;
+    const auto read_status = CB_Read(
+        &fs,
+        base_ctx,
+        read_buffer.data(),
+        0,
+        static_cast<ULONG>(read_buffer.size()),
+        &read_done);
+    CB_Close(&fs, base_ctx);
+
+    bool base_bytes_match = read_done == base_payload.size();
+    for (std::size_t index = 0; base_bytes_match && index < base_payload.size(); ++index)
+    {
+        base_bytes_match = static_cast<std::byte>(static_cast<unsigned char>(read_buffer[index])) == base_payload[index];
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(context.session_root, ec);
+    return Require(read_status == STATUS_SUCCESS && base_bytes_match, "Missing ADS probes must not corrupt or consume base-file bytes");
+}
+
+bool TestDuplicateCaseNamedStreamsCoalesceMetadata()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    context.args.volume = L"Main";
+    if (!Require(PrepareUnitHydrationRoot(context, L"duplicate-case-stream"), "Duplicate-case stream test should prepare cache root"))
+    {
+        return false;
+    }
+    SeedRoot(context);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"installer.exe");
+    auto file = MakeNode(L"\\installer.exe", false, false);
+    file->file_size = 12;
+    context.nodes.emplace(Key(file->path), file);
+    if (!Require(WriteFileBytes(HydrationPath(&context, *file), BuildPatternPayloadForTest(12, 0x18)), "Duplicate-case stream test should seed base file"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    auto fs = BuildFileSystem(&context);
+    PVOID lower_ctx = nullptr;
+    FSP_FSCTL_FILE_INFO info{};
+    const auto create_status = CB_Create(
+        &fs,
+        const_cast<PWSTR>(L"\\installer.exe:lh.identifier"),
+        FILE_NON_DIRECTORY_FILE,
+        FILE_WRITE_DATA | FILE_READ_DATA,
+        0,
+        nullptr,
+        0,
+        &lower_ctx,
+        &info);
+    if (!Require(create_status == STATUS_SUCCESS && lower_ctx != nullptr, "Lowercase named stream create should succeed"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    const std::array<char, 4> payload{ 'A', 'D', 'S', '1' };
+    ULONG done = 0;
+    const auto write_status = CB_Write(
+        &fs,
+        lower_ctx,
+        const_cast<char*>(payload.data()),
+        0,
+        static_cast<ULONG>(payload.size()),
+        FALSE,
+        FALSE,
+        &done,
+        &info);
+    CB_Close(&fs, lower_ctx);
+    if (!Require(write_status == STATUS_SUCCESS && done == payload.size(), "Lowercase named stream write should persist payload"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    PVOID upper_ctx = nullptr;
+    const auto upper_open = CB_Open(
+        &fs,
+        const_cast<PWSTR>(L"\\installer.exe:LH.IDENTIFIER"),
+        FILE_NON_DIRECTORY_FILE,
+        FILE_READ_DATA,
+        &upper_ctx,
+        &info);
+    if (!Require(upper_open == STATUS_SUCCESS && upper_ctx != nullptr, "Duplicate-case named stream reopen should resolve the same stream"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    std::array<char, 8> read_payload{};
+    ULONG read_done = 0;
+    const auto read_status = CB_Read(
+        &fs,
+        upper_ctx,
+        read_payload.data(),
+        0,
+        static_cast<ULONG>(payload.size()),
+        &read_done);
+    CB_Close(&fs, upper_ctx);
+    if (!Require(read_status == STATUS_SUCCESS && read_done == payload.size(), "Duplicate-case named stream read should return the existing payload") ||
+        !Require(std::equal(payload.begin(), payload.end(), read_payload.begin()), "Duplicate-case named stream should read bytes from the original stream"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    OpenContext base_open{};
+    base_open.node = file;
+    std::array<std::byte, 512> stream_buffer{};
+    ULONG transferred = 0;
+    const auto stream_status = CB_GetStreamInfo(
+        &fs,
+        &base_open,
+        stream_buffer.data(),
+        static_cast<ULONG>(stream_buffer.size()),
+        &transferred);
+    if (!Require(stream_status == STATUS_SUCCESS, "GetStreamInfo should succeed after duplicate-case stream opens"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    int metadata_stream_count = 0;
+    ULONG cursor = 0;
+    while (cursor < transferred)
+    {
+        const auto* stream_info = reinterpret_cast<const FSP_FSCTL_STREAM_INFO*>(stream_buffer.data() + cursor);
+        if (stream_info->Size < sizeof(FSP_FSCTL_STREAM_INFO) ||
+            stream_info->Size > transferred - cursor)
+        {
+            std::error_code ec;
+            std::filesystem::remove_all(context.session_root, ec);
+            return Require(false, "Duplicate-case stream info should contain valid packed entries");
+        }
+
+        const auto name_chars = (stream_info->Size - sizeof(FSP_FSCTL_STREAM_INFO)) / sizeof(WCHAR);
+        const std::wstring stream_name(stream_info->StreamNameBuf, name_chars);
+        if (ToLowerInvariant(stream_name) == L":lh.identifier:$data")
+        {
+            ++metadata_stream_count;
+        }
+        cursor += stream_info->Size;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(context.session_root, ec);
+    return Require(metadata_stream_count == 1, "Duplicate-case named streams should coalesce to one metadata stream entry");
+}
+
+bool TestOfficeTempRenameReplaceWorkflow()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    context.args.volume = L"Main";
+    if (!Require(PrepareUnitHydrationRoot(context, L"office-temp-rename"), "Office workflow test should prepare cache root"))
+    {
+        return false;
+    }
+    SeedRoot(context);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"office");
+    auto office_dir = MakeNode(L"\\office", true, false);
+    context.nodes.emplace(Key(office_dir->path), office_dir);
+
+    AddChildName(office_dir->children, L"document.docx");
+    auto original = MakeNode(L"\\office\\document.docx", false, false);
+    const auto original_payload = BuildPatternPayloadForTest(96, 0x21);
+    original->file_size = original_payload.size();
+    context.nodes.emplace(Key(original->path), original);
+    if (!Require(WriteFileBytes(HydrationPath(&context, *original), original_payload), "Office workflow test should seed original document"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    auto fs = BuildFileSystem(&context);
+    PVOID lock_ctx = nullptr;
+    FSP_FSCTL_FILE_INFO lock_info{};
+    const auto lock_create = CB_Create(
+        &fs,
+        const_cast<PWSTR>(L"\\office\\~$document.docx"),
+        FILE_NON_DIRECTORY_FILE,
+        FILE_WRITE_DATA | DELETE,
+        0,
+        nullptr,
+        0,
+        &lock_ctx,
+        &lock_info);
+    if (!Require(lock_create == STATUS_SUCCESS && lock_ctx != nullptr, "Office lock file create should succeed"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+    auto* lock_open = static_cast<OpenContext*>(lock_ctx);
+    lock_open->allow_delete = true;
+    CB_Cleanup(&fs, lock_ctx, const_cast<PWSTR>(L"\\office\\~$document.docx"), FspCleanupDelete);
+    CB_Close(&fs, lock_ctx);
+    if (!Require(context.nodes.find(Key(L"\\office\\~$document.docx")) == context.nodes.end(), "Office lock file delete-on-close should remove the temp lock node"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    PVOID temp_ctx = nullptr;
+    FSP_FSCTL_FILE_INFO temp_info{};
+    const auto temp_create = CB_Create(
+        &fs,
+        const_cast<PWSTR>(L"\\office\\document.tmp"),
+        FILE_NON_DIRECTORY_FILE,
+        FILE_WRITE_DATA | FILE_READ_DATA | DELETE,
+        0,
+        nullptr,
+        0,
+        &temp_ctx,
+        &temp_info);
+    if (!Require(temp_create == STATUS_SUCCESS && temp_ctx != nullptr, "Office save temp file create should succeed"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    const auto saved_payload = BuildPatternPayloadForTest(128, 0x63);
+    ULONG temp_written = 0;
+    const auto temp_write = CB_Write(
+        &fs,
+        temp_ctx,
+        const_cast<std::byte*>(saved_payload.data()),
+        0,
+        static_cast<ULONG>(saved_payload.size()),
+        FALSE,
+        FALSE,
+        &temp_written,
+        &temp_info);
+    CB_Close(&fs, temp_ctx);
+    if (!Require(temp_write == STATUS_SUCCESS && temp_written == saved_payload.size(), "Office save temp file write should persist all bytes"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    const auto rename_status = CB_Rename(
+        &fs,
+        nullptr,
+        const_cast<PWSTR>(L"\\office\\document.tmp"),
+        const_cast<PWSTR>(L"\\office\\document.docx"),
+        TRUE);
+    if (!Require(rename_status == STATUS_SUCCESS, "Office temp save should rename-replace the original document"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    auto saved_node = FindNode(&context, L"\\office\\document.docx");
+    if (!Require(saved_node != nullptr, "Office temp save should leave the final document visible") ||
+        !Require(context.nodes.find(Key(L"\\office\\document.tmp")) == context.nodes.end(), "Office temp save should remove the temp source path") ||
+        !Require(saved_node->file_size == saved_payload.size(), "Office temp save should expose the saved document size"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    const auto saved_bytes = ReadFileBytes(HydrationPath(&context, *saved_node));
+    std::error_code ec;
+    std::filesystem::remove_all(context.session_root, ec);
+    return Require(saved_bytes == saved_payload, "Office temp save should preserve the exact replacement bytes");
+}
+
+bool TestRecycleBinMetadataPairWorkflow()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    context.args.volume = L"Main";
+    if (!Require(PrepareUnitHydrationRoot(context, L"recycle-metadata-pair"), "Recycle workflow test should prepare cache root"))
+    {
+        return false;
+    }
+    SeedRoot(context);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"$RECYCLE.BIN");
+    auto recycle = MakeNode(L"\\$RECYCLE.BIN", true, false);
+    context.nodes.emplace(Key(recycle->path), recycle);
+    AddChildName(recycle->children, L"S-1-5-21-1000-1000-1000-1001");
+    auto sid = MakeNode(L"\\$RECYCLE.BIN\\S-1-5-21-1000-1000-1000-1001", true, false);
+    context.nodes.emplace(Key(sid->path), sid);
+    AddChildName(root->children, L"files");
+    auto files = MakeNode(L"\\files", true, false);
+    context.nodes.emplace(Key(files->path), files);
+    AddChildName(files->children, L"delete-me.bin");
+    auto source = MakeNode(L"\\files\\delete-me.bin", false, false);
+    const auto payload = BuildPatternPayloadForTest(256, 0x77);
+    source->file_size = payload.size();
+    context.nodes.emplace(Key(source->path), source);
+    if (!Require(WriteFileBytes(HydrationPath(&context, *source), payload), "Recycle workflow test should seed source payload"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    auto fs = BuildFileSystem(&context);
+    const auto move_to_bin = CB_Rename(
+        &fs,
+        nullptr,
+        const_cast<PWSTR>(L"\\files\\delete-me.bin"),
+        const_cast<PWSTR>(L"\\$RECYCLE.BIN\\S-1-5-21-1000-1000-1000-1001\\$RCODEX01.bin"),
+        FALSE);
+    if (!Require(move_to_bin == STATUS_SUCCESS, "Recycle workflow should move payload to $R entry"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    PVOID info_ctx = nullptr;
+    FSP_FSCTL_FILE_INFO info{};
+    const auto info_create = CB_Create(
+        &fs,
+        const_cast<PWSTR>(L"\\$RECYCLE.BIN\\S-1-5-21-1000-1000-1000-1001\\$ICODEX01.bin"),
+        FILE_NON_DIRECTORY_FILE,
+        FILE_WRITE_DATA | DELETE,
+        0,
+        nullptr,
+        0,
+        &info_ctx,
+        &info);
+    if (!Require(info_create == STATUS_SUCCESS && info_ctx != nullptr, "Recycle workflow should create $I metadata entry"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+    const std::array<char, 9> info_payload{ 'm', 'e', 't', 'a', 'd', 'a', 't', 'a', '\n' };
+    ULONG info_written = 0;
+    const auto info_write = CB_Write(
+        &fs,
+        info_ctx,
+        const_cast<char*>(info_payload.data()),
+        0,
+        static_cast<ULONG>(info_payload.size()),
+        FALSE,
+        FALSE,
+        &info_written,
+        &info);
+    if (!Require(info_write == STATUS_SUCCESS && info_written == info_payload.size(), "Recycle workflow should write $I metadata bytes"))
+    {
+        CB_Close(&fs, info_ctx);
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    const auto restore_status = CB_Rename(
+        &fs,
+        nullptr,
+        const_cast<PWSTR>(L"\\$RECYCLE.BIN\\S-1-5-21-1000-1000-1000-1001\\$RCODEX01.bin"),
+        const_cast<PWSTR>(L"\\files\\restored.bin"),
+        FALSE);
+    if (!Require(restore_status == STATUS_SUCCESS, "Recycle workflow should restore $R payload by rename"))
+    {
+        CB_Close(&fs, info_ctx);
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    auto* info_open = static_cast<OpenContext*>(info_ctx);
+    info_open->allow_delete = true;
+    const auto delete_info = CB_SetDelete(
+        &fs,
+        info_ctx,
+        const_cast<PWSTR>(L"\\$RECYCLE.BIN\\S-1-5-21-1000-1000-1000-1001\\$ICODEX01.bin"),
+        TRUE);
+    if (!Require(delete_info == STATUS_SUCCESS, "Recycle workflow should mark $I metadata for deletion"))
+    {
+        CB_Close(&fs, info_ctx);
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+    CB_Cleanup(&fs, info_ctx, const_cast<PWSTR>(L"\\$RECYCLE.BIN\\S-1-5-21-1000-1000-1000-1001\\$ICODEX01.bin"), FspCleanupDelete);
+    CB_Close(&fs, info_ctx);
+
+    auto restored = FindNode(&context, L"\\files\\restored.bin");
+    if (!Require(restored != nullptr, "Recycle workflow should leave restored payload visible") ||
+        !Require(context.nodes.find(Key(L"\\$RECYCLE.BIN\\S-1-5-21-1000-1000-1000-1001\\$ICODEX01.bin")) == context.nodes.end(), "Recycle workflow should delete $I metadata node") ||
+        !Require(context.nodes.find(Key(L"\\$RECYCLE.BIN\\S-1-5-21-1000-1000-1000-1001\\$RCODEX01.bin")) == context.nodes.end(), "Recycle workflow should remove $R payload from recycle folder"))
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+        return false;
+    }
+
+    const auto restored_bytes = ReadFileBytes(HydrationPath(&context, *restored));
+    std::error_code ec;
+    std::filesystem::remove_all(context.session_root, ec);
+    return Require(restored_bytes == payload, "Recycle workflow should preserve restored payload bytes");
+}
+
+bool TestPathNormalizationMatrixRejectsRiskyWin32Names()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    context.args.volume = L"Main";
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto fs = BuildFileSystem(&context);
+    const std::wstring long_component = L"\\" + std::wstring(256, L'n') + L".txt";
+    const std::array<std::wstring, 6> invalid_paths
+    {
+        L"\\CON",
+        L"\\AUX.txt",
+        L"\\trailing-space ",
+        L"\\trailing-dot.",
+        L"\\bad<name>.txt",
+        long_component
+    };
+
+    for (const auto& path : invalid_paths)
+    {
+        PVOID out_ctx = nullptr;
+        FSP_FSCTL_FILE_INFO info{};
+        const auto status = CB_Create(
+            &fs,
+            const_cast<PWSTR>(path.c_str()),
+            FILE_NON_DIRECTORY_FILE,
+            FILE_WRITE_DATA,
+            0,
+            nullptr,
+            0,
+            &out_ctx,
+            &info);
+        if (!Require(status == STATUS_OBJECT_NAME_INVALID, "Risky Win32 path create should fail before mutation"))
+        {
+            if (out_ctx)
+            {
+                CB_Close(&fs, out_ctx);
+            }
+            return false;
+        }
+        if (!Require(context.nodes.find(Key(path)) == context.nodes.end(), "Rejected risky Win32 path should not create a node"))
+        {
+            return false;
+        }
+    }
+
+    auto root = context.nodes.at(Key(L"\\"));
+    const std::wstring valid_unicode_path = L"\\文件-" + std::wstring(L"\xD83D\xDE80") + L"-I-\x0130-\x0131.txt";
+    PVOID valid_ctx = nullptr;
+    FSP_FSCTL_FILE_INFO valid_info{};
+    const auto valid_create = CB_Create(
+        &fs,
+        const_cast<PWSTR>(valid_unicode_path.c_str()),
+        FILE_NON_DIRECTORY_FILE,
+        FILE_WRITE_DATA | DELETE,
+        0,
+        nullptr,
+        0,
+        &valid_ctx,
+        &valid_info);
+    if (!Require(valid_create == STATUS_SUCCESS && valid_ctx != nullptr, "Unicode path matrix should allow normal Chinese, emoji, and Turkish I names"))
+    {
+        return false;
+    }
+    CB_Close(&fs, valid_ctx);
+
+    const auto case_rename = CB_Rename(
+        &fs,
+        nullptr,
+        const_cast<PWSTR>(valid_unicode_path.c_str()),
+        const_cast<PWSTR>(L"\\文件-\xD83D\xDE80-i-\x0130-\x0131.txt"),
+        FALSE);
+    if (!Require(case_rename == STATUS_SUCCESS, "Path matrix should allow case-only rename of a valid Unicode name"))
+    {
+        return false;
+    }
+    return Require(
+        HasChildName(root->children, L"文件-\xD83D\xDE80-i-\x0130-\x0131.txt") &&
+            context.nodes.find(Key(L"\\文件-\xD83D\xDE80-i-\x0130-\x0131.txt")) != context.nodes.end(),
+        "Case-only Unicode rename should update the visible directory entry");
+}
+
 bool TestNormalizePathStripsDriveQualifiedRoot()
 {
     if (!Require(NormalizePath(L"E:") == L"\\", "NormalizePath should treat drive-qualified current-directory roots as volume root"))
@@ -6822,6 +7411,26 @@ bool RunSelectedTest(const std::string& name)
     {
         return TestLegacyNamedStreamArtifactsAreHidden();
     }
+    if (name == "missing-named-stream-clean-failure")
+    {
+        return TestMissingNamedStreamOpenFailsCleanlyWithoutBaseBytes();
+    }
+    if (name == "duplicate-case-named-streams")
+    {
+        return TestDuplicateCaseNamedStreamsCoalesceMetadata();
+    }
+    if (name == "office-temp-rename-replace-workflow")
+    {
+        return TestOfficeTempRenameReplaceWorkflow();
+    }
+    if (name == "recycle-bin-metadata-pair-workflow")
+    {
+        return TestRecycleBinMetadataPairWorkflow();
+    }
+    if (name == "path-normalization-edge-matrix")
+    {
+        return TestPathNormalizationMatrixRejectsRiskyWin32Names();
+    }
     if (name == "rename-rollback-native-commit-failure")
     {
         return TestRenameRollsBackLocalNamespaceWhenNativeCommitFails();
@@ -6992,6 +7601,11 @@ int main(int argc, char** argv)
     ok &= TestNamedStreamCopyCompatibility();
     ok &= TestNamedStreamCreateDoesNotCreateVisibleApfsFile();
     ok &= TestLegacyNamedStreamArtifactsAreHidden();
+    ok &= TestMissingNamedStreamOpenFailsCleanlyWithoutBaseBytes();
+    ok &= TestDuplicateCaseNamedStreamsCoalesceMetadata();
+    ok &= TestOfficeTempRenameReplaceWorkflow();
+    ok &= TestRecycleBinMetadataPairWorkflow();
+    ok &= TestPathNormalizationMatrixRejectsRiskyWin32Names();
     ok &= TestNormalizePathStripsDriveQualifiedRoot();
     ok &= TestStableVolumeSerialDependsOnVolumeIdentityNotProcessUptime();
     ok &= TestVolumeInfoFallbackKeepsExplorerCapacityBarUsable();

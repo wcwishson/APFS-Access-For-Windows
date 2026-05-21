@@ -282,6 +282,17 @@ public sealed class PilotScriptTests
         Assert.Contains("explorer-recycle-delete-restore", script);
         Assert.Contains("explorer-final-hash-sweep", script);
         Assert.Contains("Get-FileHash -Algorithm SHA256", script);
+        Assert.Contains("edge-4095.png", script);
+        Assert.Contains("edge-4096.docx", script);
+        Assert.Contains("edge-4097.xlsx", script);
+        Assert.Contains("installer.exe", script);
+        Assert.Contains("unicodeFolder", script);
+        Assert.Contains("recycle-move-to-bin", script);
+        Assert.Contains("recycle-restore", script);
+        Assert.Contains("recycle-delete-metadata", script);
+        Assert.Contains("explorer-many-small-files", script);
+        Assert.Contains("explorer-long-name", script);
+        Assert.Contains("explorer-large-file-roundtrip", script);
     }
 
     [Fact]

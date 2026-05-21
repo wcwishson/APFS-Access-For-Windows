@@ -845,6 +845,116 @@ bool HasConflictingCreateTypeOptions(UINT32 create_options)
            ((create_options & FILE_NON_DIRECTORY_FILE) != 0);
 }
 
+bool IsReservedWin32DeviceName(const std::wstring& component)
+{
+    if (component.empty())
+    {
+        return false;
+    }
+
+    auto base = component;
+    const auto dot = base.find(L'.');
+    if (dot != std::wstring::npos)
+    {
+        base.resize(dot);
+    }
+
+    while (!base.empty() && (base.back() == L' ' || base.back() == L'.'))
+    {
+        base.pop_back();
+    }
+
+    if (base.empty())
+    {
+        return false;
+    }
+
+    if (!_wcsicmp(base.c_str(), L"CON") ||
+        !_wcsicmp(base.c_str(), L"PRN") ||
+        !_wcsicmp(base.c_str(), L"AUX") ||
+        !_wcsicmp(base.c_str(), L"NUL"))
+    {
+        return true;
+    }
+
+    if (base.size() == 4)
+    {
+        const auto prefix = base.substr(0, 3);
+        const auto suffix = base[3];
+        if ((suffix >= L'1' && suffix <= L'9') &&
+            (!_wcsicmp(prefix.c_str(), L"COM") || !_wcsicmp(prefix.c_str(), L"LPT")))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool IsValidWin32PathComponentForMutation(const std::wstring& component)
+{
+    if (component.empty() || component == L"." || component == L"..")
+    {
+        return false;
+    }
+    if (component.size() > 255)
+    {
+        return false;
+    }
+    if (component.back() == L' ' || component.back() == L'.')
+    {
+        return false;
+    }
+    if (IsReservedWin32DeviceName(component))
+    {
+        return false;
+    }
+
+    constexpr wchar_t kInvalid[] = L"<>:\"/\\|?*";
+    for (const auto ch : component)
+    {
+        if (ch < 0x20 || std::wcschr(kInvalid, ch))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool IsValidNormalizedWin32PathForMutation(const std::wstring& path)
+{
+    const auto normalized = NormalizePath(path);
+    if (normalized == L"\\")
+    {
+        return true;
+    }
+    if (normalized.empty() || normalized.front() != L'\\')
+    {
+        return false;
+    }
+
+    std::size_t start = 1;
+    while (start <= normalized.size())
+    {
+        const auto end = normalized.find(L'\\', start);
+        const auto component = normalized.substr(
+            start,
+            end == std::wstring::npos ? std::wstring::npos : end - start);
+        if (!IsValidWin32PathComponentForMutation(component))
+        {
+            return false;
+        }
+        if (end == std::wstring::npos)
+        {
+            break;
+        }
+        start = end + 1;
+    }
+
+    return true;
+}
+
 DWORD ResolveHydrationDesiredAccess(bool mutation_enabled, UINT32 granted_access, bool force_write_intent)
 {
     const UINT32 normalized = NormalizeGrantedAccess(granted_access);
@@ -2574,7 +2684,26 @@ void RememberNamedStreamSizeLocked(
         return;
     }
 
-    c->named_stream_sizes[Key(base_path)][stream_key] = size;
+    auto& streams = c->named_stream_sizes[Key(base_path)];
+    const auto stream_key_lower = ToLowerInvariant(stream_key);
+    for (auto it = streams.begin(); it != streams.end(); ++it)
+    {
+        if (ToLowerInvariant(it->first) == stream_key_lower)
+        {
+            if (it->first != stream_key)
+            {
+                streams.erase(it);
+                streams[stream_key] = size;
+            }
+            else
+            {
+                it->second = size;
+            }
+            return;
+        }
+    }
+
+    streams[stream_key] = size;
 }
 
 std::uint64_t RememberNamedStreamSizeFromHandleLocked(
@@ -4664,6 +4793,10 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
     auto stream_path = SplitNamedStreamPath(path);
     if (stream_path.is_named_stream)
     {
+        if (!IsValidNormalizedWin32PathForMutation(stream_path.base_path))
+        {
+            return STATUS_OBJECT_NAME_INVALID;
+        }
         if ((create_options & FILE_DIRECTORY_FILE) != 0)
         {
             return STATUS_NOT_A_DIRECTORY;
@@ -4735,6 +4868,10 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
     if (path == L"\\")
     {
         return STATUS_OBJECT_NAME_COLLISION;
+    }
+    if (!IsValidNormalizedWin32PathForMutation(path))
+    {
+        return STATUS_OBJECT_NAME_INVALID;
     }
     if (!EnsureParentDirectoryLoaded(c, path))
     {
@@ -5505,6 +5642,11 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
     if (old_path == L"\\" || new_path == L"\\")
     {
         return STATUS_ACCESS_DENIED;
+    }
+    if (!IsValidNormalizedWin32PathForMutation(old_path) ||
+        !IsValidNormalizedWin32PathForMutation(new_path))
+    {
+        return STATUS_OBJECT_NAME_INVALID;
     }
     auto* current_open = (OpenContext*)ctx;
     if (old_path == new_path)
@@ -6311,6 +6453,21 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
                 creation_disposition,
                 FILE_ATTRIBUTE_NORMAL,
                 nullptr);
+        }
+
+        if (o->named_stream &&
+            o->file == INVALID_HANDLE_VALUE &&
+            !mutation_access_requested)
+        {
+            const auto error = GetLastError();
+            delete o;
+            if (error == ERROR_FILE_NOT_FOUND ||
+                error == ERROR_PATH_NOT_FOUND ||
+                error == ERROR_INVALID_NAME)
+            {
+                return STATUS_OBJECT_NAME_NOT_FOUND;
+            }
+            return STATUS_IO_DEVICE_ERROR;
         }
 
         if (o->file == INVALID_HANDLE_VALUE && !mutation_enabled)
