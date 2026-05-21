@@ -2,6 +2,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <iterator>
 #include <memory>
@@ -30,6 +32,7 @@ std::shared_ptr<Node> MakeNode(const std::wstring& path, bool is_directory, bool
 {
     auto node = std::make_shared<Node>();
     node->path = NormalizePath(path);
+    node->hydration_key = Key(node->path);
     node->is_directory = is_directory;
     node->loaded = is_directory;
     node->delete_pending = delete_pending;
@@ -54,6 +57,108 @@ void SeedSecurity(MountContext& context, std::array<std::byte, 16>& security)
 {
     context.sd = reinterpret_cast<PSECURITY_DESCRIPTOR>(security.data());
     context.sd_size = static_cast<ULONG>(security.size());
+}
+
+bool ConfigureNativeCommitFailureForUnitTest(MountContext& context)
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    context.args.readwrite = true;
+    context.args.write_backend = L"Native";
+    context.args.write_recovery_policy = L"FailClosed";
+    context.native_write_enabled = true;
+    context.overlay_write_enabled = false;
+    context.test_force_native_mutation_staging_success = true;
+    context.test_forced_native_commit_status = apfsaccess::rw::MetadataStore::CommitStatus::PersistFailed;
+    context.test_forced_native_commit_recovery_reason = L"UnitTestForcedCommitFailure";
+    context.test_forced_native_commit_recovery_required = true;
+    return true;
+#else
+    (void)context;
+    return false;
+#endif
+}
+
+bool PrepareUnitHydrationRoot(MountContext& context, const wchar_t* name)
+{
+    std::error_code ec;
+    const auto suffix = name && *name ? std::wstring(name) : L"default";
+    context.session_root = std::filesystem::temp_directory_path(ec) /
+        "ApfsAccess" /
+        "fs-host-semantics" /
+        (suffix + L"-" + std::to_wstring(GetTickCount64()));
+    if (ec)
+    {
+        return false;
+    }
+
+    context.cache_root = context.session_root / "hydrate";
+    std::filesystem::create_directories(context.cache_root, ec);
+    return !ec;
+}
+
+bool WriteFileBytes(const std::filesystem::path& path, const std::vector<std::byte>& bytes)
+{
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec)
+    {
+        return false;
+    }
+
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out.good())
+    {
+        return false;
+    }
+
+    if (!bytes.empty())
+    {
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    return out.good();
+}
+
+std::vector<std::byte> ReadFileBytes(const std::filesystem::path& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in.good())
+    {
+        return {};
+    }
+
+    const std::vector<char> chars{
+        std::istreambuf_iterator<char>(in),
+        std::istreambuf_iterator<char>()};
+    std::vector<std::byte> bytes;
+    bytes.reserve(chars.size());
+    for (const char ch : chars)
+    {
+        bytes.push_back(static_cast<std::byte>(static_cast<unsigned char>(ch)));
+    }
+    return bytes;
+}
+
+std::vector<std::byte> ReadHandleBytes(HANDLE handle, DWORD bytes_to_read)
+{
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        return {};
+    }
+
+    LARGE_INTEGER start{};
+    if (!SetFilePointerEx(handle, start, nullptr, FILE_BEGIN))
+    {
+        return {};
+    }
+
+    std::vector<std::byte> buffer(bytes_to_read);
+    DWORD read = 0;
+    if (!ReadFile(handle, buffer.data(), bytes_to_read, &read, nullptr))
+    {
+        return {};
+    }
+    buffer.resize(read);
+    return buffer;
 }
 
 bool TestCreateRejectsConflictingTypeFlags()
@@ -965,6 +1070,232 @@ bool TestRenameReplaceAllowsFileTargetWithAdditionalOpenHandle()
         "Successful file target replace should move source to target");
 }
 
+bool TestRenameRollsBackLocalNamespaceWhenNativeCommitFails()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    MountContext context{};
+    if (!ConfigureNativeCommitFailureForUnitTest(context))
+    {
+        return true;
+    }
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"source.txt");
+
+    auto source = MakeNode(L"\\source.txt", false, false);
+    source->file_size = 9;
+    context.nodes.emplace(Key(source->path), source);
+
+    auto fs = BuildFileSystem(&context);
+    const auto rename_status = CB_Rename(
+        &fs,
+        nullptr,
+        const_cast<PWSTR>(L"\\source.txt"),
+        const_cast<PWSTR>(L"\\renamed.txt"),
+        FALSE);
+    if (!Require(rename_status == STATUS_MEDIA_WRITE_PROTECTED, "Forced native rename commit failure should return MEDIA_WRITE_PROTECTED"))
+    {
+        return false;
+    }
+
+    if (!Require(context.nodes.find(Key(L"\\source.txt")) != context.nodes.end(), "Failed native rename commit should restore source path"))
+    {
+        return false;
+    }
+    if (!Require(context.nodes.find(Key(L"\\renamed.txt")) == context.nodes.end(), "Failed native rename commit should remove transient destination path"))
+    {
+        return false;
+    }
+    if (!Require(HasChildName(root->children, L"source.txt"), "Failed native rename commit should restore source child entry"))
+    {
+        return false;
+    }
+    return Require(!HasChildName(root->children, L"renamed.txt"), "Failed native rename commit should remove destination child entry");
+#else
+    return true;
+#endif
+}
+
+bool TestRenameReplaceKeepsOpenTargetHandleOnOldHydration()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    if (!Require(PrepareUnitHydrationRoot(context, L"rename-replace-open-target"), "Rename-replace hydration test should prepare cache root"))
+    {
+        return false;
+    }
+    ScopeExit cleanup{[&]()
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+    }};
+
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"source.txt");
+    AddChildName(root->children, L"target.txt");
+
+    auto source = MakeNode(L"\\source.txt", false, false);
+    auto target = MakeNode(L"\\target.txt", false, false);
+    target->open_handle_count = 1;
+    source->file_size = 3;
+    target->file_size = 3;
+    context.nodes.emplace(Key(source->path), source);
+    context.nodes.emplace(Key(target->path), target);
+
+    const std::vector<std::byte> source_bytes{std::byte{'A'}, std::byte{'A'}, std::byte{'A'}};
+    const std::vector<std::byte> target_bytes{std::byte{'B'}, std::byte{'B'}, std::byte{'B'}};
+    const auto source_hydration = HydrationPath(&context, *source);
+    const auto target_hydration = HydrationPath(&context, *target);
+    if (!Require(WriteFileBytes(source_hydration, source_bytes), "Rename-replace test should seed source hydration bytes"))
+    {
+        return false;
+    }
+    if (!Require(WriteFileBytes(target_hydration, target_bytes), "Rename-replace test should seed target hydration bytes"))
+    {
+        return false;
+    }
+
+    HANDLE open_target = CreateFileW(
+        target_hydration.wstring().c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (!Require(open_target != INVALID_HANDLE_VALUE, "Rename-replace test should hold a read handle to the old target hydration"))
+    {
+        return false;
+    }
+    ScopeExit close_target{[&]()
+    {
+        CloseHandle(open_target);
+    }};
+
+    OpenContext parent_open{};
+    parent_open.node = root;
+    parent_open.allow_delete_child = true;
+    parent_open.allow_write_data = true;
+
+    auto fs = BuildFileSystem(&context);
+    auto replace_status = CB_Rename(
+        &fs,
+        &parent_open,
+        const_cast<PWSTR>(L"\\source.txt"),
+        const_cast<PWSTR>(L"\\target.txt"),
+        TRUE);
+    if (!Require(replace_status == STATUS_SUCCESS, "Rename replace should succeed with a compatible read handle on the target"))
+    {
+        return false;
+    }
+
+    if (!Require(ReadHandleBytes(open_target, 3) == target_bytes, "Old target handle should continue reading old target bytes after replace"))
+    {
+        return false;
+    }
+    if (!Require(ReadFileBytes(target_hydration) == source_bytes, "Visible target hydration should contain source bytes after replace"))
+    {
+        return false;
+    }
+    if (!Require(!std::filesystem::exists(source_hydration), "Source hydration path should be consumed by successful replace"))
+    {
+        return false;
+    }
+
+    if (!Require(
+            context.nodes.find(Key(L"\\source.txt")) == context.nodes.end() &&
+            context.nodes.find(Key(L"\\target.txt")) != context.nodes.end(),
+            "Successful file target replace with open target handle should leave only the target namespace entry"))
+    {
+        return false;
+    }
+    const auto replacement = context.nodes.at(Key(L"\\target.txt"));
+    return Require(replacement->hydration_key == Key(L"\\target.txt"), "Successful replace should keep visible target on the target hydration key");
+}
+
+bool TestRenameReplaceRollsBackHydrationWhenNativeCommitFails()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    MountContext context{};
+    if (!ConfigureNativeCommitFailureForUnitTest(context))
+    {
+        return true;
+    }
+    if (!Require(PrepareUnitHydrationRoot(context, L"rename-replace-rollback"), "Rename-replace rollback test should prepare cache root"))
+    {
+        return false;
+    }
+    ScopeExit cleanup{[&]()
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+    }};
+
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"source.txt");
+    AddChildName(root->children, L"target.txt");
+
+    auto source = MakeNode(L"\\source.txt", false, false);
+    auto target = MakeNode(L"\\target.txt", false, false);
+    source->file_size = 3;
+    target->file_size = 3;
+    context.nodes.emplace(Key(source->path), source);
+    context.nodes.emplace(Key(target->path), target);
+
+    const std::vector<std::byte> source_bytes{std::byte{'A'}, std::byte{'A'}, std::byte{'A'}};
+    const std::vector<std::byte> target_bytes{std::byte{'B'}, std::byte{'B'}, std::byte{'B'}};
+    const auto source_hydration = HydrationPath(&context, *source);
+    const auto target_hydration = HydrationPath(&context, *target);
+    if (!Require(WriteFileBytes(source_hydration, source_bytes), "Rename-replace rollback test should seed source bytes"))
+    {
+        return false;
+    }
+    if (!Require(WriteFileBytes(target_hydration, target_bytes), "Rename-replace rollback test should seed target bytes"))
+    {
+        return false;
+    }
+
+    auto fs = BuildFileSystem(&context);
+    const auto status = CB_Rename(
+        &fs,
+        nullptr,
+        const_cast<PWSTR>(L"\\source.txt"),
+        const_cast<PWSTR>(L"\\target.txt"),
+        TRUE);
+    if (!Require(status == STATUS_MEDIA_WRITE_PROTECTED, "Forced native rename-replace commit failure should return MEDIA_WRITE_PROTECTED"))
+    {
+        return false;
+    }
+
+    if (!Require(context.nodes.find(Key(L"\\source.txt")) != context.nodes.end(), "Failed native rename-replace commit should restore source node"))
+    {
+        return false;
+    }
+    if (!Require(context.nodes.find(Key(L"\\target.txt")) != context.nodes.end(), "Failed native rename-replace commit should restore target node"))
+    {
+        return false;
+    }
+    if (!Require(ReadFileBytes(source_hydration) == source_bytes, "Failed native rename-replace commit should restore source hydration bytes"))
+    {
+        return false;
+    }
+    return Require(ReadFileBytes(target_hydration) == target_bytes, "Failed native rename-replace commit should restore target hydration bytes");
+#else
+    return true;
+#endif
+}
+
 bool TestCleanupDeleteRequiresDeleteAccess()
 {
     MountContext context{};
@@ -1811,6 +2142,167 @@ bool TestDeleteOnCloseCommitsWhenDeleteIsLatching()
     return Require(
         context.nodes.find(Key(L"\\victim.txt")) == context.nodes.end(),
         "Delete-on-close should remove the node once the last cleanup closes");
+}
+
+bool TestSetFileSizeRollsBackLocalSizeWhenNativeCommitFails()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    MountContext context{};
+    if (!ConfigureNativeCommitFailureForUnitTest(context))
+    {
+        return true;
+    }
+    if (!Require(PrepareUnitHydrationRoot(context, L"set-file-size-rollback"), "SetFileSize rollback test should prepare cache root"))
+    {
+        return false;
+    }
+    ScopeExit cleanup{[&]()
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+    }};
+
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"resize.bin");
+
+    auto file = MakeNode(L"\\resize.bin", false, false);
+    file->file_size = 4;
+    context.nodes.emplace(Key(file->path), file);
+    if (!Require(WriteFileBytes(HydrationPath(&context, *file), {std::byte{'A'}, std::byte{'B'}, std::byte{'C'}, std::byte{'D'}}),
+            "SetFileSize rollback test should seed hydration file"))
+    {
+        return false;
+    }
+
+    OpenContext open_context{};
+    open_context.node = file;
+    open_context.allow_set_file_size = true;
+    open_context.allow_write_data = true;
+    open_context.file = CreateFileW(
+        HydrationPath(&context, *file).wstring().c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (!Require(open_context.file != INVALID_HANDLE_VALUE, "SetFileSize rollback test should open hydration file"))
+    {
+        return false;
+    }
+    ScopeExit close_file{[&]()
+    {
+        CloseHandle(open_context.file);
+        open_context.file = INVALID_HANDLE_VALUE;
+    }};
+
+    auto fs = BuildFileSystem(&context);
+    FSP_FSCTL_FILE_INFO info{};
+    const auto status = CB_SetFileSize(&fs, &open_context, 9, FALSE, &info);
+    if (!Require(status == STATUS_MEDIA_WRITE_PROTECTED, "Forced native SetFileSize commit failure should return MEDIA_WRITE_PROTECTED"))
+    {
+        return false;
+    }
+    if (!Require(file->file_size == 4, "Failed native SetFileSize commit should restore node file size"))
+    {
+        return false;
+    }
+    if (!Require(info.FileSize == 4, "Failed native SetFileSize commit should report restored file size"))
+    {
+        return false;
+    }
+
+    LARGE_INTEGER end{};
+    if (!Require(GetFileSizeEx(open_context.file, &end) != FALSE, "SetFileSize rollback test should read hydration size after failure"))
+    {
+        return false;
+    }
+    return Require(end.QuadPart == 4, "Failed native SetFileSize commit should restore hydration file length");
+#else
+    return true;
+#endif
+}
+
+bool TestDeleteOnCloseRestoresLocalNodeWhenNativeCommitFails()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    MountContext context{};
+    if (!ConfigureNativeCommitFailureForUnitTest(context))
+    {
+        return true;
+    }
+    if (!Require(PrepareUnitHydrationRoot(context, L"delete-on-close-rollback"), "Delete-on-close rollback test should prepare cache root"))
+    {
+        return false;
+    }
+    ScopeExit cleanup{[&]()
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+    }};
+    context.tx_manager = std::make_unique<apfsaccess::rw::TransactionManager>(L"Conservative");
+
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"victim.txt");
+
+    auto file = MakeNode(L"\\victim.txt", false, false);
+    file->open_handle_count = 1;
+    file->file_size = 4;
+    context.nodes.emplace(Key(file->path), file);
+    const std::vector<std::byte> payload{std::byte{'K'}, std::byte{'E'}, std::byte{'E'}, std::byte{'P'}};
+    if (!Require(WriteFileBytes(HydrationPath(&context, *file), payload), "Delete-on-close rollback test should seed hydration bytes"))
+    {
+        return false;
+    }
+
+    auto fs = BuildFileSystem(&context);
+    auto* open_context = new OpenContext();
+    open_context->node = file;
+    open_context->allow_delete = true;
+
+    CB_Cleanup(
+        &fs,
+        open_context,
+        const_cast<PWSTR>(L"\\victim.txt"),
+        FspCleanupDelete);
+    CB_Close(&fs, open_context);
+
+    if (!Require(context.recovery_active, "Forced native delete-on-close commit failure should latch recovery-active state"))
+    {
+        return false;
+    }
+    if (!Require(context.nodes.find(Key(L"\\victim.txt")) != context.nodes.end(), "Failed native delete-on-close commit should restore deleted node"))
+    {
+        return false;
+    }
+    if (!Require(HasChildName(root->children, L"victim.txt"), "Failed native delete-on-close commit should restore parent child entry"))
+    {
+        return false;
+    }
+    const auto restored = context.nodes.at(Key(L"\\victim.txt"));
+    if (!Require(!restored->delete_pending && !restored->delete_latched && restored->delete_intent_count == 0, "Failed native delete-on-close commit should restore node as visible and not delete-pending"))
+    {
+        return false;
+    }
+    if (!Require(ReadFileBytes(HydrationPath(&context, *restored)) == payload, "Failed native delete-on-close commit should restore hydrated file bytes"))
+    {
+        return false;
+    }
+    return Require(
+        context.tx_manager->PendingMutationCount() == 0 &&
+        context.tx_manager->CurrentState() == apfsaccess::rw::TransactionManager::State::Idle,
+        "Failed native delete-on-close commit should abort, not finalize, the local mutation journal");
+#else
+    return true;
+#endif
 }
 
 bool TestRenameDirectoryFailsWhenDescendantHandleOpen()
@@ -5841,6 +6333,26 @@ bool RunSelectedTest(const std::string& name)
     {
         return TestLegacyNamedStreamArtifactsAreHidden();
     }
+    if (name == "rename-rollback-native-commit-failure")
+    {
+        return TestRenameRollsBackLocalNamespaceWhenNativeCommitFails();
+    }
+    if (name == "set-file-size-rollback-native-commit-failure")
+    {
+        return TestSetFileSizeRollsBackLocalSizeWhenNativeCommitFails();
+    }
+    if (name == "delete-on-close-rollback-native-commit-failure")
+    {
+        return TestDeleteOnCloseRestoresLocalNodeWhenNativeCommitFails();
+    }
+    if (name == "rename-replace-open-target-hydration")
+    {
+        return TestRenameReplaceKeepsOpenTargetHandleOnOldHydration();
+    }
+    if (name == "rename-replace-rollback-native-commit-failure")
+    {
+        return TestRenameReplaceRollsBackHydrationWhenNativeCommitFails();
+    }
 
     std::cerr << "[FAIL] Unknown selected FsHost semantics test: " << name << std::endl;
     return false;
@@ -5897,6 +6409,9 @@ int main(int argc, char** argv)
     ok &= TestRenameFailsWhenSourceDeleteIntentStateIsStale();
     ok &= TestRenameReplaceFailsWhenTargetDeletePending();
     ok &= TestRenameReplaceAllowsFileTargetWithAdditionalOpenHandle();
+    ok &= TestRenameRollsBackLocalNamespaceWhenNativeCommitFails();
+    ok &= TestRenameReplaceKeepsOpenTargetHandleOnOldHydration();
+    ok &= TestRenameReplaceRollsBackHydrationWhenNativeCommitFails();
     ok &= TestCleanupDeleteRequiresDeleteAccess();
     ok &= TestCleanupDeleteBlocksRenameUntilCloseRemovesSource();
     ok &= TestCloseRemovesEmptyDirectoryAfterCleanupDelete();
@@ -5917,6 +6432,8 @@ int main(int argc, char** argv)
     ok &= TestCleanupDeleteLatchesEvenWhenAdditionalHandlesRemain();
     ok &= TestCloseOnlyCommitsWhenDeleteMutationIsEmitted();
     ok &= TestDeleteOnCloseCommitsWhenDeleteIsLatching();
+    ok &= TestSetFileSizeRollsBackLocalSizeWhenNativeCommitFails();
+    ok &= TestDeleteOnCloseRestoresLocalNodeWhenNativeCommitFails();
     ok &= TestRenameDirectoryFailsWhenDescendantHandleOpen();
     ok &= TestRenameSourceHandleSucceedsWithOnlyCurrentHandleOpen();
     ok &= TestRenameTargetParentRequiresFileInsertPermission();

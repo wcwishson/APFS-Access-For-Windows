@@ -83,6 +83,7 @@ struct Node
 {
     std::wstring path;
     std::wstring apfs_path;
+    std::wstring hydration_key;
     bool is_directory = false;
     std::uint64_t file_size = 0;
     FILETIME timestamp{};
@@ -239,6 +240,12 @@ struct MountContext
     std::unique_ptr<apfsaccess::rw::TransactionManager> tx_manager;
     std::filesystem::path tx_journal_file;
     std::unique_ptr<apfsaccess::rw::MetadataStore> metadata_store;
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+    bool test_force_native_mutation_staging_success = false;
+    std::optional<apfsaccess::rw::MetadataStore::CommitStatus> test_forced_native_commit_status;
+    std::wstring test_forced_native_commit_recovery_reason;
+    bool test_forced_native_commit_recovery_required = false;
+#endif
 #endif
 };
 
@@ -2511,7 +2518,8 @@ std::shared_ptr<Node> FindNode(MountContext* c, const std::wstring& path)
 
 std::filesystem::path HydrationPath(MountContext* c, const Node& n)
 {
-    auto key = Key(n.path) + L"|" + c->args.device + L"|" + c->args.volume;
+    const auto node_key = n.hydration_key.empty() ? Key(n.path) : n.hydration_key;
+    auto key = node_key + L"|" + c->args.device + L"|" + c->args.volume;
     auto hash = (unsigned long long)std::hash<std::wstring>{}(key);
     auto root = c && !c->cache_root.empty()
         ? c->cache_root
@@ -2591,6 +2599,259 @@ void ForgetNamedStreamsLocked(MountContext* c, const std::wstring& base_path)
     }
 
     c->named_stream_sizes.erase(Key(base_path));
+}
+
+struct LocalFileRollbackSnapshot
+{
+    std::wstring path_key;
+    bool has_named_streams = false;
+    std::unordered_map<std::wstring, std::uint64_t> named_streams;
+    bool hydration_moved = false;
+    std::filesystem::path hydration_path;
+    std::filesystem::path hydration_backup_path;
+};
+
+bool MoveFileAsideForRollbackLocked(
+    MountContext* c,
+    const std::shared_ptr<Node>& node,
+    const wchar_t* tag,
+    LocalFileRollbackSnapshot& snapshot)
+{
+    if (!c || !node || node->is_directory)
+    {
+        return true;
+    }
+
+    snapshot.path_key = Key(node->path);
+    auto stream_it = c->named_stream_sizes.find(snapshot.path_key);
+    if (stream_it != c->named_stream_sizes.end())
+    {
+        snapshot.has_named_streams = true;
+        snapshot.named_streams = stream_it->second;
+    }
+
+    snapshot.hydration_path = HydrationPath(c, *node);
+    std::error_code ec;
+    const auto hydration_exists = std::filesystem::exists(snapshot.hydration_path, ec);
+    if (!hydration_exists || ec)
+    {
+        return !ec;
+    }
+
+    const auto backup_name = snapshot.hydration_path.filename().wstring() +
+        L"." +
+        (tag && *tag ? std::wstring(tag) : std::wstring(L"rollback")) +
+        L"." +
+        std::to_wstring(GetTickCount64()) +
+        L".tmp";
+    snapshot.hydration_backup_path = snapshot.hydration_path.parent_path() / backup_name;
+    std::filesystem::rename(
+        snapshot.hydration_path,
+        snapshot.hydration_backup_path,
+        ec);
+    if (ec)
+    {
+        snapshot.hydration_backup_path.clear();
+        return false;
+    }
+    snapshot.hydration_moved = true;
+    return true;
+}
+
+void RestoreFileRollbackSnapshotLocked(MountContext* c, const LocalFileRollbackSnapshot& snapshot)
+{
+    if (!c || snapshot.path_key.empty())
+    {
+        return;
+    }
+
+    if (snapshot.has_named_streams)
+    {
+        c->named_stream_sizes[snapshot.path_key] = snapshot.named_streams;
+    }
+    else
+    {
+        c->named_stream_sizes.erase(snapshot.path_key);
+    }
+
+    std::error_code ec;
+    if (snapshot.hydration_moved && !snapshot.hydration_backup_path.empty())
+    {
+        std::filesystem::create_directories(snapshot.hydration_path.parent_path(), ec);
+        ec.clear();
+        std::filesystem::remove(snapshot.hydration_path, ec);
+        ec.clear();
+        std::filesystem::rename(
+            snapshot.hydration_backup_path,
+            snapshot.hydration_path,
+            ec);
+    }
+}
+
+void DiscardFileRollbackSnapshot(const LocalFileRollbackSnapshot& snapshot)
+{
+    if (!snapshot.hydration_backup_path.empty())
+    {
+        std::error_code ec;
+        std::filesystem::remove(snapshot.hydration_backup_path, ec);
+    }
+}
+
+struct RenameLocalSnapshot
+{
+    std::shared_ptr<Node> node;
+    std::wstring old_path;
+    std::wstring new_path;
+    std::wstring old_hydration_key;
+    FILETIME old_timestamp{};
+    std::shared_ptr<Node> old_parent;
+    std::shared_ptr<Node> new_parent;
+    std::wstring old_leaf;
+    std::wstring new_leaf;
+    std::shared_ptr<Node> replaced_node;
+    bool replaced_node_was_present = false;
+    bool node_reindexed = false;
+    LocalFileRollbackSnapshot replaced_file_snapshot;
+};
+
+struct SetFileSizeRollbackSnapshot
+{
+    std::uint64_t previous_size = 0;
+    FILETIME previous_timestamp{};
+    std::uint64_t tail_offset = 0;
+    std::filesystem::path tail_backup_path;
+};
+
+bool CaptureSetFileSizeRollbackTail(
+    HANDLE file,
+    const std::filesystem::path& hydration_path,
+    std::uint64_t previous_size,
+    std::uint64_t new_size,
+    SetFileSizeRollbackSnapshot& snapshot)
+{
+    snapshot.previous_size = previous_size;
+    snapshot.tail_offset = new_size;
+    if (file == INVALID_HANDLE_VALUE || new_size >= previous_size)
+    {
+        return true;
+    }
+
+    const auto backup_name = hydration_path.filename().wstring() +
+        L".set-size-tail." +
+        std::to_wstring(GetTickCount64()) +
+        L".tmp";
+    snapshot.tail_backup_path = hydration_path.parent_path() / backup_name;
+
+    std::error_code ec;
+    std::filesystem::create_directories(snapshot.tail_backup_path.parent_path(), ec);
+    if (ec)
+    {
+        snapshot.tail_backup_path.clear();
+        return false;
+    }
+
+    HANDLE backup = CreateFileW(
+        snapshot.tail_backup_path.wstring().c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
+        nullptr);
+    if (backup == INVALID_HANDLE_VALUE)
+    {
+        snapshot.tail_backup_path.clear();
+        return false;
+    }
+
+    std::vector<std::byte> buffer(1024 * 1024);
+    std::uint64_t remaining = previous_size - new_size;
+    std::uint64_t offset = new_size;
+    bool ok = true;
+    while (remaining > 0)
+    {
+        const auto chunk = static_cast<DWORD>(std::min<std::uint64_t>(remaining, buffer.size()));
+        OVERLAPPED read_ov{};
+        read_ov.Offset = static_cast<DWORD>(offset & 0xffffffffull);
+        read_ov.OffsetHigh = static_cast<DWORD>(offset >> 32);
+        DWORD read = 0;
+        if (!ReadFile(file, buffer.data(), chunk, &read, &read_ov) || read != chunk)
+        {
+            ok = false;
+            break;
+        }
+
+        DWORD written = 0;
+        if (!WriteFile(backup, buffer.data(), read, &written, nullptr) || written != read)
+        {
+            ok = false;
+            break;
+        }
+
+        remaining -= read;
+        offset += read;
+    }
+
+    CloseHandle(backup);
+    if (!ok)
+    {
+        std::filesystem::remove(snapshot.tail_backup_path, ec);
+        snapshot.tail_backup_path.clear();
+    }
+    return ok;
+}
+
+void RestoreSetFileSizeRollbackTail(HANDLE file, const SetFileSizeRollbackSnapshot& snapshot)
+{
+    if (file == INVALID_HANDLE_VALUE || snapshot.tail_backup_path.empty())
+    {
+        return;
+    }
+
+    HANDLE backup = CreateFileW(
+        snapshot.tail_backup_path.wstring().c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (backup == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    std::vector<std::byte> buffer(1024 * 1024);
+    std::uint64_t offset = snapshot.tail_offset;
+    while (true)
+    {
+        DWORD read = 0;
+        if (!ReadFile(backup, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr) || read == 0)
+        {
+            break;
+        }
+
+        OVERLAPPED write_ov{};
+        write_ov.Offset = static_cast<DWORD>(offset & 0xffffffffull);
+        write_ov.OffsetHigh = static_cast<DWORD>(offset >> 32);
+        DWORD written = 0;
+        if (!WriteFile(file, buffer.data(), read, &written, &write_ov) || written != read)
+        {
+            break;
+        }
+        offset += written;
+    }
+
+    CloseHandle(backup);
+}
+
+void DiscardSetFileSizeRollbackTail(const SetFileSizeRollbackSnapshot& snapshot)
+{
+    if (!snapshot.tail_backup_path.empty())
+    {
+        std::error_code ec;
+        std::filesystem::remove(snapshot.tail_backup_path, ec);
+    }
 }
 
 bool EnsureHydrated(MountContext* c, const std::shared_ptr<Node>& n, bool allow_empty_placeholder = false)
@@ -2800,6 +3061,7 @@ bool MergeCommittedInodeStateIntoNodeIndex(MountContext* c)
 
         auto created = std::make_shared<Node>();
         created->path = normalized;
+        created->hydration_key = Key(normalized);
         created->is_directory = true;
         created->file_size = 0;
         created->timestamp = now;
@@ -2846,6 +3108,7 @@ bool MergeCommittedInodeStateIntoNodeIndex(MountContext* c)
         }
 
         node->path = normalized_path;
+        node->hydration_key = Key(normalized_path);
         node->is_directory = inode.is_directory;
         node->file_size = inode.is_directory ? 0 : inode.logical_size;
         node->timestamp = inode.timestamp_utc != 0 ? ToFileTime(inode.timestamp_utc) : now;
@@ -3011,6 +3274,13 @@ bool IsNativeMutationWriteEnabled(const MountContext* c)
     }
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+    if (c->test_force_native_mutation_staging_success)
+    {
+        return true;
+    }
+#endif
+
     std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
     if (!c->metadata_store)
     {
@@ -3258,7 +3528,19 @@ bool RecordNativeMutationBestEffort(
     bool replace_if_exists = false,
     std::uint64_t timestamp_utc = 0)
 {
-    if (!IsNativeWriteEnabled(c) || !c || !c->metadata_store)
+    if (!c || !IsNativeWriteEnabled(c))
+    {
+        return true;
+    }
+
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+    if (c->test_force_native_mutation_staging_success)
+    {
+        return UpdateRecoveryMarkerBestEffort(c, true);
+    }
+#endif
+
+    if (!c->metadata_store)
     {
         return true;
     }
@@ -3463,10 +3745,23 @@ bool CommitMutationJournalBestEffort(MountContext* c)
 
 NTSTATUS CommitNativeMutationsBestEffort(MountContext* c, const wchar_t* origin)
 {
-    if (!c || !IsNativeWriteEnabled(c) || !c->metadata_store)
+    if (!c || !IsNativeWriteEnabled(c))
     {
         return STATUS_SUCCESS;
     }
+
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+    const bool forced_commit_status = c->test_forced_native_commit_status.has_value();
+    if (!forced_commit_status && !c->metadata_store)
+    {
+        return STATUS_SUCCESS;
+    }
+#else
+    if (!c->metadata_store)
+    {
+        return STATUS_SUCCESS;
+    }
+#endif
 
     std::lock_guard<std::mutex> commit_lock(c->commit_mutex);
 
@@ -3481,15 +3776,27 @@ NTSTATUS CommitNativeMutationsBestEffort(MountContext* c, const wchar_t* origin)
     {
         std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
         ArmCommitDeadline(c);
-        require_canonical_gate = RequiresCanonicalMutationGate(c->args);
-        canonical_ready_before_commit = c->metadata_store->IsCanonicalCommitReady();
-        commit_status = require_canonical_gate
-            ? c->metadata_store->CommitCanonicalTransaction()
-            : c->metadata_store->CommitTransaction();
-        final_commit_stage = c->metadata_store->LastCommitStage();
-        committed_xid = c->metadata_store->LastCommittedXid();
-        metadata_recovery_reason = c->metadata_store->RecoveryReason();
-        metadata_recovery_required = c->metadata_store->IsRecoveryRequired();
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+        if (forced_commit_status)
+        {
+            commit_status = *c->test_forced_native_commit_status;
+            metadata_recovery_reason = c->test_forced_native_commit_recovery_reason;
+            metadata_recovery_required = c->test_forced_native_commit_recovery_required;
+            final_commit_stage = "unit-test-forced";
+        }
+        else
+#endif
+        {
+            require_canonical_gate = RequiresCanonicalMutationGate(c->args);
+            canonical_ready_before_commit = c->metadata_store->IsCanonicalCommitReady();
+            commit_status = require_canonical_gate
+                ? c->metadata_store->CommitCanonicalTransaction()
+                : c->metadata_store->CommitTransaction();
+            final_commit_stage = c->metadata_store->LastCommitStage();
+            committed_xid = c->metadata_store->LastCommittedXid();
+            metadata_recovery_reason = c->metadata_store->RecoveryReason();
+            metadata_recovery_required = c->metadata_store->IsRecoveryRequired();
+        }
         if (metadata_recovery_reason.empty() &&
             require_canonical_gate &&
             !canonical_ready_before_commit &&
@@ -3677,6 +3984,29 @@ void FinalizeMutationJournalBestEffort(MountContext* c, const wchar_t* origin)
         (void)WriteHostStatusFile(*c, c->recovery_active, c->runtime_last_commit_xid);
     }
 }
+
+void AbortMutationJournalBestEffort(MountContext* c, const wchar_t* origin)
+{
+    if (!c || !c->tx_manager)
+    {
+        return;
+    }
+
+    bool aborted = false;
+    {
+        std::lock_guard<std::mutex> lock(c->tx_mutex);
+        const auto state = c->tx_manager->CurrentState();
+        if (state != apfsaccess::rw::TransactionManager::State::Idle)
+        {
+            aborted = c->tx_manager->Abort();
+        }
+    }
+
+    if (!aborted)
+    {
+        std::wcerr << L"[FsHost] RW journal warning: failed to abort transaction journal during " << origin << L"." << std::endl;
+    }
+}
 #endif
 
 NTSTATUS HandleMutationWriteDisabled(MountContext* c, const wchar_t* operation)
@@ -3862,21 +4192,100 @@ bool RemoveNodeRecursiveLocked(MountContext* c, const std::shared_ptr<Node>& nod
     return true;
 }
 
-void ReindexNodePathsLocked(MountContext* c, const std::shared_ptr<Node>& node, const std::wstring& old_path, const std::wstring& new_path)
+void RestoreNodeRecursiveLocked(MountContext* c, const std::shared_ptr<Node>& node)
 {
     if (!c || !node)
     {
         return;
     }
 
+    c->nodes[Key(node->path)] = node;
+    if (node->path != L"\\")
+    {
+        auto parent = TryGetNodeLocked(c, Parent(node->path));
+        if (parent && parent->is_directory)
+        {
+            AddChildName(parent->children, LeafName(node->path));
+        }
+    }
+
+    if (!node->is_directory)
+    {
+        return;
+    }
+
+    for (const auto& child_name : node->children)
+    {
+        auto child = TryGetNodeLocked(c, Join(node->path, child_name));
+        if (!child)
+        {
+            continue;
+        }
+
+        RestoreNodeRecursiveLocked(c, child);
+    }
+}
+
+bool ReindexNodePathsLocked(MountContext* c, const std::shared_ptr<Node>& node, const std::wstring& old_path, const std::wstring& new_path)
+{
+    if (!c || !node)
+    {
+        return false;
+    }
+
     const auto old_key = Key(old_path);
     const auto new_key = Key(new_path);
+    const auto old_hydration_key = node->hydration_key;
+    const auto target_hydration_key =
+        (node->hydration_key.empty() || node->hydration_key == old_key)
+            ? new_key
+            : node->hydration_key;
+
+    if (!node->is_directory)
+    {
+        std::error_code ec;
+        Node old_node{};
+        old_node.path = old_path;
+        old_node.hydration_key = old_hydration_key.empty() ? old_key : old_hydration_key;
+        Node new_node{};
+        new_node.path = new_path;
+        new_node.hydration_key = target_hydration_key;
+        auto old_h = HydrationPath(c, old_node);
+        auto new_h = HydrationPath(c, new_node);
+        if (old_h != new_h && std::filesystem::exists(old_h, ec))
+        {
+            std::filesystem::create_directories(new_h.parent_path(), ec);
+            if (std::filesystem::exists(new_h, ec))
+            {
+                std::filesystem::remove(new_h, ec);
+                if (ec)
+                {
+                    return false;
+                }
+            }
+            std::filesystem::rename(old_h, new_h, ec);
+            if (ec)
+            {
+                ec.clear();
+                std::filesystem::copy_file(old_h, new_h, std::filesystem::copy_options::overwrite_existing, ec);
+                if (ec)
+                {
+                    return false;
+                }
+                else
+                {
+                    std::filesystem::remove(old_h, ec);
+                }
+            }
+        }
+    }
 
     if (auto current = c->nodes.find(old_key); current != c->nodes.end())
     {
         c->nodes.erase(current);
     }
 
+    node->hydration_key = target_hydration_key;
     node->path = new_path;
     c->nodes[new_key] = node;
 
@@ -3889,22 +4298,11 @@ void ReindexNodePathsLocked(MountContext* c, const std::shared_ptr<Node>& node, 
             c->named_stream_sizes.erase(stream_map);
             c->named_stream_sizes[new_key] = std::move(streams);
         }
-
-        std::error_code ec;
-        Node old_node{};
-        old_node.path = old_path;
-        auto old_h = HydrationPath(c, old_node);
-        auto new_h = HydrationPath(c, *node);
-        if (std::filesystem::exists(old_h, ec))
-        {
-            std::filesystem::create_directories(new_h.parent_path(), ec);
-            std::filesystem::rename(old_h, new_h, ec);
-        }
     }
 
     if (!node->is_directory)
     {
-        return;
+        return true;
     }
 
     for (const auto& child_name : node->children)
@@ -3914,8 +4312,38 @@ void ReindexNodePathsLocked(MountContext* c, const std::shared_ptr<Node>& node, 
         auto child = TryGetNodeLocked(c, child_old_path);
         if (child)
         {
-            ReindexNodePathsLocked(c, child, child_old_path, child_new_path);
+            if (!ReindexNodePathsLocked(c, child, child_old_path, child_new_path))
+            {
+                return false;
+            }
         }
+    }
+    return true;
+}
+
+void RollbackRenameLocalStateLocked(MountContext* c, const RenameLocalSnapshot& snapshot)
+{
+    if (!c || !snapshot.node || !snapshot.node_reindexed)
+    {
+        return;
+    }
+
+    (void)ReindexNodePathsLocked(c, snapshot.node, snapshot.new_path, snapshot.old_path);
+    snapshot.node->hydration_key = snapshot.old_hydration_key;
+    snapshot.node->timestamp = snapshot.old_timestamp;
+    if (snapshot.old_parent && snapshot.old_parent->is_directory)
+    {
+        AddChildName(snapshot.old_parent->children, snapshot.old_leaf);
+    }
+    if (snapshot.new_parent && snapshot.new_parent->is_directory)
+    {
+        RemoveChildName(snapshot.new_parent->children, snapshot.new_leaf);
+    }
+
+    if (snapshot.replaced_node_was_present && snapshot.replaced_node)
+    {
+        RestoreNodeRecursiveLocked(c, snapshot.replaced_node);
+        RestoreFileRollbackSnapshotLocked(c, snapshot.replaced_file_snapshot);
     }
 }
 
@@ -4318,6 +4746,7 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
         node = std::make_shared<Node>();
         node->path = path;
         node->apfs_path.clear();
+        node->hydration_key = Key(path);
         node->is_directory = request_directory;
         node->file_size = 0;
         node->timestamp = UtcNow();
@@ -4771,6 +5200,18 @@ NTSTATUS CB_SetFileSize(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT64 size, BOOLEAN, FS
         return STATUS_SUCCESS;
     }
 
+    SetFileSizeRollbackSnapshot rollback_snapshot{};
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        rollback_snapshot.previous_size = o->node->file_size;
+        rollback_snapshot.previous_timestamp = o->node->timestamp;
+    }
+    const auto hydration_path = HydrationPath(c, *o->node);
+    if (!CaptureSetFileSizeRollbackTail(o->file, hydration_path, rollback_snapshot.previous_size, size, rollback_snapshot))
+    {
+        return STATUS_UNSUCCESSFUL;
+    }
+
 #ifdef APFSACCESS_HAS_RW_ENGINE
     if (IsNativeWriteEnabled(c) &&
         !RecordNativeMutationBestEffort(
@@ -4781,6 +5222,7 @@ NTSTATUS CB_SetFileSize(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT64 size, BOOLEAN, FS
             0,
             size))
     {
+        DiscardSetFileSizeRollbackTail(rollback_snapshot);
         return BlockNativeMutationAfterStagingFailure(c, L"SetFileSize");
     }
 #endif
@@ -4795,6 +5237,7 @@ NTSTATUS CB_SetFileSize(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT64 size, BOOLEAN, FS
             (void)BlockNativeMutationAfterStagingFailure(c, L"SetFileSize");
         }
 #endif
+        DiscardSetFileSizeRollbackTail(rollback_snapshot);
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -4815,10 +5258,23 @@ NTSTATUS CB_SetFileSize(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT64 size, BOOLEAN, FS
     const auto native_commit_status = CommitNativeMutationsBestEffort(c, L"SetFileSize");
     if (!NT_SUCCESS(native_commit_status))
     {
+        LARGE_INTEGER rollback_target{};
+        rollback_target.QuadPart = rollback_snapshot.previous_size;
+        (void)SetFilePointerEx(o->file, rollback_target, nullptr, FILE_BEGIN);
+        (void)SetEndOfFile(o->file);
+        RestoreSetFileSizeRollbackTail(o->file, rollback_snapshot);
+        {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            o->node->file_size = rollback_snapshot.previous_size;
+            o->node->timestamp = rollback_snapshot.previous_timestamp;
+            FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
+        }
+        DiscardSetFileSizeRollbackTail(rollback_snapshot);
         return native_commit_status;
     }
     FinalizeMutationJournalBestEffort(c, L"SetFileSize");
 #endif
+    DiscardSetFileSizeRollbackTail(rollback_snapshot);
     return STATUS_SUCCESS;
 }
 
@@ -5062,6 +5518,7 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
     auto new_parent_path = Parent(new_path);
     auto old_leaf = old_path.substr(old_path.find_last_of(L'\\') + 1);
     auto new_leaf = new_path.substr(new_path.find_last_of(L'\\') + 1);
+    RenameLocalSnapshot rename_snapshot{};
 
     {
         std::lock_guard<std::mutex> lock(c->mutex);
@@ -5194,9 +5651,29 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
             {
                 return STATUS_DIRECTORY_NOT_EMPTY;
             }
-            if (existing->is_directory && !CanRemoveNodeRecursiveLocked(c, existing))
+            const bool allow_open_file_replace = !existing->is_directory;
+            if (!CanRemoveNodeRecursiveLocked(c, existing, allow_open_file_replace))
             {
                 return STATUS_SHARING_VIOLATION;
+            }
+        }
+
+        rename_snapshot.node = node;
+        rename_snapshot.old_path = old_path;
+        rename_snapshot.new_path = new_path;
+        rename_snapshot.old_hydration_key = node->hydration_key;
+        rename_snapshot.old_timestamp = node->timestamp;
+        rename_snapshot.old_parent = old_parent;
+        rename_snapshot.new_parent = new_parent;
+        rename_snapshot.old_leaf = old_leaf;
+        rename_snapshot.new_leaf = new_leaf;
+        if (existing && existing != node)
+        {
+            rename_snapshot.replaced_node = existing;
+            rename_snapshot.replaced_node_was_present = true;
+            if (!MoveFileAsideForRollbackLocked(c, existing, L"rename-replaced", rename_snapshot.replaced_file_snapshot))
+            {
+                return STATUS_UNSUCCESSFUL;
             }
         }
 
@@ -5209,22 +5686,42 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
                 new_path,
                 0,
                 0,
-                replace_if_exists != FALSE))
+        replace_if_exists != FALSE))
         {
+            RestoreFileRollbackSnapshotLocked(c, rename_snapshot.replaced_file_snapshot);
+            DiscardFileRollbackSnapshot(rename_snapshot.replaced_file_snapshot);
             return BlockNativeMutationAfterStagingFailure(c, L"Rename");
         }
 #endif
 
         if (existing && existing != node)
         {
-            RemoveNodeRecursiveLocked(c, existing);
+            const bool allow_open_file_replace = !existing->is_directory;
+            if (!RemoveNodeRecursiveLocked(c, existing, allow_open_file_replace))
+            {
+                RestoreFileRollbackSnapshotLocked(c, rename_snapshot.replaced_file_snapshot);
+                DiscardFileRollbackSnapshot(rename_snapshot.replaced_file_snapshot);
+                return STATUS_SHARING_VIOLATION;
+            }
             RemoveChildName(new_parent->children, new_leaf);
         }
 
         RemoveChildName(old_parent->children, old_leaf);
         AddChildName(new_parent->children, new_leaf);
-        ReindexNodePathsLocked(c, node, old_path, new_path);
+        if (!ReindexNodePathsLocked(c, node, old_path, new_path))
+        {
+            AddChildName(old_parent->children, old_leaf);
+            RemoveChildName(new_parent->children, new_leaf);
+            if (existing && existing != node)
+            {
+                RestoreNodeRecursiveLocked(c, existing);
+                RestoreFileRollbackSnapshotLocked(c, rename_snapshot.replaced_file_snapshot);
+            }
+            DiscardFileRollbackSnapshot(rename_snapshot.replaced_file_snapshot);
+            return STATUS_UNSUCCESSFUL;
+        }
         node->timestamp = UtcNow();
+        rename_snapshot.node_reindexed = true;
     }
 #ifdef APFSACCESS_HAS_RW_ENGINE
     RecordMutationBestEffort(
@@ -5238,10 +5735,14 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
     const auto native_commit_status = CommitNativeMutationsBestEffort(c, L"Rename");
     if (!NT_SUCCESS(native_commit_status))
     {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        RollbackRenameLocalStateLocked(c, rename_snapshot);
+        DiscardFileRollbackSnapshot(rename_snapshot.replaced_file_snapshot);
         return native_commit_status;
     }
     FinalizeMutationJournalBestEffort(c, L"Rename");
 #endif
+    DiscardFileRollbackSnapshot(rename_snapshot.replaced_file_snapshot);
     return STATUS_SUCCESS;
 }
 
@@ -5366,6 +5867,10 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
     bool emit_delete_mutation = false;
     bool had_delete_on_cleanup = false;
     std::wstring deleted_path;
+    std::shared_ptr<Node> deleted_node;
+    std::shared_ptr<Node> deleted_parent;
+    std::wstring deleted_leaf;
+    LocalFileRollbackSnapshot deleted_file_snapshot;
     if (c && o->node)
     {
         std::lock_guard<std::mutex> lock(c->mutex);
@@ -5409,6 +5914,17 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
             auto parent_path = Parent(deleted_path);
             auto leaf = deleted_path.substr(deleted_path.find_last_of(L'\\') + 1);
             auto parent = TryGetNodeLocked(c, parent_path);
+            deleted_node = o->node;
+            deleted_parent = parent;
+            deleted_leaf = leaf;
+            if (!MoveFileAsideForRollbackLocked(c, o->node, L"delete-close", deleted_file_snapshot))
+            {
+                o->node->delete_latched = false;
+                o->node->delete_pending = false;
+                RefreshDeletePendingStateLocked(c, o->node);
+                delete o;
+                return;
+            }
             if (parent && parent->is_directory)
             {
                 RemoveChildName(parent->children, leaf);
@@ -5441,8 +5957,26 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
             std::wcerr << L"[FsHost] RW native-commit warning (Close): finalize-on-close commit failed with status 0x"
                 << std::hex << static_cast<unsigned long>(close_commit_status) << std::dec
                 << L"." << std::endl;
+            std::lock_guard<std::mutex> lock(c->mutex);
+            if (deleted_node && deleted_path != L"\\")
+            {
+                deleted_node->delete_latched = false;
+                deleted_node->delete_pending = false;
+                deleted_node->delete_intent_count = 0;
+                c->nodes[Key(deleted_path)] = deleted_node;
+                if (deleted_parent && deleted_parent->is_directory)
+                {
+                    AddChildName(deleted_parent->children, deleted_leaf);
+                }
+                RestoreFileRollbackSnapshotLocked(c, deleted_file_snapshot);
+            }
+            AbortMutationJournalBestEffort(c, L"Close");
+            DiscardFileRollbackSnapshot(deleted_file_snapshot);
+            delete o;
+            return;
         }
         FinalizeMutationJournalBestEffort(c, L"Close");
+        DiscardFileRollbackSnapshot(deleted_file_snapshot);
     }
 #endif
     delete o;
@@ -6378,6 +6912,7 @@ int wmain(int argc, wchar_t** argv)
     FILETIME now{}; GetSystemTimeAsFileTime(&now);
     auto root = std::make_shared<Node>();
     root->path = L"\\";
+    root->hydration_key = Key(root->path);
     root->apfs_path = ApfsRoot(args);
     root->is_directory = true;
     root->timestamp = now;
