@@ -275,13 +275,29 @@ public sealed class ApfsMountWorker : BackgroundService
         bool clearUserEjectedVolumes,
         CancellationToken cancellationToken
     )
+        => await RefreshAsync(clearUserEjectedVolumes, volumeId: null, cancellationToken).ConfigureAwait(false);
+
+    public async Task<(bool Success, string Message)> RefreshAsync(
+        bool clearUserEjectedVolumes,
+        string? volumeId,
+        CancellationToken cancellationToken
+    )
     {
         await _mountOperationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             if (clearUserEjectedVolumes)
             {
-                _userEjectedVolumeIds.Clear();
+                if (string.IsNullOrWhiteSpace(volumeId))
+                {
+                    _userEjectedVolumeIds.Clear();
+                }
+                else
+                {
+                    _userEjectedVolumeIds.Remove(volumeId);
+                }
+
+                await RemountUpgradeableReadOnlyVolumesAsync(volumeId, cancellationToken).ConfigureAwait(false);
             }
 
             await RunCycleCoreAsync(cancellationToken).ConfigureAwait(false);
@@ -290,6 +306,104 @@ public sealed class ApfsMountWorker : BackgroundService
         finally
         {
             _mountOperationLock.Release();
+        }
+    }
+
+    private async Task RemountUpgradeableReadOnlyVolumesAsync(string? volumeId, CancellationToken cancellationToken)
+    {
+        var options = _optionsMonitor.CurrentValue;
+        if (!options.AutoMountEnabled || !options.EnableNativeWrite)
+        {
+            return;
+        }
+
+        var mounted = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+        var readOnlyMounts = mounted
+            .Where(static mount => mount.AccessMode == MountAccessMode.ReadOnly)
+            .ToArray();
+        if (readOnlyMounts.Length == 0)
+        {
+            return;
+        }
+
+        var volumeById = new Dictionary<string, VolumeInfo>(StringComparer.OrdinalIgnoreCase);
+        var devices = await _backend.ProbeDevicesAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var device in devices.Where(static device => device.IsConnected))
+        {
+            var volumes = await _backend.ProbeVolumesAsync(device.DeviceId, cancellationToken).ConfigureAwait(false);
+            foreach (var volume in volumes)
+            {
+                volumeById[volume.VolumeId] = volume;
+            }
+        }
+
+        var warnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var mountedVolumeIds = new HashSet<string>(mounted.Select(static mount => mount.VolumeId), StringComparer.OrdinalIgnoreCase);
+        var usedLetters = new HashSet<char>(
+            mounted
+                .Select(TryGetDriveLetter)
+                .Where(static ch => ch.HasValue)
+                .Select(static ch => ch!.Value)
+        );
+
+        foreach (var mount in readOnlyMounts)
+        {
+            if (!string.IsNullOrWhiteSpace(volumeId) &&
+                !string.Equals(mount.VolumeId, volumeId, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (!volumeById.TryGetValue(mount.VolumeId, out var volume))
+            {
+                continue;
+            }
+
+            if (!_mountPolicy.ShouldAutoMount(volume) ||
+                options.SkipEncryptedVolumes && volume.IsEncrypted ||
+                !volume.SupportsExplorerMount)
+            {
+                continue;
+            }
+
+            var writeDecision = WriteGatePolicy.EvaluateForVolume(options, volume);
+            if (!writeDecision.AllowWrite)
+            {
+                continue;
+            }
+
+            var driveLetter = TryGetDriveLetter(mount);
+            if (!driveLetter.HasValue)
+            {
+                continue;
+            }
+
+            var unmounted = await UnmountAsync([mount], cancellationToken, warnings).ConfigureAwait(false);
+            if (unmounted.Count == 0)
+            {
+                continue;
+            }
+
+            mountedVolumeIds.Remove(mount.VolumeId);
+            usedLetters.Remove(driveLetter.Value);
+            var (success, _, warning, _) = await TryMountAsync(
+                volume,
+                options,
+                usedLetters,
+                cancellationToken
+            ).ConfigureAwait(false);
+            if (!success)
+            {
+                continue;
+            }
+
+            mountedVolumeIds.Add(mount.VolumeId);
+            _mountedOnce.Add(mount.VolumeId);
+            _missingVolumeProbeCounts.Remove(mount.VolumeId);
+            if (!string.IsNullOrWhiteSpace(warning))
+            {
+                warnings.Add(warning);
+            }
         }
     }
 

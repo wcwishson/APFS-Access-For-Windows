@@ -3083,6 +3083,10 @@ bool CorruptCommitBlobDropLastBtreeRecordWithValidChecksum(
     std::size_t& out_magic_offset)
 {
     out_magic_offset = 0;
+    constexpr std::array<char, 12> kReplayCheckpointMagic =
+    {
+        'A', 'P', 'F', 'S', 'R', 'W', 'R', 'P', 'L', '1', '\0', '\0'
+    };
     constexpr std::array<unsigned char, 13> kCommitBlobMagic =
     {
         'A', 'P', 'F', 'S', 'R', 'W', 'S', 'C', 'A', 'F', 'F', '3', '\0'
@@ -3124,8 +3128,85 @@ bool CorruptCommitBlobDropLastBtreeRecordWithValidChecksum(
         return false;
     }
 
+    struct ReplayReference
+    {
+        std::uint64_t target_xid = 0;
+        std::uint64_t commit_blob_address = 0;
+        std::uint64_t commit_blob_bytes = 0;
+    };
+    std::optional<ReplayReference> selected_reference;
+    const auto total_blocks = image.size() / kBlockSize;
+    for (std::size_t block_index = 0; block_index < total_blocks; ++block_index)
+    {
+        const auto block_offset = block_index * kBlockSize;
+        if ((block_offset + kReplayCheckpointMagic.size()) > image.size())
+        {
+            break;
+        }
+
+        bool replay_magic_matches = true;
+        for (std::size_t index = 0; index < kReplayCheckpointMagic.size(); ++index)
+        {
+            if (std::to_integer<unsigned char>(image[block_offset + index]) !=
+                static_cast<unsigned char>(kReplayCheckpointMagic[index]))
+            {
+                replay_magic_matches = false;
+                break;
+            }
+        }
+        if (!replay_magic_matches)
+        {
+            continue;
+        }
+
+        const auto payload_bytes = static_cast<std::size_t>(ReadLe32(image, block_offset + 24));
+        if (payload_bytes < 24 || payload_bytes > (kBlockSize - kCheckpointHeaderBytes))
+        {
+            continue;
+        }
+
+        const auto target_xid = ReadLe64(image, block_offset + 12);
+        const auto commit_blob_address = ReadLe64(image, block_offset + kCheckpointHeaderBytes + 8);
+        const auto commit_blob_bytes = ReadLe64(image, block_offset + kCheckpointHeaderBytes + 16);
+        if (target_xid == 0 ||
+            commit_blob_address == 0 ||
+            commit_blob_bytes == 0 ||
+            commit_blob_address > static_cast<std::uint64_t>(image.size()) ||
+            commit_blob_bytes > static_cast<std::uint64_t>(image.size()) ||
+            commit_blob_address > (std::numeric_limits<std::uint64_t>::max() - commit_blob_bytes) ||
+            (commit_blob_address + commit_blob_bytes) > static_cast<std::uint64_t>(image.size()))
+        {
+            continue;
+        }
+
+        if (!selected_reference.has_value() || target_xid > selected_reference->target_xid)
+        {
+            selected_reference = ReplayReference
+            {
+                target_xid,
+                commit_blob_address,
+                commit_blob_bytes,
+            };
+        }
+    }
+    if (!selected_reference.has_value())
+    {
+        return false;
+    }
+
     for (std::size_t offset = 0; offset <= (image.size() - kCommitBlobMagic.size()); ++offset)
     {
+        if (offset != static_cast<std::size_t>(selected_reference->commit_blob_address))
+        {
+            continue;
+        }
+        const auto commit_blob_end = offset + static_cast<std::size_t>(selected_reference->commit_blob_bytes);
+        if (commit_blob_end > image.size() ||
+            (offset + kCommitBlobPayloadOffset) > commit_blob_end)
+        {
+            return false;
+        }
+
         bool magic_matches = true;
         for (std::size_t index = 0; index < kCommitBlobMagic.size(); ++index)
         {
@@ -3157,7 +3238,7 @@ bool CorruptCommitBlobDropLastBtreeRecordWithValidChecksum(
                 return false;
             }
             const auto next = cursor + static_cast<std::size_t>(bytes);
-            if (next > image.size())
+            if (next > commit_blob_end)
             {
                 return false;
             }
@@ -3177,7 +3258,7 @@ bool CorruptCommitBlobDropLastBtreeRecordWithValidChecksum(
         btree_record_end_offsets.reserve(btree_records);
         for (std::uint32_t index = 0; index < btree_records; ++index)
         {
-            if (cursor > image.size() || 16 > (image.size() - cursor))
+            if (cursor > commit_blob_end || 16 > (commit_blob_end - cursor))
             {
                 return false;
             }
@@ -3188,7 +3269,7 @@ bool CorruptCommitBlobDropLastBtreeRecordWithValidChecksum(
 
             const auto payload_size = static_cast<std::uint64_t>(key_size) + static_cast<std::uint64_t>(value_size);
             if (payload_size > (std::numeric_limits<std::size_t>::max() - cursor) ||
-                (cursor + static_cast<std::size_t>(payload_size)) > image.size())
+                (cursor + static_cast<std::size_t>(payload_size)) > commit_blob_end)
             {
                 return false;
             }
@@ -3207,7 +3288,7 @@ bool CorruptCommitBlobDropLastBtreeRecordWithValidChecksum(
         const auto new_payload_end = updated_btree_records == 0
             ? btree_records_start
             : btree_record_end_offsets[updated_btree_records - 1];
-        if (new_payload_end < (offset + kCommitBlobPayloadOffset) || new_payload_end > image.size())
+        if (new_payload_end < (offset + kCommitBlobPayloadOffset) || new_payload_end > commit_blob_end)
         {
             return false;
         }

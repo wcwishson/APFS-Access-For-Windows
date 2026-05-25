@@ -10,6 +10,75 @@
 
 ---
 
+## Current Status As Of 2026-05-22
+
+**Branch:** `optimize/read-write-performance`
+
+**Implementation state:** All planned hardening tasks have been implemented as checkpoint commits. The remaining work is validation and promotion, not new plan execution.
+
+**Completed checkpoints:**
+
+- [x] Task 1: Add user-facing Explorer/SHA-256 integrity validation harness. Commit: `e5fbe0a Add Explorer workflow integrity validation`
+- [x] Task 2: Enforce copy-on-write for committed file writes. Commit: `28b28a1 Harden APFS file writes with copy-on-write extents`
+- [x] Task 3: Fix rename-replace and local rollback on commit failure. Commit: `fa21fea Harden FsHost rename and mutation rollback`
+- [x] Task 4: Remove full-file hydration as required read path. Commit: `d7e3aa0 Stream committed file reads without full hydration`
+- [x] Task 5: Strengthen fragmented-extent accounting. Commit: `47f31ac Validate fragmented APFS extent accounting`
+- [x] Task 6: Add torn-write and power-loss fault injection. Commit: `2cfaa41 Add torn-write recovery fault coverage`
+- [x] Task 7: Stabilize mount, eject, and read-only fallback lifecycle. Commit: `b57cfd9 Harden APFS mount and eject lifecycle`
+- [x] Task 8: Unify recovery reason priority and user messages. Commit: `c6d38a1 Unify native recovery diagnostics`
+- [x] Task 9: Add named-stream, Office, recycle-bin, and path edge matrices. Commit: `3710f55 Expand Explorer workflow edge coverage`
+
+**Latest delta from Task 9:**
+
+- Missing read-only alternate data stream probes such as `:Zone.Identifier`, `:LH.Identifier`, and `:AFP_AfpInfo` now fail cleanly with not-found semantics instead of surfacing as device failures.
+- Duplicate-case alternate data streams now coalesce to one stream metadata entry.
+- Office-style lock-file and temp-save rename-replace workflows have focused FsHost semantics coverage.
+- Recycle-bin `$I` metadata and `$R` payload pair workflows have focused FsHost semantics coverage.
+- Risky Win32 path components are rejected before mutation, including reserved device names, invalid characters, trailing dot/space names, and over-255-character components.
+- The physical Explorer workflow script is pinned by tests so SHA-256 format fixtures, recycle phases, many-small-file coverage, long-name coverage, and large-file roundtrips cannot be accidentally removed.
+
+**Verification already run for the latest checkpoint:**
+
+- Built `ApfsAccess.FsHost.SemanticsTests` with CMake in `C:\apfsaccess_native\build-fixed22\Release`.
+- Ran focused FsHost incremental plus new edge tests:
+  `recycle-bin-attributes volume-acl-flag stable-volume-serial named-stream-copy-compatibility named-stream-hidden-metadata legacy-named-stream-artifacts-hidden flush-finalizes-pending-journal metadata-read-open-no-hydration writable-sparse-hydration missing-named-stream-clean-failure duplicate-case-named-streams office-temp-rename-replace-workflow recycle-bin-metadata-pair-workflow path-normalization-edge-matrix`
+- Ran focused service script tests:
+  `PhysicalRwValidation_IncludesExplorerWorkflowIntegrityMode`, `PhysicalRwValidation_ScriptParses`, and `PhysicalRwValidation_CaseOnlyRenameUsesCaseSensitiveEntryCheck`.
+- Ran `git diff --check`.
+- 2026-05-22 validation pass after recursive directory delete hardening:
+  - Clean native Release build: `pwsh -NoProfile -File .\scripts\build_native_host.ps1 -Configuration Release`.
+  - Focused recursive-delete/recycle/volume FsHost semantics cluster passed.
+  - Clean portable publish: `pwsh -NoProfile -File .\build\publish.ps1 -Configuration Release -Runtime win-x64`; root `APFSAccess_Portable.exe` overwritten.
+  - Full native Release CTest at `C:\apfsaccess_native\build\Release`: 7/7 passed.
+  - Full APFS RW engine Release CTest: 6/6 passed, including conformance, conformance fault, fault injection, persistence, canonical store, and transaction lifecycle tests.
+  - Full .NET Release solution tests: 392/392 passed.
+  - Physical `Smoke` validation on mounted `E:\` passed, including recursive directory delete and post-status RW/healthy.
+  - Physical `ExplorerWorkflow` validation on mounted `E:\` passed with SHA-256 checks for format-like fixtures, rename/move/cut-paste, direct delete, recycle-style delete/restore, many-small-file sweep, long-name path, and a 64 MiB large-file roundtrip. Report: `artifacts\physical-rw-validation\physical-rw-explorerworkflow-20260522-194514.json`.
+  - Focused script regression after manifest-path reporting fix: 7/7 `PhysicalRwValidation` service tests passed.
+  - Physical `Smoke` validation after manifest-path reporting fix passed. Report: `artifacts\physical-rw-validation\physical-rw-smoke-20260522-194814.json`.
+  - Real service/tray-pipe eject path validated by sending `EjectRequested` for `\\.\PhysicalDrive2|Main`: ACK succeeded with `APFS drive E: (Main) was safely ejected.`, `E:\` disappeared, `RefreshRequested(clearUserEjectedVolumes=true)` remounted it, and new host PID `57420` reported Native/PilotReadWrite/recovery inactive/dirty count zero.
+  - Physical `Smoke` validation after service eject/remount passed against host PID `57420`. Report: `artifacts\physical-rw-validation\physical-rw-smoke-20260522-195307.json`.
+
+**Remaining validation gates before promotion:**
+
+- [x] Run full FsHost semantics suite.
+- [x] Run APFS RW engine conformance tests.
+- [x] Run APFS RW engine fault-injection tests.
+- [x] Run relevant .NET backend, service, tray, and core tests.
+- [x] Build the updated portable app artifact.
+- [x] Run physical Explorer-style validation on the real APFS drive with SHA-256:
+  create, copy in, rename, move within drive, cut/paste out, copy back, direct delete, recycle delete/restore, large-file roundtrip, and many-small-file sweep.
+- [x] Run non-manual eject/remount lifecycle validation:
+  service/tray-pipe eject removes `E:\`, refresh remounts the still-connected drive, and remounted host status is RW/healthy.
+- [ ] Run disruptive physical lifecycle validation when the user is ready:
+  unplug/replug, launch-before-plug, and plug-before-launch.
+- [ ] Confirm remaining disruptive hard user-facing gates:
+  no stale drive letter after physical unplug and expected automount behavior across app/drive launch order.
+- [x] Confirm non-disruptive hard user-facing gates:
+  no recycle-bin corruption warning in physical workflow, no stale drive letter after service eject, no unexpected read-only fallback after ordinary file operations, host status healthy, recovery inactive, and dirty transaction count zero.
+
+---
+
 ## Why SHA-256 Belongs In The Test Plan
 
 SHA-256 before/after comparison is one of the best practical tests for this app because APFS Access is ultimately moving bytes through a filesystem boundary. File formats like PNG, DOCX, XLSX, PDF, ZIP, and EXE do not need separate content logic in the filesystem layer; if their SHA-256 hashes match after copy, move, remount, and copy-back, the file bytes survived exactly.

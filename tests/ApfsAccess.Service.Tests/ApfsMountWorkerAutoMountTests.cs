@@ -54,6 +54,92 @@ public sealed class ApfsMountWorkerAutoMountTests
     }
 
     [Fact]
+    public async Task Refresh_RemountsReadOnlyVolumeWhenWriteBecomesAvailable()
+    {
+        var backend = new ControllableBackend
+        {
+            SupportsNativeWrite = false,
+        };
+        var worker = CreateWorker(
+            backend,
+            new RuntimeStatusPublisher(),
+            new ServiceHostOptions
+            {
+                AutoMountEnabled = true,
+                EnableNativeWrite = true,
+                WriteRolloutChannel = "Enabled",
+                ReadWriteMode = "RwWithRoFallback",
+                AllowWriteOnUnsupportedFeatures = false,
+                NativeWriteAllowRawPhysicalDevices = true,
+                NativeWritePromotionPolicy = "PilotHardware",
+            });
+
+        await InvokeRunCycleAsync(worker);
+        var readOnlyMount = Assert.Single(await backend.GetMountStateAsync(CancellationToken.None));
+        Assert.Equal(MountAccessMode.ReadOnly, readOnlyMount.AccessMode);
+
+        backend.SupportsNativeWrite = true;
+        var refresh = await worker.RefreshAsync(clearUserEjectedVolumes: true, CancellationToken.None);
+
+        Assert.True(refresh.Success);
+        var readWriteMount = Assert.Single(await backend.GetMountStateAsync(CancellationToken.None));
+        Assert.Equal(MountAccessMode.ReadWrite, readWriteMount.AccessMode);
+        Assert.Equal(2, backend.MountAttempts);
+        Assert.Contains("R:\\", backend.UnmountHistory);
+    }
+
+    [Fact]
+    public async Task Refresh_TargetedFixRemountsOnlySelectedReadOnlyVolume()
+    {
+        var backend = new ControllableBackend
+        {
+            IncludeSecondaryVolume = true,
+            SupportsNativeWrite = false,
+            SecondarySupportsNativeWrite = false,
+        };
+        var worker = CreateWorker(
+            backend,
+            new RuntimeStatusPublisher(),
+            new ServiceHostOptions
+            {
+                AutoMountEnabled = true,
+                EnableNativeWrite = true,
+                WriteRolloutChannel = "Enabled",
+                ReadWriteMode = "RwWithRoFallback",
+                AllowWriteOnUnsupportedFeatures = false,
+                NativeWriteAllowRawPhysicalDevices = true,
+                NativeWritePromotionPolicy = "PilotHardware",
+            },
+            new SequentialMountPolicy('R', 'S'));
+
+        await InvokeRunCycleAsync(worker);
+        var initialMounts = (await backend.GetMountStateAsync(CancellationToken.None))
+            .OrderBy(static mount => mount.MountPoint, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var initialMountByVolumeId = initialMounts.ToDictionary(
+            static mount => mount.VolumeId,
+            StringComparer.OrdinalIgnoreCase);
+        Assert.Collection(
+            initialMounts,
+            mount => Assert.Equal(MountAccessMode.ReadOnly, mount.AccessMode),
+            mount => Assert.Equal(MountAccessMode.ReadOnly, mount.AccessMode));
+
+        backend.SupportsNativeWrite = true;
+        backend.SecondarySupportsNativeWrite = true;
+        var refresh = await InvokeTargetedRefreshAsync(worker, ControllableBackend.VolumeId);
+
+        Assert.True(refresh.Success);
+        var remounted = (await backend.GetMountStateAsync(CancellationToken.None))
+            .ToDictionary(static mount => mount.VolumeId, StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(MountAccessMode.ReadWrite, remounted[ControllableBackend.VolumeId].AccessMode);
+        Assert.Equal(MountAccessMode.ReadOnly, remounted[ControllableBackend.SecondaryVolumeId].AccessMode);
+        Assert.Equal(2, backend.MountAttemptsByVolumeId[ControllableBackend.VolumeId]);
+        Assert.Equal(1, backend.MountAttemptsByVolumeId[ControllableBackend.SecondaryVolumeId]);
+        Assert.Contains(initialMountByVolumeId[ControllableBackend.VolumeId].MountPoint, backend.UnmountHistory);
+        Assert.DoesNotContain(initialMountByVolumeId[ControllableBackend.SecondaryVolumeId].MountPoint, backend.UnmountHistory);
+    }
+
+    [Fact]
     public async Task Eject_FailsAndKeepsMountVisibleWhenDriveLetterStillExists()
     {
         var backend = new ControllableBackend { KeepStaleMountAfterUnmount = true };
@@ -150,11 +236,12 @@ public sealed class ApfsMountWorkerAutoMountTests
     private static ApfsMountWorker CreateWorker(
         IApfsBackend backend,
         RuntimeStatusPublisher statusPublisher,
-        ServiceHostOptions options)
+        ServiceHostOptions options,
+        IMountPolicy? mountPolicy = null)
         => new(
             NullLogger<ApfsMountWorker>.Instance,
             backend,
-            new FixedMountPolicy('R'),
+            mountPolicy ?? new FixedMountPolicy('R'),
             statusPublisher,
             new FixedOptionsMonitor(options)
         );
@@ -171,14 +258,39 @@ public sealed class ApfsMountWorkerAutoMountTests
         await task;
     }
 
+    private static async Task<(bool Success, string Message)> InvokeTargetedRefreshAsync(
+        ApfsMountWorker worker,
+        string volumeId)
+    {
+        var method = typeof(ApfsMountWorker).GetMethod(
+            "RefreshAsync",
+            [
+                typeof(bool),
+                typeof(string),
+                typeof(CancellationToken),
+            ]);
+        Assert.NotNull(method);
+
+        var result = method!.Invoke(worker, [true, volumeId, CancellationToken.None]);
+        var task = Assert.IsAssignableFrom<Task<(bool Success, string Message)>>(result);
+        return await task;
+    }
+
     private sealed class ControllableBackend : IApfsBackend
     {
         public const string DeviceId = @"\\.\PhysicalDrive9";
         public const string VolumeId = DeviceId + "|Main";
+        public const string SecondaryVolumeId = DeviceId + "|Archive";
 
         private readonly Dictionary<string, MountedVolumeState> _mounts = new(StringComparer.OrdinalIgnoreCase);
 
         public bool IsConnected { get; set; } = true;
+
+        public bool SupportsNativeWrite { get; set; }
+
+        public bool IncludeSecondaryVolume { get; set; }
+
+        public bool SecondarySupportsNativeWrite { get; set; }
 
         public bool KeepStaleMountAfterUnmount { get; init; }
 
@@ -187,6 +299,14 @@ public sealed class ApfsMountWorkerAutoMountTests
         private readonly Dictionary<string, int> _unmountAttemptsByMountPoint = new(StringComparer.OrdinalIgnoreCase);
 
         private readonly HashSet<string> _unmountedMountPoints = new(StringComparer.OrdinalIgnoreCase);
+
+        private readonly List<string> _unmountHistory = [];
+
+        public IReadOnlyList<string> UnmountHistory => _unmountHistory;
+
+        private readonly Dictionary<string, int> _mountAttemptsByVolumeId = new(StringComparer.OrdinalIgnoreCase);
+
+        public IReadOnlyDictionary<string, int> MountAttemptsByVolumeId => _mountAttemptsByVolumeId;
 
         public int MountAttempts { get; private set; }
 
@@ -203,16 +323,39 @@ public sealed class ApfsMountWorkerAutoMountTests
         public Task<IReadOnlyList<VolumeInfo>> ProbeVolumesAsync(string deviceId, CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            return Task.FromResult<IReadOnlyList<VolumeInfo>>(
-                IsConnected && string.Equals(deviceId, DeviceId, StringComparison.OrdinalIgnoreCase)
-                    ? [new VolumeInfo(VolumeId, DeviceId, "Main", SupportsReadWrite: true)]
-                    : []);
+            if (!IsConnected || !string.Equals(deviceId, DeviceId, StringComparison.OrdinalIgnoreCase))
+            {
+                return Task.FromResult<IReadOnlyList<VolumeInfo>>([]);
+            }
+
+            List<VolumeInfo> volumes =
+            [
+                new VolumeInfo(
+                    VolumeId,
+                    DeviceId,
+                    "Main",
+                    SupportsReadWrite: true,
+                    SupportsNativeWrite: SupportsNativeWrite)
+            ];
+            if (IncludeSecondaryVolume)
+            {
+                volumes.Add(new VolumeInfo(
+                    SecondaryVolumeId,
+                    DeviceId,
+                    "Archive",
+                    SupportsReadWrite: true,
+                    SupportsNativeWrite: SecondarySupportsNativeWrite));
+            }
+
+            return Task.FromResult<IReadOnlyList<VolumeInfo>>(volumes);
         }
 
         public Task<MountResult> MountAsync(MountRequest request, CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
             MountAttempts++;
+            _mountAttemptsByVolumeId.TryGetValue(request.VolumeId, out var attempts);
+            _mountAttemptsByVolumeId[request.VolumeId] = attempts + 1;
 
             if (!IsConnected)
             {
@@ -229,7 +372,7 @@ public sealed class ApfsMountWorkerAutoMountTests
                 request.VolumeId,
                 mountPoint,
                 request.AccessMode,
-                VolumeName: "Main",
+                VolumeName: string.Equals(request.VolumeId, SecondaryVolumeId, StringComparison.OrdinalIgnoreCase) ? "Archive" : "Main",
                 DeviceId: DeviceId,
                 DeviceDisplayName: "Test APFS USB");
 
@@ -246,6 +389,7 @@ public sealed class ApfsMountWorkerAutoMountTests
         {
             cancellationToken.ThrowIfCancellationRequested();
             _unmountedMountPoints.Add(mountPoint);
+            _unmountHistory.Add(mountPoint);
             _unmountAttemptsByMountPoint.TryGetValue(mountPoint, out var attempts);
             _unmountAttemptsByMountPoint[mountPoint] = attempts + 1;
             if (!KeepStaleMountAfterUnmount || attempts > 0)
@@ -278,6 +422,30 @@ public sealed class ApfsMountWorkerAutoMountTests
             _ = volume;
             _ = usedLetters;
             return driveLetter;
+        }
+
+        public bool ShouldAutoMount(VolumeInfo volume)
+        {
+            _ = volume;
+            return true;
+        }
+    }
+
+    private sealed class SequentialMountPolicy(params char[] driveLetters) : IMountPolicy
+    {
+        public char SelectDriveLetter(VolumeInfo volume, IReadOnlySet<char> usedLetters)
+        {
+            _ = volume;
+            foreach (var driveLetter in driveLetters)
+            {
+                var normalized = char.ToUpperInvariant(driveLetter);
+                if (!usedLetters.Contains(normalized))
+                {
+                    return normalized;
+                }
+            }
+
+            return char.ToUpperInvariant(driveLetters[^1]);
         }
 
         public bool ShouldAutoMount(VolumeInfo volume)

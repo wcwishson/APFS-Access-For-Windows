@@ -1,4 +1,74 @@
-# APFS Access 1.0.0
+# APFS Access Release Notes
+
+## Current Release
+
+This update improves APFS Access for everyday use with a new dashboard, stronger write-path hardening, and more reliable eject/fix behavior.
+
+### Download
+
+Most users should download:
+
+- `APFSAccess_Portable.exe`
+
+Advanced users may also download the click-run zip for the same release.
+
+### Quick Start
+
+1. Download `APFSAccess_Portable.exe`.
+2. Double-click it.
+3. Approve the administrator prompt.
+4. Let the app install WinFsp and the Microsoft Visual C++ runtime if it asks.
+5. Plug in an APFS drive.
+6. Use the APFS Access dashboard or open This PC and use the mounted drive letter.
+
+### What Changed
+
+- Added a dashboard window that opens with the app and lists APFS volumes by physical drive, volume name, drive letter, and health state.
+- Added color-coded drive states: green for healthy read/write, yellow for read-only, orange for attention-needed, red for problem/recovery, and gray for idle/starting.
+- Added per-volume dashboard actions: `Open`, `Eject`, `Fix`, and `Details`.
+- Left-clicking the tray icon now opens the dashboard. Closing the dashboard keeps the app running in the tray.
+- `Fix` can safely refresh and remount recoverable APFS volumes, including read-only mounts and safely-ejected-but-still-connected volumes.
+- `Eject` and tray eject labels include the physical drive and APFS volume name when available.
+- Improved mount lifecycle behavior so service-level eject removes the stale drive letter and refresh can remount the still-connected drive.
+- Hardened write behavior around copy-on-write file updates, rename/replace rollback, fragmented extents, torn-write recovery, and recovery diagnostics.
+- Expanded user-facing Explorer workflow validation with SHA-256 integrity checks, Office-style save patterns, recycle-bin workflows, named-stream edge cases, many-small-file sweeps, long paths, and large-file roundtrips.
+
+### User-Facing Behavior
+
+- `Healthy read/write` means normal Explorer write operations are enabled.
+- `Read-only` means APFS Access can read the volume but did not currently consider writes safe.
+- `Needs attention` means an operation is settling, a warning is present, or a safe refresh may help.
+- `Problem` means APFS Access found an error or recovery-blocked state.
+- `Fix` first tries a safe refresh/remount. If software recovery cannot restore the drive, use the dashboard details and unplug/replug guidance.
+- Eject APFS drives from the dashboard or tray before unplugging.
+
+### Known Limits
+
+- No signed installer yet, so Windows SmartScreen may warn on first run.
+- Encrypted APFS volumes are not supported.
+- Some APFS roles and feature combinations are mounted read-only or skipped.
+- Writable mode remains conservative and may fall back to read-only.
+- Performance depends on the APFS drive, USB adapter, Windows storage stack, and the current native engine path.
+- The latest GUI/eject/fix pass was validated with focused tests and physical smoke; a later full solution test attempt timed out before reporting a final pass/fail summary.
+
+### Validation
+
+The latest pass was validated with:
+
+- Focused service auto-mount/eject/fix tests: 8/8 passed.
+- IPC tests: 6/6 passed.
+- Tray/dashboard tests: 66/66 passed.
+- `git diff --check` completed with no whitespace errors, only existing CRLF conversion warnings.
+- Portable publish completed and root `APFSAccess_Portable.exe` was overwritten.
+- Live APFS physical smoke on `E:\` passed: create, copy, SHA-256 readback, direct write, rename, move, cut/paste, recursive copy, delete, edge paths, and post-status health.
+- Live service IPC eject/remount cycle passed: `E:\` disappeared after eject, FsHost exited, refresh remounted the same connected drive, and post-status returned to read/write with recovery inactive.
+- The user's manual Explorer operations on the drive were also reported working.
+
+### Appendix: Technical Notes
+
+APFS Access uses a background service to discover APFS volumes, a tray/dashboard app for user status/control, and a native WinFsp host to expose APFS volumes as Windows drive letters. The native write path is fail-closed: commit readiness, recovery status, unsupported APFS features, and validation gates are checked before writable mode is allowed. When those checks do not pass, the mount is downgraded to read-only where possible.
+
+## APFS Access 1.0.0
 
 APFS Access 1.0.0 is the first public release of APFS Access for Windows. It packages the tray app, background service, native APFS reader/writer, and WinFsp mount host into a portable Windows download.
 

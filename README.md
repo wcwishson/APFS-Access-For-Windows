@@ -18,12 +18,17 @@ The portable launcher automatically extracts the app under `%LOCALAPPDATA%\ApfsA
 
 ## What You Should See
 
-APFS Access runs from the Windows system tray.
+APFS Access opens a small dashboard and also runs from the Windows system tray.
 
-- The tray icon says `starting` while the service starts.
-- It says `idle` when no APFS volume is mounted.
-- It says `mounted RO` for read-only mounts.
-- It says `mounted RW` when writable mode is active.
+- The dashboard lists mounted APFS volumes with the physical drive name, volume name, drive letter, and health state.
+- Green means healthy read/write.
+- Yellow means read-only but usable.
+- Orange means mounted but attention may be needed.
+- Red means APFS Access found a problem or recovery-blocked state.
+- Gray means starting, idle, or no APFS drive is mounted.
+- The dashboard has `Open`, `Eject`, `Fix`, and `Details` actions for each volume.
+- Closing the dashboard keeps APFS Access running in the tray.
+- Left-click the tray icon to reopen the dashboard.
 - Right-click the tray icon to eject APFS drives or quit the app.
 
 When a supported APFS volume is mounted, it appears in This PC with a normal drive letter. Use it from Explorer, file dialogs, terminals, and other Windows apps.
@@ -38,7 +43,9 @@ Common supported operations:
 - Create files and folders on writable APFS mounts.
 - Copy files onto writable APFS mounts.
 - Rename, move, cut/paste, and delete files on writable APFS mounts.
-- Eject APFS mounts from the tray before unplugging the drive.
+- Eject APFS mounts from the dashboard or tray before unplugging the drive.
+- Use `Fix` when a drive is read-only, safely ejected but still connected, or needs a safe refresh/remount.
+- Use `Details` when you want to see why a drive is read-only or degraded.
 
 APFS Access is conservative. If a volume is encrypted, special-purpose, uses unsupported APFS features, or fails a write-safety check, the app keeps it read-only instead of risking damage.
 
@@ -62,7 +69,7 @@ Most people should use:
 
 Advanced users may also download:
 
-- `APFSAccess-1.0.0-win-x64-click-run.zip`
+- `APFSAccess-<version>-win-x64-click-run.zip`
 
 The zip contains the extracted app folder, helper scripts, and `README_RUN.txt`. It is useful if you want to inspect or run the app without the single-file portable wrapper.
 
@@ -80,17 +87,25 @@ APFS Access has write support, but it is deliberately guarded.
 
 If no drive appears:
 
-1. Check the tray icon tooltip.
+1. Check the dashboard status and tray icon tooltip.
 2. Make sure the app was allowed to run as administrator.
 3. Install WinFsp and the Microsoft Visual C++ runtime if prompted.
 4. Unplug and replug the APFS drive.
-5. Right-click the tray icon, choose Quit, then start APFS Access again.
+5. Try the dashboard `Fix` action.
+6. Right-click the tray icon, choose Quit, then start APFS Access again.
 
 If the drive appears read-only:
 
 - The app could read the volume but did not consider writable mode safe for that volume.
 - You can still copy files from APFS to Windows.
-- Try another APFS data volume if you need write access.
+- Try the dashboard `Fix` action. It will refresh and remount the drive if writable mode is safe.
+- Try another APFS data volume if you still need write access.
+
+If eject does not finish:
+
+- Close Explorer windows, terminals, Office files, previews, and other apps using the APFS drive.
+- Click `Eject` again from the dashboard or tray.
+- If Windows still holds the drive busy, quit APFS Access from the tray before unplugging.
 
 If Windows SmartScreen warns about the app:
 

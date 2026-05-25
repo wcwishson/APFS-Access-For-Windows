@@ -628,6 +628,108 @@ bool TestDirectoryAndDeleteConformance(const std::filesystem::path& run_root)
     return ok;
 }
 
+bool TestDirectorySubtreeDeleteConformance(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "directory_subtree_delete.apfs.img";
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, "TestDirectorySubtreeDeleteConformance: unable to create synthetic container");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        L"DirectorySubtreeDelete",
+    };
+    apfsaccess::rw::MetadataStore store(context);
+    bool ok = true;
+    ok &= Require(store.LoadContainerSuperblocks(), "DirectorySubtreeDelete: LoadContainerSuperblocks should succeed");
+    ok &= Require(store.LoadObjectMap(), "DirectorySubtreeDelete: LoadObjectMap should succeed");
+    ok &= Require(store.LoadSpacemanState(), "DirectorySubtreeDelete: LoadSpacemanState should succeed");
+    ok &= Require(store.PrepareNativeWritePath(), "DirectorySubtreeDelete: PrepareNativeWritePath should succeed");
+
+    std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+    ConfigurePayloadProvider(store, staged_payloads);
+
+    apfsaccess::rw::MetadataStore::MutationRequest create_directory{};
+    create_directory.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateDirectory;
+    create_directory.path = L"\\tree";
+    ok &= ExpectMutationStatus(
+        store,
+        create_directory,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "DirectorySubtreeDelete: create tree should apply");
+
+    create_directory.path = L"\\tree\\child";
+    ok &= ExpectMutationStatus(
+        store,
+        create_directory,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "DirectorySubtreeDelete: create child directory should apply");
+
+    const auto payload = BuildPatternPayload(2048, 0x52);
+    if (!CreateAndCommitFile(
+            store,
+            staged_payloads,
+            L"\\tree\\child\\payload.bin",
+            payload.size(),
+            0x52,
+            "DirectorySubtreeDelete"))
+    {
+        return false;
+    }
+
+    apfsaccess::rw::MetadataStore::MutationRequest delete_tree_first{};
+    delete_tree_first.operation = apfsaccess::rw::MetadataStore::MutationOperation::Delete;
+    delete_tree_first.path = L"\\tree";
+    ok &= ExpectMutationStatus(
+        store,
+        delete_tree_first,
+        apfsaccess::rw::MetadataStore::MutationStatus::InvalidRequest,
+        "DirectorySubtreeDelete: deleting parent before children should fail");
+
+    apfsaccess::rw::MetadataStore::MutationRequest delete_payload{};
+    delete_payload.operation = apfsaccess::rw::MetadataStore::MutationOperation::Delete;
+    delete_payload.path = L"\\tree\\child\\payload.bin";
+    ok &= ExpectMutationStatus(
+        store,
+        delete_payload,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "DirectorySubtreeDelete: child payload delete should apply");
+    staged_payloads.erase(L"\\tree\\child\\payload.bin");
+
+    apfsaccess::rw::MetadataStore::MutationRequest delete_child{};
+    delete_child.operation = apfsaccess::rw::MetadataStore::MutationOperation::Delete;
+    delete_child.path = L"\\tree\\child";
+    ok &= ExpectMutationStatus(
+        store,
+        delete_child,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "DirectorySubtreeDelete: child directory delete after payload should apply");
+
+    apfsaccess::rw::MetadataStore::MutationRequest delete_tree{};
+    delete_tree.operation = apfsaccess::rw::MetadataStore::MutationOperation::Delete;
+    delete_tree.path = L"\\tree";
+    ok &= ExpectMutationStatus(
+        store,
+        delete_tree,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "DirectorySubtreeDelete: parent directory delete after children should apply");
+
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "DirectorySubtreeDelete: bottom-up subtree delete commit should succeed");
+
+    ok &= Require(
+        !store.LookupCommittedInodeByPath(L"\\tree").has_value() &&
+        !store.LookupCommittedInodeByPath(L"\\tree\\child").has_value() &&
+        !store.LookupCommittedInodeByPath(L"\\tree\\child\\payload.bin").has_value(),
+        "DirectorySubtreeDelete: committed view should remove the whole subtree");
+
+    return ok;
+}
+
 bool TestTruncateConformance(const std::filesystem::path& run_root)
 {
     const auto image_path = run_root / "truncate.apfs.img";
@@ -880,19 +982,15 @@ bool TestDirectorySubtreeRenameObjectMapConformance(const std::filesystem::path&
             leaf_after->object_id == leaf_before->object_id,
         "DirectorySubtreeRename: subtree rename should preserve inode object ids");
 
-    const auto a_object_after = store.LookupCommittedObject(a_after->object_id);
-    const auto b_object_after = store.LookupCommittedObject(b_after->object_id);
     const auto leaf_object_after = store.LookupCommittedObject(leaf_after->object_id);
-    ok &= Require(a_object_after.has_value(), "DirectorySubtreeRename: renamed root object-map entry should exist");
-    ok &= Require(b_object_after.has_value(), "DirectorySubtreeRename: renamed child object-map entry should exist");
+    ok &= Require(!store.LookupCommittedObject(a_after->object_id).has_value(), "DirectorySubtreeRename: renamed root directory should not consume a physical object-map slot");
+    ok &= Require(!store.LookupCommittedObject(b_after->object_id).has_value(), "DirectorySubtreeRename: renamed child directory should not consume a physical object-map slot");
     ok &= Require(leaf_object_after.has_value(), "DirectorySubtreeRename: renamed leaf object-map entry should exist");
-    if (a_object_after.has_value() && b_object_after.has_value() && leaf_object_after.has_value())
+    if (leaf_object_after.has_value())
     {
         ok &= Require(
-            a_object_after->xid == rename_xid &&
-                b_object_after->xid == rename_xid &&
-                leaf_object_after->xid == rename_xid,
-            "DirectorySubtreeRename: renamed subtree object-map xid projection should match rename commit xid");
+            leaf_object_after->xid == rename_xid,
+            "DirectorySubtreeRename: renamed file object-map xid projection should match rename commit xid");
     }
 
     std::vector<std::byte> persisted_leaf_payload;
@@ -2081,6 +2179,7 @@ int main()
 
     ok &= TestRenameReplaceConformance(run_root);
     ok &= TestDirectoryAndDeleteConformance(run_root);
+    ok &= TestDirectorySubtreeDeleteConformance(run_root);
     ok &= TestTruncateConformance(run_root);
     ok &= TestDirectorySubtreeRenameObjectMapConformance(run_root);
     ok &= TestPendingWriteDirectoryRenamePersistenceConformance(run_root);

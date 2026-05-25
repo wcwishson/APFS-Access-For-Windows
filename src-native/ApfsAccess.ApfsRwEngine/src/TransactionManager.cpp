@@ -5,6 +5,13 @@
 #include <iomanip>
 #include <sstream>
 #include <utility>
+#include <windows.h>
+#ifdef CreateFile
+#undef CreateFile
+#endif
+#ifdef CreateDirectory
+#undef CreateDirectory
+#endif
 
 namespace apfsaccess::rw
 {
@@ -131,67 +138,106 @@ bool TransactionManager::PersistTransactionLocked(const wchar_t* outcome) const
         return false;
     }
 
-    std::wofstream out(journal_file, std::ios::app);
+    std::ofstream out(journal_file, std::ios::binary | std::ios::app);
     if (!out.good())
     {
         return false;
     }
 
-    out << L"{\"transactionId\":" << current_transaction_id_
-        << L",\"safetyLevel\":\"" << EscapeJson(safety_level_)
-        << L"\",\"outcome\":\"" << (outcome ? outcome : L"unknown")
-        << L"\",\"mutationCount\":" << pending_mutations_.size()
-        << L",\"mutations\":[";
+    out << "{\"transactionId\":" << current_transaction_id_
+        << ",\"safetyLevel\":\"" << EscapeJsonUtf8(safety_level_)
+        << "\",\"outcome\":\"" << EscapeJsonUtf8(outcome ? std::wstring(outcome) : std::wstring(L"unknown"))
+        << "\",\"mutationCount\":" << pending_mutations_.size()
+        << ",\"mutations\":[";
 
     for (std::size_t i = 0; i < pending_mutations_.size(); ++i)
     {
         const auto& mutation = pending_mutations_[i];
         if (i != 0)
         {
-            out << L",";
+            out << ",";
         }
 
-        out << L"{\"kind\":\"" << MutationKindToString(mutation.kind)
-            << L"\",\"path\":\"" << EscapeJson(mutation.path)
-            << L"\",\"secondaryPath\":\"" << EscapeJson(mutation.secondary_path)
-            << L"\",\"offset\":" << mutation.offset
-            << L",\"length\":" << mutation.length
-            << L",\"replaceIfExists\":" << (mutation.replace_if_exists ? L"true" : L"false")
-            << L"}";
+        out << "{\"kind\":\"" << WideToUtf8(MutationKindToString(mutation.kind))
+            << "\",\"path\":\"" << EscapeJsonUtf8(mutation.path)
+            << "\",\"secondaryPath\":\"" << EscapeJsonUtf8(mutation.secondary_path)
+            << "\",\"offset\":" << mutation.offset
+            << ",\"length\":" << mutation.length
+            << ",\"replaceIfExists\":" << (mutation.replace_if_exists ? "true" : "false")
+            << "}";
     }
 
-    out << L"]}" << std::endl;
+    out << "]}\n";
     return out.good();
 }
 
-std::wstring TransactionManager::EscapeJson(const std::wstring& value)
+std::string TransactionManager::WideToUtf8(const std::wstring& value)
 {
-    std::wstring out;
-    out.reserve(value.size());
+    if (value.empty())
+    {
+        return {};
+    }
+
+    const int required = WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        value.data(),
+        static_cast<int>(value.size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr);
+    if (required <= 0)
+    {
+        return {};
+    }
+
+    std::string output(static_cast<std::size_t>(required), '\0');
+    const int written = WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        value.data(),
+        static_cast<int>(value.size()),
+        output.data(),
+        required,
+        nullptr,
+        nullptr);
+    if (written != required)
+    {
+        return {};
+    }
+
+    return output;
+}
+
+std::string TransactionManager::EscapeJsonUtf8(const std::wstring& value)
+{
+    std::wstring escaped;
+    escaped.reserve(value.size());
     for (const wchar_t ch : value)
     {
         switch (ch)
         {
-        case L'\\': out += L"\\\\"; break;
-        case L'"': out += L"\\\""; break;
-        case L'\r': out += L"\\r"; break;
-        case L'\n': out += L"\\n"; break;
-        case L'\t': out += L"\\t"; break;
+        case L'\\': escaped += L"\\\\"; break;
+        case L'"': escaped += L"\\\""; break;
+        case L'\r': escaped += L"\\r"; break;
+        case L'\n': escaped += L"\\n"; break;
+        case L'\t': escaped += L"\\t"; break;
         default:
             if (ch < 0x20)
             {
                 std::wostringstream hex;
                 hex << L"\\u" << std::hex << std::setw(4) << std::setfill(L'0') << static_cast<unsigned int>(ch);
-                out += hex.str();
+                escaped += hex.str();
             }
             else
             {
-                out.push_back(ch);
+                escaped.push_back(ch);
             }
             break;
         }
     }
-    return out;
+    return WideToUtf8(escaped);
 }
 
 const wchar_t* TransactionManager::MutationKindToString(MutationKind kind)

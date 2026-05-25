@@ -166,6 +166,13 @@ bool PhysicalRangeContains(std::uint64_t container_start, std::uint64_t containe
     return requested_end <= container_end;
 }
 
+bool HasPhysicalObjectMapping(const MetadataStore::ObjectMapUpdate& update) noexcept
+{
+    return update.object_id != 0 &&
+           update.physical_address != 0 &&
+           update.logical_size != 0;
+}
+
 bool ConservativePhysicalRangeContains(
     std::uint64_t extent_physical_address,
     std::uint64_t extent_bytes,
@@ -1000,6 +1007,11 @@ bool MetadataStore::LoadCanonicalState()
     object_map_entries.reserve(committed_object_map_.size());
     for (const auto& [_, update] : committed_object_map_)
     {
+        if (!HasPhysicalObjectMapping(update))
+        {
+            continue;
+        }
+
         object_map_entries.push_back(
             {
                 update.object_id,
@@ -2458,15 +2470,17 @@ bool MetadataStore::LoadObjectMapCheckpointBlock(std::uint64_t block_index, cons
     committed_object_map_.reserve(parsed_entries.size());
     for (const auto& entry : parsed_entries)
     {
-        committed_object_map_.emplace(
+        ObjectMapUpdate update
+        {
             entry.object_id,
-            ObjectMapUpdate
-            {
-                entry.object_id,
-                entry.physical_address,
-                entry.logical_size,
-                entry.xid
-            });
+            entry.physical_address,
+            entry.logical_size,
+            entry.xid
+        };
+        if (HasPhysicalObjectMapping(update))
+        {
+            committed_object_map_.emplace(entry.object_id, update);
+        }
     }
 
     if (persisted_xid > 0)
@@ -5293,7 +5307,14 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
 
     for (const auto& update : pending_object_map_updates_)
     {
-        committed_object_map_[update.object_id] = update;
+        if (HasPhysicalObjectMapping(update))
+        {
+            committed_object_map_[update.object_id] = update;
+        }
+        else
+        {
+            committed_object_map_.erase(update.object_id);
+        }
         committed_read_extents_.erase(update.object_id);
     }
     committed_spaceman_allocations_.insert(
@@ -5415,7 +5436,16 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         }
 
         constexpr std::size_t kObjectMapCheckpointEntryBytes = 32;
-        const auto required_bytes = kCheckpointHeaderBytes + (committed_object_map_.size() * kObjectMapCheckpointEntryBytes);
+        std::unordered_map<std::uint64_t, ObjectMapUpdate> persisted_object_map_snapshot;
+        persisted_object_map_snapshot.reserve(committed_object_map_.size());
+        for (const auto& [object_id, update] : committed_object_map_)
+        {
+            if (HasPhysicalObjectMapping(update))
+            {
+                persisted_object_map_snapshot.emplace(object_id, update);
+            }
+        }
+        const auto required_bytes = kCheckpointHeaderBytes + (persisted_object_map_snapshot.size() * kObjectMapCheckpointEntryBytes);
         const auto required_blocks = (required_bytes + static_cast<std::size_t>(block_size_) - 1) /
             static_cast<std::size_t>(block_size_);
         if (required_blocks == 0)
@@ -5444,13 +5474,13 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         loaded_superblock_checkpoint_xid_ = std::max(loaded_superblock_checkpoint_xid_, target_xid);
         if (!LoadObjectMapCheckpointBlock(checkpoint_candidate->first, checkpoint_candidate->second) ||
             last_committed_xid_.value_or(0) != target_xid ||
-            committed_object_map_.size() != committed_object_map_snapshot.size())
+            committed_object_map_.size() != persisted_object_map_snapshot.size())
         {
             restore_state();
             return false;
         }
 
-        for (const auto& [object_id, expected] : committed_object_map_snapshot)
+        for (const auto& [object_id, expected] : persisted_object_map_snapshot)
         {
             auto parsed = committed_object_map_.find(object_id);
             if (parsed == committed_object_map_.end())
@@ -7234,9 +7264,14 @@ bool MetadataStore::ReplayOrRecover()
                 {
                     return fail_recovery(L"ReplayCommitBlobInvalid");
                 }
+                if (parsed_inode_it == parsed_inodes_by_object.end() &&
+                    (!raw_inode_mutations_by_object.contains(object_id) ||
+                     !raw_inode_mutations_by_object.find(object_id)->second.tombstone))
+                {
+                    return fail_recovery(L"ReplayCommitBlobInvalid");
+                }
                 if (parsed_inode_it != parsed_inodes_by_object.end() &&
-                    (!parsed_inode_it->second.is_directory ||
-                     parsed_inode_it->second.logical_size != 0 ||
+                    (parsed_inode_it->second.logical_size != 0 ||
                      parsed_inode_it->second.data_physical_address != 0))
                 {
                     return fail_recovery(L"ReplayCommitBlobInvalid");
@@ -7263,13 +7298,20 @@ bool MetadataStore::ReplayOrRecover()
             }
 
             auto committed_it = committed_object_map_.find(object_id);
-            if (committed_it == committed_object_map_.end())
+            if (HasPhysicalObjectMapping(update))
             {
-                return fail_recovery(L"ReplayCommitBlobInvalid");
+                if (committed_it == committed_object_map_.end())
+                {
+                    return fail_recovery(L"ReplayCommitBlobInvalid");
+                }
+                if (committed_it->second.physical_address != update.physical_address ||
+                    committed_it->second.logical_size != update.logical_size ||
+                    committed_it->second.xid != update.xid)
+                {
+                    return fail_recovery(L"ReplayCommitBlobInvalid");
+                }
             }
-            if (committed_it->second.physical_address != update.physical_address ||
-                committed_it->second.logical_size != update.logical_size ||
-                committed_it->second.xid != update.xid)
+            else if (committed_it != committed_object_map_.end())
             {
                 return fail_recovery(L"ReplayCommitBlobInvalid");
             }
@@ -10422,13 +10464,24 @@ bool MetadataStore::ValidatePendingCommitState() const
         {
             return fail_pending(L"PendingObjectMapInvalid", update.object_id);
         }
-        effective_object_map[update.object_id] = update;
+        if (HasPhysicalObjectMapping(update))
+        {
+            effective_object_map[update.object_id] = update;
+        }
+        else
+        {
+            effective_object_map.erase(update.object_id);
+        }
     }
 
     std::vector<ApfsObjectMapEntry> effective_object_entries;
     effective_object_entries.reserve(effective_object_map.size());
     for (const auto& [_, update] : effective_object_map)
     {
+        if (!HasPhysicalObjectMapping(update))
+        {
+            continue;
+        }
         effective_object_entries.push_back(
             {
                 update.object_id,
@@ -11013,7 +11066,18 @@ bool MetadataStore::PersistObjectMapCheckpoint(std::uint64_t target_xid)
     constexpr std::size_t kHeaderBytes = kCheckpointHeaderBytes;
     constexpr std::size_t kEntryBytes = 32;
 
-    const auto required_bytes = kHeaderBytes + (committed_object_map_.size() * kEntryBytes);
+    std::vector<std::uint64_t> object_ids;
+    object_ids.reserve(committed_object_map_.size());
+    for (const auto& [object_id, update] : committed_object_map_)
+    {
+        if (HasPhysicalObjectMapping(update))
+        {
+            object_ids.push_back(object_id);
+        }
+    }
+    std::sort(object_ids.begin(), object_ids.end());
+
+    const auto required_bytes = kHeaderBytes + (object_ids.size() * kEntryBytes);
     if (block_size_ == 0 ||
         object_map_blocks.size() > (std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(block_size_)))
     {
@@ -11042,15 +11106,7 @@ bool MetadataStore::PersistObjectMapCheckpoint(std::uint64_t target_xid)
         block[index] = static_cast<std::byte>(kMagic[index]);
     }
     WriteLe64(block, 12, target_xid);
-    WriteLe32(block, 20, static_cast<std::uint32_t>(committed_object_map_.size()));
-
-    std::vector<std::uint64_t> object_ids;
-    object_ids.reserve(committed_object_map_.size());
-    for (const auto& [object_id, _] : committed_object_map_)
-    {
-        object_ids.push_back(object_id);
-    }
-    std::sort(object_ids.begin(), object_ids.end());
+    WriteLe32(block, 20, static_cast<std::uint32_t>(object_ids.size()));
 
     std::size_t cursor = kHeaderBytes;
     for (const auto object_id : object_ids)
@@ -12849,10 +12905,13 @@ bool MetadataStore::LoadPersistentState()
         {
             return false;
         }
-        auto [_, inserted] = committed_object_map_.emplace(entry.object_id, entry);
-        if (!inserted)
+        if (HasPhysicalObjectMapping(entry))
         {
-            return false;
+            auto [_, inserted] = committed_object_map_.emplace(entry.object_id, entry);
+            if (!inserted)
+            {
+                return false;
+            }
         }
     }
 
@@ -13379,6 +13438,17 @@ bool MetadataStore::PersistPersistentState(std::uint64_t commit_blob_address, st
             include_checksum);
     };
 
+    std::vector<std::uint64_t> persisted_object_ids;
+    persisted_object_ids.reserve(committed_object_map_.size());
+    for (const auto& [object_id, entry] : committed_object_map_)
+    {
+        if (HasPhysicalObjectMapping(entry))
+        {
+            persisted_object_ids.push_back(object_id);
+        }
+    }
+    std::sort(persisted_object_ids.begin(), persisted_object_ids.end());
+
     if (!write_raw(kMagic.data(), kMagic.size()) ||
         !write_u32(7) ||
         !write_u32(0, false) ||
@@ -13387,7 +13457,7 @@ bool MetadataStore::PersistPersistentState(std::uint64_t commit_blob_address, st
         !write_u64(next_ephemeral_extent_) ||
         !write_u64(commit_blob_address) ||
         !write_u64(commit_blob_bytes) ||
-        !write_u32(static_cast<std::uint32_t>(committed_object_map_.size())) ||
+        !write_u32(static_cast<std::uint32_t>(persisted_object_ids.size())) ||
         !write_u32(static_cast<std::uint32_t>(committed_spaceman_allocations_.size())) ||
         !write_u32(static_cast<std::uint32_t>(committed_inodes_.size())) ||
         !write_u32(static_cast<std::uint32_t>(committed_btree_records_.size())) ||
@@ -13399,12 +13469,19 @@ bool MetadataStore::PersistPersistentState(std::uint64_t commit_blob_address, st
         return false;
     }
 
-    for (const auto& [object_id, entry] : committed_object_map_)
+    for (const auto object_id : persisted_object_ids)
     {
+        const auto entry = committed_object_map_.find(object_id);
+        if (entry == committed_object_map_.end())
+        {
+            output.close();
+            std::filesystem::remove(tmp_path, ec);
+            return false;
+        }
         if (!write_u64(object_id) ||
-            !write_u64(entry.physical_address) ||
-            !write_u64(entry.logical_size) ||
-            !write_u64(entry.xid))
+            !write_u64(entry->second.physical_address) ||
+            !write_u64(entry->second.logical_size) ||
+            !write_u64(entry->second.xid))
         {
             output.close();
             std::filesystem::remove(tmp_path, ec);

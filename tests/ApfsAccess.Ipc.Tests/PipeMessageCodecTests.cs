@@ -137,7 +137,8 @@ public sealed class PipeMessageCodecTests
             new RefreshRequestedPayload(
                 Requester: "tester",
                 TimestampUtc: DateTime.UtcNow,
-                ClearUserEjectedVolumes: true),
+                ClearUserEjectedVolumes: true,
+                VolumeId: @"\\.\PhysicalDrive3|Main"),
             requestId: "refresh-1"
         );
 
@@ -154,6 +155,7 @@ public sealed class PipeMessageCodecTests
         Assert.NotNull(payload);
         Assert.Equal("tester", payload!.Requester);
         Assert.True(payload.ClearUserEjectedVolumes);
+        Assert.Equal(@"\\.\PhysicalDrive3|Main", payload.VolumeId);
     }
 
     [Fact]

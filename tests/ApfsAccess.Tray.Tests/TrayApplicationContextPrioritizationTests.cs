@@ -226,6 +226,14 @@ public sealed class TrayApplicationContextPrioritizationTests
     }
 
     [Fact]
+    public void FixRequestTimeout_AllowsServiceRefreshAndRemountBudget()
+    {
+        var timeout = InvokeFixRequestTimeout();
+
+        Assert.True(timeout >= TimeSpan.FromSeconds(60));
+    }
+
+    [Fact]
     public void ResetEjectMenu_DisablesAndClearsStaleEntries()
     {
         using var menuItem = new ToolStripMenuItem("Eject stale");
@@ -319,6 +327,17 @@ public sealed class TrayApplicationContextPrioritizationTests
     {
         var field = typeof(TrayApplicationContext).GetField(
             "EjectRequestTimeout",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(field);
+
+        var result = field!.GetValue(null);
+        return Assert.IsType<TimeSpan>(result);
+    }
+
+    private static TimeSpan InvokeFixRequestTimeout()
+    {
+        var field = typeof(TrayApplicationContext).GetField(
+            "FixRequestTimeout",
             BindingFlags.NonPublic | BindingFlags.Static);
         Assert.NotNull(field);
 

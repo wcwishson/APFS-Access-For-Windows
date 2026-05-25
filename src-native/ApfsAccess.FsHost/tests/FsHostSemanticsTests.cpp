@@ -1382,7 +1382,7 @@ bool TestRenameReplaceRollsBackHydrationWhenNativeCommitFails()
 #endif
 }
 
-bool TestCleanupDeleteRequiresDeleteAccess()
+bool TestCleanupDeleteTrustsPostedDeleteDisposition()
 {
     MountContext context{};
     context.overlay_write_enabled = true;
@@ -1406,17 +1406,17 @@ bool TestCleanupDeleteRequiresDeleteAccess()
         &fs,
         &open_context,
         const_cast<PWSTR>(L"\\cleanup.txt"),
-        FspCleanupDelete);
+        0);
 
-    if (!Require(!open_context.delete_on_cleanup, "Cleanup delete should ignore handles without DELETE permission"))
+    if (!Require(!open_context.delete_on_cleanup, "Cleanup without delete disposition should not latch delete-on-close"))
     {
         return false;
     }
-    if (!Require(file->delete_intent_count == 0 && !file->delete_pending, "Cleanup delete without permission should not set delete-pending state"))
+    if (!Require(file->delete_intent_count == 0 && !file->delete_pending, "Cleanup without delete disposition should not set delete-pending state"))
     {
         return false;
     }
-    if (!Require(file->open_handle_count == 0 && open_context.cleanup_seen, "Cleanup should release visible open-handle accounting even when delete access is denied"))
+    if (!Require(file->open_handle_count == 0 && open_context.cleanup_seen, "Cleanup should release visible open-handle accounting"))
     {
         return false;
     }
@@ -1437,7 +1437,516 @@ bool TestCleanupDeleteRequiresDeleteAccess()
     }
     return Require(
         file->delete_intent_count == 1 && file->delete_pending,
-        "Cleanup delete with permission should mark the node delete-pending");
+        "Cleanup delete disposition should mark the node delete-pending");
+}
+
+bool TestDirectoryCleanupDeleteDispositionWorksAfterMetadataOnlyOpen()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"delete-me");
+
+    auto directory = MakeNode(L"\\delete-me", true, false);
+    AddChildName(directory->children, L"inside.bin");
+    directory->open_handle_count = 1;
+    context.nodes.emplace(Key(directory->path), directory);
+
+    auto child = MakeNode(L"\\delete-me\\inside.bin", false, false);
+    child->open_handle_count = 1;
+    context.nodes.emplace(Key(child->path), child);
+
+    auto fs = BuildFileSystem(&context);
+    auto* directory_context = new OpenContext();
+    directory_context->node = directory;
+    directory_context->allow_set_basic_info = true;
+    auto* child_context = new OpenContext();
+    child_context->node = child;
+    child_context->allow_delete = true;
+
+    CB_Cleanup(
+        &fs,
+        child_context,
+        const_cast<PWSTR>(L"\\delete-me\\inside.bin"),
+        FspCleanupDelete);
+    CB_Close(&fs, child_context);
+    if (!Require(context.nodes.find(Key(L"\\delete-me\\inside.bin")) == context.nodes.end(), "Child delete should remove file before directory disposition cleanup"))
+    {
+        delete directory_context;
+        return false;
+    }
+
+    FSP_FSCTL_FILE_INFO info{};
+    const auto metadata_status = CB_SetBasicInfo(
+        &fs,
+        directory_context,
+        0,
+        0,
+        0,
+        ToFileTimeValue(UtcNow()),
+        0,
+        &info);
+    if (!Require(metadata_status == STATUS_SUCCESS, "Metadata-only directory handle should allow SetBasicInfo before cleanup delete disposition"))
+    {
+        delete directory_context;
+        return false;
+    }
+
+    CB_Cleanup(
+        &fs,
+        directory_context,
+        const_cast<PWSTR>(L"\\delete-me"),
+        FspCleanupDelete);
+    CB_Close(&fs, directory_context);
+
+    if (!Require(context.nodes.find(Key(L"\\delete-me")) == context.nodes.end(), "Cleanup delete disposition should remove metadata-only opened empty directory"))
+    {
+        return false;
+    }
+    return Require(!HasChildName(root->children, L"delete-me"), "Cleanup delete disposition should remove metadata-only opened directory from parent children");
+}
+
+bool TestDirectoryCleanupFilenameWithoutDeleteFlagKeepsDirectory()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"keep-me");
+
+    auto directory = MakeNode(L"\\keep-me", true, false);
+    directory->open_handle_count = 1;
+    context.nodes.emplace(Key(directory->path), directory);
+
+    auto fs = BuildFileSystem(&context);
+    auto* directory_context = new OpenContext();
+    directory_context->node = directory;
+    directory_context->allow_set_basic_info = true;
+
+    CB_Cleanup(
+        &fs,
+        directory_context,
+        const_cast<PWSTR>(L"\\keep-me"),
+        0);
+    CB_Close(&fs, directory_context);
+
+    if (!Require(context.nodes.find(Key(L"\\keep-me")) != context.nodes.end(), "Cleanup file name without delete disposition should not delete an empty directory"))
+    {
+        return false;
+    }
+    return Require(HasChildName(root->children, L"keep-me"), "Cleanup file name without delete disposition should keep directory visible");
+}
+
+bool TestDeleteOnCloseDirectoryDefersUntilChildrenDrain()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"delete-me");
+
+    auto directory = MakeNode(L"\\delete-me", true, false);
+    AddChildName(directory->children, L"inside.bin");
+    context.nodes.emplace(Key(directory->path), directory);
+
+    auto child = MakeNode(L"\\delete-me\\inside.bin", false, false);
+    context.nodes.emplace(Key(child->path), child);
+
+    auto fs = BuildFileSystem(&context);
+    PVOID directory_context_raw = nullptr;
+    FSP_FSCTL_FILE_INFO directory_info{};
+    const auto open_status = CB_Open(
+        &fs,
+        const_cast<PWSTR>(L"\\delete-me"),
+        FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE,
+        DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        &directory_context_raw,
+        &directory_info);
+    if (!Require(open_status == STATUS_SUCCESS && directory_context_raw != nullptr, "Delete-on-close directory open should succeed"))
+    {
+        return false;
+    }
+
+    auto* directory_context = static_cast<OpenContext*>(directory_context_raw);
+    if (!Require(directory_context->delete_on_close_requested, "Open should remember FILE_DELETE_ON_CLOSE for later cleanup disposition"))
+    {
+        CB_Close(&fs, directory_context);
+        return false;
+    }
+
+    CB_Cleanup(
+        &fs,
+        directory_context,
+        const_cast<PWSTR>(L"\\delete-me"),
+        FspCleanupSetLastAccessTime);
+    if (!Require(directory->delete_requested_after_children, "Delete-on-close cleanup should defer a non-empty directory until children drain"))
+    {
+        CB_Close(&fs, directory_context);
+        return false;
+    }
+
+    auto* child_context = new OpenContext();
+    child_context->node = child;
+    child_context->allow_delete = true;
+    ++child->open_handle_count;
+
+    CB_Cleanup(
+        &fs,
+        child_context,
+        const_cast<PWSTR>(L"\\delete-me\\inside.bin"),
+        FspCleanupDelete);
+    CB_Close(&fs, child_context);
+    if (!Require(context.nodes.find(Key(L"\\delete-me\\inside.bin")) == context.nodes.end(), "Child close should remove child before deferred delete-on-close directory"))
+    {
+        CB_Close(&fs, directory_context);
+        return false;
+    }
+
+    CB_Close(&fs, directory_context);
+    if (!Require(context.nodes.find(Key(L"\\delete-me")) == context.nodes.end(), "Deferred delete-on-close directory should disappear after children drain"))
+    {
+        return false;
+    }
+    return Require(!HasChildName(root->children, L"delete-me"), "Deferred delete-on-close directory should be removed from parent children");
+}
+
+bool TestDeleteAccessOpenCompletesRecentlyDrainedDirectoryDelete()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"delete-me");
+
+    auto directory = MakeNode(L"\\delete-me", true, false);
+    AddChildName(directory->children, L"subdir");
+    context.nodes.emplace(Key(directory->path), directory);
+
+    auto subdir = MakeNode(L"\\delete-me\\subdir", true, false);
+    AddChildName(subdir->children, L"inside.bin");
+    context.nodes.emplace(Key(subdir->path), subdir);
+
+    auto child = MakeNode(L"\\delete-me\\subdir\\inside.bin", false, false);
+    child->open_handle_count = 1;
+    context.nodes.emplace(Key(child->path), child);
+
+    auto fs = BuildFileSystem(&context);
+    auto* child_context = new OpenContext();
+    child_context->node = child;
+    child_context->allow_delete = true;
+
+    CB_Cleanup(
+        &fs,
+        child_context,
+        const_cast<PWSTR>(L"\\delete-me\\subdir\\inside.bin"),
+        FspCleanupDelete);
+    CB_Close(&fs, child_context);
+    if (!Require(context.nodes.find(Key(L"\\delete-me\\subdir\\inside.bin")) == context.nodes.end(), "Child delete should drain directory contents"))
+    {
+        return false;
+    }
+    if (!Require(subdir->children.empty() && subdir->last_child_delete_tick_ms != 0, "Child delete should mark parent directory as recently drained"))
+    {
+        return false;
+    }
+
+    PVOID subdir_context_raw = nullptr;
+    FSP_FSCTL_FILE_INFO subdir_info{};
+    const auto open_status = CB_Open(
+        &fs,
+        const_cast<PWSTR>(L"\\delete-me\\subdir"),
+        FILE_DIRECTORY_FILE,
+        DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        &subdir_context_raw,
+        &subdir_info);
+    if (!Require(open_status == STATUS_SUCCESS && subdir_context_raw != nullptr, "Delete-access open should succeed for recently drained directory"))
+    {
+        return false;
+    }
+
+    auto* subdir_context = static_cast<OpenContext*>(subdir_context_raw);
+    if (!Require(subdir_context->delete_on_cleanup && subdir->delete_pending, "Delete-access open should latch recently drained directory delete intent"))
+    {
+        CB_Close(&fs, subdir_context);
+        return false;
+    }
+
+    CB_Close(&fs, subdir_context);
+    if (!Require(context.nodes.find(Key(L"\\delete-me\\subdir")) == context.nodes.end(), "Close should remove recently drained delete-access directory"))
+    {
+        return false;
+    }
+    return Require(!HasChildName(directory->children, L"subdir"), "Close should remove recently drained directory from parent children");
+}
+
+bool TestSetBasicInfoPreservesOpenRecentlyDrainedDirectory()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"delete-me");
+
+    auto directory = MakeNode(L"\\delete-me", true, false);
+    AddChildName(directory->children, L"subdir");
+    context.nodes.emplace(Key(directory->path), directory);
+
+    auto subdir = MakeNode(L"\\delete-me\\subdir", true, false);
+    AddChildName(subdir->children, L"inside.bin");
+    context.nodes.emplace(Key(subdir->path), subdir);
+
+    auto child = MakeNode(L"\\delete-me\\subdir\\inside.bin", false, false);
+    child->open_handle_count = 1;
+    context.nodes.emplace(Key(child->path), child);
+
+    auto fs = BuildFileSystem(&context);
+    auto* subdir_context = new OpenContext();
+    subdir_context->node = subdir;
+    subdir_context->allow_delete = false;
+    subdir_context->allow_set_basic_info = true;
+    ++subdir->open_handle_count;
+
+    auto* child_context = new OpenContext();
+    child_context->node = child;
+    child_context->allow_delete = true;
+
+    CB_Cleanup(
+        &fs,
+        child_context,
+        const_cast<PWSTR>(L"\\delete-me\\subdir\\inside.bin"),
+        FspCleanupDelete);
+    CB_Close(&fs, child_context);
+    if (!Require(context.nodes.find(Key(L"\\delete-me\\subdir\\inside.bin")) == context.nodes.end(), "Child delete should drain open directory contents"))
+    {
+        CB_Close(&fs, subdir_context);
+        return false;
+    }
+    if (!Require(subdir->children.empty() && subdir->last_child_delete_tick_ms != 0, "Child delete should mark the still-open parent directory as recently drained"))
+    {
+        CB_Close(&fs, subdir_context);
+        return false;
+    }
+
+    FSP_FSCTL_FILE_INFO info{};
+    const auto set_basic_status = CB_SetBasicInfo(
+        &fs,
+        subdir_context,
+        0,
+        0,
+        0,
+        ToFileTimeValue(UtcNow()),
+        0,
+        &info);
+    if (!Require(set_basic_status == STATUS_SUCCESS, "SetBasicInfo should succeed on recently drained metadata-only directory handle"))
+    {
+        CB_Close(&fs, subdir_context);
+        return false;
+    }
+
+    CB_Close(&fs, subdir_context);
+    if (!Require(context.nodes.find(Key(L"\\delete-me\\subdir")) != context.nodes.end(), "Metadata-only SetBasicInfo should not remove a recently drained directory before the caller's final delete"))
+    {
+        return false;
+    }
+    return Require(HasChildName(directory->children, L"subdir"), "Metadata-only SetBasicInfo should keep the recently drained directory visible for caller cleanup");
+}
+
+bool TestSetBasicInfoDoesNotDeleteDirectoryOpenedAfterChildDelete()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"keep-me");
+
+    auto directory = MakeNode(L"\\keep-me", true, false);
+    AddChildName(directory->children, L"child.bin");
+    context.nodes.emplace(Key(directory->path), directory);
+
+    auto child = MakeNode(L"\\keep-me\\child.bin", false, false);
+    child->open_handle_count = 1;
+    context.nodes.emplace(Key(child->path), child);
+
+    auto fs = BuildFileSystem(&context);
+    auto* child_context = new OpenContext();
+    child_context->node = child;
+    child_context->allow_delete = true;
+
+    CB_Cleanup(
+        &fs,
+        child_context,
+        const_cast<PWSTR>(L"\\keep-me\\child.bin"),
+        FspCleanupDelete);
+    CB_Close(&fs, child_context);
+    if (!Require(context.nodes.find(Key(L"\\keep-me\\child.bin")) == context.nodes.end(), "Child delete should remove child before later directory metadata touch"))
+    {
+        return false;
+    }
+
+    auto* metadata_context = new OpenContext();
+    metadata_context->node = directory;
+    metadata_context->allow_set_basic_info = true;
+    ++directory->open_handle_count;
+
+    FSP_FSCTL_FILE_INFO info{};
+    const auto set_basic_status = CB_SetBasicInfo(
+        &fs,
+        metadata_context,
+        0,
+        0,
+        0,
+        ToFileTimeValue(UtcNow()),
+        0,
+        &info);
+    if (!Require(set_basic_status == STATUS_SUCCESS, "SetBasicInfo should succeed on directory opened after a child delete"))
+    {
+        CB_Close(&fs, metadata_context);
+        return false;
+    }
+    CB_Close(&fs, metadata_context);
+
+    if (!Require(context.nodes.find(Key(L"\\keep-me")) != context.nodes.end(), "SetBasicInfo should not delete a directory opened only after child deletion"))
+    {
+        return false;
+    }
+    return Require(HasChildName(root->children, L"keep-me"), "SetBasicInfo after child delete should keep directory visible");
+}
+
+bool TestRecursiveCallerCanDeleteDrainedDirectoryAfterMetadataTouch()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"delete-me");
+
+    auto directory = MakeNode(L"\\delete-me", true, false);
+    AddChildName(directory->children, L"inside.bin");
+    directory->open_handle_count = 1;
+    context.nodes.emplace(Key(directory->path), directory);
+
+    auto child = MakeNode(L"\\delete-me\\inside.bin", false, false);
+    child->open_handle_count = 1;
+    context.nodes.emplace(Key(child->path), child);
+
+    auto fs = BuildFileSystem(&context);
+    auto* directory_context = new OpenContext();
+    directory_context->node = directory;
+    directory_context->allow_delete = true;
+    directory_context->allow_set_basic_info = true;
+
+    const auto first_delete_status = CB_SetDelete(
+        &fs,
+        directory_context,
+        const_cast<PWSTR>(L"\\delete-me"),
+        TRUE);
+    if (!Require(first_delete_status == STATUS_DIRECTORY_NOT_EMPTY, "First recursive directory delete should report not-empty before children drain"))
+    {
+        delete directory_context;
+        return false;
+    }
+    if (!Require(directory->delete_requested_after_children && !directory->delete_pending, "Not-empty recursive delete should remember intent without hiding the directory"))
+    {
+        delete directory_context;
+        return false;
+    }
+
+    auto* child_context = new OpenContext();
+    child_context->node = child;
+    child_context->allow_delete = true;
+
+    CB_Cleanup(
+        &fs,
+        child_context,
+        const_cast<PWSTR>(L"\\delete-me\\inside.bin"),
+        FspCleanupDelete);
+    CB_Close(&fs, child_context);
+    if (!Require(context.nodes.find(Key(L"\\delete-me\\inside.bin")) == context.nodes.end(), "Child delete should drain directory contents"))
+    {
+        delete directory_context;
+        return false;
+    }
+
+    FSP_FSCTL_FILE_INFO info{};
+    const auto set_basic_status = CB_SetBasicInfo(
+        &fs,
+        directory_context,
+        0,
+        0,
+        0,
+        ToFileTimeValue(UtcNow()),
+        0,
+        &info);
+    if (!Require(set_basic_status == STATUS_SUCCESS, "Metadata touch on drained recursive-delete directory should succeed"))
+    {
+        delete directory_context;
+        return false;
+    }
+    if (!Require(context.nodes.find(Key(L"\\delete-me")) != context.nodes.end(), "Metadata touch should not remove the directory before the caller's final delete retry"))
+    {
+        delete directory_context;
+        return false;
+    }
+
+    CB_Cleanup(
+        &fs,
+        directory_context,
+        const_cast<PWSTR>(L"\\delete-me"),
+        0);
+    CB_Close(&fs, directory_context);
+    if (!Require(context.nodes.find(Key(L"\\delete-me")) != context.nodes.end(), "Closing a not-empty delete probe handle should not remove the drained directory before the caller's final delete retry"))
+    {
+        return false;
+    }
+
+    auto* final_context = new OpenContext();
+    final_context->node = directory;
+    final_context->allow_delete = true;
+    ++directory->open_handle_count;
+    const auto final_delete_status = CB_SetDelete(
+        &fs,
+        final_context,
+        const_cast<PWSTR>(L"\\delete-me"),
+        TRUE);
+    if (!Require(final_delete_status == STATUS_SUCCESS, "Final recursive directory delete retry should latch the drained directory"))
+    {
+        delete final_context;
+        return false;
+    }
+
+    CB_Cleanup(
+        &fs,
+        final_context,
+        const_cast<PWSTR>(L"\\delete-me"),
+        FspCleanupDelete);
+    CB_Close(&fs, final_context);
+    if (!Require(context.nodes.find(Key(L"\\delete-me")) == context.nodes.end(), "Final delete close should remove drained directory"))
+    {
+        return false;
+    }
+    return Require(!HasChildName(root->children, L"delete-me"), "Final delete close should remove drained directory from parent children");
 }
 
 bool TestCleanupDeleteBlocksRenameUntilCloseRemovesSource()
@@ -1530,6 +2039,316 @@ bool TestCloseRemovesEmptyDirectoryAfterCleanupDelete()
         return false;
     }
     return Require(!HasChildName(root->children, L"empty"), "Close after cleanup delete should remove empty directory from parent children");
+}
+
+bool TestRecursiveDirectoryDeleteCompletesAfterChildClose()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"delete-me");
+
+    auto parent = MakeNode(L"\\delete-me", true, false);
+    AddChildName(parent->children, L"subdir");
+    parent->open_handle_count = 1;
+    context.nodes.emplace(Key(parent->path), parent);
+
+    auto child = MakeNode(L"\\delete-me\\subdir", true, false);
+    child->open_handle_count = 1;
+    context.nodes.emplace(Key(child->path), child);
+
+    auto fs = BuildFileSystem(&context);
+    auto* parent_context = new OpenContext();
+    parent_context->node = parent;
+    parent_context->allow_delete = true;
+    auto* child_context = new OpenContext();
+    child_context->node = child;
+    child_context->allow_delete = true;
+
+    CB_Cleanup(
+        &fs,
+        parent_context,
+        const_cast<PWSTR>(L"\\delete-me"),
+        FspCleanupDelete);
+    CB_Close(&fs, parent_context);
+    if (!Require(context.nodes.find(Key(L"\\delete-me")) != context.nodes.end(), "Parent should remain until child directory closes"))
+    {
+        return false;
+    }
+
+    CB_Cleanup(
+        &fs,
+        child_context,
+        const_cast<PWSTR>(L"\\delete-me\\subdir"),
+        FspCleanupDelete);
+    CB_Close(&fs, child_context);
+
+    if (!Require(context.nodes.find(Key(L"\\delete-me\\subdir")) == context.nodes.end(), "Child directory close should remove child"))
+    {
+        return false;
+    }
+    if (!Require(context.nodes.find(Key(L"\\delete-me")) == context.nodes.end(), "Parent directory delete should complete after last child closes"))
+    {
+        return false;
+    }
+    return Require(!HasChildName(root->children, L"delete-me"), "Recursive delete should remove parent from root children");
+}
+
+bool TestDeferredDirectoryDeleteCompletesOnDirectoryClose()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"delete-me");
+
+    auto directory = MakeNode(L"\\delete-me", true, false);
+    AddChildName(directory->children, L"inside.bin");
+    directory->open_handle_count = 1;
+    context.nodes.emplace(Key(directory->path), directory);
+
+    auto child = MakeNode(L"\\delete-me\\inside.bin", false, false);
+    child->open_handle_count = 1;
+    context.nodes.emplace(Key(child->path), child);
+
+    auto fs = BuildFileSystem(&context);
+    auto* directory_context = new OpenContext();
+    directory_context->node = directory;
+    directory_context->allow_delete = true;
+    auto* child_context = new OpenContext();
+    child_context->node = child;
+    child_context->allow_delete = true;
+
+    CB_Cleanup(
+        &fs,
+        directory_context,
+        const_cast<PWSTR>(L"\\delete-me"),
+        FspCleanupDelete);
+    if (!Require(directory->delete_requested_after_children, "Non-empty directory cleanup delete should defer removal until children drain"))
+    {
+        delete directory_context;
+        delete child_context;
+        return false;
+    }
+
+    CB_Cleanup(
+        &fs,
+        child_context,
+        const_cast<PWSTR>(L"\\delete-me\\inside.bin"),
+        FspCleanupDelete);
+    CB_Close(&fs, child_context);
+    if (!Require(context.nodes.find(Key(L"\\delete-me\\inside.bin")) == context.nodes.end(), "Child close should remove child before directory close"))
+    {
+        delete directory_context;
+        return false;
+    }
+
+    CB_Close(&fs, directory_context);
+    if (!Require(context.nodes.find(Key(L"\\delete-me")) == context.nodes.end(), "Directory close should complete deferred delete once children are gone"))
+    {
+        return false;
+    }
+    return Require(!HasChildName(root->children, L"delete-me"), "Deferred directory close should remove directory from parent children");
+}
+
+bool TestSetDeleteNonEmptyDirectoryAllowsCallerFinalDeleteRetry()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"delete-me");
+
+    auto directory = MakeNode(L"\\delete-me", true, false);
+    AddChildName(directory->children, L"inside.bin");
+    directory->open_handle_count = 1;
+    context.nodes.emplace(Key(directory->path), directory);
+
+    auto child = MakeNode(L"\\delete-me\\inside.bin", false, false);
+    child->open_handle_count = 1;
+    context.nodes.emplace(Key(child->path), child);
+
+    auto fs = BuildFileSystem(&context);
+    auto* directory_context = new OpenContext();
+    directory_context->node = directory;
+    directory_context->allow_delete = true;
+    auto* child_context = new OpenContext();
+    child_context->node = child;
+    child_context->allow_delete = true;
+
+    const auto set_delete_status = CB_SetDelete(
+        &fs,
+        directory_context,
+        const_cast<PWSTR>(L"\\delete-me"),
+        TRUE);
+    if (!Require(set_delete_status == STATUS_DIRECTORY_NOT_EMPTY, "SetDelete on non-empty directory should report not-empty so recursive callers retry after children drain"))
+    {
+        delete directory_context;
+        delete child_context;
+        return false;
+    }
+    if (!Require(directory->delete_requested_after_children && !directory->delete_pending, "Deferred non-empty directory delete should not hide children behind delete-pending ancestor state"))
+    {
+        delete directory_context;
+        delete child_context;
+        return false;
+    }
+
+    CB_Close(&fs, directory_context);
+    if (!Require(context.nodes.find(Key(L"\\delete-me")) != context.nodes.end(), "Directory should remain until deferred children close"))
+    {
+        delete child_context;
+        return false;
+    }
+
+    CB_Cleanup(
+        &fs,
+        child_context,
+        const_cast<PWSTR>(L"\\delete-me\\inside.bin"),
+        FspCleanupDelete);
+    CB_Close(&fs, child_context);
+
+    if (!Require(context.nodes.find(Key(L"\\delete-me\\inside.bin")) == context.nodes.end(), "Child close should remove child for deferred SetDelete"))
+    {
+        return false;
+    }
+    if (!Require(context.nodes.find(Key(L"\\delete-me")) != context.nodes.end(), "Directory should remain after a not-empty SetDelete until the caller retries the final delete"))
+    {
+        return false;
+    }
+
+    auto* final_context = new OpenContext();
+    final_context->node = directory;
+    final_context->allow_delete = true;
+    ++directory->open_handle_count;
+    const auto final_set_delete_status = CB_SetDelete(
+        &fs,
+        final_context,
+        const_cast<PWSTR>(L"\\delete-me"),
+        TRUE);
+    if (!Require(final_set_delete_status == STATUS_SUCCESS, "Final delete retry after SetDelete not-empty response should latch the drained directory"))
+    {
+        delete final_context;
+        return false;
+    }
+
+    CB_Cleanup(
+        &fs,
+        final_context,
+        const_cast<PWSTR>(L"\\delete-me"),
+        FspCleanupDelete);
+    CB_Close(&fs, final_context);
+    if (!Require(context.nodes.find(Key(L"\\delete-me")) == context.nodes.end(), "Final delete retry after SetDelete not-empty response should remove directory"))
+    {
+        return false;
+    }
+    return Require(!HasChildName(root->children, L"delete-me"), "Final delete retry after SetDelete not-empty response should remove directory from root children");
+}
+
+bool TestCanDeleteNonEmptyDirectoryAllowsCallerFinalDeleteRetry()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"delete-me");
+
+    auto directory = MakeNode(L"\\delete-me", true, false);
+    AddChildName(directory->children, L"inside.bin");
+    directory->open_handle_count = 1;
+    context.nodes.emplace(Key(directory->path), directory);
+
+    auto child = MakeNode(L"\\delete-me\\inside.bin", false, false);
+    child->open_handle_count = 1;
+    context.nodes.emplace(Key(child->path), child);
+
+    auto fs = BuildFileSystem(&context);
+    auto* directory_context = new OpenContext();
+    directory_context->node = directory;
+    directory_context->allow_delete = true;
+    auto* child_context = new OpenContext();
+    child_context->node = child;
+    child_context->allow_delete = true;
+
+    const auto can_delete_status = CB_CanDelete(
+        &fs,
+        directory_context,
+        const_cast<PWSTR>(L"\\delete-me"));
+    if (!Require(can_delete_status == STATUS_DIRECTORY_NOT_EMPTY, "CanDelete should still report that a non-empty directory is not immediately deletable"))
+    {
+        delete directory_context;
+        delete child_context;
+        return false;
+    }
+    if (!Require(directory->delete_requested_after_children, "CanDelete on non-empty directory should remember a deferred recursive delete request"))
+    {
+        delete directory_context;
+        delete child_context;
+        return false;
+    }
+
+    CB_Cleanup(
+        &fs,
+        child_context,
+        const_cast<PWSTR>(L"\\delete-me\\inside.bin"),
+        FspCleanupDelete);
+    CB_Close(&fs, child_context);
+    if (!Require(context.nodes.find(Key(L"\\delete-me\\inside.bin")) == context.nodes.end(), "Child close should remove child after deferred CanDelete"))
+    {
+        delete directory_context;
+        return false;
+    }
+    if (!Require(context.nodes.find(Key(L"\\delete-me")) != context.nodes.end(), "Directory should remain while its own handle is still open"))
+    {
+        delete directory_context;
+        return false;
+    }
+
+    CB_Close(&fs, directory_context);
+    if (!Require(context.nodes.find(Key(L"\\delete-me")) != context.nodes.end(), "Directory close after CanDelete preflight should leave the drained directory for the caller's final delete retry"))
+    {
+        return false;
+    }
+
+    auto* final_context = new OpenContext();
+    final_context->node = directory;
+    final_context->allow_delete = true;
+    ++directory->open_handle_count;
+    const auto final_set_delete_status = CB_SetDelete(
+        &fs,
+        final_context,
+        const_cast<PWSTR>(L"\\delete-me"),
+        TRUE);
+    if (!Require(final_set_delete_status == STATUS_SUCCESS, "Final delete retry after CanDelete preflight should latch the drained directory"))
+    {
+        delete final_context;
+        return false;
+    }
+
+    CB_Cleanup(
+        &fs,
+        final_context,
+        const_cast<PWSTR>(L"\\delete-me"),
+        FspCleanupDelete);
+    CB_Close(&fs, final_context);
+    if (!Require(context.nodes.find(Key(L"\\delete-me")) == context.nodes.end(), "Final delete retry should remove directory after CanDelete preflight"))
+    {
+        return false;
+    }
+    return Require(!HasChildName(root->children, L"delete-me"), "Final delete retry should remove directory from root children after CanDelete preflight");
 }
 
 bool TestCloseWithoutDeleteLatchPreservesNode()
@@ -3471,6 +4290,697 @@ bool TestFlushFinalizesPendingMutationJournal()
         context.tx_manager->PendingMutationCount() == 0 &&
         context.tx_manager->CurrentState() == apfsaccess::rw::TransactionManager::State::Idle,
         "Flush should finalize pending mutation journal entries before returning success");
+}
+
+bool TestCloseCommitsPendingNativeMetadataAfterDirectoryCreate()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    MountContext context{};
+    context.args.readwrite = true;
+    context.args.write_backend = L"Native";
+    context.args.write_recovery_policy = L"FailClosed";
+    context.native_write_enabled = true;
+    context.overlay_write_enabled = false;
+    context.test_force_native_mutation_staging_success = true;
+    context.test_forced_native_commit_status = apfsaccess::rw::MetadataStore::CommitStatus::Committed;
+    std::error_code ec;
+    const auto marker_root = std::filesystem::temp_directory_path(ec) / "ApfsAccess" / "fs-host-semantics";
+    if (ec)
+    {
+        return Require(false, "Close-commit regression should resolve temp directory");
+    }
+    std::filesystem::create_directories(marker_root, ec);
+    if (ec)
+    {
+        return Require(false, "Close-commit regression should create marker directory");
+    }
+    context.recovery_marker_file = marker_root / (L"close-commit-" + std::to_wstring(GetTickCount64()) + L".state");
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto fs = BuildFileSystem(&context);
+    PVOID out_ctx = nullptr;
+    FSP_FSCTL_FILE_INFO info{};
+    const auto create_status = CB_Create(
+        &fs,
+        const_cast<PWSTR>(L"\\close-commit-dir"),
+        FILE_DIRECTORY_FILE,
+        FILE_WRITE_ATTRIBUTES,
+        0,
+        nullptr,
+        0,
+        &out_ctx,
+        &info);
+    if (!Require(create_status == STATUS_SUCCESS, "Directory create should succeed for close-commit regression"))
+    {
+        std::filesystem::remove(context.recovery_marker_file, ec);
+        return false;
+    }
+    if (!Require(out_ctx != nullptr, "Directory create should return an open context for close-commit regression"))
+    {
+        std::filesystem::remove(context.recovery_marker_file, ec);
+        return false;
+    }
+    if (!Require(context.pending_native_writes, "Directory create should mark native writes pending before close"))
+    {
+        CB_Close(&fs, out_ctx);
+        std::filesystem::remove(context.recovery_marker_file, ec);
+        return false;
+    }
+
+    CB_Close(&fs, out_ctx);
+
+    const auto ok = Require(
+        !context.pending_native_writes &&
+        !context.recovery_active &&
+        context.active_external_mutation_callbacks.load() == 0,
+        "Close should commit pending native metadata-only creates and publish a clean state");
+    std::filesystem::remove(context.recovery_marker_file, ec);
+    return ok;
+#else
+    return true;
+#endif
+}
+
+bool TestCloseStagesNativeSubtreeDeleteBottomUp()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    MountContext context{};
+    context.args.readwrite = true;
+    context.args.write_backend = L"Native";
+    context.args.write_recovery_policy = L"FailClosed";
+    context.native_write_enabled = true;
+    context.overlay_write_enabled = false;
+    context.args.allow_legacy_scaffold_for_fixtures = true;
+    context.args.write_require_canonical_commit = false;
+    context.args.write_disallow_scaffold_commit_on_non_fixture = false;
+    context.args.write_reject_scaffold_replay_blob_on_non_fixture = false;
+    context.args.write_require_canonical_replay_candidate_on_non_fixture = false;
+    context.args.volume = L"SubtreeDelete";
+    if (!Require(PrepareUnitHydrationRoot(context, L"native-subtree-delete"), "Native subtree delete test should prepare cache root"))
+    {
+        return false;
+    }
+    ScopeExit cleanup{[&]()
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+    }};
+
+    const auto image_path = context.session_root / "subtree-delete.apfs.img";
+    if (!Require(CreateSyntheticApfsContainerForTest(image_path), "Native subtree delete test should create synthetic APFS image"))
+    {
+        return false;
+    }
+    context.args.device = image_path.wstring();
+    apfsaccess::rw::MetadataStore::VolumeContext rw_context{};
+    rw_context.device_path = image_path.wstring();
+    rw_context.volume_name = L"SubtreeDelete";
+    rw_context.allow_legacy_scaffold_for_fixtures = true;
+    rw_context.disallow_scaffold_commit_on_non_fixture = false;
+    rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
+    rw_context.require_canonical_replay_candidate_on_non_fixture = false;
+    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+    context.metadata_store->SetFilePayloadProvider(
+        [&staged_payloads](const std::wstring& path, std::uint64_t logical_size) -> std::optional<std::vector<std::byte>>
+        {
+            auto it = staged_payloads.find(path);
+            if (it == staged_payloads.end())
+            {
+                return std::nullopt;
+            }
+            auto payload = it->second;
+            if (payload.size() < logical_size)
+            {
+                payload.resize(static_cast<std::size_t>(logical_size), std::byte{0});
+            }
+            else if (payload.size() > logical_size)
+            {
+                payload.resize(static_cast<std::size_t>(logical_size));
+            }
+            return payload;
+        });
+    if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Native subtree delete test should load container superblocks") ||
+        !Require(context.metadata_store->LoadObjectMap(), "Native subtree delete test should load object map") ||
+        !Require(context.metadata_store->LoadSpacemanState(), "Native subtree delete test should load spaceman state") ||
+        !Require(context.metadata_store->PrepareNativeWritePath(), "Native subtree delete test should prepare native write path"))
+    {
+        return false;
+    }
+
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+    auto fs = BuildFileSystem(&context);
+
+    auto create_directory = [&](PCWSTR path) -> bool
+    {
+        PVOID created_ctx = nullptr;
+        FSP_FSCTL_FILE_INFO info{};
+        const auto status = CB_Create(
+            &fs,
+            const_cast<PWSTR>(path),
+            FILE_DIRECTORY_FILE,
+            FILE_WRITE_ATTRIBUTES | DELETE,
+            0,
+            nullptr,
+            0,
+            &created_ctx,
+            &info);
+        if (!Require(status == STATUS_SUCCESS && created_ctx != nullptr, "Native subtree delete test should create directory"))
+        {
+            return false;
+        }
+        CB_Close(&fs, created_ctx);
+        return true;
+    };
+    if (!create_directory(L"\\tree") || !create_directory(L"\\tree\\child"))
+    {
+        return false;
+    }
+
+    PVOID file_ctx = nullptr;
+    FSP_FSCTL_FILE_INFO file_info{};
+    const auto file_create = CB_Create(
+        &fs,
+        const_cast<PWSTR>(L"\\tree\\child\\payload.bin"),
+        FILE_NON_DIRECTORY_FILE,
+        FILE_WRITE_DATA | FILE_READ_DATA | DELETE,
+        0,
+        nullptr,
+        0,
+        &file_ctx,
+        &file_info);
+    if (!Require(file_create == STATUS_SUCCESS && file_ctx != nullptr, "Native subtree delete test should create payload file"))
+    {
+        return false;
+    }
+    const auto payload = BuildPatternPayloadForTest(1536, 0x42);
+    ULONG written = 0;
+    const auto write_status = CB_Write(
+        &fs,
+        file_ctx,
+        const_cast<std::byte*>(payload.data()),
+        0,
+        static_cast<ULONG>(payload.size()),
+        FALSE,
+        FALSE,
+        &written,
+        &file_info);
+    staged_payloads[L"\\tree\\child\\payload.bin"] = payload;
+    CB_Close(&fs, file_ctx);
+    if (!Require(write_status == STATUS_SUCCESS && written == payload.size(), "Native subtree delete test should write payload bytes"))
+    {
+        return false;
+    }
+
+    auto payload_node = FindNode(&context, L"\\tree\\child\\payload.bin");
+    if (!Require(payload_node != nullptr, "Native subtree delete test should find payload before cleanup"))
+    {
+        return false;
+    }
+    auto* payload_delete = new OpenContext();
+    payload_delete->node = payload_node;
+    payload_delete->allow_delete = true;
+    ++payload_node->open_handle_count;
+    CB_Cleanup(&fs, payload_delete, const_cast<PWSTR>(L"\\tree\\child\\payload.bin"), FspCleanupDelete);
+    CB_Close(&fs, payload_delete);
+    staged_payloads.erase(L"\\tree\\child\\payload.bin");
+    if (!Require(!context.recovery_active, "Native subtree delete should not degrade after payload delete"))
+    {
+        return false;
+    }
+    if (!Require(context.nodes.find(Key(L"\\tree\\child\\payload.bin")) == context.nodes.end(), "Native subtree delete should remove local payload"))
+    {
+        return false;
+    }
+
+    auto child = FindNode(&context, L"\\tree\\child");
+    if (!Require(child != nullptr, "Native subtree delete test should find child directory after payload delete"))
+    {
+        return false;
+    }
+    auto* child_delete = new OpenContext();
+    child_delete->node = child;
+    child_delete->allow_delete = true;
+    ++child->open_handle_count;
+    CB_Cleanup(&fs, child_delete, const_cast<PWSTR>(L"\\tree\\child"), FspCleanupDelete);
+    CB_Close(&fs, child_delete);
+    if (!Require(!context.recovery_active, "Native subtree delete should not degrade after child directory delete"))
+    {
+        return false;
+    }
+    if (!Require(context.nodes.find(Key(L"\\tree\\child")) == context.nodes.end(), "Native subtree delete should remove local child directory"))
+    {
+        return false;
+    }
+
+    auto root = FindNode(&context, L"\\tree");
+    if (!Require(root != nullptr, "Native subtree delete test should find root directory after child delete"))
+    {
+        return false;
+    }
+    auto* root_delete = new OpenContext();
+    root_delete->node = root;
+    root_delete->allow_delete = true;
+    ++root->open_handle_count;
+    CB_Cleanup(&fs, root_delete, const_cast<PWSTR>(L"\\tree"), FspCleanupDelete);
+    CB_Close(&fs, root_delete);
+
+    if (!Require(!context.recovery_active, "Native subtree delete should not degrade after root directory delete"))
+    {
+        return false;
+    }
+    if (!Require(context.nodes.find(Key(L"\\tree")) == context.nodes.end(), "Native subtree delete should remove local root"))
+    {
+        return false;
+    }
+    if (!Require(!context.metadata_store->LookupCommittedInodeByPath(L"\\tree").has_value(), "Native subtree delete should remove committed root"))
+    {
+        return false;
+    }
+    return Require(
+        context.metadata_store->PendingMutationCount() == 0,
+        "Native subtree delete should drain all bottom-up staged mutations on close");
+#else
+    return true;
+#endif
+}
+
+bool TestStatusFileIncludesNativeMutationFailureDetail()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    MountContext context{};
+    context.args.readwrite = true;
+    context.args.write_backend = L"Native";
+    context.args.write_recovery_policy = L"FailClosed";
+    context.native_write_enabled = true;
+    context.overlay_write_enabled = false;
+    context.args.allow_legacy_scaffold_for_fixtures = true;
+    context.args.write_require_canonical_commit = false;
+    context.args.write_disallow_scaffold_commit_on_non_fixture = false;
+    context.args.write_reject_scaffold_replay_blob_on_non_fixture = false;
+    context.args.write_require_canonical_replay_candidate_on_non_fixture = false;
+    context.args.volume = L"FailureDetail";
+    if (!Require(PrepareUnitHydrationRoot(context, L"native-mutation-failure-detail"), "Native mutation failure-detail test should prepare cache root"))
+    {
+        return false;
+    }
+    ScopeExit cleanup{[&]()
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+    }};
+
+    const auto image_path = context.session_root / "failure-detail.apfs.img";
+    if (!Require(CreateSyntheticApfsContainerForTest(image_path), "Native mutation failure-detail test should create synthetic APFS image"))
+    {
+        return false;
+    }
+    context.args.device = image_path.wstring();
+    context.args.status_file = (context.session_root / "status.json").wstring();
+
+    apfsaccess::rw::MetadataStore::VolumeContext rw_context{};
+    rw_context.device_path = image_path.wstring();
+    rw_context.volume_name = L"FailureDetail";
+    rw_context.allow_legacy_scaffold_for_fixtures = true;
+    rw_context.disallow_scaffold_commit_on_non_fixture = false;
+    rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
+    rw_context.require_canonical_replay_candidate_on_non_fixture = false;
+    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Native mutation failure-detail test should load container superblocks") ||
+        !Require(context.metadata_store->LoadObjectMap(), "Native mutation failure-detail test should load object map") ||
+        !Require(context.metadata_store->LoadSpacemanState(), "Native mutation failure-detail test should load spaceman state") ||
+        !Require(context.metadata_store->PrepareNativeWritePath(), "Native mutation failure-detail test should prepare native write path"))
+    {
+        return false;
+    }
+
+    const auto staged = RecordNativeMutationBestEffort(
+        &context,
+        apfsaccess::rw::MetadataStore::MutationOperation::SetBasicInfo,
+        L"\\missing-after-delete.txt",
+        L"",
+        0,
+        0,
+        false,
+        ToFileTimeValue(UtcNow()));
+    if (!Require(!staged, "Native mutation failure-detail test should reject missing SetBasicInfo target"))
+    {
+        return false;
+    }
+
+    (void)BlockNativeMutationAfterStagingFailure(&context, L"SetBasicInfo");
+
+    std::ifstream in(std::filesystem::path(context.args.status_file), std::ios::binary);
+    if (!Require(in.good(), "Native mutation failure-detail test should open host status sidecar"))
+    {
+        return false;
+    }
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    const auto json = buffer.str();
+
+    return Require(json.find("\"lastNativeMutationFailure\":{") != std::string::npos, "Status sidecar should include native mutation failure detail object") &&
+        Require(json.find("\"operation\":\"SetBasicInfo\"") != std::string::npos, "Status sidecar should report failed native mutation operation") &&
+        Require(json.find("\"path\":\"\\\\missing-after-delete.txt\"") != std::string::npos, "Status sidecar should report failed native mutation path") &&
+        Require(json.find("\"status\":\"invalid-request\"") != std::string::npos, "Status sidecar should report failed native mutation status") &&
+        Require(json.find("\"reason\":\"SetBasicInfoTargetMissing\"") != std::string::npos, "Status sidecar should report failed native mutation reason");
+#else
+    return true;
+#endif
+}
+
+bool TestSetBasicInfoOnStaleDeletedHandleDoesNotDowngradeNativeWrite()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    MountContext context{};
+    context.args.readwrite = true;
+    context.args.write_backend = L"Native";
+    context.args.write_recovery_policy = L"FailClosed";
+    context.native_write_enabled = true;
+    context.overlay_write_enabled = false;
+    context.args.allow_legacy_scaffold_for_fixtures = true;
+    context.args.write_require_canonical_commit = false;
+    context.args.write_disallow_scaffold_commit_on_non_fixture = false;
+    context.args.write_reject_scaffold_replay_blob_on_non_fixture = false;
+    context.args.write_require_canonical_replay_candidate_on_non_fixture = false;
+    context.args.volume = L"StaleMetadata";
+    if (!Require(PrepareUnitHydrationRoot(context, L"stale-deleted-set-basic-info"), "Stale SetBasicInfo test should prepare cache root"))
+    {
+        return false;
+    }
+    ScopeExit cleanup{[&]()
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+    }};
+
+    const auto image_path = context.session_root / "stale-metadata.apfs.img";
+    if (!Require(CreateSyntheticApfsContainerForTest(image_path), "Stale SetBasicInfo test should create synthetic APFS image"))
+    {
+        return false;
+    }
+    context.args.device = image_path.wstring();
+
+    apfsaccess::rw::MetadataStore::VolumeContext rw_context{};
+    rw_context.device_path = image_path.wstring();
+    rw_context.volume_name = L"StaleMetadata";
+    rw_context.allow_legacy_scaffold_for_fixtures = true;
+    rw_context.disallow_scaffold_commit_on_non_fixture = false;
+    rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
+    rw_context.require_canonical_replay_candidate_on_non_fixture = false;
+    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Stale SetBasicInfo test should load container superblocks") ||
+        !Require(context.metadata_store->LoadObjectMap(), "Stale SetBasicInfo test should load object map") ||
+        !Require(context.metadata_store->LoadSpacemanState(), "Stale SetBasicInfo test should load spaceman state") ||
+        !Require(context.metadata_store->PrepareNativeWritePath(), "Stale SetBasicInfo test should prepare native write path"))
+    {
+        return false;
+    }
+
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+    auto fs = BuildFileSystem(&context);
+
+    PVOID create_ctx = nullptr;
+    FSP_FSCTL_FILE_INFO create_info{};
+    const auto create_status = CB_Create(
+        &fs,
+        const_cast<PWSTR>(L"\\stale.bin"),
+        FILE_NON_DIRECTORY_FILE,
+        FILE_WRITE_DATA | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | DELETE,
+        0,
+        nullptr,
+        0,
+        &create_ctx,
+        &create_info);
+    if (!Require(create_status == STATUS_SUCCESS && create_ctx != nullptr, "Stale SetBasicInfo test should create file"))
+    {
+        return false;
+    }
+    auto* original_open = static_cast<OpenContext*>(create_ctx);
+    auto stale_node = original_open->node;
+    CB_Close(&fs, create_ctx);
+
+    OpenContext stale_metadata_open{};
+    stale_metadata_open.node = stale_node;
+    stale_metadata_open.allow_set_basic_info = true;
+
+    auto* delete_open = new OpenContext();
+    delete_open->node = stale_node;
+    delete_open->allow_delete = true;
+    ++stale_node->open_handle_count;
+    CB_Cleanup(&fs, delete_open, const_cast<PWSTR>(L"\\stale.bin"), FspCleanupDelete);
+    CB_Close(&fs, delete_open);
+    if (!Require(context.nodes.find(Key(L"\\stale.bin")) == context.nodes.end(), "Stale SetBasicInfo test should remove local node before stale metadata touch"))
+    {
+        return false;
+    }
+    if (!Require(!context.metadata_store->LookupCommittedInodeByPath(L"\\stale.bin").has_value(), "Stale SetBasicInfo test should remove committed inode before stale metadata touch"))
+    {
+        return false;
+    }
+
+    FSP_FSCTL_FILE_INFO info{};
+    const auto set_basic_status = CB_SetBasicInfo(
+        &fs,
+        &stale_metadata_open,
+        0,
+        0,
+        0,
+        ToFileTimeValue(UtcNow()),
+        0,
+        &info);
+
+    return Require(set_basic_status == STATUS_SUCCESS, "SetBasicInfo on stale deleted handle should be treated as benign") &&
+        Require(!context.recovery_active, "SetBasicInfo on stale deleted handle should not latch recovery") &&
+        Require(context.native_write_enabled, "SetBasicInfo on stale deleted handle should keep native write enabled");
+#else
+    return true;
+#endif
+}
+
+bool TestSetBasicInfoOnVisibleNativeMissingDirectoryDoesNotDowngradeNativeWrite()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    MountContext context{};
+    context.args.readwrite = true;
+    context.args.write_backend = L"Native";
+    context.args.write_recovery_policy = L"FailClosed";
+    context.native_write_enabled = true;
+    context.overlay_write_enabled = false;
+    context.args.allow_legacy_scaffold_for_fixtures = true;
+    context.args.write_require_canonical_commit = false;
+    context.args.write_disallow_scaffold_commit_on_non_fixture = false;
+    context.args.write_reject_scaffold_replay_blob_on_non_fixture = false;
+    context.args.write_require_canonical_replay_candidate_on_non_fixture = false;
+    context.args.volume = L"VisibleNativeMissing";
+    if (!Require(PrepareUnitHydrationRoot(context, L"visible-native-missing-set-basic-info"), "Visible-native-missing SetBasicInfo test should prepare cache root"))
+    {
+        return false;
+    }
+    ScopeExit cleanup{[&]()
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+    }};
+
+    const auto image_path = context.session_root / "visible-native-missing.apfs.img";
+    if (!Require(CreateSyntheticApfsContainerForTest(image_path), "Visible-native-missing SetBasicInfo test should create synthetic APFS image"))
+    {
+        return false;
+    }
+    context.args.device = image_path.wstring();
+
+    apfsaccess::rw::MetadataStore::VolumeContext rw_context{};
+    rw_context.device_path = image_path.wstring();
+    rw_context.volume_name = L"VisibleNativeMissing";
+    rw_context.allow_legacy_scaffold_for_fixtures = true;
+    rw_context.disallow_scaffold_commit_on_non_fixture = false;
+    rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
+    rw_context.require_canonical_replay_candidate_on_non_fixture = false;
+    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Visible-native-missing SetBasicInfo test should load container superblocks") ||
+        !Require(context.metadata_store->LoadObjectMap(), "Visible-native-missing SetBasicInfo test should load object map") ||
+        !Require(context.metadata_store->LoadSpacemanState(), "Visible-native-missing SetBasicInfo test should load spaceman state") ||
+        !Require(context.metadata_store->PrepareNativeWritePath(), "Visible-native-missing SetBasicInfo test should prepare native write path"))
+    {
+        return false;
+    }
+
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+    auto fs = BuildFileSystem(&context);
+
+    PVOID create_ctx = nullptr;
+    FSP_FSCTL_FILE_INFO create_info{};
+    const auto create_status = CB_Create(
+        &fs,
+        const_cast<PWSTR>(L"\\native-missing-dir"),
+        FILE_DIRECTORY_FILE,
+        FILE_WRITE_ATTRIBUTES | DELETE,
+        0,
+        nullptr,
+        0,
+        &create_ctx,
+        &create_info);
+    if (!Require(create_status == STATUS_SUCCESS && create_ctx != nullptr, "Visible-native-missing SetBasicInfo test should create directory"))
+    {
+        return false;
+    }
+    auto* create_open = static_cast<OpenContext*>(create_ctx);
+    auto directory_node = create_open->node;
+    CB_Close(&fs, create_ctx);
+
+    auto* delete_open = new OpenContext();
+    delete_open->node = directory_node;
+    delete_open->allow_delete = true;
+    ++directory_node->open_handle_count;
+    CB_Cleanup(&fs, delete_open, const_cast<PWSTR>(L"\\native-missing-dir"), FspCleanupDelete);
+    CB_Close(&fs, delete_open);
+    if (!Require(!context.metadata_store->LookupCommittedInodeByPath(L"\\native-missing-dir").has_value(), "Visible-native-missing SetBasicInfo test should remove committed directory before stale metadata touch"))
+    {
+        return false;
+    }
+
+    directory_node->delete_latched = false;
+    directory_node->delete_pending = false;
+    directory_node->delete_intent_count = 0;
+    directory_node->open_handle_count = 0;
+    context.nodes[Key(directory_node->path)] = directory_node;
+    AddChildName(context.nodes.at(Key(L"\\"))->children, L"native-missing-dir");
+
+    OpenContext stale_metadata_open{};
+    stale_metadata_open.node = directory_node;
+    stale_metadata_open.allow_set_basic_info = true;
+    FSP_FSCTL_FILE_INFO info{};
+    const auto set_basic_status = CB_SetBasicInfo(
+        &fs,
+        &stale_metadata_open,
+        0,
+        0,
+        0,
+        ToFileTimeValue(UtcNow()),
+        0,
+        &info);
+
+    return Require(set_basic_status == STATUS_SUCCESS, "SetBasicInfo on visible local directory missing from native metadata should be benign") &&
+        Require(!context.recovery_active, "SetBasicInfo on visible local directory missing from native metadata should not latch recovery") &&
+        Require(context.native_write_enabled, "SetBasicInfo on visible local directory missing from native metadata should keep native write enabled");
+#else
+    return true;
+#endif
+}
+
+bool TestDeleteTargetMissingOnStaleDeletedHandleDoesNotDowngradeNativeWrite()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    MountContext context{};
+    context.args.readwrite = true;
+    context.args.write_backend = L"Native";
+    context.args.write_recovery_policy = L"FailClosed";
+    context.native_write_enabled = true;
+    context.overlay_write_enabled = false;
+    context.args.allow_legacy_scaffold_for_fixtures = true;
+    context.args.write_require_canonical_commit = false;
+    context.args.write_disallow_scaffold_commit_on_non_fixture = false;
+    context.args.write_reject_scaffold_replay_blob_on_non_fixture = false;
+    context.args.write_require_canonical_replay_candidate_on_non_fixture = false;
+    context.args.volume = L"StaleDelete";
+    if (!Require(PrepareUnitHydrationRoot(context, L"stale-delete-target-missing"), "Stale delete test should prepare cache root"))
+    {
+        return false;
+    }
+    ScopeExit cleanup{[&]()
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+    }};
+
+    const auto image_path = context.session_root / "stale-delete.apfs.img";
+    if (!Require(CreateSyntheticApfsContainerForTest(image_path), "Stale delete test should create synthetic APFS image"))
+    {
+        return false;
+    }
+    context.args.device = image_path.wstring();
+
+    apfsaccess::rw::MetadataStore::VolumeContext rw_context{};
+    rw_context.device_path = image_path.wstring();
+    rw_context.volume_name = L"StaleDelete";
+    rw_context.allow_legacy_scaffold_for_fixtures = true;
+    rw_context.disallow_scaffold_commit_on_non_fixture = false;
+    rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
+    rw_context.require_canonical_replay_candidate_on_non_fixture = false;
+    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Stale delete test should load container superblocks") ||
+        !Require(context.metadata_store->LoadObjectMap(), "Stale delete test should load object map") ||
+        !Require(context.metadata_store->LoadSpacemanState(), "Stale delete test should load spaceman state") ||
+        !Require(context.metadata_store->PrepareNativeWritePath(), "Stale delete test should prepare native write path"))
+    {
+        return false;
+    }
+
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+    auto fs = BuildFileSystem(&context);
+
+    PVOID create_ctx = nullptr;
+    FSP_FSCTL_FILE_INFO create_info{};
+    const auto create_status = CB_Create(
+        &fs,
+        const_cast<PWSTR>(L"\\stale-delete.bin"),
+        FILE_NON_DIRECTORY_FILE,
+        FILE_WRITE_DATA | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | DELETE,
+        0,
+        nullptr,
+        0,
+        &create_ctx,
+        &create_info);
+    if (!Require(create_status == STATUS_SUCCESS && create_ctx != nullptr, "Stale delete test should create file"))
+    {
+        return false;
+    }
+    auto* create_open = static_cast<OpenContext*>(create_ctx);
+    auto stale_node = create_open->node;
+    CB_Close(&fs, create_ctx);
+
+    auto* first_delete = new OpenContext();
+    first_delete->node = stale_node;
+    first_delete->allow_delete = true;
+    ++stale_node->open_handle_count;
+    CB_Cleanup(&fs, first_delete, const_cast<PWSTR>(L"\\stale-delete.bin"), FspCleanupDelete);
+    CB_Close(&fs, first_delete);
+    if (!Require(!context.metadata_store->LookupCommittedInodeByPath(L"\\stale-delete.bin").has_value(), "Stale delete test should remove committed inode before duplicate delete"))
+    {
+        return false;
+    }
+
+    stale_node->delete_latched = false;
+    stale_node->delete_pending = false;
+    stale_node->delete_intent_count = 0;
+    stale_node->open_handle_count = 0;
+    context.nodes[Key(stale_node->path)] = stale_node;
+    AddChildName(context.nodes.at(Key(L"\\"))->children, L"stale-delete.bin");
+
+    auto* duplicate_delete = new OpenContext();
+    duplicate_delete->node = stale_node;
+    duplicate_delete->allow_delete = true;
+    ++stale_node->open_handle_count;
+    CB_Cleanup(&fs, duplicate_delete, const_cast<PWSTR>(L"\\stale-delete.bin"), FspCleanupDelete);
+    CB_Close(&fs, duplicate_delete);
+
+    return Require(!context.recovery_active, "Duplicate delete for missing native target should not latch recovery") &&
+        Require(context.native_write_enabled, "Duplicate delete for missing native target should keep native write enabled") &&
+        Require(context.nodes.find(Key(L"\\stale-delete.bin")) == context.nodes.end(), "Duplicate delete should remove stale local node");
+#else
+    return true;
+#endif
 }
 
 bool TestMutatingCallbacksFailWriteProtectedWhenWriteDisabled()
@@ -6280,7 +7790,9 @@ bool TestVolumeParamsUseExplorerFriendlyCleanupFlags()
     {
         return false;
     }
-    if (!Require(params.PostDispositionWhenNecessaryOnly != 0, "Volume params should request disposition callbacks only when Windows needs them"))
+    if (!Require(
+            params.PostDispositionWhenNecessaryOnly == 0,
+            "Volume params should request all disposition callbacks so recursive directory deletes reach FsHost reliably"))
     {
         return false;
     }
@@ -7399,6 +8911,74 @@ bool RunSelectedTest(const std::string& name)
     {
         return TestFlushFinalizesPendingMutationJournal();
     }
+    if (name == "close-commits-pending-native-metadata-after-directory-create")
+    {
+        return TestCloseCommitsPendingNativeMetadataAfterDirectoryCreate();
+    }
+    if (name == "native-subtree-delete-bottom-up")
+    {
+        return TestCloseStagesNativeSubtreeDeleteBottomUp();
+    }
+    if (name == "recursive-directory-delete-completes-after-child-close")
+    {
+        return TestRecursiveDirectoryDeleteCompletesAfterChildClose();
+    }
+    if (name == "directory-cleanup-delete-disposition-metadata-open")
+    {
+        return TestDirectoryCleanupDeleteDispositionWorksAfterMetadataOnlyOpen();
+    }
+    if (name == "directory-cleanup-filename-without-delete-keeps-directory")
+    {
+        return TestDirectoryCleanupFilenameWithoutDeleteFlagKeepsDirectory();
+    }
+    if (name == "delete-on-close-directory-defers-until-children-drain")
+    {
+        return TestDeleteOnCloseDirectoryDefersUntilChildrenDrain();
+    }
+    if (name == "delete-access-open-completes-recently-drained-directory-delete")
+    {
+        return TestDeleteAccessOpenCompletesRecentlyDrainedDirectoryDelete();
+    }
+    if (name == "set-basic-info-preserves-open-recently-drained-directory")
+    {
+        return TestSetBasicInfoPreservesOpenRecentlyDrainedDirectory();
+    }
+    if (name == "set-basic-info-keeps-directory-opened-after-child-delete")
+    {
+        return TestSetBasicInfoDoesNotDeleteDirectoryOpenedAfterChildDelete();
+    }
+    if (name == "recursive-caller-deletes-drained-directory-after-metadata-touch")
+    {
+        return TestRecursiveCallerCanDeleteDrainedDirectoryAfterMetadataTouch();
+    }
+    if (name == "deferred-directory-delete-completes-on-directory-close")
+    {
+        return TestDeferredDirectoryDeleteCompletesOnDirectoryClose();
+    }
+    if (name == "set-delete-non-empty-directory-defers-until-child-close")
+    {
+        return TestSetDeleteNonEmptyDirectoryAllowsCallerFinalDeleteRetry();
+    }
+    if (name == "can-delete-non-empty-directory-defers-until-child-close")
+    {
+        return TestCanDeleteNonEmptyDirectoryAllowsCallerFinalDeleteRetry();
+    }
+    if (name == "native-mutation-failure-detail-status")
+    {
+        return TestStatusFileIncludesNativeMutationFailureDetail();
+    }
+    if (name == "stale-deleted-set-basic-info-native")
+    {
+        return TestSetBasicInfoOnStaleDeletedHandleDoesNotDowngradeNativeWrite();
+    }
+    if (name == "visible-native-missing-set-basic-info-native")
+    {
+        return TestSetBasicInfoOnVisibleNativeMissingDirectoryDoesNotDowngradeNativeWrite();
+    }
+    if (name == "stale-delete-target-missing-native")
+    {
+        return TestDeleteTargetMissingOnStaleDeletedHandleDoesNotDowngradeNativeWrite();
+    }
     if (name == "named-stream-copy-compatibility")
     {
         return TestNamedStreamCopyCompatibility();
@@ -7518,9 +9098,20 @@ int main(int argc, char** argv)
     ok &= TestRenameRollsBackLocalNamespaceWhenNativeCommitFails();
     ok &= TestRenameReplaceKeepsOpenTargetHandleOnOldHydration();
     ok &= TestRenameReplaceRollsBackHydrationWhenNativeCommitFails();
-    ok &= TestCleanupDeleteRequiresDeleteAccess();
+    ok &= TestCleanupDeleteTrustsPostedDeleteDisposition();
     ok &= TestCleanupDeleteBlocksRenameUntilCloseRemovesSource();
     ok &= TestCloseRemovesEmptyDirectoryAfterCleanupDelete();
+    ok &= TestRecursiveDirectoryDeleteCompletesAfterChildClose();
+    ok &= TestDirectoryCleanupDeleteDispositionWorksAfterMetadataOnlyOpen();
+    ok &= TestDirectoryCleanupFilenameWithoutDeleteFlagKeepsDirectory();
+    ok &= TestDeleteOnCloseDirectoryDefersUntilChildrenDrain();
+    ok &= TestDeleteAccessOpenCompletesRecentlyDrainedDirectoryDelete();
+    ok &= TestSetBasicInfoPreservesOpenRecentlyDrainedDirectory();
+    ok &= TestSetBasicInfoDoesNotDeleteDirectoryOpenedAfterChildDelete();
+    ok &= TestRecursiveCallerCanDeleteDrainedDirectoryAfterMetadataTouch();
+    ok &= TestDeferredDirectoryDeleteCompletesOnDirectoryClose();
+    ok &= TestSetDeleteNonEmptyDirectoryAllowsCallerFinalDeleteRetry();
+    ok &= TestCanDeleteNonEmptyDirectoryAllowsCallerFinalDeleteRetry();
     ok &= TestCloseWithoutDeleteLatchPreservesNode();
     ok &= TestCleanupWithoutDeleteReleasesFileForRename();
     ok &= TestCanDeleteSupportsParentDeleteChildPermission();
@@ -7562,6 +9153,12 @@ int main(int argc, char** argv)
     ok &= TestFlushAllowedWhenWriteDisabledDuringShutdownDrain();
     ok &= TestFlushReleasesExternalMutationScopeAfterSuccessfulWriteEnabledFlush();
     ok &= TestFlushFinalizesPendingMutationJournal();
+    ok &= TestCloseCommitsPendingNativeMetadataAfterDirectoryCreate();
+    ok &= TestCloseStagesNativeSubtreeDeleteBottomUp();
+    ok &= TestStatusFileIncludesNativeMutationFailureDetail();
+    ok &= TestSetBasicInfoOnStaleDeletedHandleDoesNotDowngradeNativeWrite();
+    ok &= TestSetBasicInfoOnVisibleNativeMissingDirectoryDoesNotDowngradeNativeWrite();
+    ok &= TestDeleteTargetMissingOnStaleDeletedHandleDoesNotDowngradeNativeWrite();
     ok &= TestMutatingCallbacksFailWriteProtectedWhenWriteDisabled();
     ok &= TestSetSecurityIsNoopWhenWriteEnabled();
     ok &= TestDefaultSecurityDescriptorGrantsUsersWriteAccess();

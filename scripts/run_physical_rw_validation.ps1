@@ -134,7 +134,11 @@ function Get-ApfsLogicalDisk {
 }
 
 function Assert-HostStatusReady {
-    param([string]$Path)
+    param(
+        [string]$Path,
+        [int]$TimeoutSeconds = 20,
+        [int]$PollMilliseconds = 100
+    )
 
     if ([string]::IsNullOrWhiteSpace($Path)) {
         return $null
@@ -143,14 +147,23 @@ function Assert-HostStatusReady {
         throw "StatusFile was not found: $Path"
     }
 
-    $status = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
-    if ($status.writeBackend -ne "Native" `
-        -or $status.nativeWriteSafetyState -ne "PilotReadWrite" `
-        -or $status.recoveryActive -ne $false `
-        -or $status.dirtyTransactionCount -ne 0) {
-        throw "Native host is not ready for physical RW validation: $($status | ConvertTo-Json -Compress)"
+    $lastStatus = $null
+    $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSeconds))
+    $pollDelay = [Math]::Max(25, $PollMilliseconds)
+    do {
+        $lastStatus = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+        if ($lastStatus.writeBackend -eq "Native" `
+            -and $lastStatus.nativeWriteSafetyState -eq "PilotReadWrite" `
+            -and $lastStatus.recoveryActive -eq $false `
+            -and $lastStatus.dirtyTransactionCount -eq 0) {
+            return $lastStatus
+        }
+
+        Start-Sleep -Milliseconds $pollDelay
     }
-    return $status
+    while ((Get-Date) -lt $deadline)
+
+    throw "Native host is not ready for physical RW validation: $($lastStatus | ConvertTo-Json -Compress)"
 }
 
 function Wait-Path {
@@ -186,6 +199,36 @@ function Wait-Size {
         Start-Sleep -Milliseconds 100
     }
     throw "Timed out waiting for size $Size at $Path"
+}
+
+function Wait-PathDeleted {
+    param(
+        [string]$Path,
+        [string]$StatusFilePath = "",
+        [int]$Seconds = 30
+    )
+
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        if (-not (Test-Path -LiteralPath $Path)) {
+            return $true
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($StatusFilePath)) {
+            try {
+                Assert-HostStatusReady -Path $StatusFilePath -TimeoutSeconds 1 -PollMilliseconds 50 | Out-Null
+            }
+            catch {
+            }
+            if (-not (Test-Path -LiteralPath $Path)) {
+                return $true
+            }
+        }
+
+        Start-Sleep -Milliseconds 100
+    }
+
+    throw "Timed out waiting for deleted path to disappear: $Path"
 }
 
 function New-PatternFile {
@@ -238,6 +281,158 @@ function Assert-HashEqual {
         throw "Hash mismatch for ${Label}: $expectedHash vs $actualHash"
     }
     return $expectedHash
+}
+
+function Remove-GeneratedApfsTree {
+    param(
+        [string]$Path,
+        [string]$MountRoot,
+        [string]$StatusFilePath,
+        [int]$Attempts = 6
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or
+        -not $Path.StartsWith($MountRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        -not ([System.IO.Path]::GetFileName($Path)).StartsWith("apfs-access-", [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing cleanup outside generated APFS test root: $Path"
+    }
+
+    function Remove-GeneratedFileIfExists {
+        param([string]$ItemPath)
+
+        if (-not [string]::IsNullOrWhiteSpace($ItemPath) -and [System.IO.File]::Exists($ItemPath)) {
+            [System.IO.File]::SetAttributes($ItemPath, [System.IO.FileAttributes]::Normal)
+            [System.IO.File]::Delete($ItemPath)
+        }
+    }
+
+    function Test-GeneratedDirectoryOpenable {
+        param([string]$ItemPath)
+
+        if ([string]::IsNullOrWhiteSpace($ItemPath)) {
+            return $false
+        }
+        if (-not [System.IO.Directory]::Exists($ItemPath)) {
+            return $false
+        }
+
+        $enumerator = $null
+        try {
+            $enumerator = [System.IO.Directory]::EnumerateFileSystemEntries($ItemPath).GetEnumerator()
+            $null = $enumerator.MoveNext()
+            return $true
+        }
+        catch [System.IO.DirectoryNotFoundException] {
+            return $false
+        }
+        finally {
+            if ($null -ne $enumerator) {
+                $enumerator.Dispose()
+            }
+        }
+    }
+
+    function Get-GeneratedApfsEntries {
+        param([string]$RootPath)
+
+        if (-not (Test-GeneratedDirectoryOpenable -ItemPath $RootPath)) {
+            return @()
+        }
+
+        try {
+            return @([System.IO.Directory]::EnumerateFileSystemEntries($RootPath, "*", [System.IO.SearchOption]::AllDirectories))
+        }
+        catch [System.IO.DirectoryNotFoundException] {
+            return @()
+        }
+    }
+
+    function Test-GeneratedDirectoryPath {
+        param([string]$ItemPath)
+
+        try {
+            return (([System.IO.File]::GetAttributes($ItemPath) -band [System.IO.FileAttributes]::Directory) -ne 0)
+        }
+        catch [System.IO.FileNotFoundException] {
+            return $false
+        }
+        catch [System.IO.DirectoryNotFoundException] {
+            return $false
+        }
+    }
+
+    function Remove-GeneratedEmptyDirectoryIfExists {
+        param([string]$ItemPath)
+
+        if (-not [string]::IsNullOrWhiteSpace($ItemPath) -and [System.IO.Directory]::Exists($ItemPath)) {
+            $directory = [System.IO.DirectoryInfo]::new($ItemPath)
+            $directory.Attributes = [System.IO.FileAttributes]::Directory
+            [System.IO.Directory]::Delete($ItemPath, $false)
+        }
+    }
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le [Math]::Max(1, $Attempts); $attempt++) {
+        if (-not (Test-GeneratedDirectoryOpenable -ItemPath $Path)) {
+            return $true
+        }
+
+        try {
+            $items = @(Get-GeneratedApfsEntries -RootPath $Path)
+
+            $items |
+                Where-Object { -not (Test-GeneratedDirectoryPath -ItemPath $_) } |
+                Sort-Object -Descending |
+                ForEach-Object {
+                    try {
+                        Remove-GeneratedFileIfExists -ItemPath $_
+                    }
+                    catch {
+                        $lastError = $_
+                    }
+                }
+            Assert-HostStatusReady -Path $StatusFilePath | Out-Null
+
+            $items |
+                Where-Object { Test-GeneratedDirectoryPath -ItemPath $_ } |
+                Sort-Object Length, { $_ } -Descending |
+                ForEach-Object {
+                    try {
+                        Remove-GeneratedEmptyDirectoryIfExists -ItemPath $_
+                    }
+                    catch {
+                        $lastError = $_
+                    }
+                }
+            Assert-HostStatusReady -Path $StatusFilePath | Out-Null
+
+            if (Test-GeneratedDirectoryOpenable -ItemPath $Path) {
+                $remainingChildren = @(Get-GeneratedApfsEntries -RootPath $Path)
+                if ($remainingChildren.Count -eq 0) {
+                    try {
+                        Remove-GeneratedEmptyDirectoryIfExists -ItemPath $Path
+                    }
+                    catch {
+                        $lastError = $_
+                    }
+                    Assert-HostStatusReady -Path $StatusFilePath | Out-Null
+                    if (-not (Test-GeneratedDirectoryOpenable -ItemPath $Path)) {
+                        return $true
+                    }
+                }
+            }
+        }
+        catch {
+            $lastError = $_
+        }
+
+        Start-Sleep -Milliseconds (100 * $attempt)
+    }
+
+    if ($null -ne $lastError) {
+        throw $lastError
+    }
+    throw "Timed out cleaning generated APFS test root: $Path"
 }
 
 function Assert-HostStatusHealthy {
@@ -859,14 +1054,8 @@ function Invoke-ExplorerWorkflow {
         $results.status = "passed"
 
         if ($Cleanup) {
-            if ($apfsRoot.StartsWith($NormalizedMountRoot, [StringComparison]::OrdinalIgnoreCase) -and
-                ([System.IO.Path]::GetFileName($apfsRoot)).StartsWith("apfs-access-explorer-", [StringComparison]::OrdinalIgnoreCase)) {
-                Remove-Item -LiteralPath $apfsRoot -Recurse -Force
-                $results.cleanup = "removed-apfs-test-root"
-            }
-            else {
-                throw "Refusing cleanup outside generated APFS test root: $apfsRoot"
-            }
+            Remove-GeneratedApfsTree -Path $apfsRoot -MountRoot $NormalizedMountRoot -StatusFilePath $StatusFilePath | Out-Null
+            $results.cleanup = "removed-apfs-test-root"
         }
     }
     catch {
@@ -1016,17 +1205,13 @@ function Invoke-PhysicalWorkload {
         New-PatternFile -Path $deleteFile -Bytes 77777 -Seed 33
         Wait-Path -Path $deleteFile | Out-Null
         Remove-Item -LiteralPath $deleteFile -Force
-        if (Test-Path -LiteralPath $deleteFile) {
-            throw "Deleted file still exists: $deleteFile"
-        }
+        Wait-PathDeleted -Path $deleteFile -StatusFilePath $StatusFilePath | Out-Null
         $results.deletedPaths += $deleteFile
         $deleteDir = Join-Path $apfsRoot "delete-me\subdir"
         New-Item -ItemType Directory -Force -Path $deleteDir | Out-Null
         New-PatternFile -Path (Join-Path $deleteDir "inside.bin") -Bytes 88888 -Seed 34
         Remove-Item -LiteralPath $deleteDir -Recurse -Force
-        if (Test-Path -LiteralPath $deleteDir) {
-            throw "Deleted directory still exists: $deleteDir"
-        }
+        Wait-PathDeleted -Path $deleteDir -StatusFilePath $StatusFilePath | Out-Null
         $results.deletedPaths += $deleteDir
         Add-Phase -Results $results -Name "delete-file-directory" -State "passed"
 
@@ -1175,7 +1360,7 @@ function Invoke-PhysicalWorkload {
         if ($Cleanup) {
             if ($apfsRoot.StartsWith($NormalizedMountRoot, [StringComparison]::OrdinalIgnoreCase) -and
                 ([System.IO.Path]::GetFileName($apfsRoot)).StartsWith("apfs-access-", [StringComparison]::OrdinalIgnoreCase)) {
-                Remove-Item -LiteralPath $apfsRoot -Recurse -Force
+                Remove-GeneratedApfsTree -Path $apfsRoot -MountRoot $NormalizedMountRoot -StatusFilePath $StatusFilePath | Out-Null
                 $results.cleanup = "removed-apfs-test-root"
             }
             else {
@@ -1237,7 +1422,12 @@ else {
         -StatusFilePath $StatusFile
 }
 
-$result.manifest = [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path $manifestPath))
+if ([System.IO.Path]::IsPathRooted($manifestPath)) {
+    $result.manifest = [System.IO.Path]::GetFullPath($manifestPath)
+}
+else {
+    $result.manifest = [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path $manifestPath))
+}
 Write-JsonFile -Path $manifestPath -InputObject $result
 Write-Output (ConvertTo-PrettyJson -InputObject $result)
 if ($result.status -ne "passed") {

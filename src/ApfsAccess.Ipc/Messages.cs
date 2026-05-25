@@ -40,7 +40,8 @@ public sealed record EjectRequestedPayload(string Requester, DateTime TimestampU
 public sealed record RefreshRequestedPayload(
     string Requester,
     DateTime TimestampUtc,
-    bool ClearUserEjectedVolumes = false
+    bool ClearUserEjectedVolumes = false,
+    string? VolumeId = null
 );
 
 public sealed record AckPayload(bool Success, string? Message);

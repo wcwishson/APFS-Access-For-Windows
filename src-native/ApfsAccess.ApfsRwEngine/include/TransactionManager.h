@@ -49,6 +49,7 @@ public:
     void SetJournalPath(std::wstring journal_path);
     [[nodiscard]] std::uint64_t CurrentTransactionId() const noexcept;
     [[nodiscard]] std::size_t PendingMutationCount() const noexcept;
+    [[nodiscard]] static std::string WideToUtf8(const std::wstring& value);
 
     // Fault-injection hook used by the planned deterministic crash harness.
     void SetFaultInjectionHook(std::function<void(const std::string& stage)> hook);
@@ -56,7 +57,7 @@ public:
 
 private:
     [[nodiscard]] bool PersistTransactionLocked(const wchar_t* outcome) const;
-    [[nodiscard]] static std::wstring EscapeJson(const std::wstring& value);
+    [[nodiscard]] static std::string EscapeJsonUtf8(const std::wstring& value);
     [[nodiscard]] static const wchar_t* MutationKindToString(MutationKind kind);
 
     std::wstring safety_level_;

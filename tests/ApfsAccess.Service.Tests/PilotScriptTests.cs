@@ -296,6 +296,53 @@ public sealed class PilotScriptTests
     }
 
     [Fact]
+    public void PhysicalRwValidation_CleansGeneratedExplorerTreeWithRetry()
+    {
+        var script = File.ReadAllText(Path.Combine(RepoRoot, "scripts", "run_physical_rw_validation.ps1"));
+
+        Assert.Contains("function Remove-GeneratedApfsTree", script);
+        Assert.DoesNotContain("Remove-Item -LiteralPath $Path -Recurse -Force", script);
+        Assert.DoesNotContain("Remove-Item -LiteralPath $apfsRoot -Recurse -Force", script);
+        Assert.Contains("function Get-GeneratedApfsEntries", script);
+        Assert.Contains("function Test-GeneratedDirectoryPath", script);
+        Assert.Contains("Where-Object { -not (Test-GeneratedDirectoryPath -ItemPath $_) }", script);
+        Assert.Contains("Where-Object { Test-GeneratedDirectoryPath -ItemPath $_ }", script);
+        Assert.Contains("Sort-Object Length, { $_ } -Descending", script);
+        Assert.Contains("function Test-GeneratedDirectoryOpenable", script);
+        Assert.Contains("[System.IO.Directory]::EnumerateFileSystemEntries($ItemPath)", script);
+        Assert.Contains("if (-not (Test-GeneratedDirectoryOpenable -ItemPath $Path))", script);
+        Assert.Contains("[System.IO.Directory]::Delete($ItemPath, $false)", script);
+        Assert.Contains("Assert-HostStatusReady -Path $StatusFilePath", script);
+        Assert.Contains("Remove-GeneratedApfsTree -Path $apfsRoot -MountRoot $NormalizedMountRoot", script);
+        Assert.Contains("Timed out cleaning generated APFS test root", script);
+    }
+
+    [Fact]
+    public void PhysicalRwValidation_WaitsForCleanNativeStatusBetweenExplorerOperations()
+    {
+        var script = File.ReadAllText(Path.Combine(RepoRoot, "scripts", "run_physical_rw_validation.ps1"));
+
+        Assert.Contains("[int]$TimeoutSeconds = 20", script);
+        Assert.Contains("[int]$PollMilliseconds = 100", script);
+        Assert.Contains("$deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSeconds))", script);
+        Assert.Contains("Start-Sleep -Milliseconds $pollDelay", script);
+        Assert.Contains("-and $lastStatus.dirtyTransactionCount -eq 0", script);
+    }
+
+    [Fact]
+    public void PhysicalRwValidation_WaitsForExplorerDeleteVisibility()
+    {
+        var script = File.ReadAllText(Path.Combine(RepoRoot, "scripts", "run_physical_rw_validation.ps1"));
+
+        Assert.Contains("function Wait-PathDeleted", script);
+        Assert.Contains("Timed out waiting for deleted path to disappear", script);
+        Assert.Contains("Wait-PathDeleted -Path $deleteFile -StatusFilePath $StatusFilePath", script);
+        Assert.Contains("Wait-PathDeleted -Path $deleteDir -StatusFilePath $StatusFilePath", script);
+        Assert.DoesNotContain("Deleted directory still exists", script);
+        Assert.DoesNotContain("Deleted file still exists", script);
+    }
+
+    [Fact]
     public void PhysicalRwValidation_ScriptParses()
     {
         var scriptPath = Path.Combine(RepoRoot, "scripts", "run_physical_rw_validation.ps1");

@@ -107,7 +107,10 @@ public sealed class TrayPipeHostService : BackgroundService
                     {
                         PipeMessageCodec.TryGetPayload<RefreshRequestedPayload>(message, out var payload);
                         var result = await _mountWorker
-                            .RefreshAsync(payload?.ClearUserEjectedVolumes == true, cancellationToken)
+                            .RefreshAsync(
+                                payload?.ClearUserEjectedVolumes == true,
+                                payload?.VolumeId,
+                                cancellationToken)
                             .ConfigureAwait(false);
                         var ack = PipeMessageCodec.Create(
                             ApfsMessageTypes.Ack,

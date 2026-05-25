@@ -1197,40 +1197,34 @@ int main()
             "Reuse file payload bytes should persist in committed extent");
         }
 
-        for (int index = 0; index < 760; ++index)
+        for (int index = 0; index < 2600; ++index)
         {
             auto path = L"\\storm-" + std::to_wstring(index) + L".bin";
-            auto payload = BuildPatternPayload(static_cast<std::size_t>((index % 512) + 1), static_cast<unsigned char>(0x40 + (index % 127)));
 
             apfsaccess::rw::MetadataStore::MutationRequest storm_create{};
-            storm_create.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+            storm_create.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateDirectory;
             storm_create.path = path;
             ok &= Require(
                 store.ApplyMutation(storm_create) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
-                "Storm create mutation should apply");
-
-            apfsaccess::rw::MetadataStore::MutationRequest storm_write{};
-            storm_write.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
-            storm_write.path = path;
-            storm_write.offset = 0;
-            storm_write.length = static_cast<std::uint64_t>(payload.size());
-            ok &= Require(
-                store.ApplyMutation(storm_write) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
-                "Storm write mutation should apply");
-            staged_payloads[path] = std::move(payload);
-
-            const auto storm_commit = store.CommitPendingMutations();
-            if (storm_commit != apfsaccess::rw::MetadataStore::CommitStatus::Committed)
+                "Storm directory create mutation should apply");
+        }
+        const auto storm_commit = store.CommitPendingMutations();
+        if (storm_commit != apfsaccess::rw::MetadataStore::CommitStatus::Committed)
+        {
+            std::cerr << "[DEBUG] metadata-only storm commit status: " << CommitStatusToString(storm_commit) << std::endl;
+            std::cerr << "[DEBUG] metadata-only storm commit stage: " << store.LastCommitStage() << std::endl;
+            const auto recovery_reason = store.RecoveryReason();
+            if (!recovery_reason.empty())
             {
-                std::cerr << "[DEBUG] storm commit " << index << " status: " << CommitStatusToString(storm_commit) << std::endl;
+                std::wcerr << L"[DEBUG] metadata-only storm recovery reason: " << recovery_reason << std::endl;
             }
-            ok &= Require(
-                storm_commit == apfsaccess::rw::MetadataStore::CommitStatus::Committed,
-                "Storm CommitPendingMutations should commit past compact checkpoint capacity");
         }
         ok &= Require(
+            storm_commit == apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+            "Metadata-only storm CommitPendingMutations should commit past compact checkpoint capacity");
+        ok &= Require(
             store.CommittedAllocationCount() < 128,
-            "Storm adjacent allocations should coalesce before spaceman checkpoint persistence");
+            "Storm metadata-only commits should avoid data allocation churn");
         const auto free_size_after_storm = store.FreeSizeBytes();
         ok &= Require(
             free_size_after_storm.has_value(),

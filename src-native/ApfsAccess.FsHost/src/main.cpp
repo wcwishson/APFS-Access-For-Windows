@@ -95,6 +95,10 @@ struct Node
     std::uint32_t delete_intent_count = 0;
     bool delete_latched = false;
     bool delete_pending = false;
+    bool delete_requested_after_children = false;
+    bool caller_delete_retry_required = false;
+    bool child_delete_observed_while_open = false;
+    std::uint64_t last_child_delete_tick_ms = 0;
 };
 
 struct OpenContext
@@ -115,6 +119,8 @@ struct OpenContext
     bool allow_delete_child = false;
     bool write_open = false;
     bool delete_on_cleanup = false;
+    bool delete_on_close_requested = false;
+    bool directory_delete_probe_failed_not_empty = false;
     bool metadata_read_fallback = false;
     bool cleanup_seen = false;
 };
@@ -217,6 +223,11 @@ struct MountContext
     std::optional<std::uint64_t> runtime_last_commit_xid;
     std::wstring runtime_recovery_reason;
     std::wstring runtime_last_recovery_action;
+    std::wstring last_native_mutation_failure_operation;
+    std::wstring last_native_mutation_failure_path;
+    std::wstring last_native_mutation_failure_secondary_path;
+    std::wstring last_native_mutation_failure_reason;
+    std::wstring last_native_mutation_failure_status;
     std::string last_status_write_contents;
     std::mutex status_file_mutex;
     std::optional<bool> last_recovery_marker_dirty;
@@ -324,6 +335,9 @@ private:
 
 bool IsMutationWriteEnabled(const MountContext* c);
 NTSTATUS HandleMutationWriteDisabled(MountContext* c, const wchar_t* operation);
+std::shared_ptr<Node> TryGetNodeLocked(MountContext* c, const std::wstring& path);
+std::string WideToUtf8(const std::wstring& in);
+std::string EscapeJson(const std::string& value);
 #ifdef APFSACCESS_HAS_RW_ENGINE
 void RefreshReportedVolumeInfoFromMetadata(MountContext& ctx);
 void ConfigureVolumeParamsForExplorer(MountContext& ctx, const FILETIME& now, FSP_FSCTL_VOLUME_PARAMS& vp);
@@ -1944,6 +1958,42 @@ bool WriteHostStatusFile(
             buffer << "null";
         }
 
+        buffer << ",\"lastNativeMutationFailure\":";
+        if (!context.last_native_mutation_failure_operation.empty() ||
+            !context.last_native_mutation_failure_path.empty() ||
+            !context.last_native_mutation_failure_reason.empty() ||
+            !context.last_native_mutation_failure_status.empty())
+        {
+            buffer
+                << "{\"operation\":\"" << EscapeJson(WideToUtf8(context.last_native_mutation_failure_operation))
+                << "\",\"path\":\"" << EscapeJson(WideToUtf8(context.last_native_mutation_failure_path))
+                << "\",\"secondaryPath\":";
+            if (!context.last_native_mutation_failure_secondary_path.empty())
+            {
+                buffer << "\"" << EscapeJson(WideToUtf8(context.last_native_mutation_failure_secondary_path)) << "\"";
+            }
+            else
+            {
+                buffer << "null";
+            }
+            buffer
+                << ",\"status\":\"" << EscapeJson(WideToUtf8(context.last_native_mutation_failure_status))
+                << "\",\"reason\":";
+            if (!context.last_native_mutation_failure_reason.empty())
+            {
+                buffer << "\"" << EscapeJson(WideToUtf8(context.last_native_mutation_failure_reason)) << "\"";
+            }
+            else
+            {
+                buffer << "null";
+            }
+            buffer << "}";
+        }
+        else
+        {
+            buffer << "null";
+        }
+
         buffer << ",\"lastCommitXid\":";
 
         if (last_commit_xid.has_value())
@@ -2414,6 +2464,58 @@ void RefreshDeletePendingStateLocked(MountContext* c, const std::shared_ptr<Node
 
     node->delete_pending = pending;
     UpdateDeletePendingVisibilityLocked(c, node);
+}
+
+void MarkAncestorChildDeleteLocked(MountContext* c, const std::wstring& deleted_path)
+{
+    if (!c || deleted_path == L"\\")
+    {
+        return;
+    }
+
+    const auto now = static_cast<std::uint64_t>(GetTickCount64());
+    auto cursor = Parent(deleted_path);
+    while (!cursor.empty())
+    {
+        auto ancestor = TryGetNodeLocked(c, cursor);
+        if (ancestor && ancestor->is_directory)
+        {
+            ancestor->last_child_delete_tick_ms = now;
+            if (ancestor->open_handle_count > 0)
+            {
+                ancestor->child_delete_observed_while_open = true;
+            }
+        }
+
+        if (cursor == L"\\")
+        {
+            break;
+        }
+
+        auto next = Parent(cursor);
+        if (next == cursor)
+        {
+            break;
+        }
+        cursor = std::move(next);
+    }
+}
+
+bool HasRecentChildDeleteLocked(const std::shared_ptr<Node>& node)
+{
+    if (!node || node->last_child_delete_tick_ms == 0)
+    {
+        return false;
+    }
+
+    const auto now = static_cast<std::uint64_t>(GetTickCount64());
+    return now >= node->last_child_delete_tick_ms &&
+        (now - node->last_child_delete_tick_ms) <= 30000;
+}
+
+bool HasRecentOpenChildDeleteLocked(const std::shared_ptr<Node>& node)
+{
+    return node && node->child_delete_observed_while_open && HasRecentChildDeleteLocked(node);
 }
 
 void SetDeleteIntentLocked(MountContext* c, OpenContext* open_ctx, bool enable_delete)
@@ -3772,6 +3874,33 @@ bool RecordNativeMutationBestEffort(
     if (status != apfsaccess::rw::MetadataStore::MutationStatus::Applied)
     {
         const wchar_t* status_text = L"unknown";
+        const wchar_t* operation_text = L"Unknown";
+        switch (operation)
+        {
+        case apfsaccess::rw::MetadataStore::MutationOperation::CreateFile:
+            operation_text = L"CreateFile";
+            break;
+        case apfsaccess::rw::MetadataStore::MutationOperation::CreateDirectory:
+            operation_text = L"CreateDirectory";
+            break;
+        case apfsaccess::rw::MetadataStore::MutationOperation::Write:
+            operation_text = L"Write";
+            break;
+        case apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize:
+            operation_text = L"SetFileSize";
+            break;
+        case apfsaccess::rw::MetadataStore::MutationOperation::Rename:
+            operation_text = L"Rename";
+            break;
+        case apfsaccess::rw::MetadataStore::MutationOperation::Delete:
+            operation_text = L"Delete";
+            break;
+        case apfsaccess::rw::MetadataStore::MutationOperation::SetBasicInfo:
+            operation_text = L"SetBasicInfo";
+            break;
+        default:
+            break;
+        }
         switch (status)
         {
         case apfsaccess::rw::MetadataStore::MutationStatus::NotReady:
@@ -3788,6 +3917,25 @@ bool RecordNativeMutationBestEffort(
             break;
         default:
             break;
+        }
+
+        if (operation == apfsaccess::rw::MetadataStore::MutationOperation::Delete &&
+            !_wcsicmp(failure_reason.c_str(), L"DeleteTargetMissing"))
+        {
+            std::wcerr << L"[FsHost] RW native-mutation info: delete target '"
+                << path
+                << L"' is already absent from native APFS metadata; treating duplicate delete as idempotent."
+                << std::endl;
+            return true;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            c->last_native_mutation_failure_operation = operation_text;
+            c->last_native_mutation_failure_path = path;
+            c->last_native_mutation_failure_secondary_path = secondary_path;
+            c->last_native_mutation_failure_reason = failure_reason;
+            c->last_native_mutation_failure_status = status_text;
         }
 
         std::wcerr << L"[FsHost] RW native-mutation warning: failed to apply mutation operation for path '"
@@ -3807,6 +3955,154 @@ bool RecordNativeMutationBestEffort(
     {
         std::wcerr << L"[FsHost] RW native-mutation warning: failed to persist recovery marker state." << std::endl;
     }
+    return true;
+}
+
+bool StageNativeDeleteSubtreeBestEffort(
+    MountContext* c,
+    const std::shared_ptr<Node>& node,
+    std::wstring* failed_path = nullptr)
+{
+    if (!c || !node || !IsNativeWriteEnabled(c))
+    {
+        return true;
+    }
+
+    if (node->is_directory)
+    {
+        std::vector<std::shared_ptr<Node>> children;
+        {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            children.reserve(node->children.size());
+            for (const auto& child_name : node->children)
+            {
+                auto child = TryGetNodeLocked(c, Join(node->path, child_name));
+                if (child)
+                {
+                    children.push_back(std::move(child));
+                }
+            }
+        }
+
+        for (const auto& child : children)
+        {
+            if (!StageNativeDeleteSubtreeBestEffort(c, child, failed_path))
+            {
+                return false;
+            }
+        }
+    }
+
+    if (!RecordNativeMutationBestEffort(
+            c,
+            apfsaccess::rw::MetadataStore::MutationOperation::Delete,
+            node->path))
+    {
+        if (failed_path)
+        {
+            *failed_path = node->path;
+        }
+        return false;
+    }
+
+    return true;
+}
+
+bool IsBenignStaleDeletedSetBasicInfoFailure(MountContext* c, const std::shared_ptr<Node>& node)
+{
+    if (!c || !node)
+    {
+        return false;
+    }
+
+    std::wstring failure_path;
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        if (_wcsicmp(c->last_native_mutation_failure_operation.c_str(), L"SetBasicInfo") ||
+            _wcsicmp(c->last_native_mutation_failure_reason.c_str(), L"SetBasicInfoTargetMissing") ||
+            !EqualsIgnoreCase(c->last_native_mutation_failure_path, node->path))
+        {
+            return false;
+        }
+
+        failure_path = c->last_native_mutation_failure_path;
+    }
+
+    bool missing_from_native_metadata = false;
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (c->metadata_store)
+    {
+        std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
+        missing_from_native_metadata = !c->metadata_store->LookupCommittedInodeByPath(failure_path).has_value();
+    }
+#endif
+
+    bool stale_node_removed = false;
+    bool same_node_delete_pending = false;
+    bool active_node_delete_hidden = false;
+    bool hidden_by_delete_pending_ancestor = false;
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        auto active = TryGetNodeLocked(c, node->path);
+        stale_node_removed = !active;
+        same_node_delete_pending = active == node && IsDeleteBlockedStateLocked(node);
+        active_node_delete_hidden = active && IsDeleteBlockedStateLocked(active);
+        hidden_by_delete_pending_ancestor = HasDeletePendingAncestorLocked(c, node->path);
+    }
+
+    if (!stale_node_removed &&
+        !same_node_delete_pending &&
+        !active_node_delete_hidden &&
+        !hidden_by_delete_pending_ancestor &&
+        !missing_from_native_metadata)
+    {
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        c->last_native_mutation_failure_operation.clear();
+        c->last_native_mutation_failure_path.clear();
+        c->last_native_mutation_failure_secondary_path.clear();
+        c->last_native_mutation_failure_reason.clear();
+        c->last_native_mutation_failure_status.clear();
+    }
+    return true;
+}
+
+bool IsBenignStaleDeletedDeleteFailure(MountContext* c, const std::shared_ptr<Node>& node)
+{
+    if (!c || !node)
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(c->mutex);
+    if (_wcsicmp(c->last_native_mutation_failure_operation.c_str(), L"Delete") ||
+        _wcsicmp(c->last_native_mutation_failure_reason.c_str(), L"DeleteTargetMissing") ||
+        !EqualsIgnoreCase(c->last_native_mutation_failure_path, node->path))
+    {
+        return false;
+    }
+
+    auto active = TryGetNodeLocked(c, node->path);
+    const bool stale_node_removed = !active;
+    const bool same_node_delete_pending = active == node && IsDeleteBlockedStateLocked(node);
+    const bool active_node_delete_hidden = active && IsDeleteBlockedStateLocked(active);
+    const bool hidden_by_delete_pending_ancestor = HasDeletePendingAncestorLocked(c, node->path);
+    if (!stale_node_removed &&
+        !same_node_delete_pending &&
+        !active_node_delete_hidden &&
+        !hidden_by_delete_pending_ancestor)
+    {
+        return false;
+    }
+
+    c->last_native_mutation_failure_operation.clear();
+    c->last_native_mutation_failure_path.clear();
+    c->last_native_mutation_failure_secondary_path.clear();
+    c->last_native_mutation_failure_reason.clear();
+    c->last_native_mutation_failure_status.clear();
     return true;
 }
 
@@ -4380,8 +4676,42 @@ bool RemoveNodeRecursiveLocked(MountContext* c, const std::shared_ptr<Node>& nod
         std::filesystem::remove(HydrationPath(c, *node), ec);
         ForgetNamedStreamsLocked(c, node->path);
     }
+    const auto removed_path = node->path;
     c->nodes.erase(Key(node->path));
+    MarkAncestorChildDeleteLocked(c, removed_path);
     return true;
+}
+
+std::shared_ptr<Node> FindRemovableDeferredDirectoryDeleteLocked(MountContext* c, const std::wstring& child_path)
+{
+    if (!c || child_path == L"\\")
+    {
+        return {};
+    }
+
+    auto cursor = Parent(child_path);
+    while (cursor != L"\\")
+    {
+        auto candidate = TryGetNodeLocked(c, cursor);
+        if (candidate &&
+            candidate->is_directory &&
+            candidate->delete_requested_after_children &&
+            !candidate->caller_delete_retry_required &&
+            candidate->open_handle_count == 0 &&
+            CanRemoveNodeRecursiveLocked(c, candidate))
+        {
+            return candidate;
+        }
+
+        auto next = Parent(cursor);
+        if (next == cursor)
+        {
+            break;
+        }
+        cursor = std::move(next);
+    }
+
+    return {};
 }
 
 void RestoreNodeRecursiveLocked(MountContext* c, const std::shared_ptr<Node>& node)
@@ -4762,7 +5092,7 @@ void ConfigureVolumeParamsForExplorer(MountContext& ctx, const FILETIME& now, FS
     vp.ReadOnlyVolume = IsMutationWriteEnabled(&ctx) ? 0 : 1;
     vp.PostCleanupWhenModifiedOnly = 0;
     vp.FlushAndPurgeOnCleanup = 1;
-    vp.PostDispositionWhenNecessaryOnly = 1;
+    vp.PostDispositionWhenNecessaryOnly = 0;
     vp.UmFileContextIsUserContext2 = 1;
     wcscpy_s(vp.FileSystemName, sizeof(vp.FileSystemName) / sizeof(WCHAR), L"APFS");
 }
@@ -5292,7 +5622,6 @@ NTSTATUS CB_SetBasicInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, UINT64 creation
     {
         return STATUS_ACCESS_DENIED;
     }
-
     if (o->named_stream)
     {
         FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
@@ -5324,8 +5653,10 @@ NTSTATUS CB_SetBasicInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, UINT64 creation
     }
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
-    if (IsNativeWriteEnabled(c) &&
-        !RecordNativeMutationBestEffort(
+    bool native_set_basic_info_staged = true;
+    if (IsNativeWriteEnabled(c))
+    {
+        native_set_basic_info_staged = RecordNativeMutationBestEffort(
             c,
             apfsaccess::rw::MetadataStore::MutationOperation::SetBasicInfo,
             o->node->path,
@@ -5333,9 +5664,14 @@ NTSTATUS CB_SetBasicInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, UINT64 creation
             0,
             0,
             false,
-            stamp.QuadPart))
+            stamp.QuadPart);
+    }
+    if (!native_set_basic_info_staged)
     {
-        return BlockNativeMutationAfterStagingFailure(c, L"SetBasicInfo");
+        if (!IsBenignStaleDeletedSetBasicInfoFailure(c, o->node))
+        {
+            return BlockNativeMutationAfterStagingFailure(c, L"SetBasicInfo");
+        }
     }
 #endif
 
@@ -5528,7 +5864,17 @@ NTSTATUS CB_CanDelete(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name)
     {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
-    return ValidateDeleteEligibilityLocked(c, locked, o);
+    const auto status = ValidateDeleteEligibilityLocked(c, locked, o);
+    if (status == STATUS_DIRECTORY_NOT_EMPTY && locked->is_directory)
+    {
+        locked->delete_requested_after_children = true;
+        locked->caller_delete_retry_required = true;
+        if (o)
+        {
+            o->directory_delete_probe_failed_not_empty = true;
+        }
+    }
+    return status;
 }
 
 NTSTATUS CB_SetDelete(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, BOOLEAN delete_file)
@@ -5605,10 +5951,18 @@ NTSTATUS CB_SetDelete(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, BOOLEAN d
             return STATUS_ACCESS_DENIED;
         }
         const auto status = ValidateDeleteEligibilityLocked(c, locked, o);
+        if (status == STATUS_DIRECTORY_NOT_EMPTY && locked->is_directory)
+        {
+            locked->delete_requested_after_children = true;
+            locked->caller_delete_retry_required = true;
+            o->directory_delete_probe_failed_not_empty = true;
+            return status;
+        }
         if (!NT_SUCCESS(status))
         {
             return status;
         }
+        locked->caller_delete_retry_required = false;
         SetDeleteIntentLocked(c, o, true);
     }
     else if (o)
@@ -6002,14 +6356,9 @@ VOID CB_Cleanup(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, ULONG flags)
         ReleaseOpenContextAccountingLocked(c, o);
     }
 
-    if ((flags & FspCleanupDelete) != 0 && IsMutationWriteEnabled(c))
+    if (((flags & FspCleanupDelete) != 0 || o->delete_on_close_requested) && IsMutationWriteEnabled(c))
     {
         if (c->shutdown_drain_active.load(std::memory_order_acquire))
-        {
-            return;
-        }
-
-        if (!o->allow_delete)
         {
             return;
         }
@@ -6041,6 +6390,7 @@ VOID CB_Cleanup(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, ULONG flags)
                 }
                 if (node->is_directory && !node->children.empty())
                 {
+                    node->delete_requested_after_children = true;
                     return;
                 }
                 LatchDeleteOnCleanupLocked(c, o);
@@ -6069,92 +6419,221 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
         o->file = INVALID_HANDLE_VALUE;
     }
 
-    bool emit_delete_mutation = false;
     bool had_delete_on_cleanup = false;
-    std::wstring deleted_path;
-    std::shared_ptr<Node> deleted_node;
-    std::shared_ptr<Node> deleted_parent;
-    std::wstring deleted_leaf;
-    LocalFileRollbackSnapshot deleted_file_snapshot;
-    if (c && o->node)
+    struct DeleteClosePlan
     {
-        std::lock_guard<std::mutex> lock(c->mutex);
-        const bool remove_requested_on_close = o->delete_on_cleanup || o->node->delete_latched;
+        bool emit = false;
+        std::wstring path;
+        std::shared_ptr<Node> node;
+        std::shared_ptr<Node> parent;
+        std::wstring leaf;
+        LocalFileRollbackSnapshot file_snapshot;
+    };
+    std::vector<DeleteClosePlan> delete_plans;
+    bool remove_requested_on_close = false;
+    bool can_remove_on_close = false;
+    std::shared_ptr<Node> delete_root;
+    const auto release_delete_on_cleanup_locked = [&]()
+    {
         if (o->delete_on_cleanup)
         {
-            had_delete_on_cleanup = true;
-            if (o->node->delete_intent_count > 0)
+            if (o->node && o->node->delete_intent_count > 0)
             {
                 --o->node->delete_intent_count;
             }
             o->delete_on_cleanup = false;
+            RefreshDeletePendingStateLocked(c, o->node);
+        }
+    };
+    if (c && o->node)
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        remove_requested_on_close =
+            o->delete_on_cleanup ||
+            o->node->delete_latched ||
+            (o->node->is_directory &&
+                o->node->delete_requested_after_children &&
+                !o->node->caller_delete_retry_required);
+        if (o->delete_on_cleanup)
+        {
+            had_delete_on_cleanup = true;
         }
         ReleaseOpenContextAccountingLocked(c, o);
         RefreshDeletePendingStateLocked(c, o->node);
 
-        const bool can_remove_now = o->node->path != L"\\" &&
-            CanRemoveNodeRecursiveLocked(c, o->node);
-        if (remove_requested_on_close && can_remove_now)
+        can_remove_on_close = o->node->path != L"\\" &&
+                CanRemoveNodeRecursiveLocked(c, o->node);
+        if (remove_requested_on_close && can_remove_on_close)
         {
-            deleted_path = o->node->path;
+            delete_root = o->node;
+        }
+        else
+        {
+            release_delete_on_cleanup_locked();
+        }
+    }
+
+    if (c && delete_root && remove_requested_on_close && can_remove_on_close)
+    {
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        bool native_delete_staged = true;
+        bool benign_stale_native_delete = false;
+        if (IsNativeWriteEnabled(c))
+        {
+            native_delete_staged = StageNativeDeleteSubtreeBestEffort(c, delete_root);
+        }
+        if (!native_delete_staged)
+        {
+            benign_stale_native_delete = IsBenignStaleDeletedDeleteFailure(c, delete_root);
+            if (!benign_stale_native_delete)
+            {
+                (void)BlockNativeMutationAfterStagingFailure(c, L"Delete");
+                std::lock_guard<std::mutex> lock(c->mutex);
+                release_delete_on_cleanup_locked();
+                delete_root->delete_latched = false;
+                delete_root->delete_pending = false;
+                delete_root->caller_delete_retry_required = false;
+                RefreshDeletePendingStateLocked(c, delete_root);
+            }
+        }
+        if (native_delete_staged || benign_stale_native_delete)
+#endif
+        {
+            bool local_delete_completed = false;
+            std::lock_guard<std::mutex> lock(c->mutex);
+            if (TryGetNodeLocked(c, delete_root->path) == delete_root &&
+                CanRemoveNodeRecursiveLocked(c, delete_root))
+            {
+                const auto plan_path = delete_root->path;
+                auto parent_path = Parent(plan_path);
+                auto leaf = plan_path.substr(plan_path.find_last_of(L'\\') + 1);
+                auto parent = TryGetNodeLocked(c, parent_path);
+                DeleteClosePlan plan;
+                if (!MoveFileAsideForRollbackLocked(c, delete_root, L"delete-close", plan.file_snapshot))
+                {
+                    delete_root->delete_latched = false;
+                    delete_root->delete_pending = false;
+                    delete_root->delete_requested_after_children = false;
+                    delete_root->caller_delete_retry_required = false;
+                    RefreshDeletePendingStateLocked(c, delete_root);
+                    delete o;
+                    return;
+                }
+                if (parent && parent->is_directory)
+                {
+                    RemoveChildName(parent->children, leaf);
+                }
+                plan.emit = RemoveNodeRecursiveLocked(c, delete_root);
+                if (plan.emit)
+                {
+                    delete_root->delete_latched = false;
+                    delete_root->delete_pending = false;
+                    delete_root->delete_intent_count = 0;
+                    delete_root->delete_requested_after_children = false;
+                    delete_root->caller_delete_retry_required = false;
+                    plan.path = plan_path;
+                    plan.node = delete_root;
+                    plan.parent = parent;
+                    plan.leaf = leaf;
+                    delete_plans.push_back(std::move(plan));
+                    local_delete_completed = true;
+                }
+            }
+            if (!local_delete_completed)
+            {
+                release_delete_on_cleanup_locked();
+            }
+        }
+    }
+
+    if (c && o->node)
+    {
+        std::shared_ptr<Node> deferred_delete_root;
+        {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            deferred_delete_root = FindRemovableDeferredDirectoryDeleteLocked(c, o->node->path);
+        }
+        if (deferred_delete_root)
+        {
 #ifdef APFSACCESS_HAS_RW_ENGINE
             bool native_delete_staged = true;
+            bool benign_stale_native_delete = false;
             if (IsNativeWriteEnabled(c))
             {
-                native_delete_staged = RecordNativeMutationBestEffort(
-                    c,
-                    apfsaccess::rw::MetadataStore::MutationOperation::Delete,
-                    deleted_path);
+                native_delete_staged = StageNativeDeleteSubtreeBestEffort(c, deferred_delete_root);
             }
             if (!native_delete_staged)
             {
-                (void)BlockNativeMutationAfterStagingFailure(c, L"Delete");
-                o->node->delete_latched = false;
-                o->node->delete_pending = false;
-                RefreshDeletePendingStateLocked(c, o->node);
+                benign_stale_native_delete = IsBenignStaleDeletedDeleteFailure(c, deferred_delete_root);
+                if (!benign_stale_native_delete)
+                {
+                    (void)BlockNativeMutationAfterStagingFailure(c, L"Delete");
+                    std::lock_guard<std::mutex> lock(c->mutex);
+                    deferred_delete_root->delete_requested_after_children = false;
+                    deferred_delete_root->caller_delete_retry_required = false;
+                    deferred_delete_root->delete_latched = false;
+                    deferred_delete_root->delete_pending = false;
+                    RefreshDeletePendingStateLocked(c, deferred_delete_root);
+                }
             }
-            else
+            if (native_delete_staged || benign_stale_native_delete)
 #endif
             {
-            auto parent_path = Parent(deleted_path);
-            auto leaf = deleted_path.substr(deleted_path.find_last_of(L'\\') + 1);
-            auto parent = TryGetNodeLocked(c, parent_path);
-            deleted_node = o->node;
-            deleted_parent = parent;
-            deleted_leaf = leaf;
-            if (!MoveFileAsideForRollbackLocked(c, o->node, L"delete-close", deleted_file_snapshot))
-            {
-                o->node->delete_latched = false;
-                o->node->delete_pending = false;
-                RefreshDeletePendingStateLocked(c, o->node);
-                delete o;
-                return;
-            }
-            if (parent && parent->is_directory)
-            {
-                RemoveChildName(parent->children, leaf);
-            }
-            emit_delete_mutation = RemoveNodeRecursiveLocked(c, o->node);
-            if (emit_delete_mutation)
-            {
-                o->node->delete_latched = false;
-                o->node->delete_pending = false;
-                o->node->delete_intent_count = 0;
-            }
+                std::lock_guard<std::mutex> lock(c->mutex);
+                if (TryGetNodeLocked(c, deferred_delete_root->path) == deferred_delete_root &&
+                    CanRemoveNodeRecursiveLocked(c, deferred_delete_root))
+                {
+                    const auto plan_path = deferred_delete_root->path;
+                    auto parent_path = Parent(plan_path);
+                    auto leaf = plan_path.substr(plan_path.find_last_of(L'\\') + 1);
+                    auto parent = TryGetNodeLocked(c, parent_path);
+                    DeleteClosePlan plan;
+                    if (!MoveFileAsideForRollbackLocked(c, deferred_delete_root, L"delete-close", plan.file_snapshot))
+                    {
+                        deferred_delete_root->delete_requested_after_children = false;
+                        deferred_delete_root->caller_delete_retry_required = false;
+                        deferred_delete_root->delete_latched = false;
+                        deferred_delete_root->delete_pending = false;
+                        RefreshDeletePendingStateLocked(c, deferred_delete_root);
+                        delete o;
+                        return;
+                    }
+                    if (parent && parent->is_directory)
+                    {
+                        RemoveChildName(parent->children, leaf);
+                    }
+                    plan.emit = RemoveNodeRecursiveLocked(c, deferred_delete_root);
+                    if (plan.emit)
+                    {
+                        deferred_delete_root->delete_latched = false;
+                        deferred_delete_root->delete_pending = false;
+                        deferred_delete_root->delete_intent_count = 0;
+                        deferred_delete_root->delete_requested_after_children = false;
+                        deferred_delete_root->caller_delete_retry_required = false;
+                        plan.path = plan_path;
+                        plan.node = deferred_delete_root;
+                        plan.parent = parent;
+                        plan.leaf = leaf;
+                        delete_plans.push_back(std::move(plan));
+                    }
+                }
             }
         }
     }
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
-    if (emit_delete_mutation && c && IsMutationWriteEnabled(c))
+    if (!delete_plans.empty() && c && IsMutationWriteEnabled(c))
     {
-        RecordMutationBestEffort(
-            c,
-            apfsaccess::rw::TransactionManager::MutationKind::Delete,
-            deleted_path);
+        for (const auto& plan : delete_plans)
+        {
+            RecordMutationBestEffort(
+                c,
+                apfsaccess::rw::TransactionManager::MutationKind::Delete,
+                plan.path);
+        }
     }
 
-    if (c && IsMutationWriteEnabled(c) && emit_delete_mutation)
+    if (c && IsMutationWriteEnabled(c) && (!delete_plans.empty() || c->pending_native_writes || HasPendingNativeMutations(c)))
     {
         const auto close_commit_status = CommitNativeMutationsBestEffort(c, L"Close");
         if (!NT_SUCCESS(close_commit_status))
@@ -6163,25 +6642,37 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
                 << std::hex << static_cast<unsigned long>(close_commit_status) << std::dec
                 << L"." << std::endl;
             std::lock_guard<std::mutex> lock(c->mutex);
-            if (deleted_node && deleted_path != L"\\")
+            for (auto it = delete_plans.rbegin(); it != delete_plans.rend(); ++it)
             {
-                deleted_node->delete_latched = false;
-                deleted_node->delete_pending = false;
-                deleted_node->delete_intent_count = 0;
-                c->nodes[Key(deleted_path)] = deleted_node;
-                if (deleted_parent && deleted_parent->is_directory)
+                auto& plan = *it;
+                if (plan.node && plan.path != L"\\")
                 {
-                    AddChildName(deleted_parent->children, deleted_leaf);
+                    plan.node->delete_latched = false;
+                    plan.node->delete_pending = false;
+                    plan.node->delete_intent_count = 0;
+                    plan.node->delete_requested_after_children = false;
+                    plan.node->caller_delete_retry_required = false;
+                    c->nodes[Key(plan.path)] = plan.node;
+                    if (plan.parent && plan.parent->is_directory)
+                    {
+                        AddChildName(plan.parent->children, plan.leaf);
+                    }
+                    RestoreFileRollbackSnapshotLocked(c, plan.file_snapshot);
                 }
-                RestoreFileRollbackSnapshotLocked(c, deleted_file_snapshot);
             }
             AbortMutationJournalBestEffort(c, L"Close");
-            DiscardFileRollbackSnapshot(deleted_file_snapshot);
+            for (auto& plan : delete_plans)
+            {
+                DiscardFileRollbackSnapshot(plan.file_snapshot);
+            }
             delete o;
             return;
         }
         FinalizeMutationJournalBestEffort(c, L"Close");
-        DiscardFileRollbackSnapshot(deleted_file_snapshot);
+        for (auto& plan : delete_plans)
+        {
+            DiscardFileRollbackSnapshot(plan.file_snapshot);
+        }
     }
 #endif
     delete o;
@@ -6409,6 +6900,17 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
     o->named_stream = stream_path.is_named_stream;
     o->stream_name = stream_path.stream_name;
     InitializeOpenAccess(o, granted_access);
+    o->delete_on_close_requested = (create_options & FILE_DELETE_ON_CLOSE) != 0;
+    if (n->is_directory && o->allow_delete)
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        if (TryGetNodeLocked(c, n->path) == n &&
+            n->children.empty() &&
+            HasRecentChildDeleteLocked(n))
+        {
+            SetDeleteIntentLocked(c, o, true);
+        }
+    }
     if (!n->is_directory)
     {
         const auto desired_access = ResolveHydrationDesiredAccess(
