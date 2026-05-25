@@ -348,6 +348,7 @@ struct MountContext
     std::optional<apfsaccess::rw::MetadataStore::CommitStatus> test_forced_native_commit_status;
     std::wstring test_forced_native_commit_recovery_reason;
     bool test_forced_native_commit_recovery_required = false;
+    std::uint32_t test_native_commit_attempt_count = 0;
 #endif
 #endif
 };
@@ -4414,6 +4415,9 @@ NTSTATUS CommitNativeMutationsBestEffort(MountContext* c, const wchar_t* origin)
 #endif
 
     std::lock_guard<std::mutex> commit_lock(c->commit_mutex);
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+    ++c->test_native_commit_attempt_count;
+#endif
 
     apfsaccess::rw::MetadataStore::CommitStatus commit_status = apfsaccess::rw::MetadataStore::CommitStatus::NotReady;
     std::optional<std::uint64_t> committed_xid = std::nullopt;
@@ -4606,6 +4610,22 @@ bool HasPendingNativeMutations(MountContext* c)
 
     std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
     return c->metadata_store->PendingMutationCount() > 0;
+}
+
+bool ClearStaleNativeDirtyMarkerIfClean(MountContext* c)
+{
+    if (!c || !c->pending_native_writes || HasPendingNativeMutations(c))
+    {
+        return false;
+    }
+
+    c->recovery_active = false;
+    c->write_degraded = false;
+    c->runtime_recovery_reason.clear();
+    c->runtime_last_recovery_action.clear();
+    (void)UpdateRecoveryMarkerBestEffort(c, false);
+    (void)WriteHostStatusFile(*c, c->recovery_active, c->runtime_last_commit_xid);
+    return true;
 }
 
 NTSTATUS CommitNativeMutationsOnFlushBestEffort(MountContext* c)
@@ -6811,45 +6831,53 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
         }
     }
 
-    if (c && IsMutationWriteEnabled(c) && (!delete_plans.empty() || c->pending_native_writes || HasPendingNativeMutations(c)))
+    if (c && IsMutationWriteEnabled(c))
     {
-        const auto close_commit_status = CommitNativeMutationsBestEffort(c, L"Close");
-        if (!NT_SUCCESS(close_commit_status))
+        const auto should_commit_on_close = !delete_plans.empty() || HasPendingNativeMutations(c);
+        if (!should_commit_on_close)
         {
-            std::wcerr << L"[FsHost] RW native-commit warning (Close): finalize-on-close commit failed with status 0x"
-                << std::hex << static_cast<unsigned long>(close_commit_status) << std::dec
-                << L"." << std::endl;
-            std::lock_guard<std::mutex> lock(c->mutex);
-            for (auto it = delete_plans.rbegin(); it != delete_plans.rend(); ++it)
+            (void)ClearStaleNativeDirtyMarkerIfClean(c);
+        }
+        else
+        {
+            const auto close_commit_status = CommitNativeMutationsBestEffort(c, L"Close");
+            if (!NT_SUCCESS(close_commit_status))
             {
-                auto& plan = *it;
-                if (plan.node && plan.path != L"\\")
+                std::wcerr << L"[FsHost] RW native-commit warning (Close): finalize-on-close commit failed with status 0x"
+                    << std::hex << static_cast<unsigned long>(close_commit_status) << std::dec
+                    << L"." << std::endl;
+                std::lock_guard<std::mutex> lock(c->mutex);
+                for (auto it = delete_plans.rbegin(); it != delete_plans.rend(); ++it)
                 {
-                    plan.node->delete_latched = false;
-                    plan.node->delete_pending = false;
-                    plan.node->delete_intent_count = 0;
-                    plan.node->delete_requested_after_children = false;
-                    plan.node->caller_delete_retry_required = false;
-                    c->nodes[Key(plan.path)] = plan.node;
-                    if (plan.parent && plan.parent->is_directory)
+                    auto& plan = *it;
+                    if (plan.node && plan.path != L"\\")
                     {
-                        AddChildName(plan.parent->children, plan.leaf);
+                        plan.node->delete_latched = false;
+                        plan.node->delete_pending = false;
+                        plan.node->delete_intent_count = 0;
+                        plan.node->delete_requested_after_children = false;
+                        plan.node->caller_delete_retry_required = false;
+                        c->nodes[Key(plan.path)] = plan.node;
+                        if (plan.parent && plan.parent->is_directory)
+                        {
+                            AddChildName(plan.parent->children, plan.leaf);
+                        }
+                        RestoreFileRollbackSnapshotLocked(c, plan.file_snapshot);
                     }
-                    RestoreFileRollbackSnapshotLocked(c, plan.file_snapshot);
                 }
+                AbortMutationJournalBestEffort(c, L"Close");
+                for (auto& plan : delete_plans)
+                {
+                    DiscardFileRollbackSnapshot(plan.file_snapshot);
+                }
+                delete o;
+                return;
             }
-            AbortMutationJournalBestEffort(c, L"Close");
+            FinalizeMutationJournalBestEffort(c, L"Close");
             for (auto& plan : delete_plans)
             {
                 DiscardFileRollbackSnapshot(plan.file_snapshot);
             }
-            delete o;
-            return;
-        }
-        FinalizeMutationJournalBestEffort(c, L"Close");
-        for (auto& plan : delete_plans)
-        {
-            DiscardFileRollbackSnapshot(plan.file_snapshot);
         }
     }
 #endif

@@ -4363,6 +4363,60 @@ bool TestCloseCommitsPendingNativeMetadataAfterDirectoryCreate()
 #endif
 }
 
+bool TestCloseSkipsNativeCommitWhenMetadataIsClean()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    MountContext context{};
+    context.args.readwrite = true;
+    context.args.write_backend = L"Native";
+    context.args.write_recovery_policy = L"FailClosed";
+    context.native_write_enabled = true;
+    context.overlay_write_enabled = true;
+    context.pending_native_writes = true;
+    context.test_forced_native_commit_status = apfsaccess::rw::MetadataStore::CommitStatus::PersistFailed;
+    context.test_forced_native_commit_recovery_reason = L"UnexpectedCleanCloseCommit";
+    context.test_forced_native_commit_recovery_required = true;
+    std::error_code ec;
+    const auto marker_root = std::filesystem::temp_directory_path(ec) / "ApfsAccess" / "fs-host-semantics";
+    if (ec)
+    {
+        return Require(false, "Clean close commit-skip test should resolve temp directory");
+    }
+    std::filesystem::create_directories(marker_root, ec);
+    if (ec)
+    {
+        return Require(false, "Clean close commit-skip test should create marker directory");
+    }
+    context.recovery_marker_file = marker_root / (L"clean-close-" + std::to_wstring(GetTickCount64()) + L".state");
+    SeedRoot(context);
+
+    auto file = MakeNode(L"\\clean.txt", false);
+    context.nodes.emplace(Key(file->path), file);
+    auto root = context.nodes[Key(L"\\")];
+    root->children.push_back(L"clean.txt");
+
+    auto* open_context = new OpenContext();
+    open_context->node = file;
+    open_context->write_open = true;
+    file->open_handle_count = 1;
+    file->write_handle_count = 1;
+
+    auto fs = BuildFileSystem(&context);
+    CB_Close(&fs, open_context);
+
+    const auto ok = Require(
+        context.test_native_commit_attempt_count == 0 &&
+            !context.pending_native_writes &&
+            !context.recovery_active &&
+            context.native_write_enabled,
+        "Close should clear a stale native dirty marker without attempting a commit when metadata is clean");
+    std::filesystem::remove(context.recovery_marker_file, ec);
+    return ok;
+#else
+    return true;
+#endif
+}
+
 bool TestCloseStagesNativeSubtreeDeleteBottomUp()
 {
 #ifdef APFSACCESS_HAS_RW_ENGINE
@@ -8914,6 +8968,10 @@ bool RunSelectedTest(const std::string& name)
     if (name == "close-commits-pending-native-metadata-after-directory-create")
     {
         return TestCloseCommitsPendingNativeMetadataAfterDirectoryCreate();
+    }
+    if (name == "close-skips-native-commit-when-metadata-clean")
+    {
+        return TestCloseSkipsNativeCommitWhenMetadataIsClean();
     }
     if (name == "native-subtree-delete-bottom-up")
     {

@@ -803,7 +803,7 @@ git commit -m "perf: replace metadata mutation snapshots with undo log"
 - Modify: `src-native/ApfsAccess.FsHost/tests/FsHostSemanticsTests.cpp`
 - Modify: `src-native/ApfsAccess.ApfsRwEngine/tests/MetadataStoreConformanceTests.cpp`
 
-- [ ] **Step 1: Use telemetry to identify redundant commits**
+- [x] **Step 1: Use telemetry to identify redundant commits**
 
 Before changing behavior, use Task 2 counters to list commit origins:
 
@@ -815,7 +815,7 @@ Before changing behavior, use Task 2 counters to list commit origins:
 
 Expected: the benchmark report shows which origins dominate small-file copy/move.
 
-- [ ] **Step 2: Add a commit decision helper**
+- [x] **Step 2: Add a commit decision helper**
 
 Centralize commit policy in FsHost:
 
@@ -833,7 +833,7 @@ enum class CommitUrgency
 
 Expected: every current call to `CommitNativeMutationsBestEffort` documents why it is needed.
 
-- [ ] **Step 3: Remove or delay only proven redundant commits**
+- [x] **Step 3: Remove or delay only proven redundant commits**
 
 Candidates to evaluate:
 
@@ -849,7 +849,7 @@ Do not delay:
 - recovery marker update;
 - namespace replacement where local rollback depends on commit success.
 
-- [ ] **Step 4: Add tests for commit origin behavior**
+- [x] **Step 4: Add tests for commit origin behavior**
 
 Add tests that assert:
 
@@ -859,7 +859,7 @@ Add tests that assert:
 - delete-on-close still commits before the node disappears permanently;
 - rename-replace rollback still works on forced commit failure.
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 Run:
 
