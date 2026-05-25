@@ -62,23 +62,27 @@ private:
     };
     struct ScopedPerfTimer;
 
-    [[nodiscard]] bool EnsureHandle(bool write_access) const;
-    void CloseHandleLocked() const;
-    [[nodiscard]] bool QueryGeometryLocked(Geometry& geometry) const;
-    [[nodiscard]] std::uint32_t LogicalBlockSizeLocked() const;
+    [[nodiscard]] HANDLE EnsureReadHandle() const;
+    [[nodiscard]] HANDLE EnsureWriteHandle() const;
+    void CloseHandlesLocked() const;
+    [[nodiscard]] bool QueryGeometryLocked(HANDLE handle, Geometry& geometry) const;
+    [[nodiscard]] std::uint32_t LogicalBlockSize() const;
+    [[nodiscard]] bool ReadAt(HANDLE handle, std::uint64_t offset_bytes, void* buffer, DWORD bytes_to_read, DWORD& bytes_read) const;
+    [[nodiscard]] bool WriteAt(HANDLE handle, std::uint64_t offset_bytes, const void* buffer, DWORD bytes_to_write, DWORD& bytes_written) const;
 
     std::wstring path_;
     std::uint64_t base_offset_bytes_ = 0;
-    mutable HANDLE handle_ = INVALID_HANDLE_VALUE;
+    mutable HANDLE read_handle_ = INVALID_HANDLE_VALUE;
+    mutable HANDLE write_handle_ = INVALID_HANDLE_VALUE;
     mutable bool writable_ = false;
     mutable bool geometry_cached_ = false;
     mutable Geometry geometry_cache_{};
-    mutable std::vector<std::byte> read_scratch_buffer_;
-    mutable std::vector<std::byte> write_scratch_buffer_;
     mutable PerfCounter read_perf_;
     mutable PerfCounter write_perf_;
     mutable PerfCounter unaligned_write_perf_;
     mutable PerfCounter flush_perf_;
-    mutable std::mutex mutex_;
+    mutable std::mutex handle_mutex_;
+    mutable std::mutex geometry_mutex_;
+    mutable std::mutex write_mutex_;
 };
 } // namespace apfsaccess::rw

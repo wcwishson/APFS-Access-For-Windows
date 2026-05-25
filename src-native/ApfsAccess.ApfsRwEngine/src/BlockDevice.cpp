@@ -239,8 +239,8 @@ std::string BlockDevice::PerformanceJson() const
 
 BlockDevice::~BlockDevice()
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    CloseHandleLocked();
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    CloseHandlesLocked();
 }
 
 const std::wstring& BlockDevice::Path() const noexcept
@@ -250,29 +250,29 @@ const std::wstring& BlockDevice::Path() const noexcept
 
 bool BlockDevice::IsWritable() const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (!writable_)
     {
-        (void)EnsureHandle(true);
+        (void)EnsureWriteHandle();
     }
     return writable_;
 }
 
 BlockDevice::Geometry BlockDevice::GetGeometry() const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(geometry_mutex_);
     if (geometry_cached_)
     {
         return geometry_cache_;
     }
 
     Geometry geometry{};
-    if (!EnsureHandle(false))
+    HANDLE handle = EnsureReadHandle();
+    if (handle == INVALID_HANDLE_VALUE)
     {
         return geometry;
     }
 
-    if (QueryGeometryLocked(geometry))
+    if (QueryGeometryLocked(handle, geometry))
     {
         geometry_cache_ = geometry;
         geometry_cached_ = true;
@@ -323,8 +323,8 @@ bool BlockDevice::ReadInto(
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!EnsureHandle(false))
+    HANDLE handle = EnsureReadHandle();
+    if (handle == INVALID_HANDLE_VALUE)
     {
         return false;
     }
@@ -335,7 +335,7 @@ bool BlockDevice::ReadInto(
     }
     offset_bytes += base_offset_bytes_;
 
-    const auto block_size = static_cast<std::uint64_t>(LogicalBlockSizeLocked());
+    const auto block_size = static_cast<std::uint64_t>(LogicalBlockSize());
     const auto aligned_offset = AlignDown(offset_bytes, block_size);
     const auto prefix_bytes = static_cast<std::size_t>(offset_bytes - aligned_offset);
     if (destination_size > (std::numeric_limits<std::uint64_t>::max() - static_cast<std::uint64_t>(prefix_bytes)))
@@ -353,17 +353,10 @@ bool BlockDevice::ReadInto(
         prefix_bytes == 0 &&
         static_cast<std::uint64_t>(destination_size) == aligned_size_u64;
 
-    LARGE_INTEGER target{};
-    target.QuadPart = static_cast<LONGLONG>(aligned_offset);
-    if (!SetFilePointerEx(handle_, target, nullptr, FILE_BEGIN))
-    {
-        return false;
-    }
-
     DWORD bytes_read = 0;
     if (already_aligned)
     {
-        if (!ReadFile(handle_, destination, static_cast<DWORD>(destination_size), &bytes_read, nullptr))
+        if (!ReadAt(handle, aligned_offset, destination, static_cast<DWORD>(destination_size), bytes_read))
         {
             return false;
         }
@@ -371,8 +364,8 @@ bool BlockDevice::ReadInto(
         return true;
     }
 
-    read_scratch_buffer_.resize(aligned_size);
-    if (!ReadFile(handle_, read_scratch_buffer_.data(), static_cast<DWORD>(read_scratch_buffer_.size()), &bytes_read, nullptr))
+    std::vector<std::byte> scratch(aligned_size);
+    if (!ReadAt(handle, aligned_offset, scratch.data(), static_cast<DWORD>(scratch.size()), bytes_read))
     {
         return false;
     }
@@ -384,7 +377,7 @@ bool BlockDevice::ReadInto(
     const auto available = static_cast<std::size_t>(bytes_read) - prefix_bytes;
     const auto bytes_to_copy = std::min(destination_size, available);
     std::copy_n(
-        read_scratch_buffer_.data() + prefix_bytes,
+        scratch.data() + prefix_bytes,
         bytes_to_copy,
         destination);
     out_bytes_read = bytes_to_copy;
@@ -414,8 +407,9 @@ bool BlockDevice::Write(std::uint64_t offset_bytes, const std::vector<std::byte>
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!EnsureHandle(true))
+    std::lock_guard<std::mutex> write_lock(write_mutex_);
+    HANDLE handle = EnsureWriteHandle();
+    if (handle == INVALID_HANDLE_VALUE)
     {
         return false;
     }
@@ -426,7 +420,7 @@ bool BlockDevice::Write(std::uint64_t offset_bytes, const std::vector<std::byte>
     }
     offset_bytes += base_offset_bytes_;
 
-    const auto block_size = static_cast<std::uint64_t>(LogicalBlockSizeLocked());
+    const auto block_size = static_cast<std::uint64_t>(LogicalBlockSize());
     const auto aligned_offset = AlignDown(offset_bytes, block_size);
     const auto prefix_bytes = static_cast<std::size_t>(offset_bytes - aligned_offset);
     if (buffer.size() > (std::numeric_limits<std::uint64_t>::max() - static_cast<std::uint64_t>(prefix_bytes)))
@@ -448,39 +442,31 @@ bool BlockDevice::Write(std::uint64_t offset_bytes, const std::vector<std::byte>
     {
         perf_scope.MarkSecondary();
     }
-    LARGE_INTEGER target{};
-    target.QuadPart = static_cast<LONGLONG>(aligned_offset);
-    if (!SetFilePointerEx(handle_, target, nullptr, FILE_BEGIN))
-    {
-        return false;
-    }
 
     const std::byte* write_buffer = buffer.data();
     std::size_t write_size = buffer.size();
+    std::vector<std::byte> scratch;
     if (!already_aligned)
     {
-        write_scratch_buffer_.resize(aligned_size);
+        scratch.resize(aligned_size);
         DWORD bytes_read = 0;
-        if (!ReadFile(handle_, write_scratch_buffer_.data(), static_cast<DWORD>(write_scratch_buffer_.size()), &bytes_read, nullptr) ||
-            bytes_read != write_scratch_buffer_.size())
+        if (!ReadAt(handle, aligned_offset, scratch.data(), static_cast<DWORD>(scratch.size()), bytes_read) ||
+            bytes_read != scratch.size())
         {
             return false;
         }
-        std::copy(buffer.begin(), buffer.end(), write_scratch_buffer_.begin() + static_cast<std::vector<std::byte>::difference_type>(prefix_bytes));
-        write_buffer = write_scratch_buffer_.data();
-        write_size = write_scratch_buffer_.size();
-
-        target.QuadPart = static_cast<LONGLONG>(aligned_offset);
-        if (!SetFilePointerEx(handle_, target, nullptr, FILE_BEGIN))
-        {
-            return false;
-        }
+        std::copy(
+            buffer.begin(),
+            buffer.end(),
+            scratch.begin() + static_cast<std::vector<std::byte>::difference_type>(prefix_bytes));
+        write_buffer = scratch.data();
+        write_size = scratch.size();
     }
 
     const auto write_failure = [&]() -> bool
     {
         DWORD bytes_written = 0;
-        if (!WriteFile(handle_, write_buffer, static_cast<DWORD>(write_size), &bytes_written, nullptr))
+        if (!WriteAt(handle, aligned_offset, write_buffer, static_cast<DWORD>(write_size), bytes_written))
         {
             return false;
         }
@@ -531,7 +517,7 @@ bool BlockDevice::Write(std::uint64_t offset_bytes, const std::vector<std::byte>
 
         DWORD bytes_written = 0;
         if (fault_write_size > 0 &&
-            !WriteFile(handle_, fault_buffer.data(), static_cast<DWORD>(fault_write_size), &bytes_written, nullptr))
+            !WriteAt(handle, aligned_offset, fault_buffer.data(), static_cast<DWORD>(fault_write_size), bytes_written))
         {
             return false;
         }
@@ -550,79 +536,76 @@ bool BlockDevice::Flush()
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!EnsureHandle(true))
+    std::lock_guard<std::mutex> write_lock(write_mutex_);
+    HANDLE handle = EnsureWriteHandle();
+    if (handle == INVALID_HANDLE_VALUE)
     {
         return false;
     }
 
-    return FlushFileBuffers(handle_) != FALSE;
+    return FlushFileBuffers(handle) != FALSE;
 }
 
-bool BlockDevice::EnsureHandle(bool write_access) const
+HANDLE BlockDevice::EnsureReadHandle() const
 {
-    if (handle_ != INVALID_HANDLE_VALUE)
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    if (read_handle_ != INVALID_HANDLE_VALUE)
     {
-        if (!write_access || writable_)
-        {
-            return true;
-        }
-
-        // Upgrade from read-only handle to read-write handle when a write path is requested.
-        CloseHandleLocked();
+        return read_handle_;
     }
 
-    const auto open_handle = [&](DWORD desired_access) -> HANDLE
-    {
-        return CreateFileW(
-            path_.c_str(),
-            desired_access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            nullptr,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr);
-    };
-
-    if (write_access)
-    {
-        handle_ = open_handle(GENERIC_READ | GENERIC_WRITE);
-        if (handle_ != INVALID_HANDLE_VALUE)
-        {
-            writable_ = true;
-            geometry_cached_ = false;
-            return true;
-        }
-    }
-
-    handle_ = open_handle(GENERIC_READ);
-    if (handle_ == INVALID_HANDLE_VALUE)
-    {
-        writable_ = false;
-        return false;
-    }
-
-    writable_ = false;
-    geometry_cached_ = false;
-    return !write_access;
+    read_handle_ = CreateFileW(
+        path_.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+        nullptr);
+    return read_handle_;
 }
 
-void BlockDevice::CloseHandleLocked() const
+HANDLE BlockDevice::EnsureWriteHandle() const
 {
-    if (handle_ != INVALID_HANDLE_VALUE)
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    if (write_handle_ != INVALID_HANDLE_VALUE)
     {
-        CloseHandle(handle_);
-        handle_ = INVALID_HANDLE_VALUE;
+        return write_handle_;
+    }
+
+    write_handle_ = CreateFileW(
+        path_.c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+        nullptr);
+    writable_ = write_handle_ != INVALID_HANDLE_VALUE;
+    return write_handle_;
+}
+
+void BlockDevice::CloseHandlesLocked() const
+{
+    if (read_handle_ != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(read_handle_);
+        read_handle_ = INVALID_HANDLE_VALUE;
+    }
+    if (write_handle_ != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(write_handle_);
+        write_handle_ = INVALID_HANDLE_VALUE;
     }
     writable_ = false;
 }
 
-bool BlockDevice::QueryGeometryLocked(Geometry& geometry) const
+bool BlockDevice::QueryGeometryLocked(HANDLE handle, Geometry& geometry) const
 {
     geometry = Geometry{};
 
     LARGE_INTEGER file_size{};
-    if (GetFileSizeEx(handle_, &file_size))
+    if (GetFileSizeEx(handle, &file_size))
     {
         geometry.total_bytes = static_cast<std::uint64_t>(file_size.QuadPart);
     }
@@ -630,7 +613,7 @@ bool BlockDevice::QueryGeometryLocked(Geometry& geometry) const
     DWORD bytes_returned = 0;
     DISK_GEOMETRY_EX disk_geometry{};
     if (DeviceIoControl(
-        handle_,
+        handle,
         IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
         nullptr,
         0,
@@ -655,7 +638,7 @@ bool BlockDevice::QueryGeometryLocked(Geometry& geometry) const
 
     GET_LENGTH_INFORMATION length_info{};
     if (DeviceIoControl(
-        handle_,
+        handle,
         IOCTL_DISK_GET_LENGTH_INFO,
         nullptr,
         0,
@@ -688,12 +671,14 @@ bool BlockDevice::QueryGeometryLocked(Geometry& geometry) const
     return geometry.total_bytes > 0;
 }
 
-std::uint32_t BlockDevice::LogicalBlockSizeLocked() const
+std::uint32_t BlockDevice::LogicalBlockSize() const
 {
+    std::lock_guard<std::mutex> lock(geometry_mutex_);
     if (!geometry_cached_)
     {
         Geometry geometry{};
-        if (QueryGeometryLocked(geometry))
+        HANDLE handle = EnsureReadHandle();
+        if (handle != INVALID_HANDLE_VALUE && QueryGeometryLocked(handle, geometry))
         {
             geometry_cache_ = geometry;
             geometry_cached_ = true;
@@ -701,5 +686,55 @@ std::uint32_t BlockDevice::LogicalBlockSizeLocked() const
     }
 
     return std::max<std::uint32_t>(512u, geometry_cache_.logical_block_size);
+}
+
+bool BlockDevice::ReadAt(
+    HANDLE handle,
+    std::uint64_t offset_bytes,
+    void* buffer,
+    DWORD bytes_to_read,
+    DWORD& bytes_read) const
+{
+    bytes_read = 0;
+    OVERLAPPED overlapped{};
+    overlapped.Offset = static_cast<DWORD>(offset_bytes & 0xffffffffull);
+    overlapped.OffsetHigh = static_cast<DWORD>(offset_bytes >> 32);
+    if (ReadFile(handle, buffer, bytes_to_read, &bytes_read, &overlapped))
+    {
+        return true;
+    }
+
+    const auto error = GetLastError();
+    if (error != ERROR_IO_PENDING)
+    {
+        return false;
+    }
+
+    return GetOverlappedResult(handle, &overlapped, &bytes_read, TRUE) != FALSE;
+}
+
+bool BlockDevice::WriteAt(
+    HANDLE handle,
+    std::uint64_t offset_bytes,
+    const void* buffer,
+    DWORD bytes_to_write,
+    DWORD& bytes_written) const
+{
+    bytes_written = 0;
+    OVERLAPPED overlapped{};
+    overlapped.Offset = static_cast<DWORD>(offset_bytes & 0xffffffffull);
+    overlapped.OffsetHigh = static_cast<DWORD>(offset_bytes >> 32);
+    if (WriteFile(handle, buffer, bytes_to_write, &bytes_written, &overlapped))
+    {
+        return true;
+    }
+
+    const auto error = GetLastError();
+    if (error != ERROR_IO_PENDING)
+    {
+        return false;
+    }
+
+    return GetOverlappedResult(handle, &overlapped, &bytes_written, TRUE) != FALSE;
 }
 } // namespace apfsaccess::rw

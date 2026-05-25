@@ -902,7 +902,7 @@ git commit -m "perf: coalesce redundant native commit work"
 - Modify: `src-native/ApfsAccess.ApfsRwEngine/tests/MetadataStoreFaultInjectionTests.cpp`
 - Modify: `src-native/ApfsAccess.ApfsRwEngine/tests/MetadataStoreConformanceFaultTests.cpp`
 
-- [ ] **Step 1: Add separate read/write handle state**
+- [x] **Step 1: Add separate read/write handle state**
 
 Split current handle usage into:
 
@@ -913,7 +913,7 @@ Split current handle usage into:
 
 Expected: reads do not wait behind unrelated writes just because they share a file pointer.
 
-- [ ] **Step 2: Use explicit offsets for reads and writes**
+- [x] **Step 2: Use explicit offsets for reads and writes**
 
 Replace `SetFilePointerEx` plus `ReadFile`/`WriteFile` with offset-based I/O. Use the safest Windows pattern for this codebase:
 
@@ -922,7 +922,7 @@ Replace `SetFilePointerEx` plus `ReadFile`/`WriteFile` with offset-based I/O. Us
 - wait synchronously for completion if the handle is overlapped;
 - preserve exact short-read and fault-injection behavior.
 
-- [ ] **Step 3: Keep unaligned write safety**
+- [x] **Step 3: Keep unaligned write safety**
 
 Preserve read-modify-write behavior for unaligned writes:
 
@@ -933,11 +933,13 @@ Preserve read-modify-write behavior for unaligned writes:
 
 - [ ] **Step 4: Add adjacent write batching only after offset I/O passes**
 
+Deferred for this checkpoint: offset-based I/O is now validated, but adjacent write batching changes commit persistence ordering and should wait for physical benchmark evidence that raw metadata write call count is still the bottleneck.
+
 Batch only adjacent small writes within one commit/checkpoint operation. Do not batch across an explicit flush boundary.
 
 Expected: metadata checkpoint persistence uses fewer raw device calls when it writes adjacent blocks.
 
-- [ ] **Step 5: Verify fault tests**
+- [x] **Step 5: Verify fault tests**
 
 Run:
 

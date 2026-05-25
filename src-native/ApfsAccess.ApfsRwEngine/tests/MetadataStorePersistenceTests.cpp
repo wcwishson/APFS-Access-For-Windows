@@ -1,3 +1,4 @@
+#include "BlockDevice.h"
 #include "MetadataStore.h"
 
 #include <algorithm>
@@ -35,6 +36,8 @@ constexpr std::uint64_t kNativeObjectMapOverflowBlocks = 16;
 constexpr std::uint64_t kNativeInodeOverflowOffset = kNativeOverflowCheckpointOffset + kNativeObjectMapOverflowBlocks;
 constexpr std::uint64_t kNativeCheckpointExtensionBlocks = 192;
 constexpr std::uint64_t kNativeBtreeExtensionOffset = 0;
+
+bool Require(bool condition, const std::string& message);
 
 void WriteLe32(std::vector<std::byte>& buffer, std::size_t offset, std::uint32_t value)
 {
@@ -158,6 +161,76 @@ bool WriteBytesToImage(
 
     io.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     return io.good();
+}
+
+bool TestBlockDeviceOffsetIo(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "block_device_offset_io.bin";
+    std::vector<std::byte> seed(64 * 1024, std::byte{0});
+    for (std::size_t i = 0; i < seed.size(); ++i)
+    {
+        seed[i] = static_cast<std::byte>(i & 0xffu);
+    }
+    {
+        std::ofstream out(image_path, std::ios::binary | std::ios::trunc);
+        if (!out.good())
+        {
+            return Require(false, "BlockDevice offset I/O test should create image");
+        }
+        out.write(reinterpret_cast<const char*>(seed.data()), static_cast<std::streamsize>(seed.size()));
+        if (!out.good())
+        {
+            return Require(false, "BlockDevice offset I/O test should seed image");
+        }
+    }
+
+    apfsaccess::rw::BlockDevice device(image_path.wstring());
+    bool ok = true;
+
+    const auto aligned_payload = BuildPatternPayload(4096, 0x51);
+    ok &= Require(device.Write(8192, aligned_payload), "BlockDevice offset I/O aligned write should succeed");
+
+    std::vector<std::byte> aligned_read;
+    ok &= Require(device.Read(8192, aligned_payload.size(), aligned_read), "BlockDevice offset I/O aligned read should succeed");
+    ok &= Require(aligned_read == aligned_payload, "BlockDevice offset I/O aligned read should match write");
+
+    const auto unaligned_payload = BuildPatternPayload(1000, 0xA4);
+    ok &= Require(device.Write(8192 + 123, unaligned_payload), "BlockDevice offset I/O unaligned write should succeed");
+
+    std::vector<std::byte> whole_block;
+    ok &= Require(device.Read(8192, 4096, whole_block), "BlockDevice offset I/O block read after RMW should succeed");
+    if (whole_block.size() == 4096)
+    {
+        ok &= Require(
+            std::equal(unaligned_payload.begin(), unaligned_payload.end(), whole_block.begin() + 123),
+            "BlockDevice offset I/O unaligned payload should land at requested offset");
+        ok &= Require(
+            std::equal(aligned_payload.begin(), aligned_payload.begin() + 123, whole_block.begin()),
+            "BlockDevice offset I/O unaligned write should preserve block prefix");
+        ok &= Require(
+            std::equal(
+                aligned_payload.begin() + 1123,
+                aligned_payload.end(),
+                whole_block.begin() + 1123),
+            "BlockDevice offset I/O unaligned write should preserve block suffix");
+    }
+    else
+    {
+        ok &= Require(false, "BlockDevice offset I/O block read should return full block");
+    }
+
+    std::vector<std::byte> disjoint_read;
+    ok &= Require(device.Read(16384, 4096, disjoint_read), "BlockDevice offset I/O disjoint read should succeed");
+    ok &= Require(disjoint_read.size() == 4096, "BlockDevice offset I/O disjoint read should return full block");
+    if (disjoint_read.size() == 4096)
+    {
+        ok &= Require(
+            std::equal(seed.begin() + 16384, seed.begin() + 20480, disjoint_read.begin()),
+            "BlockDevice offset I/O disjoint read should not depend on previous seek position");
+    }
+
+    ok &= Require(device.Flush(), "BlockDevice offset I/O flush should succeed");
+    return ok;
 }
 
 std::optional<std::uint32_t> ReadLe32FromBytes(const std::vector<std::byte>& bytes, std::size_t offset)
@@ -919,6 +992,7 @@ int main()
     const auto resized_reuse_payload = BuildPatternPayload(1024, 0x7C);
 
     bool ok = true;
+    ok &= TestBlockDeviceOffsetIo(run_root);
     std::uint64_t final_committed_xid = 0;
     std::uint64_t previous_committed_xid = 0;
     {
