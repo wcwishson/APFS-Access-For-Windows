@@ -1,8 +1,8 @@
 # APFS Access Release Notes
 
-## Current Release
+## APFS Access 1.0.2
 
-This update improves APFS Access for everyday use with a new dashboard, stronger write-path hardening, and more reliable eject/fix behavior.
+APFS Access 1.0.2 improves everyday use with a new dashboard, stronger write-path hardening, and more reliable eject/fix behavior.
 
 ### Download
 
