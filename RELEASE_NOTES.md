@@ -31,7 +31,7 @@ Advanced users may also download the click-run zip for the same release.
 - `Eject` and tray eject labels include the physical drive and APFS volume name when available.
 - Improved mount lifecycle behavior so service-level eject removes the stale drive letter and refresh can remount the still-connected drive.
 - Hardened write behavior around copy-on-write file updates, rename/replace rollback, fragmented extents, torn-write recovery, and recovery diagnostics.
-- Expanded user-facing Explorer workflow validation with SHA-256 integrity checks, Office-style save patterns, recycle-bin workflows, named-stream edge cases, many-small-file sweeps, long paths, and large-file roundtrips.
+- Improved compatibility with everyday Explorer workflows such as Office-style saves, recycle-bin operations, long paths, many small files, and large-file roundtrips.
 
 ### User-Facing Behavior
 
@@ -49,24 +49,10 @@ Advanced users may also download the click-run zip for the same release.
 - Some APFS roles and feature combinations are mounted read-only or skipped.
 - Writable mode remains conservative and may fall back to read-only.
 - Performance depends on the APFS drive, USB adapter, Windows storage stack, and the current native engine path.
-- The latest GUI/eject/fix pass was validated with focused tests and physical smoke; a later full solution test attempt timed out before reporting a final pass/fail summary.
-
-### Validation
-
-The latest pass was validated with:
-
-- Focused service auto-mount/eject/fix tests: 8/8 passed.
-- IPC tests: 6/6 passed.
-- Tray/dashboard tests: 66/66 passed.
-- `git diff --check` completed with no whitespace errors, only existing CRLF conversion warnings.
-- Portable publish completed and root `APFSAccess_Portable.exe` was overwritten.
-- Live APFS physical smoke on `E:\` passed: create, copy, SHA-256 readback, direct write, rename, move, cut/paste, recursive copy, delete, edge paths, and post-status health.
-- Live service IPC eject/remount cycle passed: `E:\` disappeared after eject, FsHost exited, refresh remounted the same connected drive, and post-status returned to read/write with recovery inactive.
-- The user's manual Explorer operations on the drive were also reported working.
 
 ### Appendix: Technical Notes
 
-APFS Access uses a background service to discover APFS volumes, a tray/dashboard app for user status/control, and a native WinFsp host to expose APFS volumes as Windows drive letters. The native write path is fail-closed: commit readiness, recovery status, unsupported APFS features, and validation gates are checked before writable mode is allowed. When those checks do not pass, the mount is downgraded to read-only where possible.
+APFS Access uses a background service to discover APFS volumes, a tray/dashboard app for user status/control, and a native WinFsp host to expose APFS volumes as Windows drive letters. The native write path is fail-closed: commit readiness, recovery status, unsupported APFS features, and safety gates are checked before writable mode is allowed. When those checks do not pass, the mount is downgraded to read-only where possible.
 
 ## APFS Access 1.0.0
 
@@ -118,14 +104,6 @@ Advanced users may also download:
 - Writable mode is intentionally conservative and may fall back to read-only.
 - Performance depends on the APFS drive, USB adapter, Windows storage stack, and the current native engine path.
 
-## Validation
-
-The 1.0.0 release was validated with:
-
-- Managed test suite: `dotnet test APFSAccess.sln -c Debug --no-restore -m:1`
-- Native APFS engine CTest suite: `ctest --test-dir build/ApfsAccess.ApfsRwEngine -C Debug --output-on-failure`
-- Native FsHost CTest suite: `ctest --test-dir build/ApfsAccess.FsHost -C Debug --output-on-failure`
-
 ## Appendix: Technical Notes
 
-APFS Access uses a background service to discover APFS volumes, a tray app for user status/control, and a native WinFsp host to expose APFS volumes as Windows drive letters. The native write path is fail-closed: commit readiness, recovery status, unsupported APFS features, and validation gates are checked before writable mode is allowed. When those checks do not pass, the mount is downgraded to read-only where possible.
+APFS Access uses a background service to discover APFS volumes, a tray app for user status/control, and a native WinFsp host to expose APFS volumes as Windows drive letters. The native write path is fail-closed: commit readiness, recovery status, unsupported APFS features, and safety gates are checked before writable mode is allowed. When those checks do not pass, the mount is downgraded to read-only where possible.
