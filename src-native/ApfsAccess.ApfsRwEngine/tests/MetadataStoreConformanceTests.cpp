@@ -628,6 +628,108 @@ bool TestDirectoryAndDeleteConformance(const std::filesystem::path& run_root)
     return ok;
 }
 
+bool TestWorkingDirectoryIndexConformance(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "directory_index.apfs.img";
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, "TestWorkingDirectoryIndexConformance: unable to create synthetic container");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        L"DirectoryIndex",
+    };
+    apfsaccess::rw::MetadataStore store(context);
+    bool ok = true;
+    ok &= Require(store.LoadContainerSuperblocks(), "DirectoryIndex: LoadContainerSuperblocks should succeed");
+    ok &= Require(store.LoadObjectMap(), "DirectoryIndex: LoadObjectMap should succeed");
+    ok &= Require(store.LoadSpacemanState(), "DirectoryIndex: LoadSpacemanState should succeed");
+    ok &= Require(store.PrepareNativeWritePath(), "DirectoryIndex: PrepareNativeWritePath should succeed");
+
+    const auto root = store.LookupCommittedInodeByPath(L"\\");
+    if (!Require(root.has_value(), "DirectoryIndex: root inode should exist"))
+    {
+        return false;
+    }
+    ok &= Require(store.DebugWorkingDirectoryChildCount(root->object_id) == 0, "DirectoryIndex: root should start with no children");
+
+    apfsaccess::rw::MetadataStore::MutationRequest create_dir{};
+    create_dir.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateDirectory;
+    create_dir.path = L"\\Parent";
+    ok &= ExpectMutationStatus(
+        store,
+        create_dir,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "DirectoryIndex: create parent should apply");
+
+    const auto parent = store.LookupCommittedInodeByPath(L"\\Parent");
+    ok &= Require(!parent.has_value(), "DirectoryIndex: uncommitted parent should not appear in committed view");
+    ok &= Require(store.DebugWorkingDirectoryChildCount(root->object_id) == 1, "DirectoryIndex: root child count should include staged parent");
+
+    apfsaccess::rw::MetadataStore::MutationRequest create_child = create_dir;
+    create_child.path = L"\\Parent\\Child";
+    ok &= ExpectMutationStatus(
+        store,
+        create_child,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "DirectoryIndex: create child should apply");
+
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "DirectoryIndex: initial commit should succeed");
+
+    const auto committed_parent = store.LookupCommittedInodeByPath(L"\\Parent");
+    if (!Require(committed_parent.has_value(), "DirectoryIndex: committed parent should exist"))
+    {
+        return false;
+    }
+    ok &= Require(store.DebugWorkingDirectoryChildCount(root->object_id) == 1, "DirectoryIndex: root count should survive commit sync");
+    ok &= Require(store.DebugWorkingDirectoryChildCount(committed_parent->object_id) == 1, "DirectoryIndex: parent count should survive commit sync");
+
+    apfsaccess::rw::MetadataStore::MutationRequest replace_parent{};
+    replace_parent.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateDirectory;
+    replace_parent.path = L"\\Parent";
+    replace_parent.replace_if_exists = true;
+    ok &= ExpectMutationStatus(
+        store,
+        replace_parent,
+        apfsaccess::rw::MetadataStore::MutationStatus::InvalidRequest,
+        "DirectoryIndex: replacing non-empty parent should fail");
+    ok &= Require(store.DebugWorkingDirectoryChildCount(committed_parent->object_id) == 1, "DirectoryIndex: failed replace should preserve parent count");
+
+    apfsaccess::rw::MetadataStore::MutationRequest delete_child{};
+    delete_child.operation = apfsaccess::rw::MetadataStore::MutationOperation::Delete;
+    delete_child.path = L"\\Parent\\Child";
+    ok &= ExpectMutationStatus(
+        store,
+        delete_child,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "DirectoryIndex: delete child should apply");
+    ok &= Require(store.DebugWorkingDirectoryChildCount(committed_parent->object_id) == 0, "DirectoryIndex: parent count should drop after child delete");
+
+    ok &= ExpectMutationStatus(
+        store,
+        replace_parent,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "DirectoryIndex: replacing empty parent should apply");
+    ok &= Require(store.DebugWorkingDirectoryChildCount(root->object_id) == 1, "DirectoryIndex: root count should remain stable after replace");
+
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "DirectoryIndex: final commit should succeed");
+
+    const auto remounted_parent = store.LookupCommittedInodeByPath(L"\\Parent");
+    if (remounted_parent.has_value())
+    {
+        ok &= Require(store.DebugWorkingDirectoryChildCount(remounted_parent->object_id) == 0, "DirectoryIndex: committed replacement parent should be empty");
+    }
+    return ok;
+}
+
 bool TestDirectorySubtreeDeleteConformance(const std::filesystem::path& run_root)
 {
     const auto image_path = run_root / "directory_subtree_delete.apfs.img";
@@ -2227,6 +2329,7 @@ int main()
 
     ok &= TestRenameReplaceConformance(run_root);
     ok &= TestDirectoryAndDeleteConformance(run_root);
+    ok &= TestWorkingDirectoryIndexConformance(run_root);
     ok &= TestDirectorySubtreeDeleteConformance(run_root);
     ok &= TestTruncateConformance(run_root);
     ok &= TestDirectorySubtreeRenameObjectMapConformance(run_root);

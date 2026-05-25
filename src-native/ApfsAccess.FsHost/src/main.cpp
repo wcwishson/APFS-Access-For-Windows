@@ -2518,6 +2518,32 @@ std::shared_ptr<Node> TryGetVisibleNodeLocked(MountContext* c, const std::wstrin
     return node;
 }
 
+std::shared_ptr<Node> TryGetVisibleChildNodeLocked(
+    MountContext* c,
+    const std::shared_ptr<Node>& parent,
+    const std::wstring& child_name)
+{
+    if (!c || !parent || LooksLikeNamedStreamArtifactName(child_name))
+    {
+        return {};
+    }
+
+    auto path = parent->path;
+    if (path != L"\\")
+    {
+        path.push_back(L'\\');
+    }
+    path.append(child_name);
+    auto node = TryGetNodeLocked(c, path);
+    if (!node ||
+        IsDeleteBlockedStateLocked(node) ||
+        HasDeletePendingAncestorLocked(c, node->path))
+    {
+        return {};
+    }
+    return node;
+}
+
 bool HasChildName(const std::vector<std::wstring>& children, const std::wstring& name)
 {
     return std::any_of(children.begin(), children.end(), [&](const std::wstring& existing)
@@ -7215,12 +7241,7 @@ NTSTATUS CB_ReadDirectory(FSP_FILE_SYSTEM* fs, PVOID dir_ctx, PWSTR, PWSTR marke
         entries.reserve(o->node->children.size());
         for (const auto& name : o->node->children)
         {
-            if (LooksLikeNamedStreamArtifactName(name))
-            {
-                continue;
-            }
-
-            auto child = TryGetNodeLocked(c, Join(o->node->path, name));
+            auto child = TryGetVisibleChildNodeLocked(c, o->node, name);
             if (child)
             {
                 entries.push_back({ name, child });

@@ -579,7 +579,7 @@ git commit -m "perf: stream committed APFS reads into caller buffers"
 - Modify: `src-native/ApfsAccess.ApfsRwEngine/tests/MetadataStoreConformanceTests.cpp`
 - Modify: `src-native/ApfsAccess.FsHost/tests/FsHostSemanticsTests.cpp`
 
-- [ ] **Step 1: Add a working directory child index**
+- [x] **Step 1: Add a working directory child index**
 
 Add internal indexes in `MetadataStore`:
 
@@ -596,7 +596,7 @@ Use a stable key:
 
 Keep `working_directory_links_` as the persisted/serialized source of truth until later tasks prove the index is correct.
 
-- [ ] **Step 2: Rebuild indexes after load and commit state sync**
+- [x] **Step 2: Rebuild indexes after load and commit state sync**
 
 Call a new helper after:
 
@@ -607,7 +607,7 @@ Call a new helper after:
 
 Expected: index state matches `working_directory_links_`.
 
-- [ ] **Step 3: Update mutation helpers**
+- [x] **Step 3: Update mutation helpers**
 
 Replace linear helpers:
 
@@ -623,7 +623,7 @@ Expected:
 - upsert/remove avoid scanning the whole link vector for every small file;
 - existing vector remains correct for persistence.
 
-- [ ] **Step 4: Add FsHost directory child node cache**
+- [x] **Step 4: Add FsHost directory child node cache**
 
 In FsHost, avoid resolving every child through `TryGetNodeLocked(c, Join(parent, name))` during `CB_ReadDirectory` when the child node can be retained or looked up by canonical child path once.
 
@@ -634,7 +634,7 @@ Safe approach:
 - only cache visible, non-delete-pending child nodes;
 - invalidate on create, rename, delete, and directory merge.
 
-- [ ] **Step 5: Verify correctness**
+- [x] **Step 5: Verify correctness**
 
 Run:
 
@@ -655,7 +655,7 @@ Run `Performance` mode and compare:
 - `directory-enumeration` entries/s;
 - `ApplyMutation` p95.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```powershell
 git add src-native/ApfsAccess.ApfsRwEngine src-native/ApfsAccess.FsHost

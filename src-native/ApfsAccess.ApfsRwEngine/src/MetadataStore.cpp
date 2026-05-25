@@ -1248,6 +1248,7 @@ bool MetadataStore::LoadContainerSuperblocks()
     working_inodes_.clear();
     working_path_index_.clear();
     working_directory_links_.clear();
+    RebuildWorkingDirectoryIndexes();
     committed_spaceman_allocations_.clear();
     committed_spaceman_free_extents_.clear();
     working_spaceman_free_extents_.clear();
@@ -3550,6 +3551,7 @@ bool MetadataStore::LoadInodeCheckpointBlock(std::uint64_t block_index, const st
     working_inodes_ = committed_inodes_;
     working_path_index_ = committed_path_index_;
     working_directory_links_ = committed_directory_links_;
+    RebuildWorkingDirectoryIndexes();
 
     if (persisted_xid > 0)
     {
@@ -4211,6 +4213,7 @@ bool MetadataStore::PrepareNativeWritePath()
     working_directory_links_ = committed_directory_links_;
     working_spaceman_free_extents_ = committed_spaceman_free_extents_;
     working_next_ephemeral_extent_ = next_ephemeral_extent_;
+    RebuildWorkingDirectoryIndexes();
     pending_mutations_.clear();
     pending_object_map_updates_.clear();
     pending_spaceman_allocations_.clear();
@@ -4449,6 +4452,7 @@ void MetadataStore::SyncWorkingStateFromCommitted()
     working_directory_links_ = committed_directory_links_;
     working_spaceman_free_extents_ = committed_spaceman_free_extents_;
     working_next_ephemeral_extent_ = next_ephemeral_extent_;
+    RebuildWorkingDirectoryIndexes();
 }
 
 MetadataStore::MutationStatus MetadataStore::RejectMutation(std::wstring reason)
@@ -4609,6 +4613,8 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
     const auto working_inodes_snapshot = working_inodes_;
     const auto working_path_index_snapshot = working_path_index_;
     const auto working_directory_links_snapshot = working_directory_links_;
+    const auto working_child_count_snapshot = working_child_count_by_parent_;
+    const auto working_directory_link_index_snapshot = working_directory_link_index_;
     const auto working_spaceman_free_extents_snapshot = working_spaceman_free_extents_;
     const auto pending_object_map_updates_snapshot = pending_object_map_updates_;
     const auto pending_spaceman_allocations_snapshot = pending_spaceman_allocations_;
@@ -4627,6 +4633,8 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
             working_inodes_ = working_inodes_snapshot;
             working_path_index_ = working_path_index_snapshot;
             working_directory_links_ = working_directory_links_snapshot;
+            working_child_count_by_parent_ = working_child_count_snapshot;
+            working_directory_link_index_ = working_directory_link_index_snapshot;
             working_spaceman_free_extents_ = working_spaceman_free_extents_snapshot;
             pending_object_map_updates_ = pending_object_map_updates_snapshot;
             pending_spaceman_allocations_ = pending_spaceman_allocations_snapshot;
@@ -5755,6 +5763,8 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         const auto working_inodes_snapshot = working_inodes_;
         const auto working_path_index_snapshot = working_path_index_;
         const auto working_directory_links_snapshot = working_directory_links_;
+        const auto working_child_count_snapshot = working_child_count_by_parent_;
+        const auto working_directory_link_index_snapshot = working_directory_link_index_;
         const auto last_committed_xid_snapshot = last_committed_xid_;
         const auto loaded_superblock_checkpoint_xid_snapshot = loaded_superblock_checkpoint_xid_;
 
@@ -5766,6 +5776,8 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
             working_inodes_ = working_inodes_snapshot;
             working_path_index_ = working_path_index_snapshot;
             working_directory_links_ = working_directory_links_snapshot;
+            working_child_count_by_parent_ = working_child_count_snapshot;
+            working_directory_link_index_ = working_directory_link_index_snapshot;
             last_committed_xid_ = last_committed_xid_snapshot;
             loaded_superblock_checkpoint_xid_ = loaded_superblock_checkpoint_xid_snapshot;
         };
@@ -8157,6 +8169,12 @@ std::size_t MetadataStore::CommittedInodeCount() const noexcept
     return committed_inodes_.size();
 }
 
+std::size_t MetadataStore::DebugWorkingDirectoryChildCount(std::uint64_t parent_object_id) const
+{
+    const auto count = working_child_count_by_parent_.find(parent_object_id);
+    return count == working_child_count_by_parent_.end() ? 0 : count->second;
+}
+
 std::optional<MetadataStore::InodeRecord> MetadataStore::LookupCommittedInodeByPath(const std::wstring& path) const
 {
     const auto normalized = NormalizePath(path);
@@ -9306,15 +9324,38 @@ std::optional<MetadataStore::InodeRecord> MetadataStore::LookupWorkingInode(cons
 
 bool MetadataStore::HasWorkingChildren(std::uint64_t parent_object_id) const
 {
-    for (const auto& [object_id, inode] : working_inodes_)
-    {
-        if (object_id != parent_object_id && inode.parent_object_id == parent_object_id)
-        {
-            return true;
-        }
-    }
+    const auto count = working_child_count_by_parent_.find(parent_object_id);
+    return count != working_child_count_by_parent_.end() && count->second != 0;
+}
 
-    return false;
+std::wstring MetadataStore::BuildWorkingDirectoryLinkIndexKey(
+    std::uint64_t parent_object_id,
+    const std::wstring& entry_name) const
+{
+    std::wstring normalized_entry_name = entry_name;
+    std::transform(
+        normalized_entry_name.begin(),
+        normalized_entry_name.end(),
+        normalized_entry_name.begin(),
+        [](wchar_t ch)
+        {
+            return static_cast<wchar_t>(std::towlower(ch));
+        });
+    return BuildDirectoryEntryIndexKey(parent_object_id, normalized_entry_name);
+}
+
+void MetadataStore::RebuildWorkingDirectoryIndexes()
+{
+    working_child_count_by_parent_.clear();
+    working_directory_link_index_.clear();
+    working_child_count_by_parent_.reserve(working_directory_links_.size());
+    working_directory_link_index_.reserve(working_directory_links_.size());
+    for (std::size_t index = 0; index < working_directory_links_.size(); ++index)
+    {
+        const auto& link = working_directory_links_[index];
+        ++working_child_count_by_parent_[link.parent_object_id];
+        working_directory_link_index_[BuildWorkingDirectoryLinkIndexKey(link.parent_object_id, link.entry_name)] = index;
+    }
 }
 
 void MetadataStore::UpsertWorkingDirectoryLink(
@@ -9324,17 +9365,19 @@ void MetadataStore::UpsertWorkingDirectoryLink(
     std::uint64_t xid
 )
 {
-    for (auto& link : working_directory_links_)
+    const auto key = BuildWorkingDirectoryLinkIndexKey(parent_object_id, entry_name);
+    auto index_it = working_directory_link_index_.find(key);
+    if (index_it != working_directory_link_index_.end() &&
+        index_it->second < working_directory_links_.size())
     {
-        if (link.parent_object_id == parent_object_id &&
-            link.entry_name == entry_name)
-        {
-            link.child_object_id = child_object_id;
-            link.xid = xid;
-            return;
-        }
+        auto& link = working_directory_links_[index_it->second];
+        link.entry_name = entry_name;
+        link.child_object_id = child_object_id;
+        link.xid = xid;
+        return;
     }
 
+    const auto new_index = working_directory_links_.size();
     working_directory_links_.push_back(DirectoryLink
     {
         parent_object_id,
@@ -9342,21 +9385,50 @@ void MetadataStore::UpsertWorkingDirectoryLink(
         child_object_id,
         xid
     });
+    ++working_child_count_by_parent_[parent_object_id];
+    working_directory_link_index_[key] = new_index;
 }
 
 void MetadataStore::RemoveWorkingDirectoryLink(std::uint64_t parent_object_id, const std::wstring& entry_name)
 {
-    working_directory_links_.erase(
-        std::remove_if(
-            working_directory_links_.begin(),
-            working_directory_links_.end(),
-            [&](const DirectoryLink& link)
-            {
-                return link.parent_object_id == parent_object_id &&
-                       link.entry_name == entry_name;
-            }),
-        working_directory_links_.end()
-    );
+    const auto key = BuildWorkingDirectoryLinkIndexKey(parent_object_id, entry_name);
+    auto index_it = working_directory_link_index_.find(key);
+    if (index_it == working_directory_link_index_.end() ||
+        index_it->second >= working_directory_links_.size())
+    {
+        RebuildWorkingDirectoryIndexes();
+        index_it = working_directory_link_index_.find(key);
+        if (index_it == working_directory_link_index_.end())
+        {
+            return;
+        }
+    }
+
+    const auto removed_index = index_it->second;
+    const auto last_index = working_directory_links_.size() - 1;
+    if (removed_index != last_index)
+    {
+        working_directory_links_[removed_index] = std::move(working_directory_links_[last_index]);
+        working_directory_link_index_[
+            BuildWorkingDirectoryLinkIndexKey(
+                working_directory_links_[removed_index].parent_object_id,
+                working_directory_links_[removed_index].entry_name)] = removed_index;
+    }
+    working_directory_links_.pop_back();
+    working_directory_link_index_.erase(key);
+
+    auto count_it = working_child_count_by_parent_.find(parent_object_id);
+    if (count_it != working_child_count_by_parent_.end())
+    {
+        if (count_it->second <= 1)
+        {
+            working_child_count_by_parent_.erase(count_it);
+        }
+        else
+        {
+            --count_it->second;
+        }
+    }
 }
 
 bool MetadataStore::IsLikelyRawDevicePath(const std::wstring& path)
@@ -11768,6 +11840,7 @@ bool MetadataStore::LoadPersistentState()
     working_inodes_.clear();
     working_path_index_.clear();
     working_directory_links_.clear();
+    RebuildWorkingDirectoryIndexes();
     working_spaceman_free_extents_.clear();
     last_commit_blob_address_.reset();
     last_commit_blob_bytes_.reset();
@@ -11982,6 +12055,7 @@ bool MetadataStore::LoadPersistentState()
         working_inodes_.clear();
         working_path_index_.clear();
         working_directory_links_.clear();
+        RebuildWorkingDirectoryIndexes();
         working_spaceman_free_extents_.clear();
         next_ephemeral_extent_ = disk_loaded_next_extent;
         working_next_ephemeral_extent_ = disk_loaded_next_extent;
@@ -12319,6 +12393,7 @@ bool MetadataStore::LoadPersistentState()
             working_inodes_.clear();
             working_path_index_.clear();
             working_directory_links_.clear();
+            RebuildWorkingDirectoryIndexes();
             last_committed_xid_ = disk_loaded_last_committed_xid;
 
             if (!LoadInodeCheckpointBlock(inode_checkpoint_block, inode_checkpoint_bytes))
@@ -12351,6 +12426,7 @@ bool MetadataStore::LoadPersistentState()
         working_inodes_.clear();
         working_path_index_.clear();
         working_directory_links_.clear();
+        RebuildWorkingDirectoryIndexes();
     }
 
     if (!require_coherent_native_checkpoint_set || !coherent_native_checkpoint_selected)
@@ -12639,6 +12715,7 @@ bool MetadataStore::LoadPersistentState()
             working_inodes_.clear();
             working_path_index_.clear();
             working_directory_links_.clear();
+            RebuildWorkingDirectoryIndexes();
             last_committed_xid_ = disk_loaded_last_committed_xid;
 
             if (!LoadInodeCheckpointBlock(inode_checkpoint_block, inode_checkpoint_bytes) ||
@@ -12667,6 +12744,7 @@ bool MetadataStore::LoadPersistentState()
         working_inodes_.clear();
         working_path_index_.clear();
         working_directory_links_.clear();
+        RebuildWorkingDirectoryIndexes();
 
         reconcile_inode_state_from_btree();
         reconcile_inode_state_from_native_projection();
@@ -12766,6 +12844,7 @@ bool MetadataStore::LoadPersistentState()
         working_directory_links_ = committed_directory_links_;
         working_spaceman_free_extents_ = committed_spaceman_free_extents_;
         working_next_ephemeral_extent_ = next_ephemeral_extent_;
+        RebuildWorkingDirectoryIndexes();
         bool persistent_state_file_present = false;
         if (!persistent_state_path_.empty())
         {

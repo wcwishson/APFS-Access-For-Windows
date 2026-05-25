@@ -201,6 +201,7 @@ public:
     [[nodiscard]] std::optional<InodeRecord> LookupCommittedInodeByPath(const std::wstring& path) const;
     [[nodiscard]] std::vector<InodeRecord> SnapshotCommittedInodes() const;
     [[nodiscard]] bool SetCommittedReadExtents(std::uint64_t object_id, std::vector<FileExtent> extents);
+    [[nodiscard]] std::size_t DebugWorkingDirectoryChildCount(std::uint64_t parent_object_id) const;
     [[nodiscard]] bool ReadCommittedFileRange(
         const std::wstring& path,
         std::uint64_t offset,
@@ -310,6 +311,8 @@ private:
     [[nodiscard]] std::uint64_t ResolveUniqueObjectId(const std::wstring& normalized_path);
     [[nodiscard]] bool IsDirectoryInWorkingState(const std::wstring& normalized_path) const;
     [[nodiscard]] std::optional<InodeRecord> LookupWorkingInode(const std::wstring& normalized_path) const;
+    [[nodiscard]] std::wstring BuildWorkingDirectoryLinkIndexKey(std::uint64_t parent_object_id, const std::wstring& entry_name) const;
+    void RebuildWorkingDirectoryIndexes();
     [[nodiscard]] bool HasWorkingChildren(std::uint64_t parent_object_id) const;
     void UpsertWorkingDirectoryLink(std::uint64_t parent_object_id, const std::wstring& entry_name, std::uint64_t child_object_id, std::uint64_t xid);
     void RemoveWorkingDirectoryLink(std::uint64_t parent_object_id, const std::wstring& entry_name);
@@ -413,6 +416,8 @@ private:
     std::unordered_map<std::uint64_t, InodeRecord> working_inodes_;
     std::unordered_map<std::wstring, std::uint64_t> working_path_index_;
     std::vector<DirectoryLink> working_directory_links_;
+    std::unordered_map<std::uint64_t, std::size_t> working_child_count_by_parent_;
+    std::unordered_map<std::wstring, std::size_t> working_directory_link_index_;
     std::vector<SpacemanAllocation> committed_spaceman_allocations_;
     std::vector<SpacemanAllocation> committed_spaceman_free_extents_;
     std::vector<SpacemanAllocation> working_spaceman_free_extents_;
