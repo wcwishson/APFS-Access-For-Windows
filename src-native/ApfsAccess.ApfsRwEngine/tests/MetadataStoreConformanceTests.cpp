@@ -1543,6 +1543,22 @@ bool TestCommittedReadExtentsConformance(const std::filesystem::path& run_root)
         std::equal(second_payload.begin(), second_payload.end(), whole.begin() + 4096),
         "ReadExtents: second extent bytes should match");
 
+    std::vector<std::byte> whole_direct(6144, std::byte{0x5A});
+    std::size_t whole_direct_bytes = 0;
+    ok &= Require(
+        store.ReadCommittedFileRangeInto(
+            L"\\fragmented.bin",
+            0,
+            whole_direct.size(),
+            whole_direct.data(),
+            whole_direct.size(),
+            whole_direct_bytes),
+        "ReadExtents: direct fragmented range should read successfully");
+    ok &= Require(whole_direct_bytes == whole.size(), "ReadExtents: direct read should report requested logical length");
+    ok &= Require(
+        std::equal(whole.begin(), whole.end(), whole_direct.begin()),
+        "ReadExtents: direct read bytes should match vector read");
+
     std::vector<std::byte> second_window;
     ok &= Require(
         store.ReadCommittedFileRange(L"\\fragmented.bin", 4608, 512, second_window),
@@ -1563,6 +1579,19 @@ bool TestCommittedReadExtentsConformance(const std::filesystem::path& run_root)
             return value == std::byte{0};
         }),
         "ReadExtents: missing tail extent should zero-fill within logical size");
+
+    std::array<std::byte, 16> too_small_destination{};
+    std::size_t too_small_bytes = 0;
+    ok &= Require(
+        !store.ReadCommittedFileRangeInto(
+            L"\\fragmented.bin",
+            0,
+            32,
+            too_small_destination.data(),
+            too_small_destination.size(),
+            too_small_bytes),
+        "ReadExtents: direct read should reject destination smaller than request");
+    ok &= Require(too_small_bytes == 0, "ReadExtents: rejected direct read should report zero bytes");
 
     return ok;
 }
@@ -1641,6 +1670,25 @@ bool TestCommittedZeroReadExtentConformance(const std::filesystem::path& run_roo
             return value == std::byte{0};
         }),
         "ZeroReadExtents: zero physical extent should return zero-filled bytes");
+
+    std::vector<std::byte> direct_payload(4096, std::byte{0x7F});
+    std::size_t direct_payload_bytes = 0;
+    ok &= Require(
+        store.ReadCommittedFileRangeInto(
+            L"\\zero-backed.bin",
+            0,
+            direct_payload.size(),
+            direct_payload.data(),
+            direct_payload.size(),
+            direct_payload_bytes),
+        "ZeroReadExtents: direct zero physical extent should read successfully");
+    ok &= Require(direct_payload_bytes == 4096, "ZeroReadExtents: direct zero extent should report logical length");
+    ok &= Require(
+        std::all_of(direct_payload.begin(), direct_payload.end(), [](std::byte value)
+        {
+            return value == std::byte{0};
+        }),
+        "ZeroReadExtents: direct zero physical extent should return zero-filled bytes");
 
     return ok;
 }

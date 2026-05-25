@@ -40,6 +40,11 @@ public:
     [[nodiscard]] bool IsWritable() const;
 
     [[nodiscard]] bool Read(std::uint64_t offset_bytes, std::size_t size_bytes, std::vector<std::byte>& out_buffer) const;
+    [[nodiscard]] bool ReadInto(
+        std::uint64_t offset_bytes,
+        std::byte* destination,
+        std::size_t destination_size,
+        std::size_t& bytes_read) const;
     [[nodiscard]] bool Write(std::uint64_t offset_bytes, const std::vector<std::byte>& buffer);
     [[nodiscard]] bool Flush();
     [[nodiscard]] std::string PerformanceJson() const;

@@ -206,6 +206,13 @@ public:
         std::uint64_t offset,
         std::size_t bytes_to_read,
         std::vector<std::byte>& out_payload) const;
+    [[nodiscard]] bool ReadCommittedFileRangeInto(
+        const std::wstring& path,
+        std::uint64_t offset,
+        std::size_t bytes_to_read,
+        std::byte* destination,
+        std::size_t destination_size,
+        std::size_t& out_bytes_read) const;
     void SetCommitStageHook(std::function<bool(std::string_view stage)> hook);
     void SetFilePayloadProvider(
         std::function<std::optional<std::vector<std::byte>>(const std::wstring& path, std::uint64_t logical_size)> provider);

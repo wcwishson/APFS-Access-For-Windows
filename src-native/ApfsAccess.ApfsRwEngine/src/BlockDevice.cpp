@@ -283,14 +283,42 @@ BlockDevice::Geometry BlockDevice::GetGeometry() const
 
 bool BlockDevice::Read(std::uint64_t offset_bytes, std::size_t size_bytes, std::vector<std::byte>& out_buffer) const
 {
-    ScopedPerfTimer perf_scope(read_perf_, static_cast<std::uint64_t>(size_bytes));
-
     out_buffer.clear();
     if (size_bytes == 0)
     {
         return true;
     }
-    if (size_bytes > static_cast<std::size_t>(std::numeric_limits<DWORD>::max()))
+    out_buffer.resize(size_bytes);
+
+    std::size_t bytes_read = 0;
+    if (!ReadInto(offset_bytes, out_buffer.data(), out_buffer.size(), bytes_read))
+    {
+        out_buffer.clear();
+        return false;
+    }
+
+    out_buffer.resize(bytes_read);
+    return true;
+}
+
+bool BlockDevice::ReadInto(
+    std::uint64_t offset_bytes,
+    std::byte* destination,
+    std::size_t destination_size,
+    std::size_t& out_bytes_read) const
+{
+    ScopedPerfTimer perf_scope(read_perf_, static_cast<std::uint64_t>(destination_size));
+
+    out_bytes_read = 0;
+    if (destination_size == 0)
+    {
+        return true;
+    }
+    if (destination == nullptr)
+    {
+        return false;
+    }
+    if (destination_size > static_cast<std::size_t>(std::numeric_limits<DWORD>::max()))
     {
         return false;
     }
@@ -310,11 +338,11 @@ bool BlockDevice::Read(std::uint64_t offset_bytes, std::size_t size_bytes, std::
     const auto block_size = static_cast<std::uint64_t>(LogicalBlockSizeLocked());
     const auto aligned_offset = AlignDown(offset_bytes, block_size);
     const auto prefix_bytes = static_cast<std::size_t>(offset_bytes - aligned_offset);
-    if (size_bytes > (std::numeric_limits<std::uint64_t>::max() - static_cast<std::uint64_t>(prefix_bytes)))
+    if (destination_size > (std::numeric_limits<std::uint64_t>::max() - static_cast<std::uint64_t>(prefix_bytes)))
     {
         return false;
     }
-    const auto requested_window = static_cast<std::uint64_t>(prefix_bytes) + static_cast<std::uint64_t>(size_bytes);
+    const auto requested_window = static_cast<std::uint64_t>(prefix_bytes) + static_cast<std::uint64_t>(destination_size);
     const auto aligned_size_u64 = AlignUp(requested_window, block_size);
     if (aligned_size_u64 == 0 || aligned_size_u64 > static_cast<std::uint64_t>(std::numeric_limits<DWORD>::max()))
     {
@@ -323,7 +351,7 @@ bool BlockDevice::Read(std::uint64_t offset_bytes, std::size_t size_bytes, std::
     const auto aligned_size = static_cast<std::size_t>(aligned_size_u64);
     const bool already_aligned =
         prefix_bytes == 0 &&
-        static_cast<std::uint64_t>(size_bytes) == aligned_size_u64;
+        static_cast<std::uint64_t>(destination_size) == aligned_size_u64;
 
     LARGE_INTEGER target{};
     target.QuadPart = static_cast<LONGLONG>(aligned_offset);
@@ -335,20 +363,17 @@ bool BlockDevice::Read(std::uint64_t offset_bytes, std::size_t size_bytes, std::
     DWORD bytes_read = 0;
     if (already_aligned)
     {
-        out_buffer.resize(size_bytes);
-        if (!ReadFile(handle_, out_buffer.data(), static_cast<DWORD>(out_buffer.size()), &bytes_read, nullptr))
+        if (!ReadFile(handle_, destination, static_cast<DWORD>(destination_size), &bytes_read, nullptr))
         {
-            out_buffer.clear();
             return false;
         }
-        out_buffer.resize(static_cast<std::size_t>(bytes_read));
+        out_bytes_read = static_cast<std::size_t>(bytes_read);
         return true;
     }
 
     read_scratch_buffer_.resize(aligned_size);
     if (!ReadFile(handle_, read_scratch_buffer_.data(), static_cast<DWORD>(read_scratch_buffer_.size()), &bytes_read, nullptr))
     {
-        out_buffer.clear();
         return false;
     }
     if (bytes_read < prefix_bytes)
@@ -357,10 +382,12 @@ bool BlockDevice::Read(std::uint64_t offset_bytes, std::size_t size_bytes, std::
     }
 
     const auto available = static_cast<std::size_t>(bytes_read) - prefix_bytes;
-    const auto bytes_to_copy = std::min(size_bytes, available);
-    out_buffer.assign(
-        read_scratch_buffer_.begin() + static_cast<std::vector<std::byte>::difference_type>(prefix_bytes),
-        read_scratch_buffer_.begin() + static_cast<std::vector<std::byte>::difference_type>(prefix_bytes + bytes_to_copy));
+    const auto bytes_to_copy = std::min(destination_size, available);
+    std::copy_n(
+        read_scratch_buffer_.data() + prefix_bytes,
+        bytes_to_copy,
+        destination);
+    out_bytes_read = bytes_to_copy;
     return true;
 }
 

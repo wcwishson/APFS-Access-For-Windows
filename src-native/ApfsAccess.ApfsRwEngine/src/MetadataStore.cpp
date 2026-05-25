@@ -8288,9 +8288,46 @@ bool MetadataStore::ReadCommittedFileRange(
     std::size_t bytes_to_read,
     std::vector<std::byte>& out_payload) const
 {
+    out_payload.clear();
+    if (bytes_to_read == 0)
+    {
+        std::size_t bytes_read = 0;
+        return ReadCommittedFileRangeInto(path, offset, bytes_to_read, nullptr, 0, bytes_read);
+    }
+
+    out_payload.resize(bytes_to_read);
+    std::size_t bytes_read = 0;
+    if (!ReadCommittedFileRangeInto(
+            path,
+            offset,
+            bytes_to_read,
+            out_payload.data(),
+            out_payload.size(),
+            bytes_read))
+    {
+        out_payload.clear();
+        return false;
+    }
+
+    out_payload.resize(bytes_read);
+    return true;
+}
+
+bool MetadataStore::ReadCommittedFileRangeInto(
+    const std::wstring& path,
+    std::uint64_t offset,
+    std::size_t bytes_to_read,
+    std::byte* destination,
+    std::size_t destination_size,
+    std::size_t& out_bytes_read) const
+{
     ScopedPerfTimer perf_scope(read_committed_range_perf_);
 
-    out_payload.clear();
+    out_bytes_read = 0;
+    if (bytes_to_read > destination_size || (bytes_to_read > 0 && destination == nullptr))
+    {
+        return false;
+    }
 
     auto inode = LookupCommittedInodeByPath(path);
     if (!inode.has_value() || inode->is_directory)
@@ -8309,10 +8346,12 @@ bool MetadataStore::ReadCommittedFileRange(
         ? bytes_to_read
         : static_cast<std::size_t>(available_u64);
 
+    std::fill_n(destination, available_bytes, std::byte{0});
+    out_bytes_read = available_bytes;
+
     if (auto extents_it = committed_read_extents_.find(inode->object_id);
         extents_it != committed_read_extents_.end())
     {
-        out_payload.assign(available_bytes, std::byte{0});
         const auto request_begin = offset;
         const auto request_end = offset + static_cast<std::uint64_t>(available_bytes);
         const auto& extents = extents_it->second;
@@ -8321,7 +8360,6 @@ bool MetadataStore::ReadCommittedFileRange(
             extents.end(),
             request_begin,
             ExtentEndsBeforeOrAt);
-        std::vector<std::byte> chunk;
         for (; extent_it != extents.end(); ++extent_it)
         {
             const auto& extent = *extent_it;
@@ -8350,29 +8388,29 @@ bool MetadataStore::ReadCommittedFileRange(
             }
             const auto physical_offset = extent.physical_address + (chunk_begin - extent_begin);
 
-            chunk.clear();
-            if (!device_.Read(physical_offset, chunk_bytes, chunk) ||
-                chunk.size() > chunk_bytes)
+            std::size_t chunk_read = 0;
+            const auto destination_offset = static_cast<std::size_t>(chunk_begin - request_begin);
+            if (destination_offset > available_bytes ||
+                chunk_bytes > (available_bytes - destination_offset))
+            {
+                return false;
+            }
+
+            if (!device_.ReadInto(
+                    physical_offset,
+                    destination + destination_offset,
+                    chunk_bytes,
+                    chunk_read) ||
+                chunk_read > chunk_bytes)
             {
                 TraceReadFailure(path, inode->object_id, physical_offset, chunk_bytes, L"ExtentDeviceReadFailed");
                 return false;
             }
-            if (chunk.size() < chunk_bytes)
+            if (chunk_read < chunk_bytes)
             {
                 TraceReadFailure(path, inode->object_id, physical_offset, chunk_bytes, L"ExtentDeviceShortRead");
                 return false;
             }
-
-            const auto destination_offset = static_cast<std::size_t>(chunk_begin - request_begin);
-            if (destination_offset > out_payload.size() ||
-                chunk.size() > (out_payload.size() - destination_offset))
-            {
-                return false;
-            }
-            std::copy(
-                chunk.begin(),
-                chunk.end(),
-                out_payload.begin() + static_cast<std::vector<std::byte>::difference_type>(destination_offset));
         }
         return true;
     }
@@ -8390,20 +8428,19 @@ bool MetadataStore::ReadCommittedFileRange(
     }
     const auto physical_offset = inode->data_physical_address + offset;
 
-    std::vector<std::byte> read_buffer;
-    if (!device_.Read(physical_offset, available_bytes, read_buffer))
+    std::size_t bytes_read = 0;
+    if (!device_.ReadInto(physical_offset, destination, available_bytes, bytes_read))
     {
         TraceReadFailure(path, inode->object_id, physical_offset, available_bytes, L"SingleExtentDeviceReadFailed");
         return false;
     }
 
-    if (read_buffer.size() < available_bytes)
+    if (bytes_read < available_bytes)
     {
         TraceReadFailure(path, inode->object_id, physical_offset, available_bytes, L"SingleExtentDeviceShortRead");
         return false;
     }
 
-    out_payload = std::move(read_buffer);
     return true;
 }
 

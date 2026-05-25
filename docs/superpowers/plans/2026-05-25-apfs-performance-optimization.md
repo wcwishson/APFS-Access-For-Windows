@@ -480,7 +480,7 @@ git commit -m "perf: reduce service and dashboard status churn"
 - Modify: `src-native/ApfsAccess.ApfsRwEngine/tests/MetadataStoreConformanceTests.cpp`
 - Modify: `src-native/ApfsAccess.FsHost/tests/FsHostSemanticsTests.cpp`
 
-- [ ] **Step 1: Add a BlockDevice read-into API**
+- [x] **Step 1: Add a BlockDevice read-into API**
 
 Add a method shaped like:
 
@@ -503,7 +503,7 @@ If `std::span` is inconvenient in this project, use:
 
 Keep existing `Read` as a wrapper so callers can migrate one at a time.
 
-- [ ] **Step 2: Add MetadataStore direct range read**
+- [x] **Step 2: Add MetadataStore direct range read**
 
 Add:
 
@@ -524,19 +524,19 @@ Behavior must match `ReadCommittedFileRange`:
 - fail on invalid extent accounting;
 - never write past `destination_size`.
 
-- [ ] **Step 3: Use direct reads in FsHost**
+- [x] **Step 3: Use direct reads in FsHost**
 
 In `CB_Read`, replace the `std::vector<std::byte> payload` fallback path with `ReadCommittedFileRangeInto` directly into the WinFsp-provided buffer.
 
 Expected: no payload vector allocation for normal committed fallback reads.
 
-- [ ] **Step 4: Preserve existing API behavior**
+- [x] **Step 4: Preserve existing API behavior**
 
 Keep `ReadCommittedFileRange` and implement it on top of `ReadCommittedFileRangeInto`, or keep both with shared helper logic.
 
 Expected: existing conformance tests continue to pass unchanged.
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 Run:
 
@@ -556,7 +556,7 @@ Run `Performance` mode and compare:
 - committed read max and total allocation counters if available;
 - block read throughput.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```powershell
 git add src-native/ApfsAccess.ApfsRwEngine src-native/ApfsAccess.FsHost

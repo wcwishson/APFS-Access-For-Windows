@@ -6866,15 +6866,17 @@ NTSTATUS CB_Read(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG le
 #ifdef APFSACCESS_HAS_RW_ENGINE
     if (o->metadata_read_fallback && c && c->metadata_store)
     {
-        std::vector<std::byte> payload;
+        std::size_t bytes_read = 0;
         bool read_ok = false;
         {
             std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
-            read_ok = c->metadata_store->ReadCommittedFileRange(
+            read_ok = c->metadata_store->ReadCommittedFileRangeInto(
                 o->node->path,
                 off,
                 static_cast<std::size_t>(len),
-                payload);
+                reinterpret_cast<std::byte*>(buf),
+                static_cast<std::size_t>(len),
+                bytes_read);
         }
 
         if (!read_ok)
@@ -6883,11 +6885,7 @@ NTSTATUS CB_Read(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG le
             return STATUS_UNSUCCESSFUL;
         }
 
-        if (!payload.empty())
-        {
-            std::memcpy(buf, payload.data(), payload.size());
-        }
-        *done = static_cast<ULONG>(payload.size());
+        *done = static_cast<ULONG>(bytes_read);
         return STATUS_SUCCESS;
     }
 #endif
