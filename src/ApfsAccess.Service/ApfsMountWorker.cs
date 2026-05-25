@@ -154,12 +154,14 @@ public sealed class ApfsMountWorker : BackgroundService
         }
 
         var mounted = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
-        mounted = await UnmountMissingVolumesAsync(
+        var unmountMissingResult = await UnmountMissingVolumesAsync(
             mounted,
             discoveredVolumeById.Keys,
             warnings,
             cancellationToken
         ).ConfigureAwait(false);
+        mounted = unmountMissingResult.Mounted;
+        var mountStateChanged = unmountMissingResult.Changed;
 
         if (connectedDevices.Length == 0)
         {
@@ -238,6 +240,7 @@ public sealed class ApfsMountWorker : BackgroundService
             ).ConfigureAwait(false);
             if (success)
             {
+                mountStateChanged = true;
                 mountedVolumeIds.Add(volume.VolumeId);
                 _mountedOnce.Add(volume.VolumeId);
                 _missingVolumeProbeCounts.Remove(volume.VolumeId);
@@ -264,8 +267,12 @@ public sealed class ApfsMountWorker : BackgroundService
             }
         }
 
-        var refreshedMounts = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
-        PublishFromMounts(refreshedMounts, firstMountError, warnings, compatibilityWarnings);
+        if (mountStateChanged)
+        {
+            mounted = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        PublishFromMounts(mounted, firstMountError, warnings, compatibilityWarnings);
     }
 
     public async Task<(bool Success, string Message)> EjectAllAsync(CancellationToken cancellationToken)
@@ -650,7 +657,7 @@ public sealed class ApfsMountWorker : BackgroundService
         return unmounted;
     }
 
-    private async Task<IReadOnlyList<MountedVolumeState>> UnmountMissingVolumesAsync(
+    private async Task<(IReadOnlyList<MountedVolumeState> Mounted, bool Changed)> UnmountMissingVolumesAsync(
         IReadOnlyList<MountedVolumeState> mounted,
         IEnumerable<string> discoveredVolumeIds,
         HashSet<string> warnings,
@@ -659,6 +666,7 @@ public sealed class ApfsMountWorker : BackgroundService
     {
         var discovered = discoveredVolumeIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
         var remaining = new List<MountedVolumeState>(mounted.Count);
+        var changed = false;
         foreach (var mount in mounted)
         {
             if (discovered.Contains(mount.VolumeId))
@@ -697,6 +705,7 @@ public sealed class ApfsMountWorker : BackgroundService
             }
             else
             {
+                changed = true;
                 _missingVolumeProbeCounts.Remove(mount.VolumeId);
                 _logger.LogInformation(
                     "Unmounted stale mount {MountPoint} (volume {VolumeId}).",
@@ -706,7 +715,7 @@ public sealed class ApfsMountWorker : BackgroundService
             }
         }
 
-        return remaining;
+        return (remaining, changed);
     }
 
     private static char? TryGetDriveLetter(MountedVolumeState state)

@@ -245,6 +245,56 @@ public sealed class DashboardFormTests
     }
 
     [Fact]
+    public void ApplyStatus_RebuildsOnlyRowsWhoseVisibleStateChanged()
+    {
+        Exception? exception = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                using var form = new DashboardForm(
+                    _ => Task.CompletedTask,
+                    _ => Task.CompletedTask,
+                    _ => Task.CompletedTask);
+
+                var initialPayload = NewTwoVolumePayload(
+                    firstAccessMode: MountAccessMode.ReadWrite,
+                    secondAccessMode: MountAccessMode.ReadWrite,
+                    state: RuntimeState.MountedRw,
+                    writeEnabled: true);
+                form.ApplyStatus(initialPayload);
+                var firstRows = EnumerateDashboardRows(form)
+                    .OrderBy(static row => row.Controls.OfType<TableLayoutPanel>().First().Controls.OfType<TableLayoutPanel>().First().Controls.OfType<Label>().First().Text)
+                    .ToArray();
+
+                var changedPayload = NewTwoVolumePayload(
+                    firstAccessMode: MountAccessMode.ReadWrite,
+                    secondAccessMode: MountAccessMode.ReadOnly,
+                    state: RuntimeState.MountedRw,
+                    writeEnabled: true);
+                form.ApplyStatus(changedPayload);
+                var secondRows = EnumerateDashboardRows(form)
+                    .OrderBy(static row => row.Controls.OfType<TableLayoutPanel>().First().Controls.OfType<TableLayoutPanel>().First().Controls.OfType<Label>().First().Text)
+                    .ToArray();
+
+                Assert.Equal(2, secondRows.Length);
+                Assert.Same(firstRows[0], secondRows[0]);
+                Assert.NotSame(firstRows[1], secondRows[1]);
+            }
+            catch (Exception ex)
+            {
+                exception = ex;
+            }
+        });
+
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+
+        Assert.Null(exception);
+    }
+
+    [Fact]
     public void EjectAndFixButtonsInvokeCallbacksWithVolumeId()
     {
         Exception? exception = null;
@@ -482,6 +532,40 @@ public sealed class DashboardFormTests
             MountPoints = ["E:\\"],
         };
     }
+
+    private static StatusChangedPayload NewTwoVolumePayload(
+        MountAccessMode firstAccessMode,
+        MountAccessMode secondAccessMode,
+        RuntimeState state,
+        bool writeEnabled)
+        => NewMountedReadWritePayload() with
+        {
+            State = state,
+            WriteEnabled = writeEnabled,
+            MountPoints = ["E:\\", "F:\\"],
+            MountedVolumes =
+            [
+                new MountedVolumeDisplay(
+                    VolumeId: @"\\.\PhysicalDrive2|Main",
+                    MountPoint: "E:\\",
+                    VolumeName: "Main",
+                    DeviceId: @"\\.\PhysicalDrive2",
+                    DeviceDisplayName: "Samsung Flash Drive FIT USB Device",
+                    AccessMode: firstAccessMode),
+                new MountedVolumeDisplay(
+                    VolumeId: @"\\.\PhysicalDrive2|Archive",
+                    MountPoint: "F:\\",
+                    VolumeName: "Archive",
+                    DeviceId: @"\\.\PhysicalDrive2",
+                    DeviceDisplayName: "Samsung Flash Drive FIT USB Device",
+                    AccessMode: secondAccessMode),
+            ],
+        };
+
+    private static IEnumerable<Panel> EnumerateDashboardRows(Control root)
+        => EnumerateControls(root)
+            .OfType<Panel>()
+            .Where(static panel => panel.BorderStyle == BorderStyle.FixedSingle);
 
     private static IEnumerable<Control> EnumerateControls(Control root)
     {

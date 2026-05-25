@@ -58,6 +58,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     private const int CommandTimeoutSeconds = 12;
     private const string DefaultMainVolumeName = "Main";
     private static readonly TimeSpan RuntimeStatusPollTimeout = TimeSpan.FromMilliseconds(350);
+    private static readonly TimeSpan RuntimeStatusCacheTtl = TimeSpan.FromMilliseconds(250);
     private static readonly Guid ApfsPartitionTypeGuid = new("7C3457EF-0000-11AA-AA11-00306543ECAC");
     private static readonly int[] ProbeSectorSizes = [512, 4096];
     private const int MaxGptEntriesToRead = 1024;
@@ -75,6 +76,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     private readonly ConcurrentDictionary<string, NativeWriteValidationEvidence> _validationEvidenceByProfileId = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _lastPromotedEvidenceSessionByProfileId = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _deviceDisplayNameById = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, RuntimeStatusCacheEntry> _runtimeStatusCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly string _writeDiagnosticsRoot = Path.Combine(Path.GetTempPath(), "ApfsAccess", "write-diagnostics");
 
     public NativeApfsBackend(ServiceHostOptions options)
@@ -369,7 +371,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 );
             }
 
-            var hostRuntimeStatus = await ReadHostRuntimeStatusAsync(
+            var hostRuntimeStatus = await ReadHostRuntimeStatusCachedAsync(
                 hostState.StatusFilePath,
                 request.AccessMode,
                 _options.WriteBackendMode,
@@ -985,6 +987,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 );
             }
 
+            InvalidateRuntimeStatusCache(hostState.StatusFilePath);
             var stopResult = await StopHostProcessAsync(hostState, cancellationToken).ConfigureAwait(false);
             var unmounted = stopResult.ProcessExited && await WaitForDriveRemovalAsync(
                 normalizedMountPoint,
@@ -1008,6 +1011,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             }
 
             _mounts.TryRemove(normalizedMountPoint, out _);
+            InvalidateRuntimeStatusCache(hostState.StatusFilePath);
             NotifyShellDriveRemoved(normalizedMountPoint);
             return new UnmountResult(true, normalizedMountPoint, null);
         }
@@ -1050,7 +1054,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             HostRuntimeStatus runtimeStatus;
             try
             {
-                runtimeStatus = await ReadHostRuntimeStatusAsync(
+                runtimeStatus = await ReadHostRuntimeStatusCachedAsync(
                     entry.Value.StatusFilePath,
                     entry.Value.RequestedAccessMode,
                     entry.Value.ConfiguredWriteBackend,
@@ -1429,6 +1433,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
 
         _mounts.Clear();
         _volumeCache.Clear();
+        _runtimeStatusCache.Clear();
         _gate.Dispose();
     }
 
@@ -2074,6 +2079,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
 
             if (_hosts.TryRemove(kvp.Key, out var host))
             {
+                InvalidateRuntimeStatusCache(host.StatusFilePath);
                 if (!_mounts.ContainsKey(kvp.Key) || !IsDriveVisible(kvp.Key))
                 {
                     _mounts.TryRemove(kvp.Key, out _);
@@ -5841,6 +5847,100 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         return fallback;
     }
 
+    private async Task<HostRuntimeStatus> ReadHostRuntimeStatusCachedAsync(
+        string statusFilePath,
+        MountAccessMode accessMode,
+        string? configuredWriteBackend,
+        TimeSpan timeout,
+        CancellationToken cancellationToken
+    )
+    {
+        if (string.IsNullOrWhiteSpace(statusFilePath))
+        {
+            return await ReadHostRuntimeStatusAsync(
+                statusFilePath,
+                accessMode,
+                configuredWriteBackend,
+                timeout,
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        var cacheKey = BuildRuntimeStatusCacheKey(statusFilePath, accessMode, configuredWriteBackend);
+        var now = DateTime.UtcNow;
+        DateTime? lastWriteUtc = null;
+        try
+        {
+            if (File.Exists(statusFilePath))
+            {
+                lastWriteUtc = File.GetLastWriteTimeUtc(statusFilePath);
+            }
+        }
+        catch
+        {
+            // Fall through to raw status polling.
+        }
+
+        if (_runtimeStatusCache.TryGetValue(cacheKey, out var cached) &&
+            cached.LastWriteUtc == lastWriteUtc &&
+            now - cached.ReadAtUtc <= RuntimeStatusCacheTtl)
+        {
+            return cached.Status;
+        }
+
+        var status = await ReadHostRuntimeStatusAsync(
+            statusFilePath,
+            accessMode,
+            configuredWriteBackend,
+            timeout,
+            cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            if (File.Exists(statusFilePath))
+            {
+                lastWriteUtc = File.GetLastWriteTimeUtc(statusFilePath);
+            }
+            else
+            {
+                lastWriteUtc = null;
+            }
+        }
+        catch
+        {
+            lastWriteUtc = null;
+        }
+
+        _runtimeStatusCache[cacheKey] = new RuntimeStatusCacheEntry(lastWriteUtc, DateTime.UtcNow, status);
+        return status;
+    }
+
+    private void InvalidateRuntimeStatusCache(string? statusFilePath)
+    {
+        if (string.IsNullOrWhiteSpace(statusFilePath))
+        {
+            return;
+        }
+
+        var prefix = Path.GetFullPath(statusFilePath) + "\u001f";
+        foreach (var key in _runtimeStatusCache.Keys)
+        {
+            if (key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                _runtimeStatusCache.TryRemove(key, out _);
+            }
+        }
+    }
+
+    private static string BuildRuntimeStatusCacheKey(
+        string statusFilePath,
+        MountAccessMode accessMode,
+        string? configuredWriteBackend)
+        => string.Join(
+            "\u001f",
+            Path.GetFullPath(statusFilePath),
+            accessMode,
+            configuredWriteBackend?.Trim() ?? string.Empty);
+
     private static HostRuntimeStatusPayload? TryDeserializeHostRuntimeStatusPayloadLenient(string json)
     {
         if (string.IsNullOrWhiteSpace(json))
@@ -6170,6 +6270,12 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     );
 
     private sealed record HostStopResult(bool ProcessExited, bool ForcedKill);
+
+    private sealed record RuntimeStatusCacheEntry(
+        DateTime? LastWriteUtc,
+        DateTime ReadAtUtc,
+        HostRuntimeStatus Status
+    );
 
     private sealed record HostRuntimeStatus(
         string WriteBackend,

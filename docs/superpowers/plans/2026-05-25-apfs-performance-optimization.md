@@ -416,31 +416,31 @@ git commit -m "perf: add APFS write path timing counters"
 - Modify: `src/ApfsAccess.Tray/DriveDashboardPresenter.cs`
 - Modify: relevant tests in `tests/ApfsAccess.Service.Tests`, `tests/ApfsAccess.Backend.Native.Tests`, and `tests/ApfsAccess.Tray.Tests`
 
-- [ ] **Step 1: Reuse mount state inside one worker cycle**
+- [x] **Step 1: Reuse mount state inside one worker cycle**
 
 In `ApfsMountWorker.RunCycleCoreAsync`, avoid calling `_backend.GetMountStateAsync` twice when no mount/eject/refresh action changed the host list.
 
 Expected: idle cycles do one host status refresh, not two.
 
-- [ ] **Step 2: Add short-lived runtime status caching**
+- [x] **Step 2: Add short-lived runtime status caching**
 
 Inside `NativeApfsBackend`, cache `HostRuntimeStatus` per status file path for one backend operation cycle or about 250 ms. Do not use stale status after mount/eject/refresh, and do not hide recovery transitions.
 
 Expected: rapid tray/service requests reuse the same status file read instead of repeatedly parsing the same JSON.
 
-- [ ] **Step 3: Coalesce status broadcasts by payload equality**
+- [x] **Step 3: Coalesce status broadcasts by payload equality**
 
 In `RuntimeStatusPublisher` or `TrayPipeHostService`, skip publishing when the payload is equal to the previous payload except for timestamp fields.
 
 Expected: dashboard does not repaint for semantically identical yellow/red states.
 
-- [ ] **Step 4: Avoid dashboard row rebuilds for unchanged rows**
+- [x] **Step 4: Avoid dashboard row rebuilds for unchanged rows**
 
 In `DashboardForm.ApplyStatus`, compare row identity and state before removing/recreating row controls. Update text/color only when that row changed.
 
 Expected: no visible flashing while a warning state is being refreshed.
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 Run:
 
@@ -455,7 +455,7 @@ Manual check:
 - Simulate a warning state if a test hook exists.
 - Confirm dashboard does not flash and tray menu still updates when the actual state changes.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```powershell
 git add src/ApfsAccess.Service src/ApfsAccess.Backend.Native src/ApfsAccess.Tray tests

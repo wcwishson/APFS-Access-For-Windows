@@ -978,6 +978,85 @@ public sealed class NativeApfsBackendRuntimeStatusTests
         Assert.Equal(NativeWriteSafetyState.PilotReadWrite, status.NativeWriteSafetyState);
     }
 
+    [Fact]
+    public async Task ReadHostRuntimeStatusCachedAsync_ReusesUnchangedStatusWithinTtl()
+    {
+        using var statusFile = new TemporaryStatusFile("""
+            {
+              "writeBackend": "Native",
+              "nativeWriteReadiness": "CommitReady",
+              "recoveryActive": false,
+              "lastCommitXid": 10
+            }
+            """);
+        using var backend = new NativeApfsBackend(new ServiceHostOptions());
+
+        var first = await InvokeReadHostRuntimeStatusCachedAsync(
+            backend,
+            statusFile.Path,
+            MountAccessMode.ReadWrite,
+            configuredWriteBackend: "Native",
+            timeout: TimeSpan.FromMilliseconds(220));
+        await statusFile.WritePreservingTimestampAsync("""
+            {
+              "writeBackend": "Native",
+              "nativeWriteReadiness": "CommitReady",
+              "recoveryActive": false,
+              "lastCommitXid": 99
+            }
+            """);
+        var second = await InvokeReadHostRuntimeStatusCachedAsync(
+            backend,
+            statusFile.Path,
+            MountAccessMode.ReadWrite,
+            configuredWriteBackend: "Native",
+            timeout: TimeSpan.FromMilliseconds(220));
+
+        Assert.Equal((ulong)10, first.LastCommitXid);
+        Assert.Equal((ulong)10, second.LastCommitXid);
+    }
+
+    [Fact]
+    public async Task ReadHostRuntimeStatusCachedAsync_InvalidatesWhenStatusTimestampChanges()
+    {
+        using var statusFile = new TemporaryStatusFile("""
+            {
+              "writeBackend": "Native",
+              "nativeWriteReadiness": "CommitReady",
+              "recoveryActive": false,
+              "lastCommitXid": 10
+            }
+            """);
+        using var backend = new NativeApfsBackend(new ServiceHostOptions());
+
+        var first = await InvokeReadHostRuntimeStatusCachedAsync(
+            backend,
+            statusFile.Path,
+            MountAccessMode.ReadWrite,
+            configuredWriteBackend: "Native",
+            timeout: TimeSpan.FromMilliseconds(220));
+        await statusFile.WriteWithNewTimestampAsync("""
+            {
+              "writeBackend": "Native",
+              "nativeWriteReadiness": "CommitReady",
+              "recoveryActive": true,
+              "recoveryReason": "RecoveryMarkerDirty",
+              "lastCommitXid": 99
+            }
+            """);
+        var second = await InvokeReadHostRuntimeStatusCachedAsync(
+            backend,
+            statusFile.Path,
+            MountAccessMode.ReadWrite,
+            configuredWriteBackend: "Native",
+            timeout: TimeSpan.FromMilliseconds(220));
+
+        Assert.Equal((ulong)10, first.LastCommitXid);
+        Assert.Equal((ulong)99, second.LastCommitXid);
+        Assert.True(second.RecoveryActive);
+        Assert.Equal("RecoveryMarkerDirty", second.RecoveryReason);
+    }
+
     private static async Task<HostRuntimeStatusProjection> InvokeReadHostRuntimeStatusAsync(
         string statusFilePath,
         MountAccessMode accessMode,
@@ -999,7 +1078,37 @@ public sealed class NativeApfsBackendRuntimeStatusTests
         var result = resultProperty!.GetValue(taskObj);
         Assert.NotNull(result);
 
-        var resultType = result!.GetType();
+        return ProjectHostRuntimeStatus(result!);
+    }
+
+    private static async Task<HostRuntimeStatusProjection> InvokeReadHostRuntimeStatusCachedAsync(
+        NativeApfsBackend backend,
+        string statusFilePath,
+        MountAccessMode accessMode,
+        string configuredWriteBackend,
+        TimeSpan timeout)
+    {
+        var method = typeof(NativeApfsBackend).GetMethod(
+            "ReadHostRuntimeStatusCachedAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var taskObj = method!.Invoke(backend, [statusFilePath, accessMode, configuredWriteBackend, timeout, CancellationToken.None]);
+        Assert.NotNull(taskObj);
+        var task = (Task)taskObj!;
+        await task.ConfigureAwait(false);
+
+        var resultProperty = taskObj!.GetType().GetProperty("Result", BindingFlags.Public | BindingFlags.Instance);
+        Assert.NotNull(resultProperty);
+        var result = resultProperty!.GetValue(taskObj);
+        Assert.NotNull(result);
+
+        return ProjectHostRuntimeStatus(result!);
+    }
+
+    private static HostRuntimeStatusProjection ProjectHostRuntimeStatus(object result)
+    {
+        var resultType = result.GetType();
         var writeBackend = (string?)resultType.GetProperty("WriteBackend", BindingFlags.Public | BindingFlags.Instance)?.GetValue(result);
         var nativeWriteReadiness = (NativeWriteReadiness?)resultType.GetProperty("NativeWriteReadiness", BindingFlags.Public | BindingFlags.Instance)?.GetValue(result);
         var nativeWriteValidationState = (NativeWriteValidationState?)resultType.GetProperty("NativeWriteValidationState", BindingFlags.Public | BindingFlags.Instance)?.GetValue(result);
@@ -1100,6 +1209,26 @@ public sealed class NativeApfsBackendRuntimeStatusTests
         }
 
         public string Path { get; }
+
+        public async Task WritePreservingTimestampAsync(string content)
+        {
+            var timestamp = File.GetLastWriteTimeUtc(Path);
+            await File.WriteAllTextAsync(Path, content);
+            File.SetLastWriteTimeUtc(Path, timestamp);
+        }
+
+        public async Task WriteWithNewTimestampAsync(string content)
+        {
+            var timestamp = File.GetLastWriteTimeUtc(Path);
+            await File.WriteAllTextAsync(Path, content);
+            var nextTimestamp = timestamp.AddSeconds(2);
+            if (nextTimestamp <= File.GetLastWriteTimeUtc(Path))
+            {
+                nextTimestamp = File.GetLastWriteTimeUtc(Path).AddSeconds(2);
+            }
+
+            File.SetLastWriteTimeUtc(Path, nextTimestamp);
+        }
 
         public void Dispose()
         {

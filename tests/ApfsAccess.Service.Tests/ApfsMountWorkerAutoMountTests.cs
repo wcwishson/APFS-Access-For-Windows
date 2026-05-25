@@ -200,6 +200,20 @@ public sealed class ApfsMountWorkerAutoMountTests
     }
 
     [Fact]
+    public async Task RunCycle_WhenMountStateDoesNotChange_PollsMountStateOnlyOnce()
+    {
+        var backend = new ControllableBackend();
+        var worker = CreateWorker(backend);
+
+        await InvokeRunCycleAsync(worker);
+        backend.GetMountStateCalls = 0;
+
+        await InvokeRunCycleAsync(worker);
+
+        Assert.Equal(1, backend.GetMountStateCalls);
+    }
+
+    [Fact]
     public async Task RunCycle_WhenAutoMountDisabled_PollsMountStateOnlyOnce()
     {
         var backend = new ControllableBackend();
@@ -310,7 +324,7 @@ public sealed class ApfsMountWorkerAutoMountTests
 
         public int MountAttempts { get; private set; }
 
-        public int GetMountStateCalls { get; private set; }
+        public int GetMountStateCalls { get; set; }
 
         public Task<IReadOnlyList<DeviceInfo>> ProbeDevicesAsync(CancellationToken cancellationToken)
         {

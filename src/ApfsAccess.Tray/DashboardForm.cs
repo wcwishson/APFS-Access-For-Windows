@@ -10,8 +10,11 @@ public sealed class DashboardForm : Form
     private readonly Label _summaryLabel;
     private readonly FlowLayoutPanel _rowsPanel;
     private readonly List<Button> _actionButtons = [];
+    private readonly List<RenderedDashboardRow> _renderedRows = [];
     private string? _renderedDashboardKey;
     private bool _allowClose;
+
+    private sealed record RenderedDashboardRow(string Identity, string Key, Control Control, IReadOnlyList<Button> Buttons);
 
     public DashboardForm(
         Func<string?, Task> openAsync,
@@ -89,8 +92,12 @@ public sealed class DashboardForm : Form
             return;
         }
 
-        _summaryLabel.Text = summary;
-        RenderRows(rows);
+        if (!string.Equals(_summaryLabel.Text, summary, StringComparison.Ordinal))
+        {
+            _summaryLabel.Text = summary;
+        }
+
+        ReconcileRows(rows);
         _renderedDashboardKey = key;
     }
 
@@ -150,7 +157,7 @@ public sealed class DashboardForm : Form
         ResizeRows();
     }
 
-    private void RenderRows(IReadOnlyList<DriveDashboardRow> rows)
+    private void ReconcileRows(IReadOnlyList<DriveDashboardRow> rows)
     {
         if (_rowsPanel is null)
         {
@@ -161,13 +168,59 @@ public sealed class DashboardForm : Form
         try
         {
             _actionButtons.Clear();
-            _rowsPanel.Controls.Clear();
+            var currentRows = _renderedRows.ToDictionary(static row => row.Identity, StringComparer.Ordinal);
+            var nextRows = new List<RenderedDashboardRow>(rows.Count);
 
             foreach (var row in rows)
             {
-                _rowsPanel.Controls.Add(BuildRow(row));
+                var identity = BuildRowIdentity(row);
+                var rowKey = BuildRowKey(row);
+                if (currentRows.TryGetValue(identity, out var existing) &&
+                    string.Equals(existing.Key, rowKey, StringComparison.Ordinal))
+                {
+                    nextRows.Add(existing);
+                    _actionButtons.AddRange(existing.Buttons);
+                }
+                else
+                {
+                    if (existing is not null)
+                    {
+                        _rowsPanel.Controls.Remove(existing.Control);
+                        existing.Control.Dispose();
+                    }
+
+                    var buttons = new List<Button>();
+                    var control = BuildRow(row, buttons);
+                    nextRows.Add(new RenderedDashboardRow(identity, rowKey, control, buttons));
+                    _actionButtons.AddRange(buttons);
+                }
             }
 
+            var nextIdentitySet = nextRows
+                .Select(static row => row.Identity)
+                .ToHashSet(StringComparer.Ordinal);
+            foreach (var oldRow in _renderedRows)
+            {
+                if (!nextIdentitySet.Contains(oldRow.Identity))
+                {
+                    _rowsPanel.Controls.Remove(oldRow.Control);
+                    oldRow.Control.Dispose();
+                }
+            }
+
+            for (var index = 0; index < nextRows.Count; ++index)
+            {
+                var control = nextRows[index].Control;
+                if (!_rowsPanel.Controls.Contains(control))
+                {
+                    _rowsPanel.Controls.Add(control);
+                }
+
+                _rowsPanel.Controls.SetChildIndex(control, index);
+            }
+
+            _renderedRows.Clear();
+            _renderedRows.AddRange(nextRows);
             ResizeRows();
         }
         finally
@@ -182,6 +235,12 @@ public sealed class DashboardForm : Form
             "\u001f",
             new[] { summary }.Concat(rows.Select(BuildRowKey)));
     }
+
+    private static string BuildRowIdentity(DriveDashboardRow row)
+        => string.Join(
+            "\u001e",
+            string.IsNullOrWhiteSpace(row.VolumeId) ? "idle" : row.VolumeId,
+            row.MountPoint);
 
     private static string BuildRowKey(DriveDashboardRow row)
         => string.Join(
@@ -199,7 +258,7 @@ public sealed class DashboardForm : Form
             row.CanEject,
             row.CanFix);
 
-    private Control BuildRow(DriveDashboardRow row)
+    private Control BuildRow(DriveDashboardRow row, List<Button> actionButtons)
     {
         var container = new Panel
         {
@@ -289,16 +348,16 @@ public sealed class DashboardForm : Form
         };
         layout.Controls.Add(buttonsPanel, 2, 0);
 
-        buttonsPanel.Controls.Add(BuildActionButton("Open", row.CanOpen, () => RunActionAsync(
+        buttonsPanel.Controls.Add(BuildActionButton(actionButtons, "Open", row.CanOpen, () => RunActionAsync(
             "Opening drive...",
             () => _openAsync(row.MountPath))));
-        buttonsPanel.Controls.Add(BuildActionButton("Eject", row.CanEject, () => RunActionAsync(
+        buttonsPanel.Controls.Add(BuildActionButton(actionButtons, "Eject", row.CanEject, () => RunActionAsync(
             "Ejecting APFS drive...",
             () => _ejectAsync(row.VolumeId))));
-        buttonsPanel.Controls.Add(BuildActionButton("Fix", row.CanFix, () => RunActionAsync(
+        buttonsPanel.Controls.Add(BuildActionButton(actionButtons, "Fix", row.CanFix, () => RunActionAsync(
             "Refreshing APFS drive...",
             () => _fixAsync(row.VolumeId))));
-        buttonsPanel.Controls.Add(BuildActionButton("Details", true, () =>
+        buttonsPanel.Controls.Add(BuildActionButton(actionButtons, "Details", true, () =>
         {
             ShowDetails(row);
             return Task.CompletedTask;
@@ -307,7 +366,7 @@ public sealed class DashboardForm : Form
         return container;
     }
 
-    private Button BuildActionButton(string text, bool enabled, Func<Task> action)
+    private static Button BuildActionButton(List<Button> actionButtons, string text, bool enabled, Func<Task> action)
     {
         var button = new Button
         {
@@ -321,7 +380,7 @@ public sealed class DashboardForm : Form
             UseVisualStyleBackColor = true,
         };
         button.Click += async (_, _) => await action().ConfigureAwait(true);
-        _actionButtons.Add(button);
+        actionButtons.Add(button);
         return button;
     }
 
