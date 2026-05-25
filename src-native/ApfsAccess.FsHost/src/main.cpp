@@ -204,6 +204,83 @@ struct ScopeExit
     }
 };
 
+struct PerfCounter
+{
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::uint64_t> total_us{0};
+    std::atomic<std::uint64_t> max_us{0};
+    std::atomic<std::uint64_t> last_us{0};
+
+    void Observe(std::uint64_t elapsed_us) noexcept
+    {
+        count.fetch_add(1, std::memory_order_relaxed);
+        total_us.fetch_add(elapsed_us, std::memory_order_relaxed);
+        last_us.store(elapsed_us, std::memory_order_relaxed);
+
+        auto current_max = max_us.load(std::memory_order_relaxed);
+        while (elapsed_us > current_max &&
+               !max_us.compare_exchange_weak(current_max, elapsed_us, std::memory_order_relaxed))
+        {
+        }
+    }
+};
+
+bool IsPerfCountersEnabled()
+{
+    static const bool enabled = []()
+    {
+        wchar_t value[8]{};
+        const auto chars = GetEnvironmentVariableW(L"APFSACCESS_PERF_COUNTERS", value, static_cast<DWORD>(std::size(value)));
+        return chars > 0 && value[0] != L'\0' && value[0] != L'0';
+    }();
+    return enabled;
+}
+
+std::uint64_t ElapsedMicroseconds(std::chrono::steady_clock::time_point started)
+{
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count());
+}
+
+void AppendPerfCounterJson(std::ostringstream& buffer, const char* name, const PerfCounter& counter)
+{
+    const auto count = counter.count.load(std::memory_order_relaxed);
+    const auto total_us = counter.total_us.load(std::memory_order_relaxed);
+    const auto max_us = counter.max_us.load(std::memory_order_relaxed);
+    const auto last_us = counter.last_us.load(std::memory_order_relaxed);
+    buffer << "\"" << name << "\":{\"count\":" << count
+           << ",\"totalUs\":" << total_us
+           << ",\"maxUs\":" << max_us
+           << ",\"lastUs\":" << last_us
+           << "}";
+}
+
+struct ScopedPerfTimer
+{
+    PerfCounter* counter = nullptr;
+    std::chrono::steady_clock::time_point started{};
+    bool enabled = false;
+
+    explicit ScopedPerfTimer(PerfCounter* perf_counter) noexcept
+        : counter(perf_counter)
+        , enabled(perf_counter != nullptr && IsPerfCountersEnabled())
+    {
+        if (enabled)
+        {
+            started = std::chrono::steady_clock::now();
+        }
+    }
+
+    ~ScopedPerfTimer()
+    {
+        if (enabled && counter)
+        {
+            counter->Observe(ElapsedMicroseconds(started));
+        }
+    }
+};
+
 struct MountContext
 {
     Arguments args;
@@ -243,6 +320,20 @@ struct MountContext
     std::mutex mutation_callback_mutex;
     std::unordered_map<std::wstring, std::shared_ptr<Node>> nodes;
     std::unordered_map<std::wstring, std::unordered_map<std::wstring, std::uint64_t>> named_stream_sizes;
+    PerfCounter perf_create;
+    PerfCounter perf_write;
+    PerfCounter perf_set_basic_info;
+    PerfCounter perf_set_file_size;
+    PerfCounter perf_set_delete;
+    PerfCounter perf_rename;
+    PerfCounter perf_cleanup;
+    PerfCounter perf_close;
+    PerfCounter perf_read;
+    PerfCounter perf_flush;
+    PerfCounter perf_read_directory;
+    PerfCounter perf_ensure_directory_loaded;
+    PerfCounter perf_merge_committed_inodes;
+    PerfCounter perf_commit_native;
 #ifdef APFSACCESS_HAS_RW_ENGINE
     mutable std::mutex metadata_mutex;
     mutable std::mutex commit_mutex;
@@ -2015,6 +2106,45 @@ bool WriteHostStatusFile(
         buffer << ",\"shutdownDrainActive\":" << (shutdown_drain_active ? "true" : "false");
         buffer << ",\"inFlightMutationCallbacks\":" << in_flight_mutations;
         buffer << ",\"hostPid\":" << host_pid;
+        if (IsPerfCountersEnabled())
+        {
+            buffer << ",\"performance\":{\"callbacks\":{";
+            AppendPerfCounterJson(buffer, "create", context.perf_create);
+            buffer << ",";
+            AppendPerfCounterJson(buffer, "write", context.perf_write);
+            buffer << ",";
+            AppendPerfCounterJson(buffer, "setBasicInfo", context.perf_set_basic_info);
+            buffer << ",";
+            AppendPerfCounterJson(buffer, "setFileSize", context.perf_set_file_size);
+            buffer << ",";
+            AppendPerfCounterJson(buffer, "setDelete", context.perf_set_delete);
+            buffer << ",";
+            AppendPerfCounterJson(buffer, "rename", context.perf_rename);
+            buffer << ",";
+            AppendPerfCounterJson(buffer, "cleanup", context.perf_cleanup);
+            buffer << ",";
+            AppendPerfCounterJson(buffer, "close", context.perf_close);
+            buffer << ",";
+            AppendPerfCounterJson(buffer, "read", context.perf_read);
+            buffer << ",";
+            AppendPerfCounterJson(buffer, "flush", context.perf_flush);
+            buffer << ",";
+            AppendPerfCounterJson(buffer, "readDirectory", context.perf_read_directory);
+            buffer << ",";
+            AppendPerfCounterJson(buffer, "ensureDirectoryLoaded", context.perf_ensure_directory_loaded);
+            buffer << ",";
+            AppendPerfCounterJson(buffer, "mergeCommittedInodes", context.perf_merge_committed_inodes);
+            buffer << ",";
+            AppendPerfCounterJson(buffer, "commitNative", context.perf_commit_native);
+            buffer << "}";
+#ifdef APFSACCESS_HAS_RW_ENGINE
+            if (context.metadata_store)
+            {
+                buffer << ",\"metadata\":" << context.metadata_store->PerformanceJson();
+            }
+#endif
+            buffer << "}";
+        }
         const auto crash_fault_passes = std::max(0, context.args.validation_crash_fault_passes);
         const auto crash_stage_matrix_passes = std::max(0, context.args.validation_crash_stage_matrix_passes);
         const auto hardware_pilot_passes = std::max(0, context.args.validation_hardware_pilot_passes);
@@ -2677,6 +2807,8 @@ bool HasDirectoryInsertPermission(const OpenContext* open_ctx, bool inserting_di
 
 bool EnsureDirectoryLoaded(MountContext* c, const std::shared_ptr<Node>& dir)
 {
+    ScopedPerfTimer perf_scope(c ? &c->perf_ensure_directory_loaded : nullptr);
+
     if (!dir || !dir->is_directory)
     {
         return false;
@@ -3309,6 +3441,8 @@ std::optional<std::vector<std::byte>> LoadHydratedPayloadForPath(
 
 bool MergeCommittedInodeStateIntoNodeIndex(MountContext* c)
 {
+    ScopedPerfTimer perf_scope(c ? &c->perf_merge_committed_inodes : nullptr);
+
     if (!c || !c->metadata_store)
     {
         return false;
@@ -4233,6 +4367,8 @@ bool CommitMutationJournalBestEffort(MountContext* c)
 
 NTSTATUS CommitNativeMutationsBestEffort(MountContext* c, const wchar_t* origin)
 {
+    ScopedPerfTimer perf_scope(c ? &c->perf_commit_native : nullptr);
+
     if (!c || !IsNativeWriteEnabled(c))
     {
         return STATUS_SUCCESS;
@@ -5100,6 +5236,8 @@ void ConfigureVolumeParamsForExplorer(MountContext& ctx, const FILETIME& now, FS
 NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UINT32 granted_access, UINT32, PSECURITY_DESCRIPTOR, UINT64, PVOID* out_ctx, FSP_FSCTL_FILE_INFO* info)
 {
     auto* c = Ctx(fs);
+    ScopedPerfTimer perf_scope(c ? &c->perf_create : nullptr);
+
     if (!c || !out_ctx || !info)
     {
         return STATUS_INVALID_PARAMETER;
@@ -5469,6 +5607,8 @@ NTSTATUS CB_Overwrite(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, BOOLEAN, UINT64 al
 NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG len, BOOLEAN write_to_end_of_file, BOOLEAN constrained_io, PULONG done, FSP_FSCTL_FILE_INFO* info)
 {
     auto* c = Ctx(fs);
+    ScopedPerfTimer perf_scope(c ? &c->perf_write : nullptr);
+
     auto* o = (OpenContext*)ctx;
     if (!c || !o || !o->node || o->node->is_directory || o->file == INVALID_HANDLE_VALUE || !buf || !done)
     {
@@ -5603,6 +5743,8 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
 NTSTATUS CB_SetBasicInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, UINT64 creation_time, UINT64 last_access_time, UINT64 last_write_time, UINT64 change_time, FSP_FSCTL_FILE_INFO* info)
 {
     auto* c = Ctx(fs);
+    ScopedPerfTimer perf_scope(c ? &c->perf_set_basic_info : nullptr);
+
     auto* o = (OpenContext*)ctx;
     if (!c || !o || !o->node || !info)
     {
@@ -5694,6 +5836,8 @@ NTSTATUS CB_SetBasicInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, UINT64 creation
 NTSTATUS CB_SetFileSize(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT64 size, BOOLEAN, FSP_FSCTL_FILE_INFO* info)
 {
     auto* c = Ctx(fs);
+    ScopedPerfTimer perf_scope(c ? &c->perf_set_file_size : nullptr);
+
     auto* o = (OpenContext*)ctx;
     if (!c || !o || !o->node || o->node->is_directory || !info)
     {
@@ -5880,6 +6024,8 @@ NTSTATUS CB_CanDelete(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name)
 NTSTATUS CB_SetDelete(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, BOOLEAN delete_file)
 {
     auto* c = Ctx(fs);
+    ScopedPerfTimer perf_scope(c ? &c->perf_set_delete : nullptr);
+
     auto* o = (OpenContext*)ctx;
     if (!c)
     {
@@ -5976,6 +6122,8 @@ NTSTATUS CB_SetDelete(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, BOOLEAN d
 NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_name, BOOLEAN replace_if_exists)
 {
     auto* c = Ctx(fs);
+    ScopedPerfTimer perf_scope(c ? &c->perf_rename : nullptr);
+
     if (!c || !old_name || !new_name)
     {
         return STATUS_INVALID_PARAMETER;
@@ -6333,6 +6481,8 @@ NTSTATUS CB_SetSecurity(FSP_FILE_SYSTEM* fs, PVOID, SECURITY_INFORMATION, PSECUR
 VOID CB_Cleanup(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, ULONG flags)
 {
     auto* c = Ctx(fs);
+    ScopedPerfTimer perf_scope(c ? &c->perf_cleanup : nullptr);
+
     auto* o = (OpenContext*)ctx;
     if (!c || !o || !o->node)
     {
@@ -6402,6 +6552,8 @@ VOID CB_Cleanup(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, ULONG flags)
 VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
 {
     auto* c = Ctx(fs);
+    ScopedPerfTimer perf_scope(c ? &c->perf_close : nullptr);
+
     auto* o = (OpenContext*)ctx;
     if (!o)
     {
@@ -6681,6 +6833,8 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
 NTSTATUS CB_Read(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG len, PULONG done)
 {
     auto* c = Ctx(fs);
+    ScopedPerfTimer perf_scope(c ? &c->perf_read : nullptr);
+
     auto* o = (OpenContext*)ctx;
     if (!o || !o->node || o->node->is_directory || !buf || !done)
     {
@@ -6754,6 +6908,8 @@ NTSTATUS CB_GetFileInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, FSP_FSCTL_FILE_INFO* inf
 NTSTATUS CB_Flush(FSP_FILE_SYSTEM* fs, PVOID ctx, FSP_FSCTL_FILE_INFO* info)
 {
     auto* c = Ctx(fs);
+    ScopedPerfTimer perf_scope(c ? &c->perf_flush : nullptr);
+
     auto* o = (OpenContext*)ctx;
     if (!o) return STATUS_SUCCESS;
     if (!c || !o->node || !info) return STATUS_INVALID_PARAMETER;
@@ -7032,6 +7188,8 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
 NTSTATUS CB_ReadDirectory(FSP_FILE_SYSTEM* fs, PVOID dir_ctx, PWSTR, PWSTR marker, PVOID buffer, ULONG length, PULONG done)
 {
     auto* c = Ctx(fs);
+    ScopedPerfTimer perf_scope(c ? &c->perf_read_directory : nullptr);
+
     auto* o = (OpenContext*)dir_ctx;
     if (!c || !o || !o->node || !o->node->is_directory || !done)
     {

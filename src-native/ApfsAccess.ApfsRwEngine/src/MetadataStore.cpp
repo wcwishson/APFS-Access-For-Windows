@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <cwctype>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 #include <iostream>
 #include <set>
 #include <limits>
+#include <sstream>
 #include <unordered_set>
 #include <utility>
 #include <Windows.h>
@@ -138,6 +140,25 @@ bool IsCommitTraceEnabled()
     }();
     return enabled;
 }
+
+bool IsPerfCountersEnabled()
+{
+    static const bool enabled = []()
+    {
+        wchar_t value[8]{};
+        const auto chars = GetEnvironmentVariableW(L"APFSACCESS_PERF_COUNTERS", value, static_cast<DWORD>(std::size(value)));
+        return chars > 0 && value[0] != L'\0' && value[0] != L'0';
+    }();
+    return enabled;
+}
+
+std::uint64_t ElapsedMicroseconds(std::chrono::steady_clock::time_point started)
+{
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count());
+}
+
 
 void TracePendingCommitFailure(std::wstring_view reason, std::uint64_t object_id = 0)
 {
@@ -4450,8 +4471,97 @@ void MetadataStore::ClearRecoveryRequired()
     commit_path_ready_ = native_write_ready_ && write_device_allowed_;
 }
 
+struct MetadataStore::ScopedPerfTimer
+{
+    PerfCounter& counter;
+    std::chrono::steady_clock::time_point started{};
+    bool enabled = false;
+
+    explicit ScopedPerfTimer(PerfCounter& perf_counter) noexcept
+        : counter(perf_counter)
+        , enabled(IsPerfCountersEnabled())
+    {
+        if (enabled)
+        {
+            started = std::chrono::steady_clock::now();
+        }
+    }
+
+    ~ScopedPerfTimer()
+    {
+        if (enabled)
+        {
+            counter.Observe(ElapsedMicroseconds(started));
+        }
+    }
+};
+
+void MetadataStore::PerfCounter::Observe(std::uint64_t elapsed_us) noexcept
+{
+    count.fetch_add(1, std::memory_order_relaxed);
+    total_us.fetch_add(elapsed_us, std::memory_order_relaxed);
+    last_us.store(elapsed_us, std::memory_order_relaxed);
+
+    auto current_max = max_us.load(std::memory_order_relaxed);
+    while (elapsed_us > current_max &&
+           !max_us.compare_exchange_weak(current_max, elapsed_us, std::memory_order_relaxed))
+    {
+    }
+}
+
+std::string MetadataStore::PerformanceJson() const
+{
+    const auto append_counter = [](std::ostringstream& buffer, const char* name, const PerfCounter& counter)
+    {
+        const auto count = counter.count.load(std::memory_order_relaxed);
+        const auto total_us = counter.total_us.load(std::memory_order_relaxed);
+        const auto max_us = counter.max_us.load(std::memory_order_relaxed);
+        const auto last_us = counter.last_us.load(std::memory_order_relaxed);
+        buffer << "\"" << name << "\":{\"count\":" << count
+               << ",\"totalUs\":" << total_us
+               << ",\"maxUs\":" << max_us
+               << ",\"lastUs\":" << last_us
+               << "}";
+    };
+
+    std::ostringstream buffer;
+    buffer << "{";
+    append_counter(buffer, "applyMutation", apply_mutation_perf_);
+    buffer << ",";
+    append_counter(buffer, "commitPending", commit_pending_perf_);
+    buffer << ",";
+    append_counter(buffer, "commitTransaction", commit_transaction_perf_);
+    buffer << ",";
+    append_counter(buffer, "commitCanonical", commit_canonical_perf_);
+    buffer << ",";
+    append_counter(buffer, "validateInodeGraph", validate_inode_graph_perf_);
+    buffer << ",";
+    append_counter(buffer, "snapshotCommittedInodes", snapshot_committed_inodes_perf_);
+    buffer << ",";
+    append_counter(buffer, "readCommittedRange", read_committed_range_perf_);
+    buffer << ",";
+    append_counter(buffer, "buildCommitBlob", build_commit_blob_perf_);
+    buffer << ",";
+    append_counter(buffer, "persistObjectMapCheckpoint", persist_object_map_checkpoint_perf_);
+    buffer << ",";
+    append_counter(buffer, "persistSpacemanCheckpoint", persist_spaceman_checkpoint_perf_);
+    buffer << ",";
+    append_counter(buffer, "persistInodeCheckpoint", persist_inode_checkpoint_perf_);
+    buffer << ",";
+    append_counter(buffer, "persistBtreeCheckpoint", persist_btree_checkpoint_perf_);
+    buffer << ",";
+    append_counter(buffer, "persistReplayCheckpoint", persist_replay_checkpoint_perf_);
+    buffer << ",";
+    append_counter(buffer, "persistSuperblockCheckpoint", persist_superblock_checkpoint_perf_);
+    buffer << ",\"blockDevice\":" << device_.PerformanceJson();
+    buffer << "}";
+    return buffer.str();
+}
+
 MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest& request)
 {
+    ScopedPerfTimer perf_scope(apply_mutation_perf_);
+
     const auto operation_name = [](MutationOperation operation) -> std::wstring_view
     {
         switch (operation)
@@ -5016,6 +5126,8 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
 
 MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
 {
+    ScopedPerfTimer perf_scope(commit_pending_perf_);
+
     last_commit_stage_ = "start";
     const auto fail_commit = [this](CommitStatus status, std::string_view stage) -> CommitStatus
     {
@@ -6051,11 +6163,15 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
 
 MetadataStore::CommitStatus MetadataStore::CommitTransaction()
 {
+    ScopedPerfTimer perf_scope(commit_transaction_perf_);
+
     return CommitPendingMutations();
 }
 
 MetadataStore::CommitStatus MetadataStore::CommitCanonicalTransaction()
 {
+    ScopedPerfTimer perf_scope(commit_canonical_perf_);
+
     if (!canonical_state_loaded_)
     {
         return CommitStatus::NotReady;
@@ -8061,6 +8177,8 @@ std::optional<MetadataStore::InodeRecord> MetadataStore::LookupCommittedInodeByP
 
 std::vector<MetadataStore::InodeRecord> MetadataStore::SnapshotCommittedInodes() const
 {
+    ScopedPerfTimer perf_scope(snapshot_committed_inodes_perf_);
+
     struct SnapshotEntry
     {
         std::wstring path_key;
@@ -8170,6 +8288,8 @@ bool MetadataStore::ReadCommittedFileRange(
     std::size_t bytes_to_read,
     std::vector<std::byte>& out_payload) const
 {
+    ScopedPerfTimer perf_scope(read_committed_range_perf_);
+
     out_payload.clear();
 
     auto inode = LookupCommittedInodeByPath(path);
@@ -8679,6 +8799,8 @@ bool MetadataStore::ValidateInodeGraphState(
     bool require_root_object
 ) const
 {
+    ScopedPerfTimer perf_scope(validate_inode_graph_perf_);
+
     if (inode_table.empty())
     {
         return !require_root_object;
@@ -11053,6 +11175,8 @@ bool MetadataStore::AllowCommitStage(std::string_view stage)
 
 bool MetadataStore::PersistObjectMapCheckpoint(std::uint64_t target_xid)
 {
+    ScopedPerfTimer perf_scope(persist_object_map_checkpoint_perf_);
+
     auto object_map_blocks = ResolveObjectMapCheckpointBlockIndices();
     if (object_map_blocks.empty())
     {
@@ -11132,6 +11256,8 @@ bool MetadataStore::PersistObjectMapCheckpoint(std::uint64_t target_xid)
 
 bool MetadataStore::PersistSpacemanCheckpoint(std::uint64_t target_xid)
 {
+    ScopedPerfTimer perf_scope(persist_spaceman_checkpoint_perf_);
+
     auto spaceman_blocks = ResolveSpacemanCheckpointBlockIndices();
     if (spaceman_blocks.empty())
     {
@@ -11210,6 +11336,8 @@ bool MetadataStore::PersistSpacemanCheckpoint(std::uint64_t target_xid)
 
 bool MetadataStore::PersistInodeCheckpoint(std::uint64_t target_xid)
 {
+    ScopedPerfTimer perf_scope(persist_inode_checkpoint_perf_);
+
     auto inode_blocks = ResolveInodeCheckpointBlockIndices();
     if (inode_blocks.empty())
     {
@@ -11352,6 +11480,8 @@ bool MetadataStore::PersistInodeCheckpoint(std::uint64_t target_xid)
 
 bool MetadataStore::PersistBtreeCheckpoint(std::uint64_t target_xid)
 {
+    ScopedPerfTimer perf_scope(persist_btree_checkpoint_perf_);
+
     auto btree_blocks = ResolveBtreeCheckpointBlockIndices();
     if (btree_blocks.empty())
     {
@@ -11433,6 +11563,8 @@ bool MetadataStore::PersistBtreeCheckpoint(std::uint64_t target_xid)
 
 bool MetadataStore::PersistReplayCheckpoint(std::uint64_t target_xid)
 {
+    ScopedPerfTimer perf_scope(persist_replay_checkpoint_perf_);
+
     auto replay_blocks = ResolveReplayCheckpointBlockIndices();
     if (replay_blocks.empty() ||
         !AreNativeCheckpointBlocksWritable(replay_blocks) ||
@@ -11489,6 +11621,8 @@ bool MetadataStore::PersistReplayCheckpoint(std::uint64_t target_xid)
 
 bool MetadataStore::PersistCheckpointSuperblock(std::uint64_t target_xid)
 {
+    ScopedPerfTimer perf_scope(persist_superblock_checkpoint_perf_);
+
     if (!container_loaded_)
     {
         return false;
@@ -13615,6 +13749,8 @@ std::filesystem::path MetadataStore::BuildPersistentStatePath(const VolumeContex
 
 std::vector<std::byte> MetadataStore::BuildCommitBlob(std::uint64_t target_xid)
 {
+    ScopedPerfTimer perf_scope(build_commit_blob_perf_);
+
     if (!IsNativeWriteReady())
     {
         return {};

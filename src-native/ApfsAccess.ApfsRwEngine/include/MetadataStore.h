@@ -3,6 +3,7 @@
 #include "BtreeMutationCodec.h"
 #include "BlockDevice.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstddef>
 #include <array>
@@ -177,6 +178,7 @@ public:
     [[nodiscard]] std::string LastCommitStage() const;
     [[nodiscard]] std::string LastReplayStage() const;
     [[nodiscard]] std::string LastCommitBlobMagic() const;
+    [[nodiscard]] std::string PerformanceJson() const;
     [[nodiscard]] bool LastReplayCheckpointCandidatePresent() const noexcept;
     [[nodiscard]] bool LastReplayCheckpointPendingWindow() const noexcept;
     [[nodiscard]] NativeWriteCommitModel ActiveCommitModel() const noexcept;
@@ -213,6 +215,17 @@ public:
     [[nodiscard]] bool FreeExtent(std::uint64_t physical_address, std::uint64_t bytes);
 
 private:
+    struct PerfCounter
+    {
+        std::atomic<std::uint64_t> count{0};
+        std::atomic<std::uint64_t> total_us{0};
+        std::atomic<std::uint64_t> max_us{0};
+        std::atomic<std::uint64_t> last_us{0};
+
+        void Observe(std::uint64_t elapsed_us) noexcept;
+    };
+    struct ScopedPerfTimer;
+
     [[nodiscard]] static std::uint32_t ReadLe32(const std::vector<std::byte>& buffer, std::size_t offset);
     [[nodiscard]] static std::uint64_t ReadLe64(const std::vector<std::byte>& buffer, std::size_t offset);
     [[nodiscard]] static std::uint64_t StableObjectIdFromPath(const std::wstring& path);
@@ -403,5 +416,19 @@ private:
     std::function<bool(std::string_view stage)> commit_stage_hook_;
     std::function<std::optional<std::vector<std::byte>>(const std::wstring&, std::uint64_t)> file_payload_provider_;
     std::filesystem::path persistent_state_path_;
+    mutable PerfCounter apply_mutation_perf_;
+    mutable PerfCounter commit_pending_perf_;
+    mutable PerfCounter commit_transaction_perf_;
+    mutable PerfCounter commit_canonical_perf_;
+    mutable PerfCounter validate_inode_graph_perf_;
+    mutable PerfCounter snapshot_committed_inodes_perf_;
+    mutable PerfCounter read_committed_range_perf_;
+    mutable PerfCounter build_commit_blob_perf_;
+    mutable PerfCounter persist_object_map_checkpoint_perf_;
+    mutable PerfCounter persist_spaceman_checkpoint_perf_;
+    mutable PerfCounter persist_inode_checkpoint_perf_;
+    mutable PerfCounter persist_btree_checkpoint_perf_;
+    mutable PerfCounter persist_replay_checkpoint_perf_;
+    mutable PerfCounter persist_superblock_checkpoint_perf_;
 };
 } // namespace apfsaccess::rw

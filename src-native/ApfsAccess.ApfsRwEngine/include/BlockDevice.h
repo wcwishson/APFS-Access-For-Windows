@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -41,8 +42,21 @@ public:
     [[nodiscard]] bool Read(std::uint64_t offset_bytes, std::size_t size_bytes, std::vector<std::byte>& out_buffer) const;
     [[nodiscard]] bool Write(std::uint64_t offset_bytes, const std::vector<std::byte>& buffer);
     [[nodiscard]] bool Flush();
+    [[nodiscard]] std::string PerformanceJson() const;
 
 private:
+    struct PerfCounter
+    {
+        std::atomic<std::uint64_t> count{0};
+        std::atomic<std::uint64_t> bytes{0};
+        std::atomic<std::uint64_t> total_us{0};
+        std::atomic<std::uint64_t> max_us{0};
+        std::atomic<std::uint64_t> last_us{0};
+
+        void Observe(std::uint64_t elapsed_us, std::uint64_t byte_count = 0) noexcept;
+    };
+    struct ScopedPerfTimer;
+
     [[nodiscard]] bool EnsureHandle(bool write_access) const;
     void CloseHandleLocked() const;
     [[nodiscard]] bool QueryGeometryLocked(Geometry& geometry) const;
@@ -56,6 +70,10 @@ private:
     mutable Geometry geometry_cache_{};
     mutable std::vector<std::byte> read_scratch_buffer_;
     mutable std::vector<std::byte> write_scratch_buffer_;
+    mutable PerfCounter read_perf_;
+    mutable PerfCounter write_perf_;
+    mutable PerfCounter unaligned_write_perf_;
+    mutable PerfCounter flush_perf_;
     mutable std::mutex mutex_;
 };
 } // namespace apfsaccess::rw

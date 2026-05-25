@@ -293,7 +293,7 @@ git commit -m "test: add APFS performance baseline harness"
 - Modify: `tests/ApfsAccess.Backend.Native.Tests/NativeApfsBackendRuntimeStatusTests.cs`
 - Modify: `tests/ApfsAccess.FsHost` native status tests if needed in `src-native/ApfsAccess.FsHost/tests/FsHostSemanticsTests.cpp`
 
-- [ ] **Step 1: Add native timing structs**
+- [x] **Step 1: Add native timing structs**
 
 Add simple counters for:
 
@@ -310,7 +310,7 @@ APFSACCESS_PERF_COUNTERS=1
 
 Expected behavior when disabled: no extra status JSON fields and minimal branch overhead.
 
-- [ ] **Step 2: Time FsHost callback phases**
+- [x] **Step 2: Time FsHost callback phases**
 
 Time these callback scopes in `src-native/ApfsAccess.FsHost/src/main.cpp`:
 
@@ -331,7 +331,7 @@ Time these callback scopes in `src-native/ApfsAccess.FsHost/src/main.cpp`:
 
 Expose p50 only if a small fixed histogram is cheap. Otherwise expose count, total, last, and max first.
 
-- [ ] **Step 3: Time RW engine phases**
+- [x] **Step 3: Time RW engine phases**
 
 Add counters in `MetadataStore` for:
 
@@ -346,7 +346,7 @@ Add counters in `MetadataStore` for:
 
 Expected: the status JSON can show whether small-file delay is dominated by mutation staging or commit persistence.
 
-- [ ] **Step 4: Time BlockDevice I/O**
+- [x] **Step 4: Time BlockDevice I/O**
 
 Add counters in `BlockDevice` for:
 
@@ -360,7 +360,7 @@ Add counters in `BlockDevice` for:
 
 Expected: benchmark reports can show whether raw device writes are slow or the host is slow before raw I/O starts.
 
-- [ ] **Step 5: Add status JSON fields only when enabled**
+- [x] **Step 5: Add status JSON fields only when enabled**
 
 When `APFSACCESS_PERF_COUNTERS=1`, add a compact object:
 
@@ -374,7 +374,7 @@ When `APFSACCESS_PERF_COUNTERS=1`, add a compact object:
 
 When the variable is not set, status JSON should remain compatible with current tests and UI.
 
-- [ ] **Step 6: Verify**
+- [x] **Step 6: Verify**
 
 Build native host:
 
@@ -391,7 +391,7 @@ dotnet test .\APFSAccess.sln -c Release --filter "FullyQualifiedName~NativeApfsB
 
 Expected: tests pass with counters disabled; new tests pass with a sample perf-enabled status payload.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```powershell
 git add src-native/ApfsAccess.FsHost/src/main.cpp src-native/ApfsAccess.ApfsRwEngine/include/MetadataStore.h src-native/ApfsAccess.ApfsRwEngine/src/MetadataStore.cpp src-native/ApfsAccess.ApfsRwEngine/include/BlockDevice.h src-native/ApfsAccess.ApfsRwEngine/src/BlockDevice.cpp tests

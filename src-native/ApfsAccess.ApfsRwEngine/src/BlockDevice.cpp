@@ -1,11 +1,13 @@
 #include "BlockDevice.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cwchar>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string_view>
 #include <utility>
 
@@ -77,6 +79,39 @@ bool IsFaultMode(std::wstring_view actual, const wchar_t* expected)
     return _wcsicmp(std::wstring(actual).c_str(), expected) == 0;
 }
 
+bool IsPerfCountersEnabled()
+{
+    static const bool enabled = []()
+    {
+        wchar_t* raw_value = nullptr;
+        std::size_t raw_length = 0;
+        if (_wdupenv_s(&raw_value, &raw_length, L"APFSACCESS_PERF_COUNTERS") != 0 || raw_value == nullptr)
+        {
+            return false;
+        }
+
+        std::unique_ptr<wchar_t, decltype(&std::free)> guard(raw_value, &std::free);
+        const auto* value = raw_value;
+        while (*value == L' ' || *value == L'\t')
+        {
+            ++value;
+        }
+
+        return *value != L'\0' &&
+               _wcsicmp(value, L"0") != 0 &&
+               _wcsicmp(value, L"false") != 0 &&
+               _wcsicmp(value, L"no") != 0;
+    }();
+    return enabled;
+}
+
+std::uint64_t ElapsedMicroseconds(std::chrono::steady_clock::time_point started)
+{
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count());
+}
+
 std::uint64_t AlignDown(std::uint64_t value, std::uint64_t alignment)
 {
     if (alignment == 0)
@@ -110,6 +145,96 @@ BlockDevice::BlockDevice(std::wstring path, std::uint64_t base_offset_bytes)
     : path_(std::move(path))
     , base_offset_bytes_(base_offset_bytes)
 {
+}
+
+struct BlockDevice::ScopedPerfTimer
+{
+    PerfCounter& primary;
+    PerfCounter* secondary = nullptr;
+    std::chrono::steady_clock::time_point started{};
+    std::uint64_t byte_count = 0;
+    bool enabled = false;
+    bool observe_secondary = false;
+
+    ScopedPerfTimer(PerfCounter& primary_counter, std::uint64_t bytes = 0) noexcept
+        : primary(primary_counter)
+        , byte_count(bytes)
+        , enabled(IsPerfCountersEnabled())
+    {
+        if (enabled)
+        {
+            started = std::chrono::steady_clock::now();
+        }
+    }
+
+    void SetSecondary(PerfCounter& secondary_counter) noexcept
+    {
+        secondary = &secondary_counter;
+    }
+
+    void MarkSecondary() noexcept
+    {
+        observe_secondary = true;
+    }
+
+    ~ScopedPerfTimer()
+    {
+        if (!enabled)
+        {
+            return;
+        }
+
+        const auto elapsed_us = ElapsedMicroseconds(started);
+        primary.Observe(elapsed_us, byte_count);
+        if (observe_secondary && secondary)
+        {
+            secondary->Observe(elapsed_us, byte_count);
+        }
+    }
+};
+
+void BlockDevice::PerfCounter::Observe(std::uint64_t elapsed_us, std::uint64_t byte_count) noexcept
+{
+    count.fetch_add(1, std::memory_order_relaxed);
+    bytes.fetch_add(byte_count, std::memory_order_relaxed);
+    total_us.fetch_add(elapsed_us, std::memory_order_relaxed);
+    last_us.store(elapsed_us, std::memory_order_relaxed);
+
+    auto current_max = max_us.load(std::memory_order_relaxed);
+    while (elapsed_us > current_max &&
+           !max_us.compare_exchange_weak(current_max, elapsed_us, std::memory_order_relaxed))
+    {
+    }
+}
+
+std::string BlockDevice::PerformanceJson() const
+{
+    const auto append_counter = [](std::ostringstream& buffer, const char* name, const PerfCounter& counter)
+    {
+        const auto count = counter.count.load(std::memory_order_relaxed);
+        const auto bytes = counter.bytes.load(std::memory_order_relaxed);
+        const auto total_us = counter.total_us.load(std::memory_order_relaxed);
+        const auto max_us = counter.max_us.load(std::memory_order_relaxed);
+        const auto last_us = counter.last_us.load(std::memory_order_relaxed);
+        buffer << "\"" << name << "\":{\"count\":" << count
+               << ",\"bytes\":" << bytes
+               << ",\"totalUs\":" << total_us
+               << ",\"maxUs\":" << max_us
+               << ",\"lastUs\":" << last_us
+               << "}";
+    };
+
+    std::ostringstream buffer;
+    buffer << "{";
+    append_counter(buffer, "read", read_perf_);
+    buffer << ",";
+    append_counter(buffer, "write", write_perf_);
+    buffer << ",";
+    append_counter(buffer, "unalignedWrite", unaligned_write_perf_);
+    buffer << ",";
+    append_counter(buffer, "flush", flush_perf_);
+    buffer << "}";
+    return buffer.str();
 }
 
 BlockDevice::~BlockDevice()
@@ -158,6 +283,8 @@ BlockDevice::Geometry BlockDevice::GetGeometry() const
 
 bool BlockDevice::Read(std::uint64_t offset_bytes, std::size_t size_bytes, std::vector<std::byte>& out_buffer) const
 {
+    ScopedPerfTimer perf_scope(read_perf_, static_cast<std::uint64_t>(size_bytes));
+
     out_buffer.clear();
     if (size_bytes == 0)
     {
@@ -239,6 +366,9 @@ bool BlockDevice::Read(std::uint64_t offset_bytes, std::size_t size_bytes, std::
 
 bool BlockDevice::Write(std::uint64_t offset_bytes, const std::vector<std::byte>& buffer)
 {
+    ScopedPerfTimer perf_scope(write_perf_, static_cast<std::uint64_t>(buffer.size()));
+    perf_scope.SetSecondary(unaligned_write_perf_);
+
     if (buffer.empty())
     {
         return true;
@@ -287,6 +417,10 @@ bool BlockDevice::Write(std::uint64_t offset_bytes, const std::vector<std::byte>
     const bool already_aligned =
         prefix_bytes == 0 &&
         static_cast<std::uint64_t>(buffer.size()) == aligned_size_u64;
+    if (!already_aligned)
+    {
+        perf_scope.MarkSecondary();
+    }
     LARGE_INTEGER target{};
     target.QuadPart = static_cast<LONGLONG>(aligned_offset);
     if (!SetFilePointerEx(handle_, target, nullptr, FILE_BEGIN))
@@ -382,6 +516,8 @@ bool BlockDevice::Write(std::uint64_t offset_bytes, const std::vector<std::byte>
 
 bool BlockDevice::Flush()
 {
+    ScopedPerfTimer perf_scope(flush_perf_);
+
     if (IsFaultSwitchEnabled(L"APFSACCESS_RW_FAULT_FLUSH"))
     {
         return false;
