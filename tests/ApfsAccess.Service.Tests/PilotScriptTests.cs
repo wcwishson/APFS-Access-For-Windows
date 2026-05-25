@@ -262,6 +262,9 @@ public sealed class PilotScriptTests
         Assert.Contains("elapsedMs", script);
         Assert.Contains("megabytesPerSecond", script);
         Assert.Contains("filesPerSecond", script);
+        Assert.Contains("sha256MismatchCount", script);
+        Assert.Contains("statusBefore", script);
+        Assert.Contains("statusAfter", script);
         Assert.Contains("Add-BenchmarkMetric -Results $results -Name \"copy-read-hash\"", script);
         Assert.Contains("Add-BenchmarkMetric -Results $results -Name \"direct-apfs-write\"", script);
         Assert.Contains("Add-BenchmarkMetric -Results $results -Name \"recursive-copy\"", script);
@@ -275,7 +278,7 @@ public sealed class PilotScriptTests
     {
         var script = File.ReadAllText(Path.Combine(RepoRoot, "scripts", "run_physical_rw_validation.ps1"));
 
-        Assert.Contains("[ValidateSet(\"Smoke\", \"Storm\", \"ExplorerWorkflow\", \"VerifyManifest\")]", script);
+        Assert.Contains("[ValidateSet(\"Smoke\", \"Storm\", \"ExplorerWorkflow\", \"VerifyManifest\", \"Performance\")]", script);
         Assert.Contains("Invoke-ExplorerWorkflow", script);
         Assert.Contains("explorer-format-copy-hash", script);
         Assert.Contains("explorer-rename-move-cut-paste", script);
@@ -293,6 +296,30 @@ public sealed class PilotScriptTests
         Assert.Contains("explorer-many-small-files", script);
         Assert.Contains("explorer-long-name", script);
         Assert.Contains("explorer-large-file-roundtrip", script);
+    }
+
+    [Fact]
+    public void PhysicalRwValidation_IncludesPerformanceMode()
+    {
+        var script = File.ReadAllText(Path.Combine(RepoRoot, "scripts", "run_physical_rw_validation.ps1"));
+
+        Assert.Contains("[ValidateSet(\"Smoke\", \"Storm\", \"ExplorerWorkflow\", \"VerifyManifest\", \"Performance\")]", script);
+        Assert.Contains("function Invoke-PerformanceBenchmark", script);
+        Assert.Contains("[int]$SmallFileBytes = 16KB", script);
+        Assert.Contains("[int]$SmallFileHashSampleCount = 100", script);
+        Assert.Contains("if ($RequestedFileCount -eq 180) { 1000 }", script);
+        Assert.Contains("if ($RequestedLargeFileBytes -eq 64MB) { [UInt64]1GB }", script);
+        Assert.Contains("-Name \"large-copy-in\"", script);
+        Assert.Contains("-Name \"large-copy-back\"", script);
+        Assert.Contains("-Name \"small-copy-in\"", script);
+        Assert.Contains("-Name \"small-copy-back\"", script);
+        Assert.Contains("-Name \"small-internal-move\"", script);
+        Assert.Contains("-Name \"small-move-out-and-back\"", script);
+        Assert.Contains("-Name \"directory-enumeration\"", script);
+        Assert.Contains("-Name \"delete-tree\"", script);
+        Assert.Contains("Assert-SampledSmallFiles", script);
+        Assert.Contains("Performance mode requires -StatusFile", script);
+        Assert.Contains("elseif ($Mode -eq \"Performance\")", script);
     }
 
     [Fact]

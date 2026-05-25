@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("Smoke", "Storm", "ExplorerWorkflow", "VerifyManifest")]
+    [ValidateSet("Smoke", "Storm", "ExplorerWorkflow", "VerifyManifest", "Performance")]
     [string]$Mode = "Smoke",
 
     [string]$MountRoot = "E:\",
@@ -15,6 +15,10 @@ param(
     [int]$FileCount = 180,
 
     [UInt64]$LargeFileBytes = 64MB,
+
+    [int]$SmallFileBytes = 16KB,
+
+    [int]$SmallFileHashSampleCount = 100,
 
     [switch]$Cleanup
 )
@@ -86,7 +90,11 @@ function Add-BenchmarkMetric {
         [TimeSpan]$Elapsed,
         [UInt64]$Bytes = 0,
         [int]$Files = 0,
-        [object]$Detail = $null
+        [object]$Detail = $null,
+        [object]$StatusBefore = $null,
+        [object]$StatusAfter = $null,
+        [int]$Sha256SampleCount = 0,
+        [int]$Sha256MismatchCount = 0
     )
 
     $elapsedSeconds = [Math]::Max($Elapsed.TotalSeconds, 0.001)
@@ -97,6 +105,10 @@ function Add-BenchmarkMetric {
         files = $Files
         megabytesPerSecond = if ($Bytes -gt 0) { [Math]::Round(($Bytes / 1MB) / $elapsedSeconds, 3) } else { $null }
         filesPerSecond = if ($Files -gt 0) { [Math]::Round($Files / $elapsedSeconds, 3) } else { $null }
+        statusBefore = $StatusBefore
+        statusAfter = $StatusAfter
+        sha256SampleCount = $Sha256SampleCount
+        sha256MismatchCount = $Sha256MismatchCount
         detail = $Detail
         at = (Get-Date).ToString("o")
     }
@@ -1077,6 +1089,332 @@ function Invoke-ExplorerWorkflow {
     return $results
 }
 
+function Invoke-PerformanceBenchmark {
+    param(
+        [string]$NormalizedMountRoot,
+        [string]$ScratchDirectory,
+        [string]$ManifestPath,
+        [int]$RequestedFileCount,
+        [UInt64]$RequestedLargeFileBytes,
+        [int]$RequestedSmallFileBytes,
+        [int]$RequestedSmallFileHashSampleCount,
+        [string]$StatusFilePath
+    )
+
+    $effectiveFileCount = if ($RequestedFileCount -eq 180) { 1000 } else { [Math]::Max(1, $RequestedFileCount) }
+    $effectiveLargeFileBytes = if ($RequestedLargeFileBytes -eq 64MB) { [UInt64]1GB } else { [UInt64][Math]::Max([double]1MB, [double]$RequestedLargeFileBytes) }
+    $effectiveSmallFileBytes = [Math]::Max(0, $RequestedSmallFileBytes)
+    $effectiveSampleCount = [Math]::Max(0, [Math]::Min($RequestedSmallFileHashSampleCount, $effectiveFileCount))
+
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $apfsRoot = Join-Path $NormalizedMountRoot ("apfs-access-performance-{0}" -f $stamp)
+    $ntfsRoot = Join-Path $ScratchDirectory ("apfs-access-performance-{0}" -f $stamp)
+    $results = New-ValidationResults -SelectedMode "Performance" -ApfsRoot $apfsRoot -NtfsRoot $ntfsRoot -ManifestPath $ManifestPath
+    $sampleMap = [ordered]@{}
+
+    function Get-PerformanceStatusSnapshot {
+        param([string]$Label)
+
+        if ([string]::IsNullOrWhiteSpace($StatusFilePath)) {
+            return $null
+        }
+
+        return Assert-HostStatusHealthy -Path $StatusFilePath -Label $Label
+    }
+
+    function Add-PerformanceMetric {
+        param(
+            [string]$Name,
+            [TimeSpan]$Elapsed,
+            [UInt64]$Bytes = 0,
+            [int]$Files = 0,
+            [object]$StatusBefore = $null,
+            [object]$StatusAfter = $null,
+            [int]$Sha256SampleCount = 0,
+            [int]$Sha256MismatchCount = 0,
+            [object]$Detail = $null
+        )
+
+        Add-BenchmarkMetric `
+            -Results $results `
+            -Name $Name `
+            -Elapsed $Elapsed `
+            -Bytes $Bytes `
+            -Files $Files `
+            -StatusBefore $StatusBefore `
+            -StatusAfter $StatusAfter `
+            -Sha256SampleCount $Sha256SampleCount `
+            -Sha256MismatchCount $Sha256MismatchCount `
+            -Detail $Detail
+    }
+
+    function Assert-SampledSmallFiles {
+        param(
+            [string]$SourceRoot,
+            [string]$DestinationRoot,
+            [string]$Label
+        )
+
+        $mismatchCount = 0
+        foreach ($entry in $sampleMap.GetEnumerator()) {
+            $relativePath = [string]$entry.Key
+            $expected = [string]$entry.Value
+            $destinationPath = Join-Path $DestinationRoot $relativePath
+            if (-not (Test-Path -LiteralPath $destinationPath)) {
+                throw "Performance sample missing after ${Label}: $destinationPath"
+            }
+
+            $actual = Get-Sha256 -Path $destinationPath
+            if ($actual -ne $expected) {
+                $mismatchCount++
+            }
+        }
+
+        if ($mismatchCount -ne 0) {
+            throw "Performance sample hash mismatches after ${Label}: $mismatchCount"
+        }
+
+        return $mismatchCount
+    }
+
+    try {
+        if ([string]::IsNullOrWhiteSpace($StatusFilePath)) {
+            throw "Performance mode requires -StatusFile so it can verify native RW health before and after benchmarks."
+        }
+
+        $disk = Get-ApfsLogicalDisk -NormalizedMountRoot $NormalizedMountRoot
+        $status = Get-PerformanceStatusSnapshot -Label "performance preflight"
+        Add-Phase -Results $results -Name "preflight" -State "passed" -Detail ([ordered]@{
+            deviceId = $disk.DeviceID
+            fileSystem = $disk.FileSystem
+            volumeName = $disk.VolumeName
+            size = $disk.Size
+            freeSpace = $disk.FreeSpace
+            hostPid = if ($null -eq $status) { $null } else { $status.hostPid }
+            fileCount = $effectiveFileCount
+            largeFileBytes = $effectiveLargeFileBytes
+            smallFileBytes = $effectiveSmallFileBytes
+            smallFileHashSampleCount = $effectiveSampleCount
+        })
+
+        New-Item -ItemType Directory -Force -Path $ntfsRoot | Out-Null
+        New-Item -ItemType Directory -Force -Path $apfsRoot | Out-Null
+        Wait-Path -Path $apfsRoot | Out-Null
+
+        $largeSource = Join-Path $ntfsRoot ("large-source-{0}.bin" -f $effectiveLargeFileBytes)
+        $largeApfs = Join-Path $apfsRoot ("large-apfs-{0}.bin" -f $effectiveLargeFileBytes)
+        $largeRoundTrip = Join-Path $ntfsRoot ("large-roundtrip-{0}.bin" -f $effectiveLargeFileBytes)
+        New-PatternFile -Path $largeSource -Bytes $effectiveLargeFileBytes -Seed 301
+
+        $largeCopyInBefore = Get-PerformanceStatusSnapshot -Label "large-copy-in before"
+        $largeCopyInElapsed = Measure-Phase {
+            Copy-Item -LiteralPath $largeSource -Destination $largeApfs -Force
+            Wait-Size -Path $largeApfs -Size $effectiveLargeFileBytes -Seconds 600 | Out-Null
+        }
+        $largeCopyInHash = Assert-HashEqual -ExpectedPath $largeSource -ActualPath $largeApfs -Label "performance large-copy-in"
+        $largeCopyInAfter = Get-PerformanceStatusSnapshot -Label "large-copy-in after"
+        Add-PerformanceMetric `
+            -Name "large-copy-in" `
+            -Elapsed $largeCopyInElapsed `
+            -Bytes $effectiveLargeFileBytes `
+            -Files 1 `
+            -StatusBefore $largeCopyInBefore `
+            -StatusAfter $largeCopyInAfter `
+            -Sha256SampleCount 1 `
+            -Sha256MismatchCount 0 `
+            -Detail ([ordered]@{ sha256 = $largeCopyInHash })
+        Add-Phase -Results $results -Name "large-copy-in" -State "passed"
+
+        $largeCopyBackBefore = Get-PerformanceStatusSnapshot -Label "large-copy-back before"
+        $largeCopyBackElapsed = Measure-Phase {
+            Copy-Item -LiteralPath $largeApfs -Destination $largeRoundTrip -Force
+            Wait-Size -Path $largeRoundTrip -Size $effectiveLargeFileBytes -Seconds 600 | Out-Null
+        }
+        Assert-HashEqual -ExpectedPath $largeSource -ActualPath $largeRoundTrip -Label "performance large-copy-back" | Out-Null
+        $largeCopyBackAfter = Get-PerformanceStatusSnapshot -Label "large-copy-back after"
+        Add-PerformanceMetric `
+            -Name "large-copy-back" `
+            -Elapsed $largeCopyBackElapsed `
+            -Bytes $effectiveLargeFileBytes `
+            -Files 1 `
+            -StatusBefore $largeCopyBackBefore `
+            -StatusAfter $largeCopyBackAfter `
+            -Sha256SampleCount 1 `
+            -Sha256MismatchCount 0 `
+            -Detail ([ordered]@{ sourceSha256 = $largeCopyInHash })
+        Add-Phase -Results $results -Name "large-copy-back" -State "passed"
+        $results.files += [ordered]@{ path = $largeApfs; size = $effectiveLargeFileBytes; hash = $largeCopyInHash; label = "performance-large" }
+
+        $smallNtfsSource = Join-Path $ntfsRoot "small-source"
+        $smallApfsDestination = Join-Path $apfsRoot "small-apfs"
+        $smallNtfsRoundTrip = Join-Path $ntfsRoot "small-roundtrip"
+        $smallApfsMoved = Join-Path $apfsRoot "small-apfs-moved"
+        $smallNtfsMovedOut = Join-Path $ntfsRoot "small-moved-out"
+        $smallApfsMovedBack = Join-Path $apfsRoot "small-apfs-moved-back"
+        New-Item -ItemType Directory -Force -Path $smallNtfsSource | Out-Null
+
+        $smallBytesTotal = [UInt64]0
+        $smallCreateElapsed = Measure-Phase {
+            for ($index = 0; $index -lt $effectiveFileCount; $index++) {
+                $bucket = "bucket_{0:D3}" -f [int]($index / 100)
+                $bucketPath = Join-Path $smallNtfsSource $bucket
+                if (-not (Test-Path -LiteralPath $bucketPath)) {
+                    New-Item -ItemType Directory -Force -Path $bucketPath | Out-Null
+                }
+                $relative = Join-Path $bucket ("small_{0:D5}.bin" -f $index)
+                $source = Join-Path $smallNtfsSource $relative
+                New-PatternFile -Path $source -Bytes ([UInt64]$effectiveSmallFileBytes) -Seed (401 + $index)
+                $smallBytesTotal += [UInt64]$effectiveSmallFileBytes
+                if ($sampleMap.Count -lt $effectiveSampleCount) {
+                    $sampleMap[$relative] = Get-Sha256 -Path $source
+                }
+            }
+        }
+        Add-PerformanceMetric `
+            -Name "small-source-create" `
+            -Elapsed $smallCreateElapsed `
+            -Bytes $smallBytesTotal `
+            -Files $effectiveFileCount `
+            -Sha256SampleCount $sampleMap.Count `
+            -Detail ([ordered]@{ sourceRoot = $smallNtfsSource })
+
+        $smallCopyInBefore = Get-PerformanceStatusSnapshot -Label "small-copy-in before"
+        $smallCopyInElapsed = Measure-Phase {
+            Copy-Item -LiteralPath $smallNtfsSource -Destination $smallApfsDestination -Recurse -Force
+            Wait-Path -Path $smallApfsDestination -Seconds 120 | Out-Null
+        }
+        $smallCopyInMismatchCount = Assert-SampledSmallFiles -SourceRoot $smallNtfsSource -DestinationRoot $smallApfsDestination -Label "small-copy-in"
+        $smallCopyInAfter = Get-PerformanceStatusSnapshot -Label "small-copy-in after"
+        Add-PerformanceMetric `
+            -Name "small-copy-in" `
+            -Elapsed $smallCopyInElapsed `
+            -Bytes $smallBytesTotal `
+            -Files $effectiveFileCount `
+            -StatusBefore $smallCopyInBefore `
+            -StatusAfter $smallCopyInAfter `
+            -Sha256SampleCount $sampleMap.Count `
+            -Sha256MismatchCount $smallCopyInMismatchCount `
+            -Detail ([ordered]@{ smallFileBytes = $effectiveSmallFileBytes })
+        Add-Phase -Results $results -Name "small-copy-in" -State "passed" -Detail ([ordered]@{ files = $effectiveFileCount; sampleCount = $sampleMap.Count })
+
+        $smallCopyBackBefore = Get-PerformanceStatusSnapshot -Label "small-copy-back before"
+        $smallCopyBackElapsed = Measure-Phase {
+            Copy-Item -LiteralPath $smallApfsDestination -Destination $smallNtfsRoundTrip -Recurse -Force
+            Wait-Path -Path $smallNtfsRoundTrip -Seconds 120 | Out-Null
+        }
+        $smallCopyBackMismatchCount = Assert-SampledSmallFiles -SourceRoot $smallNtfsSource -DestinationRoot $smallNtfsRoundTrip -Label "small-copy-back"
+        $smallCopyBackAfter = Get-PerformanceStatusSnapshot -Label "small-copy-back after"
+        Add-PerformanceMetric `
+            -Name "small-copy-back" `
+            -Elapsed $smallCopyBackElapsed `
+            -Bytes $smallBytesTotal `
+            -Files $effectiveFileCount `
+            -StatusBefore $smallCopyBackBefore `
+            -StatusAfter $smallCopyBackAfter `
+            -Sha256SampleCount $sampleMap.Count `
+            -Sha256MismatchCount $smallCopyBackMismatchCount
+        Add-Phase -Results $results -Name "small-copy-back" -State "passed"
+
+        $smallMoveInternalBefore = Get-PerformanceStatusSnapshot -Label "small-internal-move before"
+        $smallMoveInternalElapsed = Measure-Phase {
+            Move-Item -LiteralPath $smallApfsDestination -Destination $smallApfsMoved
+            Wait-Path -Path $smallApfsMoved -Seconds 120 | Out-Null
+        }
+        $smallMoveInternalMismatchCount = Assert-SampledSmallFiles -SourceRoot $smallNtfsSource -DestinationRoot $smallApfsMoved -Label "small-internal-move"
+        $smallMoveInternalAfter = Get-PerformanceStatusSnapshot -Label "small-internal-move after"
+        Add-PerformanceMetric `
+            -Name "small-internal-move" `
+            -Elapsed $smallMoveInternalElapsed `
+            -Bytes $smallBytesTotal `
+            -Files $effectiveFileCount `
+            -StatusBefore $smallMoveInternalBefore `
+            -StatusAfter $smallMoveInternalAfter `
+            -Sha256SampleCount $sampleMap.Count `
+            -Sha256MismatchCount $smallMoveInternalMismatchCount
+        Add-Phase -Results $results -Name "small-internal-move" -State "passed"
+
+        $smallMoveOutBackBefore = Get-PerformanceStatusSnapshot -Label "small-move-out-and-back before"
+        $smallMoveOutBackElapsed = Measure-Phase {
+            Move-Item -LiteralPath $smallApfsMoved -Destination $smallNtfsMovedOut
+            Wait-Path -Path $smallNtfsMovedOut -Seconds 120 | Out-Null
+            Move-Item -LiteralPath $smallNtfsMovedOut -Destination $smallApfsMovedBack
+            Wait-Path -Path $smallApfsMovedBack -Seconds 120 | Out-Null
+        }
+        $smallMoveOutBackMismatchCount = Assert-SampledSmallFiles -SourceRoot $smallNtfsSource -DestinationRoot $smallApfsMovedBack -Label "small-move-out-and-back"
+        $smallMoveOutBackAfter = Get-PerformanceStatusSnapshot -Label "small-move-out-and-back after"
+        Add-PerformanceMetric `
+            -Name "small-move-out-and-back" `
+            -Elapsed $smallMoveOutBackElapsed `
+            -Bytes ([UInt64]($smallBytesTotal * 2)) `
+            -Files $effectiveFileCount `
+            -StatusBefore $smallMoveOutBackBefore `
+            -StatusAfter $smallMoveOutBackAfter `
+            -Sha256SampleCount $sampleMap.Count `
+            -Sha256MismatchCount $smallMoveOutBackMismatchCount
+        Add-Phase -Results $results -Name "small-move-out-and-back" -State "passed"
+
+        $enumerationBefore = Get-PerformanceStatusSnapshot -Label "directory-enumeration before"
+        $enumeratedCount = 0
+        $enumerationElapsed = Measure-Phase {
+            $enumeratedCount = @([System.IO.Directory]::EnumerateFiles($smallApfsMovedBack, "*", [System.IO.SearchOption]::AllDirectories)).Count
+        }
+        if ($enumeratedCount -ne $effectiveFileCount) {
+            throw "Performance directory enumeration count mismatch: expected $effectiveFileCount, got $enumeratedCount"
+        }
+        $enumerationAfter = Get-PerformanceStatusSnapshot -Label "directory-enumeration after"
+        Add-PerformanceMetric `
+            -Name "directory-enumeration" `
+            -Elapsed $enumerationElapsed `
+            -Files $enumeratedCount `
+            -StatusBefore $enumerationBefore `
+            -StatusAfter $enumerationAfter
+        Add-Phase -Results $results -Name "directory-enumeration" -State "passed" -Detail ([ordered]@{ files = $enumeratedCount })
+
+        $deleteBefore = Get-PerformanceStatusSnapshot -Label "delete-tree before"
+        $deleteElapsed = Measure-Phase {
+            if (-not $smallApfsMovedBack.StartsWith($apfsRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Refusing delete-tree benchmark outside generated APFS test root: $smallApfsMovedBack"
+            }
+            Remove-Item -LiteralPath $smallApfsMovedBack -Recurse -Force
+            Wait-PathDeleted -Path $smallApfsMovedBack -StatusFilePath $StatusFilePath -Seconds 120 | Out-Null
+        }
+        $deleteAfter = Get-PerformanceStatusSnapshot -Label "delete-tree after"
+        Add-PerformanceMetric `
+            -Name "delete-tree" `
+            -Elapsed $deleteElapsed `
+            -Files $effectiveFileCount `
+            -StatusBefore $deleteBefore `
+            -StatusAfter $deleteAfter
+        Add-Phase -Results $results -Name "delete-tree" -State "passed"
+
+        $postStatus = Get-PerformanceStatusSnapshot -Label "performance final"
+        Add-Phase -Results $results -Name "post-status" -State "passed" -Detail $postStatus
+        $results.status = "passed"
+
+        if ($Cleanup) {
+            Remove-GeneratedApfsTree -Path $apfsRoot -MountRoot $NormalizedMountRoot -StatusFilePath $StatusFilePath | Out-Null
+            $results.cleanup = "removed-apfs-test-root"
+        }
+    }
+    catch {
+        $results.status = "failed"
+        $results.errors += [ordered]@{
+            message = $_.Exception.Message
+            at = (Get-Date).ToString("o")
+            scriptStack = $_.ScriptStackTrace
+        }
+        try {
+            if (-not [string]::IsNullOrWhiteSpace($StatusFilePath)) {
+                $results.hostStatus = Get-Content -LiteralPath $StatusFilePath -Raw | ConvertFrom-Json
+            }
+        }
+        catch {
+        }
+    }
+
+    return $results
+}
+
 function Invoke-PhysicalWorkload {
     param(
         [string]$SelectedMode,
@@ -1409,6 +1747,17 @@ if ($Mode -eq "ExplorerWorkflow") {
         -ScratchDirectory $ScratchRoot `
         -ManifestPath $manifestPath `
         -RequestedLargeFileBytes $LargeFileBytes `
+        -StatusFilePath $StatusFile
+}
+elseif ($Mode -eq "Performance") {
+    $result = Invoke-PerformanceBenchmark `
+        -NormalizedMountRoot $normalizedMountRoot `
+        -ScratchDirectory $ScratchRoot `
+        -ManifestPath $manifestPath `
+        -RequestedFileCount $FileCount `
+        -RequestedLargeFileBytes $LargeFileBytes `
+        -RequestedSmallFileBytes $SmallFileBytes `
+        -RequestedSmallFileHashSampleCount $SmallFileHashSampleCount `
         -StatusFilePath $StatusFile
 }
 else {
