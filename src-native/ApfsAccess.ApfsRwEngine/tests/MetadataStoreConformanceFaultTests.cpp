@@ -386,6 +386,51 @@ void ConfigurePayloadProvider(
         });
 }
 
+struct MutationStateSnapshot
+{
+    std::size_t pending_mutations = 0;
+    std::size_t pending_object_map_updates = 0;
+    std::size_t pending_allocations = 0;
+    std::size_t pending_deallocations = 0;
+    std::size_t pending_btree_records = 0;
+    std::size_t working_inodes = 0;
+    std::size_t working_free_extents = 0;
+    std::uint64_t working_free_extent_bytes = 0;
+};
+
+MutationStateSnapshot SnapshotMutationState(const apfsaccess::rw::MetadataStore& store)
+{
+    return MutationStateSnapshot
+    {
+        store.PendingMutationCount(),
+        store.PendingObjectMapUpdateCount(),
+        store.PendingAllocationCount(),
+        store.PendingDeallocationCount(),
+        store.PendingBtreeRecordCount(),
+        store.DebugWorkingInodeCount(),
+        store.DebugWorkingFreeExtentCount(),
+        store.DebugWorkingFreeExtentTotalBytes(),
+    };
+}
+
+bool MutationStateMatches(
+    const apfsaccess::rw::MetadataStore& store,
+    const MutationStateSnapshot& expected,
+    const std::string& label)
+{
+    const auto actual = SnapshotMutationState(store);
+    return Require(
+        actual.pending_mutations == expected.pending_mutations &&
+            actual.pending_object_map_updates == expected.pending_object_map_updates &&
+            actual.pending_allocations == expected.pending_allocations &&
+            actual.pending_deallocations == expected.pending_deallocations &&
+            actual.pending_btree_records == expected.pending_btree_records &&
+            actual.working_inodes == expected.working_inodes &&
+            actual.working_free_extents == expected.working_free_extents &&
+            actual.working_free_extent_bytes == expected.working_free_extent_bytes,
+        label);
+}
+
 bool TestRenameReplaceRollbackBeforePersist(const std::filesystem::path& run_root)
 {
     const auto image_path = run_root / "rename_replace_fault.apfs.img";
@@ -1009,6 +1054,179 @@ bool TestOversizedWriteMutationIsAtomic(const std::filesystem::path& run_root)
             pending_inode->logical_size == 0 && pending_inode->data_physical_address == 0,
             "OversizedWriteAtomic: failed oversized write should not persist file extent payload");
     }
+
+    return ok;
+}
+
+bool TestFailedMutationRollbackStateEquivalence(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "failed_mutation_rollback.apfs.img";
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, "FailedMutationRollback: unable to create synthetic container");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        L"FailedMutationRollback",
+    };
+    apfsaccess::rw::MetadataStore store(context);
+    bool ok = true;
+    ok &= Require(store.LoadContainerSuperblocks(), "FailedMutationRollback: LoadContainerSuperblocks should succeed");
+    ok &= Require(store.LoadObjectMap(), "FailedMutationRollback: LoadObjectMap should succeed");
+    ok &= Require(store.LoadSpacemanState(), "FailedMutationRollback: LoadSpacemanState should succeed");
+    ok &= Require(store.PrepareNativeWritePath(), "FailedMutationRollback: PrepareNativeWritePath should succeed");
+
+    std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+    ConfigurePayloadProvider(store, staged_payloads);
+
+    apfsaccess::rw::MetadataStore::MutationRequest create_dir{};
+    create_dir.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateDirectory;
+    create_dir.path = L"\\dir";
+    ok &= ExpectMutationStatus(
+        store,
+        create_dir,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "FailedMutationRollback: create dir should apply");
+
+    apfsaccess::rw::MetadataStore::MutationRequest create_child_dir = create_dir;
+    create_child_dir.path = L"\\dir\\child";
+    ok &= ExpectMutationStatus(
+        store,
+        create_child_dir,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "FailedMutationRollback: create child dir should apply");
+
+    apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+    create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+    create_file.path = L"\\file.bin";
+    ok &= ExpectMutationStatus(
+        store,
+        create_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "FailedMutationRollback: create file should apply");
+
+    apfsaccess::rw::MetadataStore::MutationRequest write_file{};
+    write_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+    write_file.path = L"\\file.bin";
+    write_file.length = 4096;
+    ok &= ExpectMutationStatus(
+        store,
+        write_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "FailedMutationRollback: write file should apply");
+    staged_payloads[L"\\file.bin"] = BuildPatternPayload(4096, 0x3A);
+
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "FailedMutationRollback: baseline commit should succeed");
+
+    const auto root = store.LookupCommittedInodeByPath(L"\\");
+    const auto dir = store.LookupCommittedInodeByPath(L"\\dir");
+    const auto file_before = store.LookupCommittedInodeByPath(L"\\file.bin");
+    if (!Require(root.has_value() && dir.has_value() && file_before.has_value(), "FailedMutationRollback: baseline paths should exist"))
+    {
+        return false;
+    }
+
+    auto state = SnapshotMutationState(store);
+    apfsaccess::rw::MetadataStore::MutationRequest duplicate_create{};
+    duplicate_create.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+    duplicate_create.path = L"\\file.bin";
+    ok &= ExpectMutationStatus(
+        store,
+        duplicate_create,
+        apfsaccess::rw::MetadataStore::MutationStatus::InvalidRequest,
+        "FailedMutationRollback: duplicate create should fail");
+    ok &= MutationStateMatches(store, state, "FailedMutationRollback: duplicate create should preserve mutation state");
+    ok &= Require(
+        store.DebugLookupWorkingInodeByPath(L"\\file.bin").has_value(),
+        "FailedMutationRollback: duplicate create should preserve working file");
+
+    state = SnapshotMutationState(store);
+    apfsaccess::rw::MetadataStore::MutationRequest replace_non_empty{};
+    replace_non_empty.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateDirectory;
+    replace_non_empty.path = L"\\dir";
+    replace_non_empty.replace_if_exists = true;
+    ok &= ExpectMutationStatus(
+        store,
+        replace_non_empty,
+        apfsaccess::rw::MetadataStore::MutationStatus::InvalidRequest,
+        "FailedMutationRollback: replacing non-empty directory should fail");
+    ok &= MutationStateMatches(store, state, "FailedMutationRollback: non-empty replace should preserve mutation state");
+    ok &= Require(
+        store.DebugWorkingDirectoryChildCount(dir->object_id) == 1,
+        "FailedMutationRollback: non-empty replace should preserve directory child count");
+
+    state = SnapshotMutationState(store);
+    apfsaccess::rw::MetadataStore::MutationRequest missing_parent_rename{};
+    missing_parent_rename.operation = apfsaccess::rw::MetadataStore::MutationOperation::Rename;
+    missing_parent_rename.path = L"\\file.bin";
+    missing_parent_rename.secondary_path = L"\\missing\\file.bin";
+    ok &= ExpectMutationStatus(
+        store,
+        missing_parent_rename,
+        apfsaccess::rw::MetadataStore::MutationStatus::InvalidRequest,
+        "FailedMutationRollback: rename into missing parent should fail");
+    ok &= MutationStateMatches(store, state, "FailedMutationRollback: missing-parent rename should preserve mutation state");
+    ok &= Require(
+        store.DebugLookupWorkingInodeByPath(L"\\file.bin").has_value() &&
+            !store.DebugLookupWorkingInodeByPath(L"\\missing\\file.bin").has_value(),
+        "FailedMutationRollback: missing-parent rename should preserve source and destination paths");
+
+    state = SnapshotMutationState(store);
+    apfsaccess::rw::MetadataStore::MutationRequest delete_non_empty{};
+    delete_non_empty.operation = apfsaccess::rw::MetadataStore::MutationOperation::Delete;
+    delete_non_empty.path = L"\\dir";
+    ok &= ExpectMutationStatus(
+        store,
+        delete_non_empty,
+        apfsaccess::rw::MetadataStore::MutationStatus::InvalidRequest,
+        "FailedMutationRollback: delete non-empty directory should fail");
+    ok &= MutationStateMatches(store, state, "FailedMutationRollback: delete non-empty directory should preserve mutation state");
+    ok &= Require(
+        store.DebugWorkingDirectoryChildCount(dir->object_id) == 1,
+        "FailedMutationRollback: delete non-empty directory should preserve child count");
+
+    state = SnapshotMutationState(store);
+    const auto file_size_before = file_before->logical_size;
+    const auto file_physical_before = file_before->data_physical_address;
+    apfsaccess::rw::MetadataStore::MutationRequest oversized_write{};
+    oversized_write.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+    oversized_write.path = L"\\file.bin";
+    oversized_write.length = static_cast<std::uint64_t>(kContainerBytes) + (2ull * static_cast<std::uint64_t>(kBlockSize));
+    ok &= ExpectMutationStatus(
+        store,
+        oversized_write,
+        apfsaccess::rw::MetadataStore::MutationStatus::AllocationFailed,
+        "FailedMutationRollback: oversized write should fail");
+    ok &= MutationStateMatches(store, state, "FailedMutationRollback: oversized write should preserve mutation state");
+    const auto working_file_after_write = store.DebugLookupWorkingInodeByPath(L"\\file.bin");
+    ok &= Require(
+        working_file_after_write.has_value() &&
+            working_file_after_write->logical_size == file_size_before &&
+            working_file_after_write->data_physical_address == file_physical_before,
+        "FailedMutationRollback: oversized write should preserve working inode extent");
+
+    state = SnapshotMutationState(store);
+    apfsaccess::rw::MetadataStore::MutationRequest oversized_set_size{};
+    oversized_set_size.operation = apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize;
+    oversized_set_size.path = L"\\file.bin";
+    oversized_set_size.length = static_cast<std::uint64_t>(kContainerBytes) + (2ull * static_cast<std::uint64_t>(kBlockSize));
+    ok &= ExpectMutationStatus(
+        store,
+        oversized_set_size,
+        apfsaccess::rw::MetadataStore::MutationStatus::AllocationFailed,
+        "FailedMutationRollback: oversized SetFileSize should fail");
+    ok &= MutationStateMatches(store, state, "FailedMutationRollback: oversized SetFileSize should preserve mutation state");
+    const auto working_file_after_set_size = store.DebugLookupWorkingInodeByPath(L"\\file.bin");
+    ok &= Require(
+        working_file_after_set_size.has_value() &&
+            working_file_after_set_size->logical_size == file_size_before &&
+            working_file_after_set_size->data_physical_address == file_physical_before,
+        "FailedMutationRollback: oversized SetFileSize should preserve working inode extent");
 
     return ok;
 }
@@ -1912,6 +2130,7 @@ int main()
     ok &= TestSpacemanCheckpointFallsBackWhenPreferredSlotAllocated(run_root);
     ok &= TestDeleteDirectoryRollbackOnDeviceWriteFault(run_root);
     ok &= TestOversizedWriteMutationIsAtomic(run_root);
+    ok &= TestFailedMutationRollbackStateEquivalence(run_root);
     ok &= TestCheckpointFlushFailureRemountSync(run_root);
     ok &= TestNonFixtureBootstrapTelemetryDefaults(run_root);
     ok &= TestCommitBlobModeSeparationBetweenFixtureAndNonFixture(run_root);

@@ -4610,17 +4610,292 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
     }
     const auto normalized_secondary = NormalizePath(request.secondary_path);
     const auto target_xid = checkpoint_xid_ + 1;
-    const auto working_inodes_snapshot = working_inodes_;
-    const auto working_path_index_snapshot = working_path_index_;
-    const auto working_directory_links_snapshot = working_directory_links_;
-    const auto working_child_count_snapshot = working_child_count_by_parent_;
-    const auto working_directory_link_index_snapshot = working_directory_link_index_;
-    const auto working_spaceman_free_extents_snapshot = working_spaceman_free_extents_;
-    const auto pending_object_map_updates_snapshot = pending_object_map_updates_;
-    const auto pending_spaceman_allocations_snapshot = pending_spaceman_allocations_;
-    const auto pending_spaceman_deallocations_snapshot = pending_spaceman_deallocations_;
-    const auto pending_btree_records_snapshot = pending_btree_records_;
-    const auto working_next_ephemeral_extent_snapshot = working_next_ephemeral_extent_;
+    struct InodeRestoreEntry
+    {
+        std::uint64_t object_id = 0;
+        std::optional<InodeRecord> previous;
+    };
+    struct PathIndexRestoreEntry
+    {
+        std::wstring key;
+        std::optional<std::uint64_t> previous;
+    };
+    struct PendingObjectMapRestoreEntry
+    {
+        std::uint64_t object_id = 0;
+        std::optional<ObjectMapUpdate> previous;
+    };
+    struct DirectoryLinkRestoreEntry
+    {
+        std::uint64_t parent_object_id = 0;
+        std::wstring entry_name;
+        std::optional<DirectoryLink> previous;
+    };
+    struct PendingAllocationRestoreEntry
+    {
+        std::size_t index = 0;
+        SpacemanAllocation allocation;
+    };
+    struct MutationUndoLog
+    {
+        std::size_t pending_mutations_size = 0;
+        std::size_t pending_object_map_updates_size = 0;
+        std::size_t pending_spaceman_allocations_size = 0;
+        std::size_t pending_spaceman_deallocations_size = 0;
+        std::size_t pending_btree_records_size = 0;
+        std::uint64_t working_next_ephemeral_extent = 0;
+        std::vector<InodeRestoreEntry> inode_restores;
+        std::vector<PathIndexRestoreEntry> path_index_restores;
+        std::vector<PendingObjectMapRestoreEntry> pending_object_map_restores;
+        std::vector<DirectoryLinkRestoreEntry> directory_link_restores;
+        std::vector<SpacemanAllocation> appended_pending_allocations;
+        std::vector<PendingAllocationRestoreEntry> erased_pending_allocations;
+        std::optional<std::vector<SpacemanAllocation>> working_spaceman_free_extents;
+    } undo_log
+    {
+        pending_mutations_.size(),
+        pending_object_map_updates_.size(),
+        pending_spaceman_allocations_.size(),
+        pending_spaceman_deallocations_.size(),
+        pending_btree_records_.size(),
+        working_next_ephemeral_extent_,
+    };
+    const auto remember_inode = [&](std::uint64_t object_id)
+    {
+        if (std::any_of(
+                undo_log.inode_restores.begin(),
+                undo_log.inode_restores.end(),
+                [&](const InodeRestoreEntry& entry) { return entry.object_id == object_id; }))
+        {
+            return;
+        }
+
+        auto existing = working_inodes_.find(object_id);
+        undo_log.inode_restores.push_back(
+            {
+                object_id,
+                existing == working_inodes_.end() ? std::optional<InodeRecord>{} : existing->second,
+            });
+    };
+    const auto remember_path_index = [&](const std::wstring& key)
+    {
+        if (std::any_of(
+                undo_log.path_index_restores.begin(),
+                undo_log.path_index_restores.end(),
+                [&](const PathIndexRestoreEntry& entry) { return entry.key == key; }))
+        {
+            return;
+        }
+
+        auto existing = working_path_index_.find(key);
+        undo_log.path_index_restores.push_back(
+            {
+                key,
+                existing == working_path_index_.end() ? std::optional<std::uint64_t>{} : existing->second,
+            });
+    };
+    const auto remember_pending_object_map_update = [&](std::uint64_t object_id)
+    {
+        if (std::any_of(
+                undo_log.pending_object_map_restores.begin(),
+                undo_log.pending_object_map_restores.end(),
+                [&](const PendingObjectMapRestoreEntry& entry) { return entry.object_id == object_id; }))
+        {
+            return;
+        }
+
+        auto existing = std::find_if(
+            pending_object_map_updates_.begin(),
+            pending_object_map_updates_.end(),
+            [&](const ObjectMapUpdate& update) { return update.object_id == object_id; });
+        undo_log.pending_object_map_restores.push_back(
+            {
+                object_id,
+                existing == pending_object_map_updates_.end() ? std::optional<ObjectMapUpdate>{} : *existing,
+            });
+    };
+    const auto remember_directory_link = [&](std::uint64_t parent_object_id, const std::wstring& entry_name)
+    {
+        if (std::any_of(
+                undo_log.directory_link_restores.begin(),
+                undo_log.directory_link_restores.end(),
+                [&](const DirectoryLinkRestoreEntry& entry)
+                {
+                    return entry.parent_object_id == parent_object_id &&
+                           entry.entry_name == entry_name;
+                }))
+        {
+            return;
+        }
+
+        auto index_it = working_directory_link_index_.find(
+            BuildWorkingDirectoryLinkIndexKey(parent_object_id, entry_name));
+        std::optional<DirectoryLink> previous;
+        if (index_it != working_directory_link_index_.end() &&
+            index_it->second < working_directory_links_.size())
+        {
+            previous = working_directory_links_[index_it->second];
+        }
+        undo_log.directory_link_restores.push_back(
+            {
+                parent_object_id,
+                entry_name,
+                std::move(previous),
+            });
+    };
+    const auto remember_working_free_extents = [&]()
+    {
+        if (!undo_log.working_spaceman_free_extents.has_value())
+        {
+            undo_log.working_spaceman_free_extents = working_spaceman_free_extents_;
+        }
+    };
+    const auto set_working_path_index = [&](const std::wstring& key, std::uint64_t object_id)
+    {
+        remember_path_index(key);
+        working_path_index_[key] = object_id;
+    };
+    const auto erase_working_path_index = [&](const std::wstring& key)
+    {
+        remember_path_index(key);
+        working_path_index_.erase(key);
+    };
+    const auto set_working_inode = [&](const InodeRecord& inode)
+    {
+        remember_inode(inode.object_id);
+        working_inodes_[inode.object_id] = inode;
+    };
+    const auto erase_working_inode = [&](std::uint64_t object_id)
+    {
+        remember_inode(object_id);
+        working_inodes_.erase(object_id);
+    };
+    const auto mutable_working_inode = [&](std::uint64_t object_id) -> InodeRecord&
+    {
+        remember_inode(object_id);
+        return working_inodes_[object_id];
+    };
+    const auto remove_working_directory_link = [&](std::uint64_t parent_object_id, const std::wstring& entry_name)
+    {
+        remember_directory_link(parent_object_id, entry_name);
+        RemoveWorkingDirectoryLink(parent_object_id, entry_name);
+    };
+    const auto upsert_working_directory_link = [&](std::uint64_t parent_object_id, const std::wstring& entry_name, std::uint64_t child_object_id, std::uint64_t xid)
+    {
+        remember_directory_link(parent_object_id, entry_name);
+        UpsertWorkingDirectoryLink(parent_object_id, entry_name, child_object_id, xid);
+    };
+    const auto allocate_extent = [&](std::uint64_t bytes) -> std::optional<std::uint64_t>
+    {
+        remember_working_free_extents();
+        return AllocateExtent(bytes);
+    };
+    const auto release_pending_spaceman_allocation = [&](std::uint64_t physical_address, std::uint64_t bytes)
+    {
+        if (!IsNativeWriteReady() || physical_address == 0 || bytes == 0)
+        {
+            return false;
+        }
+
+        const auto aligned_bytes = AlignExtentBytes(bytes);
+        if (aligned_bytes == 0)
+        {
+            return false;
+        }
+
+        for (auto it = pending_spaceman_allocations_.begin(); it != pending_spaceman_allocations_.end(); ++it)
+        {
+            if (it->physical_address != physical_address || it->bytes != aligned_bytes)
+            {
+                continue;
+            }
+
+            const auto index = static_cast<std::size_t>(std::distance(pending_spaceman_allocations_.begin(), it));
+            if (index < undo_log.pending_spaceman_allocations_size)
+            {
+                undo_log.erased_pending_allocations.push_back({ index, *it });
+            }
+            pending_spaceman_allocations_.erase(it);
+            remember_working_free_extents();
+            return FreeExtent(physical_address, aligned_bytes);
+        }
+
+        return false;
+    };
+    const auto stage_spaceman_allocation = [&](std::uint64_t physical_address, std::uint64_t bytes)
+    {
+        const auto before_size = pending_spaceman_allocations_.size();
+        if (!StageSpacemanAllocation(physical_address, bytes))
+        {
+            return false;
+        }
+        if (pending_spaceman_allocations_.size() > before_size)
+        {
+            undo_log.appended_pending_allocations.push_back(pending_spaceman_allocations_.back());
+        }
+        return true;
+    };
+    const auto restore_pending_allocations = [&]()
+    {
+        for (auto append_it = undo_log.appended_pending_allocations.rbegin();
+             append_it != undo_log.appended_pending_allocations.rend();
+             ++append_it)
+        {
+            auto existing = std::find_if(
+                pending_spaceman_allocations_.begin(),
+                pending_spaceman_allocations_.end(),
+                [&](const SpacemanAllocation& allocation)
+                {
+                    return allocation.physical_address == append_it->physical_address &&
+                           allocation.bytes == append_it->bytes;
+                });
+            if (existing != pending_spaceman_allocations_.end())
+            {
+                pending_spaceman_allocations_.erase(existing);
+            }
+        }
+        std::sort(
+            undo_log.erased_pending_allocations.begin(),
+            undo_log.erased_pending_allocations.end(),
+            [](const PendingAllocationRestoreEntry& lhs, const PendingAllocationRestoreEntry& rhs)
+            {
+                return lhs.index < rhs.index;
+            });
+        for (const auto& restore : undo_log.erased_pending_allocations)
+        {
+            const auto index = std::min(restore.index, pending_spaceman_allocations_.size());
+            pending_spaceman_allocations_.insert(
+                pending_spaceman_allocations_.begin() + static_cast<std::ptrdiff_t>(index),
+                restore.allocation);
+        }
+        if (pending_spaceman_allocations_.size() > undo_log.pending_spaceman_allocations_size)
+        {
+            pending_spaceman_allocations_.resize(undo_log.pending_spaceman_allocations_size);
+        }
+    };
+    const auto restore_directory_links = [&]()
+    {
+        for (const auto& restore : undo_log.directory_link_restores)
+        {
+            if (restore.previous.has_value())
+            {
+                UpsertWorkingDirectoryLink(
+                    restore.previous->parent_object_id,
+                    restore.previous->entry_name,
+                    restore.previous->child_object_id,
+                    restore.previous->xid);
+            }
+            else
+            {
+                RemoveWorkingDirectoryLink(restore.parent_object_id, restore.entry_name);
+            }
+        }
+    };
+    const auto stage_object_map_update = [&](std::uint64_t object_id, std::uint64_t physical_address, std::uint64_t logical_size)
+    {
+        remember_pending_object_map_update(object_id);
+        return StageObjectMapUpdate(object_id, physical_address, logical_size);
+    };
     bool mutation_applied = false;
     ScopeExit rollback_guard{
         [&]()
@@ -4630,17 +4905,73 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
                 return;
             }
 
-            working_inodes_ = working_inodes_snapshot;
-            working_path_index_ = working_path_index_snapshot;
-            working_directory_links_ = working_directory_links_snapshot;
-            working_child_count_by_parent_ = working_child_count_snapshot;
-            working_directory_link_index_ = working_directory_link_index_snapshot;
-            working_spaceman_free_extents_ = working_spaceman_free_extents_snapshot;
-            pending_object_map_updates_ = pending_object_map_updates_snapshot;
-            pending_spaceman_allocations_ = pending_spaceman_allocations_snapshot;
-            pending_spaceman_deallocations_ = pending_spaceman_deallocations_snapshot;
-            pending_btree_records_ = pending_btree_records_snapshot;
-            working_next_ephemeral_extent_ = working_next_ephemeral_extent_snapshot;
+            if (pending_mutations_.size() > undo_log.pending_mutations_size)
+            {
+                pending_mutations_.resize(undo_log.pending_mutations_size);
+            }
+            if (pending_object_map_updates_.size() > undo_log.pending_object_map_updates_size)
+            {
+                pending_object_map_updates_.resize(undo_log.pending_object_map_updates_size);
+            }
+            restore_pending_allocations();
+            if (pending_spaceman_deallocations_.size() > undo_log.pending_spaceman_deallocations_size)
+            {
+                pending_spaceman_deallocations_.resize(undo_log.pending_spaceman_deallocations_size);
+            }
+            if (pending_btree_records_.size() > undo_log.pending_btree_records_size)
+            {
+                pending_btree_records_.resize(undo_log.pending_btree_records_size);
+            }
+            for (const auto& restore : undo_log.pending_object_map_restores)
+            {
+                auto existing = std::find_if(
+                    pending_object_map_updates_.begin(),
+                    pending_object_map_updates_.end(),
+                    [&](const ObjectMapUpdate& update) { return update.object_id == restore.object_id; });
+                if (restore.previous.has_value())
+                {
+                    if (existing != pending_object_map_updates_.end())
+                    {
+                        *existing = restore.previous.value();
+                    }
+                    else
+                    {
+                        pending_object_map_updates_.push_back(restore.previous.value());
+                    }
+                }
+                else if (existing != pending_object_map_updates_.end())
+                {
+                    pending_object_map_updates_.erase(existing);
+                }
+            }
+            if (undo_log.working_spaceman_free_extents.has_value())
+            {
+                working_spaceman_free_extents_ = std::move(*undo_log.working_spaceman_free_extents);
+            }
+            working_next_ephemeral_extent_ = undo_log.working_next_ephemeral_extent;
+            for (const auto& restore : undo_log.path_index_restores)
+            {
+                if (restore.previous.has_value())
+                {
+                    working_path_index_[restore.key] = restore.previous.value();
+                }
+                else
+                {
+                    working_path_index_.erase(restore.key);
+                }
+            }
+            for (const auto& restore : undo_log.inode_restores)
+            {
+                if (restore.previous.has_value())
+                {
+                    working_inodes_[restore.object_id] = restore.previous.value();
+                }
+                else
+                {
+                    working_inodes_.erase(restore.object_id);
+                }
+            }
+            restore_directory_links();
         }};
     const auto stage_inode_record = [&](const InodeRecord& inode, bool tombstone)
     {
@@ -4734,9 +5065,9 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
             }
 
             replacement_id = existing->object_id;
-            RemoveWorkingDirectoryLink(existing->parent_object_id, existing->name);
-            working_path_index_.erase(CanonicalPathKey(normalized_path));
-            working_inodes_.erase(existing->object_id);
+            remove_working_directory_link(existing->parent_object_id, existing->name);
+            erase_working_path_index(CanonicalPathKey(normalized_path));
+            erase_working_inode(existing->object_id);
             stage_directory_record(existing->parent_object_id, existing->name, existing->object_id, true);
             if (!existing->is_directory && existing->logical_size > 0)
             {
@@ -4746,7 +5077,7 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
                 }
             }
             stage_inode_record(*existing, true);
-            if (!StageObjectMapUpdate(existing->object_id, 0, 0))
+            if (!stage_object_map_update(existing->object_id, 0, 0))
             {
                 return MutationStatus::AllocationFailed;
             }
@@ -4762,11 +5093,11 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         inode.data_physical_address = 0;
         inode.xid = target_xid;
 
-        working_inodes_[inode.object_id] = inode;
-        working_path_index_[CanonicalPathKey(inode.full_path)] = inode.object_id;
-        UpsertWorkingDirectoryLink(inode.parent_object_id, inode.name, inode.object_id, target_xid);
+        set_working_inode(inode);
+        set_working_path_index(CanonicalPathKey(inode.full_path), inode.object_id);
+        upsert_working_directory_link(inode.parent_object_id, inode.name, inode.object_id, target_xid);
 
-        if (!StageObjectMapUpdate(inode.object_id, inode.data_physical_address, inode.logical_size))
+        if (!stage_object_map_update(inode.object_id, inode.data_physical_address, inode.logical_size))
         {
             return MutationStatus::AllocationFailed;
         }
@@ -4793,7 +5124,7 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
 
         const auto requested_end = request.offset + request.length;
         const auto target_logical_size = std::max<std::uint64_t>(inode->logical_size, requested_end);
-        auto& inode_ref = working_inodes_[inode->object_id];
+        auto& inode_ref = mutable_working_inode(inode->object_id);
         const auto previous_physical = inode_ref.data_physical_address;
         const auto previous_size = inode_ref.logical_size;
         auto next_physical = previous_physical;
@@ -4804,12 +5135,12 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
             HasPendingSpacemanAllocation(previous_physical, previous_size);
         if (next_physical == 0 || target_logical_size > previous_size || !previous_extent_is_pending)
         {
-            auto extent = AllocateExtent(target_logical_size);
+            auto extent = allocate_extent(target_logical_size);
             if (!extent.has_value())
             {
                 return MutationStatus::AllocationFailed;
             }
-            if (!StageSpacemanAllocation(*extent, target_logical_size))
+            if (!stage_spaceman_allocation(*extent, target_logical_size))
             {
                 return MutationStatus::AllocationFailed;
             }
@@ -4819,13 +5150,13 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         inode_ref.data_physical_address = next_physical;
         inode_ref.logical_size = target_logical_size;
         inode_ref.xid = target_xid;
-        if (!StageObjectMapUpdate(inode_ref.object_id, inode_ref.data_physical_address, inode_ref.logical_size))
+        if (!stage_object_map_update(inode_ref.object_id, inode_ref.data_physical_address, inode_ref.logical_size))
         {
             return MutationStatus::AllocationFailed;
         }
         if (previous_physical != 0 && previous_physical != inode_ref.data_physical_address && previous_size > 0)
         {
-            const auto released_pending_extent = ReleasePendingSpacemanAllocation(previous_physical, previous_size);
+            const auto released_pending_extent = release_pending_spaceman_allocation(previous_physical, previous_size);
             if (!released_pending_extent && !stage_committed_file_extents_for_removal(*inode))
             {
                 return MutationStatus::AllocationFailed;
@@ -4847,7 +5178,7 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
             return reject(L"SetFileSizeTargetMissingOrDirectory");
         }
 
-        auto& inode_ref = working_inodes_[inode->object_id];
+        auto& inode_ref = mutable_working_inode(inode->object_id);
         const auto previous_physical = inode_ref.data_physical_address;
         const auto previous_size = inode_ref.logical_size;
         if (request.length == 0)
@@ -4863,12 +5194,12 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         }
         else
         {
-            auto extent = AllocateExtent(request.length);
+            auto extent = allocate_extent(request.length);
             if (!extent.has_value())
             {
                 return MutationStatus::AllocationFailed;
             }
-            if (!StageSpacemanAllocation(*extent, request.length))
+            if (!stage_spaceman_allocation(*extent, request.length))
             {
                 return MutationStatus::AllocationFailed;
             }
@@ -4879,7 +5210,7 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
             {
                 const auto released_pending_extent =
                     !committed_read_extents_.contains(inode_ref.object_id) &&
-                    ReleasePendingSpacemanAllocation(previous_physical, previous_size);
+                    release_pending_spaceman_allocation(previous_physical, previous_size);
                 if (!released_pending_extent && !stage_committed_file_extents_for_removal(*inode))
                 {
                     return MutationStatus::AllocationFailed;
@@ -4891,7 +5222,7 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         }
         inode_ref.logical_size = request.length;
         inode_ref.xid = target_xid;
-        if (!StageObjectMapUpdate(inode_ref.object_id, inode_ref.data_physical_address, inode_ref.logical_size))
+        if (!stage_object_map_update(inode_ref.object_id, inode_ref.data_physical_address, inode_ref.logical_size))
         {
             return MutationStatus::AllocationFailed;
         }
@@ -4958,9 +5289,9 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
             }
             if (!destination_is_same_object)
             {
-                RemoveWorkingDirectoryLink(destination_inode->parent_object_id, destination_inode->name);
-                working_path_index_.erase(CanonicalPathKey(normalized_secondary));
-                working_inodes_.erase(destination_inode->object_id);
+                remove_working_directory_link(destination_inode->parent_object_id, destination_inode->name);
+                erase_working_path_index(CanonicalPathKey(normalized_secondary));
+                erase_working_inode(destination_inode->object_id);
                 stage_directory_record(destination_inode->parent_object_id, destination_inode->name, destination_inode->object_id, true);
                 if (!destination_inode->is_directory &&
                     destination_inode->logical_size > 0)
@@ -4971,7 +5302,7 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
                     }
                 }
                 stage_inode_record(*destination_inode, true);
-                if (!StageObjectMapUpdate(destination_inode->object_id, 0, 0))
+                if (!stage_object_map_update(destination_inode->object_id, 0, 0))
                 {
                     return MutationStatus::AllocationFailed;
                 }
@@ -5010,17 +5341,17 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         const auto old_path = inode->full_path;
         const auto old_parent_object_id = inode->parent_object_id;
         const auto old_name = inode->name;
-        RemoveWorkingDirectoryLink(inode->parent_object_id, inode->name);
-        working_path_index_.erase(CanonicalPathKey(old_path));
+        remove_working_directory_link(inode->parent_object_id, inode->name);
+        erase_working_path_index(CanonicalPathKey(old_path));
         stage_directory_record(old_parent_object_id, old_name, inode->object_id, true);
 
-        auto& inode_ref = working_inodes_[inode->object_id];
+        auto& inode_ref = mutable_working_inode(inode->object_id);
         inode_ref.parent_object_id = destination_parent->object_id;
         inode_ref.name = LeafName(normalized_secondary);
         inode_ref.full_path = normalized_secondary;
         inode_ref.xid = target_xid;
-        working_path_index_[CanonicalPathKey(inode_ref.full_path)] = inode_ref.object_id;
-        UpsertWorkingDirectoryLink(inode_ref.parent_object_id, inode_ref.name, inode_ref.object_id, target_xid);
+        set_working_path_index(CanonicalPathKey(inode_ref.full_path), inode_ref.object_id);
+        upsert_working_directory_link(inode_ref.parent_object_id, inode_ref.name, inode_ref.object_id, target_xid);
         stage_directory_record(inode_ref.parent_object_id, inode_ref.name, inode_ref.object_id, false);
         stage_inode_record(inode_ref, false);
 
@@ -5032,8 +5363,8 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
                 continue;
             }
             const auto descendant_object_id = descendant_it->second;
-            working_path_index_.erase(descendant_it);
-            auto& descendant_inode = working_inodes_[descendant_object_id];
+            erase_working_path_index(CanonicalPathKey(old_descendant_path));
+            auto& descendant_inode = mutable_working_inode(descendant_object_id);
             const auto descendant_old_parent_object_id = descendant_inode.parent_object_id;
             const auto descendant_old_name = descendant_inode.name;
             const auto new_parent_path = ParentPath(new_descendant_path);
@@ -5048,12 +5379,12 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
                 descendant_inode.parent_object_id = parent_it->second;
             }
             descendant_inode.xid = target_xid;
-            working_path_index_[CanonicalPathKey(new_descendant_path)] = descendant_object_id;
-            RemoveWorkingDirectoryLink(descendant_old_parent_object_id, descendant_old_name);
+            set_working_path_index(CanonicalPathKey(new_descendant_path), descendant_object_id);
+            remove_working_directory_link(descendant_old_parent_object_id, descendant_old_name);
             stage_directory_record(descendant_old_parent_object_id, descendant_old_name, descendant_object_id, true);
-            UpsertWorkingDirectoryLink(descendant_inode.parent_object_id, descendant_inode.name, descendant_object_id, target_xid);
+            upsert_working_directory_link(descendant_inode.parent_object_id, descendant_inode.name, descendant_object_id, target_xid);
             stage_directory_record(descendant_inode.parent_object_id, descendant_inode.name, descendant_object_id, false);
-            if (!StageObjectMapUpdate(
+            if (!stage_object_map_update(
                     descendant_inode.object_id,
                     descendant_inode.data_physical_address,
                     descendant_inode.logical_size))
@@ -5063,7 +5394,7 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
             stage_inode_record(descendant_inode, false);
         }
 
-        if (!StageObjectMapUpdate(inode_ref.object_id, inode_ref.data_physical_address, inode_ref.logical_size))
+        if (!stage_object_map_update(inode_ref.object_id, inode_ref.data_physical_address, inode_ref.logical_size))
         {
             return MutationStatus::AllocationFailed;
         }
@@ -5086,9 +5417,9 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
             return reject(L"DeleteDirectoryNotEmpty");
         }
 
-        RemoveWorkingDirectoryLink(inode->parent_object_id, inode->name);
-        working_path_index_.erase(CanonicalPathKey(normalized_path));
-        working_inodes_.erase(inode->object_id);
+        remove_working_directory_link(inode->parent_object_id, inode->name);
+        erase_working_path_index(CanonicalPathKey(normalized_path));
+        erase_working_inode(inode->object_id);
         stage_directory_record(inode->parent_object_id, inode->name, inode->object_id, true);
         if (!inode->is_directory && inode->logical_size > 0)
         {
@@ -5099,7 +5430,7 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         }
         stage_inode_record(*inode, true);
 
-        if (!StageObjectMapUpdate(inode->object_id, 0, 0))
+        if (!stage_object_map_update(inode->object_id, 0, 0))
         {
             return MutationStatus::AllocationFailed;
         }
@@ -5113,10 +5444,10 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
             return reject(L"SetBasicInfoTargetMissing");
         }
 
-        auto& inode_ref = working_inodes_[inode->object_id];
+        auto& inode_ref = mutable_working_inode(inode->object_id);
         inode_ref.xid = target_xid;
         inode_ref.timestamp_utc = request.timestamp_utc;
-        if (!StageObjectMapUpdate(inode_ref.object_id, inode_ref.data_physical_address, inode_ref.logical_size))
+        if (!stage_object_map_update(inode_ref.object_id, inode_ref.data_physical_address, inode_ref.logical_size))
         {
             return MutationStatus::AllocationFailed;
         }
@@ -8173,6 +8504,35 @@ std::size_t MetadataStore::DebugWorkingDirectoryChildCount(std::uint64_t parent_
 {
     const auto count = working_child_count_by_parent_.find(parent_object_id);
     return count == working_child_count_by_parent_.end() ? 0 : count->second;
+}
+
+std::size_t MetadataStore::DebugWorkingInodeCount() const noexcept
+{
+    return working_inodes_.size();
+}
+
+std::optional<MetadataStore::InodeRecord> MetadataStore::DebugLookupWorkingInodeByPath(const std::wstring& path) const
+{
+    return LookupWorkingInode(NormalizePath(path));
+}
+
+std::size_t MetadataStore::DebugWorkingFreeExtentCount() const noexcept
+{
+    return working_spaceman_free_extents_.size();
+}
+
+std::uint64_t MetadataStore::DebugWorkingFreeExtentTotalBytes() const noexcept
+{
+    std::uint64_t total = 0;
+    for (const auto& extent : working_spaceman_free_extents_)
+    {
+        if (extent.bytes > (std::numeric_limits<std::uint64_t>::max() - total))
+        {
+            return std::numeric_limits<std::uint64_t>::max();
+        }
+        total += extent.bytes;
+    }
+    return total;
 }
 
 std::optional<MetadataStore::InodeRecord> MetadataStore::LookupCommittedInodeByPath(const std::wstring& path) const

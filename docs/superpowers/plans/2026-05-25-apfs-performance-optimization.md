@@ -677,7 +677,7 @@ git commit -m "perf: index APFS directory mutation lookups"
 - Modify: `src-native/ApfsAccess.ApfsRwEngine/tests/MetadataStoreConformanceTests.cpp`
 - Modify: `src-native/ApfsAccess.ApfsRwEngine/tests/MetadataStoreConformanceFaultTests.cpp`
 
-- [ ] **Step 1: Add rollback tests before refactor**
+- [x] **Step 1: Add rollback tests before refactor**
 
 Add focused tests for failed mutations that currently rely on full snapshots:
 
@@ -696,7 +696,7 @@ Run:
 
 Expected: new tests pass before refactor.
 
-- [ ] **Step 2: Add a `MutationUndoLog` helper**
+- [x] **Step 2: Add a `MutationUndoLog` helper**
 
 Add a local helper inside `MetadataStore.cpp` or a private nested type in `MetadataStore` that records only touched state:
 
@@ -717,7 +717,7 @@ struct MutationUndoLog
 
 The exact shape can differ, but it must restore only changed entries and truncate pending vectors back to their original sizes.
 
-- [ ] **Step 3: Wrap every mutating helper**
+- [x] **Step 3: Wrap every mutating helper**
 
 Before changing any of these collections, record the old value or absence:
 
@@ -731,7 +731,7 @@ Before changing any of these collections, record the old value or absence:
 
 Expected: failed mutations restore identical state without whole-map copies.
 
-- [ ] **Step 4: Remove full-state copies from `ApplyMutation`**
+- [x] **Step 4: Remove full-state copies from `ApplyMutation`**
 
 Delete these per-mutation copies:
 
@@ -746,7 +746,7 @@ Delete these per-mutation copies:
 
 Replace the rollback guard with `undo_log.Rollback(*this)`.
 
-- [ ] **Step 5: Add state-equivalence assertions in tests**
+- [x] **Step 5: Add state-equivalence assertions in tests**
 
 For the new rollback tests, compare:
 
@@ -759,7 +759,7 @@ For the new rollback tests, compare:
 
 If private access is needed, add test-only accessors guarded by the existing test compile pattern.
 
-- [ ] **Step 6: Verify**
+- [x] **Step 6: Verify**
 
 Run:
 

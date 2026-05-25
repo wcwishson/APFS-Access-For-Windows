@@ -202,6 +202,10 @@ public:
     [[nodiscard]] std::vector<InodeRecord> SnapshotCommittedInodes() const;
     [[nodiscard]] bool SetCommittedReadExtents(std::uint64_t object_id, std::vector<FileExtent> extents);
     [[nodiscard]] std::size_t DebugWorkingDirectoryChildCount(std::uint64_t parent_object_id) const;
+    [[nodiscard]] std::size_t DebugWorkingInodeCount() const noexcept;
+    [[nodiscard]] std::optional<InodeRecord> DebugLookupWorkingInodeByPath(const std::wstring& path) const;
+    [[nodiscard]] std::size_t DebugWorkingFreeExtentCount() const noexcept;
+    [[nodiscard]] std::uint64_t DebugWorkingFreeExtentTotalBytes() const noexcept;
     [[nodiscard]] bool ReadCommittedFileRange(
         const std::wstring& path,
         std::uint64_t offset,
