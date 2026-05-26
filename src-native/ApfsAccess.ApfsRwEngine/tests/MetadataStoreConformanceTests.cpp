@@ -1264,6 +1264,66 @@ bool TestPendingWriteDirectoryRenamePersistenceConformance(const std::filesystem
     return ok;
 }
 
+bool TestPendingPayloadByteEstimateTracksFinalSetFileSizeConformance(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "pending_payload_estimate.apfs.img";
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, "PendingPayloadEstimate: unable to create synthetic container");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        L"PendingPayloadEstimate",
+    };
+
+    apfsaccess::rw::MetadataStore store(context);
+    bool ok = true;
+    ok &= Require(store.LoadContainerSuperblocks(), "PendingPayloadEstimate: LoadContainerSuperblocks should succeed");
+    ok &= Require(store.LoadObjectMap(), "PendingPayloadEstimate: LoadObjectMap should succeed");
+    ok &= Require(store.LoadSpacemanState(), "PendingPayloadEstimate: LoadSpacemanState should succeed");
+    ok &= Require(store.PrepareNativeWritePath(), "PendingPayloadEstimate: PrepareNativeWritePath should succeed");
+
+    apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+    create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+    create_file.path = L"\\installer.exe";
+    ok &= ExpectMutationStatus(
+        store,
+        create_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "PendingPayloadEstimate: create file should apply");
+
+    constexpr std::uint64_t payload_bytes = 512ull * 1024ull;
+    apfsaccess::rw::MetadataStore::MutationRequest set_size{};
+    set_size.operation = apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize;
+    set_size.path = L"\\installer.exe";
+    set_size.length = payload_bytes;
+    ok &= ExpectMutationStatus(
+        store,
+        set_size,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "PendingPayloadEstimate: SetFileSize should apply");
+    ok &= Require(
+        store.PendingPayloadByteEstimate() == payload_bytes,
+        "PendingPayloadEstimate: pending payload estimate should include final logical file size");
+
+    apfsaccess::rw::MetadataStore::MutationRequest truncate_zero{};
+    truncate_zero.operation = apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize;
+    truncate_zero.path = L"\\installer.exe";
+    truncate_zero.length = 0;
+    ok &= ExpectMutationStatus(
+        store,
+        truncate_zero,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "PendingPayloadEstimate: zero-length SetFileSize should apply");
+    ok &= Require(
+        store.PendingPayloadByteEstimate() == 0,
+        "PendingPayloadEstimate: pending payload estimate should drop files truncated to zero");
+
+    return ok;
+}
+
 bool TestSequentialWriteBurstCoalescesPendingMetadataConformance(const std::filesystem::path& run_root)
 {
     const auto image_path = run_root / "sequential_write_burst.apfs.img";
@@ -2334,6 +2394,7 @@ int main()
     ok &= TestTruncateConformance(run_root);
     ok &= TestDirectorySubtreeRenameObjectMapConformance(run_root);
     ok &= TestPendingWriteDirectoryRenamePersistenceConformance(run_root);
+    ok &= TestPendingPayloadByteEstimateTracksFinalSetFileSizeConformance(run_root);
     ok &= TestSequentialWriteBurstCoalescesPendingMetadataConformance(run_root);
     ok &= TestStreamingLargeCopyWithoutPreallocationCoalescesPendingMetadataConformance(run_root);
     ok &= TestBtreeCanonicalizationConformance(run_root);

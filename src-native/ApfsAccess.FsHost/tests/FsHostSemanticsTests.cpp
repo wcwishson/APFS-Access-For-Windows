@@ -6192,6 +6192,43 @@ bool TestBeginMutationShutdownDrainTimesOutWithStuckMutation()
     return Require(context.active_external_mutation_callbacks.load() == 0, "Active mutation callback count should clear once stuck callback completes");
 }
 
+bool TestCommitTimeoutBudgetScalesWithPendingPayload()
+{
+    const auto empty_budget = ComputeWriteCommitTimeoutBudgetSeconds(15, 0);
+    if (!Require(empty_budget == 15, "Commit timeout budget should preserve configured timeout for metadata-only commits"))
+    {
+        return false;
+    }
+
+    const auto large_budget = ComputeWriteCommitTimeoutBudgetSeconds(15, 1ull * 1024ull * 1024ull * 1024ull);
+    if (!Require(large_budget > 15, "Commit timeout budget should grow for large pending payload commits"))
+    {
+        return false;
+    }
+    if (!Require(large_budget <= 180, "Commit timeout budget should remain capped for large pending payload commits"))
+    {
+        return false;
+    }
+
+    const auto capped_budget = ComputeWriteCommitTimeoutBudgetSeconds(
+        15,
+        std::numeric_limits<std::uint64_t>::max());
+    if (!Require(capped_budget == 180, "Commit timeout budget should cap extreme pending payload estimates"))
+    {
+        return false;
+    }
+    if (!Require(
+            ComputeWriteCommitTimeoutBudgetSeconds(240, 1ull * 1024ull * 1024ull) == 240,
+            "Commit timeout budget should preserve explicit configured timeouts above the payload extension cap"))
+    {
+        return false;
+    }
+
+    return Require(
+        ComputeWriteCommitTimeoutBudgetSeconds(0, 0) == 1,
+        "Commit timeout budget should clamp invalid configured timeouts to one second");
+}
+
 bool TestStatusFileTracksShutdownDrainAndInFlightMutations()
 {
     MountContext context{};
@@ -9242,6 +9279,10 @@ bool RunSelectedTest(const std::string& name)
     {
         return TestWritableOpenHydratesSparseMetadataWithoutDenseCache();
     }
+    if (name == "commit-timeout-budget-scales-with-pending-payload")
+    {
+        return TestCommitTimeoutBudgetScalesWithPendingPayload();
+    }
 
     std::cerr << "[FAIL] Unknown selected FsHost semantics test: " << name << std::endl;
     return false;
@@ -9379,6 +9420,7 @@ int main(int argc, char** argv)
     ok &= TestExternalMutationScopeTracksActiveCountAndDrainGate();
     ok &= TestBeginMutationShutdownDrainWaitsForInFlightMutation();
     ok &= TestBeginMutationShutdownDrainTimesOutWithStuckMutation();
+    ok &= TestCommitTimeoutBudgetScalesWithPendingPayload();
     ok &= TestStatusFileTracksShutdownDrainAndInFlightMutations();
     ok &= TestExternalMutationScopePublishesIdleStatusOnExit();
     ok &= TestCleanRecoveryCheckpointXidPrefersSuperblockWhenCommittedTelemetryStale();

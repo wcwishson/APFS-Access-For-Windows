@@ -8460,6 +8460,120 @@ std::size_t MetadataStore::PendingBtreeRecordCount() const noexcept
     return pending_btree_records_.size();
 }
 
+std::uint64_t MetadataStore::PendingPayloadByteEstimate() const
+{
+    if (pending_mutations_.empty())
+    {
+        return 0;
+    }
+
+    std::unordered_set<std::wstring> payload_paths;
+    payload_paths.reserve(pending_mutations_.size());
+    const auto remap_payload_subtree = [&payload_paths](const std::wstring& source_key, const std::wstring& destination_key)
+    {
+        if (source_key.empty() || destination_key.empty())
+        {
+            return;
+        }
+
+        std::vector<std::wstring> pending_removals;
+        std::vector<std::wstring> pending_additions;
+        pending_removals.reserve(payload_paths.size());
+        pending_additions.reserve(payload_paths.size());
+
+        for (const auto& payload_path : payload_paths)
+        {
+            if (payload_path == source_key)
+            {
+                pending_removals.push_back(payload_path);
+                pending_additions.push_back(destination_key);
+                continue;
+            }
+
+            if (!IsDescendantPath(payload_path, source_key))
+            {
+                continue;
+            }
+
+            auto remapped_path = destination_key;
+            remapped_path.append(payload_path.substr(source_key.size()));
+            pending_removals.push_back(payload_path);
+            pending_additions.push_back(std::move(remapped_path));
+        }
+
+        for (const auto& payload_path : pending_removals)
+        {
+            payload_paths.erase(payload_path);
+        }
+        for (const auto& payload_path : pending_additions)
+        {
+            if (!payload_path.empty())
+            {
+                payload_paths.insert(payload_path);
+            }
+        }
+    };
+
+    for (const auto& mutation : pending_mutations_)
+    {
+        const auto normalized_path = NormalizePath(mutation.path);
+        const auto normalized_key = CanonicalPathKey(normalized_path);
+        switch (mutation.operation)
+        {
+        case MutationOperation::Write:
+            if (mutation.length > 0)
+            {
+                payload_paths.insert(normalized_key);
+            }
+            break;
+        case MutationOperation::SetFileSize:
+            if (mutation.length > 0)
+            {
+                payload_paths.insert(normalized_key);
+            }
+            else
+            {
+                payload_paths.erase(normalized_key);
+            }
+            break;
+        case MutationOperation::Rename:
+        {
+            const auto normalized_secondary = NormalizePath(mutation.secondary_path);
+            const auto normalized_secondary_key = CanonicalPathKey(normalized_secondary);
+            remap_payload_subtree(normalized_key, normalized_secondary_key);
+            break;
+        }
+        case MutationOperation::Delete:
+            payload_paths.erase(normalized_key);
+            break;
+        default:
+            break;
+        }
+    }
+
+    std::uint64_t estimated_bytes = 0;
+    for (const auto& payload_path : payload_paths)
+    {
+        auto inode = LookupWorkingInode(payload_path);
+        if (!inode.has_value() ||
+            inode->is_directory ||
+            inode->data_physical_address == 0 ||
+            inode->logical_size == 0)
+        {
+            continue;
+        }
+
+        if (inode->logical_size > std::numeric_limits<std::uint64_t>::max() - estimated_bytes)
+        {
+            return std::numeric_limits<std::uint64_t>::max();
+        }
+
+        estimated_bytes += inode->logical_size;
+    }
+
+    return estimated_bytes;
+}
+
 std::optional<std::uint64_t> MetadataStore::LastCommittedXid() const noexcept
 {
     return last_committed_xid_;

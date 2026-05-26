@@ -191,6 +191,7 @@ public:
     [[nodiscard]] std::size_t PendingAllocationCount() const noexcept;
     [[nodiscard]] std::size_t PendingDeallocationCount() const noexcept;
     [[nodiscard]] std::size_t PendingBtreeRecordCount() const noexcept;
+    [[nodiscard]] std::uint64_t PendingPayloadByteEstimate() const;
     [[nodiscard]] std::optional<std::uint64_t> LastCommittedXid() const noexcept;
     [[nodiscard]] std::size_t CommittedObjectCount() const noexcept;
     [[nodiscard]] std::size_t CommittedAllocationCount() const noexcept;

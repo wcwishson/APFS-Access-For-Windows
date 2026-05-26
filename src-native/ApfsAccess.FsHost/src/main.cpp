@@ -38,6 +38,9 @@ typedef NTSTATUS* PNTSTATUS;
 
 namespace
 {
+constexpr std::uint64_t kWriteCommitTimeoutPayloadExtensionMaxSeconds = 180;
+constexpr std::uint64_t kWriteCommitTimeoutPayloadBytesPerSecond = 32ull * 1024ull * 1024ull;
+
 struct Arguments
 {
     std::wstring device;
@@ -3864,14 +3867,39 @@ std::filesystem::path BuildRecoveryMarkerPath(const Arguments& args)
     return recovery_root / marker_name;
 }
 
-void ArmCommitDeadline(MountContext* c)
+std::uint64_t ComputeWriteCommitTimeoutBudgetSeconds(
+    int configured_timeout_seconds,
+    std::uint64_t pending_payload_bytes) noexcept
+{
+    const auto base_timeout_seconds = static_cast<std::uint64_t>(std::max(1, configured_timeout_seconds));
+    std::uint64_t timeout_seconds = base_timeout_seconds;
+    if (pending_payload_bytes > 0)
+    {
+        const auto payload_seconds =
+            (pending_payload_bytes / kWriteCommitTimeoutPayloadBytesPerSecond) +
+            ((pending_payload_bytes % kWriteCommitTimeoutPayloadBytesPerSecond) == 0 ? 0 : 1);
+        const auto payload_timeout_seconds =
+            base_timeout_seconds > (std::numeric_limits<std::uint64_t>::max() - payload_seconds)
+                ? std::numeric_limits<std::uint64_t>::max()
+                : base_timeout_seconds + payload_seconds;
+        timeout_seconds = std::max(timeout_seconds, payload_timeout_seconds);
+    }
+
+    return std::max(
+        base_timeout_seconds,
+        std::min<std::uint64_t>(timeout_seconds, kWriteCommitTimeoutPayloadExtensionMaxSeconds));
+}
+
+void ArmCommitDeadline(MountContext* c, std::uint64_t pending_payload_bytes)
 {
     if (!c)
     {
         return;
     }
 
-    const auto timeout_seconds = static_cast<std::uint64_t>(std::max(1, c->args.write_commit_timeout_seconds));
+    const auto timeout_seconds = ComputeWriteCommitTimeoutBudgetSeconds(
+        c->args.write_commit_timeout_seconds,
+        pending_payload_bytes);
     const auto timeout_ms = timeout_seconds * 1000ull;
     const auto now = static_cast<std::uint64_t>(GetTickCount64());
     std::uint64_t deadline = now;
@@ -4426,10 +4454,17 @@ NTSTATUS CommitNativeMutationsBestEffort(MountContext* c, const wchar_t* origin)
     bool canonical_ready_before_commit = false;
     bool require_canonical_gate = false;
     std::string final_commit_stage;
+    std::uint64_t commit_timeout_budget_seconds = 0;
     const auto commit_started_tick = static_cast<std::uint64_t>(GetTickCount64());
     {
         std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
-        ArmCommitDeadline(c);
+        const auto pending_payload_bytes = c->metadata_store
+            ? c->metadata_store->PendingPayloadByteEstimate()
+            : 0;
+        commit_timeout_budget_seconds = ComputeWriteCommitTimeoutBudgetSeconds(
+            c->args.write_commit_timeout_seconds,
+            pending_payload_bytes);
+        ArmCommitDeadline(c, pending_payload_bytes);
 #ifdef APFSACCESS_FSHOST_UNIT_TEST
         if (forced_commit_status)
         {
@@ -4471,6 +4506,7 @@ NTSTATUS CommitNativeMutationsBestEffort(MountContext* c, const wchar_t* origin)
                    << L" origin=" << origin
                    << L" status=" << static_cast<int>(commit_status)
                    << L" durationMs=" << commit_duration_ms
+                   << L" timeoutSec=" << commit_timeout_budget_seconds
                    << L" canonicalGate=" << (require_canonical_gate ? L"true" : L"false")
                    << L" finalStage=" << Utf8ToWide(final_commit_stage)
                    << std::endl;
