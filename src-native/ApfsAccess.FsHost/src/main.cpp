@@ -4603,6 +4603,12 @@ NTSTATUS CommitNativeMutationsBestEffort(MountContext* c, const wchar_t* origin)
 
 bool HasPendingNativeMutations(MountContext* c)
 {
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+    if (c && c->test_force_native_mutation_staging_success && c->pending_native_writes)
+    {
+        return true;
+    }
+#endif
     if (!c || !c->metadata_store)
     {
         return false;
@@ -4630,7 +4636,7 @@ bool ClearStaleNativeDirtyMarkerIfClean(MountContext* c)
 
 NTSTATUS CommitNativeMutationsOnFlushBestEffort(MountContext* c)
 {
-    if (!c || !IsNativeWriteEnabled(c) || !c->metadata_store)
+    if (!c || !IsNativeWriteEnabled(c))
     {
         return STATUS_SUCCESS;
     }
@@ -5981,24 +5987,6 @@ NTSTATUS CB_SetFileSize(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT64 size, BOOLEAN, FS
         L"",
         0,
         size);
-    const auto native_commit_status = CommitNativeMutationsBestEffort(c, L"SetFileSize");
-    if (!NT_SUCCESS(native_commit_status))
-    {
-        LARGE_INTEGER rollback_target{};
-        rollback_target.QuadPart = rollback_snapshot.previous_size;
-        (void)SetFilePointerEx(o->file, rollback_target, nullptr, FILE_BEGIN);
-        (void)SetEndOfFile(o->file);
-        RestoreSetFileSizeRollbackTail(o->file, rollback_snapshot);
-        {
-            std::lock_guard<std::mutex> lock(c->mutex);
-            o->node->file_size = rollback_snapshot.previous_size;
-            o->node->timestamp = rollback_snapshot.previous_timestamp;
-            FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
-        }
-        DiscardSetFileSizeRollbackTail(rollback_snapshot);
-        return native_commit_status;
-    }
-    FinalizeMutationJournalBestEffort(c, L"SetFileSize");
 #endif
     DiscardSetFileSizeRollbackTail(rollback_snapshot);
     return STATUS_SUCCESS;

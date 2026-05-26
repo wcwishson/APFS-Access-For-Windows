@@ -204,6 +204,59 @@ bool WriteFileBytes(const std::filesystem::path& path, const std::vector<std::by
     return out.good();
 }
 
+bool SeedResizableUnitFile(MountContext& context, std::shared_ptr<Node>& file)
+{
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"resize.bin");
+
+    file = MakeNode(L"\\resize.bin", false, false);
+    file->file_size = 4;
+    context.nodes.emplace(Key(file->path), file);
+    return WriteFileBytes(
+        HydrationPath(&context, *file),
+        { std::byte{'A'}, std::byte{'B'}, std::byte{'C'}, std::byte{'D'} });
+}
+
+bool OpenResizableUnitFile(MountContext& context, const std::shared_ptr<Node>& file, OpenContext& open_context)
+{
+    if (!file)
+    {
+        return false;
+    }
+
+    open_context.node = file;
+    open_context.allow_set_file_size = true;
+    open_context.allow_write_data = true;
+    open_context.file = CreateFileW(
+        HydrationPath(&context, *file).wstring().c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    return open_context.file != INVALID_HANDLE_VALUE;
+}
+
+bool ConfigureUnitRecoveryMarker(MountContext& context, const wchar_t* name)
+{
+    std::error_code ec;
+    const auto marker_root = std::filesystem::temp_directory_path(ec) / "ApfsAccess" / "fs-host-semantics";
+    if (ec)
+    {
+        return false;
+    }
+    std::filesystem::create_directories(marker_root, ec);
+    if (ec)
+    {
+        return false;
+    }
+
+    const auto suffix = name && *name ? std::wstring(name) : L"marker";
+    context.recovery_marker_file = marker_root / (suffix + L"-" + std::to_wstring(GetTickCount64()) + L".state");
+    return true;
+}
+
 std::vector<std::byte> ReadFileBytes(const std::filesystem::path& path)
 {
     std::ifstream in(path, std::ios::binary);
@@ -3049,7 +3102,7 @@ bool TestDeleteOnCloseCommitsWhenDeleteIsLatching()
         "Delete-on-close should remove the node once the last cleanup closes");
 }
 
-bool TestSetFileSizeRollsBackLocalSizeWhenNativeCommitFails()
+bool TestSetFileSizeDefersNativeCommitUntilFlush()
 {
 #ifdef APFSACCESS_HAS_RW_ENGINE
     MountContext context{};
@@ -3057,13 +3110,18 @@ bool TestSetFileSizeRollsBackLocalSizeWhenNativeCommitFails()
     {
         return true;
     }
-    if (!Require(PrepareUnitHydrationRoot(context, L"set-file-size-rollback"), "SetFileSize rollback test should prepare cache root"))
+    if (!Require(PrepareUnitHydrationRoot(context, L"set-file-size-defer-flush"), "SetFileSize defer-to-flush test should prepare cache root"))
+    {
+        return false;
+    }
+    if (!Require(ConfigureUnitRecoveryMarker(context, L"set-file-size-defer-flush"), "SetFileSize defer-to-flush test should configure a recovery marker"))
     {
         return false;
     }
     ScopeExit cleanup{[&]()
     {
         std::error_code ec;
+        std::filesystem::remove(context.recovery_marker_file, ec);
         std::filesystem::remove_all(context.session_root, ec);
     }};
 
@@ -3071,31 +3129,14 @@ bool TestSetFileSizeRollsBackLocalSizeWhenNativeCommitFails()
     std::array<std::byte, 16> security{};
     SeedSecurity(context, security);
 
-    auto root = context.nodes.at(Key(L"\\"));
-    AddChildName(root->children, L"resize.bin");
-
-    auto file = MakeNode(L"\\resize.bin", false, false);
-    file->file_size = 4;
-    context.nodes.emplace(Key(file->path), file);
-    if (!Require(WriteFileBytes(HydrationPath(&context, *file), {std::byte{'A'}, std::byte{'B'}, std::byte{'C'}, std::byte{'D'}}),
-            "SetFileSize rollback test should seed hydration file"))
+    std::shared_ptr<Node> file;
+    if (!Require(SeedResizableUnitFile(context, file), "SetFileSize defer-to-flush test should seed hydration file"))
     {
         return false;
     }
 
     OpenContext open_context{};
-    open_context.node = file;
-    open_context.allow_set_file_size = true;
-    open_context.allow_write_data = true;
-    open_context.file = CreateFileW(
-        HydrationPath(&context, *file).wstring().c_str(),
-        GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr);
-    if (!Require(open_context.file != INVALID_HANDLE_VALUE, "SetFileSize rollback test should open hydration file"))
+    if (!Require(OpenResizableUnitFile(context, file, open_context), "SetFileSize defer-to-flush test should open hydration file"))
     {
         return false;
     }
@@ -3108,25 +3149,125 @@ bool TestSetFileSizeRollsBackLocalSizeWhenNativeCommitFails()
     auto fs = BuildFileSystem(&context);
     FSP_FSCTL_FILE_INFO info{};
     const auto status = CB_SetFileSize(&fs, &open_context, 9, FALSE, &info);
-    if (!Require(status == STATUS_MEDIA_WRITE_PROTECTED, "Forced native SetFileSize commit failure should return MEDIA_WRITE_PROTECTED"))
+    if (!Require(status == STATUS_SUCCESS, "SetFileSize should not force a native commit on the foreground resize path"))
     {
         return false;
     }
-    if (!Require(file->file_size == 4, "Failed native SetFileSize commit should restore node file size"))
+    if (!Require(context.test_native_commit_attempt_count == 0, "SetFileSize should leave native commit attempts at zero"))
     {
         return false;
     }
-    if (!Require(info.FileSize == 4, "Failed native SetFileSize commit should report restored file size"))
+    if (!Require(context.pending_native_writes, "SetFileSize should leave native writes marked pending"))
+    {
+        return false;
+    }
+    if (!Require(file->file_size == 9, "Deferred SetFileSize should publish the requested local file size"))
+    {
+        return false;
+    }
+    if (!Require(info.FileSize == 9, "Deferred SetFileSize should report the requested local file size"))
     {
         return false;
     }
 
     LARGE_INTEGER end{};
-    if (!Require(GetFileSizeEx(open_context.file, &end) != FALSE, "SetFileSize rollback test should read hydration size after failure"))
+    if (!Require(GetFileSizeEx(open_context.file, &end) != FALSE, "SetFileSize defer-to-flush test should read hydration size after resize"))
     {
         return false;
     }
-    return Require(end.QuadPart == 4, "Failed native SetFileSize commit should restore hydration file length");
+    if (!Require(end.QuadPart == 9, "Deferred SetFileSize should resize the hydration file before flush"))
+    {
+        return false;
+    }
+
+    const auto flush_status = CB_Flush(&fs, &open_context, &info);
+    if (!Require(flush_status == STATUS_MEDIA_WRITE_PROTECTED, "Flush should surface the deferred native SetFileSize commit failure"))
+    {
+        return false;
+    }
+    return Require(
+        context.test_native_commit_attempt_count == 1 &&
+            context.recovery_active &&
+            context.write_degraded &&
+            !context.native_write_enabled,
+        "Flush should be the first native commit boundary and latch fail-closed recovery on failure");
+#else
+    return true;
+#endif
+}
+
+bool TestSetFileSizeDefersNativeCommitUntilClose()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    MountContext context{};
+    if (!ConfigureNativeCommitFailureForUnitTest(context))
+    {
+        return true;
+    }
+    if (!Require(PrepareUnitHydrationRoot(context, L"set-file-size-defer-close"), "SetFileSize defer-to-close test should prepare cache root"))
+    {
+        return false;
+    }
+    if (!Require(ConfigureUnitRecoveryMarker(context, L"set-file-size-defer-close"), "SetFileSize defer-to-close test should configure a recovery marker"))
+    {
+        return false;
+    }
+    ScopeExit cleanup{[&]()
+    {
+        std::error_code ec;
+        std::filesystem::remove(context.recovery_marker_file, ec);
+        std::filesystem::remove_all(context.session_root, ec);
+    }};
+
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    std::shared_ptr<Node> file;
+    if (!Require(SeedResizableUnitFile(context, file), "SetFileSize defer-to-close test should seed hydration file"))
+    {
+        return false;
+    }
+
+    auto* open_context = new OpenContext();
+    if (!Require(OpenResizableUnitFile(context, file, *open_context), "SetFileSize defer-to-close test should open hydration file"))
+    {
+        delete open_context;
+        return false;
+    }
+    open_context->write_open = true;
+    file->open_handle_count = 1;
+    file->write_handle_count = 1;
+
+    auto fs = BuildFileSystem(&context);
+    FSP_FSCTL_FILE_INFO info{};
+    const auto status = CB_SetFileSize(&fs, open_context, 9, FALSE, &info);
+    if (!Require(status == STATUS_SUCCESS, "SetFileSize should succeed before close drains native writes"))
+    {
+        CloseHandle(open_context->file);
+        open_context->file = INVALID_HANDLE_VALUE;
+        delete open_context;
+        return false;
+    }
+    if (!Require(
+            context.test_native_commit_attempt_count == 0 &&
+                context.pending_native_writes &&
+                file->file_size == 9,
+            "SetFileSize should stage native work and defer commit until close"))
+    {
+        CloseHandle(open_context->file);
+        open_context->file = INVALID_HANDLE_VALUE;
+        delete open_context;
+        return false;
+    }
+
+    CB_Close(&fs, open_context);
+    return Require(
+        context.test_native_commit_attempt_count == 1 &&
+            context.recovery_active &&
+            context.write_degraded &&
+            !context.native_write_enabled,
+        "Close should drain deferred SetFileSize native work and fail closed on commit failure");
 #else
     return true;
 #endif
@@ -9073,9 +9214,13 @@ bool RunSelectedTest(const std::string& name)
     {
         return TestRenameRollsBackLocalNamespaceWhenNativeCommitFails();
     }
-    if (name == "set-file-size-rollback-native-commit-failure")
+    if (name == "set-file-size-defers-native-commit-until-flush")
     {
-        return TestSetFileSizeRollsBackLocalSizeWhenNativeCommitFails();
+        return TestSetFileSizeDefersNativeCommitUntilFlush();
+    }
+    if (name == "set-file-size-defers-native-commit-until-close")
+    {
+        return TestSetFileSizeDefersNativeCommitUntilClose();
     }
     if (name == "delete-on-close-rollback-native-commit-failure")
     {
@@ -9187,7 +9332,8 @@ int main(int argc, char** argv)
     ok &= TestCleanupDeleteLatchesEvenWhenAdditionalHandlesRemain();
     ok &= TestCloseOnlyCommitsWhenDeleteMutationIsEmitted();
     ok &= TestDeleteOnCloseCommitsWhenDeleteIsLatching();
-    ok &= TestSetFileSizeRollsBackLocalSizeWhenNativeCommitFails();
+    ok &= TestSetFileSizeDefersNativeCommitUntilFlush();
+    ok &= TestSetFileSizeDefersNativeCommitUntilClose();
     ok &= TestDeleteOnCloseRestoresLocalNodeWhenNativeCommitFails();
     ok &= TestRenameDirectoryFailsWhenDescendantHandleOpen();
     ok &= TestRenameSourceHandleSucceedsWithOnlyCurrentHandleOpen();
