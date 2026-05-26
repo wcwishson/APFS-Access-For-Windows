@@ -309,6 +309,7 @@ public sealed class PilotScriptTests
         Assert.Contains("[int]$SmallFileHashSampleCount = 100", script);
         Assert.Contains("if ($RequestedFileCount -eq 180) { 1000 }", script);
         Assert.Contains("if ($RequestedLargeFileBytes -eq 64MB) { [UInt64]1GB }", script);
+        Assert.Contains("$smallCreateMetric = [ordered]@{ bytes = [UInt64]0 }", script);
         Assert.Contains("-Name \"large-copy-in\"", script);
         Assert.Contains("-Name \"large-copy-back\"", script);
         Assert.Contains("-Name \"small-copy-in\"", script);
@@ -317,6 +318,8 @@ public sealed class PilotScriptTests
         Assert.Contains("-Name \"small-move-out-and-back\"", script);
         Assert.Contains("-Name \"directory-enumeration\"", script);
         Assert.Contains("-Name \"delete-tree\"", script);
+        Assert.Contains("$enumerationMetric = [ordered]@{ files = 0 }", script);
+        Assert.Contains("Get-ChildItem -LiteralPath $smallApfsMovedBack -Recurse -Force -File", script);
         Assert.Contains("Assert-SampledSmallFiles", script);
         Assert.Contains("Performance mode requires -StatusFile", script);
         Assert.Contains("elseif ($Mode -eq \"Performance\")", script);

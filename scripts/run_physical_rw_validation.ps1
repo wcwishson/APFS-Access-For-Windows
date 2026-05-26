@@ -1253,7 +1253,7 @@ function Invoke-PerformanceBenchmark {
         $smallApfsMovedBack = Join-Path $apfsRoot "small-apfs-moved-back"
         New-Item -ItemType Directory -Force -Path $smallNtfsSource | Out-Null
 
-        $smallBytesTotal = [UInt64]0
+        $smallCreateMetric = [ordered]@{ bytes = [UInt64]0 }
         $smallCreateElapsed = Measure-Phase {
             for ($index = 0; $index -lt $effectiveFileCount; $index++) {
                 $bucket = "bucket_{0:D3}" -f [int]($index / 100)
@@ -1264,7 +1264,7 @@ function Invoke-PerformanceBenchmark {
                 $relative = Join-Path $bucket ("small_{0:D5}.bin" -f $index)
                 $source = Join-Path $smallNtfsSource $relative
                 New-PatternFile -Path $source -Bytes ([UInt64]$effectiveSmallFileBytes) -Seed (401 + $index)
-                $smallBytesTotal += [UInt64]$effectiveSmallFileBytes
+                $smallCreateMetric.bytes += [UInt64]$effectiveSmallFileBytes
                 if ($sampleMap.Count -lt $effectiveSampleCount) {
                     $sampleMap[$relative] = Get-Sha256 -Path $source
                 }
@@ -1273,7 +1273,7 @@ function Invoke-PerformanceBenchmark {
         Add-PerformanceMetric `
             -Name "small-source-create" `
             -Elapsed $smallCreateElapsed `
-            -Bytes $smallBytesTotal `
+            -Bytes $smallCreateMetric.bytes `
             -Files $effectiveFileCount `
             -Sha256SampleCount $sampleMap.Count `
             -Detail ([ordered]@{ sourceRoot = $smallNtfsSource })
@@ -1288,7 +1288,7 @@ function Invoke-PerformanceBenchmark {
         Add-PerformanceMetric `
             -Name "small-copy-in" `
             -Elapsed $smallCopyInElapsed `
-            -Bytes $smallBytesTotal `
+            -Bytes $smallCreateMetric.bytes `
             -Files $effectiveFileCount `
             -StatusBefore $smallCopyInBefore `
             -StatusAfter $smallCopyInAfter `
@@ -1307,7 +1307,7 @@ function Invoke-PerformanceBenchmark {
         Add-PerformanceMetric `
             -Name "small-copy-back" `
             -Elapsed $smallCopyBackElapsed `
-            -Bytes $smallBytesTotal `
+            -Bytes $smallCreateMetric.bytes `
             -Files $effectiveFileCount `
             -StatusBefore $smallCopyBackBefore `
             -StatusAfter $smallCopyBackAfter `
@@ -1325,7 +1325,7 @@ function Invoke-PerformanceBenchmark {
         Add-PerformanceMetric `
             -Name "small-internal-move" `
             -Elapsed $smallMoveInternalElapsed `
-            -Bytes $smallBytesTotal `
+            -Bytes $smallCreateMetric.bytes `
             -Files $effectiveFileCount `
             -StatusBefore $smallMoveInternalBefore `
             -StatusAfter $smallMoveInternalAfter `
@@ -1345,7 +1345,7 @@ function Invoke-PerformanceBenchmark {
         Add-PerformanceMetric `
             -Name "small-move-out-and-back" `
             -Elapsed $smallMoveOutBackElapsed `
-            -Bytes ([UInt64]($smallBytesTotal * 2)) `
+            -Bytes ([UInt64]($smallCreateMetric.bytes * 2)) `
             -Files $effectiveFileCount `
             -StatusBefore $smallMoveOutBackBefore `
             -StatusAfter $smallMoveOutBackAfter `
@@ -1354,21 +1354,23 @@ function Invoke-PerformanceBenchmark {
         Add-Phase -Results $results -Name "small-move-out-and-back" -State "passed"
 
         $enumerationBefore = Get-PerformanceStatusSnapshot -Label "directory-enumeration before"
-        $enumeratedCount = 0
+        $enumerationMetric = [ordered]@{ files = 0 }
         $enumerationElapsed = Measure-Phase {
-            $enumeratedCount = @([System.IO.Directory]::EnumerateFiles($smallApfsMovedBack, "*", [System.IO.SearchOption]::AllDirectories)).Count
+            $enumerationMetric.files = @(
+                Get-ChildItem -LiteralPath $smallApfsMovedBack -Recurse -Force -File
+            ).Count
         }
-        if ($enumeratedCount -ne $effectiveFileCount) {
-            throw "Performance directory enumeration count mismatch: expected $effectiveFileCount, got $enumeratedCount"
+        if ($enumerationMetric.files -ne $effectiveFileCount) {
+            throw "Performance directory enumeration count mismatch: expected $effectiveFileCount, got $($enumerationMetric.files)"
         }
         $enumerationAfter = Get-PerformanceStatusSnapshot -Label "directory-enumeration after"
         Add-PerformanceMetric `
             -Name "directory-enumeration" `
             -Elapsed $enumerationElapsed `
-            -Files $enumeratedCount `
+            -Files $enumerationMetric.files `
             -StatusBefore $enumerationBefore `
             -StatusAfter $enumerationAfter
-        Add-Phase -Results $results -Name "directory-enumeration" -State "passed" -Detail ([ordered]@{ files = $enumeratedCount })
+        Add-Phase -Results $results -Name "directory-enumeration" -State "passed" -Detail ([ordered]@{ files = $enumerationMetric.files })
 
         $deleteBefore = Get-PerformanceStatusSnapshot -Label "delete-tree before"
         $deleteElapsed = Measure-Phase {
