@@ -289,7 +289,6 @@ bool DecodeBtreeExtentRecord(const BtreeRecord& record, DecodedBtreeExtent& deco
 
     const auto tombstone_flag = std::to_integer<unsigned char>(record.value[24]);
     if (decoded.xid == 0 ||
-        decoded.logical_offset != 0 ||
         decoded.extent_bytes == 0 ||
         tombstone_flag != 0)
     {
@@ -297,6 +296,56 @@ bool DecodeBtreeExtentRecord(const BtreeRecord& record, DecodedBtreeExtent& deco
     }
 
     return true;
+}
+
+bool HasLogicalExtentCoverage(
+    std::vector<DecodedBtreeExtent> extents,
+    std::uint64_t logical_size,
+    std::uint64_t anchor_physical_address)
+{
+    if (logical_size == 0)
+    {
+        return extents.empty();
+    }
+    if (extents.empty())
+    {
+        return false;
+    }
+
+    std::sort(extents.begin(), extents.end(), [](const DecodedBtreeExtent& lhs, const DecodedBtreeExtent& rhs)
+    {
+        if (lhs.logical_offset == rhs.logical_offset)
+        {
+            return lhs.physical_address < rhs.physical_address;
+        }
+        return lhs.logical_offset < rhs.logical_offset;
+    });
+
+    if (extents.front().logical_offset != 0 ||
+        extents.front().physical_address != anchor_physical_address)
+    {
+        return false;
+    }
+
+    std::uint64_t covered_until = 0;
+    for (const auto& extent : extents)
+    {
+        if (extent.extent_bytes == 0 ||
+            extent.physical_address == 0 ||
+            extent.logical_offset != covered_until ||
+            extent.logical_offset > (std::numeric_limits<std::uint64_t>::max() - extent.extent_bytes))
+        {
+            return false;
+        }
+
+        covered_until = extent.logical_offset + extent.extent_bytes;
+        if (covered_until >= logical_size)
+        {
+            return true;
+        }
+    }
+
+    return false;
 }
 } // namespace
 
@@ -312,7 +361,7 @@ bool ApfsVolumeTreeStore::TryProjectFromBtreeRecords(
     dedupe_keys.reserve(records.size());
     std::unordered_map<std::uint64_t, DecodedBtreeInode> decoded_inodes_by_object;
     std::unordered_map<std::wstring, DecodedBtreeDirectoryEntry> decoded_directory_entries;
-    std::unordered_map<std::uint64_t, DecodedBtreeExtent> decoded_extents_by_object;
+    std::unordered_map<std::uint64_t, std::vector<DecodedBtreeExtent>> decoded_extents_by_object;
     decoded_inodes_by_object.reserve(records.size());
     decoded_directory_entries.reserve(records.size());
     decoded_extents_by_object.reserve(records.size());
@@ -384,11 +433,7 @@ bool ApfsVolumeTreeStore::TryProjectFromBtreeRecords(
                 out_error = L"BtreeExtentDecodeInvalid";
                 return false;
             }
-            if (!decoded_extents_by_object.emplace(decoded.object_id, std::move(decoded)).second)
-            {
-                out_error = L"BtreeExtentDuplicateObjectId";
-                return false;
-            }
+            decoded_extents_by_object[decoded.object_id].push_back(std::move(decoded));
             break;
         }
         default:
@@ -416,7 +461,7 @@ bool ApfsVolumeTreeStore::TryProjectFromBtreeRecords(
         }
     }
 
-    for (const auto& [object_id, extent] : decoded_extents_by_object)
+    for (const auto& [object_id, extents] : decoded_extents_by_object)
     {
         auto inode_it = decoded_inodes_by_object.find(object_id);
         if (inode_it == decoded_inodes_by_object.end() || inode_it->second.is_directory)
@@ -424,8 +469,10 @@ bool ApfsVolumeTreeStore::TryProjectFromBtreeRecords(
             out_error = L"BtreeExtentMissingInode";
             return false;
         }
-        if (inode_it->second.data_physical_address != extent.physical_address ||
-            inode_it->second.logical_size != extent.extent_bytes)
+        if (!HasLogicalExtentCoverage(
+                extents,
+                inode_it->second.logical_size,
+                inode_it->second.data_physical_address))
         {
             out_error = L"BtreeExtentInodeMismatch";
             return false;
@@ -480,9 +527,15 @@ bool ApfsVolumeTreeStore::TryProjectFromBtreeRecords(
         }
     }
 
+    std::size_t extent_record_count = 0;
+    for (const auto& [_, extents] : decoded_extents_by_object)
+    {
+        extent_record_count += extents.size();
+    }
+
     out_projection.inode_record_count = decoded_inodes_by_object.size();
     out_projection.directory_entry_record_count = decoded_directory_entries.size();
-    out_projection.extent_record_count = decoded_extents_by_object.size();
+    out_projection.extent_record_count = extent_record_count;
     return true;
 }
 } // namespace apfsaccess::rw

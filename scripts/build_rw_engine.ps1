@@ -23,7 +23,7 @@ if ([string]::IsNullOrWhiteSpace($SourceDir)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($BuildDir)) {
-    $BuildDir = "C:\apfsaccess_native\rw_engine\$Configuration"
+    $BuildDir = "D:\apfsaccess_native\rw_engine\$Configuration"
 }
 
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {

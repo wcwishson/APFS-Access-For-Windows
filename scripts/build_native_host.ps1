@@ -22,7 +22,7 @@ if ([string]::IsNullOrWhiteSpace($SourceDir)) {
 
 if ([string]::IsNullOrWhiteSpace($BuildDir)) {
     # Use an ASCII-only build path to avoid MSVC/PDB Unicode path issues.
-    $BuildDir = "C:\apfsaccess_native\build\$Configuration"
+    $BuildDir = "D:\apfsaccess_native\build\$Configuration"
 }
 
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {

@@ -1324,6 +1324,101 @@ bool TestPendingPayloadByteEstimateTracksFinalSetFileSizeConformance(const std::
     return ok;
 }
 
+bool TestLargeSetFileSizeUsesFragmentedFreeExtentsConformance(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "large_fragmented_preallocation.apfs.img";
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, "LargeFragmentedPreallocation: unable to create synthetic container");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        L"LargeFragmentedPreallocation",
+    };
+
+    apfsaccess::rw::MetadataStore store(context);
+    bool ok = true;
+    ok &= Require(store.LoadContainerSuperblocks(), "LargeFragmentedPreallocation: LoadContainerSuperblocks should succeed");
+    ok &= Require(store.LoadObjectMap(), "LargeFragmentedPreallocation: LoadObjectMap should succeed");
+    ok &= Require(store.LoadSpacemanState(), "LargeFragmentedPreallocation: LoadSpacemanState should succeed");
+    ok &= Require(store.PrepareNativeWritePath(), "LargeFragmentedPreallocation: PrepareNativeWritePath should succeed");
+
+    constexpr std::uint64_t first_extent = 300ull * kBlockSize;
+    constexpr std::uint64_t second_extent = 304ull * kBlockSize;
+    ok &= Require(store.FreeExtent(first_extent, 2ull * kBlockSize), "LargeFragmentedPreallocation: first free extent should stage");
+    ok &= Require(store.FreeExtent(second_extent, 2ull * kBlockSize), "LargeFragmentedPreallocation: second free extent should stage");
+
+    apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+    create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+    create_file.path = L"\\large-fragmented.bin";
+    ok &= ExpectMutationStatus(
+        store,
+        create_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "LargeFragmentedPreallocation: create file should apply");
+
+    apfsaccess::rw::MetadataStore::MutationRequest set_size{};
+    set_size.operation = apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize;
+    set_size.path = L"\\large-fragmented.bin";
+    set_size.length = 4ull * kBlockSize;
+    ok &= ExpectMutationStatus(
+        store,
+        set_size,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "LargeFragmentedPreallocation: SetFileSize should use fragmented free extents when no single extent is large enough");
+    ok &= Require(
+        store.PendingAllocationCount() == 2,
+        "LargeFragmentedPreallocation: fragmented preallocation should stage both extents");
+    std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+    ConfigurePayloadProvider(store, staged_payloads);
+    staged_payloads[L"\\large-fragmented.bin"] = BuildPatternPayload(static_cast<std::size_t>(set_size.length), 0xA4);
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "LargeFragmentedPreallocation: fragmented file commit should succeed");
+
+    apfsaccess::rw::MetadataStore remounted(context);
+    ok &= Require(remounted.LoadContainerSuperblocks(), "LargeFragmentedPreallocation: remount LoadContainerSuperblocks should succeed");
+    ok &= Require(remounted.LoadObjectMap(), "LargeFragmentedPreallocation: remount LoadObjectMap should succeed");
+    ok &= Require(remounted.LoadSpacemanState(), "LargeFragmentedPreallocation: remount LoadSpacemanState should succeed");
+    ok &= Require(
+        remounted.PrepareNativeWritePath(),
+        "LargeFragmentedPreallocation: remount should restore fragmented read extents before integrity validation");
+    auto remounted_inode = remounted.LookupCommittedInodeByPath(L"\\large-fragmented.bin");
+    ok &= Require(
+        remounted_inode.has_value(),
+        "LargeFragmentedPreallocation: remount should expose committed inode");
+    if (remounted_inode.has_value())
+    {
+        ok &= Require(
+            remounted.DebugMergeNativeProjectionReadExtents(
+                remounted_inode->object_id,
+                {
+                    { 0, remounted_inode->data_physical_address, remounted_inode->logical_size },
+                }),
+            "LargeFragmentedPreallocation: full read projection should be accepted without replacing btree extents");
+        ok &= Require(
+            remounted.VerifyIntegrity(),
+            "LargeFragmentedPreallocation: conflicting full read projection should not poison canonical btree validation");
+
+        std::vector<std::byte> remounted_payload;
+        ok &= Require(
+            remounted.ReadCommittedFileRange(
+                L"\\large-fragmented.bin",
+                0,
+                staged_payloads[L"\\large-fragmented.bin"].size(),
+                remounted_payload),
+            "LargeFragmentedPreallocation: remounted fragmented file should remain readable after projection refresh");
+        ok &= Require(
+            remounted_payload == staged_payloads[L"\\large-fragmented.bin"],
+            "LargeFragmentedPreallocation: projection refresh should not collapse fragmented reads");
+    }
+
+    return ok;
+}
+
 bool TestSequentialWriteBurstCoalescesPendingMetadataConformance(const std::filesystem::path& run_root)
 {
     const auto image_path = run_root / "sequential_write_burst.apfs.img";
@@ -1754,6 +1849,9 @@ bool TestCommittedReadExtentsConformance(const std::filesystem::path& run_root)
             too_small_bytes),
         "ReadExtents: direct read should reject destination smaller than request");
     ok &= Require(too_small_bytes == 0, "ReadExtents: rejected direct read should report zero bytes");
+    ok &= Require(
+        store.VerifyIntegrity(),
+        "ReadExtents: sparse read projection should not poison committed integrity validation");
 
     return ok;
 }
@@ -2395,6 +2493,7 @@ int main()
     ok &= TestDirectorySubtreeRenameObjectMapConformance(run_root);
     ok &= TestPendingWriteDirectoryRenamePersistenceConformance(run_root);
     ok &= TestPendingPayloadByteEstimateTracksFinalSetFileSizeConformance(run_root);
+    ok &= TestLargeSetFileSizeUsesFragmentedFreeExtentsConformance(run_root);
     ok &= TestSequentialWriteBurstCoalescesPendingMetadataConformance(run_root);
     ok &= TestStreamingLargeCopyWithoutPreallocationCoalescesPendingMetadataConformance(run_root);
     ok &= TestBtreeCanonicalizationConformance(run_root);

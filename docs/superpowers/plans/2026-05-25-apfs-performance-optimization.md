@@ -14,7 +14,39 @@
 
 **Branch:** `optimize/read-write-performance`
 
-**Scope:** Planning only. No performance implementation has been done in this pass.
+**Scope:** Performance implementation and validation checkpoint completed; further write-speed exploration remains open.
+
+### Implementation Update As Of 2026-05-26
+
+Implemented and validated a low-risk checkpoint persistence optimization plus a portable launcher fix:
+
+- Added low-overhead performance counters for FsHost callbacks, metadata commit phases, block I/O, and directory loading.
+- Added physical `Performance` validation mode for one large sequential file plus many-small-file copy/move/delete workflows with SHA-256 sampling.
+- Added direct committed read-path and metadata/data-structure optimizations from the earlier low/medium-risk pass.
+- Added contiguous checkpoint block write batching in `MetadataStore::WriteChunkedCheckpointBlocks`, so adjacent selected checkpoint blocks are written with one raw device write per contiguous run instead of one write per block.
+- Fixed portable single-file launch extraction root selection in `ApfsAccess.Bootstrap`: the portable now uses the actual launcher executable directory instead of the single-file runtime extraction directory.
+
+Fresh validation after the final portable rebuild covered the focused FsHost semantic checks, physical Explorer workflow smoke, focused performance workflow, portable launch behavior, and post-run mount health. Integrity sampling reported zero SHA-256 mismatches.
+
+Measured focused physical performance after this checkpoint:
+
+| Benchmark | Result |
+| --- | ---: |
+| `large-copy-in` | 38.921 MB/s |
+| `large-copy-back` | 1197.093 MB/s |
+| `small-copy-in` | 4.12 files/s |
+| `small-copy-back` | 131.32 files/s |
+| `small-internal-move` | 120.77 files/s |
+| `small-move-out-and-back` | 2.19 files/s |
+| `directory-enumeration` | 1962 files/s |
+| `delete-tree` | 2.28 files/s |
+
+Interpretation:
+
+- The batching change reduced checkpoint block-write amplification risk without changing the recovery format, but it did not materially fix many-small-file user latency.
+- The final performance run still spent most write-path time in native commit/flush work.
+- The next proven bottleneck is foreground commit frequency/durability boundaries, especially close/delete/move workflows for many small files.
+- Next optimization work should prioritize Task 7-style safe foreground commit coalescing and/or a stricter analysis of which Explorer callbacks truly require immediate durable commit.
 
 **User-facing symptoms to target:**
 

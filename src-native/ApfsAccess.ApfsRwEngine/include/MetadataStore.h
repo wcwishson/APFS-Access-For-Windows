@@ -176,6 +176,8 @@ public:
     [[nodiscard]] bool IsProductionCanonicalPathActive() const noexcept;
     [[nodiscard]] std::wstring LastCanonicalGateFailure() const;
     [[nodiscard]] std::string LastCommitStage() const;
+    [[nodiscard]] std::wstring LastCommitFailureReason() const;
+    [[nodiscard]] std::optional<std::uint64_t> LastCommitFailureObjectId() const noexcept;
     [[nodiscard]] std::string LastReplayStage() const;
     [[nodiscard]] std::string LastCommitBlobMagic() const;
     [[nodiscard]] std::string PerformanceJson() const;
@@ -202,6 +204,7 @@ public:
     [[nodiscard]] std::optional<InodeRecord> LookupCommittedInodeByPath(const std::wstring& path) const;
     [[nodiscard]] std::vector<InodeRecord> SnapshotCommittedInodes() const;
     [[nodiscard]] bool SetCommittedReadExtents(std::uint64_t object_id, std::vector<FileExtent> extents);
+    [[nodiscard]] bool DebugMergeNativeProjectionReadExtents(std::uint64_t object_id, std::vector<FileExtent> extents);
     [[nodiscard]] std::size_t DebugWorkingDirectoryChildCount(std::uint64_t parent_object_id) const;
     [[nodiscard]] std::size_t DebugWorkingInodeCount() const noexcept;
     [[nodiscard]] std::optional<InodeRecord> DebugLookupWorkingInodeByPath(const std::wstring& path) const;
@@ -301,8 +304,15 @@ private:
         std::unordered_map<std::uint64_t, InodeRecord>& out_inodes,
         std::unordered_map<std::wstring, std::uint64_t>& out_path_index,
         std::vector<DirectoryLink>& out_directory_links) const;
+    [[nodiscard]] bool RebuildReadExtentsFromBtreeRecords(
+        const std::vector<BtreeRecord>& records,
+        const std::unordered_map<std::uint64_t, InodeRecord>& inode_table,
+        std::unordered_map<std::uint64_t, std::vector<FileExtent>>& out_read_extents) const;
     [[nodiscard]] bool ReadBlockByIndexDirect(std::uint64_t block_index, std::vector<std::byte>& out_block) const;
     [[nodiscard]] bool WriteBlockByIndexDirect(std::uint64_t block_index, const std::vector<std::byte>& block);
+    [[nodiscard]] bool WriteContiguousBlocksDirect(
+        std::uint64_t first_block_index,
+        const std::vector<std::byte>& blocks);
     [[nodiscard]] bool EnsureRootState();
     [[nodiscard]] bool ValidateInodeGraphState(
         const std::unordered_map<std::uint64_t, InodeRecord>& inode_table,
@@ -324,6 +334,7 @@ private:
     [[nodiscard]] bool StageObjectMapUpdate(std::uint64_t object_id, std::uint64_t physical_address, std::uint64_t logical_size);
     [[nodiscard]] bool StageSpacemanAllocation(std::uint64_t physical_address, std::uint64_t bytes);
     [[nodiscard]] bool StageSpacemanDeallocation(std::uint64_t physical_address, std::uint64_t bytes);
+    [[nodiscard]] std::optional<std::vector<FileExtent>> AllocateFileExtents(std::uint64_t logical_size);
     [[nodiscard]] std::optional<FileMutationExtents> CommittedFileExtentsForMutation(const InodeRecord& inode) const;
     [[nodiscard]] bool StageCommittedFileExtentDeallocations(const FileMutationExtents& extents);
     [[nodiscard]] bool HasPendingSpacemanAllocation(std::uint64_t physical_address, std::uint64_t bytes) const;
@@ -395,6 +406,8 @@ private:
     bool uses_scaffold_commit_blob_ = false;
     mutable std::wstring last_canonical_gate_failure_;
     std::string last_commit_stage_;
+    mutable std::wstring last_commit_failure_reason_;
+    mutable std::optional<std::uint64_t> last_commit_failure_object_id_;
     std::string last_replay_stage_;
     std::string last_commit_blob_magic_ = "APFSRWCANON3";
     bool last_replay_checkpoint_candidate_present_ = false;
@@ -418,6 +431,8 @@ private:
     std::vector<DirectoryLink> committed_directory_links_;
     std::vector<BtreeRecord> committed_btree_records_;
     std::unordered_map<std::uint64_t, std::vector<FileExtent>> committed_read_extents_;
+    std::unordered_map<std::uint64_t, std::vector<FileExtent>> working_read_extents_;
+    std::unordered_map<std::uint64_t, std::vector<FileExtent>> pending_read_extent_updates_;
     std::unordered_map<std::uint64_t, InodeRecord> working_inodes_;
     std::unordered_map<std::wstring, std::uint64_t> working_path_index_;
     std::vector<DirectoryLink> working_directory_links_;

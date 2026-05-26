@@ -10,6 +10,7 @@ coverage.*
 # Published/release binaries belong in GitHub Releases, not source git
 APFSAccess_Portable.exe
 Run_APFS_Access_Silent.vbs
+.apfsaccess-portable/
 *.msix
 *.msi
 *.nupkg

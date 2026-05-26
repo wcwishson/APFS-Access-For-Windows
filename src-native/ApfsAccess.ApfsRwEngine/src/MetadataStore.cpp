@@ -152,6 +152,17 @@ bool IsPerfCountersEnabled()
     return enabled;
 }
 
+bool IsStrictCommitVerificationEnabled()
+{
+    static const bool enabled = []()
+    {
+        wchar_t value[8]{};
+        const auto chars = GetEnvironmentVariableW(L"APFSACCESS_STRICT_COMMIT_VERIFY", value, static_cast<DWORD>(std::size(value)));
+        return chars > 0 && value[0] != L'\0' && value[0] != L'0';
+    }();
+    return enabled;
+}
+
 std::uint64_t ElapsedMicroseconds(std::chrono::steady_clock::time_point started)
 {
     return static_cast<std::uint64_t>(
@@ -192,6 +203,53 @@ bool HasPhysicalObjectMapping(const MetadataStore::ObjectMapUpdate& update) noex
     return update.object_id != 0 &&
            update.physical_address != 0 &&
            update.logical_size != 0;
+}
+
+bool HasLogicalExtentCoverage(
+    const std::vector<MetadataStore::FileExtent>& extents,
+    std::uint64_t logical_size)
+{
+    if (logical_size == 0)
+    {
+        return extents.empty();
+    }
+    if (extents.empty())
+    {
+        return false;
+    }
+
+    std::uint64_t covered_until = 0;
+    for (const auto& extent : extents)
+    {
+        if (extent.bytes == 0 ||
+            extent.physical_address == 0 ||
+            extent.logical_offset != covered_until ||
+            extent.logical_offset > (std::numeric_limits<std::uint64_t>::max() - extent.bytes))
+        {
+            return false;
+        }
+
+        covered_until = extent.logical_offset + extent.bytes;
+        if (covered_until >= logical_size)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+std::vector<MetadataStore::FileExtent> SortFileExtents(std::vector<MetadataStore::FileExtent> extents)
+{
+    std::sort(extents.begin(), extents.end(), [](const MetadataStore::FileExtent& lhs, const MetadataStore::FileExtent& rhs)
+    {
+        if (lhs.logical_offset == rhs.logical_offset)
+        {
+            return lhs.physical_address < rhs.physical_address;
+        }
+        return lhs.logical_offset < rhs.logical_offset;
+    });
+    return extents;
 }
 
 bool ConservativePhysicalRangeContains(
@@ -944,6 +1002,126 @@ bool DecodeBtreeExtentRecord(const apfsaccess::rw::BtreeRecord& record, DecodedB
 
     return true;
 }
+
+std::vector<MetadataStore::FileExtent> ExtentsFromDecodedBtreeExtents(
+    const std::vector<DecodedBtreeExtent>& decoded_extents)
+{
+    std::vector<MetadataStore::FileExtent> extents;
+    extents.reserve(decoded_extents.size());
+    for (const auto& decoded : decoded_extents)
+    {
+        extents.push_back(MetadataStore::FileExtent
+        {
+            decoded.logical_offset,
+            decoded.physical_address,
+            decoded.extent_bytes,
+        });
+    }
+    return SortFileExtents(std::move(extents));
+}
+
+bool ExtentsMatchDecodedBtreeExtents(
+    const std::vector<MetadataStore::FileExtent>& file_extents,
+    const std::vector<DecodedBtreeExtent>& decoded_extents,
+    std::uint64_t logical_size,
+    std::uint64_t anchor_physical_address,
+    std::uint64_t xid_upper_bound)
+{
+    if (!HasLogicalExtentCoverage(file_extents, logical_size) ||
+        decoded_extents.size() != file_extents.size())
+    {
+        return false;
+    }
+
+    auto sorted_file_extents = SortFileExtents(file_extents);
+    auto sorted_decoded_extents = decoded_extents;
+    std::sort(sorted_decoded_extents.begin(), sorted_decoded_extents.end(), [](const DecodedBtreeExtent& lhs, const DecodedBtreeExtent& rhs)
+    {
+        if (lhs.logical_offset == rhs.logical_offset)
+        {
+            return lhs.physical_address < rhs.physical_address;
+        }
+        return lhs.logical_offset < rhs.logical_offset;
+    });
+
+    for (std::size_t index = 0; index < sorted_file_extents.size(); ++index)
+    {
+        const auto& expected = sorted_file_extents[index];
+        const auto& decoded = sorted_decoded_extents[index];
+        if (decoded.logical_offset != expected.logical_offset ||
+            decoded.physical_address != expected.physical_address ||
+            decoded.extent_bytes != expected.bytes ||
+            decoded.xid == 0 ||
+            decoded.xid > xid_upper_bound)
+        {
+            return false;
+        }
+    }
+
+    return !sorted_file_extents.empty() &&
+           sorted_file_extents.front().logical_offset == 0 &&
+           sorted_file_extents.front().physical_address == anchor_physical_address;
+}
+
+bool FileExtentsEqual(
+    const std::vector<MetadataStore::FileExtent>& lhs,
+    const std::vector<MetadataStore::FileExtent>& rhs)
+{
+    if (lhs.size() != rhs.size())
+    {
+        return false;
+    }
+
+    for (std::size_t index = 0; index < lhs.size(); ++index)
+    {
+        if (lhs[index].logical_offset != rhs[index].logical_offset ||
+            lhs[index].physical_address != rhs[index].physical_address ||
+            lhs[index].bytes != rhs[index].bytes)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void TraceExtentMismatchDetail(
+    std::uint64_t object_id,
+    const std::vector<MetadataStore::FileExtent>& expected_extents,
+    const std::vector<DecodedBtreeExtent>& decoded_extents,
+    std::uint64_t logical_size,
+    std::uint64_t anchor_physical_address,
+    std::uint64_t xid_upper_bound)
+{
+    if (!IsReadTraceEnabled())
+    {
+        return;
+    }
+
+    std::wcerr << L"[MetadataStore] ExtentMismatch detail"
+               << L" object=" << object_id
+               << L" logicalSize=" << logical_size
+               << L" anchor=" << anchor_physical_address
+               << L" xidUpper=" << xid_upper_bound
+               << L" expectedCount=" << expected_extents.size()
+               << L" decodedCount=" << decoded_extents.size()
+               << std::endl;
+    for (const auto& extent : expected_extents)
+    {
+        std::wcerr << L"  expected logical=" << extent.logical_offset
+                   << L" physical=" << extent.physical_address
+                   << L" bytes=" << extent.bytes
+                   << std::endl;
+    }
+    for (const auto& extent : decoded_extents)
+    {
+        std::wcerr << L"  decoded logical=" << extent.logical_offset
+                   << L" physical=" << extent.physical_address
+                   << L" bytes=" << extent.extent_bytes
+                   << L" xid=" << extent.xid
+                   << std::endl;
+    }
+}
 } // namespace
 
 MetadataStore::MetadataStore(VolumeContext context)
@@ -1245,6 +1423,8 @@ bool MetadataStore::LoadContainerSuperblocks()
     committed_directory_links_.clear();
     committed_btree_records_.clear();
     committed_read_extents_.clear();
+    working_read_extents_.clear();
+    pending_read_extent_updates_.clear();
     working_inodes_.clear();
     working_path_index_.clear();
     working_directory_links_.clear();
@@ -1543,6 +1723,8 @@ bool MetadataStore::LoadSpacemanState()
         committed_spaceman_allocations_ = std::move(selected_allocations);
         committed_spaceman_free_extents_ = std::move(selected_free_extents);
         working_spaceman_free_extents_ = std::move(selected_working_free_extents);
+        working_read_extents_ = committed_read_extents_;
+        pending_read_extent_updates_.clear();
         next_ephemeral_extent_ = selected_next_ephemeral_extent;
         working_next_ephemeral_extent_ = selected_working_next_ephemeral_extent;
         last_committed_xid_ = selected_last_committed_xid;
@@ -1559,6 +1741,8 @@ bool MetadataStore::LoadSpacemanState()
             }
         }
         working_spaceman_free_extents_ = committed_spaceman_free_extents_;
+        working_read_extents_ = committed_read_extents_;
+        pending_read_extent_updates_.clear();
         working_next_ephemeral_extent_ = next_ephemeral_extent_;
         last_committed_xid_ = baseline_last_committed_xid;
         spaceman_loaded_ = true;
@@ -1784,6 +1968,39 @@ bool MetadataStore::WriteBlockByIndexDirect(std::uint64_t block_index, const std
     return device_.Write(block_offset, payload);
 }
 
+bool MetadataStore::WriteContiguousBlocksDirect(
+    std::uint64_t first_block_index,
+    const std::vector<std::byte>& blocks)
+{
+    if (block_size_ == 0 ||
+        first_block_index == 0 ||
+        blocks.empty() ||
+        blocks.size() % static_cast<std::size_t>(block_size_) != 0)
+    {
+        return false;
+    }
+
+    const auto block_count = blocks.size() / static_cast<std::size_t>(block_size_);
+    if (block_count == 0 ||
+        static_cast<std::uint64_t>(block_count) > (std::numeric_limits<std::uint64_t>::max() - first_block_index))
+    {
+        return false;
+    }
+
+    const auto last_block_index = first_block_index + static_cast<std::uint64_t>(block_count) - 1;
+    if (total_blocks_ != 0 && last_block_index >= total_blocks_)
+    {
+        return false;
+    }
+    if (first_block_index > (std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(block_size_)))
+    {
+        return false;
+    }
+
+    const auto block_offset = first_block_index * static_cast<std::uint64_t>(block_size_);
+    return device_.Write(block_offset, blocks);
+}
+
 std::vector<std::uint64_t> RotateCheckpointBlocks(
     const std::vector<std::uint64_t>& block_indices,
     std::uint64_t target_xid)
@@ -1883,18 +2100,30 @@ bool MetadataStore::WriteChunkedCheckpointBlocks(
         return false;
     }
 
-    for (std::size_t index = 0; index < block_count; ++index)
+    std::size_t index = 0;
+    while (index < block_count)
     {
-        std::vector<std::byte> block(static_cast<std::size_t>(block_size), std::byte{0});
-        const auto begin = data.begin() + static_cast<std::vector<std::byte>::difference_type>(index * block_size);
-        const auto end_index = std::min(data.size(), (index + 1) * block_size);
-        const auto end = data.begin() + static_cast<std::vector<std::byte>::difference_type>(end_index);
-        std::copy(begin, end, block.begin());
+        std::size_t run_blocks = 1;
+        while (index + run_blocks < block_count &&
+               selected_blocks[index + run_blocks] == selected_blocks[index] + static_cast<std::uint64_t>(run_blocks))
+        {
+            ++run_blocks;
+        }
 
-        if (!WriteBlockByIndexDirect(selected_blocks[index], block))
+        std::vector<std::byte> blocks(run_blocks * block_size, std::byte{0});
+        const auto begin_index = index * block_size;
+        const auto end_index = std::min(data.size(), (index + run_blocks) * block_size);
+        std::copy(
+            data.begin() + static_cast<std::vector<std::byte>::difference_type>(begin_index),
+            data.begin() + static_cast<std::vector<std::byte>::difference_type>(end_index),
+            blocks.begin());
+
+        if (!WriteContiguousBlocksDirect(selected_blocks[index], blocks))
         {
             return false;
         }
+
+        index += run_blocks;
     }
 
     return true;
@@ -2614,6 +2843,8 @@ bool MetadataStore::LoadSpacemanCheckpointBlock(std::uint64_t block_index, const
         }
     }
     working_spaceman_free_extents_ = committed_spaceman_free_extents_;
+    working_read_extents_ = committed_read_extents_;
+    pending_read_extent_updates_.clear();
     working_next_ephemeral_extent_ = next_ephemeral_extent_;
 
     if (persisted_xid > 0)
@@ -3182,7 +3413,7 @@ bool MetadataStore::RefreshNativeReadExtentProjection()
             continue;
         }
 
-        if (!SetCommittedReadExtents(committed_inode_it->first, std::move(extents)))
+        if (!DebugMergeNativeProjectionReadExtents(committed_inode_it->first, std::move(extents)))
         {
             committed_read_extents_.erase(committed_inode_it->first);
         }
@@ -3794,7 +4025,7 @@ bool MetadataStore::RebuildInodeStateFromBtreeRecords(
     out_directory_links.clear();
 
     std::unordered_map<std::uint64_t, DecodedBtreeInode> decoded_inodes;
-    std::unordered_map<std::uint64_t, DecodedBtreeExtent> decoded_extents;
+    std::unordered_map<std::uint64_t, std::vector<DecodedBtreeExtent>> decoded_extents;
     std::unordered_map<std::uint64_t, std::vector<DecodedBtreeDirectoryEntry>> decoded_directory_entries_by_parent;
     std::unordered_set<std::wstring> seen_directory_entry_keys;
 
@@ -3859,14 +4090,7 @@ bool MetadataStore::RebuildInodeStateFromBtreeRecords(
             {
                 return false;
             }
-            if (decoded.logical_offset != 0)
-            {
-                return false;
-            }
-            if (!decoded_extents.emplace(decoded.object_id, std::move(decoded)).second)
-            {
-                return false;
-            }
+            decoded_extents[decoded.object_id].push_back(std::move(decoded));
             break;
         }
         default:
@@ -3897,16 +4121,18 @@ bool MetadataStore::RebuildInodeStateFromBtreeRecords(
         auto extent_it = decoded_extents.find(object_id);
         if (extent_it == decoded_extents.end())
         {
-            if (inode.data_physical_address == 0 &&
-                context_.allow_raw_physical_write &&
+            if (context_.allow_raw_physical_write &&
                 IsLikelyRawDevicePath(context_.device_path))
             {
                 continue;
             }
             return false;
         }
-        if (extent_it->second.physical_address != inode.data_physical_address ||
-            extent_it->second.extent_bytes != inode.logical_size)
+        const auto file_extents = ExtentsFromDecodedBtreeExtents(extent_it->second);
+        if (!HasLogicalExtentCoverage(file_extents, inode.logical_size) ||
+            file_extents.empty() ||
+            file_extents.front().logical_offset != 0 ||
+            file_extents.front().physical_address != inode.data_physical_address)
         {
             return false;
         }
@@ -4043,6 +4269,55 @@ bool MetadataStore::RebuildInodeStateFromBtreeRecords(
         out_path_index,
         out_directory_links,
         /*require_root_object=*/true);
+}
+
+bool MetadataStore::RebuildReadExtentsFromBtreeRecords(
+    const std::vector<BtreeRecord>& records,
+    const std::unordered_map<std::uint64_t, InodeRecord>& inode_table,
+    std::unordered_map<std::uint64_t, std::vector<FileExtent>>& out_read_extents) const
+{
+    out_read_extents.clear();
+
+    std::unordered_map<std::uint64_t, std::vector<DecodedBtreeExtent>> decoded_extents;
+    decoded_extents.reserve(records.size());
+    for (const auto& record : records)
+    {
+        if (record.tombstone || record.kind != BtreeRecordKind::FileExtent)
+        {
+            continue;
+        }
+
+        DecodedBtreeExtent decoded{};
+        if (!DecodeBtreeExtentRecord(record, decoded))
+        {
+            return false;
+        }
+        decoded_extents[decoded.object_id].push_back(std::move(decoded));
+    }
+
+    for (const auto& [object_id, extents] : decoded_extents)
+    {
+        auto inode_it = inode_table.find(object_id);
+        if (inode_it == inode_table.end() ||
+            inode_it->second.is_directory ||
+            inode_it->second.logical_size == 0)
+        {
+            return false;
+        }
+
+        auto file_extents = ExtentsFromDecodedBtreeExtents(extents);
+        if (!HasLogicalExtentCoverage(file_extents, inode_it->second.logical_size) ||
+            file_extents.empty() ||
+            file_extents.front().logical_offset != 0 ||
+            file_extents.front().physical_address != inode_it->second.data_physical_address)
+        {
+            return false;
+        }
+
+        out_read_extents.emplace(object_id, std::move(file_extents));
+    }
+
+    return true;
 }
 
 bool MetadataStore::IsContainerLoaded() const noexcept
@@ -4219,6 +4494,8 @@ bool MetadataStore::PrepareNativeWritePath()
     pending_spaceman_allocations_.clear();
     pending_spaceman_deallocations_.clear();
     pending_btree_records_.clear();
+    pending_read_extent_updates_.clear();
+    working_read_extents_ = committed_read_extents_;
     canonical_commit_ready_ = CanReportCanonicalCommitReady(
         canonical_state_loaded_,
         commit_path_ready_,
@@ -4317,6 +4594,16 @@ std::wstring MetadataStore::LastCanonicalGateFailure() const
 std::string MetadataStore::LastCommitStage() const
 {
     return last_commit_stage_;
+}
+
+std::wstring MetadataStore::LastCommitFailureReason() const
+{
+    return last_commit_failure_reason_;
+}
+
+std::optional<std::uint64_t> MetadataStore::LastCommitFailureObjectId() const noexcept
+{
+    return last_commit_failure_object_id_;
 }
 
 std::string MetadataStore::LastReplayStage() const
@@ -4450,6 +4737,7 @@ void MetadataStore::SyncWorkingStateFromCommitted()
     working_inodes_ = committed_inodes_;
     working_path_index_ = committed_path_index_;
     working_directory_links_ = committed_directory_links_;
+    working_read_extents_ = committed_read_extents_;
     working_spaceman_free_extents_ = committed_spaceman_free_extents_;
     working_next_ephemeral_extent_ = next_ephemeral_extent_;
     RebuildWorkingDirectoryIndexes();
@@ -4625,6 +4913,12 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         std::uint64_t object_id = 0;
         std::optional<ObjectMapUpdate> previous;
     };
+    struct ReadExtentRestoreEntry
+    {
+        std::uint64_t object_id = 0;
+        std::optional<std::vector<FileExtent>> previous_working;
+        std::optional<std::vector<FileExtent>> previous_pending;
+    };
     struct DirectoryLinkRestoreEntry
     {
         std::uint64_t parent_object_id = 0;
@@ -4647,6 +4941,7 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         std::vector<InodeRestoreEntry> inode_restores;
         std::vector<PathIndexRestoreEntry> path_index_restores;
         std::vector<PendingObjectMapRestoreEntry> pending_object_map_restores;
+        std::vector<ReadExtentRestoreEntry> read_extent_restores;
         std::vector<DirectoryLinkRestoreEntry> directory_link_restores;
         std::vector<SpacemanAllocation> appended_pending_allocations;
         std::vector<PendingAllocationRestoreEntry> erased_pending_allocations;
@@ -4712,6 +5007,29 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
             {
                 object_id,
                 existing == pending_object_map_updates_.end() ? std::optional<ObjectMapUpdate>{} : *existing,
+            });
+    };
+    const auto remember_read_extents = [&](std::uint64_t object_id)
+    {
+        if (std::any_of(
+                undo_log.read_extent_restores.begin(),
+                undo_log.read_extent_restores.end(),
+                [&](const ReadExtentRestoreEntry& entry) { return entry.object_id == object_id; }))
+        {
+            return;
+        }
+
+        auto existing_working = working_read_extents_.find(object_id);
+        auto existing_pending = pending_read_extent_updates_.find(object_id);
+        undo_log.read_extent_restores.push_back(
+            {
+                object_id,
+                existing_working == working_read_extents_.end()
+                    ? std::optional<std::vector<FileExtent>>{}
+                    : existing_working->second,
+                existing_pending == pending_read_extent_updates_.end()
+                    ? std::optional<std::vector<FileExtent>>{}
+                    : existing_pending->second,
             });
     };
     const auto remember_directory_link = [&](std::uint64_t parent_object_id, const std::wstring& entry_name)
@@ -4790,6 +5108,11 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         remember_working_free_extents();
         return AllocateExtent(bytes);
     };
+    const auto allocate_file_extents = [&](std::uint64_t bytes) -> std::optional<std::vector<FileExtent>>
+    {
+        remember_working_free_extents();
+        return AllocateFileExtents(bytes);
+    };
     const auto release_pending_spaceman_allocation = [&](std::uint64_t physical_address, std::uint64_t bytes)
     {
         if (!IsNativeWriteReady() || physical_address == 0 || bytes == 0)
@@ -4833,6 +5156,35 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         {
             undo_log.appended_pending_allocations.push_back(pending_spaceman_allocations_.back());
         }
+        return true;
+    };
+    const auto release_pending_file_extents = [&](std::uint64_t object_id)
+    {
+        auto extents_it = pending_read_extent_updates_.find(object_id);
+        if (extents_it == pending_read_extent_updates_.end())
+        {
+            return true;
+        }
+
+        remember_read_extents(object_id);
+        const auto extents = extents_it->second;
+        std::vector<SpacemanAllocation> released_allocations;
+        released_allocations.reserve(extents.size());
+        for (const auto& extent : extents)
+        {
+            const auto aligned_bytes = AlignExtentBytes(extent.bytes);
+            if (!release_pending_spaceman_allocation(extent.physical_address, extent.bytes))
+            {
+                for (const auto& released : released_allocations)
+                {
+                    (void)StageSpacemanAllocation(released.physical_address, released.bytes);
+                }
+                return false;
+            }
+            released_allocations.push_back({ extent.physical_address, aligned_bytes });
+        }
+        pending_read_extent_updates_.erase(object_id);
+        working_read_extents_.erase(object_id);
         return true;
     };
     const auto restore_pending_allocations = [&]()
@@ -4944,6 +5296,26 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
                     pending_object_map_updates_.erase(existing);
                 }
             }
+            for (const auto& restore : undo_log.read_extent_restores)
+            {
+                if (restore.previous_working.has_value())
+                {
+                    working_read_extents_[restore.object_id] = restore.previous_working.value();
+                }
+                else
+                {
+                    working_read_extents_.erase(restore.object_id);
+                }
+
+                if (restore.previous_pending.has_value())
+                {
+                    pending_read_extent_updates_[restore.object_id] = restore.previous_pending.value();
+                }
+                else
+                {
+                    pending_read_extent_updates_.erase(restore.object_id);
+                }
+            }
             if (undo_log.working_spaceman_free_extents.has_value())
             {
                 working_spaceman_free_extents_ = std::move(*undo_log.working_spaceman_free_extents);
@@ -5005,8 +5377,32 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
             target_xid,
             tombstone));
     };
+    const auto stage_file_extents = [&](std::uint64_t object_id, const std::vector<FileExtent>& extents) -> bool
+    {
+        remember_read_extents(object_id);
+        if (extents.empty())
+        {
+            working_read_extents_.erase(object_id);
+            pending_read_extent_updates_.erase(object_id);
+            return true;
+        }
+
+        working_read_extents_[object_id] = extents;
+        pending_read_extent_updates_[object_id] = extents;
+        for (const auto& extent : extents)
+        {
+            stage_extent_record(
+                object_id,
+                extent.logical_offset,
+                extent.physical_address,
+                extent.bytes,
+                false);
+        }
+        return true;
+    };
     const auto stage_committed_file_extents_for_removal = [&](const InodeRecord& inode) -> bool
     {
+        remember_read_extents(inode.object_id);
         auto extents = CommittedFileExtentsForMutation(inode);
         if (!extents.has_value() || !StageCommittedFileExtentDeallocations(extents.value()))
         {
@@ -5021,6 +5417,8 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
                 extent.bytes,
                 true);
         }
+        working_read_extents_.erase(inode.object_id);
+        pending_read_extent_updates_.erase(inode.object_id);
         return true;
     };
 
@@ -5132,19 +5530,43 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
             previous_physical != 0 &&
             previous_size > 0 &&
             !committed_read_extents_.contains(inode_ref.object_id) &&
+            !working_read_extents_.contains(inode_ref.object_id) &&
             HasPendingSpacemanAllocation(previous_physical, previous_size);
         if (next_physical == 0 || target_logical_size > previous_size || !previous_extent_is_pending)
         {
-            auto extent = allocate_extent(target_logical_size);
-            if (!extent.has_value())
+            const auto old_extents_were_pending = pending_read_extent_updates_.contains(inode_ref.object_id);
+            if (old_extents_were_pending &&
+                !release_pending_file_extents(inode_ref.object_id))
             {
                 return MutationStatus::AllocationFailed;
             }
-            if (!stage_spaceman_allocation(*extent, target_logical_size))
+            const auto old_committed_extents_need_removal =
+                previous_physical != 0 &&
+                previous_size > 0 &&
+                !old_extents_were_pending &&
+                !previous_extent_is_pending;
+            if (old_committed_extents_need_removal &&
+                !stage_committed_file_extents_for_removal(*inode))
             {
                 return MutationStatus::AllocationFailed;
             }
-            next_physical = *extent;
+            auto extents = allocate_file_extents(target_logical_size);
+            if (!extents.has_value() || extents->empty())
+            {
+                return MutationStatus::AllocationFailed;
+            }
+            for (const auto& extent : extents.value())
+            {
+                if (!stage_spaceman_allocation(extent.physical_address, extent.bytes))
+                {
+                    return MutationStatus::AllocationFailed;
+                }
+            }
+            if (!stage_file_extents(inode_ref.object_id, extents.value()))
+            {
+                return MutationStatus::AllocationFailed;
+            }
+            next_physical = extents->front().physical_address;
         }
 
         inode_ref.data_physical_address = next_physical;
@@ -5154,7 +5576,10 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         {
             return MutationStatus::AllocationFailed;
         }
-        if (previous_physical != 0 && previous_physical != inode_ref.data_physical_address && previous_size > 0)
+        if (previous_extent_is_pending &&
+            previous_physical != 0 &&
+            previous_physical != inode_ref.data_physical_address &&
+            previous_size > 0)
         {
             const auto released_pending_extent = release_pending_spaceman_allocation(previous_physical, previous_size);
             if (!released_pending_extent && !stage_committed_file_extents_for_removal(*inode))
@@ -5162,7 +5587,10 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
                 return MutationStatus::AllocationFailed;
             }
         }
-        stage_extent_record(inode_ref.object_id, 0, inode_ref.data_physical_address, inode_ref.logical_size, false);
+        if (!working_read_extents_.contains(inode_ref.object_id))
+        {
+            stage_extent_record(inode_ref.object_id, 0, inode_ref.data_physical_address, inode_ref.logical_size, false);
+        }
         stage_inode_record(inode_ref, false);
         CoalescePendingWriteMutation(inode_ref.object_id, request);
         CoalescePendingBtreeFileMetadata(inode_ref.object_id);
@@ -5194,31 +5622,58 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         }
         else
         {
-            auto extent = allocate_extent(request.length);
-            if (!extent.has_value())
+            const auto old_extents_were_pending = pending_read_extent_updates_.contains(inode_ref.object_id);
+            if (old_extents_were_pending &&
+                !release_pending_file_extents(inode_ref.object_id))
             {
                 return MutationStatus::AllocationFailed;
             }
-            if (!stage_spaceman_allocation(*extent, request.length))
-            {
-                return MutationStatus::AllocationFailed;
-            }
-
-            if (previous_physical != 0 &&
+            const auto old_committed_extents_need_removal =
+                previous_physical != 0 &&
                 previous_size > 0 &&
-                previous_physical != *extent)
+                !old_extents_were_pending &&
+                !(!committed_read_extents_.contains(inode_ref.object_id) &&
+                  !working_read_extents_.contains(inode_ref.object_id) &&
+                  HasPendingSpacemanAllocation(previous_physical, previous_size));
+            if (old_committed_extents_need_removal &&
+                !stage_committed_file_extents_for_removal(*inode))
             {
-                const auto released_pending_extent =
-                    !committed_read_extents_.contains(inode_ref.object_id) &&
-                    release_pending_spaceman_allocation(previous_physical, previous_size);
-                if (!released_pending_extent && !stage_committed_file_extents_for_removal(*inode))
+                return MutationStatus::AllocationFailed;
+            }
+            auto extents = allocate_file_extents(request.length);
+            if (!extents.has_value() || extents->empty())
+            {
+                return MutationStatus::AllocationFailed;
+            }
+            for (const auto& extent : extents.value())
+            {
+                if (!stage_spaceman_allocation(extent.physical_address, extent.bytes))
                 {
                     return MutationStatus::AllocationFailed;
                 }
             }
 
-            inode_ref.data_physical_address = *extent;
-            stage_extent_record(inode_ref.object_id, 0, inode_ref.data_physical_address, request.length, false);
+            if (previous_physical != 0 &&
+                previous_size > 0 &&
+                (extents->size() != 1 || previous_physical != extents->front().physical_address))
+            {
+                const auto released_pending_extent =
+                    old_extents_were_pending ||
+                    (!committed_read_extents_.contains(inode_ref.object_id) &&
+                     !working_read_extents_.contains(inode_ref.object_id) &&
+                     release_pending_spaceman_allocation(previous_physical, previous_size));
+                if (!released_pending_extent && !old_committed_extents_need_removal &&
+                    !stage_committed_file_extents_for_removal(*inode))
+                {
+                    return MutationStatus::AllocationFailed;
+                }
+            }
+
+            if (!stage_file_extents(inode_ref.object_id, extents.value()))
+            {
+                return MutationStatus::AllocationFailed;
+            }
+            inode_ref.data_physical_address = extents->front().physical_address;
         }
         inode_ref.logical_size = request.length;
         inode_ref.xid = target_xid;
@@ -5468,6 +5923,8 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
     ScopedPerfTimer perf_scope(commit_pending_perf_);
 
     last_commit_stage_ = "start";
+    last_commit_failure_reason_.clear();
+    last_commit_failure_object_id_.reset();
     const auto fail_commit = [this](CommitStatus status, std::string_view stage) -> CommitStatus
     {
         if (!stage.empty())
@@ -5680,11 +6137,67 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
             payload_bytes.resize(logical_size);
         }
 
-        pending_payload_writes.push_back(PendingPayloadWrite
+        std::vector<FileExtent> payload_extents;
+        if (auto pending_extents_it = pending_read_extent_updates_.find(inode->object_id);
+            pending_extents_it != pending_read_extent_updates_.end())
         {
-            inode->data_physical_address,
-            std::move(payload_bytes),
-        });
+            payload_extents = pending_extents_it->second;
+        }
+        else if (auto working_extents_it = working_read_extents_.find(inode->object_id);
+                 working_extents_it != working_read_extents_.end())
+        {
+            payload_extents = working_extents_it->second;
+        }
+        else if (auto committed_extents_it = committed_read_extents_.find(inode->object_id);
+                 committed_extents_it != committed_read_extents_.end())
+        {
+            payload_extents = committed_extents_it->second;
+        }
+        else
+        {
+            payload_extents.push_back(FileExtent{ 0, inode->data_physical_address, inode->logical_size });
+        }
+        payload_extents = SortFileExtents(std::move(payload_extents));
+        if (!HasLogicalExtentCoverage(payload_extents, inode->logical_size))
+        {
+            rollback_commit_extent_stage();
+            return fail_commit(CommitStatus::PersistFailed, "payload-extent-coverage-invalid");
+        }
+
+        for (const auto& extent : payload_extents)
+        {
+            if (extent.logical_offset >= inode->logical_size)
+            {
+                continue;
+            }
+
+            const auto logical_tail = inode->logical_size - extent.logical_offset;
+            const auto extent_logical_bytes = std::min(extent.bytes, logical_tail);
+            if (extent_logical_bytes == 0 ||
+                extent_logical_bytes > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
+                extent.logical_offset > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+            {
+                rollback_commit_extent_stage();
+                return fail_commit(CommitStatus::PersistFailed, "payload-extent-size-invalid");
+            }
+
+            const auto slice_offset = static_cast<std::size_t>(extent.logical_offset);
+            const auto slice_bytes = static_cast<std::size_t>(extent_logical_bytes);
+            if (slice_offset > payload_bytes.size() ||
+                slice_bytes > (payload_bytes.size() - slice_offset))
+            {
+                rollback_commit_extent_stage();
+                return fail_commit(CommitStatus::PersistFailed, "payload-extent-slice-invalid");
+            }
+
+            pending_payload_writes.push_back(PendingPayloadWrite
+            {
+                extent.physical_address,
+                std::vector<std::byte>(
+                    payload_bytes.begin() + static_cast<std::vector<std::byte>::difference_type>(slice_offset),
+                    payload_bytes.begin() + static_cast<std::vector<std::byte>::difference_type>(slice_offset + slice_bytes)),
+            });
+        }
     }
 
     if (!AllowCommitStage("before-device-write"))
@@ -5736,6 +6249,7 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
     auto committed_path_index_snapshot = committed_path_index_;
     auto committed_directory_links_snapshot = committed_directory_links_;
     auto committed_btree_snapshot = committed_btree_records_;
+    auto committed_read_extents_snapshot = committed_read_extents_;
     auto last_commit_blob_snapshot = last_commit_blob_address_;
     auto last_commit_blob_bytes_snapshot = last_commit_blob_bytes_;
     auto checkpoint_xid_snapshot = checkpoint_xid_;
@@ -5749,6 +6263,7 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         committed_path_index_ = committed_path_index_snapshot;
         committed_directory_links_ = committed_directory_links_snapshot;
         committed_btree_records_ = committed_btree_snapshot;
+        committed_read_extents_ = committed_read_extents_snapshot;
         last_commit_blob_address_ = last_commit_blob_snapshot;
         last_commit_blob_bytes_ = last_commit_blob_bytes_snapshot;
         checkpoint_xid_ = checkpoint_xid_snapshot;
@@ -5766,7 +6281,18 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         {
             committed_object_map_.erase(update.object_id);
         }
-        committed_read_extents_.erase(update.object_id);
+        if (auto pending_extents = pending_read_extent_updates_.find(update.object_id);
+            pending_extents != pending_read_extent_updates_.end())
+        {
+            committed_read_extents_[update.object_id] = pending_extents->second;
+        }
+        else
+        {
+            if (committed_object_map_.contains(update.object_id))
+            {
+                committed_read_extents_.erase(update.object_id);
+            }
+        }
     }
     committed_spaceman_allocations_.insert(
         committed_spaceman_allocations_.end(),
@@ -5851,6 +6377,7 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
     last_committed_xid_ = target_xid;
     last_commit_blob_address_ = *commit_extent;
     last_commit_blob_bytes_ = commit_blob_persist_bytes;
+    const auto verify_commit_roundtrips = commit_stage_hook_ || IsStrictCommitVerificationEnabled();
     const auto read_chunked_checkpoint_roundtrip_candidate =
         [&](const std::vector<std::uint64_t>& checkpoint_blocks,
             std::size_t required_blocks) -> std::optional<std::pair<std::uint64_t, std::vector<std::byte>>>
@@ -6356,7 +6883,7 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         MarkRecoveryRequired(L"CommitObjectMapPersistFailed");
         return CommitStatus::PersistFailed;
     }
-    if (!verify_object_map_checkpoint_roundtrip())
+    if (verify_commit_roundtrips && !verify_object_map_checkpoint_roundtrip())
     {
         MarkRecoveryRequired(L"CommitObjectMapRoundTripFailed");
         return CommitStatus::PersistFailed;
@@ -6372,7 +6899,7 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         MarkRecoveryRequired(L"CommitSpacemanPersistFailed");
         return CommitStatus::PersistFailed;
     }
-    if (!verify_spaceman_checkpoint_roundtrip())
+    if (verify_commit_roundtrips && !verify_spaceman_checkpoint_roundtrip())
     {
         MarkRecoveryRequired(L"CommitSpacemanRoundTripFailed");
         return CommitStatus::PersistFailed;
@@ -6388,7 +6915,7 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         MarkRecoveryRequired(L"CommitInodePersistFailed");
         return CommitStatus::PersistFailed;
     }
-    if (!verify_inode_checkpoint_roundtrip())
+    if (verify_commit_roundtrips && !verify_inode_checkpoint_roundtrip())
     {
         MarkRecoveryRequired(L"CommitInodeRoundTripFailed");
         return CommitStatus::PersistFailed;
@@ -6404,7 +6931,7 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         MarkRecoveryRequired(L"CommitBtreePersistFailed");
         return CommitStatus::PersistFailed;
     }
-    if (!verify_btree_checkpoint_roundtrip())
+    if (verify_commit_roundtrips && !verify_btree_checkpoint_roundtrip())
     {
         MarkRecoveryRequired(L"CommitBtreeRoundTripFailed");
         return CommitStatus::PersistFailed;
@@ -6420,12 +6947,12 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         MarkRecoveryRequired(L"CommitReplayPersistFailed");
         return CommitStatus::PersistFailed;
     }
-    if (!AllowCommitStage("before-replay-roundtrip-verify"))
+    if (verify_commit_roundtrips && !AllowCommitStage("before-replay-roundtrip-verify"))
     {
         MarkRecoveryRequired(L"CommitInterruptedBeforeReplayRoundTripVerify");
         return CommitStatus::PersistFailed;
     }
-    if (!verify_replay_checkpoint_roundtrip())
+    if (verify_commit_roundtrips && !verify_replay_checkpoint_roundtrip())
     {
         MarkRecoveryRequired(L"CommitReplayRoundTripFailed");
         return CommitStatus::PersistFailed;
@@ -6468,12 +6995,12 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         MarkRecoveryRequired(L"CommitCheckpointWriteFailed");
         return CommitStatus::PersistFailed;
     }
-    if (!AllowCommitStage("before-checkpoint-roundtrip-verify"))
+    if (verify_commit_roundtrips && !AllowCommitStage("before-checkpoint-roundtrip-verify"))
     {
         MarkRecoveryRequired(L"CommitInterruptedBeforeCheckpointRoundTripVerify");
         return CommitStatus::PersistFailed;
     }
-    if (!verify_superblock_checkpoint_roundtrip())
+    if (verify_commit_roundtrips && !verify_superblock_checkpoint_roundtrip())
     {
         MarkRecoveryRequired(L"CommitCheckpointRoundTripFailed");
         return CommitStatus::PersistFailed;
@@ -6495,6 +7022,7 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
     pending_spaceman_allocations_.clear();
     pending_spaceman_deallocations_.clear();
     pending_btree_records_.clear();
+    pending_read_extent_updates_.clear();
     canonical_commit_ready_ = CanReportCanonicalCommitReady(
         canonical_state_loaded_,
         commit_path_ready_,
@@ -7147,7 +7675,7 @@ bool MetadataStore::ReplayOrRecover()
 
         auto canonical_blob_btree_records = CanonicalizeBtreeRecords(parsed_btree_records);
         std::unordered_map<std::uint64_t, DecodedBtreeInode> parsed_inodes_by_object;
-        std::unordered_map<std::uint64_t, DecodedBtreeExtent> parsed_extents_by_object;
+        std::unordered_map<std::uint64_t, std::vector<DecodedBtreeExtent>> parsed_extents_by_object;
         std::unordered_map<std::wstring, DecodedBtreeDirectoryEntry> canonical_directory_entries_by_key;
         std::unordered_map<std::uint64_t, RawInodeMutationState> raw_inode_mutations_by_object;
         parsed_inodes_by_object.reserve(canonical_blob_btree_records.size());
@@ -7446,12 +7974,11 @@ bool MetadataStore::ReplayOrRecover()
             case BtreeRecordKind::FileExtent:
             {
                 DecodedBtreeExtent decoded{};
-                if (!DecodeBtreeExtentRecord(record, decoded) ||
-                    decoded.logical_offset != 0 ||
-                    !parsed_extents_by_object.emplace(decoded.object_id, std::move(decoded)).second)
+                if (!DecodeBtreeExtentRecord(record, decoded))
                 {
                     return fail_recovery(L"ReplayCommitBlobInvalid");
                 }
+                parsed_extents_by_object[decoded.object_id].push_back(std::move(decoded));
                 break;
             }
             case BtreeRecordKind::DirectoryEntry:
@@ -7547,21 +8074,33 @@ bool MetadataStore::ReplayOrRecover()
                 }
                 continue;
             }
-            if (extent_it == parsed_extents_by_object.end() ||
-                extent_it->second.physical_address != inode.data_physical_address ||
-                extent_it->second.extent_bytes != inode.logical_size)
+            if (extent_it == parsed_extents_by_object.end())
+            {
+                return fail_recovery(L"ReplayCommitBlobInvalid");
+            }
+            const auto file_extents = ExtentsFromDecodedBtreeExtents(extent_it->second);
+            if (!HasLogicalExtentCoverage(file_extents, inode.logical_size) ||
+                file_extents.empty() ||
+                file_extents.front().logical_offset != 0 ||
+                file_extents.front().physical_address != inode.data_physical_address)
             {
                 return fail_recovery(L"ReplayCommitBlobInvalid");
             }
         }
 
-        for (const auto& [object_id, extent] : parsed_extents_by_object)
+        for (const auto& [object_id, extents] : parsed_extents_by_object)
         {
             auto inode_it = parsed_inodes_by_object.find(object_id);
             if (inode_it == parsed_inodes_by_object.end() ||
-                inode_it->second.is_directory ||
-                inode_it->second.logical_size != extent.extent_bytes ||
-                inode_it->second.data_physical_address != extent.physical_address)
+                inode_it->second.is_directory)
+            {
+                return fail_recovery(L"ReplayCommitBlobInvalid");
+            }
+            const auto file_extents = ExtentsFromDecodedBtreeExtents(extents);
+            if (!HasLogicalExtentCoverage(file_extents, inode_it->second.logical_size) ||
+                file_extents.empty() ||
+                file_extents.front().logical_offset != 0 ||
+                file_extents.front().physical_address != inode_it->second.data_physical_address)
             {
                 return fail_recovery(L"ReplayCommitBlobInvalid");
             }
@@ -8125,6 +8664,30 @@ bool MetadataStore::VerifyIntegrity() const
         committed_inodes_.size() +
         committed_directory_links_.size() +
         committed_inodes_.size());
+    const auto committed_btree_extents_for_inode = [this](const InodeRecord& inode) -> std::optional<std::vector<FileExtent>>
+    {
+        if (inode.is_directory ||
+            inode.logical_size == 0 ||
+            inode.data_physical_address == 0)
+        {
+            return std::nullopt;
+        }
+
+        if (auto extents_it = committed_read_extents_.find(inode.object_id);
+            extents_it != committed_read_extents_.end())
+        {
+            auto extents = SortFileExtents(extents_it->second);
+            if (HasLogicalExtentCoverage(extents, inode.logical_size) &&
+                !extents.empty() &&
+                extents.front().logical_offset == 0 &&
+                extents.front().physical_address == inode.data_physical_address)
+            {
+                return extents;
+            }
+        }
+
+        return std::vector<FileExtent>{ FileExtent{ 0, inode.data_physical_address, inode.logical_size } };
+    };
 
     for (const auto& [object_id, inode] : committed_inodes_)
     {
@@ -8151,21 +8714,27 @@ bool MetadataStore::VerifyIntegrity() const
         }
 
         if (!inode.is_directory &&
-            inode.logical_size > 0 &&
-            inode.data_physical_address != 0)
+            inode.logical_size > 0)
         {
-            auto extent_key_record = BtreeMutationCodec::EncodeExtentRecord(
-                object_id,
-                0,
-                inode.data_physical_address,
-                inode.logical_size,
-                xid_upper_bound,
-                false);
-            auto extent_key = BuildBtreeKeyBlob(extent_key_record.key);
-            if (extent_key.empty() || !expected_btree_keys.insert(std::move(extent_key)).second)
+            if (auto expected_extents = committed_btree_extents_for_inode(inode);
+                expected_extents.has_value())
             {
-                RecordIntegrityFailure(L"ExpectedBtreeExtentDuplicate", object_id);
-                return false;
+                for (const auto& extent : expected_extents.value())
+                {
+                    auto extent_key_record = BtreeMutationCodec::EncodeExtentRecord(
+                        object_id,
+                        extent.logical_offset,
+                        extent.physical_address,
+                        extent.bytes,
+                        xid_upper_bound,
+                        false);
+                    auto extent_key = BuildBtreeKeyBlob(extent_key_record.key);
+                    if (extent_key.empty() || !expected_btree_keys.insert(std::move(extent_key)).second)
+                    {
+                        RecordIntegrityFailure(L"ExpectedBtreeExtentDuplicate", object_id);
+                        return false;
+                    }
+                }
             }
         }
     }
@@ -8202,7 +8771,7 @@ bool MetadataStore::VerifyIntegrity() const
 
     std::unordered_map<std::uint64_t, DecodedBtreeInode> decoded_inodes_by_object;
     std::unordered_map<std::wstring, DecodedBtreeDirectoryEntry> decoded_directory_entries;
-    std::unordered_map<std::uint64_t, DecodedBtreeExtent> decoded_extents_by_object;
+    std::unordered_map<std::uint64_t, std::vector<DecodedBtreeExtent>> decoded_extents_by_object;
     decoded_inodes_by_object.reserve(committed_btree_records_.size());
     decoded_directory_entries.reserve(committed_btree_records_.size());
     decoded_extents_by_object.reserve(committed_btree_records_.size());
@@ -8248,15 +8817,7 @@ bool MetadataStore::VerifyIntegrity() const
                 RecordIntegrityFailure(L"DecodeExtent");
                 return false;
             }
-            if (decoded.logical_offset != 0)
-            {
-                RecordIntegrityFailure(L"ExtentOffset", decoded.object_id);
-                return false;
-            }
-            if (!decoded_extents_by_object.emplace(decoded.object_id, std::move(decoded)).second)
-            {
-                return false;
-            }
+            decoded_extents_by_object[decoded.object_id].push_back(std::move(decoded));
             break;
         }
         default:
@@ -8344,17 +8905,29 @@ bool MetadataStore::VerifyIntegrity() const
                 RecordIntegrityFailure(L"MissingExtentRecord", object_id);
                 return false;
             }
-            const auto& extent = extent_it->second;
-            const auto has_read_extent_projection = committed_read_extents_.contains(object_id);
-            if ((!relax_physical_read_projection &&
-                 !has_read_extent_projection &&
-                 (extent.physical_address != inode.data_physical_address ||
-                  extent.extent_bytes != inode.logical_size)) ||
-                extent.xid == 0 ||
-                extent.xid > xid_upper_bound)
+            if (!relax_physical_read_projection)
             {
-                RecordIntegrityFailure(L"ExtentMismatch", object_id);
-                return false;
+                if (auto expected_extents = committed_btree_extents_for_inode(inode);
+                    expected_extents.has_value())
+                {
+                    if (!ExtentsMatchDecodedBtreeExtents(
+                            expected_extents.value(),
+                            extent_it->second,
+                            inode.logical_size,
+                            inode.data_physical_address,
+                            xid_upper_bound))
+                    {
+                        TraceExtentMismatchDetail(
+                            object_id,
+                            expected_extents.value(),
+                            extent_it->second,
+                            inode.logical_size,
+                            inode.data_physical_address,
+                            xid_upper_bound);
+                        RecordIntegrityFailure(L"ExtentMismatch", object_id);
+                        return false;
+                    }
+                }
             }
 
             auto mapped = committed_object_map_.find(object_id);
@@ -8363,12 +8936,11 @@ bool MetadataStore::VerifyIntegrity() const
                 RecordIntegrityFailure(L"MissingObjectMap", object_id);
                 return false;
             }
-            if (mapped->second.xid == 0 ||
-                mapped->second.xid > xid_upper_bound ||
+        if (mapped->second.xid == 0 ||
+            mapped->second.xid > xid_upper_bound ||
                 (!relax_physical_read_projection &&
-                 !has_read_extent_projection &&
-                 (mapped->second.physical_address != extent.physical_address ||
-                  mapped->second.logical_size != extent.extent_bytes)))
+                 (mapped->second.physical_address != inode.data_physical_address ||
+                  mapped->second.logical_size != inode.logical_size)))
             {
                 RecordIntegrityFailure(L"ObjectMapMismatch", object_id);
                 return false;
@@ -8711,6 +9283,7 @@ bool MetadataStore::SetCommittedReadExtents(std::uint64_t object_id, std::vector
     if (extents.empty())
     {
         committed_read_extents_[object_id] = {};
+        working_read_extents_[object_id] = {};
         return true;
     }
 
@@ -8761,12 +9334,66 @@ bool MetadataStore::SetCommittedReadExtents(std::uint64_t object_id, std::vector
     if (normalized.empty())
     {
         committed_read_extents_[object_id] = {};
+        working_read_extents_[object_id] = {};
     }
     else
     {
         committed_read_extents_[object_id] = std::move(normalized);
+        working_read_extents_[object_id] = committed_read_extents_[object_id];
     }
     return true;
+}
+
+bool MetadataStore::DebugMergeNativeProjectionReadExtents(std::uint64_t object_id, std::vector<FileExtent> extents)
+{
+    if (object_id == 0)
+    {
+        return false;
+    }
+
+    auto inode_it = committed_inodes_.find(object_id);
+    if (inode_it != committed_inodes_.end() &&
+        !inode_it->second.is_directory &&
+        inode_it->second.logical_size > 0)
+    {
+        std::vector<DecodedBtreeExtent> decoded_btree_extents;
+        for (const auto& record : committed_btree_records_)
+        {
+            if (record.tombstone || record.kind != BtreeRecordKind::FileExtent)
+            {
+                continue;
+            }
+
+            DecodedBtreeExtent decoded{};
+            if (!DecodeBtreeExtentRecord(record, decoded))
+            {
+                continue;
+            }
+            if (decoded.object_id == object_id)
+            {
+                decoded_btree_extents.push_back(std::move(decoded));
+            }
+        }
+
+        if (!decoded_btree_extents.empty())
+        {
+            auto canonical_extents = ExtentsFromDecodedBtreeExtents(decoded_btree_extents);
+            if (HasLogicalExtentCoverage(canonical_extents, inode_it->second.logical_size) &&
+                !canonical_extents.empty() &&
+                canonical_extents.front().logical_offset == 0 &&
+                canonical_extents.front().physical_address == inode_it->second.data_physical_address)
+            {
+                auto candidate = SortFileExtents(extents);
+                if (HasLogicalExtentCoverage(candidate, inode_it->second.logical_size) &&
+                    !FileExtentsEqual(canonical_extents, candidate))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return SetCommittedReadExtents(object_id, std::move(extents));
 }
 
 bool ExtentEndsBeforeOrAt(const MetadataStore::FileExtent& extent, std::uint64_t logical_offset)
@@ -9019,6 +9646,148 @@ std::optional<std::uint64_t> MetadataStore::AllocateExtent(std::uint64_t bytes)
 
     working_next_ephemeral_extent_ = allocation_end;
     return current;
+}
+
+std::optional<std::vector<MetadataStore::FileExtent>> MetadataStore::AllocateFileExtents(std::uint64_t logical_size)
+{
+    if (!container_loaded_ || !spaceman_loaded_)
+    {
+        return std::nullopt;
+    }
+    if (logical_size == 0)
+    {
+        return std::vector<FileExtent>{};
+    }
+
+    const auto aligned_total = AlignExtentBytes(logical_size);
+    if (aligned_total == 0)
+    {
+        return std::nullopt;
+    }
+
+    std::optional<std::uint64_t> container_bytes;
+    if (total_blocks_ != 0)
+    {
+        if (block_size_ == 0 ||
+            total_blocks_ > (std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(block_size_)))
+        {
+            return std::nullopt;
+        }
+        container_bytes = total_blocks_ * static_cast<std::uint64_t>(block_size_);
+    }
+
+    const auto is_usable_extent = [&](const SpacemanAllocation& extent, std::uint64_t bytes)
+    {
+        if (extent.bytes < bytes ||
+            extent.physical_address > (std::numeric_limits<std::uint64_t>::max() - bytes))
+        {
+            return false;
+        }
+        if (container_bytes.has_value() && (extent.physical_address + bytes) > container_bytes.value())
+        {
+            return false;
+        }
+        return !ExtentOverlapsReservedMetadata(extent.physical_address, bytes);
+    };
+
+    for (auto it = working_spaceman_free_extents_.begin(); it != working_spaceman_free_extents_.end(); ++it)
+    {
+        if (!is_usable_extent(*it, aligned_total))
+        {
+            continue;
+        }
+
+        const auto physical_address = it->physical_address;
+        it->physical_address += aligned_total;
+        it->bytes -= aligned_total;
+        if (it->bytes == 0)
+        {
+            working_spaceman_free_extents_.erase(it);
+        }
+        return std::vector<FileExtent>{ FileExtent{ 0, physical_address, logical_size } };
+    }
+
+    std::uint64_t available_fragmented_bytes = 0;
+    for (const auto& extent : working_spaceman_free_extents_)
+    {
+        if (extent.bytes == 0 ||
+            extent.physical_address > (std::numeric_limits<std::uint64_t>::max() - extent.bytes) ||
+            (container_bytes.has_value() && (extent.physical_address + extent.bytes) > container_bytes.value()) ||
+            ExtentOverlapsReservedMetadata(extent.physical_address, extent.bytes))
+        {
+            continue;
+        }
+        if (available_fragmented_bytes > (std::numeric_limits<std::uint64_t>::max() - extent.bytes))
+        {
+            return std::nullopt;
+        }
+        available_fragmented_bytes += extent.bytes;
+        if (available_fragmented_bytes >= aligned_total)
+        {
+            break;
+        }
+    }
+
+    if (available_fragmented_bytes >= aligned_total)
+    {
+        std::vector<FileExtent> file_extents;
+        std::uint64_t remaining_logical = logical_size;
+        std::uint64_t logical_offset = 0;
+
+        for (auto it = working_spaceman_free_extents_.begin();
+             it != working_spaceman_free_extents_.end() && remaining_logical > 0;)
+        {
+            if (it->bytes == 0 ||
+                it->physical_address > (std::numeric_limits<std::uint64_t>::max() - it->bytes) ||
+                (container_bytes.has_value() && (it->physical_address + it->bytes) > container_bytes.value()) ||
+                ExtentOverlapsReservedMetadata(it->physical_address, it->bytes))
+            {
+                ++it;
+                continue;
+            }
+
+            const auto remaining_aligned = AlignExtentBytes(remaining_logical);
+            if (remaining_aligned == 0)
+            {
+                return std::nullopt;
+            }
+            const auto allocation_bytes = std::min(it->bytes, remaining_aligned);
+            const auto logical_bytes = std::min(remaining_logical, allocation_bytes);
+            if (logical_bytes == 0)
+            {
+                return std::nullopt;
+            }
+
+            const auto physical_address = it->physical_address;
+            file_extents.push_back(FileExtent{ logical_offset, physical_address, logical_bytes });
+            logical_offset += logical_bytes;
+            remaining_logical -= logical_bytes;
+
+            it->physical_address += allocation_bytes;
+            it->bytes -= allocation_bytes;
+            if (it->bytes == 0)
+            {
+                it = working_spaceman_free_extents_.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+
+        if (remaining_logical == 0 && HasLogicalExtentCoverage(file_extents, logical_size))
+        {
+            return file_extents;
+        }
+        return std::nullopt;
+    }
+
+    auto extent = AllocateExtent(logical_size);
+    if (!extent.has_value())
+    {
+        return std::nullopt;
+    }
+    return std::vector<FileExtent>{ FileExtent{ 0, *extent, logical_size } };
 }
 
 bool MetadataStore::FreeExtent(std::uint64_t physical_address, std::uint64_t bytes)
@@ -10353,7 +11122,7 @@ void MetadataStore::CoalescePendingBtreeFileMetadata(std::uint64_t object_id)
     };
 
     bool kept_inode = false;
-    bool kept_extent = false;
+    std::unordered_set<std::uint64_t> kept_extent_offsets;
     for (auto it = pending_btree_records_.rbegin(); it != pending_btree_records_.rend();)
     {
         if (!is_live_file_metadata_for_object(*it))
@@ -10362,9 +11131,18 @@ void MetadataStore::CoalescePendingBtreeFileMetadata(std::uint64_t object_id)
             continue;
         }
 
-        const auto keep =
-            (it->kind == BtreeRecordKind::Inode && !std::exchange(kept_inode, true)) ||
-            (it->kind == BtreeRecordKind::FileExtent && !std::exchange(kept_extent, true));
+        bool keep = false;
+        if (it->kind == BtreeRecordKind::Inode)
+        {
+            keep = !std::exchange(kept_inode, true);
+        }
+        else if (it->kind == BtreeRecordKind::FileExtent)
+        {
+            DecodedBtreeExtent decoded{};
+            keep = DecodeBtreeExtentRecord(*it, decoded) &&
+                   kept_extent_offsets.insert(decoded.logical_offset).second;
+        }
+
         if (keep)
         {
             ++it;
@@ -11001,9 +11779,13 @@ bool MetadataStore::ValidateReplayCommitBlobCandidate(
 
 bool MetadataStore::ValidatePendingCommitState() const
 {
-    const auto fail_pending = [](std::wstring_view reason, std::uint64_t object_id = 0) -> bool
+    const auto fail_pending = [this](std::wstring_view reason, std::uint64_t object_id = 0) -> bool
     {
         TracePendingCommitFailure(reason, object_id);
+        last_commit_failure_reason_.assign(reason);
+        last_commit_failure_object_id_ = object_id == 0
+            ? std::nullopt
+            : std::optional<std::uint64_t>(object_id);
         return false;
     };
 
@@ -11161,6 +11943,7 @@ bool MetadataStore::ValidatePendingCommitState() const
     };
 
     std::unordered_map<std::uint64_t, ObjectMapUpdate> effective_object_map = committed_object_map_;
+    auto effective_read_extents = committed_read_extents_;
 
     for (const auto& update : pending_object_map_updates_)
     {
@@ -11176,8 +11959,87 @@ bool MetadataStore::ValidatePendingCommitState() const
         else
         {
             effective_object_map.erase(update.object_id);
+            effective_read_extents.erase(update.object_id);
         }
     }
+    for (const auto& [object_id, extents] : pending_read_extent_updates_)
+    {
+        if (extents.empty())
+        {
+            effective_read_extents.erase(object_id);
+        }
+        else
+        {
+            effective_read_extents[object_id] = SortFileExtents(extents);
+        }
+    }
+    const auto canonical_extents_for_inode = [&](const InodeRecord& inode) -> std::optional<std::vector<FileExtent>>
+    {
+        if (inode.is_directory ||
+            inode.logical_size == 0 ||
+            inode.data_physical_address == 0)
+        {
+            return std::nullopt;
+        }
+
+        const auto extents_it = effective_read_extents.find(inode.object_id);
+        if (extents_it == effective_read_extents.end())
+        {
+            return std::vector<FileExtent>{ FileExtent{ 0, inode.data_physical_address, inode.logical_size } };
+        }
+
+        auto extents = SortFileExtents(extents_it->second);
+        const auto has_pending_extent_update = pending_read_extent_updates_.contains(inode.object_id);
+        if (HasLogicalExtentCoverage(extents, inode.logical_size) &&
+            !extents.empty() &&
+            extents.front().logical_offset == 0 &&
+            extents.front().physical_address == inode.data_physical_address)
+        {
+            return extents;
+        }
+
+        if (has_pending_extent_update)
+        {
+            return std::nullopt;
+        }
+
+        return std::vector<FileExtent>{ FileExtent{ 0, inode.data_physical_address, inode.logical_size } };
+    };
+    const auto has_projection_only_read_coverage = [&](const InodeRecord& inode) -> bool
+    {
+        if (inode.is_directory ||
+            inode.logical_size == 0 ||
+            inode.data_physical_address != 0)
+        {
+            return false;
+        }
+
+        const auto extents_it = effective_read_extents.find(inode.object_id);
+        if (extents_it == effective_read_extents.end())
+        {
+            return false;
+        }
+
+        auto extents = SortFileExtents(extents_it->second);
+        std::uint64_t covered_until = 0;
+        for (const auto& extent : extents)
+        {
+            if (extent.bytes == 0 ||
+                extent.logical_offset != covered_until ||
+                extent.logical_offset > (std::numeric_limits<std::uint64_t>::max() - extent.bytes))
+            {
+                return false;
+            }
+
+            covered_until = extent.logical_offset + extent.bytes;
+            if (covered_until >= inode.logical_size)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    };
 
     std::vector<ApfsObjectMapEntry> effective_object_entries;
     effective_object_entries.reserve(effective_object_map.size());
@@ -11264,13 +12126,22 @@ bool MetadataStore::ValidatePendingCommitState() const
         {
             return fail_pending(L"LiveExtentObjectMapMismatch", object_id);
         }
-        if (!has_allocation_for_physical(inode.data_physical_address, inode.logical_size) &&
-            !has_recovered_extent_coverage(inode.data_physical_address, inode.logical_size))
+        auto live_extents = canonical_extents_for_inode(inode);
+        if (!live_extents.has_value())
         {
-            return fail_pending(L"LiveExtentMissingAllocation", object_id);
+            return fail_pending(L"LiveExtentCoverageInvalid", object_id);
         }
 
-        live_extent_addresses.insert(inode.data_physical_address);
+        for (const auto& extent : live_extents.value())
+        {
+            if (!has_allocation_for_physical(extent.physical_address, extent.bytes) &&
+                !has_recovered_extent_coverage(extent.physical_address, extent.bytes))
+            {
+                return fail_pending(L"LiveExtentMissingAllocation", object_id);
+            }
+
+            live_extent_addresses.insert(extent.physical_address);
+        }
     }
 
     for (const auto& entry : effective_object_map)
@@ -11293,10 +12164,21 @@ bool MetadataStore::ValidatePendingCommitState() const
                 return fail_pending(L"ObjectMapMissingCommittedAllocation", update.object_id);
             }
         }
-        else if (!has_pending_allocation_for_physical(update.physical_address, update.logical_size) &&
-                 !has_recovered_extent_coverage(update.physical_address, update.logical_size))
+        else
         {
-            return fail_pending(L"ObjectMapMissingAllocation", update.object_id);
+            auto inode_it = working_inodes_.find(update.object_id);
+            const auto read_extents_cover_update =
+                inode_it != working_inodes_.end() &&
+                !inode_it->second.is_directory &&
+                inode_it->second.logical_size == update.logical_size &&
+                inode_it->second.data_physical_address == update.physical_address &&
+                canonical_extents_for_inode(inode_it->second).has_value();
+            if (!read_extents_cover_update &&
+                !has_pending_allocation_for_physical(update.physical_address, update.logical_size) &&
+                !has_recovered_extent_coverage(update.physical_address, update.logical_size))
+            {
+                return fail_pending(L"ObjectMapMissingAllocation", update.object_id);
+            }
         }
     }
 
@@ -11435,10 +12317,13 @@ bool MetadataStore::ValidatePendingCommitState() const
 
         ++expected_non_root_inode_count;
         if (!inode.is_directory &&
-            inode.logical_size > 0 &&
-            inode.data_physical_address != 0)
+            inode.logical_size > 0)
         {
-            ++expected_extent_count;
+            if (auto canonical_extents = canonical_extents_for_inode(inode);
+                canonical_extents.has_value())
+            {
+                expected_extent_count += canonical_extents->size();
+            }
         }
     }
 
@@ -11512,20 +12397,32 @@ bool MetadataStore::ValidatePendingCommitState() const
         }
 
         if (!inode.is_directory &&
-            inode.logical_size > 0 &&
-            inode.data_physical_address != 0)
+            inode.logical_size > 0)
         {
-            auto extent_key_record = BtreeMutationCodec::EncodeExtentRecord(
-                object_id,
-                0,
-                inode.data_physical_address,
-                inode.logical_size,
-                target_xid,
-                false);
-            auto extent_key = BuildBtreeKeyBlob(extent_key_record.key);
-            if (extent_key.empty() || !expected_btree_keys.insert(std::move(extent_key)).second)
+            auto expected_extents = canonical_extents_for_inode(inode);
+            if (!expected_extents.has_value())
             {
-                return fail_pending(L"ExpectedBtreeExtentDuplicate", object_id);
+                if (has_projection_only_read_coverage(inode))
+                {
+                    continue;
+                }
+                return fail_pending(L"ExpectedBtreeExtentCoverage", object_id);
+            }
+
+            for (const auto& extent : expected_extents.value())
+            {
+                auto extent_key_record = BtreeMutationCodec::EncodeExtentRecord(
+                    object_id,
+                    extent.logical_offset,
+                    extent.physical_address,
+                    extent.bytes,
+                    target_xid,
+                    false);
+                auto extent_key = BuildBtreeKeyBlob(extent_key_record.key);
+                if (extent_key.empty() || !expected_btree_keys.insert(std::move(extent_key)).second)
+                {
+                    return fail_pending(L"ExpectedBtreeExtentDuplicate", object_id);
+                }
             }
         }
     }
@@ -11559,7 +12456,7 @@ bool MetadataStore::ValidatePendingCommitState() const
 
     std::unordered_map<std::uint64_t, DecodedBtreeInode> decoded_inodes_by_object;
     std::unordered_map<std::wstring, DecodedBtreeDirectoryEntry> decoded_directory_entries;
-    std::unordered_map<std::uint64_t, DecodedBtreeExtent> decoded_extents_by_object;
+    std::unordered_map<std::uint64_t, std::vector<DecodedBtreeExtent>> decoded_extents_by_object;
     decoded_inodes_by_object.reserve(projected_btree_records.size());
     decoded_directory_entries.reserve(projected_btree_records.size());
     decoded_extents_by_object.reserve(projected_btree_records.size());
@@ -11607,14 +12504,7 @@ bool MetadataStore::ValidatePendingCommitState() const
             {
                 return fail_pending(L"ProjectedBtreeDecodeExtent");
             }
-            if (decoded.logical_offset != 0)
-            {
-                return fail_pending(L"ProjectedBtreeExtentOffset", decoded.object_id);
-            }
-            if (!decoded_extents_by_object.emplace(decoded.object_id, std::move(decoded)).second)
-            {
-                return fail_pending(L"ProjectedBtreeDuplicateExtent", decoded.object_id);
-            }
+            decoded_extents_by_object[decoded.object_id].push_back(std::move(decoded));
             break;
         }
         default:
@@ -11662,29 +12552,54 @@ bool MetadataStore::ValidatePendingCommitState() const
             return fail_pending(L"ProjectedBtreeDecodedParentNotDirectory", object_id);
         }
 
-        if (inode.is_directory || inode.logical_size == 0 || inode.data_physical_address == 0)
+        if (inode.is_directory || inode.logical_size == 0)
         {
             if (decoded_extents_by_object.contains(object_id) ||
                 (!inode.is_directory &&
                  inode.logical_size > 0 &&
                  inode.data_physical_address == 0 &&
-                 !committed_read_extents_.contains(object_id)))
+                 !effective_read_extents.contains(object_id)))
             {
                 return fail_pending(L"ProjectedBtreeUnexpectedOrMissingExtent", object_id);
             }
         }
         else
         {
+            if (has_projection_only_read_coverage(inode))
+            {
+                if (decoded_extents_by_object.contains(object_id))
+                {
+                    return fail_pending(L"ProjectedBtreeUnexpectedProjectionExtent", object_id);
+                }
+                continue;
+            }
+
             auto extent_it = decoded_extents_by_object.find(object_id);
             if (extent_it == decoded_extents_by_object.end())
             {
                 return fail_pending(L"ProjectedBtreeMissingExtent", object_id);
             }
-            const auto& extent = extent_it->second;
-            if (extent.physical_address != inode.data_physical_address ||
-                extent.extent_bytes != inode.logical_size ||
-                extent.xid == 0 ||
-                extent.xid > target_xid)
+            if (auto canonical_extents = canonical_extents_for_inode(inode);
+                canonical_extents.has_value())
+            {
+                if (!ExtentsMatchDecodedBtreeExtents(
+                    canonical_extents.value(),
+                    extent_it->second,
+                    inode.logical_size,
+                    inode.data_physical_address,
+                    target_xid))
+                {
+                    TraceExtentMismatchDetail(
+                        object_id,
+                        canonical_extents.value(),
+                        extent_it->second,
+                        inode.logical_size,
+                        inode.data_physical_address,
+                        target_xid);
+                    return fail_pending(L"ProjectedBtreeExtentMismatch", object_id);
+                }
+            }
+            else
             {
                 return fail_pending(L"ProjectedBtreeExtentMismatch", object_id);
             }
@@ -11694,8 +12609,8 @@ bool MetadataStore::ValidatePendingCommitState() const
             {
                 return fail_pending(L"ProjectedBtreeMissingObjectMap", object_id);
             }
-            if (mapped->second.physical_address != extent.physical_address ||
-                mapped->second.logical_size != extent.extent_bytes)
+            if (mapped->second.physical_address != inode.data_physical_address ||
+                mapped->second.logical_size != inode.logical_size)
             {
                 return fail_pending(L"ProjectedBtreeObjectMapMismatch", object_id);
             }
@@ -12366,6 +13281,14 @@ bool MetadataStore::LoadPersistentState()
         disk_loaded_inodes = std::move(rebuilt_inodes);
         disk_loaded_path_index = std::move(rebuilt_path_index);
         disk_loaded_directory_links = std::move(rebuilt_directory_links);
+        std::unordered_map<std::uint64_t, std::vector<FileExtent>> rebuilt_read_extents;
+        if (RebuildReadExtentsFromBtreeRecords(
+                disk_loaded_btree_checkpoint_records,
+                disk_loaded_inodes,
+                rebuilt_read_extents))
+        {
+            committed_read_extents_ = std::move(rebuilt_read_extents);
+        }
         if (disk_loaded_btree_last_committed_xid.has_value())
         {
             disk_loaded_inode_last_committed_xid = std::max(
@@ -13291,6 +14214,17 @@ bool MetadataStore::LoadPersistentState()
         committed_inodes_ = disk_loaded_inodes;
         committed_path_index_ = disk_loaded_path_index;
         committed_directory_links_ = disk_loaded_directory_links;
+        if (!committed_btree_records_.empty())
+        {
+            std::unordered_map<std::uint64_t, std::vector<FileExtent>> btree_read_extents;
+            if (RebuildReadExtentsFromBtreeRecords(
+                    committed_btree_records_,
+                    committed_inodes_,
+                    btree_read_extents))
+            {
+                committed_read_extents_ = std::move(btree_read_extents);
+            }
+        }
         next_ephemeral_extent_ = std::max(next_ephemeral_extent_, disk_loaded_next_extent);
         last_commit_blob_address_.reset();
         last_commit_blob_bytes_.reset();
@@ -13317,6 +14251,8 @@ bool MetadataStore::LoadPersistentState()
         working_path_index_ = committed_path_index_;
         working_directory_links_ = committed_directory_links_;
         working_spaceman_free_extents_ = committed_spaceman_free_extents_;
+        working_read_extents_ = committed_read_extents_;
+        pending_read_extent_updates_.clear();
         working_next_ephemeral_extent_ = next_ephemeral_extent_;
         RebuildWorkingDirectoryIndexes();
         bool persistent_state_file_present = false;
@@ -13799,6 +14735,17 @@ bool MetadataStore::LoadPersistentState()
             committed_btree_records_.push_back(std::move(record));
         }
         committed_btree_records_ = CanonicalizeBtreeRecords(committed_btree_records_);
+        if (!committed_btree_records_.empty())
+        {
+            std::unordered_map<std::uint64_t, std::vector<FileExtent>> btree_read_extents;
+            if (RebuildReadExtentsFromBtreeRecords(
+                    committed_btree_records_,
+                    committed_inodes_,
+                    btree_read_extents))
+            {
+                committed_read_extents_ = std::move(btree_read_extents);
+            }
+        }
     }
         if (version >= 4)
         {

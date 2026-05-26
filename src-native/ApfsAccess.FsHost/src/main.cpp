@@ -1716,6 +1716,34 @@ std::string ResolveCommitStageStatus(const MountContext& context)
     return {};
 }
 
+std::wstring ResolveCommitFailureReasonStatus(const MountContext& context)
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
+    if (context.metadata_store)
+    {
+        return context.metadata_store->LastCommitFailureReason();
+    }
+#else
+    (void)context;
+#endif
+    return {};
+}
+
+std::optional<std::uint64_t> ResolveCommitFailureObjectIdStatus(const MountContext& context)
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
+    if (context.metadata_store)
+    {
+        return context.metadata_store->LastCommitFailureObjectId();
+    }
+#else
+    (void)context;
+#endif
+    return std::nullopt;
+}
+
 std::string ResolveReplayStageStatus(const MountContext& context)
 {
 #ifdef APFSACCESS_HAS_RW_ENGINE
@@ -1918,6 +1946,8 @@ bool WriteHostStatusFile(
         const auto replay_checkpoint_candidate_present = ResolveReplayCheckpointCandidatePresentStatus(context);
         const auto replay_checkpoint_pending_window = ResolveReplayCheckpointPendingWindowStatus(context);
         const auto commit_stage = ResolveCommitStageStatus(context);
+        const auto commit_failure_reason = ResolveCommitFailureReasonStatus(context);
+        const auto commit_failure_object_id = ResolveCommitFailureObjectIdStatus(context);
         const auto replay_stage = ResolveReplayStageStatus(context);
         const auto commit_blob_magic = ResolveCommitBlobMagicStatus(context);
         const auto integrity_failure_reason = ResolveIntegrityFailureReasonStatus(context);
@@ -1983,6 +2013,26 @@ bool WriteHostStatusFile(
         if (!commit_stage.empty())
         {
             buffer << "\"" << EscapeJson(commit_stage) << "\"";
+        }
+        else
+        {
+            buffer << "null";
+        }
+
+        buffer << ",\"commitFailureReason\":";
+        if (!commit_failure_reason.empty())
+        {
+            buffer << "\"" << EscapeJson(WideToUtf8(commit_failure_reason)) << "\"";
+        }
+        else
+        {
+            buffer << "null";
+        }
+
+        buffer << ",\"commitFailureObjectId\":";
+        if (commit_failure_object_id.has_value())
+        {
+            buffer << *commit_failure_object_id;
         }
         else
         {

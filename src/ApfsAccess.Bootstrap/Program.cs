@@ -263,7 +263,7 @@ internal static class Program
 
     private static string DownloadToTempFile(string url, string fileName)
     {
-        var downloadRoot = Path.Combine(Path.GetTempPath(), "ApfsAccessPortable", "downloads");
+        var downloadRoot = Path.Combine(ResolvePortableRoot(), "downloads");
         Directory.CreateDirectory(downloadRoot);
 
         var destination = Path.Combine(downloadRoot, fileName);
@@ -470,10 +470,7 @@ internal static class Program
     private static string ExtractPayload(byte[] payloadBytes)
     {
         var payloadHash = ComputeSha256(payloadBytes)[..16];
-        var rootPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "ApfsAccessPortable"
-        );
+        var rootPath = ResolvePortableRoot();
         var targetPath = Path.Combine(rootPath, $"payload-{payloadHash}");
         var markerPath = Path.Combine(targetPath, ".payload.sha256");
         var trayPath = Path.Combine(targetPath, "ApfsAccess.Tray.exe");
@@ -521,6 +518,35 @@ internal static class Program
 
             throw;
         }
+    }
+
+    private static string ResolvePortableRoot()
+    {
+        var overrideRoot = Environment.GetEnvironmentVariable("APFSACCESS_PORTABLE_ROOT");
+        if (!string.IsNullOrWhiteSpace(overrideRoot))
+        {
+            return Path.GetFullPath(overrideRoot);
+        }
+
+        var launcherPath = Environment.ProcessPath ?? Application.ExecutablePath;
+        var launcherDirectory = string.IsNullOrWhiteSpace(launcherPath)
+            ? null
+            : Path.GetDirectoryName(launcherPath);
+        if (!string.IsNullOrWhiteSpace(launcherDirectory) && Directory.Exists(launcherDirectory))
+        {
+            return Path.Combine(launcherDirectory, ".apfsaccess-portable");
+        }
+
+        var baseDirectory = AppContext.BaseDirectory;
+        if (!string.IsNullOrWhiteSpace(baseDirectory) && Directory.Exists(baseDirectory))
+        {
+            return Path.Combine(baseDirectory, ".apfsaccess-portable");
+        }
+
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "ApfsAccessPortable"
+        );
     }
 
     private static void LaunchTray(string extractionDirectory)

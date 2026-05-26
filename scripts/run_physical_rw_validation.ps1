@@ -31,7 +31,8 @@ if ([string]::IsNullOrWhiteSpace($OutputDir)) {
     $OutputDir = Join-Path $repoRoot "artifacts\physical-rw-validation"
 }
 if ([string]::IsNullOrWhiteSpace($ScratchRoot)) {
-    $ScratchRoot = Join-Path ([System.IO.Path]::GetTempPath()) "ApfsAccessPhysicalRw"
+    $scratchBase = if (Test-Path -LiteralPath "D:\") { "D:\" } else { [System.IO.Path]::GetTempPath() }
+    $ScratchRoot = Join-Path $scratchBase "ApfsAccessPhysicalRw"
 }
 
 function ConvertTo-PrettyJson {
