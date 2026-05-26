@@ -405,6 +405,7 @@ bool NativeApfsReader::TryLoadVolumeProjection(
     const auto checkpoint_xid = ReadLe64(nxsb, 0x10);
     const auto nx_omap_oid = ReadLe64(nxsb, 0xA0);
     const auto selected_volume_oid = volume_object_id != 0 ? volume_object_id : ReadLe64(nxsb, 0xB8);
+    ProjectionLookupCache lookup_cache{};
     if (block_size == 0 || nx_omap_oid == 0 || selected_volume_oid == 0)
     {
         out_error = L"NativeApfsNxsbIncomplete";
@@ -416,7 +417,7 @@ bool NativeApfsReader::TryLoadVolumeProjection(
         return false;
     }
 
-    const auto volume_map = ResolveObjectMapValue(device, block_size, nx_omap_oid, selected_volume_oid, checkpoint_xid);
+    const auto volume_map = ResolveObjectMapValue(device, block_size, nx_omap_oid, selected_volume_oid, checkpoint_xid, &lookup_cache);
     if (!volume_map.has_value() || volume_map->physical_block == 0)
     {
         out_error = L"NativeApfsVolumeObjectMapMissing";
@@ -438,7 +439,7 @@ bool NativeApfsReader::TryLoadVolumeProjection(
     }
 
     auto selected_volume_superblock_block = volume_map->physical_block;
-    auto root_map = ResolveObjectMapValue(device, block_size, volume.object_map_oid, volume.root_tree_oid, checkpoint_xid);
+    auto root_map = ResolveObjectMapValue(device, block_size, volume.object_map_oid, volume.root_tree_oid, checkpoint_xid, &lookup_cache);
     if (!root_map.has_value() || root_map->physical_block == 0)
     {
         std::optional<ObjectMapValue> fallback_root_map;
@@ -472,7 +473,8 @@ bool NativeApfsReader::TryLoadVolumeProjection(
                 block_size,
                 candidate_volume.object_map_oid,
                 candidate_volume.root_tree_oid,
-                checkpoint_xid);
+                checkpoint_xid,
+                &lookup_cache);
             if (!candidate_root_map.has_value() || candidate_root_map->physical_block == 0)
             {
                 continue;
@@ -525,7 +527,8 @@ bool NativeApfsReader::TryLoadVolumeProjection(
             /*child_addresses_are_physical=*/false,
             volume.object_map_oid,
             checkpoint_xid,
-            fs_records))
+            fs_records,
+            &lookup_cache))
     {
         out_error = L"NativeApfsRootTreeReadFailed";
         return false;
@@ -538,7 +541,8 @@ bool NativeApfsReader::TryLoadVolumeProjection(
             block_size,
             volume.object_map_oid,
             volume.file_extent_tree_oid,
-            checkpoint_xid);
+            checkpoint_xid,
+            &lookup_cache);
         if (file_extent_map.has_value() && file_extent_map->physical_block != 0)
         {
             std::vector<RawBtreeRecord> file_extent_records;
@@ -549,7 +553,8 @@ bool NativeApfsReader::TryLoadVolumeProjection(
                     /*child_addresses_are_physical=*/false,
                     volume.object_map_oid,
                     checkpoint_xid,
-                    file_extent_records))
+                    file_extent_records,
+                    &lookup_cache))
             {
                 out_projection.file_extent_tree_block = file_extent_map->physical_block;
                 fs_records.insert(
@@ -606,16 +611,59 @@ std::optional<NativeApfsReader::ObjectMapValue> NativeApfsReader::ResolveObjectM
     std::uint32_t block_size,
     std::uint64_t map_oid,
     std::uint64_t object_id,
-    std::uint64_t xid)
+    std::uint64_t xid,
+    ProjectionLookupCache* cache)
 {
-    std::vector<RawBtreeRecord> records;
-    if (!ReadObjectMapRecords(device, block_size, map_oid, records))
+    const ObjectMapValueCacheKey value_cache_key
+    {
+        block_size,
+        map_oid,
+        object_id,
+        xid,
+    };
+    if (cache)
+    {
+        if (auto cached = cache->object_map_values.find(value_cache_key);
+            cached != cache->object_map_values.end())
+        {
+            return cached->second;
+        }
+    }
+
+    std::vector<RawBtreeRecord> records_storage;
+    const std::vector<RawBtreeRecord>* records = nullptr;
+    if (cache)
+    {
+        const ObjectMapRecordsCacheKey records_cache_key{ block_size, map_oid };
+        auto cached_records = cache->object_map_records.find(records_cache_key);
+        if (cached_records == cache->object_map_records.end())
+        {
+            std::vector<RawBtreeRecord> loaded_records;
+            if (!ReadObjectMapRecords(device, block_size, map_oid, loaded_records))
+            {
+                cache->object_map_values.emplace(value_cache_key, std::nullopt);
+                return std::nullopt;
+            }
+            cached_records = cache->object_map_records.emplace(records_cache_key, std::move(loaded_records)).first;
+        }
+        records = &cached_records->second;
+    }
+    else
+    {
+        if (!ReadObjectMapRecords(device, block_size, map_oid, records_storage))
+        {
+            return std::nullopt;
+        }
+        records = &records_storage;
+    }
+
+    if (!records)
     {
         return std::nullopt;
     }
 
     std::optional<ObjectMapValue> selected;
-    for (const auto& record : records)
+    for (const auto& record : *records)
     {
         if (record.key.size() < 16 || record.value.size() < 16)
         {
@@ -643,6 +691,10 @@ std::optional<NativeApfsReader::ObjectMapValue> NativeApfsReader::ResolveObjectM
         }
     }
 
+    if (cache)
+    {
+        cache->object_map_values.emplace(value_cache_key, selected);
+    }
     return selected;
 }
 
@@ -685,7 +737,8 @@ bool NativeApfsReader::ReadBtreeRecords(
     bool child_addresses_are_physical,
     std::optional<std::uint64_t> child_object_map_oid,
     std::uint64_t xid,
-    std::vector<RawBtreeRecord>& out_records)
+    std::vector<RawBtreeRecord>& out_records,
+    ProjectionLookupCache* cache)
 {
     out_records.clear();
     if (root_block == 0)
@@ -790,32 +843,31 @@ bool NativeApfsReader::ReadBtreeRecords(
 
             const auto key_start = key_area_start + key_offset;
             const auto value_start = value_area_end - value_offset;
-            RawBtreeRecord record{};
-            record.key.assign(
-                block.begin() + static_cast<std::vector<std::byte>::difference_type>(key_start),
-                block.begin() + static_cast<std::vector<std::byte>::difference_type>(key_start + key_length));
-            record.value.assign(
-                block.begin() + static_cast<std::vector<std::byte>::difference_type>(value_start),
-                block.begin() + static_cast<std::vector<std::byte>::difference_type>(value_start + value_length));
-
             if (level == 0)
             {
+                RawBtreeRecord record{};
+                record.key.assign(
+                    block.begin() + static_cast<std::vector<std::byte>::difference_type>(key_start),
+                    block.begin() + static_cast<std::vector<std::byte>::difference_type>(key_start + key_length));
+                record.value.assign(
+                    block.begin() + static_cast<std::vector<std::byte>::difference_type>(value_start),
+                    block.begin() + static_cast<std::vector<std::byte>::difference_type>(value_start + value_length));
                 out_records.push_back(std::move(record));
                 continue;
             }
 
-            if (record.value.size() < sizeof(std::uint64_t))
+            if (value_length < sizeof(std::uint64_t))
             {
                 return false;
             }
-            auto child_block = ReadLe64(record.value, 0);
+            auto child_block = ReadLe64(block, value_start);
             if (!child_addresses_are_physical)
             {
                 if (!child_object_map_oid.has_value())
                 {
                     return false;
                 }
-                const auto child_mapping = ResolveObjectMapValue(device, block_size, child_object_map_oid.value(), child_block, xid);
+                const auto child_mapping = ResolveObjectMapValue(device, block_size, child_object_map_oid.value(), child_block, xid, cache);
                 if (!child_mapping.has_value())
                 {
                     return false;

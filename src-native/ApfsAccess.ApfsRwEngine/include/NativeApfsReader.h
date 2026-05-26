@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -66,6 +67,61 @@ private:
         std::uint64_t directory_count = 0;
     };
 
+    struct ObjectMapRecordsCacheKey
+    {
+        std::uint32_t block_size = 0;
+        std::uint64_t map_oid = 0;
+
+        bool operator==(const ObjectMapRecordsCacheKey& other) const noexcept
+        {
+            return block_size == other.block_size && map_oid == other.map_oid;
+        }
+    };
+
+    struct ObjectMapValueCacheKey
+    {
+        std::uint32_t block_size = 0;
+        std::uint64_t map_oid = 0;
+        std::uint64_t object_id = 0;
+        std::uint64_t xid = 0;
+
+        bool operator==(const ObjectMapValueCacheKey& other) const noexcept
+        {
+            return block_size == other.block_size &&
+                   map_oid == other.map_oid &&
+                   object_id == other.object_id &&
+                   xid == other.xid;
+        }
+    };
+
+    struct ObjectMapRecordsCacheKeyHash
+    {
+        std::size_t operator()(const ObjectMapRecordsCacheKey& key) const noexcept
+        {
+            auto seed = std::hash<std::uint32_t>{}(key.block_size);
+            seed ^= std::hash<std::uint64_t>{}(key.map_oid) + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2);
+            return seed;
+        }
+    };
+
+    struct ObjectMapValueCacheKeyHash
+    {
+        std::size_t operator()(const ObjectMapValueCacheKey& key) const noexcept
+        {
+            auto seed = std::hash<std::uint32_t>{}(key.block_size);
+            seed ^= std::hash<std::uint64_t>{}(key.map_oid) + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2);
+            seed ^= std::hash<std::uint64_t>{}(key.object_id) + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2);
+            seed ^= std::hash<std::uint64_t>{}(key.xid) + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2);
+            return seed;
+        }
+    };
+
+    struct ProjectionLookupCache
+    {
+        std::unordered_map<ObjectMapRecordsCacheKey, std::vector<RawBtreeRecord>, ObjectMapRecordsCacheKeyHash> object_map_records;
+        std::unordered_map<ObjectMapValueCacheKey, std::optional<ObjectMapValue>, ObjectMapValueCacheKeyHash> object_map_values;
+    };
+
     [[nodiscard]] static bool ReadBlock(
         const BlockDevice& device,
         std::uint32_t block_size,
@@ -77,7 +133,8 @@ private:
         std::uint32_t block_size,
         std::uint64_t map_oid,
         std::uint64_t object_id,
-        std::uint64_t xid);
+        std::uint64_t xid,
+        ProjectionLookupCache* cache = nullptr);
 
     [[nodiscard]] static bool ReadObjectMapRecords(
         const BlockDevice& device,
@@ -92,7 +149,8 @@ private:
         bool child_addresses_are_physical,
         std::optional<std::uint64_t> child_object_map_oid,
         std::uint64_t xid,
-        std::vector<RawBtreeRecord>& out_records);
+        std::vector<RawBtreeRecord>& out_records,
+        ProjectionLookupCache* cache = nullptr);
 
     [[nodiscard]] static bool ParseVolumeSuperblock(
         const std::vector<std::byte>& block,

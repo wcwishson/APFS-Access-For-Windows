@@ -780,7 +780,7 @@ Run `Performance` mode and compare:
 - `ApplyMutation` p50/p95/max;
 - memory growth during small-file sweep.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```powershell
 git add src-native/ApfsAccess.ApfsRwEngine
@@ -880,7 +880,7 @@ Run `Performance` mode and compare:
 - p95 commit latency;
 - number of commits per 1000 files.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```powershell
 git add src-native/ApfsAccess.FsHost src-native/ApfsAccess.ApfsRwEngine
@@ -958,7 +958,7 @@ Run `Performance` mode and compare:
 - large write throughput;
 - small-file commit p95.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```powershell
 git add src-native/ApfsAccess.ApfsRwEngine/include/BlockDevice.h src-native/ApfsAccess.ApfsRwEngine/src/BlockDevice.cpp src-native/ApfsAccess.ApfsRwEngine/tests
@@ -979,7 +979,7 @@ git commit -m "perf: use offset-based APFS block device I/O"
 - Modify: `src-native/ApfsAccess.ApfsRwEngine/src/NativeApfsReader.cpp`
 - Modify: `src-native/ApfsAccess.ApfsRwEngine/tests/MetadataStoreConformanceTests.cpp`
 
-- [ ] **Step 1: Add an object map lookup cache for one projection run**
+- [x] **Step 1: Add an object map lookup cache for one projection run**
 
 During `NativeApfsReader::BuildProjection`, cache object map records by:
 
@@ -995,13 +995,17 @@ map_oid|object_id|xid
 
 Expected: repeated `ResolveObjectMapValue` calls do not reread the same object map B-tree.
 
-- [ ] **Step 2: Avoid copying B-tree key/value bytes where safe**
+Implemented note: object map record vectors are cached by block size and physical map object block for the current projection run; resolved object values are cached by block size, map object block, object id, and requested xid. This avoids rereading the same object map B-tree while still keeping xid-specific value selection correct.
+
+- [x] **Step 2: Avoid copying B-tree key/value bytes where safe**
 
 Review `RawBtreeRecord` creation. If record bytes do not outlive the block, keep copies. If they can be parsed immediately, add a fast parse path that extracts inode, directory, and extent data without storing all raw key/value vectors.
 
 Expected: mount projection uses less memory and does fewer allocations.
 
-- [ ] **Step 3: Verify projection correctness**
+Implemented note: internal B-tree node traversal now reads child block ids directly from the source block instead of allocating a temporary `RawBtreeRecord`. Leaf records still copy key/value bytes because those records outlive the source block and are consumed later by projection parsers.
+
+- [x] **Step 3: Verify projection correctness**
 
 Run:
 
@@ -1010,6 +1014,11 @@ Run:
 ```
 
 Expected: all native projection/conformance tests pass.
+
+Verification:
+
+- `.\scripts\build_rw_engine.ps1 -Configuration Release -RunTests` passed: 6/6 native RW engine test groups.
+- `.\scripts\build_native_host.ps1 -Configuration Release` passed, with the existing WinFsp padding warning.
 
 - [ ] **Step 4: Benchmark**
 
@@ -1020,7 +1029,7 @@ Measure:
 - `EnsureDirectoryLoaded` timing;
 - first root directory enumeration time.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add src-native/ApfsAccess.ApfsRwEngine/include/NativeApfsReader.h src-native/ApfsAccess.ApfsRwEngine/src/NativeApfsReader.cpp src-native/ApfsAccess.ApfsRwEngine/tests
