@@ -39,8 +39,17 @@ constexpr std::uint64_t kNativeReplayCheckpointOffset = 64;
 constexpr std::uint64_t kNativeOverflowCheckpointOffset = kNativeReplayCheckpointOffset + 2;
 constexpr std::uint64_t kNativeObjectMapOverflowBlocks = 16;
 constexpr std::uint64_t kNativeInodeOverflowOffset = kNativeOverflowCheckpointOffset + kNativeObjectMapOverflowBlocks;
-constexpr std::uint64_t kNativeCheckpointExtensionBlocks = 192;
-constexpr std::uint64_t kNativeBtreeExtensionOffset = 0;
+constexpr std::uint64_t kNativeSpacemanExtensionBlocks = 32;
+constexpr std::uint64_t kNativeInodeExtensionBlocks = 192;
+constexpr std::uint64_t kNativeBtreeExtensionBlocks = 192;
+constexpr std::uint64_t kNativeMetadataExtensionBlocks =
+    kNativeInodeExtensionBlocks + kNativeBtreeExtensionBlocks;
+constexpr std::uint64_t kNativeCheckpointExtensionBlocks =
+    kNativeSpacemanExtensionBlocks + kNativeMetadataExtensionBlocks;
+constexpr std::uint64_t kNativeMinimumSpacemanExtensionStartBlock = 1024;
+constexpr std::uint64_t kNativeSpacemanExtensionOffset = 0;
+constexpr std::uint64_t kNativeInodeExtensionOffset = 0;
+constexpr std::uint64_t kNativeBtreeExtensionOffset = kNativeInodeExtensionBlocks;
 
 std::uint32_t UpdateFnv1a(std::uint32_t hash, const std::byte* bytes, std::size_t length)
 {
@@ -398,6 +407,8 @@ bool AddConservativeAllocationFromReadExtents(
     return true;
 }
 
+bool NormalizeSpacemanExtents(std::vector<MetadataStore::SpacemanAllocation>& extents);
+
 bool SubtractAllocationsFromFreeExtents(
     std::vector<MetadataStore::SpacemanAllocation>& free_extents,
     const std::vector<MetadataStore::SpacemanAllocation>& allocations)
@@ -529,6 +540,85 @@ bool SubtractAllocationsFromFreeExtents(
 
     free_extents = std::move(merged);
     return true;
+}
+
+bool SubtractExtentsFromAllocations(
+    std::vector<MetadataStore::SpacemanAllocation>& allocations,
+    const std::vector<MetadataStore::SpacemanAllocation>& removals)
+{
+    if (allocations.empty())
+    {
+        return true;
+    }
+    if (removals.empty())
+    {
+        return NormalizeSpacemanExtents(allocations);
+    }
+
+    std::vector<MetadataStore::SpacemanAllocation> sorted_removals;
+    sorted_removals.reserve(removals.size());
+    for (const auto& removal : removals)
+    {
+        if (removal.physical_address == 0 || removal.bytes == 0)
+        {
+            continue;
+        }
+        if (removal.physical_address > (std::numeric_limits<std::uint64_t>::max() - removal.bytes))
+        {
+            return false;
+        }
+        sorted_removals.push_back(removal);
+    }
+    if (!NormalizeSpacemanExtents(sorted_removals))
+    {
+        return false;
+    }
+
+    std::vector<MetadataStore::SpacemanAllocation> adjusted;
+    adjusted.reserve(allocations.size());
+    for (const auto& allocation : allocations)
+    {
+        if (allocation.physical_address == 0 || allocation.bytes == 0)
+        {
+            continue;
+        }
+        if (allocation.physical_address > (std::numeric_limits<std::uint64_t>::max() - allocation.bytes))
+        {
+            return false;
+        }
+
+        const auto allocation_end = allocation.physical_address + allocation.bytes;
+        auto cursor = allocation.physical_address;
+        for (const auto& removal : sorted_removals)
+        {
+            const auto removal_end = removal.physical_address + removal.bytes;
+            if (removal_end <= cursor)
+            {
+                continue;
+            }
+            if (removal.physical_address >= allocation_end)
+            {
+                break;
+            }
+            if (removal.physical_address > cursor)
+            {
+                adjusted.push_back({ cursor, removal.physical_address - cursor });
+            }
+            cursor = std::max(cursor, std::min(removal_end, allocation_end));
+            if (cursor >= allocation_end)
+            {
+                break;
+            }
+        }
+
+        if (cursor < allocation_end)
+        {
+            adjusted.push_back({ cursor, allocation_end - cursor });
+        }
+    }
+
+    allocations = std::move(adjusted);
+    return NormalizeSpacemanExtents(allocations);
 }
 
 bool NormalizeSpacemanExtents(std::vector<MetadataStore::SpacemanAllocation>& extents)
@@ -1888,6 +1978,13 @@ bool MetadataStore::LoadSpacemanState()
         }
     }
 
+    if (!SanitizeWorkingFreeExtents())
+    {
+        MarkRecoveryRequired(L"WorkingFreeExtentSanitizeFailed");
+        return false;
+    }
+    committed_spaceman_free_extents_ = working_spaceman_free_extents_;
+
     return spaceman_loaded_;
 }
 
@@ -2340,10 +2437,21 @@ bool MetadataStore::IsNativeCheckpointBandBlock(std::uint64_t block_index) const
         return true;
     }
 
+    if (band_start.value() >= kNativeMetadataExtensionBlocks)
+    {
+        const auto metadata_extension_start = band_start.value() - kNativeMetadataExtensionBlocks;
+        if (block_index >= metadata_extension_start && block_index < band_start.value())
+        {
+            return true;
+        }
+    }
+
     if (band_start.value() >= kNativeCheckpointExtensionBlocks)
     {
-        const auto extension_start = band_start.value() - kNativeCheckpointExtensionBlocks;
-        if (block_index >= extension_start && block_index < band_start.value())
+        const auto spaceman_extension_start = band_start.value() - kNativeCheckpointExtensionBlocks;
+        if (spaceman_extension_start >= kNativeMinimumSpacemanExtensionStartBlock &&
+            block_index >= spaceman_extension_start &&
+            block_index < spaceman_extension_start + kNativeSpacemanExtensionBlocks)
         {
             return true;
         }
@@ -2515,6 +2623,33 @@ std::vector<std::uint64_t> MetadataStore::ResolveSpacemanCheckpointBlockIndices(
             candidates.push_back(candidate);
         }
     }
+
+    if (band_start.value() >= kNativeCheckpointExtensionBlocks)
+    {
+        const auto extension_start = band_start.value() - kNativeCheckpointExtensionBlocks;
+        if (extension_start >= kNativeMinimumSpacemanExtensionStartBlock)
+        {
+            const auto range_start = extension_start + kNativeSpacemanExtensionOffset;
+            for (std::uint64_t index = 0; index < kNativeSpacemanExtensionBlocks; ++index)
+            {
+                if (range_start > (std::numeric_limits<std::uint64_t>::max() - index))
+                {
+                    break;
+                }
+
+                const auto candidate = range_start + index;
+                if (candidate >= band_start.value())
+                {
+                    break;
+                }
+
+                if (IsNativeCheckpointBandBlock(candidate))
+                {
+                    candidates.push_back(candidate);
+                }
+            }
+        }
+    }
     return candidates;
 }
 
@@ -2558,6 +2693,30 @@ std::vector<std::uint64_t> MetadataStore::ResolveInodeCheckpointBlockIndices() c
     append_range(
         kNativeInodeOverflowOffset,
         kNativeCheckpointBandBlocks - kNativeInodeOverflowOffset);
+
+    if (band_start.value() >= kNativeMetadataExtensionBlocks)
+    {
+        const auto extension_start = band_start.value() - kNativeMetadataExtensionBlocks;
+        const auto range_start = extension_start + kNativeInodeExtensionOffset;
+        for (std::uint64_t index = 0; index < kNativeInodeExtensionBlocks; ++index)
+        {
+            if (range_start > (std::numeric_limits<std::uint64_t>::max() - index))
+            {
+                break;
+            }
+
+            const auto candidate = range_start + index;
+            if (candidate >= band_start.value())
+            {
+                break;
+            }
+
+            if (IsNativeCheckpointBandBlock(candidate))
+            {
+                candidates.push_back(candidate);
+            }
+        }
+    }
 
     return candidates;
 }
@@ -2614,10 +2773,10 @@ std::vector<std::uint64_t> MetadataStore::ResolveBtreeCheckpointBlockIndices() c
         }
     }
 
-    if (band_start.value() >= kNativeCheckpointExtensionBlocks)
+    if (band_start.value() >= kNativeMetadataExtensionBlocks)
     {
-        const auto extension_start = band_start.value() - kNativeCheckpointExtensionBlocks;
-        for (std::uint64_t index = 0; index < kNativeCheckpointExtensionBlocks; ++index)
+        const auto extension_start = band_start.value() - kNativeMetadataExtensionBlocks;
+        for (std::uint64_t index = 0; index < kNativeBtreeExtensionBlocks; ++index)
         {
             if (extension_start > (std::numeric_limits<std::uint64_t>::max() - index))
             {
@@ -5960,6 +6119,10 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
     {
         return fail_commit(CommitStatus::InvariantFailed, "preflight-stage-blocked");
     }
+    if (!SanitizeWorkingFreeExtents())
+    {
+        return fail_commit(CommitStatus::InvariantFailed, "working-free-extents-sanitize-failed");
+    }
     if (!ValidatePendingCommitState())
     {
         return fail_commit(CommitStatus::InvariantFailed, "preflight-validation-failed");
@@ -6006,6 +6169,11 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         working_spaceman_free_extents_ = working_free_extents_snapshot;
         working_next_ephemeral_extent_ = working_next_extent_snapshot;
     };
+    if (!SanitizeWorkingFreeExtents())
+    {
+        rollback_commit_extent_stage();
+        return fail_commit(CommitStatus::InvariantFailed, "post-allocation-free-extents-sanitize-failed");
+    }
     if (!ValidatePendingCommitState())
     {
         rollback_commit_extent_stage();
@@ -9789,6 +9957,10 @@ std::optional<std::uint64_t> MetadataStore::AllocateExtent(std::uint64_t bytes)
     {
         return std::nullopt;
     }
+    if (!SanitizeWorkingFreeExtents())
+    {
+        return std::nullopt;
+    }
 
     for (auto it = working_spaceman_free_extents_.begin(); it != working_spaceman_free_extents_.end(); ++it)
     {
@@ -9797,7 +9969,12 @@ std::optional<std::uint64_t> MetadataStore::AllocateExtent(std::uint64_t bytes)
             continue;
         }
 
-        const auto allocation_address = it->physical_address;
+        auto allocation_address = it->physical_address;
+        if (allocation_address > (std::numeric_limits<std::uint64_t>::max() - it->bytes))
+        {
+            continue;
+        }
+        const auto extent_end = allocation_address + it->bytes;
         if (allocation_address > (std::numeric_limits<std::uint64_t>::max() - aligned_bytes))
         {
             continue;
@@ -9807,9 +9984,28 @@ std::optional<std::uint64_t> MetadataStore::AllocateExtent(std::uint64_t bytes)
         {
             continue;
         }
-        if (ExtentOverlapsReservedMetadata(allocation_address, aligned_bytes))
+        if (ExtentOverlapsReservedMetadata(allocation_address, aligned_bytes) ||
+            ExtentOverlapsLiveAllocation(allocation_address, aligned_bytes))
         {
-            continue;
+            const auto advanced = AdvancePastUnavailableExtent(allocation_address, aligned_bytes);
+            if (!advanced.has_value() ||
+                advanced.value() < allocation_address ||
+                advanced.value() > extent_end ||
+                advanced.value() > (std::numeric_limits<std::uint64_t>::max() - aligned_bytes) ||
+                (advanced.value() + aligned_bytes) > extent_end)
+            {
+                continue;
+            }
+
+            const auto skipped_bytes = advanced.value() - allocation_address;
+            allocation_address = advanced.value();
+            it->physical_address = allocation_address;
+            it->bytes -= skipped_bytes;
+
+            if (container_bytes.has_value() && (allocation_address + aligned_bytes) > container_bytes.value())
+            {
+                continue;
+            }
         }
         it->physical_address += aligned_bytes;
         it->bytes -= aligned_bytes;
@@ -9826,12 +10022,23 @@ std::optional<std::uint64_t> MetadataStore::AllocateExtent(std::uint64_t bytes)
         return std::nullopt;
     }
 
+    if (ExtentOverlapsReservedMetadata(current, aligned_bytes) ||
+        ExtentOverlapsLiveAllocation(current, aligned_bytes))
+    {
+        const auto advanced = AdvancePastUnavailableExtent(current, aligned_bytes);
+        if (!advanced.has_value())
+        {
+            return std::nullopt;
+        }
+        current = advanced.value();
+        if (current > (std::numeric_limits<std::uint64_t>::max() - aligned_bytes))
+        {
+            return std::nullopt;
+        }
+    }
+
     const auto allocation_end = current + aligned_bytes;
     if (container_bytes.has_value() && allocation_end > container_bytes.value())
-    {
-        return std::nullopt;
-    }
-    if (ExtentOverlapsReservedMetadata(current, aligned_bytes))
     {
         return std::nullopt;
     }
@@ -9853,6 +10060,10 @@ std::optional<std::vector<MetadataStore::FileExtent>> MetadataStore::AllocateFil
 
     const auto aligned_total = AlignExtentBytes(logical_size);
     if (aligned_total == 0)
+    {
+        return std::nullopt;
+    }
+    if (!SanitizeWorkingFreeExtents())
     {
         return std::nullopt;
     }
@@ -9879,7 +10090,8 @@ std::optional<std::vector<MetadataStore::FileExtent>> MetadataStore::AllocateFil
         {
             return false;
         }
-        return !ExtentOverlapsReservedMetadata(extent.physical_address, bytes);
+        return !ExtentOverlapsReservedMetadata(extent.physical_address, bytes) &&
+               !ExtentOverlapsLiveAllocation(extent.physical_address, bytes);
     };
 
     for (auto it = working_spaceman_free_extents_.begin(); it != working_spaceman_free_extents_.end(); ++it)
@@ -9905,7 +10117,8 @@ std::optional<std::vector<MetadataStore::FileExtent>> MetadataStore::AllocateFil
         if (extent.bytes == 0 ||
             extent.physical_address > (std::numeric_limits<std::uint64_t>::max() - extent.bytes) ||
             (container_bytes.has_value() && (extent.physical_address + extent.bytes) > container_bytes.value()) ||
-            ExtentOverlapsReservedMetadata(extent.physical_address, extent.bytes))
+            ExtentOverlapsReservedMetadata(extent.physical_address, extent.bytes) ||
+            ExtentOverlapsLiveAllocation(extent.physical_address, extent.bytes))
         {
             continue;
         }
@@ -9932,7 +10145,8 @@ std::optional<std::vector<MetadataStore::FileExtent>> MetadataStore::AllocateFil
             if (it->bytes == 0 ||
                 it->physical_address > (std::numeric_limits<std::uint64_t>::max() - it->bytes) ||
                 (container_bytes.has_value() && (it->physical_address + it->bytes) > container_bytes.value()) ||
-                ExtentOverlapsReservedMetadata(it->physical_address, it->bytes))
+                ExtentOverlapsReservedMetadata(it->physical_address, it->bytes) ||
+                ExtentOverlapsLiveAllocation(it->physical_address, it->bytes))
             {
                 ++it;
                 continue;
@@ -10062,7 +10276,7 @@ bool MetadataStore::FreeExtent(std::uint64_t physical_address, std::uint64_t byt
     }
 
     working_spaceman_free_extents_ = std::move(merged);
-    return true;
+    return SanitizeWorkingFreeExtents();
 }
 
 std::uint64_t MetadataStore::StableObjectIdFromPath(const std::wstring& path)
@@ -11005,6 +11219,10 @@ bool MetadataStore::StageSpacemanAllocation(std::uint64_t physical_address, std:
     {
         return false;
     }
+    if (ExtentOverlapsLiveAllocation(physical_address, aligned_bytes))
+    {
+        return false;
+    }
 
     pending_spaceman_allocations_.push_back(SpacemanAllocation
     {
@@ -11459,6 +11677,229 @@ bool MetadataStore::ExtentOverlapsReservedMetadata(
         }
     }
     return false;
+}
+
+bool MetadataStore::ExtentOverlapsLiveAllocation(
+    std::uint64_t physical_address,
+    std::uint64_t bytes) const
+{
+    if (physical_address == 0 || bytes == 0 ||
+        physical_address > (std::numeric_limits<std::uint64_t>::max() - bytes))
+    {
+        return true;
+    }
+
+    const auto range_end = physical_address + bytes;
+    const auto overlaps_allocation = [&](const SpacemanAllocation& allocation)
+    {
+        if (allocation.physical_address == 0 || allocation.bytes == 0 ||
+            allocation.physical_address > (std::numeric_limits<std::uint64_t>::max() - allocation.bytes))
+        {
+            return false;
+        }
+
+        const auto allocation_end = allocation.physical_address + allocation.bytes;
+        return physical_address < allocation_end && allocation.physical_address < range_end;
+    };
+
+    return std::any_of(
+               committed_spaceman_allocations_.begin(),
+               committed_spaceman_allocations_.end(),
+               overlaps_allocation) ||
+           std::any_of(
+               pending_spaceman_allocations_.begin(),
+               pending_spaceman_allocations_.end(),
+               overlaps_allocation);
+}
+
+std::optional<std::uint64_t> MetadataStore::AdvancePastReservedMetadata(
+    std::uint64_t physical_address,
+    std::uint64_t bytes) const
+{
+    if (physical_address == 0 || bytes == 0 || block_size_ == 0)
+    {
+        return std::nullopt;
+    }
+
+    const auto block_bytes = static_cast<std::uint64_t>(block_size_);
+    if ((physical_address % block_bytes) != 0 || (bytes % block_bytes) != 0)
+    {
+        return std::nullopt;
+    }
+    if (physical_address > (std::numeric_limits<std::uint64_t>::max() - bytes))
+    {
+        return std::nullopt;
+    }
+
+    const auto required_blocks = bytes / block_bytes;
+    if (required_blocks == 0)
+    {
+        return std::nullopt;
+    }
+
+    auto candidate_block = physical_address / block_bytes;
+    const auto replay_checkpoint_blocks = ResolveReplayCheckpointBlockIndices();
+    while (true)
+    {
+        if (candidate_block > (std::numeric_limits<std::uint64_t>::max() - (required_blocks - 1)))
+        {
+            return std::nullopt;
+        }
+        if (total_blocks_ != 0 &&
+            (required_blocks > total_blocks_ || candidate_block > (total_blocks_ - required_blocks)))
+        {
+            return std::nullopt;
+        }
+        if (candidate_block > (std::numeric_limits<std::uint64_t>::max() / block_bytes))
+        {
+            return std::nullopt;
+        }
+
+        const auto candidate_address = candidate_block * block_bytes;
+        if (!ExtentOverlapsReservedMetadata(candidate_address, bytes))
+        {
+            return candidate_address;
+        }
+
+        std::optional<std::uint64_t> next_candidate_block;
+        for (std::uint64_t index = 0; index < required_blocks; ++index)
+        {
+            const auto block = candidate_block + index;
+            if (IsReservedMetadataBlock(block) ||
+                std::find(replay_checkpoint_blocks.begin(), replay_checkpoint_blocks.end(), block) != replay_checkpoint_blocks.end())
+            {
+                if (block == std::numeric_limits<std::uint64_t>::max())
+                {
+                    return std::nullopt;
+                }
+                next_candidate_block = block + 1;
+                break;
+            }
+        }
+
+        if (!next_candidate_block.has_value() || next_candidate_block.value() <= candidate_block)
+        {
+            return std::nullopt;
+        }
+        candidate_block = next_candidate_block.value();
+    }
+}
+
+std::optional<std::uint64_t> MetadataStore::AdvancePastUnavailableExtent(
+    std::uint64_t physical_address,
+    std::uint64_t bytes) const
+{
+    if (physical_address == 0 || bytes == 0 || block_size_ == 0)
+    {
+        return std::nullopt;
+    }
+
+    const auto block_bytes = static_cast<std::uint64_t>(block_size_);
+    if ((physical_address % block_bytes) != 0 || (bytes % block_bytes) != 0)
+    {
+        return std::nullopt;
+    }
+
+    auto candidate = physical_address;
+    while (true)
+    {
+        if (candidate > (std::numeric_limits<std::uint64_t>::max() - bytes))
+        {
+            return std::nullopt;
+        }
+        if (total_blocks_ != 0)
+        {
+            if (total_blocks_ > (std::numeric_limits<std::uint64_t>::max() / block_bytes))
+            {
+                return std::nullopt;
+            }
+            const auto container_bytes = total_blocks_ * block_bytes;
+            if ((candidate + bytes) > container_bytes)
+            {
+                return std::nullopt;
+            }
+        }
+
+        if (ExtentOverlapsReservedMetadata(candidate, bytes))
+        {
+            const auto advanced = AdvancePastReservedMetadata(candidate, bytes);
+            if (!advanced.has_value() || advanced.value() <= candidate)
+            {
+                return std::nullopt;
+            }
+            candidate = advanced.value();
+            continue;
+        }
+
+        std::optional<std::uint64_t> next_candidate;
+        const auto range_end = candidate + bytes;
+        const auto consider_allocation = [&](const SpacemanAllocation& allocation)
+        {
+            if (allocation.physical_address == 0 || allocation.bytes == 0 ||
+                allocation.physical_address > (std::numeric_limits<std::uint64_t>::max() - allocation.bytes))
+            {
+                return;
+            }
+
+            const auto allocation_end = allocation.physical_address + allocation.bytes;
+            if (candidate < allocation_end && allocation.physical_address < range_end)
+            {
+                if (!next_candidate.has_value() || allocation_end < next_candidate.value())
+                {
+                    next_candidate = allocation_end;
+                }
+            }
+        };
+
+        for (const auto& allocation : committed_spaceman_allocations_)
+        {
+            consider_allocation(allocation);
+        }
+        for (const auto& allocation : pending_spaceman_allocations_)
+        {
+            consider_allocation(allocation);
+        }
+
+        if (!next_candidate.has_value())
+        {
+            return candidate;
+        }
+        if (next_candidate.value() <= candidate)
+        {
+            return std::nullopt;
+        }
+        candidate = next_candidate.value();
+    }
+}
+
+bool MetadataStore::SanitizeWorkingFreeExtents()
+{
+    if (working_spaceman_free_extents_.empty())
+    {
+        return true;
+    }
+
+    std::vector<SpacemanAllocation> live_allocations;
+    live_allocations.reserve(committed_spaceman_allocations_.size() + pending_spaceman_allocations_.size());
+    live_allocations.insert(
+        live_allocations.end(),
+        committed_spaceman_allocations_.begin(),
+        committed_spaceman_allocations_.end());
+    live_allocations.insert(
+        live_allocations.end(),
+        pending_spaceman_allocations_.begin(),
+        pending_spaceman_allocations_.end());
+
+    if (!NormalizeSpacemanExtents(live_allocations))
+    {
+        return false;
+    }
+    if (!SubtractExtentsFromAllocations(live_allocations, pending_spaceman_deallocations_))
+    {
+        return false;
+    }
+
+    return SubtractAllocationsFromFreeExtents(working_spaceman_free_extents_, live_allocations);
 }
 
 bool MetadataStore::ValidateCommitBlobLocation(
@@ -12480,30 +12921,19 @@ bool MetadataStore::ValidatePendingCommitState() const
         }
     }
 
-    std::vector<ApfsExtent> projected_allocations;
-    projected_allocations.reserve(committed_spaceman_allocations_.size() + pending_spaceman_allocations_.size());
-    for (const auto& allocation : committed_spaceman_allocations_)
+    auto projected_spaceman_allocations = committed_spaceman_allocations_;
+    projected_spaceman_allocations.insert(
+        projected_spaceman_allocations.end(),
+        pending_spaceman_allocations_.begin(),
+        pending_spaceman_allocations_.end());
+    if (!SubtractExtentsFromAllocations(projected_spaceman_allocations, pending_spaceman_deallocations_))
     {
-        bool removed_by_deallocation = false;
-        for (const auto& deallocation : pending_spaceman_deallocations_)
-        {
-            if (allocation.physical_address == deallocation.physical_address &&
-                allocation.bytes == deallocation.bytes)
-            {
-                removed_by_deallocation = true;
-                break;
-            }
-        }
-        if (!removed_by_deallocation)
-        {
-            projected_allocations.push_back(
-                {
-                    allocation.physical_address,
-                    allocation.bytes,
-                });
-        }
+        return fail_pending(L"ProjectedAllocationDeallocationInvalid");
     }
-    for (const auto& allocation : pending_spaceman_allocations_)
+
+    std::vector<ApfsExtent> projected_allocations;
+    projected_allocations.reserve(projected_spaceman_allocations.size());
+    for (const auto& allocation : projected_spaceman_allocations)
     {
         projected_allocations.push_back(
             {
@@ -12581,11 +13011,36 @@ bool MetadataStore::ValidatePendingCommitState() const
     {
         return fail_pending(volume_tree_error.empty() ? L"ProjectedVolumeTreeInvalid" : volume_tree_error);
     }
-    if (volume_tree_projection.inode_record_count != expected_non_root_inode_count ||
-        volume_tree_projection.directory_entry_record_count != working_directory_links_.size() ||
-        volume_tree_projection.extent_record_count != expected_extent_count)
+    const auto count_mismatch_reason = [](std::wstring_view label, std::size_t actual, std::size_t expected)
     {
-        return fail_pending(L"ProjectedVolumeTreeCountMismatch");
+        std::wstring reason(L"ProjectedVolumeTree");
+        reason.append(label);
+        reason.append(L"CountMismatch:");
+        reason.append(std::to_wstring(actual));
+        reason.push_back(L'/');
+        reason.append(std::to_wstring(expected));
+        return reason;
+    };
+    if (volume_tree_projection.inode_record_count != expected_non_root_inode_count)
+    {
+        return fail_pending(count_mismatch_reason(
+            L"Inode",
+            volume_tree_projection.inode_record_count,
+            expected_non_root_inode_count));
+    }
+    if (volume_tree_projection.directory_entry_record_count != working_directory_links_.size())
+    {
+        return fail_pending(count_mismatch_reason(
+            L"Directory",
+            volume_tree_projection.directory_entry_record_count,
+            working_directory_links_.size()));
+    }
+    if (volume_tree_projection.extent_record_count != expected_extent_count)
+    {
+        return fail_pending(count_mismatch_reason(
+            L"Extent",
+            volume_tree_projection.extent_record_count,
+            expected_extent_count));
     }
 
     std::unordered_set<std::string> projected_btree_keys;
@@ -13032,6 +13487,13 @@ bool MetadataStore::PersistSpacemanCheckpoint(std::uint64_t target_xid)
         spaceman_blocks.size() > (std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(block_size_)))
     {
         return false;
+    }
+    constexpr std::size_t kCompactSpacemanCheckpointBlocks =
+        static_cast<std::size_t>(kNativeInodeCheckpointOffset - kNativeSpacemanCheckpointOffset);
+    if (spaceman_blocks.size() >= kCompactSpacemanCheckpointBlocks &&
+        required_bytes <= (kCompactSpacemanCheckpointBlocks * static_cast<std::size_t>(block_size_)))
+    {
+        spaceman_blocks.resize(kCompactSpacemanCheckpointBlocks);
     }
     const auto checkpoint_capacity = spaceman_blocks.size() * static_cast<std::size_t>(block_size_);
     if (required_bytes > checkpoint_capacity)

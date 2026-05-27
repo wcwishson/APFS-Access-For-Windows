@@ -35,8 +35,17 @@ constexpr std::uint64_t kNativeReplayCheckpointOffset = 64;
 constexpr std::uint64_t kNativeOverflowCheckpointOffset = kNativeReplayCheckpointOffset + 2;
 constexpr std::uint64_t kNativeObjectMapOverflowBlocks = 16;
 constexpr std::uint64_t kNativeInodeOverflowOffset = kNativeOverflowCheckpointOffset + kNativeObjectMapOverflowBlocks;
-constexpr std::uint64_t kNativeCheckpointExtensionBlocks = 192;
-constexpr std::uint64_t kNativeBtreeExtensionOffset = 0;
+constexpr std::uint64_t kNativeSpacemanExtensionBlocks = 32;
+constexpr std::uint64_t kNativeInodeExtensionBlocks = 192;
+constexpr std::uint64_t kNativeBtreeExtensionBlocks = 192;
+constexpr std::uint64_t kNativeMetadataExtensionBlocks =
+    kNativeInodeExtensionBlocks + kNativeBtreeExtensionBlocks;
+constexpr std::uint64_t kNativeCheckpointExtensionBlocks =
+    kNativeSpacemanExtensionBlocks + kNativeMetadataExtensionBlocks;
+constexpr std::uint64_t kNativeMinimumSpacemanExtensionStartBlock = 1024;
+constexpr std::uint64_t kNativeSpacemanExtensionOffset = 0;
+constexpr std::uint64_t kNativeInodeExtensionOffset = 0;
+constexpr std::uint64_t kNativeBtreeExtensionOffset = kNativeInodeExtensionBlocks;
 
 bool Require(bool condition, const std::string& message);
 
@@ -614,6 +623,18 @@ std::vector<std::pair<std::uint64_t, InodeCheckpointSummary>> CollectInodeCheckp
             band_start + kNativeInodeOverflowOffset,
             std::min<std::uint64_t>(total_blocks - 1, band_start + kNativeCheckpointBandBlocks - 1),
             ReadInodeCheckpointSummary);
+        if (band_start >= kNativeMetadataExtensionBlocks)
+        {
+            const auto extension_start = band_start - kNativeMetadataExtensionBlocks;
+            AppendCheckpointSummaries(
+                summaries,
+                image_path,
+                extension_start + kNativeInodeExtensionOffset,
+                std::min<std::uint64_t>(
+                    band_start - 1,
+                    extension_start + kNativeInodeExtensionOffset + kNativeInodeExtensionBlocks - 1),
+                ReadInodeCheckpointSummary);
+        }
     }
     else
     {
@@ -644,14 +665,16 @@ std::vector<std::pair<std::uint64_t, BtreeCheckpointSummary>> CollectBtreeCheckp
         band_start + kNativeBtreeCheckpointOffset,
         std::min<std::uint64_t>(total_blocks - 1, band_start + kNativeReplayCheckpointOffset - 1),
         ReadBtreeCheckpointSummary);
-    if (band_start >= kNativeCheckpointExtensionBlocks)
+    if (band_start >= kNativeMetadataExtensionBlocks)
     {
-        const auto extension_start = band_start - kNativeCheckpointExtensionBlocks;
+        const auto extension_start = band_start - kNativeMetadataExtensionBlocks;
         AppendCheckpointSummaries(
             summaries,
             image_path,
             extension_start + kNativeBtreeExtensionOffset,
-            std::min<std::uint64_t>(band_start - 1, extension_start + kNativeCheckpointExtensionBlocks - 1),
+            std::min<std::uint64_t>(
+                band_start - 1,
+                extension_start + kNativeBtreeExtensionOffset + kNativeBtreeExtensionBlocks - 1),
             ReadBtreeCheckpointSummary);
     }
 
@@ -969,6 +992,78 @@ const char* CommitStatusToString(apfsaccess::rw::MetadataStore::CommitStatus sta
         return "Unknown";
     }
 }
+
+bool TestLargeSpacemanCheckpointUsesExtension(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "large_spaceman_checkpoint.apfs.img";
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, "LargeSpacemanCheckpoint: unable to create synthetic APFS container");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        L"LargeSpacemanCheckpoint",
+    };
+    const auto persistent_state_path = BuildPersistentStatePathForTest(context);
+    if (!persistent_state_path.empty())
+    {
+        std::error_code remove_ec;
+        std::filesystem::remove(persistent_state_path, remove_ec);
+    }
+
+    apfsaccess::rw::MetadataStore store(context);
+    bool ok = true;
+    ok &= Require(store.LoadContainerSuperblocks(), "LargeSpacemanCheckpoint: LoadContainerSuperblocks should succeed");
+    ok &= Require(store.LoadObjectMap(), "LargeSpacemanCheckpoint: LoadObjectMap should succeed");
+    ok &= Require(store.LoadSpacemanState(), "LargeSpacemanCheckpoint: LoadSpacemanState should succeed");
+    ok &= Require(store.PrepareNativeWritePath(), "LargeSpacemanCheckpoint: PrepareNativeWritePath should succeed");
+
+    constexpr std::uint64_t kInjectedFreeExtentCount = 1100;
+    constexpr std::uint64_t kFirstFreeBlock = 512;
+    for (std::uint64_t index = 0; index < kInjectedFreeExtentCount; ++index)
+    {
+        const auto physical_address = (kFirstFreeBlock + (index * 2ull)) * static_cast<std::uint64_t>(kBlockSize);
+        ok &= Require(
+            store.FreeExtent(physical_address, kBlockSize),
+            "LargeSpacemanCheckpoint: synthetic fragmented free extent should be accepted");
+    }
+
+    apfsaccess::rw::MetadataStore::MutationRequest create_directory{};
+    create_directory.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateDirectory;
+    create_directory.path = L"\\large-spaceman-checkpoint";
+    ok &= Require(
+        store.ApplyMutation(create_directory) == apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "LargeSpacemanCheckpoint: metadata mutation should apply");
+
+    const auto commit_status = store.CommitPendingMutations();
+    if (commit_status != apfsaccess::rw::MetadataStore::CommitStatus::Committed)
+    {
+        std::cerr << "[DEBUG] LargeSpacemanCheckpoint commit status: "
+                  << CommitStatusToString(commit_status) << std::endl;
+        std::cerr << "[DEBUG] LargeSpacemanCheckpoint commit stage: "
+                  << store.LastCommitStage() << std::endl;
+        const auto recovery_reason = store.RecoveryReason();
+        if (!recovery_reason.empty())
+        {
+            std::wcerr << L"[DEBUG] LargeSpacemanCheckpoint recovery reason: " << recovery_reason << std::endl;
+        }
+    }
+    ok &= Require(
+        commit_status == apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "LargeSpacemanCheckpoint: commit should persist a spaceman checkpoint larger than the compact band slots");
+
+    apfsaccess::rw::MetadataStore remounted(context);
+    ok &= Require(remounted.LoadContainerSuperblocks(), "LargeSpacemanCheckpoint: remount LoadContainerSuperblocks should succeed");
+    ok &= Require(remounted.LoadObjectMap(), "LargeSpacemanCheckpoint: remount LoadObjectMap should succeed");
+    ok &= Require(remounted.LoadSpacemanState(), "LargeSpacemanCheckpoint: remount LoadSpacemanState should succeed");
+    ok &= Require(
+        remounted.CommittedFreeExtentCount() >= kInjectedFreeExtentCount - 1,
+        "LargeSpacemanCheckpoint: remount should recover large spaceman free ledger");
+
+    return ok;
+}
 } // namespace
 
 int main()
@@ -989,6 +1084,9 @@ int main()
         std::cerr << "[FAIL] unable to create test directory" << std::endl;
         return 1;
     }
+
+    bool ok = true;
+    ok &= TestLargeSpacemanCheckpointUsesExtension(run_root);
 
     const auto image_path = run_root / "container.apfs.img";
     if (!CreateSyntheticContainer(image_path))
@@ -1015,7 +1113,6 @@ int main()
     const auto reuse_payload = BuildPatternPayload(777, 0x57);
     const auto resized_reuse_payload = BuildPatternPayload(1024, 0x7C);
 
-    bool ok = true;
     ok &= TestBlockDeviceOffsetIo(run_root);
     std::uint64_t final_committed_xid = 0;
     std::uint64_t previous_committed_xid = 0;
@@ -1411,11 +1508,26 @@ int main()
         }
 
         const auto spaceman_scan_end = std::min<std::uint64_t>(kTotalBlocks - 1, kNativeCheckpointBandStart + kNativeInodeCheckpointOffset - 1);
-        const auto spaceman_checkpoints = CollectCheckpointSummaries<SpacemanCheckpointSummary>(
+        auto spaceman_checkpoints = CollectCheckpointSummaries<SpacemanCheckpointSummary>(
             image_path,
             kNativeCheckpointBandStart + kNativeSpacemanCheckpointOffset,
             spaceman_scan_end,
             ReadSpacemanCheckpointSummary);
+        if constexpr (kNativeCheckpointBandStart >= kNativeCheckpointExtensionBlocks)
+        {
+            const auto extension_start = kNativeCheckpointBandStart - kNativeCheckpointExtensionBlocks;
+            if constexpr (extension_start >= kNativeMinimumSpacemanExtensionStartBlock)
+            {
+                AppendCheckpointSummaries(
+                    spaceman_checkpoints,
+                    image_path,
+                    extension_start + kNativeSpacemanExtensionOffset,
+                    std::min<std::uint64_t>(
+                        kTotalBlocks - 1,
+                        extension_start + kNativeSpacemanExtensionOffset + kNativeSpacemanExtensionBlocks - 1),
+                    ReadSpacemanCheckpointSummary);
+            }
+        }
         ok &= Require(
             !spaceman_checkpoints.empty(),
             "Spaceman checkpoint block should be persisted to the native checkpoint band");

@@ -2162,7 +2162,7 @@ bool TestFragmentedReadExtentMutationAccountingConformance(const std::filesystem
     ok &= InstallFragmentedReadExtents(
         store,
         L"\\fragmented-delete.bin",
-        512ull * kBlockSize,
+        400ull * kBlockSize,
         "FragmentedExtentAccounting/delete");
 
     apfsaccess::rw::MetadataStore::MutationRequest delete_file{};
@@ -2194,7 +2194,7 @@ bool TestFragmentedReadExtentMutationAccountingConformance(const std::filesystem
     ok &= InstallFragmentedReadExtents(
         store,
         L"\\fragmented-overwrite.bin",
-        532ull * kBlockSize,
+        420ull * kBlockSize,
         "FragmentedExtentAccounting/overwrite");
     const auto dealloc_before_overwrite = store.PendingDeallocationCount();
     apfsaccess::rw::MetadataStore::MutationRequest overwrite_file{};
@@ -2228,7 +2228,7 @@ bool TestFragmentedReadExtentMutationAccountingConformance(const std::filesystem
     ok &= InstallFragmentedReadExtents(
         store,
         L"\\fragmented-truncate.bin",
-        552ull * kBlockSize,
+        440ull * kBlockSize,
         "FragmentedExtentAccounting/truncate");
     const auto dealloc_before_truncate = store.PendingDeallocationCount();
     apfsaccess::rw::MetadataStore::MutationRequest truncate_file{};
@@ -2265,7 +2265,7 @@ bool TestFragmentedReadExtentMutationAccountingConformance(const std::filesystem
     ok &= InstallFragmentedReadExtents(
         store,
         L"\\fragmented-destination.bin",
-        572ull * kBlockSize,
+        460ull * kBlockSize,
         "FragmentedExtentAccounting/rename-destination");
     ok &= CreateAndCommitFile(
         store,
@@ -2296,6 +2296,166 @@ bool TestFragmentedReadExtentMutationAccountingConformance(const std::filesystem
         !store.LookupCommittedInodeByPath(L"\\fragmented-source.bin").has_value() &&
             store.LookupCommittedInodeByPath(L"\\fragmented-destination.bin").has_value(),
         "FragmentedExtentAccounting: rename replace namespace should persist");
+
+    return ok;
+}
+
+bool TestRecycleBinRestoreRenameConformance(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "recycle_bin_restore_rename.apfs.img";
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, "RecycleBinRestoreRename: unable to create synthetic container");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        L"RecycleBinRestoreRename",
+    };
+    apfsaccess::rw::MetadataStore store(context);
+    bool ok = true;
+    ok &= Require(store.LoadContainerSuperblocks(), "RecycleBinRestoreRename: LoadContainerSuperblocks should succeed");
+    ok &= Require(store.LoadObjectMap(), "RecycleBinRestoreRename: LoadObjectMap should succeed");
+    ok &= Require(store.LoadSpacemanState(), "RecycleBinRestoreRename: LoadSpacemanState should succeed");
+    ok &= Require(store.PrepareNativeWritePath(), "RecycleBinRestoreRename: PrepareNativeWritePath should succeed");
+
+    std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+    ConfigurePayloadProvider(store, staged_payloads);
+
+    const auto create_and_commit_directory = [&](const std::wstring& path, const std::string& label)
+    {
+        apfsaccess::rw::MetadataStore::MutationRequest create_directory{};
+        create_directory.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateDirectory;
+        create_directory.path = path;
+        if (!ExpectMutationStatus(
+                store,
+                create_directory,
+                apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+                label + ": create directory should apply"))
+        {
+            return false;
+        }
+
+        return ExpectCommitStatus(
+            store,
+            apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+            label + ": directory commit should succeed");
+    };
+
+    ok &= create_and_commit_directory(L"\\workflow", "RecycleBinRestoreRename/workflow");
+    ok &= create_and_commit_directory(L"\\workflow\\recycle", "RecycleBinRestoreRename/recycle");
+    ok &= create_and_commit_directory(L"\\workflow\\$RECYCLE.BIN", "RecycleBinRestoreRename/recycle-bin");
+    ok &= create_and_commit_directory(
+        L"\\workflow\\$RECYCLE.BIN\\S-1-5-21-1000-1000-1000-1001",
+        "RecycleBinRestoreRename/recycle-sid");
+
+    ok &= CreateAndCommitFile(
+        store,
+        staged_payloads,
+        L"\\workflow\\recycle\\recycle-me.bin",
+        262144,
+        0x55,
+        "RecycleBinRestoreRename/source");
+    ok &= CreateAndCommitFile(
+        store,
+        staged_payloads,
+        L"\\workflow\\$RECYCLE.BIN\\S-1-5-21-1000-1000-1000-1001\\$ICODEX01.bin",
+        42,
+        0x19,
+        "RecycleBinRestoreRename/info");
+
+    apfsaccess::rw::MetadataStore::MutationRequest move_to_recycle{};
+    move_to_recycle.operation = apfsaccess::rw::MetadataStore::MutationOperation::Rename;
+    move_to_recycle.path = L"\\workflow\\recycle\\recycle-me.bin";
+    move_to_recycle.secondary_path = L"\\workflow\\$RECYCLE.BIN\\S-1-5-21-1000-1000-1000-1001\\$RCODEX01.bin";
+    ok &= ExpectMutationStatus(
+        store,
+        move_to_recycle,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "RecycleBinRestoreRename: move-to-recycle rename should apply");
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "RecycleBinRestoreRename: move-to-recycle commit should succeed");
+
+    apfsaccess::rw::MetadataStore::MutationRequest restore{};
+    restore.operation = apfsaccess::rw::MetadataStore::MutationOperation::Rename;
+    restore.path = L"\\workflow\\$RECYCLE.BIN\\S-1-5-21-1000-1000-1000-1001\\$RCODEX01.bin";
+    restore.secondary_path = L"\\workflow\\recycle\\recycle-restored.bin";
+    ok &= ExpectMutationStatus(
+        store,
+        restore,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "RecycleBinRestoreRename: restore rename should apply");
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "RecycleBinRestoreRename: restore commit should succeed");
+    ok &= Require(
+        store.LookupCommittedInodeByPath(L"\\workflow\\recycle\\recycle-restored.bin").has_value(),
+        "RecycleBinRestoreRename: restored file should be committed");
+    ok &= Require(
+        !store.LookupCommittedInodeByPath(L"\\workflow\\$RECYCLE.BIN\\S-1-5-21-1000-1000-1000-1001\\$RCODEX01.bin").has_value(),
+        "RecycleBinRestoreRename: recycle payload should be absent after restore");
+
+    return ok;
+}
+
+bool TestStaleFreeExtentOverlapSanitizedConformance(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "stale_free_extent_overlap.apfs.img";
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, "StaleFreeExtentOverlap: unable to create synthetic container");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        L"StaleFreeExtentOverlap",
+    };
+    apfsaccess::rw::MetadataStore store(context);
+    bool ok = true;
+    ok &= Require(store.LoadContainerSuperblocks(), "StaleFreeExtentOverlap: LoadContainerSuperblocks should succeed");
+    ok &= Require(store.LoadObjectMap(), "StaleFreeExtentOverlap: LoadObjectMap should succeed");
+    ok &= Require(store.LoadSpacemanState(), "StaleFreeExtentOverlap: LoadSpacemanState should succeed");
+    ok &= Require(store.PrepareNativeWritePath(), "StaleFreeExtentOverlap: PrepareNativeWritePath should succeed");
+
+    std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+    ConfigurePayloadProvider(store, staged_payloads);
+
+    ok &= CreateAndCommitFile(
+        store,
+        staged_payloads,
+        L"\\live.bin",
+        4096,
+        0xA7,
+        "StaleFreeExtentOverlap/live");
+
+    const auto live_inode = store.LookupCommittedInodeByPath(L"\\live.bin");
+    ok &= Require(live_inode.has_value(), "StaleFreeExtentOverlap: live file should be committed");
+    if (!live_inode.has_value())
+    {
+        return ok;
+    }
+
+    ok &= Require(
+        store.FreeExtent(live_inode->data_physical_address, 4ull * kBlockSize),
+        "StaleFreeExtentOverlap: stale reusable range should be sanitized instead of poisoning the ledger");
+
+    ok &= CreateAndCommitFile(
+        store,
+        staged_payloads,
+        L"\\after-stale-free.bin",
+        1024,
+        0xB8,
+        "StaleFreeExtentOverlap/after-stale-free");
+
+    ok &= Require(
+        store.LookupCommittedInodeByPath(L"\\live.bin").has_value() &&
+            store.LookupCommittedInodeByPath(L"\\after-stale-free.bin").has_value(),
+        "StaleFreeExtentOverlap: both live and new files should remain committed");
 
     return ok;
 }
@@ -2677,6 +2837,8 @@ int main()
     ok &= TestCommittedReadExtentsConformance(run_root);
     ok &= TestCommittedZeroReadExtentConformance(run_root);
     ok &= TestFragmentedReadExtentMutationAccountingConformance(run_root);
+    ok &= TestRecycleBinRestoreRenameConformance(run_root);
+    ok &= TestStaleFreeExtentOverlapSanitizedConformance(run_root);
     ok &= TestObjectMapDeltaCanonicalizationConformance(run_root);
     ok &= TestEphemeralCreateDeleteConformance(run_root);
     ok &= TestObjectIdMonotonicAllocationConformance(run_root);

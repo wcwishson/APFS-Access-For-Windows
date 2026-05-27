@@ -1171,6 +1171,7 @@ function Invoke-PerformanceBenchmark {
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
         $operationStartLatencyMs = $null
         $firstByteLatencyMs = $null
+        $recursiveCopy = $Recurse.IsPresent
         $job = Start-Job -ScriptBlock {
             param(
                 [string]$Source,
@@ -1184,7 +1185,7 @@ function Invoke-PerformanceBenchmark {
             else {
                 Copy-Item -LiteralPath $Source -Destination $Destination -Force
             }
-        } -ArgumentList $SourcePath, $DestinationPath, [bool]$Recurse
+        } -ArgumentList @($SourcePath, $DestinationPath, $recursiveCopy)
 
         try {
             $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSeconds))

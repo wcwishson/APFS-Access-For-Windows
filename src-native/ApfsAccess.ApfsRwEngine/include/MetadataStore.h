@@ -353,6 +353,14 @@ private:
     void CoalescePendingBtreeFileMetadata(std::uint64_t object_id);
     [[nodiscard]] std::uint64_t AlignExtentBytes(std::uint64_t bytes) const noexcept;
     [[nodiscard]] bool ExtentOverlapsReservedMetadata(std::uint64_t physical_address, std::uint64_t bytes) const;
+    [[nodiscard]] bool ExtentOverlapsLiveAllocation(std::uint64_t physical_address, std::uint64_t bytes) const;
+    [[nodiscard]] std::optional<std::uint64_t> AdvancePastReservedMetadata(
+        std::uint64_t physical_address,
+        std::uint64_t bytes) const;
+    [[nodiscard]] std::optional<std::uint64_t> AdvancePastUnavailableExtent(
+        std::uint64_t physical_address,
+        std::uint64_t bytes) const;
+    [[nodiscard]] bool SanitizeWorkingFreeExtents();
     [[nodiscard]] bool ValidateCommitBlobLocation(std::uint64_t physical_address, std::uint64_t bytes) const;
     [[nodiscard]] bool ShouldAcceptScaffoldCommitBlobForCurrentContext() const noexcept;
     [[nodiscard]] bool ShouldUseScaffoldCommitBlobForCurrentContext() const noexcept;
