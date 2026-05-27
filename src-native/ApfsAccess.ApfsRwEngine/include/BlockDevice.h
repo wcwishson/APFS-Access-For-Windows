@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <atomic>
 #include <mutex>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,7 @@ public:
         std::byte* destination,
         std::size_t destination_size,
         std::size_t& bytes_read) const;
+    [[nodiscard]] bool Write(std::uint64_t offset_bytes, std::span<const std::byte> buffer);
     [[nodiscard]] bool Write(std::uint64_t offset_bytes, const std::vector<std::byte>& buffer);
     [[nodiscard]] bool Flush();
     [[nodiscard]] std::string PerformanceJson() const;

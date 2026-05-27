@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -193,6 +194,29 @@ bool TestBlockDeviceOffsetIo(const std::filesystem::path& run_root)
     std::vector<std::byte> aligned_read;
     ok &= Require(device.Read(8192, aligned_payload.size(), aligned_read), "BlockDevice offset I/O aligned read should succeed");
     ok &= Require(aligned_read == aligned_payload, "BlockDevice offset I/O aligned read should match write");
+
+    const auto span_source = BuildPatternPayload(2048, 0x6D);
+    const std::span<const std::byte> span_payload(span_source.data() + 256, 1024);
+    ok &= Require(device.Write(12288 + 512, span_payload), "BlockDevice offset I/O span write should succeed");
+
+    std::vector<std::byte> span_read;
+    ok &= Require(device.Read(12288, 4096, span_read), "BlockDevice offset I/O span block read should succeed");
+    if (span_read.size() == 4096)
+    {
+        ok &= Require(
+            std::equal(span_payload.begin(), span_payload.end(), span_read.begin() + 512),
+            "BlockDevice offset I/O span payload should land at requested offset");
+        ok &= Require(
+            std::equal(seed.begin() + 12288, seed.begin() + 12800, span_read.begin()),
+            "BlockDevice offset I/O span write should preserve block prefix");
+        ok &= Require(
+            std::equal(seed.begin() + 13824, seed.begin() + 16384, span_read.begin() + 1536),
+            "BlockDevice offset I/O span write should preserve block suffix");
+    }
+    else
+    {
+        ok &= Require(false, "BlockDevice offset I/O span block read should return full block");
+    }
 
     const auto unaligned_payload = BuildPatternPayload(1000, 0xA4);
     ok &= Require(device.Write(8192 + 123, unaligned_payload), "BlockDevice offset I/O unaligned write should succeed");

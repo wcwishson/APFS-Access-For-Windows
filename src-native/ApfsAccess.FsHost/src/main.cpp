@@ -228,6 +228,51 @@ struct PerfCounter
     }
 };
 
+struct NativeCommitOriginCounter
+{
+    std::atomic<std::uint64_t> attempts{0};
+    std::atomic<std::uint64_t> committed{0};
+    std::atomic<std::uint64_t> nothing_to_commit{0};
+    std::atomic<std::uint64_t> failed{0};
+    std::atomic<std::uint64_t> total_ms{0};
+    std::atomic<std::uint64_t> max_ms{0};
+    std::atomic<std::uint64_t> last_ms{0};
+    std::atomic<std::uint64_t> pending_mutations_before{0};
+    std::atomic<std::uint64_t> payload_bytes_before{0};
+
+    void Observe(
+        bool did_commit,
+        bool did_nothing,
+        std::uint64_t elapsed_ms,
+        std::uint64_t pending_before,
+        std::uint64_t payload_before) noexcept
+    {
+        attempts.fetch_add(1, std::memory_order_relaxed);
+        if (did_commit)
+        {
+            committed.fetch_add(1, std::memory_order_relaxed);
+        }
+        else if (did_nothing)
+        {
+            nothing_to_commit.fetch_add(1, std::memory_order_relaxed);
+        }
+        else
+        {
+            failed.fetch_add(1, std::memory_order_relaxed);
+        }
+        total_ms.fetch_add(elapsed_ms, std::memory_order_relaxed);
+        last_ms.store(elapsed_ms, std::memory_order_relaxed);
+        pending_mutations_before.store(pending_before, std::memory_order_relaxed);
+        payload_bytes_before.store(payload_before, std::memory_order_relaxed);
+
+        auto current_max = max_ms.load(std::memory_order_relaxed);
+        while (elapsed_ms > current_max &&
+               !max_ms.compare_exchange_weak(current_max, elapsed_ms, std::memory_order_relaxed))
+        {
+        }
+    }
+};
+
 bool IsPerfCountersEnabled()
 {
     static const bool enabled = []()
@@ -256,6 +301,23 @@ void AppendPerfCounterJson(std::ostringstream& buffer, const char* name, const P
            << ",\"totalUs\":" << total_us
            << ",\"maxUs\":" << max_us
            << ",\"lastUs\":" << last_us
+           << "}";
+}
+
+void AppendNativeCommitOriginCounterJson(
+    std::ostringstream& buffer,
+    const char* name,
+    const NativeCommitOriginCounter& counter)
+{
+    buffer << "\"" << name << "\":{\"attempts\":" << counter.attempts.load(std::memory_order_relaxed)
+           << ",\"committed\":" << counter.committed.load(std::memory_order_relaxed)
+           << ",\"nothingToCommit\":" << counter.nothing_to_commit.load(std::memory_order_relaxed)
+           << ",\"failed\":" << counter.failed.load(std::memory_order_relaxed)
+           << ",\"totalMs\":" << counter.total_ms.load(std::memory_order_relaxed)
+           << ",\"maxMs\":" << counter.max_ms.load(std::memory_order_relaxed)
+           << ",\"lastMs\":" << counter.last_ms.load(std::memory_order_relaxed)
+           << ",\"pendingMutationsBefore\":" << counter.pending_mutations_before.load(std::memory_order_relaxed)
+           << ",\"payloadBytesBefore\":" << counter.payload_bytes_before.load(std::memory_order_relaxed)
            << "}";
 }
 
@@ -337,6 +399,12 @@ struct MountContext
     PerfCounter perf_ensure_directory_loaded;
     PerfCounter perf_merge_committed_inodes;
     PerfCounter perf_commit_native;
+    NativeCommitOriginCounter perf_commit_origin_close;
+    NativeCommitOriginCounter perf_commit_origin_flush;
+    NativeCommitOriginCounter perf_commit_origin_rename;
+    NativeCommitOriginCounter perf_commit_origin_shutdown;
+    NativeCommitOriginCounter perf_commit_origin_dirty_limit;
+    NativeCommitOriginCounter perf_commit_origin_other;
 #ifdef APFSACCESS_HAS_RW_ENGINE
     mutable std::mutex metadata_mutex;
     mutable std::mutex commit_mutex;
@@ -1277,6 +1345,31 @@ std::string EscapeJson(const std::string& value)
     return out;
 }
 
+NativeCommitOriginCounter& ResolveNativeCommitOriginCounter(MountContext& context, const wchar_t* origin)
+{
+    if (origin && !_wcsicmp(origin, L"Close"))
+    {
+        return context.perf_commit_origin_close;
+    }
+    if (origin && !_wcsicmp(origin, L"Flush"))
+    {
+        return context.perf_commit_origin_flush;
+    }
+    if (origin && !_wcsicmp(origin, L"Rename"))
+    {
+        return context.perf_commit_origin_rename;
+    }
+    if (origin && !_wcsicmp(origin, L"Shutdown"))
+    {
+        return context.perf_commit_origin_shutdown;
+    }
+    if (origin && !_wcsicmp(origin, L"DirtyLimit"))
+    {
+        return context.perf_commit_origin_dirty_limit;
+    }
+    return context.perf_commit_origin_other;
+}
+
 std::wstring ResolveWriteBackendStatus(const MountContext& context)
 {
     if (!context.args.readwrite)
@@ -2190,6 +2283,18 @@ bool WriteHostStatusFile(
             AppendPerfCounterJson(buffer, "mergeCommittedInodes", context.perf_merge_committed_inodes);
             buffer << ",";
             AppendPerfCounterJson(buffer, "commitNative", context.perf_commit_native);
+            buffer << "},\"commitOrigins\":{";
+            AppendNativeCommitOriginCounterJson(buffer, "Close", context.perf_commit_origin_close);
+            buffer << ",";
+            AppendNativeCommitOriginCounterJson(buffer, "Flush", context.perf_commit_origin_flush);
+            buffer << ",";
+            AppendNativeCommitOriginCounterJson(buffer, "Rename", context.perf_commit_origin_rename);
+            buffer << ",";
+            AppendNativeCommitOriginCounterJson(buffer, "Shutdown", context.perf_commit_origin_shutdown);
+            buffer << ",";
+            AppendNativeCommitOriginCounterJson(buffer, "DirtyLimit", context.perf_commit_origin_dirty_limit);
+            buffer << ",";
+            AppendNativeCommitOriginCounterJson(buffer, "Other", context.perf_commit_origin_other);
             buffer << "}";
 #ifdef APFSACCESS_HAS_RW_ENGINE
             if (context.metadata_store)
@@ -3991,6 +4096,25 @@ bool UpdateRecoveryMarkerBestEffort(MountContext* c, bool dirty)
 }
 
 NTSTATUS CommitNativeMutationsBestEffort(MountContext* c, const wchar_t* origin);
+bool HasPendingNativeMutations(MountContext* c);
+
+enum class NativeCommitUrgency
+{
+    None,
+    MetadataOnlyCanDelay,
+    FileContentCloseCanDelay,
+    DirtyLimitMustCommit,
+    UserFlushMustCommit,
+    NamespaceBoundaryMustCommit,
+    DeleteBoundaryMustCommit,
+    ShutdownMustCommit
+};
+
+NativeCommitUrgency ClassifyNativeCommitRequest(
+    MountContext* c,
+    const wchar_t* origin,
+    bool has_delete_plans,
+    bool namespace_boundary);
 
 void LatchDirtyTransactionLimitExceeded(MountContext* c, std::size_t dirty_limit)
 {
@@ -4470,6 +4594,78 @@ bool CommitMutationJournalBestEffort(MountContext* c)
     return true;
 }
 
+NativeCommitUrgency ClassifyNativeCommitRequest(
+    MountContext* c,
+    const wchar_t* origin,
+    bool has_delete_plans,
+    bool namespace_boundary)
+{
+    if (!c || !IsNativeWriteEnabled(c))
+    {
+        return NativeCommitUrgency::None;
+    }
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+    if (c->test_force_native_mutation_staging_success &&
+        c->test_forced_native_commit_status.has_value())
+    {
+        if (has_delete_plans)
+        {
+            return NativeCommitUrgency::DeleteBoundaryMustCommit;
+        }
+        if (namespace_boundary)
+        {
+            return NativeCommitUrgency::NamespaceBoundaryMustCommit;
+        }
+        if (origin && !_wcsicmp(origin, L"Flush"))
+        {
+            return NativeCommitUrgency::UserFlushMustCommit;
+        }
+        if (origin && !_wcsicmp(origin, L"Shutdown"))
+        {
+            return NativeCommitUrgency::ShutdownMustCommit;
+        }
+        if (origin && !_wcsicmp(origin, L"DirtyLimit"))
+        {
+            return NativeCommitUrgency::DirtyLimitMustCommit;
+        }
+        if (origin && !_wcsicmp(origin, L"Close"))
+        {
+            return NativeCommitUrgency::FileContentCloseCanDelay;
+        }
+        return NativeCommitUrgency::MetadataOnlyCanDelay;
+    }
+#endif
+    if (!HasPendingNativeMutations(c))
+    {
+        return NativeCommitUrgency::None;
+    }
+    if (has_delete_plans)
+    {
+        return NativeCommitUrgency::DeleteBoundaryMustCommit;
+    }
+    if (namespace_boundary)
+    {
+        return NativeCommitUrgency::NamespaceBoundaryMustCommit;
+    }
+    if (origin && !_wcsicmp(origin, L"Flush"))
+    {
+        return NativeCommitUrgency::UserFlushMustCommit;
+    }
+    if (origin && !_wcsicmp(origin, L"Shutdown"))
+    {
+        return NativeCommitUrgency::ShutdownMustCommit;
+    }
+    if (origin && !_wcsicmp(origin, L"DirtyLimit"))
+    {
+        return NativeCommitUrgency::DirtyLimitMustCommit;
+    }
+    if (origin && !_wcsicmp(origin, L"Close"))
+    {
+        return NativeCommitUrgency::FileContentCloseCanDelay;
+    }
+    return NativeCommitUrgency::MetadataOnlyCanDelay;
+}
+
 NTSTATUS CommitNativeMutationsBestEffort(MountContext* c, const wchar_t* origin)
 {
     ScopedPerfTimer perf_scope(c ? &c->perf_commit_native : nullptr);
@@ -4505,11 +4701,17 @@ NTSTATUS CommitNativeMutationsBestEffort(MountContext* c, const wchar_t* origin)
     bool require_canonical_gate = false;
     std::string final_commit_stage;
     std::uint64_t commit_timeout_budget_seconds = 0;
+    std::uint64_t pending_mutations_before = 0;
+    std::uint64_t pending_payload_bytes_before = 0;
     const auto commit_started_tick = static_cast<std::uint64_t>(GetTickCount64());
     {
         std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
         const auto pending_payload_bytes = c->metadata_store
             ? c->metadata_store->PendingPayloadByteEstimate()
+            : 0;
+        pending_payload_bytes_before = pending_payload_bytes;
+        pending_mutations_before = c->metadata_store
+            ? static_cast<std::uint64_t>(c->metadata_store->PendingMutationCount())
             : 0;
         commit_timeout_budget_seconds = ComputeWriteCommitTimeoutBudgetSeconds(
             c->args.write_commit_timeout_seconds,
@@ -4549,6 +4751,15 @@ NTSTATUS CommitNativeMutationsBestEffort(MountContext* c, const wchar_t* origin)
     const auto commit_duration_ms = commit_finished_tick >= commit_started_tick
         ? commit_finished_tick - commit_started_tick
         : 0;
+    if (IsPerfCountersEnabled())
+    {
+        ResolveNativeCommitOriginCounter(*c, origin).Observe(
+            commit_status == apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+            commit_status == apfsaccess::rw::MetadataStore::CommitStatus::NothingToCommit,
+            commit_duration_ms,
+            pending_mutations_before,
+            pending_payload_bytes_before);
+    }
     const auto commit_timed_out = c->commit_timeout_latched.exchange(false, std::memory_order_relaxed);
     if (IsHostCommitTraceEnabled())
     {
@@ -4720,19 +4931,25 @@ bool ClearStaleNativeDirtyMarkerIfClean(MountContext* c)
     return true;
 }
 
+NTSTATUS DrainNativeMutationsByPolicy(
+    MountContext* c,
+    const wchar_t* origin,
+    bool has_delete_plans = false,
+    bool namespace_boundary = false)
+{
+    const auto urgency = ClassifyNativeCommitRequest(c, origin, has_delete_plans, namespace_boundary);
+    if (urgency == NativeCommitUrgency::None)
+    {
+        (void)ClearStaleNativeDirtyMarkerIfClean(c);
+        return STATUS_SUCCESS;
+    }
+
+    return CommitNativeMutationsBestEffort(c, origin);
+}
+
 NTSTATUS CommitNativeMutationsOnFlushBestEffort(MountContext* c)
 {
-    if (!c || !IsNativeWriteEnabled(c))
-    {
-        return STATUS_SUCCESS;
-    }
-
-    if (!HasPendingNativeMutations(c))
-    {
-        return STATUS_SUCCESS;
-    }
-
-    return CommitNativeMutationsBestEffort(c, L"Flush");
+    return DrainNativeMutationsByPolicy(c, L"Flush");
 }
 
 void FinalizeMutationJournalBestEffort(MountContext* c, const wchar_t* origin)
@@ -6559,7 +6776,7 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
         0,
         0,
         replace_if_exists != FALSE);
-    const auto native_commit_status = CommitNativeMutationsBestEffort(c, L"Rename");
+    const auto native_commit_status = DrainNativeMutationsByPolicy(c, L"Rename", false, true);
     if (!NT_SUCCESS(native_commit_status))
     {
         std::lock_guard<std::mutex> lock(c->mutex);
@@ -6914,7 +7131,7 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
         }
         else
         {
-            const auto close_commit_status = CommitNativeMutationsBestEffort(c, L"Close");
+            const auto close_commit_status = DrainNativeMutationsByPolicy(c, L"Close", !delete_plans.empty(), false);
             if (!NT_SUCCESS(close_commit_status))
             {
                 std::wcerr << L"[FsHost] RW native-commit warning (Close): finalize-on-close commit failed with status 0x"
@@ -8059,7 +8276,7 @@ int wmain(int argc, wchar_t** argv)
 #ifdef APFSACCESS_HAS_RW_ENGINE
     if (args.readwrite)
     {
-        const auto shutdown_commit_status = CommitNativeMutationsBestEffort(&ctx, L"Shutdown");
+        const auto shutdown_commit_status = DrainNativeMutationsByPolicy(&ctx, L"Shutdown");
         if (!NT_SUCCESS(shutdown_commit_status))
         {
             std::wcerr << L"[FsHost] RW native-commit warning (Shutdown): final commit failed with status 0x"

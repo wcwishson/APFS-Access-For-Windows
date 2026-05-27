@@ -89,6 +89,8 @@ function Add-BenchmarkMetric {
         [hashtable]$Results,
         [string]$Name,
         [TimeSpan]$Elapsed,
+        [Nullable[double]]$OperationStartLatencyMs = $null,
+        [Nullable[double]]$FirstByteLatencyMs = $null,
         [UInt64]$Bytes = 0,
         [int]$Files = 0,
         [object]$Detail = $null,
@@ -102,6 +104,8 @@ function Add-BenchmarkMetric {
     $metric = [ordered]@{
         name = $Name
         elapsedMs = [Math]::Round($Elapsed.TotalMilliseconds, 3)
+        operationStartLatencyMs = if ($null -eq $OperationStartLatencyMs) { $null } else { [Math]::Round([double]$OperationStartLatencyMs, 3) }
+        firstByteLatencyMs = if ($null -eq $FirstByteLatencyMs) { $null } else { [Math]::Round([double]$FirstByteLatencyMs, 3) }
         bytes = $Bytes
         files = $Files
         megabytesPerSecond = if ($Bytes -gt 0) { [Math]::Round(($Bytes / 1MB) / $elapsedSeconds, 3) } else { $null }
@@ -1127,6 +1131,8 @@ function Invoke-PerformanceBenchmark {
         param(
             [string]$Name,
             [TimeSpan]$Elapsed,
+            [Nullable[double]]$OperationStartLatencyMs = $null,
+            [Nullable[double]]$FirstByteLatencyMs = $null,
             [UInt64]$Bytes = 0,
             [int]$Files = 0,
             [object]$StatusBefore = $null,
@@ -1140,6 +1146,8 @@ function Invoke-PerformanceBenchmark {
             -Results $results `
             -Name $Name `
             -Elapsed $Elapsed `
+            -OperationStartLatencyMs $OperationStartLatencyMs `
+            -FirstByteLatencyMs $FirstByteLatencyMs `
             -Bytes $Bytes `
             -Files $Files `
             -StatusBefore $StatusBefore `
@@ -1147,6 +1155,79 @@ function Invoke-PerformanceBenchmark {
             -Sha256SampleCount $Sha256SampleCount `
             -Sha256MismatchCount $Sha256MismatchCount `
             -Detail $Detail
+    }
+
+    function Measure-ObservableCopy {
+        param(
+            [string]$SourcePath,
+            [string]$DestinationPath,
+            [string]$FirstBytePath = "",
+            [switch]$Recurse,
+            [int]$TimeoutSeconds = 600,
+            [int]$PollMilliseconds = 25
+        )
+
+        $lengthPath = if ([string]::IsNullOrWhiteSpace($FirstBytePath)) { $DestinationPath } else { $FirstBytePath }
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $operationStartLatencyMs = $null
+        $firstByteLatencyMs = $null
+        $job = Start-Job -ScriptBlock {
+            param(
+                [string]$Source,
+                [string]$Destination,
+                [bool]$Recursive
+            )
+
+            if ($Recursive) {
+                Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force
+            }
+            else {
+                Copy-Item -LiteralPath $Source -Destination $Destination -Force
+            }
+        } -ArgumentList $SourcePath, $DestinationPath, [bool]$Recurse
+
+        try {
+            $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSeconds))
+            $pollDelay = [Math]::Max(10, $PollMilliseconds)
+            while ($job.State -eq "Running" -and (Get-Date) -lt $deadline) {
+                if ($null -eq $operationStartLatencyMs -and (Test-Path -LiteralPath $DestinationPath)) {
+                    $operationStartLatencyMs = $watch.Elapsed.TotalMilliseconds
+                }
+                if ($null -eq $firstByteLatencyMs -and (Test-Path -LiteralPath $lengthPath)) {
+                    $item = Get-Item -LiteralPath $lengthPath -ErrorAction SilentlyContinue
+                    if ($null -ne $item -and -not $item.PSIsContainer -and [UInt64]$item.Length -gt 0) {
+                        $firstByteLatencyMs = $watch.Elapsed.TotalMilliseconds
+                    }
+                }
+                Start-Sleep -Milliseconds $pollDelay
+            }
+
+            if (-not (Wait-Job -Job $job -Timeout 1)) {
+                throw "Timed out waiting for copy operation to finish: $SourcePath -> $DestinationPath"
+            }
+
+            Receive-Job -Job $job -ErrorAction Stop | Out-Null
+        }
+        finally {
+            $watch.Stop()
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+
+        if ($null -eq $operationStartLatencyMs -and (Test-Path -LiteralPath $DestinationPath)) {
+            $operationStartLatencyMs = $watch.Elapsed.TotalMilliseconds
+        }
+        if ($null -eq $firstByteLatencyMs -and (Test-Path -LiteralPath $lengthPath)) {
+            $item = Get-Item -LiteralPath $lengthPath -ErrorAction SilentlyContinue
+            if ($null -ne $item -and -not $item.PSIsContainer -and [UInt64]$item.Length -gt 0) {
+                $firstByteLatencyMs = $watch.Elapsed.TotalMilliseconds
+            }
+        }
+
+        return [ordered]@{
+            elapsed = $watch.Elapsed
+            operationStartLatencyMs = $operationStartLatencyMs
+            firstByteLatencyMs = $firstByteLatencyMs
+        }
     }
 
     function Assert-SampledSmallFiles {
@@ -1208,15 +1289,15 @@ function Invoke-PerformanceBenchmark {
         New-PatternFile -Path $largeSource -Bytes $effectiveLargeFileBytes -Seed 301
 
         $largeCopyInBefore = Get-PerformanceStatusSnapshot -Label "large-copy-in before"
-        $largeCopyInElapsed = Measure-Phase {
-            Copy-Item -LiteralPath $largeSource -Destination $largeApfs -Force
-            Wait-Size -Path $largeApfs -Size $effectiveLargeFileBytes -Seconds 600 | Out-Null
-        }
+        $largeCopyInTiming = Measure-ObservableCopy -SourcePath $largeSource -DestinationPath $largeApfs
+        Wait-Size -Path $largeApfs -Size $effectiveLargeFileBytes -Seconds 600 | Out-Null
         $largeCopyInHash = Assert-HashEqual -ExpectedPath $largeSource -ActualPath $largeApfs -Label "performance large-copy-in"
         $largeCopyInAfter = Get-PerformanceStatusSnapshot -Label "large-copy-in after"
         Add-PerformanceMetric `
             -Name "large-copy-in" `
-            -Elapsed $largeCopyInElapsed `
+            -Elapsed $largeCopyInTiming.elapsed `
+            -OperationStartLatencyMs $largeCopyInTiming.operationStartLatencyMs `
+            -FirstByteLatencyMs $largeCopyInTiming.firstByteLatencyMs `
             -Bytes $effectiveLargeFileBytes `
             -Files 1 `
             -StatusBefore $largeCopyInBefore `
@@ -1227,15 +1308,15 @@ function Invoke-PerformanceBenchmark {
         Add-Phase -Results $results -Name "large-copy-in" -State "passed"
 
         $largeCopyBackBefore = Get-PerformanceStatusSnapshot -Label "large-copy-back before"
-        $largeCopyBackElapsed = Measure-Phase {
-            Copy-Item -LiteralPath $largeApfs -Destination $largeRoundTrip -Force
-            Wait-Size -Path $largeRoundTrip -Size $effectiveLargeFileBytes -Seconds 600 | Out-Null
-        }
+        $largeCopyBackTiming = Measure-ObservableCopy -SourcePath $largeApfs -DestinationPath $largeRoundTrip
+        Wait-Size -Path $largeRoundTrip -Size $effectiveLargeFileBytes -Seconds 600 | Out-Null
         Assert-HashEqual -ExpectedPath $largeSource -ActualPath $largeRoundTrip -Label "performance large-copy-back" | Out-Null
         $largeCopyBackAfter = Get-PerformanceStatusSnapshot -Label "large-copy-back after"
         Add-PerformanceMetric `
             -Name "large-copy-back" `
-            -Elapsed $largeCopyBackElapsed `
+            -Elapsed $largeCopyBackTiming.elapsed `
+            -OperationStartLatencyMs $largeCopyBackTiming.operationStartLatencyMs `
+            -FirstByteLatencyMs $largeCopyBackTiming.firstByteLatencyMs `
             -Bytes $effectiveLargeFileBytes `
             -Files 1 `
             -StatusBefore $largeCopyBackBefore `
@@ -1279,16 +1360,22 @@ function Invoke-PerformanceBenchmark {
             -Sha256SampleCount $sampleMap.Count `
             -Detail ([ordered]@{ sourceRoot = $smallNtfsSource })
 
-        $smallCopyInBefore = Get-PerformanceStatusSnapshot -Label "small-copy-in before"
-        $smallCopyInElapsed = Measure-Phase {
-            Copy-Item -LiteralPath $smallNtfsSource -Destination $smallApfsDestination -Recurse -Force
-            Wait-Path -Path $smallApfsDestination -Seconds 120 | Out-Null
+        $smallFirstRelativePath = ""
+        foreach ($entry in $sampleMap.GetEnumerator()) {
+            $smallFirstRelativePath = [string]$entry.Key
+            break
         }
+        $smallCopyInBefore = Get-PerformanceStatusSnapshot -Label "small-copy-in before"
+        $smallCopyInFirstBytePath = if ([string]::IsNullOrWhiteSpace($smallFirstRelativePath)) { "" } else { Join-Path $smallApfsDestination $smallFirstRelativePath }
+        $smallCopyInTiming = Measure-ObservableCopy -SourcePath $smallNtfsSource -DestinationPath $smallApfsDestination -FirstBytePath $smallCopyInFirstBytePath -Recurse -TimeoutSeconds 120
+        Wait-Path -Path $smallApfsDestination -Seconds 120 | Out-Null
         $smallCopyInMismatchCount = Assert-SampledSmallFiles -SourceRoot $smallNtfsSource -DestinationRoot $smallApfsDestination -Label "small-copy-in"
         $smallCopyInAfter = Get-PerformanceStatusSnapshot -Label "small-copy-in after"
         Add-PerformanceMetric `
             -Name "small-copy-in" `
-            -Elapsed $smallCopyInElapsed `
+            -Elapsed $smallCopyInTiming.elapsed `
+            -OperationStartLatencyMs $smallCopyInTiming.operationStartLatencyMs `
+            -FirstByteLatencyMs $smallCopyInTiming.firstByteLatencyMs `
             -Bytes $smallCreateMetric.bytes `
             -Files $effectiveFileCount `
             -StatusBefore $smallCopyInBefore `
@@ -1299,15 +1386,16 @@ function Invoke-PerformanceBenchmark {
         Add-Phase -Results $results -Name "small-copy-in" -State "passed" -Detail ([ordered]@{ files = $effectiveFileCount; sampleCount = $sampleMap.Count })
 
         $smallCopyBackBefore = Get-PerformanceStatusSnapshot -Label "small-copy-back before"
-        $smallCopyBackElapsed = Measure-Phase {
-            Copy-Item -LiteralPath $smallApfsDestination -Destination $smallNtfsRoundTrip -Recurse -Force
-            Wait-Path -Path $smallNtfsRoundTrip -Seconds 120 | Out-Null
-        }
+        $smallCopyBackFirstBytePath = if ([string]::IsNullOrWhiteSpace($smallFirstRelativePath)) { "" } else { Join-Path $smallNtfsRoundTrip $smallFirstRelativePath }
+        $smallCopyBackTiming = Measure-ObservableCopy -SourcePath $smallApfsDestination -DestinationPath $smallNtfsRoundTrip -FirstBytePath $smallCopyBackFirstBytePath -Recurse -TimeoutSeconds 120
+        Wait-Path -Path $smallNtfsRoundTrip -Seconds 120 | Out-Null
         $smallCopyBackMismatchCount = Assert-SampledSmallFiles -SourceRoot $smallNtfsSource -DestinationRoot $smallNtfsRoundTrip -Label "small-copy-back"
         $smallCopyBackAfter = Get-PerformanceStatusSnapshot -Label "small-copy-back after"
         Add-PerformanceMetric `
             -Name "small-copy-back" `
-            -Elapsed $smallCopyBackElapsed `
+            -Elapsed $smallCopyBackTiming.elapsed `
+            -OperationStartLatencyMs $smallCopyBackTiming.operationStartLatencyMs `
+            -FirstByteLatencyMs $smallCopyBackTiming.firstByteLatencyMs `
             -Bytes $smallCreateMetric.bytes `
             -Files $effectiveFileCount `
             -StatusBefore $smallCopyBackBefore `

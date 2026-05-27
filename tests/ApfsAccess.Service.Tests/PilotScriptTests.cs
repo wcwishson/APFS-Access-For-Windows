@@ -260,6 +260,10 @@ public sealed class PilotScriptTests
 
         Assert.Contains("function Measure-Phase", script);
         Assert.Contains("elapsedMs", script);
+        Assert.Contains("operationStartLatencyMs", script);
+        Assert.Contains("firstByteLatencyMs", script);
+        Assert.Contains("[Nullable[double]]$OperationStartLatencyMs = $null", script);
+        Assert.Contains("[Nullable[double]]$FirstByteLatencyMs = $null", script);
         Assert.Contains("megabytesPerSecond", script);
         Assert.Contains("filesPerSecond", script);
         Assert.Contains("sha256MismatchCount", script);
@@ -271,6 +275,26 @@ public sealed class PilotScriptTests
         Assert.Contains("Add-BenchmarkMetric -Results $results -Name \"storm-create-copy\"", script);
         Assert.Contains("Add-BenchmarkMetric -Results $results -Name \"large-file-roundtrip\"", script);
         Assert.Contains("$Results.benchmarks += $metric", script);
+    }
+
+    [Fact]
+    public void PhysicalRwValidation_PerformanceModeSamplesCopyStartAndFirstByteLatency()
+    {
+        var script = File.ReadAllText(Path.Combine(RepoRoot, "scripts", "run_physical_rw_validation.ps1"));
+
+        Assert.Contains("function Measure-ObservableCopy", script);
+        Assert.Contains("Start-Job -ScriptBlock", script);
+        Assert.Contains("operationStartLatencyMs = $operationStartLatencyMs", script);
+        Assert.Contains("firstByteLatencyMs = $firstByteLatencyMs", script);
+        Assert.Contains("Test-Path -LiteralPath $DestinationPath", script);
+        Assert.Contains("[UInt64]$item.Length -gt 0", script);
+        Assert.Contains("Measure-ObservableCopy -SourcePath $largeSource -DestinationPath $largeApfs", script);
+        Assert.Contains("-OperationStartLatencyMs $largeCopyInTiming.operationStartLatencyMs", script);
+        Assert.Contains("-FirstByteLatencyMs $largeCopyInTiming.firstByteLatencyMs", script);
+        Assert.Contains("Measure-ObservableCopy -SourcePath $smallNtfsSource -DestinationPath $smallApfsDestination", script);
+        Assert.Contains("-FirstBytePath $smallCopyInFirstBytePath -Recurse", script);
+        Assert.Contains("Measure-ObservableCopy -SourcePath $smallApfsDestination -DestinationPath $smallNtfsRoundTrip", script);
+        Assert.Contains("-FirstBytePath $smallCopyBackFirstBytePath -Recurse", script);
     }
 
     [Fact]

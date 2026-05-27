@@ -7,6 +7,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string_view>
 #include <utility>
@@ -386,6 +387,11 @@ bool BlockDevice::ReadInto(
 
 bool BlockDevice::Write(std::uint64_t offset_bytes, const std::vector<std::byte>& buffer)
 {
+    return Write(offset_bytes, std::span<const std::byte>(buffer.data(), buffer.size()));
+}
+
+bool BlockDevice::Write(std::uint64_t offset_bytes, std::span<const std::byte> buffer)
+{
     ScopedPerfTimer perf_scope(write_perf_, static_cast<std::uint64_t>(buffer.size()));
     perf_scope.SetSecondary(unaligned_write_perf_);
 
@@ -455,10 +461,7 @@ bool BlockDevice::Write(std::uint64_t offset_bytes, const std::vector<std::byte>
         {
             return false;
         }
-        std::copy(
-            buffer.begin(),
-            buffer.end(),
-            scratch.begin() + static_cast<std::vector<std::byte>::difference_type>(prefix_bytes));
+        std::copy(buffer.begin(), buffer.end(), scratch.begin() + static_cast<std::ptrdiff_t>(prefix_bytes));
         write_buffer = scratch.data();
         write_size = scratch.size();
     }

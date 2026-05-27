@@ -14,6 +14,8 @@
 #include <iostream>
 #include <set>
 #include <limits>
+#include <memory>
+#include <span>
 #include <sstream>
 #include <unordered_set>
 #include <utility>
@@ -6004,10 +6006,12 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         return fail_commit(CommitStatus::InvariantFailed, "post-allocation-preflight-failed");
     }
 
-    struct PendingPayloadWrite
+    struct PendingPayloadWriteView
     {
         std::uint64_t physical_address = 0;
-        std::vector<std::byte> bytes;
+        std::shared_ptr<std::vector<std::byte>> payload;
+        std::size_t offset = 0;
+        std::size_t length = 0;
     };
 
     std::unordered_set<std::wstring> payload_paths;
@@ -6094,7 +6098,7 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         }
     }
 
-    std::vector<PendingPayloadWrite> pending_payload_writes;
+    std::vector<PendingPayloadWriteView> pending_payload_writes;
     pending_payload_writes.reserve(payload_paths.size());
     for (const auto& payload_path : payload_paths)
     {
@@ -6125,16 +6129,16 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
             rollback_commit_extent_stage();
             return fail_commit(CommitStatus::PersistFailed, "payload-provider-unresolved");
         }
-        auto payload_bytes = std::move(resolved.value());
+        auto payload_bytes = std::make_shared<std::vector<std::byte>>(std::move(resolved.value()));
 
         const auto logical_size = static_cast<std::size_t>(inode->logical_size);
-        if (payload_bytes.size() < logical_size)
+        if (payload_bytes->size() < logical_size)
         {
-            payload_bytes.resize(logical_size, std::byte{0});
+            payload_bytes->resize(logical_size, std::byte{0});
         }
-        else if (payload_bytes.size() > logical_size)
+        else if (payload_bytes->size() > logical_size)
         {
-            payload_bytes.resize(logical_size);
+            payload_bytes->resize(logical_size);
         }
 
         std::vector<FileExtent> payload_extents;
@@ -6183,22 +6187,33 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
 
             const auto slice_offset = static_cast<std::size_t>(extent.logical_offset);
             const auto slice_bytes = static_cast<std::size_t>(extent_logical_bytes);
-            if (slice_offset > payload_bytes.size() ||
-                slice_bytes > (payload_bytes.size() - slice_offset))
+            if (slice_offset > payload_bytes->size() ||
+                slice_bytes > (payload_bytes->size() - slice_offset))
             {
                 rollback_commit_extent_stage();
                 return fail_commit(CommitStatus::PersistFailed, "payload-extent-slice-invalid");
             }
 
-            pending_payload_writes.push_back(PendingPayloadWrite
-            {
+            pending_payload_writes.push_back(PendingPayloadWriteView{
                 extent.physical_address,
-                std::vector<std::byte>(
-                    payload_bytes.begin() + static_cast<std::vector<std::byte>::difference_type>(slice_offset),
-                    payload_bytes.begin() + static_cast<std::vector<std::byte>::difference_type>(slice_offset + slice_bytes)),
+                payload_bytes,
+                slice_offset,
+                slice_bytes,
             });
         }
     }
+
+    std::sort(
+        pending_payload_writes.begin(),
+        pending_payload_writes.end(),
+        [](const PendingPayloadWriteView& lhs, const PendingPayloadWriteView& rhs)
+        {
+            if (lhs.physical_address == rhs.physical_address)
+            {
+                return lhs.length < rhs.length;
+            }
+            return lhs.physical_address < rhs.physical_address;
+        });
 
     if (!AllowCommitStage("before-device-write"))
     {
@@ -6212,13 +6227,85 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         return CommitStatus::PersistFailed;
     }
 
-    for (const auto& payload_write : pending_payload_writes)
+    std::vector<std::byte> merged_payload_scratch;
+    for (std::size_t write_index = 0; write_index < pending_payload_writes.size();)
     {
-        if (!device_.Write(payload_write.physical_address, payload_write.bytes))
+        const auto& first_write = pending_payload_writes[write_index];
+        if (first_write.length > static_cast<std::size_t>(std::numeric_limits<std::uint64_t>::max() - first_write.physical_address))
         {
             rollback_commit_extent_stage();
             return fail_commit(CommitStatus::PersistFailed, "payload-device-write-failed");
         }
+
+        auto physical_end = first_write.physical_address + static_cast<std::uint64_t>(first_write.length);
+        std::size_t merge_end = write_index + 1;
+        while (merge_end < pending_payload_writes.size())
+        {
+            const auto& next_write = pending_payload_writes[merge_end];
+            if (next_write.physical_address != physical_end ||
+                next_write.length > static_cast<std::size_t>(std::numeric_limits<std::uint64_t>::max() - physical_end))
+            {
+                break;
+            }
+            const auto next_physical_end = physical_end + static_cast<std::uint64_t>(next_write.length);
+            if ((next_physical_end - first_write.physical_address) > static_cast<std::uint64_t>(std::numeric_limits<DWORD>::max()))
+            {
+                break;
+            }
+            physical_end = next_physical_end;
+            ++merge_end;
+        }
+
+        bool wrote_payload = false;
+        if (merge_end == write_index + 1)
+        {
+            if (first_write.payload &&
+                first_write.offset <= first_write.payload->size() &&
+                first_write.length <= (first_write.payload->size() - first_write.offset))
+            {
+                wrote_payload = device_.Write(
+                    first_write.physical_address,
+                    std::span<const std::byte>(
+                        first_write.payload->data() + static_cast<std::ptrdiff_t>(first_write.offset),
+                        first_write.length));
+            }
+        }
+        else
+        {
+            const auto merged_bytes_u64 = physical_end - first_write.physical_address;
+            if (merged_bytes_u64 <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+            {
+                merged_payload_scratch.clear();
+                merged_payload_scratch.reserve(static_cast<std::size_t>(merged_bytes_u64));
+                for (std::size_t current = write_index; current < merge_end; ++current)
+                {
+                    const auto& segment = pending_payload_writes[current];
+                    if (!segment.payload ||
+                        segment.offset > segment.payload->size() ||
+                        segment.length > (segment.payload->size() - segment.offset))
+                    {
+                        merged_payload_scratch.clear();
+                        break;
+                    }
+                    merged_payload_scratch.insert(
+                        merged_payload_scratch.end(),
+                        segment.payload->begin() + static_cast<std::ptrdiff_t>(segment.offset),
+                        segment.payload->begin() + static_cast<std::ptrdiff_t>(segment.offset + segment.length));
+                }
+                if (merged_payload_scratch.size() == static_cast<std::size_t>(merged_bytes_u64))
+                {
+                    wrote_payload = device_.Write(first_write.physical_address, merged_payload_scratch);
+                }
+            }
+        }
+
+        if (!wrote_payload)
+        {
+            rollback_commit_extent_stage();
+            return fail_commit(CommitStatus::PersistFailed, "payload-device-write-failed");
+        }
+
+        write_index = merge_end;
     }
 
     if (!AllowCommitStage("before-commit-blob-device-write"))

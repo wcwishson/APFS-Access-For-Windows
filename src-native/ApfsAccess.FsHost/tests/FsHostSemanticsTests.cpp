@@ -4558,6 +4558,99 @@ bool TestCloseSkipsNativeCommitWhenMetadataIsClean()
 #endif
 }
 
+bool TestStatusFileIncludesCommitOriginPerformanceCounters()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    SetEnvironmentVariableW(L"APFSACCESS_PERF_COUNTERS", L"1");
+    ScopeExit clear_perf_env{[]()
+    {
+        SetEnvironmentVariableW(L"APFSACCESS_PERF_COUNTERS", nullptr);
+    }};
+
+    MountContext context{};
+    context.args.readwrite = true;
+    context.args.write_backend = L"Native";
+    context.args.write_recovery_policy = L"FailClosed";
+    context.native_write_enabled = true;
+    context.overlay_write_enabled = false;
+    context.pending_native_writes = true;
+    context.test_force_native_mutation_staging_success = true;
+    context.test_forced_native_commit_status = apfsaccess::rw::MetadataStore::CommitStatus::Committed;
+
+    std::error_code ec;
+    const auto status_root = std::filesystem::temp_directory_path(ec) / "ApfsAccess" / "fs-host-semantics";
+    if (ec)
+    {
+        return Require(false, "Commit-origin status test should resolve temp directory");
+    }
+    std::filesystem::create_directories(status_root, ec);
+    if (ec)
+    {
+        return Require(false, "Commit-origin status test should create status directory");
+    }
+    context.args.status_file = (status_root / (L"commit-origin-" + std::to_wstring(GetTickCount64()) + L".json")).wstring();
+    context.recovery_marker_file = status_root / (L"commit-origin-" + std::to_wstring(GetTickCount64()) + L".state");
+
+    const auto status = CommitNativeMutationsBestEffort(&context, L"Flush");
+    if (!Require(status == STATUS_SUCCESS, "Forced commit-origin test commit should succeed"))
+    {
+        std::filesystem::remove(context.args.status_file, ec);
+        std::filesystem::remove(context.recovery_marker_file, ec);
+        return false;
+    }
+
+    std::ifstream in(context.args.status_file, std::ios::binary);
+    const auto status_json = std::string{
+        std::istreambuf_iterator<char>(in),
+        std::istreambuf_iterator<char>()};
+    const auto ok =
+        Require(status_json.find("\"performance\":") != std::string::npos, "Status file should include performance payload when counters are enabled") &&
+        Require(status_json.find("\"commitOrigins\":") != std::string::npos, "Status file should include commit-origin counters") &&
+        Require(status_json.find("\"Flush\"") != std::string::npos, "Commit-origin counters should include Flush origin") &&
+        Require(status_json.find("\"attempts\":1") != std::string::npos, "Flush commit-origin counter should record one attempt") &&
+        Require(status_json.find("\"committed\":1") != std::string::npos, "Flush commit-origin counter should record one committed result");
+
+    std::filesystem::remove(context.args.status_file, ec);
+    std::filesystem::remove(context.recovery_marker_file, ec);
+    return ok;
+#else
+    return true;
+#endif
+}
+
+bool TestNativeCommitPolicyClassifiesSafetyBoundaries()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    MountContext context{};
+    context.args.readwrite = true;
+    context.args.write_backend = L"Native";
+    context.args.write_recovery_policy = L"FailClosed";
+    context.native_write_enabled = true;
+    context.overlay_write_enabled = false;
+    context.pending_native_writes = true;
+    context.test_force_native_mutation_staging_success = true;
+
+    return
+        Require(
+            ClassifyNativeCommitRequest(&context, L"Flush", false, false) == NativeCommitUrgency::UserFlushMustCommit,
+            "Flush should classify as a user durability boundary") &&
+        Require(
+            ClassifyNativeCommitRequest(&context, L"Rename", false, true) == NativeCommitUrgency::NamespaceBoundaryMustCommit,
+            "Rename should classify as a namespace durability boundary") &&
+        Require(
+            ClassifyNativeCommitRequest(&context, L"Close", true, false) == NativeCommitUrgency::DeleteBoundaryMustCommit,
+            "Delete-on-close should classify as a delete durability boundary") &&
+        Require(
+            ClassifyNativeCommitRequest(&context, L"DirtyLimit", false, false) == NativeCommitUrgency::DirtyLimitMustCommit,
+            "Dirty-limit drains should classify as a forced safety boundary") &&
+        Require(
+            ClassifyNativeCommitRequest(&context, L"Close", false, false) == NativeCommitUrgency::FileContentCloseCanDelay,
+            "Plain close should be identified as the future coalescing candidate");
+#else
+    return true;
+#endif
+}
+
 bool TestCloseStagesNativeSubtreeDeleteBottomUp()
 {
 #ifdef APFSACCESS_HAS_RW_ENGINE
@@ -9150,6 +9243,14 @@ bool RunSelectedTest(const std::string& name)
     if (name == "close-skips-native-commit-when-metadata-clean")
     {
         return TestCloseSkipsNativeCommitWhenMetadataIsClean();
+    }
+    if (name == "status-file-commit-origin-performance-counters")
+    {
+        return TestStatusFileIncludesCommitOriginPerformanceCounters();
+    }
+    if (name == "native-commit-policy-classifies-safety-boundaries")
+    {
+        return TestNativeCommitPolicyClassifiesSafetyBoundaries();
     }
     if (name == "native-subtree-delete-bottom-up")
     {
