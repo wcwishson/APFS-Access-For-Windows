@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -225,6 +226,11 @@ public:
     void SetCommitStageHook(std::function<bool(std::string_view stage)> hook);
     void SetFilePayloadProvider(
         std::function<std::optional<std::vector<std::byte>>(const std::wstring& path, std::uint64_t logical_size)> provider);
+    void SetFilePayloadRangeProvider(
+        std::function<bool(
+            const std::wstring& path,
+            std::uint64_t offset,
+            std::span<std::byte> destination)> provider);
 
     // Allocation/free-space primitives used by staged native mutations.
     [[nodiscard]] std::optional<std::uint64_t> AllocateExtent(std::uint64_t bytes);
@@ -336,6 +342,10 @@ private:
     [[nodiscard]] bool StageSpacemanDeallocation(std::uint64_t physical_address, std::uint64_t bytes);
     [[nodiscard]] std::optional<std::vector<FileExtent>> AllocateFileExtents(std::uint64_t logical_size);
     [[nodiscard]] std::optional<FileMutationExtents> CommittedFileExtentsForMutation(const InodeRecord& inode) const;
+    [[nodiscard]] bool PendingReadExtentsCoverLogicalRange(
+        std::uint64_t object_id,
+        std::uint64_t offset,
+        std::uint64_t length) const;
     [[nodiscard]] bool StageCommittedFileExtentDeallocations(const FileMutationExtents& extents);
     [[nodiscard]] bool HasPendingSpacemanAllocation(std::uint64_t physical_address, std::uint64_t bytes) const;
     [[nodiscard]] bool ReleasePendingSpacemanAllocation(std::uint64_t physical_address, std::uint64_t bytes);
@@ -447,6 +457,7 @@ private:
     std::vector<BtreeRecord> pending_btree_records_;
     std::function<bool(std::string_view stage)> commit_stage_hook_;
     std::function<std::optional<std::vector<std::byte>>(const std::wstring&, std::uint64_t)> file_payload_provider_;
+    std::function<bool(const std::wstring&, std::uint64_t, std::span<std::byte>)> file_payload_range_provider_;
     std::filesystem::path persistent_state_path_;
     mutable PerfCounter apply_mutation_perf_;
     mutable PerfCounter commit_pending_perf_;

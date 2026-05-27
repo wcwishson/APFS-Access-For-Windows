@@ -5534,7 +5534,13 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
             !committed_read_extents_.contains(inode_ref.object_id) &&
             !working_read_extents_.contains(inode_ref.object_id) &&
             HasPendingSpacemanAllocation(previous_physical, previous_size);
-        if (next_physical == 0 || target_logical_size > previous_size || !previous_extent_is_pending)
+        const auto pending_extents_cover_request = PendingReadExtentsCoverLogicalRange(
+            inode_ref.object_id,
+            request.offset,
+            request.length);
+        if (next_physical == 0 ||
+            target_logical_size > previous_size ||
+            (!previous_extent_is_pending && !pending_extents_cover_request))
         {
             const auto old_extents_were_pending = pending_read_extent_updates_.contains(inode_ref.object_id);
             if (old_extents_were_pending &&
@@ -6009,7 +6015,10 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
     struct PendingPayloadWriteView
     {
         std::uint64_t physical_address = 0;
+        std::wstring path;
         std::shared_ptr<std::vector<std::byte>> payload;
+        std::uint64_t logical_offset = 0;
+        std::uint64_t logical_size = 0;
         std::size_t offset = 0;
         std::size_t length = 0;
     };
@@ -6117,28 +6126,32 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
             return fail_commit(CommitStatus::PersistFailed, "payload-size-overflow");
         }
 
-        if (!file_payload_provider_)
+        if (!file_payload_provider_ && !file_payload_range_provider_)
         {
             rollback_commit_extent_stage();
             return fail_commit(CommitStatus::PersistFailed, "payload-provider-missing");
         }
 
-        auto resolved = file_payload_provider_(inode->full_path, inode->logical_size);
-        if (!resolved.has_value())
+        std::shared_ptr<std::vector<std::byte>> payload_bytes;
+        if (!file_payload_range_provider_)
         {
-            rollback_commit_extent_stage();
-            return fail_commit(CommitStatus::PersistFailed, "payload-provider-unresolved");
-        }
-        auto payload_bytes = std::make_shared<std::vector<std::byte>>(std::move(resolved.value()));
+            auto resolved = file_payload_provider_(inode->full_path, inode->logical_size);
+            if (!resolved.has_value())
+            {
+                rollback_commit_extent_stage();
+                return fail_commit(CommitStatus::PersistFailed, "payload-provider-unresolved");
+            }
+            payload_bytes = std::make_shared<std::vector<std::byte>>(std::move(resolved.value()));
 
-        const auto logical_size = static_cast<std::size_t>(inode->logical_size);
-        if (payload_bytes->size() < logical_size)
-        {
-            payload_bytes->resize(logical_size, std::byte{0});
-        }
-        else if (payload_bytes->size() > logical_size)
-        {
-            payload_bytes->resize(logical_size);
+            const auto logical_size = static_cast<std::size_t>(inode->logical_size);
+            if (payload_bytes->size() < logical_size)
+            {
+                payload_bytes->resize(logical_size, std::byte{0});
+            }
+            else if (payload_bytes->size() > logical_size)
+            {
+                payload_bytes->resize(logical_size);
+            }
         }
 
         std::vector<FileExtent> payload_extents;
@@ -6187,8 +6200,9 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
 
             const auto slice_offset = static_cast<std::size_t>(extent.logical_offset);
             const auto slice_bytes = static_cast<std::size_t>(extent_logical_bytes);
-            if (slice_offset > payload_bytes->size() ||
-                slice_bytes > (payload_bytes->size() - slice_offset))
+            if (payload_bytes &&
+                (slice_offset > payload_bytes->size() ||
+                 slice_bytes > (payload_bytes->size() - slice_offset)))
             {
                 rollback_commit_extent_stage();
                 return fail_commit(CommitStatus::PersistFailed, "payload-extent-slice-invalid");
@@ -6196,7 +6210,10 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
 
             pending_payload_writes.push_back(PendingPayloadWriteView{
                 extent.physical_address,
+                inode->full_path,
                 payload_bytes,
+                extent.logical_offset,
+                inode->logical_size,
                 slice_offset,
                 slice_bytes,
             });
@@ -6226,6 +6243,83 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         rollback_commit_extent_stage();
         return CommitStatus::PersistFailed;
     }
+
+    const auto append_payload_segment = [&](const PendingPayloadWriteView& segment, std::vector<std::byte>& destination) -> bool
+    {
+        const auto original_size = destination.size();
+        if (segment.length > destination.max_size() - original_size)
+        {
+            return false;
+        }
+
+        if (segment.payload)
+        {
+            if (segment.offset > segment.payload->size() ||
+                segment.length > (segment.payload->size() - segment.offset))
+            {
+                return false;
+            }
+            destination.insert(
+                destination.end(),
+                segment.payload->begin() + static_cast<std::ptrdiff_t>(segment.offset),
+                segment.payload->begin() + static_cast<std::ptrdiff_t>(segment.offset + segment.length));
+            return true;
+        }
+
+        if (!file_payload_range_provider_ ||
+            segment.logical_offset > (std::numeric_limits<std::uint64_t>::max() - static_cast<std::uint64_t>(segment.length)))
+        {
+            return false;
+        }
+
+        destination.resize(original_size + segment.length);
+        if (file_payload_range_provider_(
+                segment.path,
+                segment.logical_offset,
+                std::span<std::byte>(destination.data() + static_cast<std::ptrdiff_t>(original_size), segment.length)))
+        {
+            return true;
+        }
+
+        if (!file_payload_provider_)
+        {
+            destination.resize(original_size);
+            return false;
+        }
+
+        auto fallback_payload = file_payload_provider_(segment.path, segment.logical_size);
+        if (!fallback_payload.has_value())
+        {
+            destination.resize(original_size);
+            return false;
+        }
+        if (segment.logical_size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+        {
+            destination.resize(original_size);
+            return false;
+        }
+        auto& fallback = fallback_payload.value();
+        const auto fallback_size = static_cast<std::size_t>(segment.logical_size);
+        if (fallback.size() < fallback_size)
+        {
+            fallback.resize(fallback_size, std::byte{0});
+        }
+        else if (fallback.size() > fallback_size)
+        {
+            fallback.resize(fallback_size);
+        }
+        if (segment.offset > fallback.size() ||
+            segment.length > (fallback.size() - segment.offset))
+        {
+            destination.resize(original_size);
+            return false;
+        }
+        std::copy(
+            fallback.begin() + static_cast<std::ptrdiff_t>(segment.offset),
+            fallback.begin() + static_cast<std::ptrdiff_t>(segment.offset + segment.length),
+            destination.begin() + static_cast<std::ptrdiff_t>(original_size));
+        return true;
+    };
 
     std::vector<std::byte> merged_payload_scratch;
     for (std::size_t write_index = 0; write_index < pending_payload_writes.size();)
@@ -6269,6 +6363,15 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
                         first_write.payload->data() + static_cast<std::ptrdiff_t>(first_write.offset),
                         first_write.length));
             }
+            else
+            {
+                merged_payload_scratch.clear();
+                if (append_payload_segment(first_write, merged_payload_scratch) &&
+                    merged_payload_scratch.size() == first_write.length)
+                {
+                    wrote_payload = device_.Write(first_write.physical_address, merged_payload_scratch);
+                }
+            }
         }
         else
         {
@@ -6279,18 +6382,11 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
                 merged_payload_scratch.reserve(static_cast<std::size_t>(merged_bytes_u64));
                 for (std::size_t current = write_index; current < merge_end; ++current)
                 {
-                    const auto& segment = pending_payload_writes[current];
-                    if (!segment.payload ||
-                        segment.offset > segment.payload->size() ||
-                        segment.length > (segment.payload->size() - segment.offset))
+                    if (!append_payload_segment(pending_payload_writes[current], merged_payload_scratch))
                     {
                         merged_payload_scratch.clear();
                         break;
                     }
-                    merged_payload_scratch.insert(
-                        merged_payload_scratch.end(),
-                        segment.payload->begin() + static_cast<std::ptrdiff_t>(segment.offset),
-                        segment.payload->begin() + static_cast<std::ptrdiff_t>(segment.offset + segment.length));
                 }
                 if (merged_payload_scratch.size() == static_cast<std::size_t>(merged_bytes_u64))
                 {
@@ -9661,6 +9757,15 @@ void MetadataStore::SetFilePayloadProvider(
     file_payload_provider_ = std::move(provider);
 }
 
+void MetadataStore::SetFilePayloadRangeProvider(
+    std::function<bool(
+        const std::wstring& path,
+        std::uint64_t offset,
+        std::span<std::byte> destination)> provider)
+{
+    file_payload_range_provider_ = std::move(provider);
+}
+
 std::optional<std::uint64_t> MetadataStore::AllocateExtent(std::uint64_t bytes)
 {
     if (!container_loaded_ || !spaceman_loaded_)
@@ -11153,6 +11258,58 @@ bool MetadataStore::ReleasePendingSpacemanAllocation(std::uint64_t physical_addr
 
         pending_spaceman_allocations_.erase(it);
         return FreeExtent(physical_address, aligned_bytes);
+    }
+
+    return false;
+}
+
+bool MetadataStore::PendingReadExtentsCoverLogicalRange(
+    std::uint64_t object_id,
+    std::uint64_t offset,
+    std::uint64_t length) const
+{
+    if (length == 0)
+    {
+        return true;
+    }
+
+    if (offset > (std::numeric_limits<std::uint64_t>::max() - length))
+    {
+        return false;
+    }
+
+    auto extents_it = pending_read_extent_updates_.find(object_id);
+    if (extents_it == pending_read_extent_updates_.end())
+    {
+        return false;
+    }
+
+    const auto extents = SortFileExtents(extents_it->second);
+    const auto range_end = offset + length;
+    auto covered_until = offset;
+    for (const auto& extent : extents)
+    {
+        if (extent.bytes == 0 ||
+            extent.logical_offset > (std::numeric_limits<std::uint64_t>::max() - extent.bytes))
+        {
+            return false;
+        }
+
+        const auto extent_end = extent.logical_offset + extent.bytes;
+        if (extent_end <= covered_until)
+        {
+            continue;
+        }
+        if (extent.logical_offset > covered_until)
+        {
+            return false;
+        }
+
+        covered_until = std::min(extent_end, range_end);
+        if (covered_until >= range_end)
+        {
+            return true;
+        }
     }
 
     return false;

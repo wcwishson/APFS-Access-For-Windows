@@ -3650,6 +3650,94 @@ std::optional<std::vector<std::byte>> LoadHydratedPayloadForPath(
     return payload;
 }
 
+bool ReadHydratedPayloadRangeForPath(
+    MountContext* c,
+    const std::wstring& path,
+    std::uint64_t offset,
+    std::span<std::byte> destination)
+{
+    if (!c || destination.empty())
+    {
+        return c != nullptr;
+    }
+
+    auto node = FindNode(c, path);
+    if (!node || node->is_directory)
+    {
+        return false;
+    }
+
+    const auto hydrated_file = HydrationPath(c, *node);
+    std::error_code exists_ec;
+    if (!std::filesystem::exists(hydrated_file, exists_ec) || exists_ec)
+    {
+        return false;
+    }
+
+    HANDLE file = CreateFileW(
+        hydrated_file.wstring().c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+    ScopeExit close_file{[&]()
+    {
+        CloseHandle(file);
+    }};
+
+    LARGE_INTEGER file_size{};
+    if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart < 0)
+    {
+        return false;
+    }
+
+    std::fill(destination.begin(), destination.end(), std::byte{0});
+    const auto file_bytes = static_cast<std::uint64_t>(file_size.QuadPart);
+    if (offset >= file_bytes)
+    {
+        return true;
+    }
+
+    const auto available_bytes = file_bytes - offset;
+    auto remaining = static_cast<std::size_t>(std::min<std::uint64_t>(
+        static_cast<std::uint64_t>(destination.size()),
+        available_bytes));
+    std::size_t destination_offset = 0;
+    auto file_offset = offset;
+    while (remaining > 0)
+    {
+        const auto bytes_this_read = static_cast<DWORD>(std::min<std::size_t>(
+            remaining,
+            static_cast<std::size_t>(std::numeric_limits<DWORD>::max())));
+        OVERLAPPED ov{};
+        ov.Offset = static_cast<DWORD>(file_offset & 0xffffffffull);
+        ov.OffsetHigh = static_cast<DWORD>(file_offset >> 32);
+        DWORD bytes_read = 0;
+        if (!ReadFile(
+                file,
+                destination.data() + static_cast<std::ptrdiff_t>(destination_offset),
+                bytes_this_read,
+                &bytes_read,
+                &ov) ||
+            bytes_read != bytes_this_read)
+        {
+            return false;
+        }
+
+        destination_offset += bytes_read;
+        file_offset += bytes_read;
+        remaining -= bytes_read;
+    }
+
+    return true;
+}
+
 bool MergeCommittedInodeStateIntoNodeIndex(MountContext* c)
 {
     ScopedPerfTimer perf_scope(c ? &c->perf_merge_committed_inodes : nullptr);
@@ -8128,6 +8216,13 @@ int wmain(int argc, wchar_t** argv)
                 // Commit callbacks run under metadata locks; avoid on-demand
                 // hydration fallback paths here to prevent lock re-entry.
                 return LoadHydratedPayloadForPath(&ctx, path, logical_size, false);
+            });
+        ctx.metadata_store->SetFilePayloadRangeProvider(
+            [&ctx](const std::wstring& path, std::uint64_t offset, std::span<std::byte> destination) -> bool
+            {
+                // Commit callbacks run under metadata locks; read only the
+                // requested hydrated range and let sparse tail bytes stay zero.
+                return ReadHydratedPayloadRangeForPath(&ctx, path, offset, destination);
             });
         ctx.metadata_store->SetCommitStageHook(
             [&ctx](std::string_view stage) -> bool

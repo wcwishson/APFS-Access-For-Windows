@@ -1599,6 +1599,181 @@ bool TestStreamingLargeCopyWithoutPreallocationCoalescesPendingMetadataConforman
     return ok;
 }
 
+bool TestPendingPreallocationWriteBurstReusesExtentsConformance(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "pending_preallocation_reuse.apfs.img";
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, "PendingPreallocationReuse: unable to create synthetic container");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        L"PendingPreallocationReuse",
+    };
+
+    apfsaccess::rw::MetadataStore store(context);
+    bool ok = true;
+    ok &= Require(store.LoadContainerSuperblocks(), "PendingPreallocationReuse: LoadContainerSuperblocks should succeed");
+    ok &= Require(store.LoadObjectMap(), "PendingPreallocationReuse: LoadObjectMap should succeed");
+    ok &= Require(store.LoadSpacemanState(), "PendingPreallocationReuse: LoadSpacemanState should succeed");
+    ok &= Require(store.PrepareNativeWritePath(), "PendingPreallocationReuse: PrepareNativeWritePath should succeed");
+
+    const auto payload = BuildPatternPayload(64 * 4096, 0x4E);
+    std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
+    ConfigurePayloadProvider(store, staged_payloads);
+
+    apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+    create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+    create_file.path = L"\\burst.bin";
+    ok &= ExpectMutationStatus(
+        store,
+        create_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "PendingPreallocationReuse: create file should apply");
+
+    apfsaccess::rw::MetadataStore::MutationRequest set_size{};
+    set_size.operation = apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize;
+    set_size.path = L"\\burst.bin";
+    set_size.length = payload.size();
+    ok &= ExpectMutationStatus(
+        store,
+        set_size,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "PendingPreallocationReuse: SetFileSize should preallocate the final extent");
+    const auto pending_allocations_after_preallocate = store.PendingAllocationCount();
+    const auto pending_btree_after_preallocate = store.PendingBtreeRecordCount();
+
+    apfsaccess::rw::MetadataStore::MutationRequest write_file{};
+    write_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+    write_file.path = L"\\burst.bin";
+    write_file.length = 4096;
+    for (std::size_t offset = 0; offset < payload.size(); offset += 4096)
+    {
+        write_file.offset = offset;
+        ok &= ExpectMutationStatus(
+            store,
+            write_file,
+            apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "PendingPreallocationReuse: staged write chunk should reuse pending extents");
+        ok &= Require(
+            store.PendingAllocationCount() == pending_allocations_after_preallocate,
+            "PendingPreallocationReuse: writes inside final size should not churn pending allocations");
+    }
+
+    ok &= Require(
+        store.PendingBtreeRecordCount() <= pending_btree_after_preallocate + 2,
+        "PendingPreallocationReuse: writes inside final size should keep pending btree metadata compact");
+    staged_payloads[L"\\burst.bin"] = payload;
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "PendingPreallocationReuse: commit should succeed");
+
+    std::vector<std::byte> committed_payload;
+    ok &= Require(
+        store.ReadCommittedFileRange(L"\\burst.bin", 0, payload.size(), committed_payload),
+        "PendingPreallocationReuse: committed payload should be readable");
+    ok &= Require(
+        committed_payload == payload,
+        "PendingPreallocationReuse: committed payload should match written burst");
+
+    return ok;
+}
+
+bool TestPayloadRangeProviderAvoidsWholeFileProviderConformance(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "payload_range_provider.apfs.img";
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, "PayloadRangeProvider: unable to create synthetic container");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        L"PayloadRangeProvider",
+    };
+
+    apfsaccess::rw::MetadataStore store(context);
+    bool ok = true;
+    ok &= Require(store.LoadContainerSuperblocks(), "PayloadRangeProvider: LoadContainerSuperblocks should succeed");
+    ok &= Require(store.LoadObjectMap(), "PayloadRangeProvider: LoadObjectMap should succeed");
+    ok &= Require(store.LoadSpacemanState(), "PayloadRangeProvider: LoadSpacemanState should succeed");
+    ok &= Require(store.PrepareNativeWritePath(), "PayloadRangeProvider: PrepareNativeWritePath should succeed");
+
+    const auto payload = BuildPatternPayload(96 * 1024, 0xB2);
+    bool whole_file_provider_called = false;
+    std::uint64_t range_bytes_requested = 0;
+    store.SetFilePayloadProvider(
+        [&whole_file_provider_called](const std::wstring&, std::uint64_t) -> std::optional<std::vector<std::byte>>
+        {
+            whole_file_provider_called = true;
+            return std::nullopt;
+        });
+    store.SetFilePayloadRangeProvider(
+        [&payload, &range_bytes_requested](
+            const std::wstring& path,
+            std::uint64_t offset,
+            std::span<std::byte> destination) -> bool
+        {
+            if (path != L"\\range.bin" ||
+                offset > payload.size() ||
+                destination.size() > (payload.size() - static_cast<std::size_t>(offset)))
+            {
+                return false;
+            }
+
+            std::copy_n(
+                payload.data() + static_cast<std::ptrdiff_t>(offset),
+                destination.size(),
+                destination.data());
+            range_bytes_requested += destination.size();
+            return true;
+        });
+
+    apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+    create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+    create_file.path = L"\\range.bin";
+    ok &= ExpectMutationStatus(
+        store,
+        create_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "PayloadRangeProvider: create file should apply");
+
+    apfsaccess::rw::MetadataStore::MutationRequest set_size{};
+    set_size.operation = apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize;
+    set_size.path = L"\\range.bin";
+    set_size.length = payload.size();
+    ok &= ExpectMutationStatus(
+        store,
+        set_size,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "PayloadRangeProvider: SetFileSize should apply");
+
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "PayloadRangeProvider: commit should succeed through range provider");
+    ok &= Require(
+        !whole_file_provider_called,
+        "PayloadRangeProvider: whole-file payload provider should not be called when range provider is available");
+    ok &= Require(
+        range_bytes_requested == payload.size(),
+        "PayloadRangeProvider: range provider should read exactly the committed payload bytes");
+
+    std::vector<std::byte> committed_payload;
+    ok &= Require(
+        store.ReadCommittedFileRange(L"\\range.bin", 0, payload.size(), committed_payload),
+        "PayloadRangeProvider: committed payload should be readable");
+    ok &= Require(
+        committed_payload == payload,
+        "PayloadRangeProvider: committed payload should match range-provided bytes");
+
+    return ok;
+}
+
 bool TestBtreeCanonicalizationConformance(const std::filesystem::path& run_root)
 {
     const auto image_path = run_root / "btree_canonical.apfs.img";
@@ -2496,6 +2671,8 @@ int main()
     ok &= TestLargeSetFileSizeUsesFragmentedFreeExtentsConformance(run_root);
     ok &= TestSequentialWriteBurstCoalescesPendingMetadataConformance(run_root);
     ok &= TestStreamingLargeCopyWithoutPreallocationCoalescesPendingMetadataConformance(run_root);
+    ok &= TestPendingPreallocationWriteBurstReusesExtentsConformance(run_root);
+    ok &= TestPayloadRangeProviderAvoidsWholeFileProviderConformance(run_root);
     ok &= TestBtreeCanonicalizationConformance(run_root);
     ok &= TestCommittedReadExtentsConformance(run_root);
     ok &= TestCommittedZeroReadExtentConformance(run_root);
