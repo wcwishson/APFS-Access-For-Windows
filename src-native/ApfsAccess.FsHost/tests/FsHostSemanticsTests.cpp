@@ -3273,6 +3273,399 @@ bool TestSetFileSizeDefersNativeCommitUntilClose()
 #endif
 }
 
+bool TestDeferredCloseDoesNotCommitImmediatelyWhenEnabled()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", L"1");
+    ScopeExit clear_defer_env{[]()
+    {
+        SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", nullptr);
+    }};
+
+    MountContext context{};
+    if (!ConfigureNativeCommitFailureForUnitTest(context))
+    {
+        return true;
+    }
+    if (!Require(PrepareUnitHydrationRoot(context, L"deferred-close-no-immediate"), "Deferred close test should prepare cache root"))
+    {
+        return false;
+    }
+    if (!Require(ConfigureUnitRecoveryMarker(context, L"deferred-close-no-immediate"), "Deferred close test should configure a recovery marker"))
+    {
+        return false;
+    }
+    ScopeExit cleanup{[&]()
+    {
+        StopDeferredCommitWorker(&context);
+        std::error_code ec;
+        std::filesystem::remove(context.recovery_marker_file, ec);
+        std::filesystem::remove_all(context.session_root, ec);
+    }};
+
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    std::shared_ptr<Node> file;
+    if (!Require(SeedResizableUnitFile(context, file), "Deferred close test should seed hydration file"))
+    {
+        return false;
+    }
+    auto* open_context = new OpenContext();
+    if (!Require(OpenResizableUnitFile(context, file, *open_context), "Deferred close test should open hydration file"))
+    {
+        delete open_context;
+        return false;
+    }
+    open_context->write_open = true;
+    file->open_handle_count = 1;
+    file->write_handle_count = 1;
+
+    auto fs = BuildFileSystem(&context);
+    FSP_FSCTL_FILE_INFO info{};
+    const auto status = CB_SetFileSize(&fs, open_context, 9, FALSE, &info);
+    if (!Require(status == STATUS_SUCCESS, "Deferred close test should stage SetFileSize"))
+    {
+        CloseHandle(open_context->file);
+        open_context->file = INVALID_HANDLE_VALUE;
+        delete open_context;
+        return false;
+    }
+
+    CB_Close(&fs, open_context);
+
+    return Require(
+        context.test_native_commit_attempt_count == 0 &&
+            context.close_commit_deferred.load(std::memory_order_acquire) &&
+            context.pending_native_writes &&
+            context.native_write_enabled,
+        "Opt-in deferred close should not commit immediately and should leave native writes pending");
+#else
+    return true;
+#endif
+}
+
+bool TestDeferredCloseDrainsOnFlushBeforeSuccess()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", L"1");
+    ScopeExit clear_defer_env{[]()
+    {
+        SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", nullptr);
+    }};
+
+    MountContext context{};
+    if (!ConfigureNativeCommitFailureForUnitTest(context))
+    {
+        return true;
+    }
+    if (!Require(PrepareUnitHydrationRoot(context, L"deferred-close-flush-drain"), "Deferred flush test should prepare cache root"))
+    {
+        return false;
+    }
+    if (!Require(ConfigureUnitRecoveryMarker(context, L"deferred-close-flush-drain"), "Deferred flush test should configure a recovery marker"))
+    {
+        return false;
+    }
+    ScopeExit cleanup{[&]()
+    {
+        StopDeferredCommitWorker(&context);
+        std::error_code ec;
+        std::filesystem::remove(context.recovery_marker_file, ec);
+        std::filesystem::remove_all(context.session_root, ec);
+    }};
+
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    std::shared_ptr<Node> file;
+    if (!Require(SeedResizableUnitFile(context, file), "Deferred flush test should seed hydration file"))
+    {
+        return false;
+    }
+
+    auto fs = BuildFileSystem(&context);
+    auto* close_context = new OpenContext();
+    if (!Require(OpenResizableUnitFile(context, file, *close_context), "Deferred flush test should open hydration file"))
+    {
+        delete close_context;
+        return false;
+    }
+    close_context->write_open = true;
+    file->open_handle_count = 1;
+    file->write_handle_count = 1;
+
+    FSP_FSCTL_FILE_INFO info{};
+    const auto status = CB_SetFileSize(&fs, close_context, 9, FALSE, &info);
+    if (!Require(status == STATUS_SUCCESS, "Deferred flush test should stage SetFileSize"))
+    {
+        CloseHandle(close_context->file);
+        close_context->file = INVALID_HANDLE_VALUE;
+        delete close_context;
+        return false;
+    }
+    CB_Close(&fs, close_context);
+    if (!Require(context.test_native_commit_attempt_count == 0, "Deferred flush test should not commit at close"))
+    {
+        return false;
+    }
+
+    OpenContext flush_context{};
+    flush_context.node = file;
+    const auto flush_status = CB_Flush(&fs, &flush_context, &info);
+    return Require(
+        flush_status == STATUS_MEDIA_WRITE_PROTECTED &&
+            context.test_native_commit_attempt_count == 1 &&
+            context.recovery_active &&
+            !context.native_write_enabled,
+        "Flush should synchronously drain deferred close commits before returning");
+#else
+    return true;
+#endif
+}
+
+bool TestDeferredCloseDrainsOnShutdownBeforeSuccess()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", L"1");
+    ScopeExit clear_defer_env{[]()
+    {
+        SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", nullptr);
+    }};
+
+    MountContext context{};
+    context.args.readwrite = true;
+    context.args.write_backend = L"Native";
+    context.args.write_recovery_policy = L"FailClosed";
+    context.native_write_enabled = true;
+    context.overlay_write_enabled = false;
+    context.test_force_native_mutation_staging_success = true;
+    context.test_forced_native_commit_status = apfsaccess::rw::MetadataStore::CommitStatus::Committed;
+
+    if (!Require(PrepareUnitHydrationRoot(context, L"deferred-close-shutdown-drain"), "Deferred shutdown test should prepare cache root"))
+    {
+        return false;
+    }
+    if (!Require(ConfigureUnitRecoveryMarker(context, L"deferred-close-shutdown-drain"), "Deferred shutdown test should configure a recovery marker"))
+    {
+        return false;
+    }
+    ScopeExit cleanup{[&]()
+    {
+        StopDeferredCommitWorker(&context);
+        std::error_code ec;
+        std::filesystem::remove(context.recovery_marker_file, ec);
+        std::filesystem::remove_all(context.session_root, ec);
+    }};
+
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    std::shared_ptr<Node> file;
+    if (!Require(SeedResizableUnitFile(context, file), "Deferred shutdown test should seed hydration file"))
+    {
+        return false;
+    }
+    auto* open_context = new OpenContext();
+    if (!Require(OpenResizableUnitFile(context, file, *open_context), "Deferred shutdown test should open hydration file"))
+    {
+        delete open_context;
+        return false;
+    }
+    open_context->write_open = true;
+    file->open_handle_count = 1;
+    file->write_handle_count = 1;
+
+    auto fs = BuildFileSystem(&context);
+    FSP_FSCTL_FILE_INFO info{};
+    const auto status = CB_SetFileSize(&fs, open_context, 9, FALSE, &info);
+    if (!Require(status == STATUS_SUCCESS, "Deferred shutdown test should stage SetFileSize"))
+    {
+        CloseHandle(open_context->file);
+        open_context->file = INVALID_HANDLE_VALUE;
+        delete open_context;
+        return false;
+    }
+    CB_Close(&fs, open_context);
+    if (!Require(
+            context.test_native_commit_attempt_count == 0 &&
+                context.close_commit_deferred.load(std::memory_order_acquire),
+            "Deferred shutdown test should start with a pending close commit"))
+    {
+        return false;
+    }
+
+    const auto shutdown_status = DrainNativeMutationsByPolicy(&context, L"Shutdown");
+    return Require(
+        shutdown_status == STATUS_SUCCESS &&
+            context.test_native_commit_attempt_count == 1 &&
+            !context.close_commit_deferred.load(std::memory_order_acquire) &&
+            !context.pending_native_writes &&
+            !context.recovery_active &&
+            context.native_write_enabled,
+        "Shutdown should synchronously drain deferred close commits before reporting success");
+#else
+    return true;
+#endif
+}
+
+bool TestDeferredCloseDrainsAtDirtyThreshold()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", L"1");
+    ScopeExit clear_defer_env{[]()
+    {
+        SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", nullptr);
+    }};
+
+    MountContext context{};
+    context.args.readwrite = true;
+    context.args.write_backend = L"Native";
+    context.args.write_recovery_policy = L"FailClosed";
+    context.native_write_enabled = true;
+    context.overlay_write_enabled = false;
+    context.pending_native_writes = true;
+    context.test_force_native_mutation_staging_success = true;
+    context.test_forced_native_commit_status = apfsaccess::rw::MetadataStore::CommitStatus::Committed;
+    context.close_commit_deferred.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(context.deferred_commit_mutex);
+        context.deferred_commit_requested = true;
+    }
+    if (!Require(ConfigureUnitRecoveryMarker(context, L"deferred-close-dirty-limit"), "Deferred dirty-limit test should configure a recovery marker"))
+    {
+        return false;
+    }
+    ScopeExit cleanup{[&]()
+    {
+        StopDeferredCommitWorker(&context);
+        std::error_code ec;
+        std::filesystem::remove(context.recovery_marker_file, ec);
+    }};
+
+    const auto dirty_status = DrainNativeMutationsByPolicy(&context, L"DirtyLimit");
+    return Require(
+        dirty_status == STATUS_SUCCESS &&
+            context.test_native_commit_attempt_count == 1 &&
+            !context.close_commit_deferred.load(std::memory_order_acquire) &&
+            !context.pending_native_writes &&
+            !context.recovery_active,
+        "Dirty-limit drains should clear deferred close state and commit synchronously");
+#else
+    return true;
+#endif
+}
+
+bool TestDeferredCloseDeleteStillCommitsSynchronously()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", L"1");
+    ScopeExit clear_defer_env{[]()
+    {
+        SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", nullptr);
+    }};
+
+    MountContext context{};
+    if (!ConfigureNativeCommitFailureForUnitTest(context))
+    {
+        return true;
+    }
+    if (!Require(PrepareUnitHydrationRoot(context, L"deferred-close-delete-boundary"), "Deferred delete-boundary test should prepare cache root"))
+    {
+        return false;
+    }
+    ScopeExit cleanup{[&]()
+    {
+        StopDeferredCommitWorker(&context);
+        std::error_code ec;
+        std::filesystem::remove_all(context.session_root, ec);
+    }};
+    context.tx_manager = std::make_unique<apfsaccess::rw::TransactionManager>(L"Conservative");
+
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"victim.txt");
+    auto file = MakeNode(L"\\victim.txt", false, false);
+    file->open_handle_count = 1;
+    file->file_size = 4;
+    context.nodes.emplace(Key(file->path), file);
+    const std::vector<std::byte> payload{std::byte{'K'}, std::byte{'E'}, std::byte{'E'}, std::byte{'P'}};
+    if (!Require(WriteFileBytes(HydrationPath(&context, *file), payload), "Deferred delete-boundary test should seed hydration bytes"))
+    {
+        return false;
+    }
+
+    auto fs = BuildFileSystem(&context);
+    auto* open_context = new OpenContext();
+    open_context->node = file;
+    open_context->allow_delete = true;
+    CB_Cleanup(
+        &fs,
+        open_context,
+        const_cast<PWSTR>(L"\\victim.txt"),
+        FspCleanupDelete);
+    CB_Close(&fs, open_context);
+
+    return Require(
+        context.test_native_commit_attempt_count == 1 &&
+            !context.close_commit_deferred.load(std::memory_order_acquire) &&
+            context.recovery_active &&
+            context.nodes.find(Key(L"\\victim.txt")) != context.nodes.end(),
+        "Delete-on-close should remain a synchronous safety boundary when deferred close is enabled");
+#else
+    return true;
+#endif
+}
+
+bool TestDeferredCloseRenameStillCommitsSynchronously()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", L"1");
+    ScopeExit clear_defer_env{[]()
+    {
+        SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", nullptr);
+    }};
+
+    MountContext context{};
+    if (!ConfigureNativeCommitFailureForUnitTest(context))
+    {
+        return true;
+    }
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = context.nodes.at(Key(L"\\"));
+    AddChildName(root->children, L"source.txt");
+    auto source = MakeNode(L"\\source.txt", false, false);
+    context.nodes.emplace(Key(source->path), source);
+
+    auto fs = BuildFileSystem(&context);
+    const auto rename_status = CB_Rename(
+        &fs,
+        nullptr,
+        const_cast<PWSTR>(L"\\source.txt"),
+        const_cast<PWSTR>(L"\\renamed.txt"),
+        FALSE);
+
+    return Require(
+        rename_status == STATUS_MEDIA_WRITE_PROTECTED &&
+            context.test_native_commit_attempt_count == 1 &&
+            !context.close_commit_deferred.load(std::memory_order_acquire) &&
+            context.nodes.find(Key(L"\\source.txt")) != context.nodes.end() &&
+            context.nodes.find(Key(L"\\renamed.txt")) == context.nodes.end(),
+        "Rename should remain a synchronous namespace boundary when deferred close is enabled");
+#else
+    return true;
+#endif
+}
+
 bool TestDeleteOnCloseRestoresLocalNodeWhenNativeCommitFails()
 {
 #ifdef APFSACCESS_HAS_RW_ENGINE
@@ -4608,7 +5001,8 @@ bool TestStatusFileIncludesCommitOriginPerformanceCounters()
         Require(status_json.find("\"commitOrigins\":") != std::string::npos, "Status file should include commit-origin counters") &&
         Require(status_json.find("\"Flush\"") != std::string::npos, "Commit-origin counters should include Flush origin") &&
         Require(status_json.find("\"attempts\":1") != std::string::npos, "Flush commit-origin counter should record one attempt") &&
-        Require(status_json.find("\"committed\":1") != std::string::npos, "Flush commit-origin counter should record one committed result");
+        Require(status_json.find("\"committed\":1") != std::string::npos, "Flush commit-origin counter should record one committed result") &&
+        Require(status_json.find("\"closeCommitDeferred\":false") != std::string::npos, "Status file should include deferred close state");
 
     std::filesystem::remove(context.args.status_file, ec);
     std::filesystem::remove(context.recovery_marker_file, ec);
@@ -9359,6 +9753,30 @@ bool RunSelectedTest(const std::string& name)
     if (name == "set-file-size-defers-native-commit-until-close")
     {
         return TestSetFileSizeDefersNativeCommitUntilClose();
+    }
+    if (name == "deferred-close-does-not-commit-immediately-when-flag-enabled")
+    {
+        return TestDeferredCloseDoesNotCommitImmediatelyWhenEnabled();
+    }
+    if (name == "deferred-close-drains-on-flush-before-success")
+    {
+        return TestDeferredCloseDrainsOnFlushBeforeSuccess();
+    }
+    if (name == "deferred-close-drains-on-shutdown-before-success")
+    {
+        return TestDeferredCloseDrainsOnShutdownBeforeSuccess();
+    }
+    if (name == "deferred-close-drains-at-dirty-threshold")
+    {
+        return TestDeferredCloseDrainsAtDirtyThreshold();
+    }
+    if (name == "deferred-close-delete-still-commits-synchronously")
+    {
+        return TestDeferredCloseDeleteStillCommitsSynchronously();
+    }
+    if (name == "deferred-close-rename-still-commits-synchronously")
+    {
+        return TestDeferredCloseRenameStillCommitsSynchronously();
     }
     if (name == "delete-on-close-rollback-native-commit-failure")
     {

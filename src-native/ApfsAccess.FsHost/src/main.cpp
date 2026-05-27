@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cwctype>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -275,6 +276,11 @@ struct NativeCommitOriginCounter
 
 bool IsPerfCountersEnabled()
 {
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+    wchar_t value[8]{};
+    const auto chars = GetEnvironmentVariableW(L"APFSACCESS_PERF_COUNTERS", value, static_cast<DWORD>(std::size(value)));
+    return chars > 0 && value[0] != L'\0' && value[0] != L'0';
+#else
     static const bool enabled = []()
     {
         wchar_t value[8]{};
@@ -282,6 +288,14 @@ bool IsPerfCountersEnabled()
         return chars > 0 && value[0] != L'\0' && value[0] != L'0';
     }();
     return enabled;
+#endif
+}
+
+bool IsDeferCloseCommitsEnabled()
+{
+    wchar_t value[8]{};
+    const auto chars = GetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", value, static_cast<DWORD>(std::size(value)));
+    return chars > 0 && value[0] != L'\0' && value[0] != L'0';
 }
 
 std::uint64_t ElapsedMicroseconds(std::chrono::steady_clock::time_point started)
@@ -410,6 +424,14 @@ struct MountContext
     mutable std::mutex commit_mutex;
     std::atomic<std::uint64_t> commit_deadline_tick_ms{0};
     std::atomic<bool> commit_timeout_latched{false};
+    std::mutex deferred_commit_mutex;
+    std::condition_variable deferred_commit_cv;
+    std::thread deferred_commit_thread;
+    bool deferred_commit_thread_stop = false;
+    bool deferred_commit_requested = false;
+    std::chrono::steady_clock::time_point deferred_commit_deadline{};
+    std::atomic<bool> close_commit_deferred{false};
+    std::atomic<std::uint64_t> deferred_close_commit_count{0};
     mutable std::mutex tx_mutex;
     std::unique_ptr<apfsaccess::rw::TransactionManager> tx_manager;
     std::filesystem::path tx_journal_file;
@@ -2053,6 +2075,8 @@ bool WriteHostStatusFile(
         const auto mount_ready = context.mount_ready.load(std::memory_order_acquire);
         const auto shutdown_drain_active = context.shutdown_drain_active.load(std::memory_order_acquire);
         const auto in_flight_mutations = context.active_external_mutation_callbacks.load(std::memory_order_acquire);
+        const auto close_commit_deferred = context.close_commit_deferred.load(std::memory_order_acquire);
+        const auto deferred_close_commit_count = context.deferred_close_commit_count.load(std::memory_order_acquire);
         const auto host_pid = static_cast<unsigned long>(GetCurrentProcessId());
         buffer << "{\"writeBackend\":\"" << write_backend
                << "\",\"commitModel\":\"" << commit_model
@@ -2251,6 +2275,8 @@ bool WriteHostStatusFile(
         buffer << ",\"dirtyTransactionCount\":" << std::max(0, dirty_tx);
         buffer << ",\"mountReady\":" << (mount_ready ? "true" : "false");
         buffer << ",\"shutdownDrainActive\":" << (shutdown_drain_active ? "true" : "false");
+        buffer << ",\"closeCommitDeferred\":" << (close_commit_deferred ? "true" : "false");
+        buffer << ",\"deferredCloseCommitCount\":" << deferred_close_commit_count;
         buffer << ",\"inFlightMutationCallbacks\":" << in_flight_mutations;
         buffer << ",\"hostPid\":" << host_pid;
         if (IsPerfCountersEnabled())
@@ -4097,6 +4123,16 @@ bool UpdateRecoveryMarkerBestEffort(MountContext* c, bool dirty)
 
 NTSTATUS CommitNativeMutationsBestEffort(MountContext* c, const wchar_t* origin);
 bool HasPendingNativeMutations(MountContext* c);
+void RequestDeferredCloseCommit(MountContext* c);
+NTSTATUS DrainNativeMutationsByPolicy(
+    MountContext* c,
+    const wchar_t* origin,
+    bool has_delete_plans = false,
+    bool namespace_boundary = false);
+void FinalizeMutationJournalBestEffort(MountContext* c, const wchar_t* origin);
+void AbortMutationJournalBestEffort(MountContext* c, const wchar_t* origin);
+void StartDeferredCommitWorker(MountContext* c);
+void StopDeferredCommitWorker(MountContext* c);
 
 enum class NativeCommitUrgency
 {
@@ -4161,7 +4197,7 @@ bool DrainNativeMutationsForDirtyLimit(MountContext* c, std::size_t dirty_limit,
         << L"); draining commit before accepting more writes."
         << std::endl;
 
-    const auto status = CommitNativeMutationsBestEffort(c, origin);
+    const auto status = DrainNativeMutationsByPolicy(c, origin);
     if (NT_SUCCESS(status))
     {
         return true;
@@ -4931,17 +4967,123 @@ bool ClearStaleNativeDirtyMarkerIfClean(MountContext* c)
     return true;
 }
 
+void RequestDeferredCloseCommit(MountContext* c)
+{
+    if (!c)
+    {
+        return;
+    }
+
+    c->close_commit_deferred.store(true, std::memory_order_release);
+    c->deferred_close_commit_count.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(c->deferred_commit_mutex);
+        c->deferred_commit_requested = true;
+        c->deferred_commit_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+    }
+    c->deferred_commit_cv.notify_one();
+    (void)WriteHostStatusFile(*c, c->recovery_active, c->runtime_last_commit_xid);
+}
+
+void DeferredCommitWorkerMain(MountContext* c)
+{
+    if (!c)
+    {
+        return;
+    }
+
+    std::unique_lock<std::mutex> lock(c->deferred_commit_mutex);
+    for (;;)
+    {
+        c->deferred_commit_cv.wait(lock, [&]()
+        {
+            return c->deferred_commit_thread_stop || c->deferred_commit_requested;
+        });
+        if (c->deferred_commit_thread_stop)
+        {
+            break;
+        }
+
+        const auto deadline = c->deferred_commit_deadline;
+        if (c->deferred_commit_cv.wait_until(lock, deadline, [&]()
+            {
+                return c->deferred_commit_thread_stop ||
+                    !c->deferred_commit_requested ||
+                    c->deferred_commit_deadline != deadline;
+            }))
+        {
+            if (c->deferred_commit_thread_stop)
+            {
+                break;
+            }
+            continue;
+        }
+
+        c->deferred_commit_requested = false;
+        lock.unlock();
+        c->close_commit_deferred.store(false, std::memory_order_release);
+        const auto status = DrainNativeMutationsByPolicy(c, L"Close");
+        if (NT_SUCCESS(status))
+        {
+            FinalizeMutationJournalBestEffort(c, L"Close");
+        }
+        else
+        {
+            std::wcerr << L"[FsHost] RW native-commit warning (Close): deferred close commit failed with status 0x"
+                << std::hex << static_cast<unsigned long>(status) << std::dec
+                << L"." << std::endl;
+            AbortMutationJournalBestEffort(c, L"Close");
+        }
+        lock.lock();
+    }
+}
+
+void StartDeferredCommitWorker(MountContext* c)
+{
+    if (!c || !IsDeferCloseCommitsEnabled())
+    {
+        return;
+    }
+
+    c->deferred_commit_thread = std::thread(DeferredCommitWorkerMain, c);
+}
+
+void StopDeferredCommitWorker(MountContext* c)
+{
+    if (!c)
+    {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(c->deferred_commit_mutex);
+        c->deferred_commit_thread_stop = true;
+        c->deferred_commit_requested = false;
+    }
+    c->deferred_commit_cv.notify_one();
+    if (c->deferred_commit_thread.joinable())
+    {
+        c->deferred_commit_thread.join();
+    }
+    c->close_commit_deferred.store(false, std::memory_order_release);
+}
+
 NTSTATUS DrainNativeMutationsByPolicy(
     MountContext* c,
     const wchar_t* origin,
-    bool has_delete_plans = false,
-    bool namespace_boundary = false)
+    bool has_delete_plans,
+    bool namespace_boundary)
 {
     const auto urgency = ClassifyNativeCommitRequest(c, origin, has_delete_plans, namespace_boundary);
     if (urgency == NativeCommitUrgency::None)
     {
         (void)ClearStaleNativeDirtyMarkerIfClean(c);
         return STATUS_SUCCESS;
+    }
+    if (urgency != NativeCommitUrgency::FileContentCloseCanDelay)
+    {
+        std::lock_guard<std::mutex> lock(c->deferred_commit_mutex);
+        c->deferred_commit_requested = false;
+        c->close_commit_deferred.store(false, std::memory_order_release);
     }
 
     return CommitNativeMutationsBestEffort(c, origin);
@@ -7129,6 +7271,14 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
         {
             (void)ClearStaleNativeDirtyMarkerIfClean(c);
         }
+        else if (delete_plans.empty() && IsDeferCloseCommitsEnabled())
+        {
+            RequestDeferredCloseCommit(c);
+            for (auto& plan : delete_plans)
+            {
+                DiscardFileRollbackSnapshot(plan.file_snapshot);
+            }
+        }
         else
         {
             const auto close_commit_status = DrainNativeMutationsByPolicy(c, L"Close", !delete_plans.empty(), false);
@@ -8250,6 +8400,9 @@ int wmain(int argc, wchar_t** argv)
         ctx.api.Delete(ctx.fs);
         return 8;
     }
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    StartDeferredCommitWorker(&ctx);
+#endif
     ctx.mount_ready.store(true, std::memory_order_release);
     (void)WriteHostStatusFile(ctx, ctx.recovery_active, ctx.runtime_last_commit_xid);
     NotifyShellDriveAdded(args.mount);
@@ -8272,6 +8425,9 @@ int wmain(int argc, wchar_t** argv)
     }
 
     BeginMutationShutdownDrain(&ctx);
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    StopDeferredCommitWorker(&ctx);
+#endif
     ctx.api.Stop(ctx.fs);
 #ifdef APFSACCESS_HAS_RW_ENGINE
     if (args.readwrite)
@@ -8283,7 +8439,14 @@ int wmain(int argc, wchar_t** argv)
                 << std::hex << static_cast<unsigned long>(shutdown_commit_status) << std::dec
                 << L"." << std::endl;
         }
-        FinalizeMutationJournalBestEffort(&ctx, L"Shutdown");
+        if (NT_SUCCESS(shutdown_commit_status))
+        {
+            FinalizeMutationJournalBestEffort(&ctx, L"Shutdown");
+        }
+        else
+        {
+            AbortMutationJournalBestEffort(&ctx, L"Shutdown");
+        }
     }
 #endif
     ctx.api.Delete(ctx.fs);
