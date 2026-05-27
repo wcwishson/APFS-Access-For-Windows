@@ -9,6 +9,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -1774,6 +1775,161 @@ bool TestPayloadRangeProviderAvoidsWholeFileProviderConformance(const std::files
     return ok;
 }
 
+bool TestPreparedPayloadWriteThroughSkipsCommittedRangesConformance(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "prepared_payload_write_through.apfs.img";
+    if (!CreateSyntheticContainer(image_path))
+    {
+        return Require(false, "PreparedPayloadWriteThrough: unable to create synthetic container");
+    }
+
+    apfsaccess::rw::MetadataStore::VolumeContext context
+    {
+        image_path.wstring(),
+        L"PreparedPayloadWriteThrough",
+    };
+
+    apfsaccess::rw::MetadataStore store(context);
+    bool ok = true;
+    ok &= Require(store.LoadContainerSuperblocks(), "PreparedPayloadWriteThrough: LoadContainerSuperblocks should succeed");
+    ok &= Require(store.LoadObjectMap(), "PreparedPayloadWriteThrough: LoadObjectMap should succeed");
+    ok &= Require(store.LoadSpacemanState(), "PreparedPayloadWriteThrough: LoadSpacemanState should succeed");
+    ok &= Require(store.PrepareNativeWritePath(), "PreparedPayloadWriteThrough: PrepareNativeWritePath should succeed");
+
+    bool whole_file_provider_called = false;
+    std::unordered_map<std::wstring, std::vector<std::byte>> range_payloads;
+    std::unordered_map<std::wstring, std::uint64_t> range_bytes_requested;
+    store.SetFilePayloadProvider(
+        [&whole_file_provider_called](const std::wstring&, std::uint64_t) -> std::optional<std::vector<std::byte>>
+        {
+            whole_file_provider_called = true;
+            return std::nullopt;
+        });
+    store.SetFilePayloadRangeProvider(
+        [&range_payloads, &range_bytes_requested](
+            const std::wstring& path,
+            std::uint64_t offset,
+            std::span<std::byte> destination) -> bool
+        {
+            auto payload_it = range_payloads.find(path);
+            if (payload_it == range_payloads.end() ||
+                offset > payload_it->second.size() ||
+                destination.size() > (payload_it->second.size() - static_cast<std::size_t>(offset)))
+            {
+                return false;
+            }
+
+            std::copy_n(
+                payload_it->second.data() + static_cast<std::ptrdiff_t>(offset),
+                destination.size(),
+                destination.data());
+            range_bytes_requested[path] += destination.size();
+            return true;
+        });
+
+    const auto payload = BuildPatternPayload(64 * 1024, 0xC3);
+    const auto prepared_bytes = payload.size() / 2;
+    range_payloads[L"\\prepared.bin"] = payload;
+
+    apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+    create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+    create_file.path = L"\\prepared.bin";
+    ok &= ExpectMutationStatus(
+        store,
+        create_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "PreparedPayloadWriteThrough: create prepared file should apply");
+
+    apfsaccess::rw::MetadataStore::MutationRequest set_size{};
+    set_size.operation = apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize;
+    set_size.path = L"\\prepared.bin";
+    set_size.length = payload.size();
+    ok &= ExpectMutationStatus(
+        store,
+        set_size,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "PreparedPayloadWriteThrough: SetFileSize should allocate prepared file extents");
+    ok &= Require(
+        store.WritePreparedFileRange(
+            L"\\prepared.bin",
+            0,
+            std::span<const std::byte>(payload.data(), prepared_bytes)),
+        "PreparedPayloadWriteThrough: prepared first half should write through");
+
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "PreparedPayloadWriteThrough: prepared-range commit should succeed");
+    ok &= Require(
+        !whole_file_provider_called,
+        "PreparedPayloadWriteThrough: commit should use range provider, not whole-file provider");
+    ok &= Require(
+        range_bytes_requested[L"\\prepared.bin"] == payload.size() - prepared_bytes,
+        "PreparedPayloadWriteThrough: commit should request only bytes not already prepared");
+
+    std::vector<std::byte> committed_payload;
+    ok &= Require(
+        store.ReadCommittedFileRange(L"\\prepared.bin", 0, payload.size(), committed_payload),
+        "PreparedPayloadWriteThrough: committed prepared payload should be readable");
+    ok &= Require(
+        committed_payload == payload,
+        "PreparedPayloadWriteThrough: committed prepared payload should match");
+
+    const auto small_payload = BuildPatternPayload(8 * 1024, 0x29);
+    const auto grown_payload = BuildPatternPayload(16 * 1024, 0xD4);
+    range_payloads[L"\\reallocated.bin"] = grown_payload;
+    range_bytes_requested[L"\\reallocated.bin"] = 0;
+
+    apfsaccess::rw::MetadataStore::MutationRequest create_reallocated = create_file;
+    create_reallocated.path = L"\\reallocated.bin";
+    ok &= ExpectMutationStatus(
+        store,
+        create_reallocated,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "PreparedPayloadWriteThrough: create reallocated file should apply");
+
+    apfsaccess::rw::MetadataStore::MutationRequest set_small = set_size;
+    set_small.path = L"\\reallocated.bin";
+    set_small.length = small_payload.size();
+    ok &= ExpectMutationStatus(
+        store,
+        set_small,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "PreparedPayloadWriteThrough: initial small allocation should apply");
+    ok &= Require(
+        store.WritePreparedFileRange(
+            L"\\reallocated.bin",
+            0,
+            std::span<const std::byte>(small_payload.data(), small_payload.size())),
+        "PreparedPayloadWriteThrough: stale small range should write through before reallocation");
+
+    apfsaccess::rw::MetadataStore::MutationRequest grow_file = set_size;
+    grow_file.path = L"\\reallocated.bin";
+    grow_file.length = grown_payload.size();
+    ok &= ExpectMutationStatus(
+        store,
+        grow_file,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "PreparedPayloadWriteThrough: growth should reallocate and clear prepared ranges");
+    ok &= ExpectCommitStatus(
+        store,
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "PreparedPayloadWriteThrough: reallocated commit should succeed");
+    ok &= Require(
+        range_bytes_requested[L"\\reallocated.bin"] == grown_payload.size(),
+        "PreparedPayloadWriteThrough: reallocation should clear stale prepared ranges");
+
+    std::vector<std::byte> reallocated_payload;
+    ok &= Require(
+        store.ReadCommittedFileRange(L"\\reallocated.bin", 0, grown_payload.size(), reallocated_payload),
+        "PreparedPayloadWriteThrough: reallocated payload should be readable");
+    ok &= Require(
+        reallocated_payload == grown_payload,
+        "PreparedPayloadWriteThrough: reallocated payload should match grown payload");
+
+    return ok;
+}
+
 bool TestBtreeCanonicalizationConformance(const std::filesystem::path& run_root)
 {
     const auto image_path = run_root / "btree_canonical.apfs.img";
@@ -2833,6 +2989,7 @@ int main()
     ok &= TestStreamingLargeCopyWithoutPreallocationCoalescesPendingMetadataConformance(run_root);
     ok &= TestPendingPreallocationWriteBurstReusesExtentsConformance(run_root);
     ok &= TestPayloadRangeProviderAvoidsWholeFileProviderConformance(run_root);
+    ok &= TestPreparedPayloadWriteThroughSkipsCommittedRangesConformance(run_root);
     ok &= TestBtreeCanonicalizationConformance(run_root);
     ok &= TestCommittedReadExtentsConformance(run_root);
     ok &= TestCommittedZeroReadExtentConformance(run_root);

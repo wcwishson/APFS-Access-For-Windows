@@ -14,6 +14,15 @@
 
 **Branch:** `optimize/read-write-performance`
 
+## Checkpoint Update As Of 2026-05-27
+
+- Implemented prepared payload range tracking in `MetadataStore` so bytes that have already been written to APFS data extents can be skipped by the later metadata commit.
+- Added a conformance test that proves prepared ranges skip the range provider at commit, and that prepared ranges are cleared when file extents are reallocated.
+- Wired FsHost payload write-through as an experimental path only. The default is off unless `APFSACCESS_PREPARED_PAYLOAD_WRITETHROUGH=1` is set.
+- Physical validation found that naive foreground write-through is not ready as a default: a 1 GiB copy-in regressed to about `4.96 MB/s` because raw payload writes moved into `CB_Write` without batching.
+- The corrected default build passed Explorer workflow validation and a shorter performance sanity run: 256 MiB copy-in reached about `44.88 MB/s`, SHA-256 mismatches stayed at `0`, and final status stayed RW healthy with dirty count `0`.
+- Next write-through attempt should batch adjacent prepared payload writes or move them to a controlled background writer before considering a default enablement.
+
 **Baseline already observed:**
 
 | Metric | Result |
@@ -1256,4 +1265,3 @@ Revert the latest checkpoint immediately if any of these occur:
 - App restart after interrupted deferred writes mounts writable with ambiguous state.
 - Fault injection shows mixed old/new payload after crash.
 - Throughput improves only by weakening explicit flush, eject, or shutdown durability.
-

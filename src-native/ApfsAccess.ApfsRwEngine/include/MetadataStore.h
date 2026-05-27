@@ -223,6 +223,10 @@ public:
         std::byte* destination,
         std::size_t destination_size,
         std::size_t& out_bytes_read) const;
+    [[nodiscard]] bool WritePreparedFileRange(
+        const std::wstring& path,
+        std::uint64_t offset,
+        std::span<const std::byte> payload);
     void SetCommitStageHook(std::function<bool(std::string_view stage)> hook);
     void SetFilePayloadProvider(
         std::function<std::optional<std::vector<std::byte>>(const std::wstring& path, std::uint64_t logical_size)> provider);
@@ -245,6 +249,11 @@ private:
         std::atomic<std::uint64_t> last_us{0};
 
         void Observe(std::uint64_t elapsed_us) noexcept;
+    };
+    struct PreparedPayloadRange
+    {
+        std::uint64_t offset = 0;
+        std::uint64_t bytes = 0;
     };
     struct ScopedPerfTimer;
 
@@ -349,6 +358,13 @@ private:
     [[nodiscard]] bool StageCommittedFileExtentDeallocations(const FileMutationExtents& extents);
     [[nodiscard]] bool HasPendingSpacemanAllocation(std::uint64_t physical_address, std::uint64_t bytes) const;
     [[nodiscard]] bool ReleasePendingSpacemanAllocation(std::uint64_t physical_address, std::uint64_t bytes);
+    [[nodiscard]] bool WritePreparedFileRangeFromExtents(
+        std::uint64_t object_id,
+        const std::vector<FileExtent>& extents,
+        std::uint64_t offset,
+        std::span<const std::byte> payload);
+    void RememberPreparedPayloadRange(std::uint64_t object_id, std::uint64_t offset, std::uint64_t bytes);
+    void ClearPreparedPayloadRanges(std::uint64_t object_id);
     void CoalescePendingWriteMutation(std::uint64_t object_id, const MutationRequest& request);
     void CoalescePendingBtreeFileMetadata(std::uint64_t object_id);
     [[nodiscard]] std::uint64_t AlignExtentBytes(std::uint64_t bytes) const noexcept;
@@ -463,6 +479,7 @@ private:
     std::vector<SpacemanAllocation> pending_spaceman_allocations_;
     std::vector<SpacemanAllocation> pending_spaceman_deallocations_;
     std::vector<BtreeRecord> pending_btree_records_;
+    std::unordered_map<std::uint64_t, std::vector<PreparedPayloadRange>> prepared_payload_ranges_;
     std::function<bool(std::string_view stage)> commit_stage_hook_;
     std::function<std::optional<std::vector<std::byte>>(const std::wstring&, std::uint64_t)> file_payload_provider_;
     std::function<bool(const std::wstring&, std::uint64_t, std::span<std::byte>)> file_payload_range_provider_;

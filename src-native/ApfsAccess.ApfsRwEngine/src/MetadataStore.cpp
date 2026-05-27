@@ -1517,6 +1517,7 @@ bool MetadataStore::LoadContainerSuperblocks()
     committed_read_extents_.clear();
     working_read_extents_.clear();
     pending_read_extent_updates_.clear();
+    prepared_payload_ranges_.clear();
     working_inodes_.clear();
     working_path_index_.clear();
     working_directory_links_.clear();
@@ -1817,6 +1818,7 @@ bool MetadataStore::LoadSpacemanState()
         working_spaceman_free_extents_ = std::move(selected_working_free_extents);
         working_read_extents_ = committed_read_extents_;
         pending_read_extent_updates_.clear();
+        prepared_payload_ranges_.clear();
         next_ephemeral_extent_ = selected_next_ephemeral_extent;
         working_next_ephemeral_extent_ = selected_working_next_ephemeral_extent;
         last_committed_xid_ = selected_last_committed_xid;
@@ -1835,6 +1837,7 @@ bool MetadataStore::LoadSpacemanState()
         working_spaceman_free_extents_ = committed_spaceman_free_extents_;
         working_read_extents_ = committed_read_extents_;
         pending_read_extent_updates_.clear();
+        prepared_payload_ranges_.clear();
         working_next_ephemeral_extent_ = next_ephemeral_extent_;
         last_committed_xid_ = baseline_last_committed_xid;
         spaceman_loaded_ = true;
@@ -3006,6 +3009,7 @@ bool MetadataStore::LoadSpacemanCheckpointBlock(std::uint64_t block_index, const
     working_spaceman_free_extents_ = committed_spaceman_free_extents_;
     working_read_extents_ = committed_read_extents_;
     pending_read_extent_updates_.clear();
+    prepared_payload_ranges_.clear();
     working_next_ephemeral_extent_ = next_ephemeral_extent_;
 
     if (persisted_xid > 0)
@@ -4656,6 +4660,7 @@ bool MetadataStore::PrepareNativeWritePath()
     pending_spaceman_deallocations_.clear();
     pending_btree_records_.clear();
     pending_read_extent_updates_.clear();
+    prepared_payload_ranges_.clear();
     working_read_extents_ = committed_read_extents_;
     canonical_commit_ready_ = CanReportCanonicalCommitReady(
         canonical_state_loaded_,
@@ -5091,6 +5096,11 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         std::size_t index = 0;
         SpacemanAllocation allocation;
     };
+    struct PreparedPayloadRangesRestoreEntry
+    {
+        std::uint64_t object_id = 0;
+        std::optional<std::vector<PreparedPayloadRange>> previous;
+    };
     struct MutationUndoLog
     {
         std::size_t pending_mutations_size = 0;
@@ -5106,6 +5116,7 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         std::vector<DirectoryLinkRestoreEntry> directory_link_restores;
         std::vector<SpacemanAllocation> appended_pending_allocations;
         std::vector<PendingAllocationRestoreEntry> erased_pending_allocations;
+        std::vector<PreparedPayloadRangesRestoreEntry> prepared_payload_range_restores;
         std::optional<std::vector<SpacemanAllocation>> working_spaceman_free_extents;
     } undo_log
     {
@@ -5192,6 +5203,30 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
                     ? std::optional<std::vector<FileExtent>>{}
                     : existing_pending->second,
             });
+    };
+    const auto remember_prepared_payload_ranges = [&](std::uint64_t object_id)
+    {
+        if (std::any_of(
+                undo_log.prepared_payload_range_restores.begin(),
+                undo_log.prepared_payload_range_restores.end(),
+                [&](const PreparedPayloadRangesRestoreEntry& entry) { return entry.object_id == object_id; }))
+        {
+            return;
+        }
+
+        auto existing = prepared_payload_ranges_.find(object_id);
+        undo_log.prepared_payload_range_restores.push_back(
+            {
+                object_id,
+                existing == prepared_payload_ranges_.end()
+                    ? std::optional<std::vector<PreparedPayloadRange>>{}
+                    : existing->second,
+            });
+    };
+    const auto clear_prepared_payload_ranges = [&](std::uint64_t object_id)
+    {
+        remember_prepared_payload_ranges(object_id);
+        prepared_payload_ranges_.erase(object_id);
     };
     const auto remember_directory_link = [&](std::uint64_t parent_object_id, const std::wstring& entry_name)
     {
@@ -5328,6 +5363,7 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
         }
 
         remember_read_extents(object_id);
+        clear_prepared_payload_ranges(object_id);
         const auto extents = extents_it->second;
         std::vector<SpacemanAllocation> released_allocations;
         released_allocations.reserve(extents.size());
@@ -5477,6 +5513,17 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
                     pending_read_extent_updates_.erase(restore.object_id);
                 }
             }
+            for (const auto& restore : undo_log.prepared_payload_range_restores)
+            {
+                if (restore.previous.has_value())
+                {
+                    prepared_payload_ranges_[restore.object_id] = restore.previous.value();
+                }
+                else
+                {
+                    prepared_payload_ranges_.erase(restore.object_id);
+                }
+            }
             if (undo_log.working_spaceman_free_extents.has_value())
             {
                 working_spaceman_free_extents_ = std::move(*undo_log.working_spaceman_free_extents);
@@ -5541,6 +5588,7 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
     const auto stage_file_extents = [&](std::uint64_t object_id, const std::vector<FileExtent>& extents) -> bool
     {
         remember_read_extents(object_id);
+        clear_prepared_payload_ranges(object_id);
         if (extents.empty())
         {
             working_read_extents_.erase(object_id);
@@ -5564,6 +5612,7 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(const MutationRequest
     const auto stage_committed_file_extents_for_removal = [&](const InodeRecord& inode) -> bool
     {
         remember_read_extents(inode.object_id);
+        clear_prepared_payload_ranges(inode.object_id);
         auto extents = CommittedFileExtentsForMutation(inode);
         if (!extents.has_value() || !StageCommittedFileExtentDeallocations(extents.value()))
         {
@@ -6183,6 +6232,7 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
     struct PendingPayloadWriteView
     {
         std::uint64_t physical_address = 0;
+        std::uint64_t object_id = 0;
         std::wstring path;
         std::shared_ptr<std::vector<std::byte>> payload;
         std::uint64_t logical_offset = 0;
@@ -6349,6 +6399,39 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
             return fail_commit(CommitStatus::PersistFailed, "payload-extent-coverage-invalid");
         }
 
+        const auto prepared_ranges_it = prepared_payload_ranges_.find(inode->object_id);
+        const auto append_pending_payload_write =
+            [&](std::uint64_t logical_offset, std::uint64_t physical_address, std::uint64_t bytes) -> bool
+        {
+            if (bytes == 0 ||
+                bytes > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
+                logical_offset > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+            {
+                return false;
+            }
+
+            const auto slice_offset = static_cast<std::size_t>(logical_offset);
+            const auto slice_bytes = static_cast<std::size_t>(bytes);
+            if (payload_bytes &&
+                (slice_offset > payload_bytes->size() ||
+                 slice_bytes > (payload_bytes->size() - slice_offset)))
+            {
+                return false;
+            }
+
+            pending_payload_writes.push_back(PendingPayloadWriteView{
+                physical_address,
+                inode->object_id,
+                inode->full_path,
+                payload_bytes,
+                logical_offset,
+                inode->logical_size,
+                slice_offset,
+                slice_bytes,
+            });
+            return true;
+        };
+
         for (const auto& extent : payload_extents)
         {
             if (extent.logical_offset >= inode->logical_size)
@@ -6366,25 +6449,68 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
                 return fail_commit(CommitStatus::PersistFailed, "payload-extent-size-invalid");
             }
 
-            const auto slice_offset = static_cast<std::size_t>(extent.logical_offset);
-            const auto slice_bytes = static_cast<std::size_t>(extent_logical_bytes);
-            if (payload_bytes &&
-                (slice_offset > payload_bytes->size() ||
-                 slice_bytes > (payload_bytes->size() - slice_offset)))
+            const auto extent_end = extent.logical_offset + extent_logical_bytes;
+            auto cursor = extent.logical_offset;
+            if (prepared_ranges_it != prepared_payload_ranges_.end())
             {
-                rollback_commit_extent_stage();
-                return fail_commit(CommitStatus::PersistFailed, "payload-extent-slice-invalid");
+                for (const auto& prepared_range : prepared_ranges_it->second)
+                {
+                    if (prepared_range.bytes == 0 ||
+                        prepared_range.offset > (std::numeric_limits<std::uint64_t>::max() - prepared_range.bytes))
+                    {
+                        continue;
+                    }
+
+                    const auto prepared_end = prepared_range.offset + prepared_range.bytes;
+                    if (prepared_end <= cursor)
+                    {
+                        continue;
+                    }
+                    if (prepared_range.offset >= extent_end)
+                    {
+                        break;
+                    }
+                    if (prepared_range.offset > cursor)
+                    {
+                        const auto logical_offset = cursor;
+                        const auto bytes = prepared_range.offset - cursor;
+                        if (extent.physical_address >
+                            (std::numeric_limits<std::uint64_t>::max() - (logical_offset - extent.logical_offset)))
+                        {
+                            rollback_commit_extent_stage();
+                            return fail_commit(CommitStatus::PersistFailed, "payload-extent-physical-overflow");
+                        }
+                        const auto physical_address = extent.physical_address + (logical_offset - extent.logical_offset);
+                        if (!append_pending_payload_write(logical_offset, physical_address, bytes))
+                        {
+                            rollback_commit_extent_stage();
+                            return fail_commit(CommitStatus::PersistFailed, "payload-extent-slice-invalid");
+                        }
+                    }
+
+                    cursor = std::max(cursor, std::min(prepared_end, extent_end));
+                    if (cursor >= extent_end)
+                    {
+                        break;
+                    }
+                }
             }
 
-            pending_payload_writes.push_back(PendingPayloadWriteView{
-                extent.physical_address,
-                inode->full_path,
-                payload_bytes,
-                extent.logical_offset,
-                inode->logical_size,
-                slice_offset,
-                slice_bytes,
-            });
+            if (cursor < extent_end)
+            {
+                if (extent.physical_address >
+                    (std::numeric_limits<std::uint64_t>::max() - (cursor - extent.logical_offset)))
+                {
+                    rollback_commit_extent_stage();
+                    return fail_commit(CommitStatus::PersistFailed, "payload-extent-physical-overflow");
+                }
+                const auto physical_address = extent.physical_address + (cursor - extent.logical_offset);
+                if (!append_pending_payload_write(cursor, physical_address, extent_end - cursor))
+                {
+                    rollback_commit_extent_stage();
+                    return fail_commit(CommitStatus::PersistFailed, "payload-extent-slice-invalid");
+                }
+            }
         }
     }
 
@@ -7374,6 +7500,7 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
     pending_spaceman_deallocations_.clear();
     pending_btree_records_.clear();
     pending_read_extent_updates_.clear();
+    prepared_payload_ranges_.clear();
     canonical_commit_ready_ = CanReportCanonicalCommitReady(
         canonical_state_loaded_,
         commit_path_ready_,
@@ -9912,6 +10039,215 @@ bool MetadataStore::ReadCommittedFileRangeInto(
     }
 
     return true;
+}
+
+bool MetadataStore::WritePreparedFileRange(
+    const std::wstring& path,
+    std::uint64_t offset,
+    std::span<const std::byte> payload)
+{
+    if (payload.empty())
+    {
+        return true;
+    }
+    if (!IsNativeWriteReady() || !commit_path_ready_ || !write_device_allowed_)
+    {
+        return false;
+    }
+    if (payload.size() > static_cast<std::size_t>(std::numeric_limits<std::uint64_t>::max() - offset))
+    {
+        return false;
+    }
+
+    const auto normalized_path = NormalizePath(path);
+    auto inode = LookupWorkingInode(normalized_path);
+    if (!inode.has_value() ||
+        inode->is_directory ||
+        inode->logical_size == 0 ||
+        offset > inode->logical_size ||
+        static_cast<std::uint64_t>(payload.size()) > (inode->logical_size - offset))
+    {
+        return false;
+    }
+
+    std::vector<FileExtent> extents;
+    if (auto pending_extents_it = pending_read_extent_updates_.find(inode->object_id);
+        pending_extents_it != pending_read_extent_updates_.end())
+    {
+        extents = pending_extents_it->second;
+    }
+    else if (auto working_extents_it = working_read_extents_.find(inode->object_id);
+             working_extents_it != working_read_extents_.end())
+    {
+        extents = working_extents_it->second;
+    }
+    else if (auto committed_extents_it = committed_read_extents_.find(inode->object_id);
+             committed_extents_it != committed_read_extents_.end())
+    {
+        extents = committed_extents_it->second;
+    }
+    else if (inode->data_physical_address != 0)
+    {
+        extents.push_back(FileExtent{ 0, inode->data_physical_address, inode->logical_size });
+    }
+
+    if (extents.empty())
+    {
+        return false;
+    }
+
+    return WritePreparedFileRangeFromExtents(inode->object_id, SortFileExtents(std::move(extents)), offset, payload);
+}
+
+bool MetadataStore::WritePreparedFileRangeFromExtents(
+    std::uint64_t object_id,
+    const std::vector<FileExtent>& extents,
+    std::uint64_t offset,
+    std::span<const std::byte> payload)
+{
+    if (payload.empty())
+    {
+        return true;
+    }
+
+    const auto request_begin = offset;
+    const auto request_end = offset + static_cast<std::uint64_t>(payload.size());
+    auto cursor = request_begin;
+    auto extent_it = std::lower_bound(
+        extents.begin(),
+        extents.end(),
+        request_begin,
+        ExtentEndsBeforeOrAt);
+    for (; extent_it != extents.end() && cursor < request_end; ++extent_it)
+    {
+        const auto& extent = *extent_it;
+        if (extent.bytes == 0)
+        {
+            continue;
+        }
+        if (extent.logical_offset > (std::numeric_limits<std::uint64_t>::max() - extent.bytes))
+        {
+            return false;
+        }
+
+        const auto extent_begin = extent.logical_offset;
+        const auto extent_end = extent.logical_offset + extent.bytes;
+        if (extent_begin > cursor)
+        {
+            return false;
+        }
+        if (extent_end <= cursor)
+        {
+            continue;
+        }
+        if (extent.physical_address == 0)
+        {
+            return false;
+        }
+
+        const auto chunk_begin = std::max(cursor, extent_begin);
+        const auto chunk_end = std::min(request_end, extent_end);
+        if (chunk_end <= chunk_begin)
+        {
+            continue;
+        }
+        if (extent.physical_address > (std::numeric_limits<std::uint64_t>::max() - (chunk_begin - extent_begin)))
+        {
+            return false;
+        }
+
+        const auto source_offset = static_cast<std::size_t>(chunk_begin - request_begin);
+        const auto chunk_bytes = static_cast<std::size_t>(chunk_end - chunk_begin);
+        if (source_offset > payload.size() ||
+            chunk_bytes > (payload.size() - source_offset))
+        {
+            return false;
+        }
+
+        const auto physical_offset = extent.physical_address + (chunk_begin - extent_begin);
+        if (!device_.Write(
+                physical_offset,
+                payload.subspan(source_offset, chunk_bytes)))
+        {
+            return false;
+        }
+
+        cursor = chunk_end;
+    }
+
+    if (cursor != request_end)
+    {
+        return false;
+    }
+
+    RememberPreparedPayloadRange(object_id, offset, static_cast<std::uint64_t>(payload.size()));
+    return true;
+}
+
+void MetadataStore::RememberPreparedPayloadRange(
+    std::uint64_t object_id,
+    std::uint64_t offset,
+    std::uint64_t bytes)
+{
+    if (object_id == 0 || bytes == 0)
+    {
+        return;
+    }
+    if (offset > (std::numeric_limits<std::uint64_t>::max() - bytes))
+    {
+        return;
+    }
+
+    auto& ranges = prepared_payload_ranges_[object_id];
+    ranges.push_back(PreparedPayloadRange{ offset, bytes });
+    std::sort(
+        ranges.begin(),
+        ranges.end(),
+        [](const PreparedPayloadRange& lhs, const PreparedPayloadRange& rhs)
+        {
+            if (lhs.offset == rhs.offset)
+            {
+                return lhs.bytes < rhs.bytes;
+            }
+            return lhs.offset < rhs.offset;
+        });
+
+    std::vector<PreparedPayloadRange> merged;
+    merged.reserve(ranges.size());
+    for (const auto& range : ranges)
+    {
+        if (range.bytes == 0 ||
+            range.offset > (std::numeric_limits<std::uint64_t>::max() - range.bytes))
+        {
+            continue;
+        }
+        if (merged.empty())
+        {
+            merged.push_back(range);
+            continue;
+        }
+
+        auto& previous = merged.back();
+        const auto previous_end = previous.offset + previous.bytes;
+        const auto range_end = range.offset + range.bytes;
+        if (range.offset <= previous_end)
+        {
+            if (range_end > previous_end)
+            {
+                previous.bytes = range_end - previous.offset;
+            }
+            continue;
+        }
+
+        merged.push_back(range);
+    }
+
+    ranges = std::move(merged);
+}
+
+void MetadataStore::ClearPreparedPayloadRanges(std::uint64_t object_id)
+{
+    prepared_payload_ranges_.erase(object_id);
 }
 
 void MetadataStore::SetCommitStageHook(std::function<bool(std::string_view stage)> hook)
@@ -13944,6 +14280,7 @@ bool MetadataStore::LoadPersistentState()
     pending_spaceman_allocations_.clear();
     pending_spaceman_deallocations_.clear();
     pending_btree_records_.clear();
+    prepared_payload_ranges_.clear();
 
     std::unordered_map<std::uint64_t, InodeRecord> disk_loaded_inodes;
     std::unordered_map<std::wstring, std::uint64_t> disk_loaded_path_index;
@@ -14959,6 +15296,7 @@ bool MetadataStore::LoadPersistentState()
         working_spaceman_free_extents_ = committed_spaceman_free_extents_;
         working_read_extents_ = committed_read_extents_;
         pending_read_extent_updates_.clear();
+        prepared_payload_ranges_.clear();
         working_next_ephemeral_extent_ = next_ephemeral_extent_;
         RebuildWorkingDirectoryIndexes();
         bool persistent_state_file_present = false;

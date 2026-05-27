@@ -16,6 +16,7 @@
 #include <mutex>
 #include <limits>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -539,6 +540,27 @@ bool IsHostCommitTraceEnabled()
         wchar_t value[8]{};
         const auto chars = GetEnvironmentVariableW(L"APFSACCESS_TRACE_COMMITS", value, static_cast<DWORD>(std::size(value)));
         return chars > 0 && value[0] != L'\0' && value[0] != L'0';
+    }();
+    return enabled;
+}
+
+bool IsPreparedPayloadWriteThroughEnabled()
+{
+    static const bool enabled = []()
+    {
+        wchar_t value[16]{};
+        const auto chars = GetEnvironmentVariableW(
+            L"APFSACCESS_PREPARED_PAYLOAD_WRITETHROUGH",
+            value,
+            static_cast<DWORD>(std::size(value)));
+        if (chars == 0 || value[0] == L'\0')
+        {
+            return false;
+        }
+
+        return _wcsicmp(value, L"0") != 0 &&
+               _wcsicmp(value, L"false") != 0 &&
+               _wcsicmp(value, L"no") != 0;
     }();
     return enabled;
 }
@@ -4445,6 +4467,47 @@ bool RecordNativeMutationBestEffort(
     return true;
 }
 
+void WritePreparedNativePayloadBestEffort(
+    MountContext* c,
+    const std::wstring& path,
+    std::uint64_t offset,
+    const void* payload,
+    std::uint32_t payload_bytes)
+{
+    if (!c ||
+        !IsNativeWriteEnabled(c) ||
+        !c->metadata_store ||
+        !payload ||
+        payload_bytes == 0 ||
+        !IsPreparedPayloadWriteThroughEnabled())
+    {
+        return;
+    }
+
+    bool prepared = false;
+    {
+        std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
+        prepared = c->metadata_store->WritePreparedFileRange(
+            path,
+            offset,
+            std::span<const std::byte>(
+                static_cast<const std::byte*>(payload),
+                static_cast<std::size_t>(payload_bytes)));
+    }
+
+    if (!prepared && IsHostCommitTraceEnabled())
+    {
+        std::wcerr << L"[FsHost] RW prepared-payload write-through skipped for '"
+            << path
+            << L"' at offset "
+            << offset
+            << L" (bytes="
+            << payload_bytes
+            << L"); close/flush commit will fall back to hydrated payload."
+            << std::endl;
+    }
+}
+
 bool StageNativeDeleteSubtreeBestEffort(
     MountContext* c,
     const std::shared_ptr<Node>& node,
@@ -6314,6 +6377,7 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
     }
     *done = written;
 #ifdef APFSACCESS_HAS_RW_ENGINE
+    WritePreparedNativePayloadBestEffort(c, o->node->path, off, buf, written);
     RecordMutationBestEffort(
         c,
         apfsaccess::rw::TransactionManager::MutationKind::Write,
