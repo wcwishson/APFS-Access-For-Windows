@@ -49,6 +49,8 @@ Common supported operations:
 
 APFS Access is conservative. If a volume is encrypted, special-purpose, uses unsupported APFS features, or fails a write-safety check, the app keeps it read-only instead of risking damage.
 
+Writable APFS operations are improving, especially folders with many small files, but writes are still slower than reads in the current native engine. For important data, keep a backup and eject from APFS Access before unplugging.
+
 ## Requirements
 
 - Windows 10 or Windows 11, 64-bit.

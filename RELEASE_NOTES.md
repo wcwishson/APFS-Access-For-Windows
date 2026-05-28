@@ -1,5 +1,53 @@
 # APFS Access Release Notes
 
+## APFS Access 1.0.4
+
+APFS Access 1.0.4 is a performance-focused release for writable APFS drives. It keeps the same dashboard and tray workflow from 1.0.3, while making common write-heavy Explorer operations feel smoother, especially folders with many small files.
+
+### Download
+
+Most users should download:
+
+- `APFSAccess_Portable.exe`
+
+Advanced users may also download the click-run zip for the same release.
+
+### Quick Start
+
+1. Download `APFSAccess_Portable.exe`.
+2. Double-click it.
+3. Approve the administrator prompt.
+4. Let the app install WinFsp and the Microsoft Visual C++ runtime if it asks.
+5. Plug in an APFS drive.
+6. Use the APFS Access dashboard or open This PC and use the mounted drive letter.
+
+### What Changed
+
+- Improved write responsiveness for folders with many small files.
+- Reduced repeated APFS metadata work during ordinary copy, move, rename, and delete flows.
+- Improved native write-path observability so future performance work can target the slowest parts of the pipeline more directly.
+- Kept the conservative write-safety behavior from earlier releases: unsupported or uncertain APFS volumes still mount read-only instead of risking the drive.
+- Kept the experimental prepared-payload write-through path disabled by default because the safer default path performed better in real Explorer-style use.
+
+### User-Facing Behavior
+
+- Writable APFS volumes should feel more responsive during many-small-file operations than 1.0.3.
+- Large writes are improved in the safe default path, but APFS write speed is still not close to read speed yet.
+- Dashboard states, `Open`, `Eject`, `Fix`, and `Details` work the same way as 1.0.3.
+- Eject APFS drives from the dashboard or tray before unplugging.
+
+### Known Limits
+
+- No signed installer yet, so Windows SmartScreen may warn on first run.
+- Encrypted APFS volumes are not supported.
+- Some APFS roles and feature combinations are mounted read-only or skipped.
+- Writable mode remains conservative and may fall back to read-only.
+- Write performance still depends heavily on the APFS drive, USB adapter, Windows storage stack, and the current native engine path.
+
+### Appendix: Technical Notes
+
+This release reduces commit and metadata amplification in the native APFS write path and adds better performance counters around commit origins, payload writes, checkpoint work, and mounted-volume benchmarks. More aggressive write-back behavior remains experimental until it can preserve crash recovery and explicit flush/eject safety.
+
 ## APFS Access 1.0.3
 
 APFS Access 1.0.3 improves everyday use with a new dashboard, stronger write-path hardening, more reliable eject/fix behavior, and a first throughput optimization pass.
