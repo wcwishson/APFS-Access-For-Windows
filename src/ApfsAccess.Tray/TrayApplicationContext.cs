@@ -611,7 +611,7 @@ private void TryStartServiceProcessIfMissing()
             {
                 LogDiagnostic(
                     $"Found {knownStaleServices.Length} stale service process(es) from another payload; requesting clean shutdown before starting current service.");
-                if (!TrySendQuitAsync().GetAwaiter().GetResult())
+                if (!TrySendQuitAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult())
                 {
                     LogDiagnostic("Stale service shutdown request was not acknowledged; delaying service replacement.");
                     DisposeProcesses(runningServices);
@@ -807,52 +807,17 @@ private void TryStartServiceProcessIfMissing()
         }
     }
 
-    private async Task<bool> TrySendQuitAsync()
+    private async Task<bool> TrySendQuitAsync(TimeSpan? timeout = null)
     {
-        var requestId = Guid.NewGuid().ToString("N");
-
-        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-        try
-        {
-            await using var peer = await NamedPipeMessageClient
-                .ConnectAsync(ApfsPipeConstants.PipeName, timeoutMilliseconds: 1000, timeoutCts.Token)
-                .ConfigureAwait(false);
-
-            var quitMessage = PipeMessageCodec.Create(
-                ApfsMessageTypes.QuitRequested,
-                new QuitRequestedPayload(Environment.UserName, DateTime.UtcNow),
-                requestId
-            );
-
-            await peer.SendAsync(quitMessage, timeoutCts.Token).ConfigureAwait(false);
-
-            while (!timeoutCts.Token.IsCancellationRequested)
-            {
-                var response = await peer.ReadMessageAsync(timeoutCts.Token).ConfigureAwait(false);
-                if (response is null)
-                {
-                    break;
-                }
-
-                if (!string.Equals(response.Type, ApfsMessageTypes.Ack, StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                if (!string.Equals(response.RequestId, requestId, StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                return PipeMessageCodec.TryGetPayload<AckPayload>(response, out var ack) && ack?.Success == true;
-            }
-        }
-        catch
-        {
-            // The caller verifies service exit before allowing the tray to close.
-        }
-
-        return false;
+        var (success, message) = await TrySendRequestAsync(
+            ApfsMessageTypes.QuitRequested,
+            new QuitRequestedPayload(Environment.UserName, DateTime.UtcNow),
+            timeout ?? UpdateShutdownTimeout,
+            "application shutdown",
+            "Timed out waiting for APFS Access to quit.")
+            .ConfigureAwait(false);
+        LogDiagnostic($"Quit request completed. success={success}; message='{message ?? string.Empty}'");
+        return success;
     }
 
     private async Task<bool> TryPrimeStatusFromServiceAsync(PipePeer peer, CancellationToken cancellationToken)
@@ -922,10 +887,7 @@ private void HandleServiceStopping()
             return;
         }
 
-        if (Interlocked.Exchange(ref _exitRequested, 1) != 0)
-        {
-            return;
-        }
+        Interlocked.Exchange(ref _exitRequested, 1);
 
         LogDiagnostic("Service notified the tray that it is stopping; exiting tray.");
         ExitTrayForShutdown();

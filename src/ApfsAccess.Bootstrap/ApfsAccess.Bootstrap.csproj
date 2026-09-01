@@ -5,6 +5,8 @@
     <UseWindowsForms>true</UseWindowsForms>
     <AssemblyName>APFS Access</AssemblyName>
     <ApplicationIcon>..\..\assets\icons\tray_idle.ico</ApplicationIcon>
+    <AssemblyVersion>1.0.5.1</AssemblyVersion>
+    <FileVersion>1.0.5.1</FileVersion>
     <PortablePayloadZip Condition="'$(PortablePayloadZip)'==''">$(MSBuildProjectDirectory)\click-run-payload.zip</PortablePayloadZip>
   </PropertyGroup>
 

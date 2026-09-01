@@ -512,7 +512,15 @@ public sealed class GitHubReleaseUpdateClient : IAppUpdateClient, IDisposable
 
         var leftPatch = Math.Max(left.Build, 0);
         var rightPatch = Math.Max(right.Build, 0);
-        return leftPatch.CompareTo(rightPatch);
+        comparison = leftPatch.CompareTo(rightPatch);
+        if (comparison != 0)
+        {
+            return comparison;
+        }
+
+        var leftRevision = Math.Max(left.Revision, 0);
+        var rightRevision = Math.Max(right.Revision, 0);
+        return leftRevision.CompareTo(rightRevision);
     }
 
     private static bool TryNormalizeSha256(string value, out string sha256)

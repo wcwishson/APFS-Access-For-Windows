@@ -257,6 +257,24 @@ public sealed class GitHubReleaseUpdateClientTests
     }
 
     [Fact]
+    public async Task CheckAndDownloadAsync_DoesNotDowngradeNewerBuildRevision()
+    {
+        using var workspace = new TestWorkspace();
+        var launcherBytes = Encoding.UTF8.GetBytes("newer local build");
+        var updateBytes = Encoding.UTF8.GetBytes("older published build");
+        var handler = new FakeReleaseHandler(
+            BuildReleaseJson("v1.0.5", Asset(DownloadUrl, updateBytes)),
+            updateBytes);
+        var launcherPath = workspace.CreateFile("APFS.Access.exe", launcherBytes);
+
+        var result = await CheckAsync(handler, launcherPath, new Version(1, 0, 5, 1));
+
+        Assert.Equal(AppUpdateDecision.UpToDate, result.Decision);
+        Assert.Null(result.Download);
+        Assert.Equal(0, handler.DownloadRequests);
+    }
+
+    [Fact]
     public async Task CheckAndDownloadAsync_RejectsOversizedReleaseResponse()
     {
         using var workspace = new TestWorkspace();

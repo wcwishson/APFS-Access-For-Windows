@@ -4,6 +4,8 @@
     <TargetFramework>net9.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <ApplicationIcon>..\..\assets\icons\tray_idle.ico</ApplicationIcon>
+    <AssemblyVersion>1.0.5.1</AssemblyVersion>
+    <FileVersion>1.0.5.1</FileVersion>
   </PropertyGroup>
 
   <ItemGroup>
