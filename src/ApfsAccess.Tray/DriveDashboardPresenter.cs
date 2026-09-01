@@ -52,7 +52,8 @@ public static class DriveDashboardPresenter
         var worst = mountedRows.Select(static row => row.State).Max();
         return worst switch
         {
-            DriveDashboardState.HealthyReadWrite => $"{countText}. All listed drives are healthy.",
+            DriveDashboardState.HealthyReadWrite => $"{countText}. Full read/write access is available.",
+            DriveDashboardState.FinishingWrites => $"{countText}. Finishing recent writes.",
             DriveDashboardState.ReadOnly => $"{countText}. Attention may be needed.",
             DriveDashboardState.Attention => $"{countText}. Attention may be needed.",
             DriveDashboardState.Problem => $"{countText}. A problem needs attention.",
@@ -101,34 +102,50 @@ public static class DriveDashboardPresenter
 
     private static DriveDashboardState Classify(StatusChangedPayload payload, MountedVolumeDisplay volume)
     {
-        if (payload.State == RuntimeState.Error ||
-            payload.NativeWriteSafetyState == NativeWriteSafetyState.RecoveryBlocked ||
+        if (payload.State == RuntimeState.Error)
+        {
+            return DriveDashboardState.Problem;
+        }
+
+        if (volume.AccessMode == MountAccessMode.ReadWrite &&
+            payload.State == RuntimeState.MountedRw)
+        {
+            if (payload.DirtyTransactionCount > 0 ||
+                payload.ShutdownDrainActive)
+            {
+                return DriveDashboardState.FinishingWrites;
+            }
+
+            return DriveDashboardState.HealthyReadWrite;
+        }
+
+        if (payload.NativeWriteSafetyState == NativeWriteSafetyState.RecoveryBlocked ||
             payload.RecoveryActive)
         {
             return DriveDashboardState.Problem;
         }
 
         if (payload.DirtyTransactionCount > 0 ||
-            payload.ShutdownDrainActive ||
-            payload.InFlightMutationCallbacks > 0 ||
-            HasWarnings(payload))
+            payload.ShutdownDrainActive)
         {
-            return DriveDashboardState.Attention;
+            return DriveDashboardState.FinishingWrites;
         }
 
         if (volume.AccessMode == MountAccessMode.ReadOnly ||
-            payload.State == RuntimeState.MountedRo ||
-            !payload.WriteEnabled ||
+            payload.State == RuntimeState.MountedRo)
+        {
+            return DriveDashboardState.ReadOnly;
+        }
+
+        if (!payload.WriteEnabled ||
             payload.NativeWriteSafetyState == NativeWriteSafetyState.ReadOnlyFallback)
         {
             return DriveDashboardState.ReadOnly;
         }
 
-        if (volume.AccessMode == MountAccessMode.ReadWrite &&
-            payload.State == RuntimeState.MountedRw &&
-            payload.NativeWriteSafetyState is NativeWriteSafetyState.PilotReadWrite or NativeWriteSafetyState.StableReadWrite)
+        if (HasWarnings(payload))
         {
-            return DriveDashboardState.HealthyReadWrite;
+            return DriveDashboardState.Attention;
         }
 
         return DriveDashboardState.Idle;
@@ -146,7 +163,6 @@ public static class DriveDashboardPresenter
         if (payload.State is RuntimeState.Starting or RuntimeState.Stopping ||
             payload.DirtyTransactionCount > 0 ||
             payload.ShutdownDrainActive ||
-            payload.InFlightMutationCallbacks > 0 ||
             HasWarnings(payload))
         {
             return DriveDashboardState.Attention;
@@ -159,6 +175,7 @@ public static class DriveDashboardPresenter
         => state switch
         {
             DriveDashboardState.HealthyReadWrite => DashboardPalette.Green,
+            DriveDashboardState.FinishingWrites => DashboardPalette.Blue,
             DriveDashboardState.ReadOnly => DashboardPalette.Yellow,
             DriveDashboardState.Attention => DashboardPalette.Orange,
             DriveDashboardState.Problem => DashboardPalette.Red,
@@ -169,6 +186,7 @@ public static class DriveDashboardPresenter
         => state switch
         {
             DriveDashboardState.HealthyReadWrite => "Healthy read/write",
+            DriveDashboardState.FinishingWrites => "Finishing writes",
             DriveDashboardState.ReadOnly => "Read-only",
             DriveDashboardState.Attention => "Needs attention",
             DriveDashboardState.Problem => "Problem",
@@ -179,6 +197,7 @@ public static class DriveDashboardPresenter
         => state switch
         {
             DriveDashboardState.HealthyReadWrite => "Full read/write access is available.",
+            DriveDashboardState.FinishingWrites => BuildAttentionSummary(payload),
             DriveDashboardState.ReadOnly => "The drive is mounted for reading, but writes are not currently available.",
             DriveDashboardState.Attention => BuildAttentionSummary(payload),
             DriveDashboardState.Problem => BuildProblemSummary(payload),
@@ -245,6 +264,7 @@ public static class DriveDashboardPresenter
             $"Recovery: {(payload.RecoveryActive ? "active" : "inactive")}",
             $"Recovery reason: {FirstNonBlank(payload.RecoveryReason, "none")}",
             $"Dirty transactions: {payload.DirtyTransactionCount}",
+            $"Active file operations: {payload.InFlightMutationCallbacks}",
             $"Last commit: {(payload.LastCommitXid.HasValue ? payload.LastCommitXid.Value.ToString() : "none")}",
             $"Warnings: {(warnings.Length == 0 ? "none" : string.Join(" | ", warnings))}",
             $"Diagnostics: {(diagnostics.Count == 0 ? "none" : string.Join(" | ", diagnostics.Select(static x => $"{x.Code}: {x.Message}")))}",
@@ -265,7 +285,7 @@ public static class DriveDashboardPresenter
 
     private static IReadOnlyList<string> BuildFixGuidance(DriveDashboardState state, StatusChangedPayload payload)
     {
-        if (state == DriveDashboardState.HealthyReadWrite || state == DriveDashboardState.Idle)
+        if (state is DriveDashboardState.HealthyReadWrite or DriveDashboardState.FinishingWrites or DriveDashboardState.Idle)
         {
             return Array.Empty<string>();
         }

@@ -11,30 +11,47 @@ Set-Location -LiteralPath $repoRoot
 $serviceOut = Join-Path $repoRoot "artifacts/publish/service"
 $trayOut = Join-Path $repoRoot "artifacts/publish/tray"
 $probeOut = Join-Path $repoRoot "artifacts/publish/native-probe"
+$cliOut = Join-Path $repoRoot "artifacts/publish/cli"
+$probeDebugSmokeOut = Join-Path $repoRoot "artifacts/publish/native-probe-debug-smoke"
 $bundleOut = Join-Path $repoRoot "artifacts/publish/click-run"
 $portableOut = Join-Path $repoRoot "artifacts/publish/portable"
+$portableExeName = "APFS Access.exe"
+$legacyPortableExeNames = @("APFSAccess_Portable.exe", "APFSAccess.Portable.exe")
 $portablePayloadZip = Join-Path $repoRoot "artifacts/publish/click-run-payload.zip"
 $nativeOut = Join-Path $repoRoot "artifacts/native/$Configuration"
+$nativeHostExe = Join-Path $nativeOut "ApfsAccess.FsHost.exe"
 $bundleSelfContained = $true
+$nativeBuildRoot = if ([string]::IsNullOrWhiteSpace($env:APFSACCESS_NATIVE_BUILD_ROOT)) {
+    Join-Path ([System.IO.Path]::GetTempPath()) "apfsaccess_native"
+} else {
+    [System.IO.Path]::GetFullPath($env:APFSACCESS_NATIVE_BUILD_ROOT)
+}
 
-New-Item -ItemType Directory -Force -Path $serviceOut, $trayOut, $probeOut, $bundleOut, $portableOut | Out-Null
+$publishOutputDirs = @($serviceOut, $trayOut, $probeOut, $cliOut, $bundleOut, $portableOut)
+foreach ($publishOutputDir in $publishOutputDirs) {
+    if (Test-Path -LiteralPath $publishOutputDir) {
+        Get-ChildItem -LiteralPath $publishOutputDir -Force |
+            Remove-Item -Recurse -Force
+    }
+}
+if (Test-Path -LiteralPath $probeDebugSmokeOut) {
+    Remove-Item -LiteralPath $probeDebugSmokeOut -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path $serviceOut, $trayOut, $probeOut, $cliOut, $bundleOut, $portableOut | Out-Null
 
 Write-Host "[publish] generating tray icons..."
 pwsh -NoProfile -File (Join-Path $repoRoot "scripts/create_tray_icons.ps1")
 
-Write-Host "[publish] building native fs host (best-effort)..."
-$vcvars = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-if (Test-Path -LiteralPath $vcvars) {
-    $cmd = '"' + $vcvars + '" >nul && cd /d "' + $repoRoot + '" && pwsh -NoProfile -File .\scripts\build_native_host.ps1 -Configuration ' + $Configuration + ' -Generator "NMake Makefiles" -SkipIfUnavailable'
-    cmd /c $cmd
-
-    Write-Host "[publish] building native RW engine (best-effort)..."
-    $cmdRw = '"' + $vcvars + '" >nul && cd /d "' + $repoRoot + '" && pwsh -NoProfile -File .\scripts\build_rw_engine.ps1 -Configuration ' + $Configuration + ' -Generator "NMake Makefiles" -SkipIfUnavailable'
-    cmd /c $cmdRw
-} else {
-    pwsh -NoProfile -File (Join-Path $repoRoot "scripts/build_native_host.ps1") -Configuration $Configuration -SkipIfUnavailable
-    pwsh -NoProfile -File (Join-Path $repoRoot "scripts/build_rw_engine.ps1") -Configuration $Configuration -SkipIfUnavailable
+if (Test-Path -LiteralPath $nativeHostExe) {
+    Remove-Item -LiteralPath $nativeHostExe -Force
 }
+
+Write-Host "[publish] building native fs host..."
+$nativeGenerator = "Visual Studio 17 2022"
+pwsh -NoProfile -File (Join-Path $repoRoot "scripts/build_native_host.ps1") `
+    -Configuration $Configuration `
+    -BuildDir (Join-Path $nativeBuildRoot "publish_host_vs/$Configuration") `
+    -Generator $nativeGenerator
 
 Write-Host "[publish] publishing service (split output)..."
 dotnet publish .\src\ApfsAccess.Service\ApfsAccess.Service.csproj -c $Configuration -r $Runtime --self-contained $SelfContained -o $serviceOut
@@ -45,6 +62,9 @@ dotnet publish .\src\ApfsAccess.Tray\ApfsAccess.Tray.csproj -c $Configuration -r
 Write-Host "[publish] publishing native probe (split output)..."
 dotnet publish .\src\ApfsAccess.NativeProbe\ApfsAccess.NativeProbe.csproj -c $Configuration -r $Runtime --self-contained $SelfContained -o $probeOut
 
+Write-Host "[publish] publishing CLI (split output)..."
+dotnet publish .\src\ApfsAccess.Cli\ApfsAccess.Cli.csproj -c $Configuration -r $Runtime --self-contained $SelfContained -o $cliOut
+
 Write-Host "[publish] publishing service (click-run bundle)..."
 dotnet publish .\src\ApfsAccess.Service\ApfsAccess.Service.csproj -c $Configuration -r $Runtime --self-contained $bundleSelfContained -o $bundleOut
 
@@ -54,45 +74,33 @@ dotnet publish .\src\ApfsAccess.Tray\ApfsAccess.Tray.csproj -c $Configuration -r
 Write-Host "[publish] publishing native probe (click-run bundle)..."
 dotnet publish .\src\ApfsAccess.NativeProbe\ApfsAccess.NativeProbe.csproj -c $Configuration -r $Runtime --self-contained $bundleSelfContained -o $bundleOut
 
-$nativeHostExe = Join-Path $nativeOut "ApfsAccess.FsHost.exe"
-if (Test-Path -LiteralPath $nativeHostExe) {
-    Write-Host "[publish] including native fs host..."
-    Copy-Item -LiteralPath $nativeHostExe -Destination (Join-Path $serviceOut "ApfsAccess.FsHost.exe") -Force
-    Copy-Item -LiteralPath $nativeHostExe -Destination (Join-Path $bundleOut "ApfsAccess.FsHost.exe") -Force
-} else {
-    Write-Warning "Native fs host was not found at '$nativeHostExe'. Native Explorer mounting will not work until built."
+Write-Host "[publish] publishing CLI (click-run bundle)..."
+dotnet publish .\src\ApfsAccess.Cli\ApfsAccess.Cli.csproj -c $Configuration -r $Runtime --self-contained $bundleSelfContained -o $bundleOut
+
+foreach ($publishOutputDir in @($serviceOut, $trayOut, $probeOut, $cliOut, $bundleOut)) {
+    $developmentSettings = Join-Path $publishOutputDir "appsettings.Development.json"
+    if (Test-Path -LiteralPath $developmentSettings) {
+        Remove-Item -LiteralPath $developmentSettings -Force
+    }
 }
 
-$rwEngineLib = Join-Path $nativeOut "ApfsAccess.ApfsRwEngine.lib"
-if (Test-Path -LiteralPath $rwEngineLib) {
-    Write-Host "[publish] including native RW engine artifact..."
-    Copy-Item -LiteralPath $rwEngineLib -Destination (Join-Path $bundleOut "ApfsAccess.ApfsRwEngine.lib") -Force
+if (-not (Test-Path -LiteralPath $nativeHostExe)) {
+    throw "Native fs host was not produced at '$nativeHostExe'. Refusing to create an incomplete package."
 }
+
+Write-Host "[publish] including native fs host..."
+Copy-Item -LiteralPath $nativeHostExe -Destination (Join-Path $serviceOut "ApfsAccess.FsHost.exe") -Force
+Copy-Item -LiteralPath $nativeHostExe -Destination (Join-Path $bundleOut "ApfsAccess.FsHost.exe") -Force
 
 $winfspDoc = Join-Path $repoRoot "docs/winfsp-setup.md"
 if (Test-Path -LiteralPath $winfspDoc) {
     Copy-Item -LiteralPath $winfspDoc -Destination (Join-Path $bundleOut "WINFSP_SETUP.md") -Force
 }
 
-$nativeWritePilotDoc = Join-Path $repoRoot "docs/native-write-pilot.md"
-if (Test-Path -LiteralPath $nativeWritePilotDoc) {
-    Copy-Item -LiteralPath $nativeWritePilotDoc -Destination (Join-Path $bundleOut "NATIVE_WRITE_PILOT.md") -Force
-}
-
 $bundleScriptsDir = Join-Path $bundleOut "scripts"
 New-Item -ItemType Directory -Force -Path $bundleScriptsDir | Out-Null
 $bundleScriptNames = @(
-    "configure_native_ce.ps1",
-    "create_test_image.ps1",
-    "evaluate_write_promotion.ps1",
-    "import_validation_report.ps1",
-    "install_prereqs.ps1",
-    "native_probe.ps1",
-    "new_validation_report.ps1",
-    "run_pilot_validation.ps1",
-    "run_physical_rw_validation.ps1",
-    "run_rw_harness.ps1",
-    "update_write_evidence.ps1"
+    "install_prereqs.ps1"
 )
 foreach ($scriptName in $bundleScriptNames) {
     $sourcePath = Join-Path $repoRoot "scripts/$scriptName"
@@ -100,6 +108,9 @@ foreach ($scriptName in $bundleScriptNames) {
         Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $bundleScriptsDir $scriptName) -Force
     }
 }
+
+Get-ChildItem -LiteralPath $bundleOut -Filter "*.pdb" -File -Recurse |
+    Remove-Item -Force
 
 @'
 Option Explicit
@@ -145,68 +156,27 @@ cd /d "%~dp0"
 start "" /min "ApfsAccess.Tray.exe"
 '@ | Set-Content -Path (Join-Path $bundleOut "Run_APFS_Access.bat") -Encoding ascii
  
-Copy-Item -LiteralPath (Join-Path $bundleOut "Run_APFS_Access_Silent.vbs") -Destination (Join-Path $repoRoot "Run_APFS_Access_Silent.vbs") -Force
-
-@'
-@echo off
-setlocal
-if /I not "%APFSACCESS_VISIBLE_CONSOLE%"=="1" if exist "%~dp0Run_APFS_Access_Silent.vbs" (
-  wscript.exe "%~dp0Run_APFS_Access_Silent.vbs"
-  exit /b %ERRORLEVEL%
-)
-if /I not "%APFSACCESS_VISIBLE_CONSOLE%"=="1" if /I not "%APFSACCESS_LAUNCHED_MINIMIZED%"=="1" (
-  set "APFSACCESS_LAUNCHED_MINIMIZED=1"
-  start "" /min "%~f0" %*
-  exit /b
-)
-cd /d "%~dp0"
-set "APP_DIR=%~dp0artifacts\publish\click-run"
-if not exist "%APP_DIR%\ApfsAccess.Tray.exe" (
-  echo APFS Access app is not published yet.
-  echo Build it with:
-  echo   pwsh -NoProfile -File .\build\publish.ps1 -Configuration Release -Runtime win-x64
-  pause
-  exit /b 1
-)
-start "" /min "%APP_DIR%\ApfsAccess.Tray.exe"
-'@ | Set-Content -Path (Join-Path $repoRoot "Run_APFS_Access.bat") -Encoding ascii
-
 @'
 APFS Access click-run package
 
 How to run
-1) Install prerequisites (admin PowerShell):
-   pwsh -NoProfile -File .\scripts\install_prereqs.ps1
-2) Double-click ApfsAccess.Tray.exe (or Run_APFS_Access.bat).
-3) Tray starts and auto-launches ApfsAccess.Service.exe when needed.
-4) Right-click tray icon -> Quit to stop.
+1) Double-click Run_APFS_Access.bat.
+2) Approve the administrator prompt if Windows asks.
+3) If a prerequisite is missing, run scripts\install_prereqs.ps1 as administrator.
+4) Plug in an APFS drive and use the dashboard or This PC.
+5) Eject the APFS volume before unplugging the drive.
+6) Right-click the tray icon and choose Quit to stop APFS Access.
 
 Quiet launcher
 - Use Run_APFS_Access.bat or Run_APFS_Access_Silent.vbs for normal app startup without a visible terminal.
 - Set APFSACCESS_VISIBLE_CONSOLE=1 before running the .bat only when you want troubleshooting output.
 
-Native backend setup
-1) Build native host:
-   pwsh -NoProfile -File .\scripts\build_native_host.ps1 -Configuration Release
-2) Configure appsettings with native paths:
-   pwsh -NoProfile -File .\scripts\configure_native_ce.ps1 -NativeFsHostPath "C:\path\ApfsAccess.FsHost.exe" -DeviceCandidates "\\.\PhysicalDrive1"
-
-Native write policy notes
-- Native write remains conservative and fail-closed by default.
-- Raw physical APFS validation defaults to read-only mount/copy/hash checks.
-- Unsupported volumes (for example encrypted/special-role) are automatically read-only.
-- Image-backed/native test media is the supported in-repo validation path.
-- Raw physical APFS write remains blocked unless an operator deliberately passes the destructive pilot switch and the app's allow-list/evidence gates are satisfied.
-- After a sacrificial APFS volume is mounted read/write, use scripts\run_physical_rw_validation.ps1 for guarded mounted-volume create/copy/hash/rename/move/delete/storm validation.
-- Use `NATIVE_WRITE_PILOT.md` and the bundled `scripts\new_validation_report.ps1`, `scripts\import_validation_report.ps1`, `scripts\evaluate_write_promotion.ps1`, and `scripts\update_write_evidence.ps1` helpers for hardware/cross-OS validation and promotion checks.
-
-Safe image-backed smoke test
-1) Create a disposable normal file:
-   pwsh -NoProfile -File .\scripts\create_test_image.ps1 -Path .\artifacts\test-images\apfsaccess-test.apfs.img -SizeMiB 64
-2) Probe that file through the native backend:
-   pwsh -NoProfile -File .\scripts\native_probe.ps1 -DeviceId .\artifacts\test-images\apfsaccess-test.apfs.img -AsJson
-
-This path never formats a physical drive and refuses to overwrite existing files. The image is synthetic APFS Access validation media, not macOS-compatible mkfs.apfs output.
+Command-line control
+- Run ApfsAccess.Cli.exe from this folder for automation or agent control.
+- `status` reports the current service and mount health; `list` discovers connected APFS devices and volumes.
+- `mount`, `fix`, `eject`, and `quit` issue the same bounded service commands used by the tray app.
+- JSON is the default output. Use `--timeout-ms N`, `--volume-id ID`, `--dry-run`, and `--require-admin` as needed.
+- Exit code 0 means success; 2 invalid arguments; 3 service unavailable; 4 timeout; 5 operation failure; 6 elevation required.
 '@ | Set-Content -Path (Join-Path $bundleOut "README_RUN.txt") -Encoding utf8
 
 if (Test-Path -LiteralPath $portablePayloadZip) {
@@ -234,6 +204,24 @@ Compress-Archive -Path (Join-Path $portablePayloadStaging "*") -DestinationPath 
 Remove-Item -LiteralPath $portablePayloadStaging -Recurse -Force
 
 Write-Host "[publish] publishing portable single-file launcher..."
+foreach ($legacyPortableExeName in $legacyPortableExeNames) {
+    $legacyPortableExe = Join-Path $portableOut $legacyPortableExeName
+    if (Test-Path -LiteralPath $legacyPortableExe) {
+        Remove-Item -LiteralPath $legacyPortableExe -Force
+    }
+}
+
+$bootstrapProjectDir = Join-Path $repoRoot "src/ApfsAccess.Bootstrap"
+$bootstrapCacheDirs = @(
+    (Join-Path $bootstrapProjectDir "bin/$Configuration"),
+    (Join-Path $bootstrapProjectDir "obj/$Configuration")
+)
+foreach ($cacheDir in $bootstrapCacheDirs) {
+    if (Test-Path -LiteralPath $cacheDir) {
+        Remove-Item -LiteralPath $cacheDir -Recurse -Force
+    }
+}
+
 dotnet publish .\src\ApfsAccess.Bootstrap\ApfsAccess.Bootstrap.csproj `
     -c $Configuration `
     -r $Runtime `
@@ -243,14 +231,24 @@ dotnet publish .\src\ApfsAccess.Bootstrap\ApfsAccess.Bootstrap.csproj `
     -p:PortablePayloadZip="$portablePayloadZip" `
     -o $portableOut
 
-$portableExe = Join-Path $portableOut "APFSAccess.Portable.exe"
+$portableExe = Join-Path $portableOut $portableExeName
 if (Test-Path -LiteralPath $portableExe) {
-    Copy-Item -LiteralPath $portableExe -Destination (Join-Path $repoRoot "APFSAccess_Portable.exe") -Force
+    foreach ($legacyPortableExeName in $legacyPortableExeNames) {
+        $legacyRootPortableExe = Join-Path $repoRoot $legacyPortableExeName
+        if (Test-Path -LiteralPath $legacyRootPortableExe) {
+            Remove-Item -LiteralPath $legacyRootPortableExe -Force
+        }
+    }
+
+    Copy-Item -LiteralPath $portableExe -Destination (Join-Path $repoRoot $portableExeName) -Force
+} else {
+    throw "Published portable launcher was not found at '$portableExe'."
 }
 
 Write-Host "[publish] done"
 Write-Host " service   : $serviceOut"
 Write-Host " tray      : $trayOut"
 Write-Host " probe     : $probeOut"
+Write-Host " cli       : $cliOut"
 Write-Host " click-run : $bundleOut"
 Write-Host " portable  : $portableOut"

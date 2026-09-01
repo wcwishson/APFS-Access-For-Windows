@@ -33,13 +33,4 @@ pwsh -NoProfile -File .\scripts\install_prereqs.ps1 -ForDeveloperBuild
 pwsh -NoProfile -File .\scripts\build_native_host.ps1 -Configuration Release
 ```
 
-## Native write pilot validation
-
-1. Use `docs/native-write-pilot.md` for hardware + macOS validation sequencing.
-2. Record pilot evidence with:
-
-```powershell
-pwsh -NoProfile -File .\scripts\update_write_evidence.ps1 -ProfileId "raw::\\.\physicaldrive3::main" -Scenario CrashFault,CrashStageMatrix,HardwarePilot
-```
-
-3. Evidence is stored by default at `%ProgramData%\ApfsAccess\write-evidence.json`.
+APFS Access applies its write-safety and recovery checks automatically. Do not edit its validation or recovery state by hand.

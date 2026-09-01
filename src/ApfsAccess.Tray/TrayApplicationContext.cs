@@ -18,6 +18,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly Control _uiInvoker = new();
     private readonly NotifyIcon _notifyIcon;
     private readonly DashboardForm _dashboard;
+    private readonly StartupSettingsManager _startupSettingsManager;
     private readonly ToolStripMenuItem _ejectItem;
     private readonly List<Icon> _ownedIcons = [];
     private readonly Dictionary<RuntimeState, Icon> _iconByState;
@@ -25,14 +26,18 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly CancellationTokenSource _shutdownCts = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<AckPayload>> _pendingAcks = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _statusPeerSync = new();
+    private string? _ejectMenuSignature;
 
-    private PipePeer? _statusPeer;
+private PipePeer? _statusPeer;
     private StatusChangedPayload? _latestStatus;
-    private bool _exitRequested;
+    private DriveDashboardState? _lastStatusBalloonState;
+    private int _exitRequested;
     private DateTime _lastServiceStartAttemptUtc = DateTime.MinValue;
+    private readonly DateTime _trayStartedUtc;
 
     public TrayApplicationContext()
     {
+        _trayStartedUtc = DateTime.UtcNow;
         _uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
         _ = _uiInvoker.Handle;
 
@@ -64,9 +69,21 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         _notifyIcon.MouseClick += OnNotifyIconMouseClick;
 
-        _dashboard = new DashboardForm(OpenMountPointAsync, RequestEjectAsync, RequestFixAsync);
-        _dashboard.Show();
+        _startupSettingsManager = StartupSettingsManager.CreateDefault();
+        var startupPreferences = _startupSettingsManager.Load();
+        _dashboard = new DashboardForm(
+            OpenMountPointAsync,
+            RequestEjectAsync,
+            RequestFixAsync,
+            startupPreferences,
+            SetStartWithWindowsAsync,
+            SetStartMinimizedAsync);
+if (!startupPreferences.StartMinimized)
+        {
+            _dashboard.Show();
+        }
 
+        HandleIntentionalQuitMarker();
         TryStartServiceProcessIfMissing();
         _ = Task.Run(() => RunStatusListenerAsync(_shutdownCts.Token));
     }
@@ -127,9 +144,9 @@ public sealed class TrayApplicationContext : ApplicationContext
                 : message);
             _notifyIcon.ShowBalloonTip(
                 5000,
-                success ? "APFS Access" : "APFS Access Notice",
+                SelectActionFeedbackTitle(success, volumeId),
                 string.IsNullOrWhiteSpace(message) ? (success ? "APFS drives ejected." : "Eject failed.") : message,
-                success ? ToolTipIcon.Info : ToolTipIcon.Warning);
+                SelectActionFeedbackIcon(success, volumeId));
         });
     }
 
@@ -140,7 +157,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             _dashboard.SetActionsEnabled(false);
             _dashboard.SetFooter("Refreshing APFS drive...");
         });
-        var (success, message) = await TrySendRefreshAsync(clearUserEjectedVolumes: true, volumeId).ConfigureAwait(false);
+        var (success, message) = await TrySendFixAsync(volumeId).ConfigureAwait(false);
         LogDiagnostic($"Fix refresh request completed. success={success}; message='{message ?? string.Empty}'");
         PostToUi(() =>
         {
@@ -150,12 +167,24 @@ public sealed class TrayApplicationContext : ApplicationContext
                 : message);
             _notifyIcon.ShowBalloonTip(
                 5000,
-                success ? "APFS Access" : "APFS Access Notice",
+                SelectActionFeedbackTitle(success, volumeId),
                 string.IsNullOrWhiteSpace(message)
                     ? (success ? "APFS drives refreshed." : "Could not refresh APFS drives.")
                     : message,
-                success ? ToolTipIcon.Info : ToolTipIcon.Warning);
+                SelectActionFeedbackIcon(success, volumeId));
         });
+    }
+
+    private Task SetStartWithWindowsAsync(bool enabled)
+    {
+        _startupSettingsManager.SetStartWithWindows(enabled);
+        return Task.CompletedTask;
+    }
+
+    private Task SetStartMinimizedAsync(bool enabled)
+    {
+        _startupSettingsManager.SetStartMinimized(enabled);
+        return Task.CompletedTask;
     }
 
     private static Task OpenMountPointAsync(string? mountPoint)
@@ -176,13 +205,19 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private async Task RequestQuitAndExitAsync()
     {
-        if (_exitRequested)
+        if (Interlocked.Exchange(ref _exitRequested, 1) != 0)
         {
             return;
         }
 
-        _exitRequested = true;
-        await TrySendQuitAsync().ConfigureAwait(false);
+        var acknowledged = await TrySendQuitAsync().ConfigureAwait(false);
+        var serviceRunning = IsServiceProcessRunningOrUnknown();
+        if (!ShouldCompleteQuit(acknowledged, serviceRunning))
+        {
+            LogDiagnostic("Quit request was not acknowledged and the APFS Access service is still running; keeping the tray available for retry.");
+            Interlocked.Exchange(ref _exitRequested, 0);
+            return;
+        }
 
         PostToUi(() =>
         {
@@ -217,6 +252,13 @@ public sealed class TrayApplicationContext : ApplicationContext
                         var message = await peer.ReadMessageAsync(cancellationToken).ConfigureAwait(false);
                         if (message is null)
                         {
+                            break;
+                        }
+
+                        if (message.Type == ApfsMessageTypes.ServiceStopping &&
+                            PipeMessageCodec.TryGetPayload<ServiceStoppingPayload>(message, out _))
+                        {
+                            HandleServiceStopping();
                             break;
                         }
 
@@ -269,9 +311,15 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
-    private void TryStartServiceProcessIfMissing()
+private void TryStartServiceProcessIfMissing()
     {
-        if (_exitRequested)
+        if (Volatile.Read(ref _exitRequested) != 0)
+        {
+            return;
+        }
+
+        HandleIntentionalQuitMarker();
+        if (Volatile.Read(ref _exitRequested) != 0)
         {
             return;
         }
@@ -326,6 +374,8 @@ public sealed class TrayApplicationContext : ApplicationContext
                     DisposeProcesses(runningServices);
                     return;
                 }
+
+                QuitRequestMarker.ClearMarker();
             }
 
             DisposeProcesses(runningServices);
@@ -351,6 +401,33 @@ public sealed class TrayApplicationContext : ApplicationContext
                     WorkingDirectory = workingDirectory,
                     UseShellExecute = false,
                     CreateNoWindow = true,
+                    Environment =
+                    {
+                        ["TEMP"] = Environment.GetEnvironmentVariable("TEMP") ?? Path.GetTempPath(),
+                        ["TMP"] = Environment.GetEnvironmentVariable("TMP") ?? Path.GetTempPath(),
+                        ["APFSACCESS_SPOOL_ROOT"] = Environment.GetEnvironmentVariable("APFSACCESS_SPOOL_ROOT") ?? string.Empty,
+                        ["APFSACCESS_RUNTIME_ROOT"] = Environment.GetEnvironmentVariable("APFSACCESS_RUNTIME_ROOT") ?? string.Empty,
+                        ["APFSACCESS_TRACE_MOVES"] = Environment.GetEnvironmentVariable("APFSACCESS_TRACE_MOVES") ?? string.Empty,
+                        ["APFSACCESS_PERF_COUNTERS"] = Environment.GetEnvironmentVariable("APFSACCESS_PERF_COUNTERS") ?? string.Empty,
+                        ["APFSACCESS_TRACE_COMMITS"] = Environment.GetEnvironmentVariable("APFSACCESS_TRACE_COMMITS") ?? string.Empty,
+                        ["APFSACCESS_TRACE_READS"] = Environment.GetEnvironmentVariable("APFSACCESS_TRACE_READS") ?? string.Empty,
+                        ["APFSACCESS_DEFER_CLOSE_COMMITS"] = Environment.GetEnvironmentVariable("APFSACCESS_DEFER_CLOSE_COMMITS") ?? string.Empty,
+                        ["APFSACCESS_DISABLE_CONTENT_WRITEBACK"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_CONTENT_WRITEBACK") ?? string.Empty,
+                        ["APFSACCESS_ENABLE_GROUPED_DEFERRED_ACCEPTANCE"] = Environment.GetEnvironmentVariable("APFSACCESS_ENABLE_GROUPED_DEFERRED_ACCEPTANCE") ?? string.Empty,
+                        ["APFSACCESS_DISABLE_GROUPED_DEFERRED_ACCEPTANCE"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_GROUPED_DEFERRED_ACCEPTANCE") ?? string.Empty,
+                        ["APFSACCESS_DISABLE_DEFERRED_INDEX_PERSISTENCE"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_DEFERRED_INDEX_PERSISTENCE") ?? string.Empty,
+                        ["APFSACCESS_EXPERIMENTAL_NAMESPACE_WRITEBACK"] = Environment.GetEnvironmentVariable("APFSACCESS_EXPERIMENTAL_NAMESPACE_WRITEBACK") ?? string.Empty,
+                        ["APFSACCESS_DISABLE_NAMESPACE_WRITEBACK"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_NAMESPACE_WRITEBACK") ?? string.Empty,
+                        ["APFSACCESS_DISABLE_ASYNC_BLOCK_IO"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_ASYNC_BLOCK_IO") ?? string.Empty,
+                        ["APFSACCESS_ASYNC_BLOCK_IO_DEPTH"] = Environment.GetEnvironmentVariable("APFSACCESS_ASYNC_BLOCK_IO_DEPTH") ?? string.Empty,
+                        ["APFSACCESS_CHECKPOINT_DELTA_SHADOW"] = Environment.GetEnvironmentVariable("APFSACCESS_CHECKPOINT_DELTA_SHADOW") ?? string.Empty,
+                        ["APFSACCESS_STRICT_COMMIT_VERIFY"] = Environment.GetEnvironmentVariable("APFSACCESS_STRICT_COMMIT_VERIFY") ?? string.Empty,
+                        ["APFSACCESS_DISABLE_WORKING_FREE_SANITIZE_CACHE"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_WORKING_FREE_SANITIZE_CACHE") ?? string.Empty,
+                        ["APFSACCESS_DISABLE_CHECKPOINT_SERIALIZATION_BUFFER_REUSE"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_CHECKPOINT_SERIALIZATION_BUFFER_REUSE") ?? string.Empty,
+                        ["APFSACCESS_DISABLE_CHECKPOINT_SLOT_INDEX"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_CHECKPOINT_SLOT_INDEX") ?? string.Empty,
+                        ["APFSACCESS_DISABLE_CHECKPOINT_BLOCK_INDEX_CACHE"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_CHECKPOINT_BLOCK_INDEX_CACHE") ?? string.Empty,
+                        ["APFSACCESS_DISABLE_INDEX_DELTA"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_INDEX_DELTA") ?? string.Empty,
+                    },
                 });
                 return;
             }
@@ -511,7 +588,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
         catch
         {
-            // Timeout fallback behavior: tray should still exit.
+            // The caller verifies service exit before allowing the tray to close.
         }
 
         return false;
@@ -524,6 +601,13 @@ public sealed class TrayApplicationContext : ApplicationContext
             var message = await peer.ReadMessageAsync(cancellationToken).ConfigureAwait(false);
             if (message is null)
             {
+                return false;
+            }
+
+            if (message.Type == ApfsMessageTypes.ServiceStopping &&
+                PipeMessageCodec.TryGetPayload<ServiceStoppingPayload>(message, out _))
+            {
+                HandleServiceStopping();
                 return false;
             }
 
@@ -544,6 +628,88 @@ public sealed class TrayApplicationContext : ApplicationContext
         return false;
     }
 
+    private static bool ShouldCompleteQuit(bool acknowledged, bool serviceRunning)
+        => acknowledged || !serviceRunning;
+
+    private static bool IsServiceProcessRunningOrUnknown()
+    {
+        Process[] processes;
+        try
+        {
+            processes = Process.GetProcessesByName("ApfsAccess.Service");
+        }
+        catch
+        {
+            return true;
+        }
+
+        try
+        {
+            return processes.Length > 0;
+        }
+        finally
+        {
+            DisposeProcesses(processes);
+        }
+    }
+
+private void HandleServiceStopping()
+    {
+        if (Interlocked.Exchange(ref _exitRequested, 1) != 0)
+        {
+            return;
+        }
+
+        LogDiagnostic("Service notified the tray that it is stopping; exiting tray.");
+        ExitTrayForShutdown();
+    }
+
+    private void HandleIntentionalQuitMarker()
+    {
+        if (Volatile.Read(ref _exitRequested) != 0)
+        {
+            return;
+        }
+
+        var markerTimestampUtc = QuitRequestMarker.TryReadMarkerTimestampUtc();
+        if (markerTimestampUtc is null)
+        {
+            return;
+        }
+
+        if (QuitRequestMarker.ShouldHonorMarker(markerTimestampUtc.Value, _trayStartedUtc))
+        {
+            LogDiagnostic($"Intentional quit marker found (written {markerTimestampUtc.Value:O}); exiting tray without restarting the service.");
+            if (Interlocked.Exchange(ref _exitRequested, 1) != 0)
+            {
+                return;
+            }
+
+            ExitTrayForShutdown();
+            return;
+        }
+
+        LogDiagnostic("Ignoring stale quit marker from a previous tray session.");
+        QuitRequestMarker.ClearMarker();
+    }
+
+    private void ExitTrayForShutdown()
+    {
+        try
+        {
+            _shutdownCts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+
+        PostToUi(() =>
+        {
+            _notifyIcon.Visible = false;
+            ExitThread();
+        });
+    }
+
     private async Task<(bool Success, string? Message)> TrySendEjectAsync(string? volumeId = null)
         => await TrySendRequestAsync(
             ApfsMessageTypes.EjectRequested,
@@ -560,6 +726,15 @@ public sealed class TrayApplicationContext : ApplicationContext
             FixRequestTimeout,
             $"clearUserEjectedVolumes={clearUserEjectedVolumes}; volumeId='{volumeId ?? "<all>"}'",
             "Timed out waiting for APFS Access to refresh drives.")
+            .ConfigureAwait(false);
+
+    private async Task<(bool Success, string? Message)> TrySendFixAsync(string? volumeId = null)
+        => await TrySendRequestAsync(
+            ApfsMessageTypes.FixRequested,
+            new FixRequestedPayload(Environment.UserName, DateTime.UtcNow, volumeId),
+            FixRequestTimeout,
+            $"volumeId='{volumeId ?? "<all>"}'",
+            "Timed out waiting for APFS Access to fix drives.")
             .ConfigureAwait(false);
 
     private async Task<(bool Success, string? Message)> TrySendRequestAsync(
@@ -741,6 +916,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         _notifyIcon.Icon = _iconByState[RuntimeState.Error];
         _notifyIcon.Text = "APFS Access: service disconnected";
+        _ejectMenuSignature = null;
         ResetEjectMenu(_ejectItem);
         var disconnected = new StatusChangedPayload(
             State: RuntimeState.Error,
@@ -751,20 +927,24 @@ public sealed class TrayApplicationContext : ApplicationContext
             WriteEnabled: false,
             CompatibilityWarnings: Array.Empty<string>());
         _latestStatus = disconnected;
+        _lastStatusBalloonState = SelectBalloonState(disconnected);
         _dashboard.ApplyStatus(disconnected);
     }
 
     private void UpdateUi(StatusChangedPayload payload)
     {
         _latestStatus = payload;
-        if (!_iconByState.TryGetValue(payload.State, out var icon))
+        var previousBalloonState = _lastStatusBalloonState;
+        var rows = DriveDashboardPresenter.BuildRows(payload);
+        var currentBalloonState = SelectBalloonStateFromRows(payload, rows);
+        if (!_iconByState.TryGetValue(SelectNotifyIconStateForState(currentBalloonState, payload.State), out var icon))
         {
             icon = _iconByState[RuntimeState.Idle];
         }
 
         _notifyIcon.Icon = icon;
 
-        var text = BuildNotifyIconText(payload);
+        var text = BuildNotifyIconTextForState(payload, currentBalloonState);
 
         if (text.Length > 63)
         {
@@ -774,12 +954,25 @@ public sealed class TrayApplicationContext : ApplicationContext
         _notifyIcon.Text = text;
         UpdateEjectMenu(payload);
         _dashboard.ApplyStatus(payload);
-        ShowWarnings(payload);
+        if (currentBalloonState == DriveDashboardState.HealthyReadWrite)
+        {
+            _shownWarnings.Clear();
+        }
+        ShowWarnings(payload, BuildStatusBalloonWarnings(payload, currentBalloonState), currentBalloonState);
+        ShowHealthTransition(payload, previousBalloonState, currentBalloonState);
+        _lastStatusBalloonState = currentBalloonState;
     }
 
     private void UpdateEjectMenu(StatusChangedPayload payload)
     {
         var descriptors = BuildEjectMenuDescriptors(payload);
+        var signature = BuildEjectMenuSignature(descriptors);
+        if (string.Equals(_ejectMenuSignature, signature, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        _ejectMenuSignature = signature;
         _ejectItem.DropDownItems.Clear();
         _ejectItem.Tag = null;
         _ejectItem.Enabled = descriptors.Count > 0;
@@ -818,26 +1011,39 @@ public sealed class TrayApplicationContext : ApplicationContext
         ejectItem.Enabled = false;
     }
 
+    private static string BuildEjectMenuSignature(IReadOnlyList<EjectMenuDescriptor> descriptors)
+        => string.Join(
+            "\u001f",
+            descriptors.Select(static descriptor =>
+                $"{descriptor.VolumeId ?? string.Empty}\u001e{descriptor.Text}"));
+
     private static string BuildNotifyIconText(StatusChangedPayload payload)
+        => BuildNotifyIconTextForState(payload, SelectBalloonState(payload));
+
+    private static string BuildNotifyIconTextForState(StatusChangedPayload payload, DriveDashboardState effectiveState)
     {
         var text = payload.State switch
         {
-            RuntimeState.MountedRw => $"APFS Access: mounted RW ({payload.MountPoints.Count})",
-            RuntimeState.MountedRo => $"APFS Access: mounted RO ({payload.MountPoints.Count})",
+            RuntimeState.MountedRw => $"APFS Access: mounted read/write ({payload.MountPoints.Count})",
+            RuntimeState.MountedRo => $"APFS Access: mounted read-only ({payload.MountPoints.Count})",
             RuntimeState.Error => "APFS Access: error",
             RuntimeState.Starting => "APFS Access: starting",
             RuntimeState.Stopping => "APFS Access: stopping",
             _ => "APFS Access: idle",
         };
 
-        var warningCount = (payload.Warnings?.Count ?? 0) + (payload.CompatibilityWarnings?.Count ?? 0);
+        var nonWarningMountedState = IsNonWarningMountedState(effectiveState);
+        var warningCount = nonWarningMountedState
+            ? 0
+            : (payload.Warnings?.Count ?? 0) + (payload.CompatibilityWarnings?.Count ?? 0);
         if (warningCount > 0 && payload.State is not RuntimeState.Error)
         {
             text = $"{text} [warn:{warningCount}]";
         }
 
         var primaryRecoveryReason = SelectPrimaryRecoveryReason(payload);
-        if ((payload.RecoveryActive || payload.NativeWriteSafetyState == NativeWriteSafetyState.RecoveryBlocked) &&
+        if (!nonWarningMountedState &&
+            (payload.RecoveryActive || payload.NativeWriteSafetyState == NativeWriteSafetyState.RecoveryBlocked) &&
             payload.State is not RuntimeState.Error)
         {
             text = string.IsNullOrWhiteSpace(primaryRecoveryReason)
@@ -845,7 +1051,8 @@ public sealed class TrayApplicationContext : ApplicationContext
                 : $"{text} [recovery:{primaryRecoveryReason}]";
         }
 
-        if (payload.NativeWriteSafetyState == NativeWriteSafetyState.RecoveryBlocked &&
+        if (!nonWarningMountedState &&
+            payload.NativeWriteSafetyState == NativeWriteSafetyState.RecoveryBlocked &&
             payload.State is not RuntimeState.Error)
         {
             text = $"{text} [rw:blocked]";
@@ -859,11 +1066,6 @@ public sealed class TrayApplicationContext : ApplicationContext
         if (payload.ShutdownDrainActive && payload.State is not RuntimeState.Error)
         {
             text = $"{text} [drain]";
-        }
-
-        if (payload.InFlightMutationCallbacks > 0 && payload.State is not RuntimeState.Error)
-        {
-            text = $"{text} [mut:{payload.InFlightMutationCallbacks}]";
         }
 
         return text;
@@ -945,18 +1147,35 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private void ShowWarnings(StatusChangedPayload payload)
     {
+        var balloonState = SelectBalloonState(payload);
+        ShowWarnings(payload, BuildStatusBalloonWarnings(payload, balloonState), balloonState);
+    }
+
+    private static IReadOnlyList<string> BuildStatusBalloonWarnings(StatusChangedPayload payload)
+        => BuildStatusBalloonWarnings(payload, SelectBalloonState(payload));
+
+    private static IReadOnlyList<string> BuildStatusBalloonWarnings(
+        StatusChangedPayload payload,
+        DriveDashboardState balloonState)
+    {
         var warnings = (payload.Warnings ?? Array.Empty<string>())
             .Concat(payload.CompatibilityWarnings ?? Array.Empty<string>())
             .Where(static x => !string.IsNullOrWhiteSpace(x))
+            .Where(static x => !IsHealthyMountNotice(x))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(static x => GetWarningPriority(x))
             .ThenBy(x => x, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
-        ShowWarnings(warnings);
+        return IsNonWarningMountedState(balloonState)
+            ? Array.Empty<string>()
+            : warnings;
     }
 
-    private void ShowWarnings(IReadOnlyList<string> warnings)
+    private void ShowWarnings(
+        StatusChangedPayload payload,
+        IReadOnlyList<string> warnings,
+        DriveDashboardState balloonState)
     {
         if (warnings.Count == 0)
         {
@@ -976,9 +1195,241 @@ public sealed class TrayApplicationContext : ApplicationContext
             }
 
             var message = warning.Length > 220 ? warning[..220] : warning;
-            _notifyIcon.ShowBalloonTip(6000, "APFS Access Notice", message, ToolTipIcon.Warning);
+            _notifyIcon.ShowBalloonTip(
+                6000,
+                SelectBalloonTitle(balloonState),
+                message,
+                SelectBalloonIcon(balloonState));
         }
     }
+
+    private void ShowHealthTransition(
+        StatusChangedPayload payload,
+        DriveDashboardState? previousState,
+        DriveDashboardState currentState)
+    {
+        if (!ShouldShowHealthTransitionBalloon(previousState, currentState))
+        {
+            return;
+        }
+
+        _notifyIcon.ShowBalloonTip(
+            4000,
+            SelectBalloonTitle(currentState),
+            BuildHealthTransitionBalloonMessage(payload),
+            SelectBalloonIcon(currentState));
+    }
+
+    private static bool ShouldShowHealthTransitionBalloon(
+        DriveDashboardState? previousState,
+        DriveDashboardState currentState)
+        => currentState == DriveDashboardState.HealthyReadWrite &&
+           (previousState is DriveDashboardState.Problem or
+               DriveDashboardState.ReadOnly or
+               DriveDashboardState.Attention);
+
+    private static string BuildHealthTransitionBalloonMessage(StatusChangedPayload payload)
+    {
+        if (payload.MountedVolumes is { Count: 1 })
+        {
+            var volume = payload.MountedVolumes[0];
+            var drive = NormalizeDriveLabel(volume.MountPoint);
+            var volumeName = string.IsNullOrWhiteSpace(volume.VolumeName)
+                ? "APFS"
+                : volume.VolumeName.Trim();
+            return $"{drive} ({volumeName}) is mounted with full read/write access.";
+        }
+
+        if (payload.MountPoints.Count == 1)
+        {
+            return $"{NormalizeDriveLabel(payload.MountPoints[0])} is mounted with full read/write access.";
+        }
+
+        var count = payload.MountedVolumes?.Count > 0
+            ? payload.MountedVolumes.Count
+            : payload.MountPoints.Count;
+        return count == 1
+            ? "APFS drive is mounted with full read/write access."
+            : $"{count} APFS drives are mounted with full read/write access.";
+    }
+
+    private static ToolTipIcon SelectBalloonIcon(StatusChangedPayload payload)
+        => SelectBalloonIcon(SelectBalloonState(payload));
+
+    private static RuntimeState SelectNotifyIconState(StatusChangedPayload payload)
+        => SelectNotifyIconStateForState(SelectBalloonState(payload), payload.State);
+
+    private static RuntimeState SelectNotifyIconStateForState(DriveDashboardState state, RuntimeState fallbackState)
+        => state switch
+        {
+            DriveDashboardState.Problem => RuntimeState.Error,
+            DriveDashboardState.ReadOnly or DriveDashboardState.Attention => RuntimeState.MountedRo,
+            DriveDashboardState.HealthyReadWrite or DriveDashboardState.FinishingWrites => RuntimeState.MountedRw,
+            _ => fallbackState,
+        };
+
+    private string SelectActionBalloonTitle(bool success)
+    {
+        if (!success && _latestStatus is { } latestStatus)
+        {
+            return SelectBalloonTitle(SelectBalloonState(latestStatus));
+        }
+
+        if (_latestStatus is { } currentStatus)
+        {
+            return SelectBalloonTitle(SelectBalloonState(currentStatus));
+        }
+
+        return success ? "APFS Access" : "APFS Access Problem";
+    }
+
+    private ToolTipIcon SelectActionBalloonIcon(bool success)
+    {
+        if (!success && _latestStatus is { } latestStatus)
+        {
+            return SelectBalloonIcon(SelectBalloonState(latestStatus));
+        }
+
+        if (_latestStatus is { } currentStatus)
+        {
+            return SelectBalloonIcon(SelectBalloonState(currentStatus));
+        }
+
+        return success ? ToolTipIcon.Info : ToolTipIcon.Error;
+    }
+
+    private string SelectActionFeedbackTitle(bool success, string? volumeId)
+    {
+        var state = SelectActionFeedbackState(volumeId);
+        if (state.HasValue)
+        {
+            return SelectBalloonTitle(state.Value);
+        }
+
+        return success ? "APFS Access" : "APFS Access Problem";
+    }
+
+    private ToolTipIcon SelectActionFeedbackIcon(bool success, string? volumeId)
+    {
+        var state = SelectActionFeedbackState(volumeId);
+        if (state.HasValue)
+        {
+            return SelectBalloonIcon(state.Value);
+        }
+
+        return success ? ToolTipIcon.Info : ToolTipIcon.Error;
+    }
+
+    private DriveDashboardState? SelectActionFeedbackState(string? volumeId)
+    {
+        if (_latestStatus is not { } latestStatus)
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(volumeId))
+        {
+            return SelectBalloonState(latestStatus);
+        }
+
+        var rows = DriveDashboardPresenter.BuildRows(latestStatus);
+        var matchingRow = rows.FirstOrDefault(candidate =>
+            string.Equals(candidate.VolumeId, volumeId, StringComparison.OrdinalIgnoreCase));
+        if (matchingRow is not null)
+        {
+            return matchingRow.State;
+        }
+
+        return SelectBalloonState(latestStatus);
+    }
+
+    private static DriveDashboardState SelectBalloonState(StatusChangedPayload payload)
+    {
+        var rows = DriveDashboardPresenter.BuildRows(payload);
+        return SelectBalloonStateFromRows(payload, rows);
+    }
+
+    private static DriveDashboardState SelectBalloonStateFromRows(
+        StatusChangedPayload payload,
+        IReadOnlyList<DriveDashboardRow> rows)
+    {
+        if (payload.MountedVolumes is { Count: > 0 })
+        {
+            var mountedStates = rows
+                .Where(static row => row.State != DriveDashboardState.Idle)
+                .Select(static row => row.State)
+                .ToArray();
+            if (mountedStates.Length > 0)
+            {
+                return mountedStates.Max();
+            }
+        }
+
+        if (payload.NativeWriteSafetyState == NativeWriteSafetyState.RecoveryBlocked ||
+            payload.RecoveryActive)
+        {
+            return DriveDashboardState.Problem;
+        }
+
+        if (payload.DirtyTransactionCount > 0 ||
+            payload.ShutdownDrainActive)
+        {
+            return DriveDashboardState.FinishingWrites;
+        }
+
+        if (payload.State == RuntimeState.MountedRw)
+        {
+            return DriveDashboardState.HealthyReadWrite;
+        }
+
+        if (payload.State == RuntimeState.MountedRo ||
+            payload.NativeWriteSafetyState == NativeWriteSafetyState.ReadOnlyFallback ||
+            ((payload.MountPoints?.Count ?? 0) > 0 && !payload.WriteEnabled))
+        {
+            return DriveDashboardState.ReadOnly;
+        }
+
+        if (HasWarningSignals(payload) ||
+            payload.State is RuntimeState.Starting or RuntimeState.Stopping)
+        {
+            return DriveDashboardState.Attention;
+        }
+
+        return DriveDashboardState.Idle;
+    }
+
+    private static bool HasWarningSignals(StatusChangedPayload payload)
+        => (payload.Warnings ?? Array.Empty<string>()).Any(static warning => !string.IsNullOrWhiteSpace(warning)) ||
+           (payload.CompatibilityWarnings ?? Array.Empty<string>()).Any(static warning => !string.IsNullOrWhiteSpace(warning)) ||
+           payload.NativeWriteDiagnostics is { Count: > 0 };
+
+    private static bool IsHealthyMountNotice(string warning)
+        => warning.Contains("mounted", StringComparison.OrdinalIgnoreCase) &&
+           warning.Contains("native write enabled", StringComparison.OrdinalIgnoreCase);
+
+    private static ToolTipIcon SelectBalloonIcon(DriveDashboardState state)
+        => state switch
+        {
+            DriveDashboardState.Problem => ToolTipIcon.Error,
+            DriveDashboardState.ReadOnly or DriveDashboardState.Attention => ToolTipIcon.Warning,
+            DriveDashboardState.FinishingWrites => ToolTipIcon.Info,
+            DriveDashboardState.HealthyReadWrite => ToolTipIcon.Info,
+            _ => ToolTipIcon.Info,
+        };
+
+    private static bool IsNonWarningMountedState(DriveDashboardState state)
+        => state is DriveDashboardState.HealthyReadWrite or DriveDashboardState.FinishingWrites;
+
+    private static string SelectBalloonTitle(DriveDashboardState state)
+        => state switch
+        {
+            DriveDashboardState.Problem => "APFS Access Problem",
+            DriveDashboardState.ReadOnly => "APFS Access Read-only",
+            DriveDashboardState.Attention => "APFS Access Notice",
+            DriveDashboardState.FinishingWrites => "APFS Access Finishing Writes",
+            DriveDashboardState.HealthyReadWrite => "APFS Access Healthy",
+            _ => "APFS Access",
+        };
 
     private static string? SelectPrimaryRecoveryReason(StatusChangedPayload payload)
     {

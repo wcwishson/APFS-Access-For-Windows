@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.20)
 project(ApfsAccessFsHost LANGUAGES CXX)
 include(CTest)
 
+set(APFSACCESS_MSVC_PGO_MODE "" CACHE STRING "MSVC profile-guided optimization mode: empty, Instrument, or Optimize")
+set_property(CACHE APFSACCESS_MSVC_PGO_MODE PROPERTY STRINGS "" "Instrument" "Optimize")
+set(APFSACCESS_MSVC_PGO_PGD "" CACHE STRING "MSVC PGO database path")
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -17,7 +21,32 @@ target_compile_definitions(ApfsAccess.FsHost PRIVATE
 )
 
 if(MSVC)
-    target_compile_options(ApfsAccess.FsHost PRIVATE /W4 /permissive-)
+    target_compile_options(ApfsAccess.FsHost PRIVATE
+        /W4
+        /permissive-
+        $<$<CONFIG:Release>:/Oi>
+        $<$<CONFIG:Release>:/Ot>
+        $<$<CONFIG:Release>:/Gy>
+        $<$<CONFIG:Release>:/Gw>
+    )
+    target_link_options(ApfsAccess.FsHost PRIVATE
+        $<$<CONFIG:Release>:/OPT:REF>
+        $<$<CONFIG:Release>:/OPT:ICF>
+        $<$<CONFIG:Release>:/PDBALTPATH:%_PDB%>
+    )
+    set_property(TARGET ApfsAccess.FsHost PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    if(CMAKE_BUILD_TYPE STREQUAL "Release" AND APFSACCESS_MSVC_PGO_MODE)
+        if(APFSACCESS_MSVC_PGO_MODE STREQUAL "Instrument")
+            target_link_options(ApfsAccess.FsHost PRIVATE /GENPROFILE)
+        elseif(APFSACCESS_MSVC_PGO_MODE STREQUAL "Optimize")
+            target_link_options(ApfsAccess.FsHost PRIVATE /USEPROFILE)
+        else()
+            message(FATAL_ERROR "Unsupported APFSACCESS_MSVC_PGO_MODE: ${APFSACCESS_MSVC_PGO_MODE}")
+        endif()
+        if(APFSACCESS_MSVC_PGO_PGD)
+            target_link_options(ApfsAccess.FsHost PRIVATE "/PGD:${APFSACCESS_MSVC_PGO_PGD}")
+        endif()
+    endif()
 endif()
 
 # Prefer vendored WinFsp headers to avoid requiring a local SDK installation.
@@ -59,6 +88,7 @@ if(APFSACCESS_BUILD_FSHOST_TESTS)
 
     if(MSVC)
         target_compile_options(ApfsAccess.FsHost.SemanticsTests PRIVATE /W4 /permissive-)
+        set_property(TARGET ApfsAccess.FsHost.SemanticsTests PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
     endif()
 
     if(TARGET ApfsAccess.ApfsRwEngine)

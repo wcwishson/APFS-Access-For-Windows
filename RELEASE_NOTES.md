@@ -1,5 +1,50 @@
 # APFS Access Release Notes
 
+## APFS Access 1.0.5
+
+APFS Access 1.0.5 improves day-to-day reliability, control, and performance for supported writable APFS data volumes. It also makes read-only states clearer and gives scripts and AI agents a complete command-line interface.
+
+### Download
+
+Most users should download:
+
+- `APFS Access.exe`
+
+Advanced users may also download the click-run zip for the same release.
+
+### Quick Start
+
+1. Download `APFS Access.exe`.
+2. Double-click it and approve the administrator prompt.
+3. Let APFS Access install WinFsp and the Microsoft Visual C++ runtime if requested.
+4. Plug in an APFS drive.
+5. Use the dashboard or open This PC and use the mounted drive letter.
+
+### What Changed
+
+- Improved responsiveness for common copy, move, rename, delete, and many-small-file workloads while preserving guarded commits and recovery behavior.
+- Removed an arbitrary age limit that could make an otherwise healthy validated volume fall back to read-only.
+- Improved mount, fix, eject, quit, and restart lifecycle handling so stale hosts and stale drive state are less likely to survive an operation.
+- Added `ApfsAccess.Cli.exe` with structured commands for status, discovery, mounting, fixing, ejecting, and quitting.
+- Made read-only status consistent: the tray icon is yellow and user-facing text says `read-only` instead of abbreviations.
+- Added `Start with Windows` and `Start minimized` dashboard options.
+
+### User-Facing Behavior
+
+- Green means the volume is healthy and mounted read/write.
+- Yellow means the volume is mounted read-only but remains usable for reading and copying files out.
+- `Fix` performs a safe refresh/remount when writable mode can be restored in software.
+- `Eject` drains pending work, removes the mount, and verifies that APFS Access has released it.
+- Closing the dashboard leaves the tray app running; use the tray `Quit` command to stop APFS Access.
+
+### Known Limits
+
+- No signed installer yet, so Windows SmartScreen may warn on first run.
+- Encrypted APFS volumes are not supported.
+- Case-sensitive volumes and some APFS roles or feature combinations remain read-only or unsupported.
+- Writable mode remains conservative and can still fall back to read-only when a safety or recovery check fails.
+- Write speed varies with the drive, USB adapter, Windows storage stack, workload, and APFS layout.
+
 ## APFS Access 1.0.4
 
 APFS Access 1.0.4 is a performance-focused release for writable APFS drives. It keeps the same dashboard and tray workflow from 1.0.3, while making common write-heavy Explorer operations feel smoother, especially folders with many small files.
@@ -8,13 +53,13 @@ APFS Access 1.0.4 is a performance-focused release for writable APFS drives. It 
 
 Most users should download:
 
-- `APFSAccess_Portable.exe`
+- `APFS Access.exe`
 
 Advanced users may also download the click-run zip for the same release.
 
 ### Quick Start
 
-1. Download `APFSAccess_Portable.exe`.
+1. Download `APFS Access.exe`.
 2. Double-click it.
 3. Approve the administrator prompt.
 4. Let the app install WinFsp and the Microsoft Visual C++ runtime if it asks.
@@ -56,13 +101,13 @@ APFS Access 1.0.3 improves everyday use with a new dashboard, stronger write-pat
 
 Most users should download:
 
-- `APFSAccess_Portable.exe`
+- `APFS Access.exe`
 
 Advanced users may also download the click-run zip for the same release.
 
 ### Quick Start
 
-1. Download `APFSAccess_Portable.exe`.
+1. Download `APFS Access.exe`.
 2. Double-click it.
 3. Approve the administrator prompt.
 4. Let the app install WinFsp and the Microsoft Visual C++ runtime if it asks.
@@ -111,13 +156,13 @@ APFS Access 1.0.2 improves everyday use with a new dashboard, stronger write-pat
 
 Most users should download:
 
-- `APFSAccess_Portable.exe`
+- `APFS Access.exe`
 
 Advanced users may also download the click-run zip for the same release.
 
 ### Quick Start
 
-1. Download `APFSAccess_Portable.exe`.
+1. Download `APFS Access.exe`.
 2. Double-click it.
 3. Approve the administrator prompt.
 4. Let the app install WinFsp and the Microsoft Visual C++ runtime if it asks.
@@ -165,7 +210,7 @@ APFS Access 1.0.0 is the first public release of APFS Access for Windows. It pac
 
 Most users should download:
 
-- `APFSAccess_Portable.exe`
+- `APFS Access.exe`
 
 Advanced users may also download:
 
@@ -173,7 +218,7 @@ Advanced users may also download:
 
 ## Quick Start
 
-1. Download `APFSAccess_Portable.exe`.
+1. Download `APFS Access.exe`.
 2. Double-click it.
 3. Approve the administrator prompt.
 4. Let the app install WinFsp and the Microsoft Visual C++ runtime if it asks.

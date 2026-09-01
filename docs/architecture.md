@@ -61,8 +61,34 @@
    - native mutation staging now applies fail-atomic per-request rollback in `MetadataStore::ApplyMutation`, preventing partial pending-state drift when an operation returns `InvalidRequest` or `AllocationFailed`.
 17. Service reconciliation loop unmounts stale volumes and can remount reconnected ones.
 
-## Current implementation phase
+## Write durability flow (WAL / payload spool / checkpoint)
 
-1. Phase-1/2 bridge now includes host/process orchestration, direct WinFsp read callbacks, contracts, scripts, and packaging.
-2. Phase-A/Phase-B write support adds contracts, safety gates, diagnostics, and overlay/native write scaffolds with partial persisted commit scaffolding, but without full APFS metadata transaction parity.
-3. Full APFS mutation engine remains follow-up work (`docs/native-write-roadmap.md`).
+1. Mutation acceptance and journaling:
+   - FsHost mutation callbacks are admitted by `MetadataStore` only while the host is `CommitReady`; `ApplyMutation` stages fail-atomic per-request rollback and returns `NotReady` while a recovery-required latch is armed (e.g., after checkpoint-stage failures).
+   - `TransactionManager` writes binary `WriteAheadLog` records bound to a partition identity (device path + partition offset + volume token + stable serial), with checksum/version/wrong-volume rejection, and persists buffered prepared records plus the transaction-end marker in one durable WAL append at commit time.
+   - WAL recovery truncates torn tails with a flushed fix-up, compacts through write-through replacement, and enforces a runtime size cap with compaction retry before failing.
+2. Payload spool staging:
+   - `PayloadSpool` appends dirty payload chunks first, then indexes them by object/generation/logical range with bounded same-sequence coalescing; reads are checksum-protected and wrong-volume reads are rejected.
+   - Payload ranges are staged before the WAL mutation record; a failed WAL prepare discards the just-staged payload range; dirty persisted spool evidence at startup forces recovery/fail-closed behavior.
+   - The spool enforces a quota, cleans only after successful native checkpoints, and is pruned on host exit; hydration remains the fallback byte source.
+3. Deferred close:
+   - Close commits defer only when pending mutations are content writes (`PendingMutationsAreContentWritesOnly`); create, resize, timestamp, delete, rename, flush, shutdown, and dirty-limit remain synchronous safety barriers.
+   - Deferred batches are accepted through grouped acceptance cohorts with a bounded worker drain; flush/eject/shutdown force a checkpoint; repeated status updates coalesce while in finishing-writes state.
+4. Commit and checkpoint durability:
+   - The commit builds a precise-reserve commit blob (`APFSRWCANON3`), validates pending state (one full sorted allocation pass plus a focused commit-extent check), and persists full canonical object-map, spaceman, inode, B-tree, and replay checkpoint families plus the sidecar state, then switches the alternate APFS checkpoint superblock and issues the final device flush.
+   - Normal commits queue the checkpoint-family writes as one ordered raw-device batch (batch-owned storage); strict verification and commit-stage fault hooks keep immediate per-family writes.
+   - Persist paths reuse cached inode/object-map orders, already-normalized committed vectors, and checkpoint block-index caches; committed deltas apply with per-key restore logs so rollback avoids full snapshots.
+5. Recovery and fail-closed:
+   - A per-volume recovery marker arms on pending native writes; `NativeWriteRecoveryPolicy` at startup maps `FailClosed` to read-only and `BestEffort` to native with recovery-active telemetry.
+   - Checkpoint-stage failures latch recovery-required in-session, forcing later commit attempts to `NotWritable` until remount/recovery; metadata bootstrap reconciles persisted RW-state checkpoint xid with the superblock xid and forces recovery-required on mismatch.
+6. Physical device layer:
+   - `BlockDevice` issues aligned payload and checkpoint writes as ordered batch writes (adjacent-range merge, barriers preserved), uses a bounded overlapped event-handle pool for async batches by default, reuses aligned scratch buffers, and flushes once per durable batch.
+   - Fault-injection switches and perf JSON counters (flush count/p95, batch and merged counts, scratch resize, WAL and spool latencies) keep ordering and barrier behavior observable.
+7. Shutdown:
+   - FsHost performs a bounded mutation drain before dispatcher stop: new external mutating callbacks are rejected (`STATUS_VOLUME_DISMOUNTED`) and in-flight callbacks finish within a timeout; the service then stops the host and updates tray/dashboard state.
+
+## Current implementation scope
+
+1. The application includes device discovery, host/process orchestration, WinFsp callbacks, guarded native reads and writes, recovery handling, dashboard/tray controls, and a structured CLI.
+2. Writable mode is limited to supported APFS data volumes that pass the runtime safety and recovery gates.
+3. Encrypted volumes, case-sensitive volumes, special APFS roles, snapshots, sealed/system layouts, and unsupported feature combinations remain read-only or unavailable.

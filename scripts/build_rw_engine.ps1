@@ -12,7 +12,9 @@ param(
 
     [string]$Generator = "NMake Makefiles",
 
-    [switch]$RunTests
+    [switch]$RunTests,
+
+    [switch]$Clean
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,7 +25,12 @@ if ([string]::IsNullOrWhiteSpace($SourceDir)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($BuildDir)) {
-    $BuildDir = "D:\apfsaccess_native\rw_engine\$Configuration"
+    $nativeBuildRoot = if ([string]::IsNullOrWhiteSpace($env:APFSACCESS_NATIVE_BUILD_ROOT)) {
+        Join-Path ([System.IO.Path]::GetTempPath()) "apfsaccess_native"
+    } else {
+        [System.IO.Path]::GetFullPath($env:APFSACCESS_NATIVE_BUILD_ROOT)
+    }
+    $BuildDir = Join-Path $nativeBuildRoot "rw_engine/$Configuration"
 }
 
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
@@ -68,7 +75,9 @@ if ($Generator -eq "NMake Makefiles" -and -not (Get-Command nmake -ErrorAction S
 
 New-Item -ItemType Directory -Force -Path $BuildDir, $OutputDir | Out-Null
 
-if (Test-Path -LiteralPath (Join-Path $BuildDir "CMakeCache.txt")) {
+# Keep normal builds incremental. Reconfiguring from a wiped build tree makes
+# CMake regenerate CompilerId probe executables, which can trigger AV alerts.
+if ($Clean -and (Test-Path -LiteralPath $BuildDir)) {
     Remove-Item -LiteralPath $BuildDir -Recurse -Force
     New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 }

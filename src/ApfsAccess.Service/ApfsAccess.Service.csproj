@@ -5,6 +5,7 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.0" />
+    <PackageReference Include="System.Threading.AccessControl" Version="9.0.0" />
   </ItemGroup>
 
   <ItemGroup>

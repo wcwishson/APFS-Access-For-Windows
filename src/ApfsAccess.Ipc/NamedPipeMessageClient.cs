@@ -23,7 +23,26 @@ public static class NamedPipeMessageClient
             PipeOptions.Asynchronous
         );
 
-        await client.ConnectAsync(timeoutMilliseconds, cancellationToken).ConfigureAwait(false);
-        return new PipePeer(client);
+        try
+        {
+            await client.ConnectAsync(timeoutMilliseconds, cancellationToken).ConfigureAwait(false);
+            if (NamedPipeEndpointAuthentication.IsRequired(pipeName))
+            {
+                if (!OperatingSystem.IsWindows())
+                {
+                    throw new PlatformNotSupportedException(
+                        "The production APFS Access pipe requires Windows endpoint authentication.");
+                }
+
+                NamedPipeEndpointAuthentication.AuthenticateServer(client);
+            }
+
+            return new PipePeer(client);
+        }
+        catch
+        {
+            client.Dispose();
+            throw;
+        }
     }
 }

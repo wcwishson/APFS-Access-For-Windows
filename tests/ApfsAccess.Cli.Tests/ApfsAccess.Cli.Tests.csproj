@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.2" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\ApfsAccess.Cli\ApfsAccess.Cli.csproj" />
+  </ItemGroup>
+
+  <Target Name="BuildCliTestChildArtifacts" BeforeTargets="CopyCliTestChildArtifacts">
+    <MSBuild
+      Projects="$(MSBuildProjectDirectory)\..\ApfsAccess.Cli.TestChild\ApfsAccess.Cli.TestChild.csproj"
+      Targets="Build"
+      Properties="Configuration=$(Configuration);TargetFramework=$(TargetFramework)" />
+  </Target>
+
+  <Target Name="CopyCliTestChildArtifacts" AfterTargets="Build">
+    <ItemGroup>
+      <_CliTestChildArtifacts Include="$(MSBuildProjectDirectory)\..\ApfsAccess.Cli.TestChild\bin\$(Configuration)\$(TargetFramework)\*" />
+    </ItemGroup>
+    <Copy
+      SourceFiles="@(_CliTestChildArtifacts)"
+      DestinationFolder="$(OutDir)"
+      SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>

@@ -750,6 +750,7 @@ bool NativeApfsReader::ReadBtreeRecords(
     pending.push(root_block);
     std::unordered_set<std::uint64_t> visited;
     visited.reserve(4096);
+    std::vector<std::byte> block;
 
     while (!pending.empty())
     {
@@ -764,7 +765,6 @@ bool NativeApfsReader::ReadBtreeRecords(
             return false;
         }
 
-        std::vector<std::byte> block;
         if (!ReadBlock(device, block_size, block_index, block))
         {
             return false;

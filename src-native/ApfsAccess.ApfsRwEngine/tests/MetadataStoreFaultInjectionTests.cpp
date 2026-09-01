@@ -17,6 +17,11 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_MSC_VER)
+// The monolithic fault matrix keeps many MetadataStore fixtures in one main frame.
+#pragma comment(linker, "/STACK:8388608")
+#endif
+
 namespace
 {
 constexpr std::size_t kContainerBytes = 4 * 1024 * 1024;

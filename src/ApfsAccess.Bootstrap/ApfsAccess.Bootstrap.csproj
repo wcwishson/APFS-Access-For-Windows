@@ -3,7 +3,7 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net9.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
-    <AssemblyName>APFSAccess.Portable</AssemblyName>
+    <AssemblyName>APFS Access</AssemblyName>
     <ApplicationIcon>..\..\assets\icons\tray_idle.ico</ApplicationIcon>
     <PortablePayloadZip Condition="'$(PortablePayloadZip)'==''">$(MSBuildProjectDirectory)\click-run-payload.zip</PortablePayloadZip>
   </PropertyGroup>

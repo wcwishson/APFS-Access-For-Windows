@@ -7,14 +7,14 @@ The app is designed for practical day-to-day use: browse folders, open files, co
 ## Quick Start
 
 1. Go to the [latest release](https://github.com/wcwishson/APFS-Access-For-Windows/releases/latest).
-2. Download `APFSAccess_Portable.exe`.
+2. Download `APFS Access.exe`.
 3. Double-click it.
 4. Approve the Windows administrator prompt.
 5. If prompted, let APFS Access install its required components.
 6. Plug in your APFS drive.
 7. Open This PC and use the new APFS drive letter.
 
-The portable launcher automatically extracts the app under `%LOCALAPPDATA%\ApfsAccessPortable`, checks for WinFsp and the Microsoft Visual C++ runtime, and starts the tray app.
+The portable launcher automatically unpacks its bundled files, checks for WinFsp and the Microsoft Visual C++ runtime, and starts the tray app.
 
 ## What You Should See
 
@@ -27,6 +27,8 @@ APFS Access opens a small dashboard and also runs from the Windows system tray.
 - Red means APFS Access found a problem or recovery-blocked state.
 - Gray means starting, idle, or no APFS drive is mounted.
 - The dashboard has `Open`, `Eject`, `Fix`, and `Details` actions for each volume.
+- `Start with Windows` launches APFS Access automatically after sign-in.
+- `Start minimized` keeps the dashboard hidden at startup while leaving the tray icon available.
 - Closing the dashboard keeps APFS Access running in the tray.
 - Left-click the tray icon to reopen the dashboard.
 - Right-click the tray icon to eject APFS drives or quit the app.
@@ -46,6 +48,25 @@ Common supported operations:
 - Eject APFS mounts from the dashboard or tray before unplugging the drive.
 - Use `Fix` when a drive is read-only, safely ejected but still connected, or needs a safe refresh/remount.
 - Use `Details` when you want to see why a drive is read-only or degraded.
+- Use the bundled `ApfsAccess.Cli.exe` for the same status, mount, fix, eject, and quit operations from scripts.
+
+## Automation
+
+The click-run package also includes `ApfsAccess.Cli.exe` for scripts and AI
+agents. It uses structured JSON by default and the same service controls as the
+dashboard:
+
+```text
+ApfsAccess.Cli.exe status
+ApfsAccess.Cli.exe list
+ApfsAccess.Cli.exe mount --volume-id "\\.\PhysicalDrive2|Main"
+ApfsAccess.Cli.exe eject --volume-id "\\.\PhysicalDrive2|Main"
+```
+
+Use `--timeout-ms N` to bound a request, `--dry-run` to inspect a mutating
+command without issuing it, and `--human` for simple console output. The CLI
+returns stable nonzero exit codes when arguments, service availability,
+timeouts, or the requested operation fail.
 
 APFS Access is conservative. If a volume is encrypted, special-purpose, uses unsupported APFS features, or fails a write-safety check, the app keeps it read-only instead of risking damage.
 
@@ -58,7 +79,7 @@ Writable APFS operations are improving, especially folders with many small files
 - WinFsp runtime.
 - Microsoft Visual C++ Redistributable x64.
 
-`APFSAccess_Portable.exe` checks the last two requirements for you and can install them automatically. If automatic installation does not work, install them manually and then run APFS Access again:
+`APFS Access.exe` checks the last two requirements for you and can install them automatically. If automatic installation does not work, install them manually and then run APFS Access again:
 
 - [WinFsp](https://winfsp.dev/rel/)
 - [Microsoft Visual C++ Redistributable x64](https://aka.ms/vs/17/release/vc_redist.x64.exe)
@@ -67,7 +88,7 @@ Writable APFS operations are improving, especially folders with many small files
 
 Most people should use:
 
-- `APFSAccess_Portable.exe`
+- `APFS Access.exe`
 
 Advanced users may also download:
 
@@ -134,6 +155,7 @@ Main project layout:
 
 - `src/ApfsAccess.Tray` - tray app and user-facing status.
 - `src/ApfsAccess.Service` - device discovery and mount orchestration.
+- `src/ApfsAccess.Cli` - structured command-line control for automation.
 - `src/ApfsAccess.Backend.Native` - native backend integration.
 - `src-native/ApfsAccess.FsHost` - WinFsp mount host.
 - `src-native/ApfsAccess.ApfsRwEngine` - APFS metadata/read-write engine.

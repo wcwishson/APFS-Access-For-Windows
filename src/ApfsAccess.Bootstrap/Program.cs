@@ -2,10 +2,10 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
-using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 namespace ApfsAccess.Bootstrap;
@@ -16,15 +16,21 @@ internal static class Program
     private const string AdjacentPayloadFileName = "click-run-payload.zip";
     private const string LauncherDisplayName = "APFS Access Portable";
     private const string InstallModeArgument = "--install-prereqs";
+    private const int RestartRequiredExitCode = 4;
     private const string VcRedistDirectUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
-    private const string WinFspListingUrl = "https://winfsp.dev/rel/";
+    private const string WinFspDirectUrl = "https://github.com/winfsp/winfsp/releases/download/v2.2B4/winfsp-2.2.26215.msi";
+    private const string WinFspDirectSha256 = "2ECB5C89405488A95BBD8A01875E02C48534FD37BBDFD84488F7590464D65944";
+    private const int MinimumWinFspMajor = 2;
+    private const int MinimumWinFspMinor = 2;
+    private const int MinimumWinFspBuild = 26215;
+    private static bool _restartRequired;
 
     private static readonly IReadOnlyList<PrerequisiteSpec> RequiredPrerequisites =
     [
         new(
             Key: "winfsp",
-            DisplayName: "WinFsp runtime",
-            WingetId: "WinFsp.WinFsp",
+            DisplayName: "WinFsp filesystem runtime update",
+            WingetId: string.Empty,
             ManualUrl: "https://winfsp.dev/rel/",
             IsInstalled: IsWinFspInstalled),
         new(
@@ -49,8 +55,15 @@ internal static class Program
 
             EnsurePrerequisitesInteractive();
 
-            var payloadBytes = LoadPayloadBytes();
-            var extractionDirectory = ExtractPayload(payloadBytes);
+            var extractionDirectory = ShouldUseAdjacentClickRunDirectory()
+                ? ResolveAdjacentClickRunDirectory()
+                : null;
+            if (string.IsNullOrWhiteSpace(extractionDirectory))
+            {
+                var payloadBytes = LoadPayloadBytes();
+                extractionDirectory = ExtractPayload(payloadBytes);
+            }
+
             LaunchTray(extractionDirectory);
             return 0;
         }
@@ -73,12 +86,18 @@ internal static class Program
             return 2;
         }
 
-        return InstallMissingPrerequisitesWithUi() ? 0 : 3;
+        var installed = InstallMissingPrerequisitesWithUi();
+        return _restartRequired ? RestartRequiredExitCode : installed ? 0 : 3;
     }
 
     private static void EnsurePrerequisitesInteractive()
     {
         var missing = GetMissingPrerequisites();
+        if (_restartRequired)
+        {
+            ShowWinFspRestartRequired();
+            throw new OperationCanceledException("Windows must restart before APFS Access can run.");
+        }
         if (missing.Count == 0)
         {
             return;
@@ -107,9 +126,24 @@ internal static class Program
             throw new OperationCanceledException("Prerequisite installation was canceled.");
         }
 
-        var installSucceeded = IsAdministrator()
-            ? InstallMissingPrerequisitesWithUi()
-            : RunElevatedInstaller() == 0;
+        bool installSucceeded;
+        if (IsAdministrator())
+        {
+            installSucceeded = InstallMissingPrerequisitesWithUi();
+            if (_restartRequired)
+            {
+                throw new OperationCanceledException("Windows must restart before APFS Access can run.");
+            }
+        }
+        else
+        {
+            var installerExitCode = RunElevatedInstaller();
+            if (installerExitCode == RestartRequiredExitCode)
+            {
+                throw new OperationCanceledException("Windows must restart before APFS Access can run.");
+            }
+            installSucceeded = installerExitCode == 0;
+        }
 
         var remaining = GetMissingPrerequisites();
         if (installSucceeded && remaining.Count == 0)
@@ -157,6 +191,11 @@ internal static class Program
     private static bool InstallMissingPrerequisitesWithUi()
     {
         var missing = GetMissingPrerequisites();
+        if (_restartRequired)
+        {
+            ShowWinFspRestartRequired();
+            return false;
+        }
         if (missing.Count == 0)
         {
             return true;
@@ -188,6 +227,12 @@ internal static class Program
             }
         }
 
+        if (_restartRequired)
+        {
+            ShowWinFspRestartRequired();
+            return false;
+        }
+
         MessageBox.Show(
             "Setup finished. APFS Access will start now.",
             LauncherDisplayName,
@@ -209,7 +254,7 @@ internal static class Program
             "--accept-package-agreements --accept-source-agreements --silent --disable-interactivity";
 
         var exitCode = RunProcess("winget", args, timeout: TimeSpan.FromMinutes(10));
-        return IsAcceptableInstallerExitCode(exitCode);
+        return RecordInstallerExitCode(exitCode);
     }
 
     private static bool InstallViaFallbackDownload(PrerequisiteSpec prerequisite)
@@ -231,34 +276,27 @@ internal static class Program
 
     private static bool InstallWinFspFromDirectDownload()
     {
-        var winfspUrl = ResolveWinFspInstallerUrl();
-        if (string.IsNullOrWhiteSpace(winfspUrl))
+        var msiPath = DownloadToTempFile(WinFspDirectUrl, "winfsp-2.2.26215.msi");
+        var downloadedHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(msiPath)));
+        if (!string.Equals(downloadedHash, WinFspDirectSha256, StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
 
-        var msiPath = DownloadToTempFile(winfspUrl, "winfsp.msi");
-        var exitCode = RunProcess("msiexec.exe", $"/i \"{msiPath}\" /passive /norestart", timeout: TimeSpan.FromMinutes(10));
-        return IsAcceptableInstallerExitCode(exitCode);
+        var exitCode = RunProcess(
+            "msiexec.exe",
+            BuildWinFspInstallerArguments(msiPath),
+            timeout: TimeSpan.FromMinutes(10));
+        var installed = RecordInstallerExitCode(exitCode);
+        _restartRequired |= WinFspInstallRequiresRestart(exitCode);
+        return installed;
     }
 
     private static bool InstallVcRedistFromDirectDownload()
     {
         var exePath = DownloadToTempFile(VcRedistDirectUrl, "vc_redist.x64.exe");
         var exitCode = RunProcess(exePath, "/install /passive /norestart", timeout: TimeSpan.FromMinutes(10));
-        return IsAcceptableInstallerExitCode(exitCode) || exitCode == 1638;
-    }
-
-    private static string? ResolveWinFspInstallerUrl()
-    {
-        using var client = CreateHttpClient();
-        var html = client.GetStringAsync(WinFspListingUrl).GetAwaiter().GetResult();
-        var match = Regex.Match(
-            html,
-            @"https://github\.com/winfsp/winfsp/releases/download/[^""']+\.msi",
-            RegexOptions.IgnoreCase);
-
-        return match.Success ? match.Value : null;
+        return RecordInstallerExitCode(exitCode) || exitCode == 1638;
     }
 
     private static string DownloadToTempFile(string url, string fileName)
@@ -325,6 +363,23 @@ internal static class Program
         return exitCode is 0 or 1641 or 3010;
     }
 
+    private static string BuildWinFspInstallerArguments(string msiPath)
+        => $"/i \"{msiPath}\" /passive /norestart MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress";
+
+    private static bool WinFspInstallRequiresRestart(int exitCode)
+        => IsAcceptableInstallerExitCode(exitCode);
+
+    private static bool IsRestartRequiredInstallerExitCode(int exitCode)
+    {
+        return exitCode is 1641 or 3010;
+    }
+
+    private static bool RecordInstallerExitCode(int exitCode)
+    {
+        _restartRequired |= IsRestartRequiredInstallerExitCode(exitCode);
+        return IsAcceptableInstallerExitCode(exitCode);
+    }
+
     private static bool IsWingetAvailable()
     {
         try
@@ -372,19 +427,168 @@ internal static class Program
 
     private static bool IsWinFspInstalled()
     {
-        using var serviceKey = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\WinFsp.Launcher");
-        if (serviceKey is not null)
+        var binDirectories = new[]
         {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "WinFsp", "bin"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "WinFsp", "bin"),
+        };
+
+        var bootUtc = CurrentBootUtc();
+        foreach (var binDirectory in binDirectories)
+        {
+            var dllPath = Path.Combine(binDirectory, "winfsp-x64.dll");
+            var driverPath = Path.Combine(binDirectory, "winfsp-x64.sys");
+            var dllCreationUtc = File.Exists(dllPath)
+                ? File.GetCreationTimeUtc(dllPath)
+                : DateTime.MinValue;
+            var driverCreationUtc = File.Exists(driverPath)
+                ? File.GetCreationTimeUtc(driverPath)
+                : DateTime.MinValue;
+            if (RequiresRestartForWinFspRuntimeFileTimes(
+                    dllCreationUtc,
+                    driverCreationUtc,
+                    bootUtc))
+            {
+                _restartRequired = true;
+                return true;
+            }
+        }
+
+        foreach (var binDirectory in binDirectories)
+        {
+            var dllPath = Path.Combine(binDirectory, "winfsp-x64.dll");
+            var driverPath = Path.Combine(binDirectory, "winfsp-x64.sys");
+            if (!TryReadWinFspFileVersion(dllPath, out var dllVersion) ||
+                !TryReadWinFspFileVersion(driverPath, out var driverVersion) ||
+                !IsMatchingSupportedWinFspFileVersions(
+                    dllVersion.Major,
+                    dllVersion.Minor,
+                    dllVersion.Build,
+                    dllVersion.Revision,
+                    driverVersion.Major,
+                    driverVersion.Minor,
+                    driverVersion.Build,
+                    driverVersion.Revision) ||
+                !IsActiveWinFspServiceVersionCompatible(
+                    dllPath,
+                    dllVersion.Major,
+                    dllVersion.Minor))
+            {
+                continue;
+            }
+
+            if (RequiresRestartForWinFspRuntimeFileTimes(
+                    File.GetCreationTimeUtc(dllPath),
+                    File.GetCreationTimeUtc(driverPath),
+                    bootUtc))
+            {
+                _restartRequired = true;
+                return true;
+            }
+
             return true;
         }
 
-        var programFilesPaths = new[]
-        {
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "WinFsp", "bin", "launchctl-x64.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "WinFsp", "bin", "launchctl-x64.exe"),
-        };
+        return false;
+    }
 
-        return programFilesPaths.Any(File.Exists);
+    private static bool TryReadWinFspFileVersion(string path, out WinFspFileVersion version)
+    {
+        version = default;
+        if (!File.Exists(path))
+        {
+            return false;
+        }
+
+        var fileVersion = FileVersionInfo.GetVersionInfo(path);
+        version = new WinFspFileVersion(
+            fileVersion.FileMajorPart,
+            fileVersion.FileMinorPart,
+            fileVersion.FileBuildPart,
+            fileVersion.FilePrivatePart);
+        return true;
+    }
+
+    private static bool IsMatchingSupportedWinFspFileVersions(
+        int dllMajor,
+        int dllMinor,
+        int dllBuild,
+        int dllRevision,
+        int driverMajor,
+        int driverMinor,
+        int driverBuild,
+        int driverRevision)
+    {
+        if (dllMajor != driverMajor ||
+            dllMinor != driverMinor ||
+            dllBuild != driverBuild ||
+            dllRevision != driverRevision)
+        {
+            return false;
+        }
+
+        return IsSupportedWinFspVersion(
+            dllMajor,
+            dllMinor,
+            dllBuild);
+    }
+
+    private static bool IsActiveWinFspServiceVersionCompatible(
+        string dllPath,
+        int expectedMajor,
+        int expectedMinor)
+    {
+        nint module = 0;
+        try
+        {
+            module = NativeLibrary.Load(dllPath);
+            var export = NativeLibrary.GetExport(module, "FspFsctlServiceVersion");
+            var serviceVersion = Marshal.GetDelegateForFunctionPointer<FspFsctlServiceVersionDelegate>(export);
+            var status = serviceVersion(out var encodedVersion);
+            if (status < 0)
+            {
+                return false;
+            }
+
+            var activeMajor = (int)(encodedVersion >> 16);
+            var activeMinor = (int)(encodedVersion & 0xffffu);
+            return activeMajor == expectedMajor && activeMinor == expectedMinor;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            if (module != 0)
+            {
+                NativeLibrary.Free(module);
+            }
+        }
+    }
+
+    private static bool IsSupportedWinFspVersion(int major, int minor, int build)
+        => major > MinimumWinFspMajor ||
+           major == MinimumWinFspMajor &&
+           (minor > MinimumWinFspMinor ||
+            minor == MinimumWinFspMinor && build >= MinimumWinFspBuild);
+
+    private static DateTime CurrentBootUtc()
+        => DateTime.UtcNow - TimeSpan.FromMilliseconds(Environment.TickCount64);
+
+    private static bool RequiresRestartForWinFspRuntimeFileTimes(
+        DateTime dllCreationUtc,
+        DateTime driverCreationUtc,
+        DateTime bootUtc)
+        => dllCreationUtc >= bootUtc || driverCreationUtc >= bootUtc;
+
+    private static void ShowWinFspRestartRequired()
+    {
+        MessageBox.Show(
+            "WinFsp was installed or updated after Windows started. Restart Windows once before APFS Access mounts a drive. The app will not reinstall WinFsp while this restart is pending.",
+            LauncherDisplayName,
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning);
     }
 
     private static bool IsVcRuntimeInstalled()
@@ -416,7 +620,7 @@ internal static class Program
         message.AppendLine("APFS Access could not complete automatic setup.");
         message.AppendLine("Official download pages were opened in your browser.");
         message.AppendLine();
-        message.AppendLine("Please install these components, then run APFSAccess_Portable.exe again:");
+        message.AppendLine("Please install these components, then run APFS Access.exe again:");
         foreach (var prerequisite in missing)
         {
             message.AppendLine($"- {prerequisite.DisplayName}");
@@ -467,23 +671,71 @@ internal static class Program
         );
     }
 
+    private static bool ShouldUseAdjacentClickRunDirectory()
+        => string.Equals(
+            Environment.GetEnvironmentVariable("APFSACCESS_USE_ADJACENT_CLICK_RUN"),
+            "1",
+            StringComparison.OrdinalIgnoreCase);
+
+    private static string? ResolveAdjacentClickRunDirectory()
+    {
+        var launcherPath = Environment.ProcessPath ?? Application.ExecutablePath;
+        var launcherDirectory = string.IsNullOrWhiteSpace(launcherPath)
+            ? AppContext.BaseDirectory
+            : Path.GetDirectoryName(launcherPath);
+        if (string.IsNullOrWhiteSpace(launcherDirectory))
+        {
+            return null;
+        }
+
+        var candidates = new[]
+        {
+            Path.Combine(launcherDirectory, "artifacts", "publish", "click-run"),
+            Path.Combine(launcherDirectory, "click-run"),
+        };
+
+        foreach (var candidate in candidates)
+        {
+            var trayPath = Path.Combine(candidate, "ApfsAccess.Tray.exe");
+            if (File.Exists(trayPath))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
     private static string ExtractPayload(byte[] payloadBytes)
     {
         var payloadHash = ComputeSha256(payloadBytes)[..16];
-        var rootPath = ResolvePortableRoot();
-        var targetPath = Path.Combine(rootPath, $"payload-{payloadHash}");
-        var markerPath = Path.Combine(targetPath, ".payload.sha256");
-        var trayPath = Path.Combine(targetPath, "ApfsAccess.Tray.exe");
-
-        Directory.CreateDirectory(rootPath);
-
-        if (File.Exists(markerPath) &&
-            File.Exists(trayPath) &&
-            string.Equals(File.ReadAllText(markerPath).Trim(), payloadHash, StringComparison.OrdinalIgnoreCase))
+        Exception? lastError = null;
+        foreach (var rootPath in ResolvePortableRootCandidates())
         {
-            return targetPath;
+            try
+            {
+                var existingPayload = TryFindExistingPayloadDirectory(rootPath, payloadHash);
+                if (!string.IsNullOrWhiteSpace(existingPayload))
+                {
+                    return existingPayload;
+                }
+
+                return ExtractPayloadToRoot(payloadBytes, payloadHash, rootPath);
+            }
+            catch (Exception ex) when (IsRecoverableExtractionError(ex))
+            {
+                lastError = ex;
+            }
         }
 
+        throw new InvalidOperationException("APFS Access could not prepare its portable app files.", lastError);
+    }
+
+    private static string ExtractPayloadToRoot(byte[] payloadBytes, string payloadHash, string rootPath)
+    {
+        Directory.CreateDirectory(rootPath);
+
+        var targetPath = Path.Combine(rootPath, $"payload-{payloadHash}");
         var stagingPath = Path.Combine(rootPath, $"staging-{Guid.NewGuid():N}");
         Directory.CreateDirectory(stagingPath);
 
@@ -494,29 +746,89 @@ internal static class Program
             archive.ExtractToDirectory(stagingPath, overwriteFiles: true);
             File.WriteAllText(Path.Combine(stagingPath, ".payload.sha256"), payloadHash, Encoding.UTF8);
 
-            if (Directory.Exists(targetPath))
-            {
-                Directory.Delete(targetPath, recursive: true);
-            }
+            var finalPath = Directory.Exists(targetPath)
+                ? Path.Combine(rootPath, $"payload-{payloadHash}-{Guid.NewGuid():N}")
+                : targetPath;
+            Directory.Move(stagingPath, finalPath);
+            return finalPath;
+        }
+        finally
+        {
+            DeleteDirectoryBestEffort(stagingPath);
+        }
+    }
 
-            Directory.Move(stagingPath, targetPath);
-            return targetPath;
+    private static string? TryFindExistingPayloadDirectory(string rootPath, string payloadHash)
+    {
+        if (!Directory.Exists(rootPath))
+        {
+            return null;
+        }
+
+        foreach (var candidate in Directory.EnumerateDirectories(rootPath, $"payload-{payloadHash}*"))
+        {
+            var markerPath = Path.Combine(candidate, ".payload.sha256");
+            var trayPath = Path.Combine(candidate, "ApfsAccess.Tray.exe");
+            if (File.Exists(markerPath) &&
+                File.Exists(trayPath) &&
+                string.Equals(File.ReadAllText(markerPath).Trim(), payloadHash, StringComparison.OrdinalIgnoreCase))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<string> ResolvePortableRootCandidates()
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var candidate in new[]
+        {
+            ResolvePortableRoot(),
+            ResolveDriveScratchPortableRoot(),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ApfsAccessPortable"),
+        })
+        {
+            if (!string.IsNullOrWhiteSpace(candidate) && seen.Add(candidate))
+            {
+                yield return candidate;
+            }
+        }
+    }
+
+    private static string? ResolveDriveScratchPortableRoot()
+    {
+        var launcherPath = Environment.ProcessPath ?? Application.ExecutablePath;
+        var launcherDirectory = string.IsNullOrWhiteSpace(launcherPath)
+            ? AppContext.BaseDirectory
+            : Path.GetDirectoryName(launcherPath);
+        if (string.IsNullOrWhiteSpace(launcherDirectory))
+        {
+            return null;
+        }
+
+        var root = Path.GetPathRoot(launcherDirectory);
+        return string.IsNullOrWhiteSpace(root)
+            ? null
+            : Path.Combine(root, "ApfsAccessScratch", "PortablePayload");
+    }
+
+    private static bool IsRecoverableExtractionError(Exception ex)
+        => ex is IOException or UnauthorizedAccessException or InvalidDataException;
+
+    private static void DeleteDirectoryBestEffort(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+            {
+                Directory.Delete(path, recursive: true);
+            }
         }
         catch
         {
-            if (Directory.Exists(stagingPath))
-            {
-                try
-                {
-                    Directory.Delete(stagingPath, recursive: true);
-                }
-                catch
-                {
-                    // Keep original exception.
-                }
-            }
-
-            throw;
+            // Best effort cleanup; a later launch can use another staging folder.
         }
     }
 
@@ -551,18 +863,93 @@ internal static class Program
 
     private static void LaunchTray(string extractionDirectory)
     {
+        ConfigureRuntimeScratchEnvironment();
+
         var trayPath = Path.Combine(extractionDirectory, "ApfsAccess.Tray.exe");
         if (!File.Exists(trayPath))
         {
             throw new FileNotFoundException($"Tray executable not found at '{trayPath}'.");
         }
 
-        Process.Start(new ProcessStartInfo
+        var psi = new ProcessStartInfo
         {
             FileName = trayPath,
             WorkingDirectory = extractionDirectory,
-            UseShellExecute = true,
-        });
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        psi.Environment["TEMP"] = Environment.GetEnvironmentVariable("TEMP") ?? Path.GetTempPath();
+        psi.Environment["TMP"] = Environment.GetEnvironmentVariable("TMP") ?? Path.GetTempPath();
+        psi.Environment["APFSACCESS_SPOOL_ROOT"] = Environment.GetEnvironmentVariable("APFSACCESS_SPOOL_ROOT") ?? string.Empty;
+        psi.Environment["APFSACCESS_RUNTIME_ROOT"] = Environment.GetEnvironmentVariable("APFSACCESS_RUNTIME_ROOT") ?? string.Empty;
+        psi.Environment["APFSACCESS_TRACE_MOVES"] = Environment.GetEnvironmentVariable("APFSACCESS_TRACE_MOVES") ?? string.Empty;
+        psi.Environment["APFSACCESS_PERF_COUNTERS"] = Environment.GetEnvironmentVariable("APFSACCESS_PERF_COUNTERS") ?? string.Empty;
+        psi.Environment["APFSACCESS_TRACE_COMMITS"] = Environment.GetEnvironmentVariable("APFSACCESS_TRACE_COMMITS") ?? string.Empty;
+        psi.Environment["APFSACCESS_TRACE_READS"] = Environment.GetEnvironmentVariable("APFSACCESS_TRACE_READS") ?? string.Empty;
+        psi.Environment["APFSACCESS_DEFER_CLOSE_COMMITS"] = Environment.GetEnvironmentVariable("APFSACCESS_DEFER_CLOSE_COMMITS") ?? string.Empty;
+        psi.Environment["APFSACCESS_DISABLE_CONTENT_WRITEBACK"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_CONTENT_WRITEBACK") ?? string.Empty;
+        psi.Environment["APFSACCESS_ENABLE_GROUPED_DEFERRED_ACCEPTANCE"] = Environment.GetEnvironmentVariable("APFSACCESS_ENABLE_GROUPED_DEFERRED_ACCEPTANCE") ?? string.Empty;
+        psi.Environment["APFSACCESS_DISABLE_GROUPED_DEFERRED_ACCEPTANCE"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_GROUPED_DEFERRED_ACCEPTANCE") ?? string.Empty;
+        psi.Environment["APFSACCESS_DISABLE_DEFERRED_INDEX_PERSISTENCE"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_DEFERRED_INDEX_PERSISTENCE") ?? string.Empty;
+        psi.Environment["APFSACCESS_EXPERIMENTAL_NAMESPACE_WRITEBACK"] = Environment.GetEnvironmentVariable("APFSACCESS_EXPERIMENTAL_NAMESPACE_WRITEBACK") ?? string.Empty;
+        psi.Environment["APFSACCESS_DISABLE_NAMESPACE_WRITEBACK"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_NAMESPACE_WRITEBACK") ?? string.Empty;
+        psi.Environment["APFSACCESS_DISABLE_ASYNC_BLOCK_IO"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_ASYNC_BLOCK_IO") ?? string.Empty;
+        psi.Environment["APFSACCESS_ASYNC_BLOCK_IO_DEPTH"] = Environment.GetEnvironmentVariable("APFSACCESS_ASYNC_BLOCK_IO_DEPTH") ?? string.Empty;
+        psi.Environment["APFSACCESS_CHECKPOINT_DELTA_SHADOW"] = Environment.GetEnvironmentVariable("APFSACCESS_CHECKPOINT_DELTA_SHADOW") ?? string.Empty;
+        psi.Environment["APFSACCESS_STRICT_COMMIT_VERIFY"] = Environment.GetEnvironmentVariable("APFSACCESS_STRICT_COMMIT_VERIFY") ?? string.Empty;
+        psi.Environment["APFSACCESS_DISABLE_WORKING_FREE_SANITIZE_CACHE"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_WORKING_FREE_SANITIZE_CACHE") ?? string.Empty;
+        psi.Environment["APFSACCESS_DISABLE_CHECKPOINT_SERIALIZATION_BUFFER_REUSE"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_CHECKPOINT_SERIALIZATION_BUFFER_REUSE") ?? string.Empty;
+        psi.Environment["APFSACCESS_DISABLE_CHECKPOINT_SLOT_INDEX"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_CHECKPOINT_SLOT_INDEX") ?? string.Empty;
+        psi.Environment["APFSACCESS_DISABLE_CHECKPOINT_BLOCK_INDEX_CACHE"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_CHECKPOINT_BLOCK_INDEX_CACHE") ?? string.Empty;
+        psi.Environment["APFSACCESS_DISABLE_INDEX_DELTA"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_INDEX_DELTA") ?? string.Empty;
+        psi.Environment["APFSACCESS_LAUNCHER_PATH"] = Environment.ProcessPath ?? Application.ExecutablePath;
+
+        Process.Start(psi);
+    }
+
+    private static void ConfigureRuntimeScratchEnvironment()
+    {
+        var runtimeRoot = ResolveRuntimeRoot();
+        var tempRoot = Path.Combine(runtimeRoot, "temp");
+        var spoolRoot = Path.Combine(runtimeRoot, "payload-spool");
+
+        Directory.CreateDirectory(tempRoot);
+        Directory.CreateDirectory(spoolRoot);
+
+        Environment.SetEnvironmentVariable("TEMP", tempRoot);
+        Environment.SetEnvironmentVariable("TMP", tempRoot);
+        Environment.SetEnvironmentVariable("APFSACCESS_SPOOL_ROOT", spoolRoot);
+        Environment.SetEnvironmentVariable("APFSACCESS_RUNTIME_ROOT", runtimeRoot);
+    }
+
+    private static string ResolveRuntimeRoot()
+    {
+        var overrideRoot = Environment.GetEnvironmentVariable("APFSACCESS_RUNTIME_ROOT");
+        if (!string.IsNullOrWhiteSpace(overrideRoot))
+        {
+            return Path.GetFullPath(overrideRoot);
+        }
+
+        var portableRoot = ResolvePortableRoot();
+        if (LooksLikeCloudSyncedPath(portableRoot))
+        {
+            var driveRoot = Path.GetPathRoot(portableRoot);
+            if (!string.IsNullOrWhiteSpace(driveRoot))
+            {
+                return Path.Combine(driveRoot, "ApfsAccessScratch", "AppRuntime");
+            }
+        }
+
+        return Path.Combine(portableRoot, "runtime");
+    }
+
+    private static bool LooksLikeCloudSyncedPath(string path)
+    {
+        return path.Contains("SynologyDrive", StringComparison.OrdinalIgnoreCase) ||
+               path.Contains("OneDrive", StringComparison.OrdinalIgnoreCase) ||
+               path.Contains("Dropbox", StringComparison.OrdinalIgnoreCase) ||
+               path.Contains("Google Drive", StringComparison.OrdinalIgnoreCase) ||
+               path.Contains("iCloudDrive", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string ComputeSha256(byte[] bytes)
@@ -588,4 +975,9 @@ internal static class Program
         string WingetId,
         string ManualUrl,
         Func<bool> IsInstalled);
+
+    private readonly record struct WinFspFileVersion(int Major, int Minor, int Build, int Revision);
+
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    private delegate int FspFsctlServiceVersionDelegate(out uint version);
 }

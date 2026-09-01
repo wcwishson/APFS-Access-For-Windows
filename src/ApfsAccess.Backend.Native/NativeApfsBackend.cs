@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;
+using System.Security.Cryptography;
 using Microsoft.Win32.SafeHandles;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -57,6 +58,9 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
 
     private const int CommandTimeoutSeconds = 12;
     private const string DefaultMainVolumeName = "Main";
+    private const int MaxHostExitObserverProofAttempts = 8;
+    private static readonly TimeSpan HostExitObserverInitialRetryDelay = TimeSpan.FromMilliseconds(50);
+    private static readonly TimeSpan HostExitObserverWaitSlice = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan RuntimeStatusPollTimeout = TimeSpan.FromMilliseconds(350);
     private static readonly TimeSpan RuntimeStatusCacheTtl = TimeSpan.FromMilliseconds(250);
     private static readonly Guid ApfsPartitionTypeGuid = new("7C3457EF-0000-11AA-AA11-00306543ECAC");
@@ -69,21 +73,46 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly ConcurrentDictionary<string, MountedVolumeState> _mounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, HostProcessState> _hosts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, HostProcessState> _retainedStartupHosts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, HostStopResult> _completedHostStops = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, VolumeInfo> _volumeCache = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, DiscoveredDevice> _deviceDiscoveryCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, DiscoveryCacheEntry> _deviceDiscoveryCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, VolumeMountTarget> _mountTargetsByVolumeId = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, NativeWriteValidationEvidence> _validationEvidenceByVolumeId = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, NativeWriteValidationEvidence> _validationEvidenceByProfileId = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _lastPromotedEvidenceSessionByProfileId = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _deviceDisplayNameById = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, RuntimeStatusCacheEntry> _runtimeStatusCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, Lazy<Task<RuntimeStatusReadResult>>> _runtimeStatusReads = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, Task> _hostExitObservers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly CancellationTokenSource _disposeCts = new();
+    private readonly object _lifecycleSync = new();
+    private readonly object _disposeFinalizationSync = new();
+    private readonly TaskCompletionSource _disposeCompleted = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly string _writeDiagnosticsRoot = Path.Combine(Path.GetTempPath(), "ApfsAccess", "write-diagnostics");
+    private readonly HostProcessLifecycleTestHooks? _lifecycleTestHooks;
+    private long _deviceDiscoveryScanCount;
+    private long _mountStateVersion;
+    private long _runtimeStatusReadOperationCount;
+    private long _writeSessionMarkerIoWhileGateHeldCount;
+    private int _activeLifecycleOperations;
+    private bool _disposeStarted;
+    private bool _disposeFinalizationRunning;
+    private TaskCompletionSource? _lifecycleOperationsDrained;
 
     public NativeApfsBackend(ServiceHostOptions options)
+        : this(options, null)
+    {
+    }
+
+    internal NativeApfsBackend(
+        ServiceHostOptions options,
+        HostProcessLifecycleTestHooks? lifecycleTestHooks)
     {
         ArgumentNullException.ThrowIfNull(options);
 
         _options = options;
+        _lifecycleTestHooks = lifecycleTestHooks;
         _nativeFsHostPath = ResolveNativeFsHostPath(options);
         _deviceCandidates = BuildDeviceCandidates(options);
         Directory.CreateDirectory(_writeDiagnosticsRoot);
@@ -93,6 +122,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     public Task<IReadOnlyList<DeviceInfo>> ProbeDevicesAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        using var operationLease = AcquireLifecycleOperationLease();
 
         var devices = new List<DeviceInfo>();
         foreach (var candidate in _deviceCandidates)
@@ -102,7 +132,6 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             var discovered = DiscoverDevice(candidate);
             if (discovered is not null)
             {
-                _deviceDiscoveryCache[candidate] = discovered;
                 _deviceDisplayNameById[discovered.DeviceId] = discovered.DisplayName;
                 devices.Add(new DeviceInfo(discovered.DeviceId, discovered.DisplayName, true));
             }
@@ -120,15 +149,14 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentException.ThrowIfNullOrWhiteSpace(deviceId);
+        using var operationLease = AcquireLifecycleOperationLease();
 
         var discovered = DiscoverDevice(deviceId);
         if (discovered is null)
         {
-            _deviceDiscoveryCache.TryRemove(deviceId, out _);
             return Task.FromResult<IReadOnlyList<VolumeInfo>>(Array.Empty<VolumeInfo>());
         }
 
-        _deviceDiscoveryCache[deviceId] = discovered;
         _deviceDisplayNameById[discovered.DeviceId] = discovered.DisplayName;
 
         var volumes = discovered.Volumes
@@ -147,6 +175,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentNullException.ThrowIfNull(request);
+        using var operationLease = AcquireLifecycleOperationLease();
 
         if (string.IsNullOrWhiteSpace(_nativeFsHostPath) || !File.Exists(_nativeFsHostPath))
         {
@@ -198,18 +227,21 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         var resolvedVolume = await ResolveVolumeAsync(request.VolumeId, cancellationToken).ConfigureAwait(false);
         HostProcessState? pendingHostState = null;
         var hostRegistered = false;
+        WriteSessionMarkerRequest? pendingMarker = null;
 
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             CleanupExitedHosts_NoLock();
 
-            if (_mounts.ContainsKey(mountPoint))
+            if (_mounts.ContainsKey(mountPoint) ||
+                _hosts.ContainsKey(mountPoint) ||
+                HasRetainedStartupHost_NoLock(mountPoint))
             {
                 return new MountResult(
                     Success: false,
                     MountPoint: null,
-                    Error: $"Mount point '{mountPoint}' is already in use.",
+                    Error: $"Mount point '{mountPoint}' is already in use or still owned by an FsHost process.",
                     EffectiveAccessMode: MountAccessMode.ReadOnly,
                     DiagnosticCode: "MountPointBusy",
                     IsReadOnly: true,
@@ -294,7 +326,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                         ? recoveryGateState
                         : writeGateDecision.GateState.Trim();
 
-                    WriteWriteSessionMarker(
+                    pendingMarker = CaptureWriteSessionMarker(
                         requestedVolumeId: request.VolumeId,
                         requestedAccessMode: request.AccessMode,
                         mountPoint: mountPoint,
@@ -357,12 +389,15 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
 
             if (!started)
             {
-                await StopHostProcessAsync(hostState, CancellationToken.None).ConfigureAwait(false);
+                var stopResult = await StopStartedHostProcessAsync(
+                    mountPoint,
+                    hostState,
+                    CancellationToken.None).ConfigureAwait(false);
                 pendingHostState = null;
                 return new MountResult(
                     Success: false,
                     MountPoint: null,
-                    Error: $"FsHost did not expose drive {mountPoint} within {startupTimeout.TotalSeconds:n0}s.",
+                    Error: $"FsHost did not expose drive {mountPoint} within {startupTimeout.TotalSeconds:n0}s ({DescribeHostStopResult(stopResult)}).",
                     EffectiveAccessMode: MountAccessMode.ReadOnly,
                     DiagnosticCode: "FsHostStartupTimeout",
                     IsReadOnly: true,
@@ -371,13 +406,19 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 );
             }
 
-            var hostRuntimeStatus = await ReadHostRuntimeStatusCachedAsync(
+            var hostRuntimeStatusResult = await ReadHostRuntimeStatusResultCachedAsync(
                 hostState.StatusFilePath,
                 request.AccessMode,
                 _options.WriteBackendMode,
                 timeout: TimeSpan.FromSeconds(3),
                 cancellationToken
             ).ConfigureAwait(false);
+            var hostRuntimeStatus = hostRuntimeStatusResult.IsTrusted
+                ? hostRuntimeStatusResult.Status
+                : BuildFailClosedRuntimeStatus(
+                    request.AccessMode,
+                    _options.WriteBackendMode,
+                    "RuntimeStatusUntrusted");
 
             var requestedNativeWrite = request.AccessMode == MountAccessMode.ReadWrite &&
                                        IsWriteBackendMode(_options.WriteBackendMode, "Native");
@@ -402,15 +443,21 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                     strictNonFixtureScaffoldControls.RejectScaffoldReplayBlobOnNonFixture,
                     strictNonFixtureScaffoldControls.RequireCanonicalReplayCandidateOnNonFixture)
                 : null;
-            if (requestedNativeWrite && failClosedReason is not null)
+            var mountedReadOnlyIdentityFallbackReason = GetMountedReadOnlyIdentityFallbackReason(
+                request.AccessMode,
+                hostRuntimeStatus.WriteBackend,
+                hostRuntimeStatus.RecoveryReason);
+            var enforceRequestedNativeWritePolicy = requestedNativeWrite &&
+                                                    mountedReadOnlyIdentityFallbackReason is null;
+            if (enforceRequestedNativeWritePolicy && failClosedReason is not null)
             {
                 var recoveryGateState = BuildRecoveryFailClosedGateState(failClosedReason);
                 var recoveryDiagnosticCode = BuildRecoveryFailClosedDiagnosticCode(failClosedReason);
                 var recoveryExplanation = DescribeRecoveryReason(failClosedReason);
 
-                await StopHostProcessAsync(hostState, CancellationToken.None).ConfigureAwait(false);
+                await StopStartedHostProcessAsync(mountPoint, hostState, CancellationToken.None).ConfigureAwait(false);
                 pendingHostState = null;
-                WriteWriteSessionMarker(
+                pendingMarker = CaptureWriteSessionMarker(
                     requestedVolumeId: request.VolumeId,
                     requestedAccessMode: request.AccessMode,
                     mountPoint: mountPoint,
@@ -468,13 +515,13 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 );
             }
 
-            if (requestedNativeWrite &&
+            if (enforceRequestedNativeWritePolicy &&
                 _options.NativeWriteRequireCanonicalCommit &&
                 hostRuntimeStatus.CommitModel != NativeWriteCommitModel.CanonicalApfsCheckpoint)
             {
-                await StopHostProcessAsync(hostState, CancellationToken.None).ConfigureAwait(false);
+                await StopStartedHostProcessAsync(mountPoint, hostState, CancellationToken.None).ConfigureAwait(false);
                 pendingHostState = null;
-                WriteWriteSessionMarker(
+                pendingMarker = CaptureWriteSessionMarker(
                     requestedVolumeId: request.VolumeId,
                     requestedAccessMode: request.AccessMode,
                     mountPoint: mountPoint,
@@ -529,12 +576,12 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 );
             }
 
-            if (requestedNativeWrite &&
+            if (enforceRequestedNativeWritePolicy &&
                 hostRuntimeStatus.FixtureLegacyFallbackActive)
             {
-                await StopHostProcessAsync(hostState, CancellationToken.None).ConfigureAwait(false);
+                await StopStartedHostProcessAsync(mountPoint, hostState, CancellationToken.None).ConfigureAwait(false);
                 pendingHostState = null;
-                WriteWriteSessionMarker(
+                pendingMarker = CaptureWriteSessionMarker(
                     requestedVolumeId: request.VolumeId,
                     requestedAccessMode: request.AccessMode,
                     mountPoint: mountPoint,
@@ -589,13 +636,13 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 );
             }
 
-            if (requestedNativeWrite &&
+            if (enforceRequestedNativeWritePolicy &&
                 hostRuntimeStatus.UsesScaffoldCommitBlob &&
                 !IsFixtureImagePath(volume.DeviceId))
             {
-                await StopHostProcessAsync(hostState, CancellationToken.None).ConfigureAwait(false);
+                await StopStartedHostProcessAsync(mountPoint, hostState, CancellationToken.None).ConfigureAwait(false);
                 pendingHostState = null;
-                WriteWriteSessionMarker(
+                pendingMarker = CaptureWriteSessionMarker(
                     requestedVolumeId: request.VolumeId,
                     requestedAccessMode: request.AccessMode,
                     mountPoint: mountPoint,
@@ -650,13 +697,13 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 );
             }
 
-            if (requestedNativeWrite &&
+            if (enforceRequestedNativeWritePolicy &&
                 _options.NativeWriteStrictMode &&
                 hostRuntimeStatus.NativeWriteReadiness != NativeWriteReadiness.CommitReady)
             {
-                await StopHostProcessAsync(hostState, CancellationToken.None).ConfigureAwait(false);
+                await StopStartedHostProcessAsync(mountPoint, hostState, CancellationToken.None).ConfigureAwait(false);
                 pendingHostState = null;
-                WriteWriteSessionMarker(
+                pendingMarker = CaptureWriteSessionMarker(
                     requestedVolumeId: request.VolumeId,
                     requestedAccessMode: request.AccessMode,
                     mountPoint: mountPoint,
@@ -764,7 +811,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 string.Equals(writeBackend, "Native", StringComparison.OrdinalIgnoreCase) &&
                 validationPolicyFailClosedReason is not null)
             {
-                await StopHostProcessAsync(hostState, CancellationToken.None).ConfigureAwait(false);
+                await StopStartedHostProcessAsync(mountPoint, hostState, CancellationToken.None).ConfigureAwait(false);
                 pendingHostState = null;
 
                 var promotionPolicy = string.IsNullOrWhiteSpace(_options.NativeWritePromotionPolicy)
@@ -784,7 +831,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                                    $"policy '{promotionPolicy}' requirement '{requiredValidationState}' " +
                                    $"(evidence: {evidenceDetail}, reason={validationPolicyFailClosedReason}; detail={recoveryExplanation}).";
 
-                WriteWriteSessionMarker(
+                pendingMarker = CaptureWriteSessionMarker(
                     requestedVolumeId: request.VolumeId,
                     requestedAccessMode: request.AccessMode,
                     mountPoint: mountPoint,
@@ -859,6 +906,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 replayCheckpointCandidatePresent: hostRuntimeStatus.ReplayCheckpointCandidatePresent,
                 replayCheckpointPendingWindow: hostRuntimeStatus.ReplayCheckpointPendingWindow);
 
+            _completedHostStops.TryRemove(mountPoint, out _);
             _hosts[mountPoint] = hostState;
             hostRegistered = true;
             pendingHostState = null;
@@ -885,8 +933,15 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                     ShutdownDrainActive: hostRuntimeStatus.ShutdownDrainActive,
                     InFlightMutationCallbacks: hostRuntimeStatus.InFlightMutationCallbacks,
                     NativeWriteValidationEvidence: nativeWriteValidationEvidence,
-                    NativeWriteDiagnostics: mountDiagnostics
+                    NativeWriteDiagnostics: mountDiagnostics,
+                    RecoveryIdentity: volume.RecoveryIdentity,
+                    MountReady: hostRuntimeStatus.MountReady,
+                    HostProcessId: hostRuntimeStatus.HostProcessId,
+                    WalAcceptedSequence: hostRuntimeStatus.WalAcceptedSequence,
+                    WalApfsDurableSequence: hostRuntimeStatus.WalApfsDurableSequence,
+                    WalCleanupSequence: hostRuntimeStatus.WalCleanupSequence
                 );
+            Interlocked.Increment(ref _mountStateVersion);
 
             return new MountResult(
                 Success: true,
@@ -916,14 +971,25 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 ShutdownDrainActive: hostRuntimeStatus.ShutdownDrainActive,
                 InFlightMutationCallbacks: hostRuntimeStatus.InFlightMutationCallbacks,
                 NativeWriteValidationEvidence: nativeWriteValidationEvidence,
-                NativeWriteDiagnostics: mountDiagnostics
+                NativeWriteDiagnostics: mountDiagnostics,
+                MountReady: hostRuntimeStatus.MountReady,
+                HostProcessId: hostRuntimeStatus.HostProcessId,
+                WalAcceptedSequence: hostRuntimeStatus.WalAcceptedSequence,
+                WalApfsDurableSequence: hostRuntimeStatus.WalApfsDurableSequence,
+                WalCleanupSequence: hostRuntimeStatus.WalCleanupSequence,
+                RecoveryActive: hostRuntimeStatus.RecoveryActive,
+                RecoveryReason: hostRuntimeStatus.RecoveryReason,
+                LastCommitXid: hostRuntimeStatus.LastCommitXid
             );
         }
         catch (Exception ex)
         {
             if (pendingHostState is not null && !hostRegistered)
             {
-                await StopHostProcessAsync(pendingHostState, CancellationToken.None).ConfigureAwait(false);
+                await StopStartedHostProcessAsync(
+                    mountPoint,
+                    pendingHostState,
+                    CancellationToken.None).ConfigureAwait(false);
             }
 
             return new MountResult(
@@ -940,12 +1006,17 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         finally
         {
             _gate.Release();
+            if (pendingMarker is not null)
+            {
+                WriteCapturedSessionMarkers([pendingMarker]);
+            }
         }
     }
 
     public async Task<UnmountResult> UnmountAsync(string mountPoint, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        using var operationLease = AcquireLifecycleOperationLease();
         if (string.IsNullOrWhiteSpace(mountPoint))
         {
             return new UnmountResult(false, mountPoint, "Mount point was not provided.");
@@ -958,8 +1029,29 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         {
             CleanupExitedHosts_NoLock();
 
-            if (!_hosts.TryRemove(normalizedMountPoint, out var hostState))
+            if (!_hosts.TryGetValue(normalizedMountPoint, out var hostState))
             {
+                if (_completedHostStops.TryGetValue(normalizedMountPoint, out var completedStop))
+                {
+                    var removed = !IsDriveVisible(normalizedMountPoint) || await WaitForDriveRemovalAsync(
+                        normalizedMountPoint,
+                        TimeSpan.FromSeconds(Math.Clamp(_options.NativeHostStopTimeoutSeconds, 1, 60)),
+                        cancellationToken).ConfigureAwait(false);
+                    if (!removed)
+                    {
+                        return new UnmountResult(
+                            false,
+                            normalizedMountPoint,
+                            $"Mount point '{normalizedMountPoint}' remained visible after FsHost stopped. Close Explorer windows or files and try eject again."
+                        );
+                    }
+
+                    _completedHostStops.TryRemove(normalizedMountPoint, out _);
+                    _mounts.TryRemove(normalizedMountPoint, out _);
+                    NotifyShellDriveRemoved(normalizedMountPoint);
+                    return BuildCompletedUnmountResult(normalizedMountPoint, completedStop);
+                }
+
                 if (_mounts.ContainsKey(normalizedMountPoint))
                 {
                     var removed = await WaitForDriveRemovalAsync(
@@ -970,7 +1062,12 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                     {
                         _mounts.TryRemove(normalizedMountPoint, out _);
                         NotifyShellDriveRemoved(normalizedMountPoint);
-                        return new UnmountResult(true, normalizedMountPoint, null);
+                        return new UnmountResult(
+                            false,
+                            normalizedMountPoint,
+                            "FsHost stopped, but its final write status was unavailable.",
+                            MountRemoved: true
+                        );
                     }
 
                     return new UnmountResult(
@@ -988,17 +1085,37 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             }
 
             InvalidateRuntimeStatusCache(hostState.StatusFilePath);
-            var stopResult = await StopHostProcessAsync(hostState, cancellationToken).ConfigureAwait(false);
+            // Once shutdown has been signaled, finish the bounded ownership
+            // transition even if the request is canceled. Abandoning this
+            // section can drop the only reference to a live host and its job.
+            var stopResult = await StopHostProcessAsync(
+                hostState,
+                CancellationToken.None).ConfigureAwait(false);
+            if (stopResult.ProcessExited)
+            {
+                lock (_disposeFinalizationSync)
+                {
+                    if (!TryFinalizeProvenHost_NoLock(normalizedMountPoint, hostState) &&
+                        !IsHostExitObserverOwned_NoLock(hostState))
+                    {
+                        CleanupHostResources(hostState);
+                    }
+                }
+            }
             var unmounted = stopResult.ProcessExited && await WaitForDriveRemovalAsync(
                 normalizedMountPoint,
                 TimeSpan.FromSeconds(Math.Clamp(_options.NativeHostStopTimeoutSeconds, 1, 60)),
-                cancellationToken).ConfigureAwait(false);
+                CancellationToken.None).ConfigureAwait(false);
 
             if (!unmounted)
             {
-                if (!stopResult.ProcessExited)
+                if (stopResult.ProcessExited)
                 {
-                    _hosts[normalizedMountPoint] = hostState;
+                    _completedHostStops[normalizedMountPoint] = stopResult;
+                }
+                else
+                {
+                    EnsureHostExitObserver(normalizedMountPoint, hostState);
                 }
 
                 return new UnmountResult(
@@ -1011,9 +1128,10 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             }
 
             _mounts.TryRemove(normalizedMountPoint, out _);
+            Interlocked.Increment(ref _mountStateVersion);
             InvalidateRuntimeStatusCache(hostState.StatusFilePath);
             NotifyShellDriveRemoved(normalizedMountPoint);
-            return new UnmountResult(true, normalizedMountPoint, null);
+            return BuildCompletedUnmountResult(normalizedMountPoint, stopResult);
         }
         finally
         {
@@ -1024,13 +1142,38 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     public async Task<IReadOnlyList<MountedVolumeState>> GetMountStateAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        using var operationLease = AcquireLifecycleOperationLease();
+        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            _disposeCts.Token);
+        var refreshCancellationToken = linkedCancellation.Token;
 
-        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        RuntimeStatusRefreshSnapshot snapshot;
+        await _gate.WaitAsync(refreshCancellationToken).ConfigureAwait(false);
         try
         {
             CleanupExitedHosts_NoLock();
-            await RefreshMountedRuntimeState_NoLock(cancellationToken).ConfigureAwait(false);
-            return _mounts.Values
+            snapshot = CaptureRuntimeStatusRefreshSnapshot_NoLock();
+        }
+        finally
+        {
+            _gate.Release();
+        }
+
+        var runtimeStatuses = await ReadRuntimeStatusesAsync(snapshot, refreshCancellationToken).ConfigureAwait(false);
+
+        IReadOnlyList<WriteSessionMarkerRequest> markerRequests = Array.Empty<WriteSessionMarkerRequest>();
+        IReadOnlyList<MountedVolumeState> mounts;
+        await _gate.WaitAsync(refreshCancellationToken).ConfigureAwait(false);
+        try
+        {
+            CleanupExitedHosts_NoLock();
+            if (Volatile.Read(ref _mountStateVersion) == snapshot.Version)
+            {
+                markerRequests = ApplyMountedRuntimeState_NoLock(snapshot, runtimeStatuses);
+            }
+
+            mounts = _mounts.Values
                 .OrderBy(x => x.MountPoint, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
         }
@@ -1038,40 +1181,98 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         {
             _gate.Release();
         }
+
+        WriteCapturedSessionMarkers(markerRequests);
+        return mounts;
     }
 
-    private async Task RefreshMountedRuntimeState_NoLock(CancellationToken cancellationToken)
+    private RuntimeStatusRefreshSnapshot CaptureRuntimeStatusRefreshSnapshot_NoLock()
     {
+        var entries = new List<RuntimeStatusRefreshEntry>(_hosts.Count);
         foreach (var entry in _hosts.ToArray())
+        {
+            if (_mounts.TryGetValue(entry.Key, out var current))
+            {
+                entries.Add(new RuntimeStatusRefreshEntry(entry.Key, entry.Value, current));
+            }
+        }
+
+        return new RuntimeStatusRefreshSnapshot(
+            Volatile.Read(ref _mountStateVersion),
+            entries);
+    }
+
+    private async Task<IReadOnlyDictionary<string, RuntimeStatusReadResult>> ReadRuntimeStatusesAsync(
+        RuntimeStatusRefreshSnapshot snapshot,
+        CancellationToken cancellationToken)
+    {
+        var statuses = new Dictionary<string, RuntimeStatusReadResult>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in snapshot.Entries)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            if (!_mounts.TryGetValue(entry.Key, out var current))
-            {
-                continue;
-            }
-
-            HostRuntimeStatus runtimeStatus;
             try
             {
-                runtimeStatus = await ReadHostRuntimeStatusCachedAsync(
-                    entry.Value.StatusFilePath,
-                    entry.Value.RequestedAccessMode,
-                    entry.Value.ConfiguredWriteBackend,
+                statuses[entry.MountPoint] = await ReadHostRuntimeStatusResultCachedAsync(
+                    entry.HostState.StatusFilePath,
+                    entry.HostState.RequestedAccessMode,
+                    entry.HostState.ConfiguredWriteBackend,
                     RuntimeStatusPollTimeout,
                     cancellationToken
                 ).ConfigureAwait(false);
             }
-            catch
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                statuses[entry.MountPoint] = BuildUntrustedRuntimeStatusResult(
+                    entry.HostState,
+                    "RuntimeStatusUntrusted",
+                    ex.GetType().Name);
+            }
+        }
+
+        return statuses;
+    }
+
+    private IReadOnlyList<WriteSessionMarkerRequest> ApplyMountedRuntimeState_NoLock(
+        RuntimeStatusRefreshSnapshot snapshot,
+        IReadOnlyDictionary<string, RuntimeStatusReadResult> runtimeStatuses)
+    {
+        var appliedAny = false;
+        var markerRequests = new List<WriteSessionMarkerRequest>();
+        foreach (var entry in snapshot.Entries)
+        {
+            if (!IsRuntimeStatusRefreshEntryCurrent_NoLock(entry, snapshot))
             {
                 continue;
             }
 
+            if (!runtimeStatuses.TryGetValue(entry.MountPoint, out var runtimeStatusResult))
+            {
+                runtimeStatusResult = BuildUntrustedRuntimeStatusResult(
+                    entry.HostState,
+                    "RuntimeStatusUntrusted",
+                    "StatusResultMissing");
+            }
+
+            var current = entry.MountedState;
+            var trustFailureReason = GetRuntimeStatusTrustFailureReason_NoLock(runtimeStatusResult);
+            var runtimeStatus = trustFailureReason is null
+                ? runtimeStatusResult.Status
+                : BuildFailClosedRuntimeStatus(
+                    entry.HostState.RequestedAccessMode,
+                    entry.HostState.ConfiguredWriteBackend,
+                    trustFailureReason);
+
             var normalizedRuntimeBackend = NormalizeWriteBackendName(runtimeStatus.WriteBackend);
-            var runtimeAllowsWrite = entry.Value.RequestedAccessMode == MountAccessMode.ReadWrite &&
+            var runtimeAllowsWrite = entry.HostState.RequestedAccessMode == MountAccessMode.ReadWrite &&
                                      !string.Equals(normalizedRuntimeBackend, "Disabled", StringComparison.OrdinalIgnoreCase);
-            var recoveryFailClosedTriggered = false;
-            string? failClosedReason = null;
+            var recoveryFailClosedTriggered = trustFailureReason is not null &&
+                                              current.AccessMode == MountAccessMode.ReadWrite;
+            string? failClosedReason = trustFailureReason;
             string? writeGateDetail = null;
             var runtimeVolumeIsFixtureImage = IsMountedVolumeFixtureImage(current.VolumeId);
             var runtimeStrictNonFixtureScaffoldControls = ResolveEffectiveNonFixtureScaffoldControlsForMountedVolume(current.VolumeId);
@@ -1151,7 +1352,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 nextWriteBackend,
                 runtimeStatus.CommitModel
             );
-            var nextReadiness = entry.Value.RequestedAccessMode == MountAccessMode.ReadWrite
+            var nextReadiness = entry.HostState.RequestedAccessMode == MountAccessMode.ReadWrite
                 ? runtimeStatus.NativeWriteReadiness
                 : NativeWriteReadiness.Unavailable;
             var nextSafetyState = ResolveEffectiveSafetyState(
@@ -1174,13 +1375,13 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             }
             var validationEvidence = MergeValidationEvidenceFromRuntimeStatus(
                 evidenceVolume,
-                entry.Value.RequestedAccessMode,
+                entry.HostState.RequestedAccessMode,
                 runtimeStatus,
                 ResolveValidationEvidence(evidenceVolume),
-                runtimeSessionId: entry.Value.StatusFilePath
+                runtimeSessionId: entry.HostState.StatusFilePath
             );
             var nextValidationState = ResolveNativeWriteValidationState(
-                entry.Value.RequestedAccessMode,
+                entry.HostState.RequestedAccessMode,
                 nextWriteBackend,
                 nextCommitModel,
                 nextReadiness,
@@ -1218,6 +1419,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 );
             }
 
+            WriteSessionMarkerRequest? markerRequest = null;
             if (recoveryFailClosedTriggered && current.AccessMode == MountAccessMode.ReadWrite)
             {
                 var recoveryGateState = BuildRecoveryFailClosedGateState(failClosedReason);
@@ -1247,7 +1449,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 details.Add($"recoveryActive={runtimeStatus.RecoveryActive}");
                 var detailText = string.Join(", ", details);
 
-                WriteWriteSessionMarker(
+                markerRequest = CaptureWriteSessionMarker(
                     requestedVolumeId: current.VolumeId,
                     requestedAccessMode: MountAccessMode.ReadWrite,
                     mountPoint: current.MountPoint,
@@ -1281,7 +1483,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 replayCheckpointCandidatePresent: runtimeStatus.ReplayCheckpointCandidatePresent,
                 replayCheckpointPendingWindow: runtimeStatus.ReplayCheckpointPendingWindow);
 
-            _mounts[entry.Key] = current with
+            var updated = current with
             {
                 AccessMode = nextAccessMode,
                 WriteBackend = nextWriteBackend,
@@ -1305,7 +1507,85 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 InFlightMutationCallbacks = runtimeStatus.InFlightMutationCallbacks,
                 NativeWriteValidationEvidence = validationEvidence,
                 NativeWriteDiagnostics = runtimeDiagnostics,
+                MountReady = runtimeStatus.MountReady,
+                HostProcessId = runtimeStatus.HostProcessId,
+                WalAcceptedSequence = runtimeStatus.WalAcceptedSequence,
+                WalApfsDurableSequence = runtimeStatus.WalApfsDurableSequence,
+                WalCleanupSequence = runtimeStatus.WalCleanupSequence,
             };
+            _mounts[entry.MountPoint] = updated;
+            if (markerRequest is not null)
+            {
+                markerRequests.Add(markerRequest with { ExpectedMountedState = updated });
+            }
+            appliedAny = true;
+        }
+
+        if (appliedAny)
+        {
+            var appliedVersion = Interlocked.Increment(ref _mountStateVersion);
+            for (var index = 0; index < markerRequests.Count; index++)
+            {
+                markerRequests[index] = markerRequests[index] with { MountStateVersion = appliedVersion };
+            }
+        }
+
+        return markerRequests;
+    }
+
+    private string? GetRuntimeStatusTrustFailureReason_NoLock(RuntimeStatusReadResult result)
+    {
+        if (!result.IsTrusted || result.Identity is null)
+        {
+            return "RuntimeStatusUntrusted";
+        }
+
+        var currentMetadata = CaptureRuntimeStatusFileMetadata(result.Identity.NormalizedPath);
+        return RuntimeStatusFileMetadataMatches(result.Identity.Metadata, currentMetadata)
+            ? null
+            : "RuntimeStatusChangedBeforeApply";
+    }
+
+    private static HostRuntimeStatus BuildFailClosedRuntimeStatus(
+        MountAccessMode accessMode,
+        string? configuredWriteBackend,
+        string recoveryReason)
+    {
+        var fallback = BuildDefaultHostRuntimeStatus(
+            accessMode,
+            configuredWriteBackend);
+        return fallback with
+        {
+            WriteBackend = "Disabled",
+            NativeWriteReadiness = NativeWriteReadiness.RecoveryMode,
+            RecoveryActive = true,
+            RecoveryReason = recoveryReason,
+            NativeWriteSafetyState = NativeWriteSafetyState.RecoveryBlocked,
+            LastRecoveryAction = "DowngradedAfterRuntimeStatusFailure",
+            MountReady = false,
+        };
+    }
+
+    private bool IsRuntimeStatusRefreshEntryCurrent_NoLock(
+        RuntimeStatusRefreshEntry entry,
+        RuntimeStatusRefreshSnapshot snapshot)
+    {
+        if (Volatile.Read(ref _mountStateVersion) != snapshot.Version ||
+            !_hosts.TryGetValue(entry.MountPoint, out var currentHost) ||
+            !ReferenceEquals(currentHost, entry.HostState) ||
+            !_mounts.TryGetValue(entry.MountPoint, out var currentMount) ||
+            !ReferenceEquals(currentMount, entry.MountedState))
+        {
+            return false;
+        }
+
+        try
+        {
+            return !entry.HostState.Process.HasExited;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -1400,41 +1680,695 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         return _options.NativeWriteAllowLegacyScaffoldForFixtures;
     }
 
+    private LifecycleOperationLease AcquireLifecycleOperationLease()
+    {
+        lock (_lifecycleSync)
+        {
+            ObjectDisposedException.ThrowIf(_disposeStarted, this);
+            _activeLifecycleOperations++;
+            return new LifecycleOperationLease(this);
+        }
+    }
+
+    private void ReleaseLifecycleOperationLease()
+    {
+        TaskCompletionSource? drained = null;
+        lock (_lifecycleSync)
+        {
+            _activeLifecycleOperations--;
+            if (_activeLifecycleOperations == 0)
+            {
+                drained = _lifecycleOperationsDrained;
+                _lifecycleOperationsDrained = null;
+            }
+        }
+
+        drained?.TrySetResult();
+    }
+
     public void Dispose()
     {
-        foreach (var kvp in _hosts.ToArray())
+        Task waitTask;
+        var ownsDisposal = false;
+        lock (_lifecycleSync)
         {
-            if (!_hosts.TryRemove(kvp.Key, out var host))
+            if (_disposeStarted)
             {
-                continue;
+                waitTask = _disposeCompleted.Task;
+            }
+            else
+            {
+                _disposeStarted = true;
+                ownsDisposal = true;
+                if (_activeLifecycleOperations == 0)
+                {
+                    waitTask = Task.CompletedTask;
+                }
+                else
+                {
+                    _lifecycleOperationsDrained = new TaskCompletionSource(
+                        TaskCreationOptions.RunContinuationsAsynchronously);
+                    waitTask = _lifecycleOperationsDrained.Task;
+                }
+            }
+        }
+
+        if (!ownsDisposal)
+        {
+            _ = waitTask.Wait(GetLifecycleShutdownTimeout());
+            return;
+        }
+
+        _disposeCts.Cancel();
+        if (!waitTask.Wait(GetLifecycleShutdownTimeout()))
+        {
+            WriteLifecycleDiagnostic("lifecycle-drain-timeout");
+            // Keep this backend alive until every operation releases its lease;
+            // cleanup while a caller still holds MountContext-related state
+            // would be unsafe. The caller returns on the bounded deadline, and
+            // the continuation performs the same cleanup once ownership drains.
+            _ = FinishDisposeAfterLifecycleDrainAsync(waitTask);
+            return;
+        }
+
+        FinishDisposeAfterLifecycleDrain();
+    }
+
+    private TimeSpan GetLifecycleShutdownTimeout()
+        => TimeSpan.FromSeconds(Math.Clamp(_options.NativeHostStopTimeoutSeconds, 1, 60));
+
+    private async Task FinishDisposeAfterLifecycleDrainAsync(Task lifecycleDrain)
+    {
+        try
+        {
+            await lifecycleDrain.ConfigureAwait(false);
+        }
+        catch
+        {
+            // Lifecycle leases complete normally; keep cleanup fail-closed if a
+            // future implementation faults the drain task.
+        }
+
+        FinishDisposeAfterLifecycleDrain();
+    }
+
+    private void FinishDisposeAfterLifecycleDrain()
+    {
+        lock (_disposeFinalizationSync)
+        {
+            if (_disposeFinalizationRunning)
+            {
+                return;
             }
 
+            _disposeFinalizationRunning = true;
             try
             {
-                TrySignalHostStop(host);
-                if (!host.Process.HasExited)
+                foreach (var kvp in _hosts.ToArray())
                 {
-                    if (!host.Process.WaitForExit(Math.Clamp(_options.NativeHostStopTimeoutSeconds, 1, 30) * 1000))
-                    {
-                        host.Process.Kill(entireProcessTree: true);
-                        host.Process.WaitForExit(2000);
-                    }
+                    FinishHostShutdown_NoLock(kvp.Key, kvp.Value);
+                }
+
+                foreach (var kvp in _retainedStartupHosts.ToArray())
+                {
+                    FinishHostShutdown_NoLock(kvp.Value.TrackedMountPoint ?? string.Empty, kvp.Value);
+                }
+
+                CompleteDisposeIfNoHosts_NoLock();
+            }
+            finally
+            {
+                _disposeFinalizationRunning = false;
+            }
+        }
+    }
+
+    private void FinishHostShutdown_NoLock(string mountPoint, HostProcessState host)
+    {
+        if (TryReleaseExitedHost_NoLock(mountPoint, host))
+        {
+            return;
+        }
+
+        try
+        {
+            // Signal the child without releasing the lifetime handle. The
+            // handle remains owned until exact exit is proven and
+            // CleanupHostResources can safely close it.
+            TrySignalHostStop(host);
+            host.Guardian?.TryTerminate(13);
+            if (!TryProveProcessExited(host, out _) &&
+                !WaitForProcessExit(host.Process, GetLifecycleShutdownTimeout()))
+            {
+                host.Guardian?.TryTerminate(13);
+                if (!TryProveProcessExited(host, out _) &&
+                    TryKillProcess(host.Process))
+                {
+                    WaitForProcessExit(host.Process, TimeSpan.FromSeconds(2));
+                }
+            }
+        }
+        catch
+        {
+            // Keep the host tracked when any stop operation cannot establish an
+            // exit boundary.
+        }
+
+        if (TryReleaseExitedHost_NoLock(mountPoint, host))
+        {
+            return;
+        }
+
+        WriteLifecycleDiagnostic(
+            "host-exit-unproven",
+            mountPoint,
+            host,
+            "The bounded stop sequence did not prove exact process exit; ownership remains retained.");
+        EnsureHostExitObserver_NoLock(mountPoint, host);
+    }
+
+    private bool TryReleaseExitedHost_NoLock(string mountPoint, HostProcessState host)
+    {
+        if (IsHostExitObserverOwned_NoLock(host) ||
+            !TryProveProcessExited(host, out _))
+        {
+            return false;
+        }
+
+        return TryFinalizeProvenHost_NoLock(mountPoint, host);
+    }
+
+    private bool TryFinalizeProvenHost_NoLock(string mountPoint, HostProcessState host)
+    {
+        if (IsHostExitObserverOwned_NoLock(host))
+        {
+            return false;
+        }
+
+        if (!TryRemoveTrackedHost(mountPoint, host, out var removedHost))
+        {
+            return false;
+        }
+
+        Interlocked.Increment(ref _mountStateVersion);
+        InvalidateRuntimeStatusCache(removedHost.StatusFilePath);
+        CleanupHostResources(removedHost);
+        return true;
+    }
+
+    private void CompleteDisposeIfNoHosts_NoLock()
+    {
+        if (!_disposeStarted ||
+            !_hosts.IsEmpty ||
+            !_retainedStartupHosts.IsEmpty ||
+            !_hostExitObservers.IsEmpty)
+        {
+            return;
+        }
+
+        _mounts.Clear();
+        Interlocked.Increment(ref _mountStateVersion);
+        _volumeCache.Clear();
+        _runtimeStatusCache.Clear();
+        _runtimeStatusReads.Clear();
+        _disposeCompleted.TrySetResult();
+    }
+
+    private bool TryProveProcessExited(HostProcessState host, out int? exitCode)
+        => TryProveProcessExited(
+            host.Process,
+            host.ProcessId,
+            host.ProcessCreationTimeFileTimeUtc,
+            out exitCode);
+
+    private bool TryProveProcessExited(Process process, out int? exitCode)
+    {
+        var processId = TryGetProcessId(process) ?? 0;
+        var creationTime = CaptureProcessCreationTime(process);
+        return TryProveProcessExited(process, processId, creationTime, out exitCode);
+    }
+
+    private bool TryProveProcessExited(
+        Process process,
+        int processId,
+        long? launchCreationTimeFileTimeUtc,
+        out int? exitCode)
+    {
+        exitCode = null;
+        bool processExited;
+        try
+        {
+            processExited = process.HasExited;
+            if (!processExited)
+            {
+                return false;
+            }
+        }
+        catch
+        {
+            return false;
+        }
+
+        var exactHandleProof = TryProbeExactProcessHandleExit(process);
+        if (exactHandleProof == false)
+        {
+            // Contradictory process observations fail closed. Never release a
+            // host when its exact handle still says the original process lives.
+            return false;
+        }
+
+        if (processId <= 0)
+        {
+            WriteLifecycleDiagnostic(
+                "host-exit-proof-unavailable",
+                null,
+                null,
+                detail: "The exact process ID was unavailable, so handle state alone was not accepted as exit proof.");
+            return false;
+        }
+
+        var systemProbeAvailable = TryProbeSystemProcessPresence(processId, out var isEnumerated);
+        if (!systemProbeAvailable)
+        {
+            systemProbeAvailable = TryProbeFallbackSystemProcessPresence(processId, out isEnumerated);
+        }
+
+        if (!systemProbeAvailable)
+        {
+            WriteLifecycleDiagnostic(
+                "host-exit-proof-unavailable",
+                null,
+                null,
+                detail: "Both independent system process enumeration probes failed; exact handle state was not accepted as exit proof.");
+            return false;
+        }
+
+        if (!isEnumerated)
+        {
+            exitCode = TryGetHostExitCode(process);
+            return true;
+        }
+
+        // A live process with the same PID is not necessarily the original
+        // host. Compare its immutable creation time before treating the PID as
+        // evidence that the old host is still present. If identity cannot be
+        // read, fail closed rather than letting a signaled handle release a
+        // process that Windows still reports under the original PID.
+        if (!launchCreationTimeFileTimeUtc.HasValue ||
+            !TryProbeProcessCreationTime(processId, out var currentCreationTimeFileTimeUtc))
+        {
+            WriteLifecycleDiagnostic(
+                "host-exit-proof-unavailable",
+                null,
+                null,
+                detail: $"PID {processId} remained enumerated, but its immutable creation time could not be independently verified.");
+            return false;
+        }
+
+        if (currentCreationTimeFileTimeUtc == launchCreationTimeFileTimeUtc.Value)
+        {
+            // This is the termination-limbo case: the exact handle may be
+            // signaled while Windows still retains the original PID row.
+            return false;
+        }
+
+        // The PID now belongs to a different process, so the original host is
+        // gone even if its old handle reports an exited state.
+        exitCode = TryGetHostExitCode(process);
+        return true;
+    }
+
+    private bool TryProbeSystemProcessPresence(int processId, out bool isEnumerated)
+    {
+        if (_lifecycleTestHooks?.ProbeSystemProcessPresence is { } probe)
+        {
+            try
+            {
+                var result = probe(processId);
+                isEnumerated = result.GetValueOrDefault();
+                return result.HasValue;
+            }
+            catch
+            {
+                isEnumerated = false;
+                return false;
+            }
+        }
+
+        return Win32ProcessPresenceProbe.TryIsEnumerated(processId, out isEnumerated);
+    }
+
+    private bool TryProbeFallbackSystemProcessPresence(int processId, out bool isEnumerated)
+    {
+        if (_lifecycleTestHooks?.ProbeFallbackSystemProcessPresence is { } probe)
+        {
+            try
+            {
+                var result = probe(processId);
+                isEnumerated = result.GetValueOrDefault();
+                return result.HasValue;
+            }
+            catch
+            {
+                isEnumerated = false;
+                return false;
+            }
+        }
+
+        return Win32ToolhelpProcessPresenceProbe.TryIsEnumerated(processId, out isEnumerated);
+    }
+
+    private bool? TryProbeExactProcessHandleExit(Process process)
+    {
+        if (_lifecycleTestHooks?.ProbeExactProcessHandleExit is { } probe)
+        {
+            try
+            {
+                return probe(process);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        return Win32ProcessIdentityProbe.TryHasExited(process);
+    }
+
+    private bool TryProbeProcessCreationTime(int processId, out long creationTimeFileTimeUtc)
+    {
+        if (_lifecycleTestHooks?.ProbeProcessCreationTime is { } probe)
+        {
+            try
+            {
+                var result = probe(processId);
+                if (result.HasValue)
+                {
+                    creationTimeFileTimeUtc = result.Value;
+                    return true;
                 }
             }
             catch
             {
-                // Best-effort cleanup.
             }
-            finally
+
+            creationTimeFileTimeUtc = 0;
+            return false;
+        }
+
+        return Win32ProcessIdentityProbe.TryGetCreationTime(processId, out creationTimeFileTimeUtc);
+    }
+
+    private bool WaitForProcessExit(Process process, TimeSpan timeout)
+    {
+        if (_lifecycleTestHooks?.WaitForExit is { } waitForExit)
+        {
+            try
             {
-                CleanupHostResources(host);
+                return waitForExit(process, timeout);
+            }
+            catch
+            {
+                return false;
             }
         }
 
-        _mounts.Clear();
-        _volumeCache.Clear();
-        _runtimeStatusCache.Clear();
-        _gate.Dispose();
+        try
+        {
+            return process.WaitForExit(Math.Clamp((int)timeout.TotalMilliseconds, 1, int.MaxValue));
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private bool TryKillProcess(Process process)
+    {
+        if (_lifecycleTestHooks?.KillProcess is { } killProcess)
+        {
+            try
+            {
+                return killProcess(process);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        try
+        {
+            if (process.HasExited)
+            {
+                return false;
+            }
+
+            process.Kill(entireProcessTree: true);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private bool TryRemoveHost(
+        string mountPoint,
+        HostProcessState expectedHost,
+        out HostProcessState removedHost)
+    {
+        removedHost = expectedHost;
+        return ((ICollection<KeyValuePair<string, HostProcessState>>)_hosts)
+            .Remove(new KeyValuePair<string, HostProcessState>(mountPoint, expectedHost));
+    }
+
+    private bool TryRemoveTrackedHost(
+        string mountPoint,
+        HostProcessState expectedHost,
+        out HostProcessState removedHost)
+    {
+        if (TryRemoveHost(mountPoint, expectedHost, out removedHost))
+        {
+            return true;
+        }
+
+        return TryRemoveRetainedStartupHost(expectedHost, out removedHost);
+    }
+
+    private bool TryRemoveRetainedStartupHost(
+        HostProcessState expectedHost,
+        out HostProcessState removedHost)
+    {
+        removedHost = expectedHost;
+        return ((ICollection<KeyValuePair<string, HostProcessState>>)_retainedStartupHosts)
+            .Remove(new KeyValuePair<string, HostProcessState>(expectedHost.TrackingKey, expectedHost));
+    }
+
+    private void EnsureHostExitObserver_NoLock(string mountPoint, HostProcessState host)
+    {
+        var completion = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_hostExitObservers.TryAdd(host.TrackingKey, completion.Task))
+        {
+            return;
+        }
+
+        _ = RunHostExitObserverAsync(host.TrackingKey, mountPoint, host, completion);
+    }
+
+    private void EnsureHostExitObserver(string mountPoint, HostProcessState host)
+    {
+        lock (_disposeFinalizationSync)
+        {
+            EnsureHostExitObserver_NoLock(mountPoint, host);
+        }
+    }
+
+    private async Task RunHostExitObserverAsync(
+        string observerKey,
+        string mountPoint,
+        HostProcessState host,
+        TaskCompletionSource completion)
+    {
+        var proofAttempts = 0;
+        string? lastWaitFailure = null;
+        try
+        {
+            while (proofAttempts < MaxHostExitObserverProofAttempts)
+            {
+                proofAttempts++;
+                try
+                {
+                    using var waitCts = new CancellationTokenSource(HostExitObserverWaitSlice);
+                    await host.Process.WaitForExitAsync(waitCts.Token)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    lastWaitFailure = ex.GetType().Name;
+                }
+
+                try
+                {
+                    _lifecycleTestHooks?.BeforeObserverProof?.Invoke(host.Process);
+                }
+                catch (Exception ex)
+                {
+                    WriteLifecycleDiagnostic(
+                        "host-exit-observer-terminal",
+                        mountPoint,
+                        host,
+                        $"Observer proof callback failed after {proofAttempts} attempt(s): {ex.GetType().Name}.");
+                    return;
+                }
+
+                if (TryProveProcessExited(host, out _))
+                {
+                    lock (_disposeFinalizationSync)
+                    {
+                        if (TryRemoveTrackedHost(mountPoint, host, out var removedHost))
+                        {
+                            Interlocked.Increment(ref _mountStateVersion);
+                            InvalidateRuntimeStatusCache(removedHost.StatusFilePath);
+                            CleanupHostResources(removedHost);
+                        }
+
+                        RemoveHostExitObserver_NoLock(observerKey, completion);
+                        CompleteDisposeIfNoHosts_NoLock();
+                    }
+
+                    return;
+                }
+
+                if (proofAttempts >= MaxHostExitObserverProofAttempts)
+                {
+                    WriteLifecycleDiagnostic(
+                        "host-exit-observer-terminal",
+                        mountPoint,
+                        host,
+                        $"Exact process exit remained unproven after {proofAttempts} bounded observer attempt(s)." +
+                        (lastWaitFailure is null ? string.Empty : $" Last wait failure: {lastWaitFailure}."));
+                    return;
+                }
+
+                var retryDelay = TimeSpan.FromMilliseconds(Math.Min(
+                    2000,
+                    HostExitObserverInitialRetryDelay.TotalMilliseconds * Math.Pow(2, proofAttempts - 1)));
+                await Task.Delay(retryDelay).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Retain ownership on any observer failure. A bounded terminal
+            // diagnostic is safer than an unbounded retry or false cleanup.
+            WriteLifecycleDiagnostic(
+                "host-exit-observer-terminal",
+                mountPoint,
+                host,
+                $"Observer stopped after an unexpected {ex.GetType().Name}; ownership remains retained.");
+        }
+        finally
+        {
+            completion.TrySetResult();
+            RemoveHostExitObserver(observerKey, completion);
+        }
+    }
+
+    private void RemoveHostExitObserver(
+        string observerKey,
+        TaskCompletionSource completion)
+    {
+        lock (_disposeFinalizationSync)
+        {
+            RemoveHostExitObserver_NoLock(observerKey, completion);
+        }
+    }
+
+    private void RemoveHostExitObserver_NoLock(
+        string observerKey,
+        TaskCompletionSource completion)
+    {
+        ((ICollection<KeyValuePair<string, Task>>)_hostExitObservers)
+            .Remove(new KeyValuePair<string, Task>(observerKey, completion.Task));
+    }
+
+    private bool IsHostExitObserverOwned_NoLock(HostProcessState host)
+        => _hostExitObservers.ContainsKey(host.TrackingKey);
+
+    private bool HasRetainedStartupHost_NoLock(string mountPoint)
+    {
+        foreach (var host in _retainedStartupHosts.Values)
+        {
+            if (string.Equals(host.TrackedMountPoint, mountPoint, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void WriteLifecycleDiagnostic(string stage)
+        => WriteLifecycleDiagnostic(stage, null, null, null);
+
+    private void WriteLifecycleDiagnostic(
+        string stage,
+        string? mountPoint,
+        HostProcessState? host,
+        string? detail)
+    {
+        try
+        {
+            Directory.CreateDirectory(_writeDiagnosticsRoot);
+            var path = Path.Combine(
+                _writeDiagnosticsRoot,
+                $"backend-{stage}-{DateTime.UtcNow:yyyyMMddHHmmssfff}-{Environment.ProcessId}.json");
+            File.WriteAllText(
+                path,
+                JsonSerializer.Serialize(new
+                {
+                    stage,
+                    processId = Environment.ProcessId,
+                    activeLifecycleOperations = Volatile.Read(ref _activeLifecycleOperations),
+                    mountPoint,
+                    hostProcessId = host is null ? (int?)null : TryGetProcessId(host.Process),
+                    detail,
+                    timestampUtc = DateTime.UtcNow,
+                }));
+        }
+        catch
+        {
+            // Diagnostics must never turn a bounded shutdown into another wait.
+        }
+
+        try
+        {
+            _lifecycleTestHooks?.OnLifecycleDiagnostic?.Invoke(stage);
+        }
+        catch
+        {
+            // Test and telemetry callbacks must not change lifecycle behavior.
+        }
+    }
+
+    private static int? TryGetProcessId(Process process)
+    {
+        try
+        {
+            return process.Id;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static long? CaptureProcessCreationTime(Process process)
+    {
+        return Win32ProcessIdentityProbe.TryGetCreationTime(process, out var creationTimeFileTimeUtc)
+            ? creationTimeFileTimeUtc
+            : null;
     }
 
     private static string NormalizeMountPoint(char driveLetter)
@@ -1468,16 +2402,22 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             $"host_{char.ToUpperInvariant(mountPoint[0])}_{Guid.NewGuid():N}.status.json"
         );
 
-        File.WriteAllText(lifetimeFilePath, "alive");
-
-        var psi = new ProcessStartInfo
+        using var startupGate = HostStartupGate.Create(lifetimeDir);
+        HostLifetimeSentinel? lifetimeSentinel = null;
+        HostProcessGuardian? guardian = null;
+        Process? process = null;
+        try
         {
-            FileName = _nativeFsHostPath!,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            WorkingDirectory = Path.GetDirectoryName(_nativeFsHostPath!) ?? AppContext.BaseDirectory,
-        };
-        var mountTarget = ResolveMountTarget(volume);
+            lifetimeSentinel = HostLifetimeSentinel.Create(lifetimeFilePath);
+            var psi = new ProcessStartInfo
+            {
+                FileName = _nativeFsHostPath!,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = Path.GetDirectoryName(_nativeFsHostPath!) ?? AppContext.BaseDirectory,
+            };
+            PropagateRuntimeScratchEnvironment(psi);
+            var mountTarget = ResolveMountTarget(volume);
         psi.ArgumentList.Add("--device");
         psi.ArgumentList.Add(mountTarget.DevicePath);
         if (mountTarget.DeviceOffsetBytes > 0)
@@ -1485,6 +2425,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             psi.ArgumentList.Add("--device-offset");
             psi.ArgumentList.Add(mountTarget.DeviceOffsetBytes.ToString(CultureInfo.InvariantCulture));
         }
+        AppendRecoveryIdentityArgument(psi, mountTarget.RecoveryIdentity);
         psi.ArgumentList.Add("--volume");
         psi.ArgumentList.Add(volume.VolumeName);
         psi.ArgumentList.Add("--mount");
@@ -1603,46 +2544,226 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         }
         psi.ArgumentList.Add("--lifetime-file");
         psi.ArgumentList.Add(lifetimeFilePath);
+        psi.ArgumentList.Add("--parent-pid");
+        psi.ArgumentList.Add(Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
+        psi.ArgumentList.Add("--startup-gate-file");
+        psi.ArgumentList.Add(startupGate.FilePath);
+        psi.ArgumentList.Add("--startup-gate-token");
+        psi.ArgumentList.Add(startupGate.AuthorizationToken);
         psi.ArgumentList.Add("--status-file");
         psi.ArgumentList.Add(statusFilePath);
 
-        var process = Process.Start(psi);
-        if (process is null)
+            if (_lifecycleTestHooks?.StartProcess is not null)
+            {
+                process = _lifecycleTestHooks.StartProcess(psi);
+                if (process is null)
+                {
+                    throw new InvalidOperationException("Unable to start native mount host process.");
+                }
+
+                guardian = _lifecycleTestHooks.CreateGuardian?.Invoke(process, startupGate) ??
+                           HostProcessGuardian.Create(process, startupGate);
+            }
+            else
+            {
+                var launch = HostProcessGuardian.Start(psi, startupGate);
+                process = launch.Process;
+                guardian = launch.Guardian;
+            }
+
+            return new HostProcessState(
+                process,
+                guardian,
+                lifetimeSentinel,
+                lifetimeFilePath,
+                startupGate.FilePath,
+                statusFilePath,
+                accessMode,
+                _options.WriteBackendMode)
+            {
+                TrackedMountPoint = mountPoint,
+            };
+        }
+        catch (Exception ex)
         {
-            throw new InvalidOperationException("Unable to start native mount host process.");
+            if (process is not null && !TryProveProcessExited(process, out _))
+            {
+                var retainedHost = new HostProcessState(
+                    process,
+                    guardian,
+                    lifetimeSentinel,
+                    lifetimeFilePath,
+                    startupGate.FilePath,
+                    statusFilePath,
+                    accessMode,
+                    _options.WriteBackendMode)
+                {
+                    TrackedMountPoint = mountPoint,
+                };
+
+                if (_hosts.TryAdd(mountPoint, retainedHost))
+                {
+                    // Startup failed, so request the child to stop. Keep every
+                    // ownership reference until the observer proves exit.
+                    TrySignalHostStop(retainedHost);
+                    retainedHost.Guardian?.TryTerminate(13);
+                    WriteLifecycleDiagnostic(
+                        "startup-host-retained",
+                        mountPoint,
+                        retainedHost,
+                        "Startup failed after Process.Start; the host remains reserved until exact exit is proven.");
+                    lock (_disposeFinalizationSync)
+                    {
+                        EnsureHostExitObserver_NoLock(mountPoint, retainedHost);
+                    }
+                }
+                else
+                {
+                    // The primary slot is already owned by another host. Keep
+                    // this failed-start host in a separate collection so its
+                    // process, guardian, and lifetime sentinel remain owned
+                    // until the observer proves exit.
+                    _retainedStartupHosts[retainedHost.TrackingKey] = retainedHost;
+                    WriteLifecycleDiagnostic(
+                        "startup-host-registration-failed",
+                        mountPoint,
+                        retainedHost,
+                        "Startup failed and the mount-point ownership slot was unexpectedly occupied; supplemental ownership was retained.");
+                    TrySignalHostStop(retainedHost);
+                    retainedHost.Guardian?.TryTerminate(13);
+                    lock (_disposeFinalizationSync)
+                    {
+                        EnsureHostExitObserver_NoLock(mountPoint, retainedHost);
+                    }
+                }
+            }
+            else
+            {
+                CleanupHostResources(
+                    new HostProcessState(
+                        process ?? new Process(),
+                        guardian,
+                        lifetimeSentinel,
+                        lifetimeFilePath,
+                        startupGate.FilePath,
+                        statusFilePath,
+                        accessMode,
+                        _options.WriteBackendMode));
+            }
+
+            throw new InvalidOperationException(
+                "Unable to establish an OS-level lifetime guardian for the native mount host.",
+                ex);
+        }
+    }
+
+    private static void AppendRecoveryIdentityArgument(ProcessStartInfo psi, string? recoveryIdentity)
+    {
+        if (string.IsNullOrWhiteSpace(recoveryIdentity))
+        {
+            return;
         }
 
-        return new HostProcessState(process, lifetimeFilePath, statusFilePath, accessMode, _options.WriteBackendMode);
+        psi.ArgumentList.Add("--recovery-identity");
+        psi.ArgumentList.Add(recoveryIdentity);
+    }
+
+    private static void PropagateRuntimeScratchEnvironment(ProcessStartInfo psi)
+    {
+        foreach (var key in new[]
+        {
+            "TEMP",
+            "TMP",
+            "APFSACCESS_SPOOL_ROOT",
+            "APFSACCESS_RUNTIME_ROOT",
+            "APFSACCESS_TRACE_MOVES",
+            "APFSACCESS_PERF_COUNTERS",
+            "APFSACCESS_TRACE_COMMITS",
+            "APFSACCESS_TRACE_READS",
+            "APFSACCESS_DEFER_CLOSE_COMMITS",
+            "APFSACCESS_DISABLE_CONTENT_WRITEBACK",
+            "APFSACCESS_ENABLE_GROUPED_DEFERRED_ACCEPTANCE",
+            "APFSACCESS_DISABLE_GROUPED_DEFERRED_ACCEPTANCE",
+            "APFSACCESS_DISABLE_DEFERRED_INDEX_PERSISTENCE",
+            "APFSACCESS_EXPERIMENTAL_NAMESPACE_WRITEBACK",
+            "APFSACCESS_DISABLE_NAMESPACE_WRITEBACK",
+            "APFSACCESS_DISABLE_ASYNC_BLOCK_IO",
+            "APFSACCESS_ASYNC_BLOCK_IO_DEPTH",
+            "APFSACCESS_CHECKPOINT_DELTA_SHADOW",
+            "APFSACCESS_STRICT_COMMIT_VERIFY",
+            "APFSACCESS_DISABLE_WORKING_FREE_SANITIZE_CACHE",
+            "APFSACCESS_DISABLE_CHECKPOINT_SERIALIZATION_BUFFER_REUSE",
+            "APFSACCESS_DISABLE_CHECKPOINT_SLOT_INDEX",
+            "APFSACCESS_DISABLE_CHECKPOINT_BLOCK_INDEX_CACHE",
+            "APFSACCESS_DISABLE_INDEX_DELTA",
+        })
+        {
+            var value = Environment.GetEnvironmentVariable(key);
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                psi.Environment[key] = value;
+            }
+        }
     }
 
     private async Task<HostStopResult> StopHostProcessAsync(HostProcessState host, CancellationToken cancellationToken)
     {
         TrySignalHostStop(host);
 
+        if (cancellationToken.IsCancellationRequested)
+        {
+            var canceledProcessExited = TryProveProcessExited(host, out var canceledExitCode);
+            if (!canceledProcessExited && !string.IsNullOrWhiteSpace(host.TrackedMountPoint))
+            {
+                EnsureHostExitObserver(host.TrackedMountPoint!, host);
+            }
+
+            return new HostStopResult(
+                ProcessExited: canceledProcessExited,
+                ForcedKill: false,
+                ExitCode: canceledProcessExited ? canceledExitCode : null);
+        }
+
         var timeout = TimeSpan.FromSeconds(Math.Clamp(_options.NativeHostStopTimeoutSeconds, 1, 60));
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutCts.CancelAfter(timeout);
+        using var timeoutCts = new CancellationTokenSource(timeout);
 
         HostStopResult result;
         try
         {
-            if (!host.Process.HasExited)
+            if (!TryProveProcessExited(host, out _))
             {
                 await host.Process.WaitForExitAsync(timeoutCts.Token).ConfigureAwait(false);
             }
 
-            result = new HostStopResult(ProcessExited: true, ForcedKill: false);
+            var processExited = TryProveProcessExited(host, out var exitCode);
+            result = new HostStopResult(
+                ProcessExited: processExited,
+                ForcedKill: false,
+                ExitCode: processExited ? exitCode : null);
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
             var forcedKill = false;
             try
             {
-                if (!host.Process.HasExited)
+                forcedKill = host.Guardian?.TryTerminate(13) == true;
+                if (!TryProveProcessExited(host, out _))
                 {
-                    host.Process.Kill(entireProcessTree: true);
-                    forcedKill = true;
-                    await host.Process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+                    if (!forcedKill)
+                    {
+                        forcedKill = TryKillProcess(host.Process);
+                    }
+                    using var killWaitCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                    try
+                    {
+                        await host.Process.WaitForExitAsync(killWaitCts.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (!TryProveProcessExited(host, out _))
+                    {
+                        // Keep ProcessExited=false truthful. The caller will
+                        // quarantine the mount and refuse a remount while the
+                        // old host remains owned.
+                    }
                 }
             }
             catch
@@ -1650,17 +2771,124 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 // Best-effort force-kill.
             }
 
-            result = new HostStopResult(ProcessExited: host.Process.HasExited, ForcedKill: forcedKill);
+            var processExited = TryProveProcessExited(host, out _);
+            result = new HostStopResult(
+                ProcessExited: processExited,
+                ForcedKill: forcedKill,
+                ExitCode: processExited ? TryGetHostExitCode(host.Process) : null);
         }
-        finally
+        catch (Exception ex)
         {
-            if (host.Process.HasExited)
-            {
-                CleanupHostResources(host);
-            }
+            WriteLifecycleDiagnostic(
+                "host-stop-observation-failed",
+                host.TrackedMountPoint,
+                host,
+                $"Stop observation failed with {ex.GetType().Name}; ownership remains retained.");
+            result = new HostStopResult(ProcessExited: false, ForcedKill: false, ExitCode: null);
+        }
+
+        if (!result.ProcessExited && !string.IsNullOrWhiteSpace(host.TrackedMountPoint))
+        {
+            EnsureHostExitObserver(host.TrackedMountPoint!, host);
         }
 
         return result;
+    }
+
+    private async Task<HostStopResult> StopStartedHostProcessAsync(
+        string mountPoint,
+        HostProcessState host,
+        CancellationToken cancellationToken)
+    {
+        host = host with { TrackedMountPoint = mountPoint };
+
+        // Register ownership before issuing the stop. Any unexpected exception
+        // then leaves the host reachable by later cleanup instead of orphaned.
+        _hosts[mountPoint] = host;
+        Interlocked.Increment(ref _mountStateVersion);
+        HostStopResult result;
+        try
+        {
+            result = await StopHostProcessAsync(host, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            TrySignalHostStop(host);
+            WriteLifecycleDiagnostic(
+                "host-stop-unhandled-failure",
+                mountPoint,
+                host,
+                $"Stop operation failed with {ex.GetType().Name}; ownership remains retained.");
+            result = new HostStopResult(ProcessExited: false, ForcedKill: false, ExitCode: null);
+        }
+
+        if (result.ProcessExited)
+        {
+            lock (_disposeFinalizationSync)
+            {
+                if (!TryFinalizeProvenHost_NoLock(mountPoint, host) &&
+                    !IsHostExitObserverOwned_NoLock(host))
+                {
+                    CleanupHostResources(host);
+                }
+            }
+        }
+        else
+        {
+            EnsureHostExitObserver(mountPoint, host);
+        }
+        return result;
+    }
+
+    private static string DescribeHostStopResult(HostStopResult result)
+    {
+        if (!result.ProcessExited)
+        {
+            return "FsHost remained alive after the bounded stop attempt; ownership was retained";
+        }
+
+        if (result.ForcedKill)
+        {
+            return $"FsHost required a forced stop (exitCode={result.ExitCode?.ToString() ?? "unknown"})";
+        }
+
+        return $"FsHost exited (exitCode={result.ExitCode?.ToString() ?? "unknown"})";
+    }
+
+    private static UnmountResult BuildCompletedUnmountResult(string mountPoint, HostStopResult stopResult)
+    {
+        if (IsCleanHostStop(stopResult.ProcessExited, stopResult.ForcedKill, stopResult.ExitCode))
+        {
+            return new UnmountResult(
+                true,
+                mountPoint,
+                null,
+                MountRemoved: true,
+                HostOwnershipReleased: true,
+                PendingDurabilityCleared: true);
+        }
+
+        var error = stopResult.ForcedKill
+            ? "FsHost was force-stopped before pending writes could be finalized."
+            : stopResult.ExitCode.HasValue
+                ? $"FsHost stopped with exit code {stopResult.ExitCode.Value}; pending writes were not finalized safely."
+                : "FsHost stopped, but its final write status was unavailable.";
+        return new UnmountResult(false, mountPoint, error, MountRemoved: true);
+    }
+
+    private static bool IsCleanHostStop(bool processExited, bool forcedKill, int? exitCode)
+        => processExited && !forcedKill && exitCode == 0;
+
+    private static int? TryGetHostExitCode(Process process)
+    {
+        try
+        {
+            return process.HasExited ? process.ExitCode : null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static async Task<bool> WaitForMountOrExitAsync(
@@ -1683,17 +2911,27 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 return false;
             }
 
-            if (IsDriveVisible(mountPoint))
+            var driveVisible = IsDriveVisible(mountPoint);
+            if (IsMountStartupReady(
+                    driveVisible,
+                    hostMountReady: false,
+                    accessMode,
+                    configuredWriteBackend))
             {
                 return true;
             }
 
-            if (await IsHostMountReadyAsync(
+            var hostMountReady = await IsHostMountReadyAsync(
                     statusFilePath,
                     accessMode,
                     configuredWriteBackend,
                     cancellationToken
-                ).ConfigureAwait(false))
+                ).ConfigureAwait(false);
+            if (IsMountStartupReady(
+                    driveVisible,
+                    hostMountReady,
+                    accessMode,
+                    configuredWriteBackend))
             {
                 return true;
             }
@@ -1708,6 +2946,23 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         }
 
         return false;
+    }
+
+    private static bool IsMountStartupReady(
+        bool driveVisible,
+        bool hostMountReady,
+        MountAccessMode accessMode,
+        string? configuredWriteBackend)
+    {
+        if (hostMountReady)
+        {
+            return true;
+        }
+
+        var requiresSettledNativeWriteStatus =
+            accessMode == MountAccessMode.ReadWrite &&
+            IsWriteBackendMode(configuredWriteBackend, "Native");
+        return driveVisible && !requiresSettledNativeWriteStatus;
     }
 
     private static async Task<bool> WaitForDriveRemovalAsync(
@@ -1786,66 +3041,306 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     {
         var normalizedMountPoint = NormalizeMountPoint(mountPoint);
 
-        try
-        {
-            if (DriveInfo.GetDrives()
-                .Any(drive => string.Equals(drive.Name, normalizedMountPoint, StringComparison.OrdinalIgnoreCase)))
-            {
-                return true;
-            }
-        }
-        catch
-        {
-            // Fall through to direct Win32 probes below. DriveInfo can lag behind
-            // WinFsp drive-letter exposure during mount startup.
-        }
-
         if (!OperatingSystem.IsWindows())
         {
             return false;
         }
 
-        return Win32DriveVisibilityProbe.HasRootAttributes(normalizedMountPoint) ||
-               Win32DriveVisibilityProbe.HasVolumeInformation(normalizedMountPoint) ||
-               Win32DriveVisibilityProbe.HasDosDevice(normalizedMountPoint);
+        // Do not ask the filesystem provider for root attributes or volume
+        // information here. Those calls enter WinFsp callbacks and can stall
+        // the service's mount/eject state machine when a provider is unhealthy.
+        // Mount Manager's DOS-device mapping is a provider-independent signal
+        // that is sufficient for drive-letter collision and removal checks.
+        return Win32DriveVisibilityProbe.HasDosDevice(normalizedMountPoint);
+    }
+
+    private static class Win32ProcessPresenceProbe
+    {
+        private const int InitialProcessCapacity = 1024;
+        private const int MaximumProcessCapacity = 1 << 20;
+
+        public static bool TryIsEnumerated(int processId, out bool isEnumerated)
+        {
+            isEnumerated = false;
+            if (!OperatingSystem.IsWindows() || processId <= 0)
+            {
+                return false;
+            }
+
+            try
+            {
+                for (var capacity = InitialProcessCapacity;
+                     capacity <= MaximumProcessCapacity;
+                     capacity *= 2)
+                {
+                    var processIds = new uint[capacity];
+                    var bufferBytes = checked((uint)(processIds.Length * sizeof(uint)));
+                    if (!EnumProcesses(processIds, bufferBytes, out var bytesReturned))
+                    {
+                        return false;
+                    }
+
+                    var count = checked((int)(bytesReturned / sizeof(uint)));
+                    for (var index = 0; index < count; index++)
+                    {
+                        if (processIds[index] == (uint)processId)
+                        {
+                            isEnumerated = true;
+                            return true;
+                        }
+                    }
+
+                    if (bytesReturned < bufferBytes)
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+                return false;
+            }
+
+            return false;
+        }
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool EnumProcesses(
+            [Out] uint[] processIds,
+            uint bufferBytes,
+            out uint bytesReturned);
+    }
+
+    private static class Win32ToolhelpProcessPresenceProbe
+    {
+        private const uint SnapshotProcess = 0x00000002;
+        private const int ErrorNoMoreFiles = 18;
+        private const int MaximumProcessEntries = 131_072;
+        private static readonly TimeSpan EnumerationBudget = TimeSpan.FromMilliseconds(250);
+
+        public static bool TryIsEnumerated(int processId, out bool isEnumerated)
+        {
+            isEnumerated = false;
+            if (!OperatingSystem.IsWindows() || processId <= 0)
+            {
+                return false;
+            }
+
+            try
+            {
+                var snapshotHandle = CreateToolhelp32Snapshot(SnapshotProcess, 0);
+                if (snapshotHandle == nint.Zero || snapshotHandle == (nint)(-1))
+                {
+                    return false;
+                }
+
+                using var snapshot = new SnapshotHandle(snapshotHandle);
+                var entry = new ProcessEntry32
+                {
+                    Size = (uint)Marshal.SizeOf<ProcessEntry32>(),
+                    ExecutableFile = string.Empty,
+                };
+                if (!Process32FirstW(snapshot, ref entry))
+                {
+                    return false;
+                }
+
+                var startedAt = Stopwatch.GetTimestamp();
+                for (var entryCount = 0; entryCount < MaximumProcessEntries; entryCount++)
+                {
+                    if (entry.ProcessId == (uint)processId)
+                    {
+                        isEnumerated = true;
+                        return true;
+                    }
+
+                    if (Stopwatch.GetElapsedTime(startedAt) >= EnumerationBudget)
+                    {
+                        return false;
+                    }
+
+                    if (Process32NextW(snapshot, ref entry))
+                    {
+                        continue;
+                    }
+
+                    return Marshal.GetLastWin32Error() == ErrorNoMoreFiles;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+
+            return false;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern nint CreateToolhelp32Snapshot(
+            uint flags,
+            uint processId);
+
+        [DllImport("kernel32.dll", EntryPoint = "Process32FirstW", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool Process32FirstW(
+            SnapshotHandle snapshot,
+            ref ProcessEntry32 entry);
+
+        [DllImport("kernel32.dll", EntryPoint = "Process32NextW", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool Process32NextW(
+            SnapshotHandle snapshot,
+            ref ProcessEntry32 entry);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(nint handle);
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct ProcessEntry32
+        {
+            public uint Size;
+            public uint UsageCount;
+            public uint ProcessId;
+            public nuint DefaultHeapId;
+            public uint ModuleId;
+            public uint ThreadCount;
+            public uint ParentProcessId;
+            public int BasePriority;
+            public uint Flags;
+
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string? ExecutableFile;
+        }
+
+        private sealed class SnapshotHandle : SafeHandleZeroOrMinusOneIsInvalid
+        {
+            public SnapshotHandle(nint handle)
+                : base(ownsHandle: true)
+            {
+                SetHandle(handle);
+            }
+
+            protected override bool ReleaseHandle() => CloseHandle(handle);
+        }
+    }
+
+    private static class Win32ProcessIdentityProbe
+    {
+        private const uint ProcessQueryLimitedInformation = 0x1000;
+        private const uint Synchronize = 0x00100000;
+        private const uint WaitObjectSignaled = 0;
+        private const uint WaitTimeout = 0x00000102;
+        private const uint WaitFailed = 0xFFFFFFFF;
+
+        public static bool? TryHasExited(Process process)
+        {
+            try
+            {
+                var handle = process.SafeHandle;
+                if (handle is null || handle.IsInvalid || handle.IsClosed)
+                {
+                    return null;
+                }
+
+                var waitResult = WaitForSingleObject(handle, 0);
+                return waitResult switch
+                {
+                    WaitObjectSignaled => true,
+                    WaitTimeout => false,
+                    WaitFailed => null,
+                    _ => null,
+                };
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        public static bool TryGetCreationTime(Process process, out long creationTimeFileTimeUtc)
+        {
+            try
+            {
+                var handle = process.SafeHandle;
+                if (handle is null || handle.IsInvalid || handle.IsClosed)
+                {
+                    creationTimeFileTimeUtc = 0;
+                    return false;
+                }
+
+                return GetProcessTimes(
+                    handle,
+                    out creationTimeFileTimeUtc,
+                    out _,
+                    out _,
+                    out _);
+            }
+            catch
+            {
+                creationTimeFileTimeUtc = 0;
+                return false;
+            }
+        }
+
+        public static bool TryGetCreationTime(int processId, out long creationTimeFileTimeUtc)
+        {
+            creationTimeFileTimeUtc = 0;
+            if (!OperatingSystem.IsWindows() || processId <= 0)
+            {
+                return false;
+            }
+
+            try
+            {
+                using var handle = OpenProcess(
+                    ProcessQueryLimitedInformation | Synchronize,
+                    inheritHandle: false,
+                    (uint)processId);
+                if (handle is null || handle.IsInvalid || handle.IsClosed)
+                {
+                    return false;
+                }
+
+                return GetProcessTimes(
+                    handle,
+                    out creationTimeFileTimeUtc,
+                    out _,
+                    out _,
+                    out _);
+            }
+            catch
+            {
+                creationTimeFileTimeUtc = 0;
+                return false;
+            }
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForSingleObject(
+            SafeProcessHandle handle,
+            uint milliseconds);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetProcessTimes(
+            SafeProcessHandle process,
+            out long creationTime,
+            out long exitTime,
+            out long kernelTime,
+            out long userTime);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern SafeProcessHandle OpenProcess(
+            uint desiredAccess,
+            [MarshalAs(UnmanagedType.Bool)] bool inheritHandle,
+            uint processId);
     }
 
     private static class Win32DriveVisibilityProbe
     {
-        private const uint InvalidFileAttributes = 0xFFFFFFFF;
         private const int DosDeviceBufferLength = 4096;
-
-        public static bool HasRootAttributes(string rootPath)
-        {
-            try
-            {
-                return GetFileAttributesW(rootPath) != InvalidFileAttributes;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        public static bool HasVolumeInformation(string rootPath)
-        {
-            try
-            {
-                return GetVolumeInformationW(
-                    rootPath,
-                    lpVolumeNameBuffer: null,
-                    nVolumeNameSize: 0,
-                    lpVolumeSerialNumber: out _,
-                    lpMaximumComponentLength: out _,
-                    lpFileSystemFlags: out _,
-                    lpFileSystemNameBuffer: null,
-                    nFileSystemNameSize: 0);
-            }
-            catch
-            {
-                return false;
-            }
-        }
 
         public static bool HasDosDevice(string rootPath)
         {
@@ -1865,20 +3360,6 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 return false;
             }
         }
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern uint GetFileAttributesW(string lpFileName);
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern bool GetVolumeInformationW(
-            string lpRootPathName,
-            StringBuilder? lpVolumeNameBuffer,
-            uint nVolumeNameSize,
-            out uint lpVolumeSerialNumber,
-            out uint lpMaximumComponentLength,
-            out uint lpFileSystemFlags,
-            StringBuilder? lpFileSystemNameBuffer,
-            uint nFileSystemNameSize);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern uint QueryDosDeviceW(
@@ -1929,6 +3410,89 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             string? dwItem2);
     }
 
+    private static class Win32FileGeneration
+    {
+        public static bool TryRead(string path, out RuntimeStatusFileGeneration generation)
+        {
+            generation = default;
+            if (!OperatingSystem.IsWindows())
+            {
+                return false;
+            }
+
+            try
+            {
+                using var handle = File.OpenHandle(
+                    path,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete);
+                if (!GetFileInformationByHandleEx(
+                        handle,
+                        FileInfoByHandleClass.FileBasicInfo,
+                        out FileBasicInfo basicInfo,
+                        (uint)Marshal.SizeOf<FileBasicInfo>()) ||
+                    !GetFileInformationByHandleEx(
+                        handle,
+                        FileInfoByHandleClass.FileIdInfo,
+                        out FileIdInfo fileIdInfo,
+                        (uint)Marshal.SizeOf<FileIdInfo>()))
+                {
+                    return false;
+                }
+
+                generation = new RuntimeStatusFileGeneration(
+                    basicInfo.ChangeTime,
+                    fileIdInfo.VolumeSerialNumber,
+                    fileIdInfo.FileIdLow,
+                    fileIdInfo.FileIdHigh);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private enum FileInfoByHandleClass
+        {
+            FileBasicInfo = 0,
+            FileIdInfo = 18,
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileBasicInfo
+        {
+            public long CreationTime;
+            public long LastAccessTime;
+            public long LastWriteTime;
+            public long ChangeTime;
+            public uint FileAttributes;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileIdInfo
+        {
+            public ulong VolumeSerialNumber;
+            public ulong FileIdLow;
+            public ulong FileIdHigh;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandleEx(
+            SafeFileHandle hFile,
+            FileInfoByHandleClass fileInformationClass,
+            out FileBasicInfo fileInformation,
+            uint bufferSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandleEx(
+            SafeFileHandle hFile,
+            FileInfoByHandleClass fileInformationClass,
+            out FileIdInfo fileInformation,
+            uint bufferSize);
+    }
+
     private static class Win32StorageDescriptor
     {
         private const uint GenericRead = 0x80000000;
@@ -1938,6 +3502,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         private const uint OpenExisting = 3;
         private const uint FileAttributeNormal = 0x00000080;
         private const uint IoctlStorageQueryProperty = 0x002D1400;
+        private const uint IoctlDiskGetDriveLayoutEx = 0x00070050;
         private const int StorageDeviceProperty = 0;
         private const int PropertyStandardQuery = 0;
         private const int DescriptorBufferLength = 4096;
@@ -2004,6 +3569,71 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             }
         }
 
+        public static bool TryGetPhysicalDriveDiscoveryFingerprint(string devicePath, out DiscoveryFingerprint fingerprint)
+        {
+            fingerprint = default;
+
+            if (string.IsNullOrWhiteSpace(devicePath) || !OperatingSystem.IsWindows())
+            {
+                return false;
+            }
+
+            var normalizedPath = devicePath.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase)
+                ? @"\\.\" + devicePath[4..]
+                : devicePath;
+
+            try
+            {
+                using var handle = CreateFileW(
+                    normalizedPath,
+                    GenericRead,
+                    FileShareRead | FileShareWrite | FileShareDelete,
+                    nint.Zero,
+                    OpenExisting,
+                    FileAttributeNormal,
+                    nint.Zero);
+                if (handle.IsInvalid)
+                {
+                    return false;
+                }
+
+                var bufferLength = 8192;
+                for (var attempt = 0; attempt < 3; attempt++)
+                {
+                    var buffer = new byte[bufferLength];
+                    var success = DeviceIoControl(
+                        handle,
+                        IoctlDiskGetDriveLayoutEx,
+                        nint.Zero,
+                        0,
+                        buffer,
+                        buffer.Length,
+                        out var bytesReturned,
+                        nint.Zero);
+                    if (success && bytesReturned > 0)
+                    {
+                        var hash = SHA256.HashData(buffer.AsSpan(0, (int)bytesReturned));
+                        fingerprint = new DiscoveryFingerprint("layout", Convert.ToHexString(hash));
+                        return true;
+                    }
+
+                    var lastError = Marshal.GetLastWin32Error();
+                    if (lastError is not 122 and not 234)
+                    {
+                        return false;
+                    }
+
+                    bufferLength *= 2;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+
+            return false;
+        }
+
         private static string? ReadDescriptorString(byte[] buffer, int offsetFieldIndex)
         {
             if (buffer.Length < offsetFieldIndex + sizeof(uint))
@@ -2059,50 +3689,127 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             int nOutBufferSize,
             out uint lpBytesReturned,
             nint lpOverlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool DeviceIoControl(
+            SafeFileHandle hDevice,
+            uint dwIoControlCode,
+            nint lpInBuffer,
+            int nInBufferSize,
+            byte[] lpOutBuffer,
+            int nOutBufferSize,
+            out uint lpBytesReturned,
+            nint lpOverlapped);
     }
 
     private void CleanupExitedHosts_NoLock()
     {
-        foreach (var kvp in _hosts.ToArray())
+        lock (_disposeFinalizationSync)
         {
-            try
+            foreach (var kvp in _hosts.ToArray())
             {
-                if (!kvp.Value.Process.HasExited)
+                if (IsHostExitObserverOwned_NoLock(kvp.Value) ||
+                    !TryProveProcessExited(kvp.Value, out var exitCode))
+                {
+                    // An observer owns its Process until it completes. A
+                    // failed process observation is not proof of exit either.
+                    continue;
+                }
+
+                if (TryRemoveHost(kvp.Key, kvp.Value, out var host))
+                {
+                    Interlocked.Increment(ref _mountStateVersion);
+                    var mountTracked = _mounts.ContainsKey(kvp.Key);
+                    if (mountTracked)
+                    {
+                        var stopResult = new HostStopResult(
+                            ProcessExited: true,
+                            ForcedKill: false,
+                            ExitCode: exitCode);
+                        _completedHostStops[kvp.Key] = stopResult;
+                        if (!IsCleanHostStop(
+                                stopResult.ProcessExited,
+                                stopResult.ForcedKill,
+                                stopResult.ExitCode) &&
+                            _mounts.TryGetValue(kvp.Key, out var mountedState))
+                        {
+                            _mounts[kvp.Key] = MarkUnexpectedHostStop(mountedState, stopResult);
+                        }
+                    }
+
+                    InvalidateRuntimeStatusCache(host.StatusFilePath);
+                    CleanupHostResources(host);
+                }
+            }
+
+            foreach (var kvp in _retainedStartupHosts.ToArray())
+            {
+                var host = kvp.Value;
+                if (IsHostExitObserverOwned_NoLock(host) ||
+                    !TryProveProcessExited(host, out _))
                 {
                     continue;
                 }
-            }
-            catch
-            {
-                // Treat disposed process as exited.
-            }
 
-            if (_hosts.TryRemove(kvp.Key, out var host))
-            {
-                InvalidateRuntimeStatusCache(host.StatusFilePath);
-                if (!_mounts.ContainsKey(kvp.Key) || !IsDriveVisible(kvp.Key))
+                if (TryRemoveRetainedStartupHost(host, out var removedHost))
                 {
-                    _mounts.TryRemove(kvp.Key, out _);
+                    Interlocked.Increment(ref _mountStateVersion);
+                    InvalidateRuntimeStatusCache(removedHost.StatusFilePath);
+                    CleanupHostResources(removedHost);
                 }
-
-                CleanupHostResources(host);
             }
-        }
 
-        CleanupDetachedMounts_NoLock();
+            CleanupDetachedMounts_NoLock();
+            CompleteDisposeIfNoHosts_NoLock();
+        }
+    }
+
+    private static MountedVolumeState MarkUnexpectedHostStop(
+        MountedVolumeState mountedState,
+        HostStopResult stopResult)
+    {
+        var exitDetail = stopResult.ExitCode.HasValue
+            ? $"FsHost exited with code {stopResult.ExitCode.Value}."
+            : "FsHost exited without a readable exit code.";
+        var diagnostic = new NativeWriteDiagnostic(
+            Code: "FsHostUnexpectedExit",
+            Message: $"{exitDetail} Pending writes were not proven durable.",
+            IsFailClosed: true,
+            Scope: "Runtime:HostStop",
+            RecoveryReason: "FsHostExitedUnexpectedly",
+            RecoveryAction: "RemountBlockedUntilFix");
+        var diagnostics = (mountedState.NativeWriteDiagnostics ?? Array.Empty<NativeWriteDiagnostic>())
+            .Append(diagnostic)
+            .ToArray();
+
+        return mountedState with
+        {
+            AccessMode = MountAccessMode.ReadOnly,
+            WriteBackend = "Disabled",
+            NativeWriteReadiness = NativeWriteReadiness.RecoveryMode,
+            RecoveryActive = true,
+            RecoveryReason = "FsHostExitedUnexpectedly",
+            NativeWriteSafetyState = NativeWriteSafetyState.RecoveryBlocked,
+            LastRecoveryAction = "RemountBlockedUntilFix",
+            NativeWriteDiagnostics = diagnostics,
+        };
     }
 
     private void CleanupDetachedMounts_NoLock()
     {
         foreach (var kvp in _mounts.ToArray())
         {
-            if (_hosts.ContainsKey(kvp.Key) || IsDriveVisible(kvp.Key))
+            if (_hosts.ContainsKey(kvp.Key) ||
+                HasRetainedStartupHost_NoLock(kvp.Key) ||
+                _completedHostStops.ContainsKey(kvp.Key) ||
+                IsDriveVisible(kvp.Key))
             {
                 continue;
             }
 
             if (_mounts.TryRemove(kvp.Key, out _))
             {
+                Interlocked.Increment(ref _mountStateVersion);
                 NotifyShellDriveRemoved(kvp.Key);
             }
         }
@@ -2125,6 +3832,20 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
 
     private static void CleanupHostResources(HostProcessState host)
     {
+        if (!host.TryClaimResourceCleanup())
+        {
+            return;
+        }
+
+        try
+        {
+            host.LifetimeSentinel?.Dispose();
+        }
+        catch
+        {
+            // Best-effort lifetime signal cleanup.
+        }
+
         try
         {
             host.Process.Dispose();
@@ -2132,6 +3853,18 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         catch
         {
             // Best-effort cleanup.
+        }
+
+        try
+        {
+            // Closing a live guardian is intentionally a final kill-on-close
+            // boundary. Normal paths reach this point only after the host has
+            // exited; failed teardown paths use it to prevent an orphan.
+            host.Guardian?.Dispose();
+        }
+        catch
+        {
+            // Best-effort guardian cleanup.
         }
 
         try
@@ -2156,6 +3889,18 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         catch
         {
             // Best-effort cleanup.
+        }
+
+        try
+        {
+            if (File.Exists(host.StartupGateFilePath))
+            {
+                File.Delete(host.StartupGateFilePath);
+            }
+        }
+        catch
+        {
+            // Best-effort startup authorization cleanup.
         }
     }
 
@@ -2268,43 +4013,43 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                         : "Write backend is disabled (set Service.WriteBackendMode=Overlay or Native for experimental write-path testing).",
             WriteIncompatibilities: writeIncompatibilities,
             WriteUnsupportedFeatures: writeUnsupportedFeatures,
-            NativeWriteReadiness: nativeWriteReadiness
+            NativeWriteReadiness: nativeWriteReadiness,
+            RecoveryIdentity: discoveredVolume.MountTarget.RecoveryIdentity
         );
     }
 
     private async Task<VolumeInfo?> ResolveVolumeAsync(string volumeId, CancellationToken cancellationToken)
     {
-        if (_volumeCache.TryGetValue(volumeId, out var cachedVolume))
-        {
-            return cachedVolume;
-        }
-
         if (!TryParseVolumeId(volumeId, out var deviceId, out _))
         {
             return null;
         }
 
         var discoveredVolumes = await ProbeVolumesAsync(deviceId, cancellationToken).ConfigureAwait(false);
-        var discoveredVolume = discoveredVolumes.FirstOrDefault(volume =>
+        return discoveredVolumes.FirstOrDefault(volume =>
             string.Equals(volume.VolumeId, volumeId, StringComparison.OrdinalIgnoreCase));
-        if (discoveredVolume is not null)
-        {
-            return discoveredVolume;
-        }
-
-        return TryBuildVolumeFromId(volumeId, out var fallbackVolume)
-            ? fallbackVolume
-            : null;
     }
 
     private VolumeMountTarget ResolveMountTarget(VolumeInfo volume)
     {
-        if (_mountTargetsByVolumeId.TryGetValue(volume.VolumeId, out var mountTarget))
+        // Runtime-status recovery diagnostics can carry a metadata-only volume
+        // fallback. It is not a mount candidate and has no native volume path.
+        if (volume.NativeVolumePath is null)
+        {
+            return new VolumeMountTarget(volume.DeviceId, 0, RecoveryIdentity: null);
+        }
+
+        if (TryParseVolumeId(volume.VolumeId, out var volumeDeviceId, out var volumeName) &&
+            string.Equals(volume.DeviceId, volumeDeviceId, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(volume.VolumeName, volumeName, StringComparison.OrdinalIgnoreCase) &&
+            _mountTargetsByVolumeId.TryGetValue(volume.VolumeId, out var mountTarget) &&
+            string.Equals(mountTarget.DevicePath, volumeDeviceId, StringComparison.OrdinalIgnoreCase))
         {
             return mountTarget;
         }
 
-        return new VolumeMountTarget(volume.DeviceId, 0);
+        throw new InvalidOperationException(
+            $"No authoritative mount target was discovered for volume '{volume.VolumeId}'.");
     }
 
     private DiscoveredDevice? DiscoverDevice(string deviceId)
@@ -2314,9 +4059,44 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             return null;
         }
 
+        if (!TryGetDiscoveryFingerprint(deviceId, out var discoveryFingerprint))
+        {
+            return DiscoverDeviceWithoutCache(deviceId);
+        }
+
+        if (_deviceDiscoveryCache.TryGetValue(deviceId, out var cachedDiscovery) &&
+            cachedDiscovery.Fingerprint.Equals(discoveryFingerprint))
+        {
+            return cachedDiscovery.Device;
+        }
+
+        System.Threading.Interlocked.Increment(ref _deviceDiscoveryScanCount);
         var discoveredVolumes = DiscoverVolumes(deviceId);
         if (discoveredVolumes.Count == 0)
         {
+            _deviceDiscoveryCache.TryRemove(deviceId, out _);
+            RemoveCachedVolumesForDevice(deviceId);
+            return null;
+        }
+
+        var displayName = IsRawPhysicalDevicePath(deviceId)
+            ? BuildDeviceDisplayName(deviceId)
+            : $"APFS Image ({Path.GetFileName(deviceId)})";
+
+        var discovered = new DiscoveredDevice(deviceId, displayName, discoveredVolumes);
+        _deviceDiscoveryCache[deviceId] = new DiscoveryCacheEntry(discoveryFingerprint, discovered);
+        CacheDiscoveredVolumes(discoveredVolumes, deviceId);
+        return discovered;
+    }
+
+    private DiscoveredDevice? DiscoverDeviceWithoutCache(string deviceId)
+    {
+        System.Threading.Interlocked.Increment(ref _deviceDiscoveryScanCount);
+        var discoveredVolumes = DiscoverVolumes(deviceId);
+        if (discoveredVolumes.Count == 0)
+        {
+            _deviceDiscoveryCache.TryRemove(deviceId, out _);
+            RemoveCachedVolumesForDevice(deviceId);
             return null;
         }
 
@@ -2361,7 +4141,8 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         var discoveredVolumes = new List<DiscoveredVolume>();
         var usedVolumeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        if (TryReadApfsContainerHeader(deviceId, 0, out _))
+        if (TryReadApfsContainerHeader(deviceId, 0, out var directContainerHeader) &&
+            directContainerHeader is not null)
         {
             discoveredVolumes.Add(new DiscoveredVolume(
                 VolumeName: DefaultMainVolumeName,
@@ -2369,7 +4150,13 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 WriteIncompatibilities: Array.Empty<string>(),
                 WriteUnsupportedFeatures: Array.Empty<string>(),
                 NativeVolumePath: BuildNativeVolumePath(deviceId, DefaultMainVolumeName),
-                MountTarget: new VolumeMountTarget(deviceId, 0)));
+                MountTarget: new VolumeMountTarget(
+                    deviceId,
+                    0,
+                    BuildRecoveryIdentity(
+                        partitionUniqueGuid: null,
+                        directContainerHeader,
+                        allowPartitionlessIdentity: !IsRawPhysicalDevicePath(deviceId)))));
             return discoveredVolumes;
         }
 
@@ -2378,16 +4165,21 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             return discoveredVolumes;
         }
 
-        var apfsPartitions = partitions
-            .Where(partition => partition.PartitionTypeGuid == ApfsPartitionTypeGuid)
-            .Where(partition => TryReadApfsContainerHeader(deviceId, partition.StartOffsetBytes, out _))
-            .ToArray();
+        var apfsPartitions = new List<(GptPartitionInfo Partition, ApfsContainerHeader ContainerHeader)>();
+        foreach (var partition in partitions.Where(partition => partition.PartitionTypeGuid == ApfsPartitionTypeGuid))
+        {
+            if (TryReadApfsContainerHeader(deviceId, partition.StartOffsetBytes, out var containerHeader) &&
+                containerHeader is not null)
+            {
+                apfsPartitions.Add((partition, containerHeader));
+            }
+        }
 
-        foreach (var partition in apfsPartitions)
+        foreach (var (partition, containerHeader) in apfsPartitions)
         {
             var baseName = NormalizeDiscoveredVolumeName(
                 partition.PartitionName,
-                allowDefaultMain: apfsPartitions.Length == 1,
+                allowDefaultMain: apfsPartitions.Count == 1,
                 partitionNumber: partition.PartitionNumber);
             var volumeName = baseName;
             for (var suffix = 2; !usedVolumeNames.Add(volumeName); suffix++)
@@ -2401,10 +4193,89 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 WriteIncompatibilities: Array.Empty<string>(),
                 WriteUnsupportedFeatures: Array.Empty<string>(),
                 NativeVolumePath: BuildNativeVolumePath(deviceId, volumeName),
-                MountTarget: new VolumeMountTarget(deviceId, partition.StartOffsetBytes)));
+                MountTarget: new VolumeMountTarget(
+                    deviceId,
+                    partition.StartOffsetBytes,
+                    BuildRecoveryIdentity(
+                        partition.IdentityMetadataTrusted ? partition.PartitionUniqueGuid : null,
+                        containerHeader,
+                        allowPartitionlessIdentity: false))));
         }
 
         return discoveredVolumes;
+    }
+
+    private static bool TryGetDiscoveryFingerprint(string deviceId, out DiscoveryFingerprint fingerprint)
+    {
+        fingerprint = default;
+
+        if (string.IsNullOrWhiteSpace(deviceId))
+        {
+            return false;
+        }
+
+        if (IsRawPhysicalDevicePath(deviceId))
+        {
+            return TryGetPhysicalDriveDiscoveryFingerprint(deviceId, out fingerprint);
+        }
+
+        try
+        {
+            var fullPath = Path.GetFullPath(deviceId);
+            var fileInfo = new FileInfo(fullPath);
+            if (!fileInfo.Exists)
+            {
+                return false;
+            }
+
+            fingerprint = new DiscoveryFingerprint(
+                Kind: "file",
+                Value: $"{fileInfo.Length}:{fileInfo.LastWriteTimeUtc.Ticks}");
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryGetPhysicalDriveDiscoveryFingerprint(string deviceId, out DiscoveryFingerprint fingerprint)
+    {
+        return Win32StorageDescriptor.TryGetPhysicalDriveDiscoveryFingerprint(deviceId, out fingerprint);
+    }
+
+    private void CacheDiscoveredVolumes(IReadOnlyList<DiscoveredVolume> discoveredVolumes, string deviceId)
+    {
+        var volumeIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var discoveredVolume in discoveredVolumes)
+        {
+            var volume = CreateDiscoveredVolumeInfo(deviceId, discoveredVolume);
+            _volumeCache[volume.VolumeId] = volume;
+            volumeIds.Add(volume.VolumeId);
+        }
+
+        RemoveStaleVolumeCacheEntries(deviceId, volumeIds);
+    }
+
+    private void RemoveCachedVolumesForDevice(string deviceId)
+    {
+        RemoveStaleVolumeCacheEntries(deviceId, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+    }
+
+    private void RemoveStaleVolumeCacheEntries(string deviceId, HashSet<string> currentVolumeIds)
+    {
+        foreach (var cachedVolume in _volumeCache.Keys.ToArray())
+        {
+            if (!TryParseVolumeId(cachedVolume, out var cachedDeviceId, out _) ||
+                !string.Equals(cachedDeviceId, deviceId, StringComparison.OrdinalIgnoreCase) ||
+                currentVolumeIds.Contains(cachedVolume))
+            {
+                continue;
+            }
+
+            _volumeCache.TryRemove(cachedVolume, out _);
+            _mountTargetsByVolumeId.TryRemove(cachedVolume, out _);
+        }
     }
 
     private static string NormalizeDiscoveredVolumeName(string? rawName, bool allowDefaultMain, int partitionNumber)
@@ -2437,6 +4308,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 continue;
             }
 
+            var headerChecksumValid = HasValidGptHeaderChecksum(header);
             var partitionEntryCount = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(80, 4));
             var partitionEntrySize = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(84, 4));
             if (partitionEntryCount == 0 || partitionEntrySize is < 128 or > 4096)
@@ -2452,6 +4324,15 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             {
                 continue;
             }
+
+            var partitionEntriesChecksumValid = false;
+            if (partitionEntryCount <= MaxGptEntriesToRead)
+            {
+                var storedEntriesChecksum = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(88, 4));
+                partitionEntriesChecksumValid = storedEntriesChecksum != 0 &&
+                                                ComputeCrc32(entriesBlock) == storedEntriesChecksum;
+            }
+            var identityMetadataTrusted = headerChecksumValid && partitionEntriesChecksumValid;
 
             var discoveredPartitions = new List<GptPartitionInfo>();
             for (var index = 0; index < cappedEntryCount; index++)
@@ -2474,6 +4355,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 }
 
                 var typeGuid = new Guid(entry[..16]);
+                var uniqueGuid = new Guid(entry.Slice(16, 16));
                 var startLba = BinaryPrimitives.ReadUInt64LittleEndian(entry.Slice(32, 8));
                 var endLba = BinaryPrimitives.ReadUInt64LittleEndian(entry.Slice(40, 8));
                 if (startLba == 0 || endLba < startLba)
@@ -2485,6 +4367,8 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 discoveredPartitions.Add(new GptPartitionInfo(
                     PartitionNumber: index + 1,
                     PartitionTypeGuid: typeGuid,
+                    PartitionUniqueGuid: uniqueGuid,
+                    IdentityMetadataTrusted: identityMetadataTrusted,
                     StartOffsetBytes: checked(startLba * (ulong)sectorSize),
                     PartitionName: name));
             }
@@ -2501,28 +4385,88 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     {
         header = default;
 
-        if (!TryReadBytes(deviceId, offsetBytes, 4096, out var primaryBlock) || primaryBlock.Length < 0xA8)
+        if (!TryReadApfsContainerBlock(deviceId, offsetBytes, out var primaryHeader, out var primaryBlock) ||
+            primaryHeader is null)
         {
             return false;
         }
 
-        if (!TryParseApfsContainerHeader(primaryBlock, out var parsedHeader) || parsedHeader is null)
-        {
-            return false;
-        }
-
-        header = parsedHeader;
-        if (header.BlockSize > 0 &&
-            TryReadBytes(deviceId, checked(offsetBytes + header.BlockSize), 4096, out var secondaryBlock) &&
-            secondaryBlock.Length >= 0xA8 &&
-            TryParseApfsContainerHeader(secondaryBlock, out var secondaryHeader) &&
+        var selectedHeader = primaryHeader;
+        if (primaryHeader.BlockSize > 0 &&
+            TryReadApfsContainerBlock(
+                deviceId,
+                checked(offsetBytes + primaryHeader.BlockSize),
+                out var secondaryHeader,
+                out var secondaryBlock) &&
             secondaryHeader is not null &&
-            secondaryHeader.BlockSize == header.BlockSize &&
-            secondaryHeader.TotalBlocks == header.TotalBlocks &&
-            secondaryHeader.VolumeRootBlock == header.VolumeRootBlock &&
-            secondaryHeader.CheckpointXid > header.CheckpointXid)
+            secondaryHeader.BlockSize == primaryHeader.BlockSize &&
+            secondaryHeader.TotalBlocks == primaryHeader.TotalBlocks &&
+            secondaryHeader.VolumeRootBlock == primaryHeader.VolumeRootBlock)
         {
-            header = secondaryHeader;
+            if (HasLegacyCheckpointWriterChecksumSignature(
+                    primaryHeader,
+                    primaryBlock,
+                    secondaryHeader,
+                    secondaryBlock))
+            {
+                primaryHeader = primaryHeader with { IdentityMetadataTrusted = true };
+                secondaryHeader = secondaryHeader with { IdentityMetadataTrusted = true };
+                selectedHeader = primaryHeader;
+            }
+
+            if (((secondaryHeader.IdentityMetadataTrusted && !primaryHeader.IdentityMetadataTrusted) ||
+                 string.Equals(secondaryHeader.ContainerUuid, primaryHeader.ContainerUuid, StringComparison.Ordinal)) &&
+                secondaryHeader.CheckpointXid > primaryHeader.CheckpointXid)
+            {
+                selectedHeader = secondaryHeader;
+            }
+        }
+
+        header = selectedHeader;
+        return true;
+    }
+
+    private static bool HasLegacyCheckpointWriterChecksumSignature(
+        ApfsContainerHeader primaryHeader,
+        byte[] primaryBlock,
+        ApfsContainerHeader secondaryHeader,
+        byte[] secondaryBlock)
+    {
+        if (primaryHeader.IdentityMetadataTrusted ||
+            secondaryHeader.IdentityMetadataTrusted ||
+            primaryHeader.CheckpointXid == 0 ||
+            secondaryHeader.CheckpointXid == 0 ||
+            string.IsNullOrWhiteSpace(primaryHeader.ContainerUuid) ||
+            !string.Equals(primaryHeader.ContainerUuid, secondaryHeader.ContainerUuid, StringComparison.Ordinal) ||
+            !primaryHeader.FirstVolumeObjectId.HasValue ||
+            primaryHeader.FirstVolumeObjectId.Value == 0 ||
+            primaryHeader.FirstVolumeObjectId != secondaryHeader.FirstVolumeObjectId ||
+            primaryBlock.Length != secondaryBlock.Length ||
+            primaryBlock.Length != primaryHeader.BlockSize)
+        {
+            return false;
+        }
+
+        var lowerXid = Math.Min(primaryHeader.CheckpointXid, secondaryHeader.CheckpointXid);
+        var higherXid = Math.Max(primaryHeader.CheckpointXid, secondaryHeader.CheckpointXid);
+        if (lowerXid == ulong.MaxValue || higherXid != lowerXid + 1)
+        {
+            return false;
+        }
+
+        const int checkpointXidOffset = 0x10;
+        const int checkpointXidBytes = sizeof(ulong);
+        for (var index = 0; index < primaryBlock.Length; index++)
+        {
+            if (index is >= checkpointXidOffset and < checkpointXidOffset + checkpointXidBytes)
+            {
+                continue;
+            }
+
+            if (primaryBlock[index] != secondaryBlock[index])
+            {
+                return false;
+            }
         }
 
         return true;
@@ -2542,6 +4486,17 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         var totalBlocks = BinaryPrimitives.ReadUInt64LittleEndian(block.AsSpan(0x28, 8));
         var checkpointXid = BinaryPrimitives.ReadUInt64LittleEndian(block.AsSpan(0x10, 8));
         var volumeRootBlock = BinaryPrimitives.ReadUInt64LittleEndian(block.AsSpan(0xA0, 8));
+        var containerUuidBytes = block.AsSpan(0x48, 16);
+        var containerUuid = containerUuidBytes.IndexOfAnyExcept((byte)0) >= 0
+            ? Convert.ToHexString(containerUuidBytes)
+            : null;
+        ulong? firstVolumeObjectId = block.Length >= 0xC0
+            ? BinaryPrimitives.ReadUInt64LittleEndian(block.AsSpan(0xB8, 8))
+            : null;
+        if (firstVolumeObjectId == 0)
+        {
+            firstVolumeObjectId = null;
+        }
 
         if (magic != nxsbMagic ||
             blockSize is 0 or > (1 << 20) ||
@@ -2551,8 +4506,164 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             return false;
         }
 
-        header = new ApfsContainerHeader(blockSize, totalBlocks, checkpointXid, volumeRootBlock);
+        var identityMetadataTrusted = block.Length == blockSize &&
+                                      HasValidApfsObjectChecksum(block);
+        header = new ApfsContainerHeader(
+            blockSize,
+            totalBlocks,
+            checkpointXid,
+            volumeRootBlock,
+            containerUuid,
+            firstVolumeObjectId,
+            identityMetadataTrusted);
         return true;
+    }
+
+    private static bool TryReadApfsContainerBlock(
+        string deviceId,
+        ulong offsetBytes,
+        out ApfsContainerHeader? header,
+        out byte[] block)
+    {
+        header = default;
+        block = Array.Empty<byte>();
+        if (!TryReadBytes(deviceId, offsetBytes, 4096, out block) ||
+            !TryParseApfsContainerHeader(block, out var parsedHeader) ||
+            parsedHeader is null)
+        {
+            return false;
+        }
+
+        if (parsedHeader.BlockSize != block.Length)
+        {
+            if (!TryReadBytes(deviceId, offsetBytes, checked((int)parsedHeader.BlockSize), out block) ||
+                !TryParseApfsContainerHeader(block, out parsedHeader) ||
+                parsedHeader is null)
+            {
+                return false;
+            }
+        }
+
+        header = parsedHeader;
+        return true;
+    }
+
+    private static string? BuildRecoveryIdentity(
+        Guid? partitionUniqueGuid,
+        ApfsContainerHeader containerHeader,
+        bool allowPartitionlessIdentity)
+    {
+        if (!containerHeader.IdentityMetadataTrusted)
+        {
+            return null;
+        }
+
+        return BuildRecoveryIdentityFromComponents(
+            partitionUniqueGuid,
+            containerHeader.ContainerUuid,
+            containerHeader.FirstVolumeObjectId,
+            allowPartitionlessIdentity);
+    }
+
+    private static string? BuildRecoveryIdentityFromComponents(
+        Guid? partitionUniqueGuid,
+        string? containerUuid,
+        ulong? firstVolumeObjectId,
+        bool allowPartitionlessIdentity)
+    {
+        var hasPartitionGuid = partitionUniqueGuid.HasValue && partitionUniqueGuid.Value != Guid.Empty;
+        if ((!hasPartitionGuid && !allowPartitionlessIdentity) ||
+            string.IsNullOrWhiteSpace(containerUuid) ||
+            containerUuid.Length != 32 ||
+            !firstVolumeObjectId.HasValue ||
+            firstVolumeObjectId.Value == 0)
+        {
+            return null;
+        }
+
+        Span<byte> identityMaterial = stackalloc byte[42];
+        identityMaterial.Clear();
+        identityMaterial[0] = hasPartitionGuid ? (byte)1 : (byte)0;
+        if (hasPartitionGuid)
+        {
+            partitionUniqueGuid!.Value.TryWriteBytes(identityMaterial.Slice(1, 16));
+        }
+
+        Convert.FromHexString(containerUuid).CopyTo(identityMaterial.Slice(17, 16));
+        identityMaterial[33] = 1;
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            identityMaterial.Slice(34, 8),
+            firstVolumeObjectId.Value);
+
+        var digest = SHA256.HashData(identityMaterial);
+        var encodedDigest = Convert.ToBase64String(digest)
+            .TrimEnd('=')
+            .Replace('+', '-')
+            .Replace('/', '_');
+        return $"apfs-recovery-v1-{encodedDigest}";
+    }
+
+    private static bool HasValidGptHeaderChecksum(byte[] header)
+    {
+        var headerSize = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(12, 4));
+        if (headerSize is < 92 || headerSize > (uint)header.Length)
+        {
+            return false;
+        }
+
+        var storedChecksum = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(16, 4));
+        if (storedChecksum == 0)
+        {
+            return false;
+        }
+
+        var checksumBytes = header.AsSpan(0, checked((int)headerSize)).ToArray();
+        checksumBytes.AsSpan(16, 4).Clear();
+        return ComputeCrc32(checksumBytes) == storedChecksum;
+    }
+
+    private static uint ComputeCrc32(ReadOnlySpan<byte> bytes)
+    {
+        var crc = uint.MaxValue;
+        foreach (var value in bytes)
+        {
+            crc ^= value;
+            for (var bit = 0; bit < 8; bit++)
+            {
+                crc = (crc >> 1) ^ (0xEDB88320u & (uint)-(int)(crc & 1));
+            }
+        }
+
+        return ~crc;
+    }
+
+    private static bool HasValidApfsObjectChecksum(byte[] block)
+    {
+        if (block.Length < 12 || (block.Length - 8) % sizeof(uint) != 0)
+        {
+            return false;
+        }
+
+        var storedChecksum = BinaryPrimitives.ReadUInt64LittleEndian(block);
+        return storedChecksum != 0 &&
+               storedChecksum != ulong.MaxValue &&
+               ComputeApfsObjectChecksum(block.AsSpan(8)) == storedChecksum;
+    }
+
+    private static ulong ComputeApfsObjectChecksum(ReadOnlySpan<byte> bytes)
+    {
+        const ulong modulus = uint.MaxValue;
+        ulong sum1 = 0;
+        ulong sum2 = 0;
+        for (var offset = 0; offset < bytes.Length; offset += sizeof(uint))
+        {
+            sum1 += BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(offset, sizeof(uint)));
+            sum2 += sum1;
+        }
+
+        var low = modulus - ((sum1 + sum2) % modulus);
+        var high = modulus - ((sum1 + low) % modulus);
+        return (high << 32) | low;
     }
 
     private static bool TryReadBytes(string path, ulong offsetBytes, int length, out byte[] buffer)
@@ -4966,6 +7077,29 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         return null;
     }
 
+    private static string? GetMountedReadOnlyIdentityFallbackReason(
+        MountAccessMode requestedAccessMode,
+        string? hostWriteBackend,
+        string? recoveryReason)
+    {
+        if (requestedAccessMode != MountAccessMode.ReadWrite ||
+            !string.Equals(
+                NormalizeWriteBackendName(hostWriteBackend),
+                "Disabled",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        return NormalizeRecoveryReason(recoveryReason) switch
+        {
+            "ImmutableRecoveryIdentityMissing" => "ImmutableRecoveryIdentityMissing",
+            "ImmutableRecoveryIdentityInvalid" => "ImmutableRecoveryIdentityInvalid",
+            "LegacyRecoveryEvidenceAmbiguous" => "LegacyRecoveryEvidenceAmbiguous",
+            _ => null,
+        };
+    }
+
     private static string BuildRecoveryFailClosedGateState(string? recoveryReason)
     {
         return NormalizeRecoveryReason(recoveryReason) switch
@@ -5559,6 +7693,9 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         var shutdownDrainActive = payload.ShutdownDrainActive ?? false;
         var inFlightMutationCallbacks = NormalizeInFlightMutationCallbacks(payload.InFlightMutationCallbacks);
         var hostProcessId = NormalizeHostProcessId(payload.HostPid ?? fallback.HostProcessId);
+        var walAcceptedSequence = payload.WalAcceptedSequence ?? fallback.WalAcceptedSequence;
+        var walApfsDurableSequence = payload.WalApfsDurableSequence ?? fallback.WalApfsDurableSequence;
+        var walCleanupSequence = payload.WalCleanupSequence ?? fallback.WalCleanupSequence;
         var fixtureLegacyFallbackActive = payload.FixtureLegacyFallbackActive ?? fallback.FixtureLegacyFallbackActive;
         var fixtureCompatibilityPathActive = payload.FixtureCompatibilityPathActive ?? fallback.FixtureCompatibilityPathActive;
         var usesScaffoldCommitBlob = payload.UsesScaffoldCommitBlob ?? fallback.UsesScaffoldCommitBlob;
@@ -5634,11 +7771,15 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 ReplayCheckpointCandidatePresent = null,
                 ReplayCheckpointPendingWindow = null,
                 MountReady = mountReady,
+                WalAcceptedSequence = walAcceptedSequence,
+                WalApfsDurableSequence = walApfsDurableSequence,
+                WalCleanupSequence = walCleanupSequence,
             };
         }
 
         var backend = NormalizeWriteBackendName(payload.WriteBackend);
-        if (string.Equals(backend, "Disabled", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(backend, "Disabled", StringComparison.OrdinalIgnoreCase) &&
+            GetMountedReadOnlyIdentityFallbackReason(accessMode, backend, recoveryReason) is null)
         {
             backend = fallback.WriteBackend;
         }
@@ -5701,6 +7842,9 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 ReplayCheckpointCandidatePresent = replayCheckpointCandidatePresent,
                 ReplayCheckpointPendingWindow = replayCheckpointPendingWindow,
                 MountReady = mountReady,
+                WalAcceptedSequence = walAcceptedSequence,
+                WalApfsDurableSequence = walApfsDurableSequence,
+                WalCleanupSequence = walCleanupSequence,
             };
         }
 
@@ -5748,6 +7892,9 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 ReplayCheckpointCandidatePresent = null,
                 ReplayCheckpointPendingWindow = null,
                 MountReady = mountReady,
+                WalAcceptedSequence = walAcceptedSequence,
+                WalApfsDurableSequence = walApfsDurableSequence,
+                WalCleanupSequence = walCleanupSequence,
             };
         }
 
@@ -5779,6 +7926,9 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             ReplayCheckpointCandidatePresent = null,
             ReplayCheckpointPendingWindow = null,
             MountReady = mountReady,
+            WalAcceptedSequence = walAcceptedSequence,
+            WalApfsDurableSequence = walApfsDurableSequence,
+            WalCleanupSequence = walCleanupSequence,
         };
     }
 
@@ -5808,31 +7958,10 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             {
                 if (File.Exists(statusFilePath))
                 {
-                    var json = await File.ReadAllTextAsync(statusFilePath, cancellationToken).ConfigureAwait(false);
-                    if (!string.IsNullOrWhiteSpace(json))
+                    var json = await ReadAllTextSharedAsync(statusFilePath, cancellationToken).ConfigureAwait(false);
+                    if (TryParseHostRuntimeStatus(json, accessMode, fallback, out var status))
                     {
-                        HostRuntimeStatusPayload? payload = null;
-                        try
-                        {
-                            payload = JsonSerializer.Deserialize<HostRuntimeStatusPayload>(
-                                json,
-                                new JsonSerializerOptions
-                                {
-                                    PropertyNameCaseInsensitive = true,
-                                }
-                            );
-                        }
-                        catch
-                        {
-                            payload = TryDeserializeHostRuntimeStatusPayloadLenient(json);
-                        }
-
-                        payload ??= TryDeserializeHostRuntimeStatusPayloadLenient(json);
-
-                        if (payload is not null)
-                        {
-                            return BuildHostRuntimeStatusFromPayload(payload, accessMode, fallback);
-                        }
+                        return status;
                     }
                 }
             }
@@ -5847,7 +7976,71 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         return fallback;
     }
 
+    private static bool TryParseHostRuntimeStatus(
+        string? json,
+        MountAccessMode accessMode,
+        HostRuntimeStatus fallback,
+        out HostRuntimeStatus status)
+    {
+        status = fallback;
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return false;
+        }
+
+        HostRuntimeStatusPayload? payload = null;
+        try
+        {
+            payload = JsonSerializer.Deserialize<HostRuntimeStatusPayload>(
+                json,
+                new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true,
+                });
+        }
+        catch
+        {
+            payload = TryDeserializeHostRuntimeStatusPayloadLenient(json);
+        }
+
+        payload ??= TryDeserializeHostRuntimeStatusPayloadLenient(json);
+        if (payload is null)
+        {
+            return false;
+        }
+
+        status = BuildHostRuntimeStatusFromPayload(payload, accessMode, fallback);
+        return true;
+    }
+
+    private static async Task<string> ReadAllTextSharedAsync(string path, CancellationToken cancellationToken)
+    {
+        await using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            bufferSize: 4096,
+            useAsync: true);
+        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        return await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     private async Task<HostRuntimeStatus> ReadHostRuntimeStatusCachedAsync(
+        string statusFilePath,
+        MountAccessMode accessMode,
+        string? configuredWriteBackend,
+        TimeSpan timeout,
+        CancellationToken cancellationToken
+    )
+        => (await ReadHostRuntimeStatusResultCachedAsync(
+            statusFilePath,
+            accessMode,
+            configuredWriteBackend,
+            timeout,
+            cancellationToken).ConfigureAwait(false)).Status;
+
+    private async Task<RuntimeStatusReadResult> ReadHostRuntimeStatusResultCachedAsync(
         string statusFilePath,
         MountAccessMode accessMode,
         string? configuredWriteBackend,
@@ -5857,61 +8050,252 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     {
         if (string.IsNullOrWhiteSpace(statusFilePath))
         {
-            return await ReadHostRuntimeStatusAsync(
+            return BuildUntrustedRuntimeStatusResult(
+                accessMode,
+                configuredWriteBackend,
+                "RuntimeStatusUntrusted",
+                "StatusPathMissing");
+        }
+
+        string cacheKey;
+        try
+        {
+            cacheKey = BuildRuntimeStatusCacheKey(statusFilePath, accessMode, configuredWriteBackend);
+        }
+        catch (Exception ex)
+        {
+            return BuildUntrustedRuntimeStatusResult(
+                accessMode,
+                configuredWriteBackend,
+                "RuntimeStatusUntrusted",
+                ex.GetType().Name);
+        }
+
+        var candidate = new Lazy<Task<RuntimeStatusReadResult>>(
+            () => LoadRuntimeStatusAsync(
+                cacheKey,
                 statusFilePath,
                 accessMode,
                 configuredWriteBackend,
                 timeout,
+                _disposeCts.Token),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+        var sharedRead = _runtimeStatusReads.GetOrAdd(cacheKey, candidate);
+        var task = sharedRead.Value;
+        _ = task.ContinueWith(
+            _ => RemoveCompletedRuntimeStatusRead(cacheKey, sharedRead),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+
+        return await task.WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<RuntimeStatusReadResult> LoadRuntimeStatusAsync(
+        string cacheKey,
+        string statusFilePath,
+        MountAccessMode accessMode,
+        string? configuredWriteBackend,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        Interlocked.Increment(ref _runtimeStatusReadOperationCount);
+        var fallback = BuildDefaultHostRuntimeStatus(accessMode, configuredWriteBackend);
+        var startedAt = Stopwatch.GetTimestamp();
+        string? failureDetail = null;
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var snapshot = await CaptureRuntimeStatusFileSnapshotAsync(
+                statusFilePath,
                 cancellationToken).ConfigureAwait(false);
-        }
-
-        var cacheKey = BuildRuntimeStatusCacheKey(statusFilePath, accessMode, configuredWriteBackend);
-        var now = DateTime.UtcNow;
-        DateTime? lastWriteUtc = null;
-        try
-        {
-            if (File.Exists(statusFilePath))
+            failureDetail = snapshot.FailureDetail;
+            if (snapshot.IsStable && snapshot.Identity is not null)
             {
-                lastWriteUtc = File.GetLastWriteTimeUtc(statusFilePath);
+                var now = DateTime.UtcNow;
+                if (_runtimeStatusCache.TryGetValue(cacheKey, out var cached) &&
+                    RuntimeStatusFileIdentityMatches(cached.Identity, snapshot.Identity) &&
+                    now - cached.ReadAtUtc <= RuntimeStatusCacheTtl)
+                {
+                    return new RuntimeStatusReadResult(
+                        cached.Status,
+                        snapshot.Identity,
+                        IsTrusted: true,
+                        FailureDetail: null);
+                }
+
+                if (snapshot.Identity.Metadata.Exists &&
+                    TryParseHostRuntimeStatus(snapshot.Content, accessMode, fallback, out var status))
+                {
+                    _runtimeStatusCache[cacheKey] = new RuntimeStatusCacheEntry(
+                        snapshot.Identity,
+                        now,
+                        status);
+                    return new RuntimeStatusReadResult(
+                        status,
+                        snapshot.Identity,
+                        IsTrusted: true,
+                        FailureDetail: null);
+                }
             }
-        }
-        catch
-        {
-            // Fall through to raw status polling.
+
+            if (Stopwatch.GetElapsedTime(startedAt) >= timeout)
+            {
+                break;
+            }
+
+            await Task.Delay(150, cancellationToken).ConfigureAwait(false);
         }
 
-        if (_runtimeStatusCache.TryGetValue(cacheKey, out var cached) &&
-            cached.LastWriteUtc == lastWriteUtc &&
-            now - cached.ReadAtUtc <= RuntimeStatusCacheTtl)
-        {
-            return cached.Status;
-        }
-
-        var status = await ReadHostRuntimeStatusAsync(
-            statusFilePath,
+        cancellationToken.ThrowIfCancellationRequested();
+        return BuildUntrustedRuntimeStatusResult(
             accessMode,
             configuredWriteBackend,
-            timeout,
-            cancellationToken).ConfigureAwait(false);
+            "RuntimeStatusUntrusted",
+            failureDetail ?? "StatusUnavailable");
+    }
 
+    private static async Task<RuntimeStatusFileSnapshot> CaptureRuntimeStatusFileSnapshotAsync(
+        string statusFilePath,
+        CancellationToken cancellationToken)
+    {
+        string normalizedPath;
         try
         {
-            if (File.Exists(statusFilePath))
+            normalizedPath = Path.GetFullPath(statusFilePath);
+        }
+        catch (Exception ex)
+        {
+            return new RuntimeStatusFileSnapshot(null, null, IsStable: false, ex.GetType().Name);
+        }
+
+        var before = CaptureRuntimeStatusFileMetadata(normalizedPath);
+        if (!before.IsReadable)
+        {
+            return new RuntimeStatusFileSnapshot(null, null, IsStable: false, "MetadataUnavailable");
+        }
+
+        if (!before.Exists)
+        {
+            return new RuntimeStatusFileSnapshot(
+                new RuntimeStatusFileIdentity(normalizedPath, before, string.Empty),
+                null,
+                IsStable: true,
+                "StatusFileMissing");
+        }
+
+        string content;
+        try
+        {
+            content = await ReadAllTextSharedAsync(normalizedPath, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return new RuntimeStatusFileSnapshot(null, null, IsStable: false, ex.GetType().Name);
+        }
+
+        var after = CaptureRuntimeStatusFileMetadata(normalizedPath);
+        var contentToken = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(content)));
+        var identity = new RuntimeStatusFileIdentity(normalizedPath, after, contentToken);
+        return RuntimeStatusFileMetadataMatches(before, after)
+            ? new RuntimeStatusFileSnapshot(identity, content, IsStable: true, FailureDetail: null)
+            : new RuntimeStatusFileSnapshot(identity, content, IsStable: false, "StatusChangedDuringRead");
+    }
+
+    private static RuntimeStatusFileMetadata CaptureRuntimeStatusFileMetadata(string normalizedPath)
+    {
+        try
+        {
+            var info = new FileInfo(normalizedPath);
+            info.Refresh();
+            RuntimeStatusFileGeneration? generation = null;
+            if (info.Exists && Win32FileGeneration.TryRead(normalizedPath, out var capturedGeneration))
             {
-                lastWriteUtc = File.GetLastWriteTimeUtc(statusFilePath);
+                generation = capturedGeneration;
             }
-            else
-            {
-                lastWriteUtc = null;
-            }
+            return info.Exists
+                ? new RuntimeStatusFileMetadata(
+                    IsReadable: true,
+                    Exists: true,
+                    Length: info.Length,
+                    CreationTimeUtc: info.CreationTimeUtc,
+                    LastWriteTimeUtc: info.LastWriteTimeUtc,
+                    Generation: generation)
+                : new RuntimeStatusFileMetadata(
+                    IsReadable: true,
+                    Exists: false,
+                    Length: 0,
+                    CreationTimeUtc: default,
+                    LastWriteTimeUtc: default,
+                    Generation: null);
         }
         catch
         {
-            lastWriteUtc = null;
+            return new RuntimeStatusFileMetadata(
+                IsReadable: false,
+                Exists: false,
+                Length: 0,
+                CreationTimeUtc: default,
+                LastWriteTimeUtc: default,
+                Generation: null);
         }
+    }
 
-        _runtimeStatusCache[cacheKey] = new RuntimeStatusCacheEntry(lastWriteUtc, DateTime.UtcNow, status);
-        return status;
+    private static bool RuntimeStatusFileMetadataMatches(
+        RuntimeStatusFileMetadata left,
+        RuntimeStatusFileMetadata right)
+        => left.IsReadable &&
+           right.IsReadable &&
+           left.Exists == right.Exists &&
+           (!left.Exists ||
+            left.Length == right.Length &&
+            left.CreationTimeUtc == right.CreationTimeUtc &&
+            left.LastWriteTimeUtc == right.LastWriteTimeUtc &&
+            left.Generation == right.Generation);
+
+    private static bool RuntimeStatusFileIdentityMatches(
+        RuntimeStatusFileIdentity left,
+        RuntimeStatusFileIdentity right)
+        => string.Equals(left.NormalizedPath, right.NormalizedPath, StringComparison.OrdinalIgnoreCase) &&
+           RuntimeStatusFileMetadataMatches(left.Metadata, right.Metadata) &&
+           string.Equals(left.ContentToken, right.ContentToken, StringComparison.Ordinal);
+
+    private static RuntimeStatusReadResult BuildUntrustedRuntimeStatusResult(
+        HostProcessState hostState,
+        string recoveryReason,
+        string failureDetail)
+        => BuildUntrustedRuntimeStatusResult(
+            hostState.RequestedAccessMode,
+            hostState.ConfiguredWriteBackend,
+            recoveryReason,
+            failureDetail);
+
+    private static RuntimeStatusReadResult BuildUntrustedRuntimeStatusResult(
+        MountAccessMode accessMode,
+        string? configuredWriteBackend,
+        string recoveryReason,
+        string failureDetail)
+        => new(
+            BuildFailClosedRuntimeStatus(
+                accessMode,
+                configuredWriteBackend,
+                recoveryReason),
+            Identity: null,
+            IsTrusted: false,
+            FailureDetail: failureDetail);
+
+    private void RemoveCompletedRuntimeStatusRead(
+        string cacheKey,
+        Lazy<Task<RuntimeStatusReadResult>> completedRead)
+    {
+        if (_runtimeStatusReads.TryGetValue(cacheKey, out var current) &&
+            ReferenceEquals(current, completedRead))
+        {
+            _runtimeStatusReads.TryRemove(cacheKey, out _);
+        }
     }
 
     private void InvalidateRuntimeStatusCache(string? statusFilePath)
@@ -5927,6 +8311,14 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             if (key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
             {
                 _runtimeStatusCache.TryRemove(key, out _);
+            }
+        }
+
+        foreach (var key in _runtimeStatusReads.Keys)
+        {
+            if (key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                _runtimeStatusReads.TryRemove(key, out _);
             }
         }
     }
@@ -5992,6 +8384,9 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             )
             {
                 MountReady = ReadJsonBoolean(root, "mountReady"),
+                WalAcceptedSequence = ReadJsonUInt64(root, "walAcceptedSequence"),
+                WalApfsDurableSequence = ReadJsonUInt64(root, "walApfsDurableSequence"),
+                WalCleanupSequence = ReadJsonUInt64(root, "walCleanupSequence"),
                 ReplayCheckpointCandidatePresent = ReadJsonBoolean(root, "replayCheckpointCandidatePresent"),
                 ReplayCheckpointPendingWindow = ReadJsonBoolean(root, "replayCheckpointPendingWindow"),
             };
@@ -6193,18 +8588,73 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         string diagnosticCode,
         string error
     )
+        => WriteCapturedSessionMarkers(
+            [CaptureWriteSessionMarker(
+                requestedVolumeId,
+                requestedAccessMode,
+                mountPoint,
+                gateState,
+                diagnosticCode,
+                error)]);
+
+    private WriteSessionMarkerRequest CaptureWriteSessionMarker(
+        string requestedVolumeId,
+        MountAccessMode requestedAccessMode,
+        string mountPoint,
+        string gateState,
+        string diagnosticCode,
+        string error)
+        => new(
+            RequestedVolumeId: requestedVolumeId,
+            RequestedAccessMode: requestedAccessMode,
+            MountPoint: mountPoint,
+            GateState: gateState,
+            DiagnosticCode: diagnosticCode,
+            Error: error,
+            MountStateVersion: Volatile.Read(ref _mountStateVersion),
+            ExpectedMountedState: null);
+
+    private void WriteCapturedSessionMarkers(IReadOnlyList<WriteSessionMarkerRequest> requests)
     {
+        foreach (var request in requests)
+        {
+            if (IsWriteSessionMarkerRequestCurrent(request))
+            {
+                WriteWriteSessionMarker(request);
+            }
+        }
+    }
+
+    private bool IsWriteSessionMarkerRequestCurrent(WriteSessionMarkerRequest request)
+    {
+        if (Volatile.Read(ref _mountStateVersion) != request.MountStateVersion)
+        {
+            return false;
+        }
+
+        return request.ExpectedMountedState is null ||
+               _mounts.TryGetValue(request.MountPoint, out var current) &&
+               ReferenceEquals(current, request.ExpectedMountedState);
+    }
+
+    private void WriteWriteSessionMarker(WriteSessionMarkerRequest request)
+    {
+        if (_gate.CurrentCount == 0)
+        {
+            Interlocked.Increment(ref _writeSessionMarkerIoWhileGateHeldCount);
+        }
+
         try
         {
             Directory.CreateDirectory(_writeDiagnosticsRoot);
             var marker = new WriteSessionMarker(
                 TimestampUtc: DateTime.UtcNow,
-                RequestedVolumeId: requestedVolumeId,
-                RequestedAccessMode: requestedAccessMode.ToString(),
-                MountPoint: mountPoint,
-                GateState: gateState,
-                DiagnosticCode: diagnosticCode,
-                Error: error,
+                RequestedVolumeId: request.RequestedVolumeId,
+                RequestedAccessMode: request.RequestedAccessMode.ToString(),
+                MountPoint: request.MountPoint,
+                GateState: request.GateState,
+                DiagnosticCode: request.DiagnosticCode,
+                Error: request.Error,
                 RolloutChannel: _options.WriteRolloutChannel,
                 SafetyLevel: _options.WriteSafetyLevel
             );
@@ -6234,17 +8684,25 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         uint BlockSize,
         ulong TotalBlocks,
         ulong CheckpointXid,
-        ulong VolumeRootBlock
+        ulong VolumeRootBlock,
+        string? ContainerUuid,
+        ulong? FirstVolumeObjectId,
+        bool IdentityMetadataTrusted
     );
 
     private sealed record GptPartitionInfo(
         int PartitionNumber,
         Guid PartitionTypeGuid,
+        Guid PartitionUniqueGuid,
+        bool IdentityMetadataTrusted,
         ulong StartOffsetBytes,
         string PartitionName
     );
 
-    private sealed record VolumeMountTarget(string DevicePath, ulong DeviceOffsetBytes);
+    private sealed record VolumeMountTarget(
+        string DevicePath,
+        ulong DeviceOffsetBytes,
+        string? RecoveryIdentity);
 
     private sealed record DiscoveredVolume(
         string VolumeName,
@@ -6261,21 +8719,129 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         IReadOnlyList<DiscoveredVolume> Volumes
     );
 
+    private sealed record DiscoveryCacheEntry(
+        DiscoveryFingerprint Fingerprint,
+        DiscoveredDevice Device
+    );
+
+    private readonly record struct DiscoveryFingerprint(
+        string Kind,
+        string Value
+    );
+
+    private sealed record RuntimeStatusRefreshSnapshot(
+        long Version,
+        IReadOnlyList<RuntimeStatusRefreshEntry> Entries
+    );
+
+    private sealed record RuntimeStatusRefreshEntry(
+        string MountPoint,
+        HostProcessState HostState,
+        MountedVolumeState MountedState
+    );
+
     private sealed record HostProcessState(
         Process Process,
+        HostProcessGuardian? Guardian,
+        HostLifetimeSentinel? LifetimeSentinel,
         string LifetimeFilePath,
+        string StartupGateFilePath,
         string StatusFilePath,
         MountAccessMode RequestedAccessMode,
         string? ConfiguredWriteBackend
-    );
+    )
+    {
+        public string TrackingKey { get; } = Guid.NewGuid().ToString("N");
 
-    private sealed record HostStopResult(bool ProcessExited, bool ForcedKill);
+        public string? TrackedMountPoint { get; init; }
+
+        // These values belong to the exact Process.Start handle and are never
+        // refreshed from a PID lookup. They let cleanup distinguish a reused
+        // PID from the original FsHost instance.
+        public int ProcessId { get; } = TryGetProcessId(Process) ?? 0;
+
+        public long? ProcessCreationTimeFileTimeUtc { get; } = CaptureProcessCreationTime(Process);
+
+        private int _resourceCleanupClaimed;
+
+        public bool TryClaimResourceCleanup()
+            => Interlocked.Exchange(ref _resourceCleanupClaimed, 1) == 0;
+
+        // Retain the legacy synthetic-fixture constructor used by the
+        // reflection-based runtime-status tests. Real hosts always use the
+        // guardian-bearing constructor from StartHostProcess.
+        private HostProcessState(
+            Process process,
+            string lifetimeFilePath,
+            string statusFilePath,
+            MountAccessMode requestedAccessMode,
+            string? configuredWriteBackend)
+            : this(
+                process,
+                null,
+                null,
+                lifetimeFilePath,
+                string.Empty,
+                statusFilePath,
+                requestedAccessMode,
+                configuredWriteBackend)
+        {
+        }
+    }
+
+    private sealed record HostStopResult(bool ProcessExited, bool ForcedKill, int? ExitCode);
 
     private sealed record RuntimeStatusCacheEntry(
-        DateTime? LastWriteUtc,
+        RuntimeStatusFileIdentity Identity,
         DateTime ReadAtUtc,
         HostRuntimeStatus Status
     );
+
+    private sealed record RuntimeStatusReadResult(
+        HostRuntimeStatus Status,
+        RuntimeStatusFileIdentity? Identity,
+        bool IsTrusted,
+        string? FailureDetail
+    );
+
+    private sealed record RuntimeStatusFileSnapshot(
+        RuntimeStatusFileIdentity? Identity,
+        string? Content,
+        bool IsStable,
+        string? FailureDetail
+    );
+
+    private sealed record RuntimeStatusFileIdentity(
+        string NormalizedPath,
+        RuntimeStatusFileMetadata Metadata,
+        string ContentToken
+    );
+
+    private readonly record struct RuntimeStatusFileMetadata(
+        bool IsReadable,
+        bool Exists,
+        long Length,
+        DateTime CreationTimeUtc,
+        DateTime LastWriteTimeUtc,
+        RuntimeStatusFileGeneration? Generation
+    );
+
+    private readonly record struct RuntimeStatusFileGeneration(
+        long ChangeTime,
+        ulong VolumeSerialNumber,
+        ulong FileIdLow,
+        ulong FileIdHigh
+    );
+
+    private sealed class LifecycleOperationLease(NativeApfsBackend owner) : IDisposable
+    {
+        private NativeApfsBackend? _owner = owner;
+
+        public void Dispose()
+        {
+            Interlocked.Exchange(ref _owner, null)?.ReleaseLifecycleOperationLease();
+        }
+    }
 
     private sealed record HostRuntimeStatus(
         string WriteBackend,
@@ -6307,6 +8873,12 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         public bool? ReplayCheckpointPendingWindow { get; init; }
 
         public bool MountReady { get; init; }
+
+        public ulong WalAcceptedSequence { get; init; }
+
+        public ulong WalApfsDurableSequence { get; init; }
+
+        public ulong WalCleanupSequence { get; init; }
     }
 
     private sealed record HostRuntimeStatusPayload(
@@ -6345,6 +8917,12 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     {
         public bool? MountReady { get; init; }
 
+        public ulong? WalAcceptedSequence { get; init; }
+
+        public ulong? WalApfsDurableSequence { get; init; }
+
+        public ulong? WalCleanupSequence { get; init; }
+
         public bool? ReplayCheckpointCandidatePresent { get; init; }
 
         public bool? ReplayCheckpointPendingWindow { get; init; }
@@ -6367,6 +8945,17 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         string Error,
         string RolloutChannel,
         string SafetyLevel
+    );
+
+    private sealed record WriteSessionMarkerRequest(
+        string RequestedVolumeId,
+        MountAccessMode RequestedAccessMode,
+        string MountPoint,
+        string GateState,
+        string DiagnosticCode,
+        string Error,
+        long MountStateVersion,
+        MountedVolumeState? ExpectedMountedState
     );
 }
 

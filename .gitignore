@@ -8,6 +8,7 @@ coverage/
 coverage.*
 
 # Published/release binaries belong in GitHub Releases, not source git
+APFS Access.exe
 APFSAccess_Portable.exe
 Run_APFS_Access_Silent.vbs
 .apfsaccess-portable/
@@ -47,3 +48,11 @@ physical-usb-tests/
 # Local/private app overrides
 appsettings.Local.json
 *.local.json
+
+# Private development plans, evidence, and one-off harnesses
+docs/superpowers/
+docs/native-write-pilot.md
+docs/native-write-roadmap.md
+docs/performance-baselines.md
+docs/read-write-optimization-plan.md
+scripts/.scratch-*

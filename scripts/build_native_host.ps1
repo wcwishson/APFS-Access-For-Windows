@@ -10,7 +10,14 @@ param(
 
     [switch]$SkipIfUnavailable,
 
-    [string]$Generator = "NMake Makefiles"
+    [string]$Generator = "NMake Makefiles",
+
+    [ValidateSet("", "Instrument", "Optimize")]
+    [string]$PgoMode = "",
+
+    [string]$PgoDatabasePath = "",
+
+    [switch]$Clean
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,7 +29,12 @@ if ([string]::IsNullOrWhiteSpace($SourceDir)) {
 
 if ([string]::IsNullOrWhiteSpace($BuildDir)) {
     # Use an ASCII-only build path to avoid MSVC/PDB Unicode path issues.
-    $BuildDir = "D:\apfsaccess_native\build\$Configuration"
+    $nativeBuildRoot = if ([string]::IsNullOrWhiteSpace($env:APFSACCESS_NATIVE_BUILD_ROOT)) {
+        Join-Path ([System.IO.Path]::GetTempPath()) "apfsaccess_native"
+    } else {
+        [System.IO.Path]::GetFullPath($env:APFSACCESS_NATIVE_BUILD_ROOT)
+    }
+    $BuildDir = Join-Path $nativeBuildRoot "build/$Configuration"
 }
 
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
@@ -65,7 +77,9 @@ if ($Generator -eq "NMake Makefiles" -and -not (Get-Command nmake -ErrorAction S
 
 New-Item -ItemType Directory -Force -Path $BuildDir, $OutputDir | Out-Null
 
-if (Test-Path -LiteralPath (Join-Path $BuildDir "CMakeCache.txt")) {
+# Keep normal builds incremental. Reconfiguring from a wiped build tree makes
+# CMake regenerate CompilerId probe executables, which can trigger AV alerts.
+if ($Clean -and (Test-Path -LiteralPath $BuildDir)) {
     Remove-Item -LiteralPath $BuildDir -Recurse -Force
     New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 }
@@ -81,6 +95,16 @@ if ($Generator -match "NMake|Ninja|Unix Makefiles|MinGW Makefiles") {
     $configureArgs += "-DCMAKE_BUILD_TYPE=$Configuration"
 } else {
     $configureArgs += @("-A", "x64")
+}
+
+if (-not [string]::IsNullOrWhiteSpace($PgoMode)) {
+    if ($Configuration -ne "Release") {
+        throw "PGO mode is only supported for Release builds."
+    }
+    $configureArgs += "-DAPFSACCESS_MSVC_PGO_MODE=$PgoMode"
+    if (-not [string]::IsNullOrWhiteSpace($PgoDatabasePath)) {
+        $configureArgs += "-DAPFSACCESS_MSVC_PGO_PGD=$PgoDatabasePath"
+    }
 }
 
 & $cmakeExe @configureArgs
@@ -114,7 +138,11 @@ try {
     Copy-Item -LiteralPath $hostExe -Destination (Join-Path $OutputDir "ApfsAccess.FsHost.exe") -Force
 }
 catch {
-    Write-Warning "ApfsAccess.FsHost.exe could not be copied into the artifacts output directory because the file is locked. The build output is still available at $hostExe."
+    if ($SkipIfUnavailable) {
+        Write-Warning "ApfsAccess.FsHost.exe could not be copied into the artifacts output directory because the file is locked. The build output is still available at $hostExe."
+    } else {
+        throw
+    }
 }
 
 $candidatePdb = [System.IO.Path]::ChangeExtension($hostExe, ".pdb")

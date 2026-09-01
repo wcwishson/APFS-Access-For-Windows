@@ -57,15 +57,12 @@ public sealed class DriveDashboardPresenterTests
     }
 
     [Fact]
-    public void BuildRows_ClassifiesRecoveryBlockedAsProblemEvenIfMounted()
+    public void BuildRows_ClassifiesRecoveryBlockedAsProblemWhenMountStateHasNoVolumeRows()
     {
         var payload = NewPayload(
             RuntimeState.MountedRw,
             writeEnabled: false,
-            mountedVolumes:
-            [
-                NewMountedVolume(MountAccessMode.ReadWrite)
-            ],
+            mountedVolumes: [],
             nativeWriteSafetyState: NativeWriteSafetyState.RecoveryBlocked,
             recoveryActive: true,
             recoveryReason: "ReplayCanonicalCandidateMissing");
@@ -75,11 +72,101 @@ public sealed class DriveDashboardPresenterTests
         Assert.Equal(DriveDashboardState.Problem, row.State);
         Assert.Equal(DashboardPalette.Red, row.Palette);
         Assert.True(row.CanFix);
-        Assert.Contains(row.Details, detail => detail.Contains("ReplayCanonicalCandidateMissing", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains("Current recovery reason: ReplayCanonicalCandidateMissing", row.FixGuidance);
     }
 
     [Fact]
-    public void BuildRows_ClassifiesDirtyTransactionsAsAttention()
+    public void BuildRows_IgnoresStaleWarningsWhenMountedVolumeIsHealthyReadWrite()
+    {
+        var payload = NewPayload(
+            RuntimeState.MountedRw,
+            writeEnabled: true,
+            mountedVolumes:
+            [
+                NewMountedVolume(MountAccessMode.ReadWrite)
+            ],
+            nativeWriteSafetyState: NativeWriteSafetyState.PilotReadWrite,
+            warnings: ["Drive status refresh is delayed."]);
+
+        var row = Assert.Single(DriveDashboardPresenter.BuildRows(payload));
+
+        Assert.Equal(DriveDashboardState.HealthyReadWrite, row.State);
+        Assert.Equal(DashboardPalette.Green, row.Palette);
+        Assert.False(row.CanFix);
+        Assert.Contains(row.Details, detail => detail.Contains("Drive status refresh is delayed.", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void BuildRows_UsesMountedReadWriteVolumeWhenTopLevelFlagsLag()
+    {
+        var payload = NewPayload(
+            RuntimeState.MountedRw,
+            writeEnabled: false,
+            mountedVolumes:
+            [
+                NewMountedVolume(MountAccessMode.ReadWrite)
+            ],
+            nativeWriteSafetyState: NativeWriteSafetyState.ReadOnlyFallback,
+            warnings: ["Native write was temporarily unavailable during startup."],
+            compatibilityWarnings: ["Stale startup diagnostic"]);
+
+        var row = Assert.Single(DriveDashboardPresenter.BuildRows(payload));
+
+        Assert.Equal(DriveDashboardState.HealthyReadWrite, row.State);
+        Assert.Equal("Healthy read/write", row.StateText);
+        Assert.Equal(DashboardPalette.Green, row.Palette);
+        Assert.False(row.CanFix);
+        Assert.Contains(row.Details, detail => detail.Contains("Native write was temporarily unavailable", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void BuildRows_UsesMountedReadWriteVolumeWhenRecoveryFlagsLag()
+    {
+        var payload = NewPayload(
+            RuntimeState.MountedRw,
+            writeEnabled: true,
+            mountedVolumes:
+            [
+                NewMountedVolume(MountAccessMode.ReadWrite)
+            ],
+            nativeWriteSafetyState: NativeWriteSafetyState.RecoveryBlocked,
+            recoveryActive: true,
+            recoveryReason: "stale startup probe",
+            warnings: ["Native write was temporarily unavailable during startup."]);
+
+        var row = Assert.Single(DriveDashboardPresenter.BuildRows(payload));
+
+        Assert.Equal(DriveDashboardState.HealthyReadWrite, row.State);
+        Assert.Equal(DashboardPalette.Green, row.Palette);
+        Assert.False(row.CanFix);
+        Assert.Contains(row.Details, detail => detail == "Recovery: active");
+        Assert.Contains(row.Details, detail => detail == "Recovery reason: stale startup probe");
+    }
+
+    [Fact]
+    public void BuildRows_ClassifiesMountedRecoveryBlockedReadOnlyVolumeAsProblem()
+    {
+        var payload = NewPayload(
+            RuntimeState.MountedRo,
+            writeEnabled: false,
+            mountedVolumes:
+            [
+                NewMountedVolume(MountAccessMode.ReadOnly)
+            ],
+            nativeWriteSafetyState: NativeWriteSafetyState.RecoveryBlocked,
+            recoveryActive: true,
+            recoveryReason: "checkpoint replay blocked");
+
+        var row = Assert.Single(DriveDashboardPresenter.BuildRows(payload));
+
+        Assert.Equal(DriveDashboardState.Problem, row.State);
+        Assert.Equal(DashboardPalette.Red, row.Palette);
+        Assert.True(row.CanFix);
+        Assert.Contains("Current recovery reason: checkpoint replay blocked", row.FixGuidance);
+    }
+
+    [Fact]
+    public void BuildRows_ClassifiesPendingWriteBackAsFinishingWrites()
     {
         var payload = NewPayload(
             RuntimeState.MountedRw,
@@ -93,9 +180,32 @@ public sealed class DriveDashboardPresenterTests
 
         var row = Assert.Single(DriveDashboardPresenter.BuildRows(payload));
 
-        Assert.Equal(DriveDashboardState.Attention, row.State);
-        Assert.Equal(DashboardPalette.Orange, row.Palette);
-        Assert.True(row.CanFix);
+        Assert.Equal(DriveDashboardState.FinishingWrites, row.State);
+        Assert.Equal("Finishing writes", row.StateText);
+        Assert.Equal(DashboardPalette.Blue, row.Palette);
+        Assert.False(row.CanFix);
+        Assert.Contains("Wait a moment before unplugging", row.Summary);
+    }
+
+    [Fact]
+    public void BuildRows_DoesNotClassifyTransientCallbacksAsFinishingWrites()
+    {
+        var payload = NewPayload(
+            RuntimeState.MountedRw,
+            writeEnabled: true,
+            mountedVolumes:
+            [
+                NewMountedVolume(MountAccessMode.ReadWrite)
+            ],
+            nativeWriteSafetyState: NativeWriteSafetyState.PilotReadWrite,
+            dirtyTransactionCount: 0,
+            inFlightMutationCallbacks: 2);
+
+        var row = Assert.Single(DriveDashboardPresenter.BuildRows(payload));
+
+        Assert.Equal(DriveDashboardState.HealthyReadWrite, row.State);
+        Assert.Equal("Healthy read/write", row.StateText);
+        Assert.Contains(row.Details, detail => detail == "Active file operations: 2");
     }
 
     [Fact]
@@ -190,6 +300,24 @@ public sealed class DriveDashboardPresenterTests
         var summary = DriveDashboardPresenter.BuildSummary(payload);
 
         Assert.Equal("1 APFS drive mounted. Attention may be needed.", summary);
+    }
+
+    [Fact]
+    public void BuildSummary_StillReportsWorstMountedStateForMixedVolumes()
+    {
+        var payload = NewPayload(
+            RuntimeState.MountedRw,
+            writeEnabled: true,
+            mountedVolumes:
+            [
+                NewMountedVolume(MountAccessMode.ReadWrite, mountPoint: "P:\\"),
+                NewMountedVolume(MountAccessMode.ReadOnly, mountPoint: "Q:\\")
+            ],
+            nativeWriteSafetyState: NativeWriteSafetyState.PilotReadWrite);
+
+        var summary = DriveDashboardPresenter.BuildSummary(payload);
+
+        Assert.Equal("2 APFS drives mounted. Attention may be needed.", summary);
     }
 
     private static StatusChangedPayload NewPayload(

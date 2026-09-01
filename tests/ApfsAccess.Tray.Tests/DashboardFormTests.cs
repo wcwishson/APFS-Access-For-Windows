@@ -245,7 +245,7 @@ public sealed class DashboardFormTests
     }
 
     [Fact]
-    public void ApplyStatus_RebuildsOnlyRowsWhoseVisibleStateChanged()
+    public void ApplyStatus_UpdatesRowsInPlaceWhenVisibleStateChanges()
     {
         Exception? exception = null;
         var thread = new Thread(() =>
@@ -279,7 +279,10 @@ public sealed class DashboardFormTests
 
                 Assert.Equal(2, secondRows.Length);
                 Assert.Same(firstRows[0], secondRows[0]);
-                Assert.NotSame(firstRows[1], secondRows[1]);
+                Assert.Same(firstRows[1], secondRows[1]);
+
+                var readOnlyLabels = EnumerateControls(secondRows[1]).OfType<Label>().ToArray();
+                Assert.Contains(readOnlyLabels, label => label.Text == "Read-only");
             }
             catch (Exception ex)
             {
@@ -394,6 +397,150 @@ public sealed class DashboardFormTests
                 Assert.DoesNotContain(labels, static label =>
                     label.Visible &&
                     label.Text.Contains("Close this window", StringComparison.OrdinalIgnoreCase));
+            }
+            catch (Exception ex)
+            {
+                exception = ex;
+            }
+        });
+
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+
+        Assert.Null(exception);
+    }
+
+    [Fact]
+    public void ApplyStatus_DoesNotRebuildRowsWhenOnlySummaryChanges()
+    {
+        Exception? exception = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                using var form = new DashboardForm(
+                    _ => Task.CompletedTask,
+                    _ => Task.CompletedTask,
+                    _ => Task.CompletedTask);
+
+                var initialPayload = new StatusChangedPayload(
+                    State: RuntimeState.Error,
+                    MountPoints: Array.Empty<string>(),
+                    LastError: "First status message.",
+                    TimestampUtc: DateTime.UtcNow,
+                    Warnings: ["First status message."],
+                    WriteEnabled: false,
+                    CompatibilityWarnings: Array.Empty<string>());
+                var initialSummary = DriveDashboardPresenter.BuildSummary(initialPayload);
+                form.ApplyStatus(initialPayload);
+                var firstRow = Assert.Single(
+                    EnumerateControls(form).OfType<Panel>(),
+                    static panel => panel.BorderStyle == BorderStyle.FixedSingle);
+                var summaryLabel = GetSummaryLabel(form);
+                Assert.Equal(initialSummary, summaryLabel.Text);
+
+                var changedPayload = initialPayload with
+                {
+                    LastError = "Second status message.",
+                    Warnings = ["Second status message."],
+                };
+                var changedSummary = DriveDashboardPresenter.BuildSummary(changedPayload);
+                form.ApplyStatus(changedPayload);
+                var secondRow = Assert.Single(
+                    EnumerateControls(form).OfType<Panel>(),
+                    static panel => panel.BorderStyle == BorderStyle.FixedSingle);
+
+                Assert.Same(firstRow, secondRow);
+                Assert.Equal(changedSummary, summaryLabel.Text);
+            }
+            catch (Exception ex)
+            {
+                exception = ex;
+            }
+        });
+
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+
+        Assert.Null(exception);
+    }
+
+    [Fact]
+    public void Constructor_RendersStartupPreferenceCheckboxesFromInitialState()
+    {
+        Exception? exception = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                using var form = new DashboardForm(
+                    _ => Task.CompletedTask,
+                    _ => Task.CompletedTask,
+                    _ => Task.CompletedTask,
+                    new StartupPreferences(StartWithWindows: true, StartMinimized: true));
+
+                var checkBoxes = EnumerateControls(form).OfType<CheckBox>().ToArray();
+                var startWithWindows = Assert.Single(checkBoxes, static checkBox => checkBox.Text == "Start the program with Windows");
+                var startMinimized = Assert.Single(checkBoxes, static checkBox => checkBox.Text == "Start minimized");
+
+                Assert.True(startWithWindows.Checked);
+                Assert.True(startMinimized.Checked);
+                Assert.True(startWithWindows.AutoSize);
+                Assert.True(startMinimized.AutoSize);
+                Assert.True(startWithWindows.Width >= startWithWindows.GetPreferredSize(Size.Empty).Width);
+                Assert.True(startMinimized.Width >= startMinimized.GetPreferredSize(Size.Empty).Width);
+            }
+            catch (Exception ex)
+            {
+                exception = ex;
+            }
+        });
+
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+
+        Assert.Null(exception);
+    }
+
+    [Fact]
+    public void StartupPreferenceCheckboxesInvokeCallbacksWhenClicked()
+    {
+        Exception? exception = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var startWithWindowsValues = new List<bool>();
+                var startMinimizedValues = new List<bool>();
+                using var form = new DashboardForm(
+                    _ => Task.CompletedTask,
+                    _ => Task.CompletedTask,
+                    _ => Task.CompletedTask,
+                    new StartupPreferences(StartWithWindows: false, StartMinimized: false),
+                    value =>
+                    {
+                        startWithWindowsValues.Add(value);
+                        return Task.CompletedTask;
+                    },
+                    value =>
+                    {
+                        startMinimizedValues.Add(value);
+                        return Task.CompletedTask;
+                    });
+
+                form.Show();
+                Application.DoEvents();
+
+                var checkBoxes = EnumerateControls(form).OfType<CheckBox>().ToArray();
+                Assert.Single(checkBoxes, static checkBox => checkBox.Text == "Start the program with Windows").Checked = true;
+                Assert.Single(checkBoxes, static checkBox => checkBox.Text == "Start minimized").Checked = true;
+                Application.DoEvents();
+
+                Assert.Equal([true], startWithWindowsValues);
+                Assert.Equal([true], startMinimizedValues);
             }
             catch (Exception ex)
             {
@@ -566,6 +713,13 @@ public sealed class DashboardFormTests
         => EnumerateControls(root)
             .OfType<Panel>()
             .Where(static panel => panel.BorderStyle == BorderStyle.FixedSingle);
+
+    private static Label GetSummaryLabel(DashboardForm form)
+    {
+        var field = typeof(DashboardForm).GetField("_summaryLabel", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        return Assert.IsType<Label>(field!.GetValue(form));
+    }
 
     private static IEnumerable<Control> EnumerateControls(Control root)
     {

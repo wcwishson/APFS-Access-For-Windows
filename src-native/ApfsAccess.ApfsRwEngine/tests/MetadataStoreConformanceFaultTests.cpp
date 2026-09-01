@@ -984,11 +984,30 @@ bool TestOversizedWriteMutationIsAtomic(const std::filesystem::path& run_root)
         apfsaccess::rw::MetadataStore::MutationStatus::Applied,
         "OversizedWriteAtomic: create pending file should apply");
 
+    apfsaccess::rw::MetadataStore::MutationRequest write_pending{};
+    write_pending.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
+    write_pending.path = L"\\pending.bin";
+    write_pending.length = 2048;
+    ok &= ExpectMutationStatus(
+        store,
+        write_pending,
+        apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+        "OversizedWriteAtomic: write pending file should apply");
+    staged_payloads[L"\\pending.bin"] = BuildPatternPayload(2048, 0x6B);
+    ok &= Require(
+        store.PendingPayloadObjectSummaryCount() == 1,
+        "OversizedWriteAtomic: pending write should add one payload object before failed mutation");
+    ok &= Require(
+        store.PendingPayloadByteEstimate() == 2048,
+        "OversizedWriteAtomic: pending write should add payload bytes before failed mutation");
+
     const auto pending_mutations_before = store.PendingMutationCount();
     const auto pending_omap_before = store.PendingObjectMapUpdateCount();
     const auto pending_alloc_before = store.PendingAllocationCount();
     const auto pending_dealloc_before = store.PendingDeallocationCount();
     const auto pending_btree_before = store.PendingBtreeRecordCount();
+    const auto pending_payload_objects_before = store.PendingPayloadObjectSummaryCount();
+    const auto pending_payload_bytes_before = store.PendingPayloadByteEstimate();
 
     apfsaccess::rw::MetadataStore::MutationRequest oversized_write{};
     oversized_write.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
@@ -1007,12 +1026,18 @@ bool TestOversizedWriteMutationIsAtomic(const std::filesystem::path& run_root)
             store.PendingDeallocationCount() == pending_dealloc_before &&
             store.PendingBtreeRecordCount() == pending_btree_before,
         "OversizedWriteAtomic: failed oversized write should not mutate pending state");
+    ok &= Require(
+        store.PendingPayloadObjectSummaryCount() == pending_payload_objects_before &&
+            store.PendingPayloadByteEstimate() == pending_payload_bytes_before,
+        "OversizedWriteAtomic: failed oversized write should preserve pending payload summary");
 
     const auto pending_mutations_before_overflow = store.PendingMutationCount();
     const auto pending_omap_before_overflow = store.PendingObjectMapUpdateCount();
     const auto pending_alloc_before_overflow = store.PendingAllocationCount();
     const auto pending_dealloc_before_overflow = store.PendingDeallocationCount();
     const auto pending_btree_before_overflow = store.PendingBtreeRecordCount();
+    const auto pending_payload_objects_before_overflow = store.PendingPayloadObjectSummaryCount();
+    const auto pending_payload_bytes_before_overflow = store.PendingPayloadByteEstimate();
 
     apfsaccess::rw::MetadataStore::MutationRequest overflow_write{};
     overflow_write.operation = apfsaccess::rw::MetadataStore::MutationOperation::Write;
@@ -1032,6 +1057,10 @@ bool TestOversizedWriteMutationIsAtomic(const std::filesystem::path& run_root)
             store.PendingDeallocationCount() == pending_dealloc_before_overflow &&
             store.PendingBtreeRecordCount() == pending_btree_before_overflow,
         "OversizedWriteAtomic: failed overflowed write should not mutate pending state");
+    ok &= Require(
+        store.PendingPayloadObjectSummaryCount() == pending_payload_objects_before_overflow &&
+            store.PendingPayloadByteEstimate() == pending_payload_bytes_before_overflow,
+        "OversizedWriteAtomic: failed overflowed write should preserve pending payload summary");
 
     ok &= ExpectCommitStatus(
         store,
@@ -1051,9 +1080,17 @@ bool TestOversizedWriteMutationIsAtomic(const std::filesystem::path& run_root)
             !pending_inode->is_directory,
             "OversizedWriteAtomic: pending inode should be a file");
         ok &= Require(
-            pending_inode->logical_size == 0 && pending_inode->data_physical_address == 0,
-            "OversizedWriteAtomic: failed oversized write should not persist file extent payload");
+            pending_inode->logical_size == 2048 && pending_inode->data_physical_address != 0,
+            "OversizedWriteAtomic: failed oversized write should preserve earlier valid payload extent");
     }
+
+    std::vector<std::byte> pending_payload;
+    ok &= Require(
+        store.ReadCommittedFileRange(L"\\pending.bin", 0, 2048, pending_payload),
+        "OversizedWriteAtomic: pending payload should be readable after failed oversized writes");
+    ok &= Require(
+        pending_payload == staged_payloads[L"\\pending.bin"],
+        "OversizedWriteAtomic: pending payload should match earlier valid bytes");
 
     return ok;
 }

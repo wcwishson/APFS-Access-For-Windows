@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Diagnostics;
 using ApfsAccess.Backend.Native;
 using ApfsAccess.Core;
 
@@ -6,6 +7,817 @@ namespace ApfsAccess.Backend.Native.Tests;
 
 public sealed class NativeApfsBackendRuntimeStatusTests
 {
+    [Fact]
+    public async Task ApplyMountedRuntimeState_PropagatesHostAndWalFacts()
+    {
+        using var statusFile = new TemporaryStatusFile("""
+            {
+              "writeBackend": "Overlay",
+              "nativeWriteReadiness": "MutationReady",
+              "nativeWriteSafetyState": "PilotReadWrite",
+              "recoveryActive": false,
+              "mountReady": true,
+              "hostPid": 4242,
+              "walAcceptedSequence": 12,
+              "walApfsDurableSequence": 10,
+              "walCleanupSequence": 8
+            }
+            """);
+        var root = Path.Combine(Path.GetTempPath(), "apfsaccess_phase10", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        using var process = StartLongRunningProcess();
+        using var backend = new NativeApfsBackend(CreateOverlayRuntimeOptions());
+        SeedMountedHost(
+            backend,
+            process,
+            Path.Combine(root, "lifetime"),
+            statusFile.Path,
+            configuredWriteBackend: "Overlay",
+            writeBackend: "Overlay",
+            readiness: NativeWriteReadiness.MutationReady);
+
+        var snapshot = InvokeCaptureRuntimeStatusRefreshSnapshot(backend);
+        var statuses = await InvokeReadRuntimeStatusesAsync(backend, snapshot);
+        InvokeApplyMountedRuntimeState(backend, snapshot, statuses);
+
+        var mount = GetSeededMount(backend);
+        Assert.True(mount.MountReady);
+        Assert.Equal(4242, mount.HostProcessId);
+        Assert.Equal(12UL, mount.WalAcceptedSequence);
+        Assert.Equal(10UL, mount.WalApfsDurableSequence);
+        Assert.Equal(8UL, mount.WalCleanupSequence);
+        process.Kill(entireProcessTree: true);
+    }
+
+    [Fact]
+    public async Task ApplyMountedRuntimeState_RejectsSameMetadataStatusChangedAfterUnlockedRead()
+    {
+        var healthyStatus = """
+            {
+              "writeBackend": "Overlay",
+              "nativeWriteReadiness": "MutationReady",
+              "nativeWriteSafetyState": "PilotReadWrite",
+              "recoveryActive": false,
+              "lastCommitXid": 10,
+              "mountReady": true
+            }
+            """ + new string(' ', 256);
+        using var statusFile = new TemporaryStatusFile(healthyStatus);
+        var root = Path.Combine(Path.GetTempPath(), "apfsaccess_phase8", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        using var process = StartLongRunningProcess();
+        using var backend = new NativeApfsBackend(CreateOverlayRuntimeOptions());
+        SeedMountedHost(
+            backend,
+            process,
+            Path.Combine(root, "lifetime"),
+            statusFile.Path,
+            configuredWriteBackend: "Overlay",
+            writeBackend: "Overlay",
+            readiness: NativeWriteReadiness.MutationReady);
+        var snapshot = InvokeCaptureRuntimeStatusRefreshSnapshot(backend);
+        var statuses = await InvokeReadRuntimeStatusesAsync(backend, snapshot);
+        var originalLength = new FileInfo(statusFile.Path).Length;
+        var originalCreationTime = File.GetCreationTimeUtc(statusFile.Path);
+        var originalLastWriteTime = File.GetLastWriteTimeUtc(statusFile.Path);
+
+        var failClosedStatus = """
+            {
+              "writeBackend": "Overlay",
+              "nativeWriteReadiness": "Degraded",
+              "nativeWriteSafetyState": "RecoveryBlocked",
+              "recoveryActive": true,
+              "recoveryReason": "RecoveryMarkerDirty",
+              "lastCommitXid": 11,
+              "mountReady": true
+            }
+            """;
+        Assert.True(failClosedStatus.Length < healthyStatus.Length);
+        await statusFile.WritePreservingIdentityMetadataAsync(
+            failClosedStatus.PadRight(healthyStatus.Length));
+        Assert.Equal(originalLength, new FileInfo(statusFile.Path).Length);
+        Assert.Equal(originalCreationTime, File.GetCreationTimeUtc(statusFile.Path));
+        Assert.Equal(originalLastWriteTime, File.GetLastWriteTimeUtc(statusFile.Path));
+        InvokeApplyMountedRuntimeState(backend, snapshot, statuses);
+
+        var mount = GetSeededMount(backend);
+        Assert.Equal(MountAccessMode.ReadOnly, mount.AccessMode);
+        Assert.True(mount.RecoveryActive);
+        Assert.Equal("RuntimeStatusChangedBeforeApply", mount.RecoveryReason);
+        Assert.Equal(NativeWriteSafetyState.RecoveryBlocked, mount.NativeWriteSafetyState);
+        process.Kill(entireProcessTree: true);
+    }
+
+    [Fact]
+    public async Task ApplyMountedRuntimeState_FailsClosedWhenStatusResultIsMissing()
+    {
+        using var statusFile = new TemporaryStatusFile("""
+            {
+              "writeBackend": "Overlay",
+              "nativeWriteReadiness": "MutationReady",
+              "recoveryActive": false,
+              "mountReady": true
+            }
+            """);
+        var root = Path.Combine(Path.GetTempPath(), "apfsaccess_phase8", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        using var process = StartLongRunningProcess();
+        using var backend = new NativeApfsBackend(CreateOverlayRuntimeOptions());
+        SeedMountedHost(
+            backend,
+            process,
+            Path.Combine(root, "lifetime"),
+            statusFile.Path,
+            configuredWriteBackend: "Overlay",
+            writeBackend: "Overlay",
+            readiness: NativeWriteReadiness.MutationReady);
+        var snapshot = InvokeCaptureRuntimeStatusRefreshSnapshot(backend);
+        var statuses = await InvokeReadRuntimeStatusesAsync(backend, snapshot);
+        statuses.GetType().GetMethod("Clear")!.Invoke(statuses, null);
+
+        InvokeApplyMountedRuntimeState(backend, snapshot, statuses);
+
+        var mount = GetSeededMount(backend);
+        Assert.Equal(MountAccessMode.ReadOnly, mount.AccessMode);
+        Assert.True(mount.RecoveryActive);
+        Assert.Equal("RuntimeStatusUntrusted", mount.RecoveryReason);
+        Assert.Equal(NativeWriteSafetyState.RecoveryBlocked, mount.NativeWriteSafetyState);
+        process.Kill(entireProcessTree: true);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task GetMountStateAsync_FailsClosedWhenRwRuntimeStatusIsUntrusted(bool malformed)
+    {
+        using var statusFile = new TemporaryStatusFile(malformed ? "{ not-json" : "placeholder");
+        if (!malformed)
+        {
+            File.Delete(statusFile.Path);
+        }
+
+        var root = Path.Combine(Path.GetTempPath(), "apfsaccess_phase8", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        using var process = StartLongRunningProcess();
+        using var backend = new NativeApfsBackend(CreateOverlayRuntimeOptions());
+        SeedMountedHost(
+            backend,
+            process,
+            Path.Combine(root, "lifetime"),
+            statusFile.Path,
+            configuredWriteBackend: "Overlay",
+            writeBackend: "Overlay",
+            readiness: NativeWriteReadiness.MutationReady);
+
+        var mounts = await backend.GetMountStateAsync(CancellationToken.None);
+
+        var mount = Assert.Single(mounts);
+        Assert.Equal(MountAccessMode.ReadOnly, mount.AccessMode);
+        Assert.True(mount.RecoveryActive);
+        Assert.Equal("RuntimeStatusUntrusted", mount.RecoveryReason);
+        Assert.Equal(NativeWriteSafetyState.RecoveryBlocked, mount.NativeWriteSafetyState);
+        process.Kill(entireProcessTree: true);
+    }
+
+    [Fact]
+    public async Task ReadHostRuntimeStatusCachedAsync_CoalescesConcurrentCacheMisses()
+    {
+        using var statusFile = new TemporaryStatusFile("""
+            {
+              "writeBackend": "Native",
+              "nativeWriteReadiness": "CommitReady",
+              "recoveryActive": false,
+              "lastCommitXid": 10
+            }
+            """);
+        using var statusLock = new FileStream(
+            statusFile.Path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.None);
+        using var backend = new NativeApfsBackend(new ServiceHostOptions());
+
+        var first = InvokeReadHostRuntimeStatusCachedAsync(
+            backend,
+            statusFile.Path,
+            MountAccessMode.ReadWrite,
+            configuredWriteBackend: "Native",
+            timeout: TimeSpan.FromMilliseconds(600));
+        var second = InvokeReadHostRuntimeStatusCachedAsync(
+            backend,
+            statusFile.Path,
+            MountAccessMode.ReadWrite,
+            configuredWriteBackend: "Native",
+            timeout: TimeSpan.FromMilliseconds(600));
+        await Task.Delay(60);
+        statusLock.Dispose();
+
+        await Task.WhenAll(first, second);
+
+        Assert.Equal(1, GetPrivateLong(backend, "_runtimeStatusReadOperationCount"));
+    }
+
+    [Fact]
+    public async Task Dispose_CancelsAndDrainsUnlockedRuntimeStatusRefresh()
+    {
+        using var statusFile = new TemporaryStatusFile("""
+            {
+              "writeBackend": "Overlay",
+              "nativeWriteReadiness": "MutationReady",
+              "recoveryActive": false
+            }
+            """);
+        using var statusLock = new FileStream(
+            statusFile.Path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.None);
+        var root = Path.Combine(Path.GetTempPath(), "apfsaccess_phase8", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        using var process = StartLongRunningProcess();
+        var backend = new NativeApfsBackend(CreateOverlayRuntimeOptions());
+        SeedMountedHost(
+            backend,
+            process,
+            Path.Combine(root, "lifetime"),
+            statusFile.Path,
+            configuredWriteBackend: "Overlay",
+            writeBackend: "Overlay",
+            readiness: NativeWriteReadiness.MutationReady);
+        var refresh = backend.GetMountStateAsync(CancellationToken.None);
+        await Task.Delay(60);
+
+        var dispose = Task.Run(backend.Dispose);
+
+        await dispose.WaitAsync(TimeSpan.FromSeconds(5));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            async () =>
+            {
+                await refresh.WaitAsync(TimeSpan.FromSeconds(2));
+            });
+    }
+
+    [Fact]
+    public async Task Dispose_WaitsForMountQueuedOnLifecycleGate_AndRejectsLaterMounts()
+    {
+        var backend = new NativeApfsBackend(new ServiceHostOptions
+        {
+            NativeFsHostPath = Environment.ProcessPath,
+        });
+        SeedVolume(backend);
+        var gate = GetPrivateGate(backend);
+        await gate.WaitAsync();
+        using var mountCancellation = new CancellationTokenSource();
+        var mount = backend.MountAsync(
+            new MountRequest(@"\\.\PhysicalDrive9|Main", 'S', MountAccessMode.ReadOnly),
+            mountCancellation.Token);
+        var dispose = Task.Run(backend.Dispose);
+        Task? concurrentDispose = null;
+
+        try
+        {
+            await Assert.ThrowsAsync<TimeoutException>(
+                async () => await dispose.WaitAsync(TimeSpan.FromMilliseconds(200)));
+            concurrentDispose = Task.Run(backend.Dispose);
+            await Assert.ThrowsAsync<TimeoutException>(
+                async () => await concurrentDispose.WaitAsync(TimeSpan.FromMilliseconds(200)));
+        }
+        finally
+        {
+            mountCancellation.Cancel();
+            try
+            {
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await mount);
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }
+
+        await dispose.WaitAsync(TimeSpan.FromSeconds(5));
+        await Assert.IsAssignableFrom<Task>(concurrentDispose).WaitAsync(TimeSpan.FromSeconds(5));
+        await Assert.ThrowsAsync<ObjectDisposedException>(
+            async () => await backend.MountAsync(
+                new MountRequest(@"\\.\PhysicalDrive9|Main", 'S', MountAccessMode.ReadOnly),
+                CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Dispose_WaitsForUnmountQueuedOnLifecycleGate()
+    {
+        var backend = new NativeApfsBackend(CreateOverlayRuntimeOptions());
+        var gate = GetPrivateGate(backend);
+        await gate.WaitAsync();
+        using var unmountCancellation = new CancellationTokenSource();
+        var unmount = backend.UnmountAsync("R:\\", unmountCancellation.Token);
+        var dispose = Task.Run(backend.Dispose);
+
+        try
+        {
+            await Assert.ThrowsAsync<TimeoutException>(
+                async () => await dispose.WaitAsync(TimeSpan.FromMilliseconds(200)));
+        }
+        finally
+        {
+            unmountCancellation.Cancel();
+            try
+            {
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await unmount);
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }
+
+        await dispose.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task Unmount_CancellationAfterStopSignalDoesNotAbandonHostOwnership()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "apfsaccess_phase8", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var lifetimePath = Path.Combine(root, "lifetime");
+        var statusPath = Path.Combine(root, "status.json");
+        File.WriteAllText(lifetimePath, "alive");
+        File.WriteAllText(statusPath, "{}");
+
+        using var process = StartLongRunningProcess();
+        var processId = process.Id;
+        using var backend = new NativeApfsBackend(CreateOverlayRuntimeOptions());
+        SeedMountedHost(
+            backend,
+            process,
+            lifetimePath,
+            statusPath,
+            configuredWriteBackend: "Overlay",
+            writeBackend: "Overlay",
+            readiness: NativeWriteReadiness.MutationReady);
+        using var cancellation = new CancellationTokenSource();
+
+        try
+        {
+            var unmount = backend.UnmountAsync("R:\\", cancellation.Token);
+            var stopSignalDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+            while (File.Exists(lifetimePath) && DateTime.UtcNow < stopSignalDeadline)
+            {
+                await Task.Delay(10);
+            }
+            Assert.False(File.Exists(lifetimePath));
+            cancellation.Cancel();
+
+            var result = await unmount.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Throws<ArgumentException>(() => Process.GetProcessById(processId));
+            Assert.True(result.MountRemoved);
+        }
+        finally
+        {
+            try
+            {
+                using var remaining = Process.GetProcessById(processId);
+                remaining.Kill(entireProcessTree: true);
+                remaining.WaitForExit(2_000);
+            }
+            catch (ArgumentException)
+            {
+                // The expected path already reaped the process.
+            }
+
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Unmount_CancellationWhileWaitingForDriveRemovalPreservesCompletedStop()
+    {
+        using var backend = new NativeApfsBackend(CreateOverlayRuntimeOptions());
+        SeedCompletedHostStop(backend, "C:\\");
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => backend.UnmountAsync("C:\\", cancellation.Token));
+
+        Assert.True(HasCompletedHostStop(backend, "C:\\"));
+    }
+
+    [Fact]
+    public async Task GetMountStateAsync_WritesFailClosedMarkerOnlyAfterGateIsReleased()
+    {
+        using var statusFile = new TemporaryStatusFile("{ not-json");
+        var root = Path.Combine(Path.GetTempPath(), "apfsaccess_phase8", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        using var process = StartLongRunningProcess();
+        using var backend = new NativeApfsBackend(CreateOverlayRuntimeOptions());
+        SeedMountedHost(
+            backend,
+            process,
+            Path.Combine(root, "lifetime"),
+            statusFile.Path,
+            configuredWriteBackend: "Overlay",
+            writeBackend: "Overlay",
+            readiness: NativeWriteReadiness.MutationReady);
+
+        var mounts = await backend.GetMountStateAsync(CancellationToken.None);
+
+        Assert.Equal(MountAccessMode.ReadOnly, Assert.Single(mounts).AccessMode);
+        Assert.Equal(0, GetPrivateLong(backend, "_writeSessionMarkerIoWhileGateHeldCount"));
+        process.Kill(entireProcessTree: true);
+    }
+
+    [Fact]
+    public async Task GetMountStateAsync_DoesNotReapplyRwSnapshotAfterHostExitsDuringStatusRead()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "apfsaccess_phase8", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var lifetimePath = Path.Combine(root, "lifetime");
+        var statusPath = Path.Combine(root, "status.json");
+        using var process = StartLongRunningProcess();
+        using var backend = new NativeApfsBackend(new ServiceHostOptions());
+        await File.WriteAllTextAsync(
+            statusPath,
+            "{\"writeBackend\":\"Native\",\"recoveryActive\":true,\"recoveryReason\":\"InjectedStatus\"}");
+        using var statusLock = new FileStream(
+            statusPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.None);
+
+        SeedMountedHost(backend, process, lifetimePath, statusPath);
+        var refreshTask = backend.GetMountStateAsync(CancellationToken.None);
+        await Task.Delay(60);
+        process.Kill(entireProcessTree: true);
+        statusLock.Dispose();
+
+        var mounts = await refreshTask;
+
+        var mount = Assert.Single(mounts);
+        Assert.Equal(MountAccessMode.ReadOnly, mount.AccessMode);
+        Assert.True(mount.RecoveryActive);
+        Assert.Equal("FsHostExitedUnexpectedly", mount.RecoveryReason);
+        Assert.Equal(NativeWriteSafetyState.RecoveryBlocked, mount.NativeWriteSafetyState);
+    }
+
+    [Fact]
+    public async Task GetMountStateAsync_DoesNotApplyOldHostStatusToReplacementHost()
+    {
+        using var oldStatusFile = new TemporaryStatusFile("""
+            {
+              "writeBackend": "Native",
+              "nativeWriteReadiness": "Degraded",
+              "recoveryActive": true,
+              "recoveryReason": "OldHostRecovery"
+            }
+            """);
+        using var oldStatusLock = new FileStream(
+            oldStatusFile.Path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.None);
+        using var replacementStatusFile = new TemporaryStatusFile("""
+            {
+              "writeBackend": "Native",
+              "nativeWriteReadiness": "CommitReady",
+              "recoveryActive": false
+            }
+            """);
+        var root = Path.Combine(Path.GetTempPath(), "apfsaccess_phase8", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        using var oldProcess = StartLongRunningProcess();
+        using var replacementProcess = StartLongRunningProcess();
+        using var backend = new NativeApfsBackend(new ServiceHostOptions());
+        SeedMountedHost(
+            backend,
+            oldProcess,
+            Path.Combine(root, "old-lifetime"),
+            oldStatusFile.Path);
+        var refresh = backend.GetMountStateAsync(CancellationToken.None);
+        var readStartTimeout = Stopwatch.StartNew();
+        while (GetPrivateLong(backend, "_runtimeStatusReadOperationCount") == 0 &&
+               readStartTimeout.Elapsed < TimeSpan.FromSeconds(2))
+        {
+            await Task.Delay(10);
+        }
+        Assert.Equal(1, GetPrivateLong(backend, "_runtimeStatusReadOperationCount"));
+        var replacement = new MountedVolumeState(
+            VolumeId: @"\\.\PhysicalDrive9|Replacement",
+            MountPoint: "R:\\",
+            AccessMode: MountAccessMode.ReadWrite,
+            VolumeName: "Replacement",
+            DeviceId: @"\\.\PhysicalDrive9",
+            WriteBackend: "Native",
+            NativeWriteReadiness: NativeWriteReadiness.CommitReady,
+            NativeWriteSafetyState: NativeWriteSafetyState.PilotReadWrite);
+        ReplaceMountedHost(
+            backend,
+            replacementProcess,
+            Path.Combine(root, "replacement-lifetime"),
+            replacementStatusFile.Path,
+            replacement);
+        oldStatusLock.Dispose();
+
+        var mount = Assert.Single(await refresh);
+
+        Assert.Equal(replacement, mount);
+        Assert.False(mount.RecoveryActive);
+        Assert.Null(mount.RecoveryReason);
+        oldProcess.Kill(entireProcessTree: true);
+        replacementProcess.Kill(entireProcessTree: true);
+    }
+
+    private static Process StartLongRunningProcess()
+    {
+        var process = Process.Start(new ProcessStartInfo
+        {
+            FileName = Path.Combine(Environment.SystemDirectory, "PING.EXE"),
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            ArgumentList =
+            {
+                "-n",
+                "20",
+                "127.0.0.1",
+            },
+        });
+        return process ?? throw new InvalidOperationException("Could not start the test host process.");
+    }
+
+    private static void SeedMountedHost(
+        NativeApfsBackend backend,
+        Process process,
+        string lifetimePath,
+        string statusPath,
+        string configuredWriteBackend = "Native",
+        string writeBackend = "Native",
+        NativeWriteReadiness readiness = NativeWriteReadiness.CommitReady)
+    {
+        const string mountPoint = "R:\\";
+        var hostType = typeof(NativeApfsBackend).GetNestedType(
+            "HostProcessState",
+            BindingFlags.NonPublic);
+        Assert.NotNull(hostType);
+
+        var host = Activator.CreateInstance(
+            hostType!,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            args: [process, lifetimePath, statusPath, MountAccessMode.ReadWrite, configuredWriteBackend],
+            culture: null);
+        Assert.NotNull(host);
+
+        var hostMap = typeof(NativeApfsBackend)
+            .GetField("_hosts", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(backend)!;
+        var mountMap = typeof(NativeApfsBackend)
+            .GetField("_mounts", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(backend)!;
+        var volumeMap = typeof(NativeApfsBackend)
+            .GetField("_volumeCache", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(backend)!;
+        Assert.True((bool)hostMap.GetType().GetMethod("TryAdd")!.Invoke(hostMap, [mountPoint, host])!);
+        Assert.True((bool)mountMap.GetType().GetMethod("TryAdd")!.Invoke(
+            mountMap,
+            [
+                mountPoint,
+                new MountedVolumeState(
+                    VolumeId: @"\\.\PhysicalDrive9|Main",
+                    MountPoint: mountPoint,
+                    AccessMode: MountAccessMode.ReadWrite,
+                    VolumeName: "Main",
+                    DeviceId: @"\\.\PhysicalDrive9",
+                    WriteBackend: writeBackend,
+                    NativeWriteReadiness: readiness,
+                    NativeWriteSafetyState: NativeWriteSafetyState.PilotReadWrite)
+            ])!);
+        Assert.True((bool)volumeMap.GetType().GetMethod("TryAdd")!.Invoke(
+            volumeMap,
+            [
+                @"\\.\PhysicalDrive9|Main",
+                new VolumeInfo(
+                    VolumeId: @"\\.\PhysicalDrive9|Main",
+                    DeviceId: @"\\.\PhysicalDrive9",
+                    VolumeName: "Main",
+                    SupportsReadWrite: true,
+                    SupportsNativeWrite: true)
+            ])!);
+    }
+
+    private static void SeedCompletedHostStop(NativeApfsBackend backend, string mountPoint)
+    {
+        var stopType = typeof(NativeApfsBackend).GetNestedType(
+            "HostStopResult",
+            BindingFlags.NonPublic);
+        Assert.NotNull(stopType);
+        var stop = Activator.CreateInstance(
+            stopType!,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            args: [true, false, 0],
+            culture: null);
+        Assert.NotNull(stop);
+
+        var stopMap = typeof(NativeApfsBackend)
+            .GetField("_completedHostStops", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(backend)!;
+        Assert.True((bool)stopMap.GetType().GetMethod("TryAdd")!.Invoke(
+            stopMap,
+            [mountPoint, stop])!);
+    }
+
+    private static bool HasCompletedHostStop(NativeApfsBackend backend, string mountPoint)
+    {
+        var stopMap = typeof(NativeApfsBackend)
+            .GetField("_completedHostStops", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(backend)!;
+        return (bool)stopMap.GetType().GetMethod("ContainsKey")!.Invoke(
+            stopMap,
+            [mountPoint])!;
+    }
+
+    private static void SeedVolume(NativeApfsBackend backend)
+    {
+        var volumeMap = typeof(NativeApfsBackend)
+            .GetField("_volumeCache", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(backend)!;
+        Assert.True((bool)volumeMap.GetType().GetMethod("TryAdd")!.Invoke(
+            volumeMap,
+            [
+                @"\\.\PhysicalDrive9|Main",
+                new VolumeInfo(
+                    VolumeId: @"\\.\PhysicalDrive9|Main",
+                    DeviceId: @"\\.\PhysicalDrive9",
+                    VolumeName: "Main",
+                    SupportsReadWrite: true,
+                    SupportsNativeWrite: true)
+            ])!);
+    }
+
+    private static SemaphoreSlim GetPrivateGate(NativeApfsBackend backend)
+        => Assert.IsType<SemaphoreSlim>(typeof(NativeApfsBackend)
+            .GetField("_gate", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(backend));
+
+    private static void ReplaceMountedHost(
+        NativeApfsBackend backend,
+        Process process,
+        string lifetimePath,
+        string statusPath,
+        MountedVolumeState mount)
+    {
+        var hostType = typeof(NativeApfsBackend).GetNestedType(
+            "HostProcessState",
+            BindingFlags.NonPublic);
+        Assert.NotNull(hostType);
+        var host = Activator.CreateInstance(
+            hostType!,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            args: [process, lifetimePath, statusPath, MountAccessMode.ReadWrite, "Native"],
+            culture: null);
+        Assert.NotNull(host);
+
+        var hostMap = typeof(NativeApfsBackend)
+            .GetField("_hosts", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(backend)!;
+        var mountMap = typeof(NativeApfsBackend)
+            .GetField("_mounts", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(backend)!;
+        hostMap.GetType().GetProperty("Item")!.SetValue(hostMap, host, ["R:\\"]);
+        mountMap.GetType().GetProperty("Item")!.SetValue(mountMap, mount, ["R:\\"]);
+        var versionField = typeof(NativeApfsBackend).GetField(
+            "_mountStateVersion",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        versionField.SetValue(backend, (long)versionField.GetValue(backend)! + 1);
+    }
+
+    private static ServiceHostOptions CreateOverlayRuntimeOptions()
+        => new()
+        {
+            EnableNativeWrite = true,
+            WriteRolloutChannel = "Enabled",
+            WriteBackendMode = "Overlay",
+            NativeWriteAllowRawPhysicalDevices = true,
+            NativeWritePromotionPolicy = "Pilot",
+            NativeWriteRequireCanonicalCommit = false,
+            NativeWriteDisallowScaffoldCommitOnNonFixture = false,
+            NativeWriteRejectScaffoldReplayBlobOnNonFixture = false,
+            NativeWriteRequireCanonicalReplayCandidateOnNonFixture = false,
+            NativeWriteCrossOsValidationRequired = false,
+            NativeWriteCrashFaultMatrixRequired = false,
+            NativeWriteRequireMacOsValidationForStable = false,
+            NativeWriteStableRequiresPowerLossPass = false,
+            NativeHostStopTimeoutSeconds = 1,
+            NativeWriteEvidenceStorePath = Path.Combine(
+                Path.GetTempPath(),
+                "apfsaccess_phase8",
+                Guid.NewGuid().ToString("N"),
+                "evidence.json"),
+        };
+
+    private static object InvokeCaptureRuntimeStatusRefreshSnapshot(NativeApfsBackend backend)
+    {
+        var method = typeof(NativeApfsBackend).GetMethod(
+            "CaptureRuntimeStatusRefreshSnapshot_NoLock",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(method);
+        var snapshot = method!.Invoke(backend, null);
+        Assert.NotNull(snapshot);
+        return snapshot!;
+    }
+
+    private static async Task<object> InvokeReadRuntimeStatusesAsync(NativeApfsBackend backend, object snapshot)
+    {
+        var method = typeof(NativeApfsBackend).GetMethod(
+            "ReadRuntimeStatusesAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(method);
+        var taskObject = method!.Invoke(backend, [snapshot, CancellationToken.None]);
+        var task = Assert.IsAssignableFrom<Task>(taskObject);
+        await task.ConfigureAwait(false);
+        var result = taskObject!.GetType().GetProperty("Result")!.GetValue(taskObject);
+        Assert.NotNull(result);
+        return result!;
+    }
+
+    private static void InvokeApplyMountedRuntimeState(
+        NativeApfsBackend backend,
+        object snapshot,
+        object statuses)
+    {
+        var method = typeof(NativeApfsBackend).GetMethod(
+            "ApplyMountedRuntimeState_NoLock",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(method);
+        method!.Invoke(backend, [snapshot, statuses]);
+    }
+
+    private static MountedVolumeState GetSeededMount(NativeApfsBackend backend)
+    {
+        var mountMap = typeof(NativeApfsBackend)
+            .GetField("_mounts", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(backend)!;
+        var values = Assert.IsAssignableFrom<IEnumerable<MountedVolumeState>>(
+            mountMap.GetType().GetProperty("Values")!.GetValue(mountMap));
+        return Assert.Single(values);
+    }
+
+    private static long GetPrivateLong(NativeApfsBackend backend, string fieldName)
+    {
+        var field = typeof(NativeApfsBackend).GetField(
+            fieldName,
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(field);
+        return Assert.IsType<long>(field!.GetValue(backend));
+    }
+
+    [Theory]
+    [InlineData(true, false, 0, true)]
+    [InlineData(true, false, 10, false)]
+    [InlineData(true, true, 0, false)]
+    [InlineData(false, false, null, false)]
+    public void IsCleanHostStop_RequiresNaturalZeroExit(
+        bool processExited,
+        bool forcedKill,
+        int? exitCode,
+        bool expected)
+    {
+        var method = typeof(NativeApfsBackend).GetMethod(
+            "IsCleanHostStop",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+
+        var result = method!.Invoke(null, [processExited, forcedKill, exitCode]);
+        Assert.Equal(expected, Assert.IsType<bool>(result));
+    }
+
+    [Theory]
+    [InlineData(true, false, MountAccessMode.ReadWrite, "Native", false)]
+    [InlineData(true, true, MountAccessMode.ReadWrite, "Native", true)]
+    [InlineData(false, true, MountAccessMode.ReadWrite, "Native", true)]
+    [InlineData(true, false, MountAccessMode.ReadOnly, "Native", true)]
+    [InlineData(true, false, MountAccessMode.ReadWrite, "Overlay", true)]
+    public void IsMountStartupReady_RequiresSettledStatusForNativeReadWrite(
+        bool driveVisible,
+        bool hostMountReady,
+        MountAccessMode accessMode,
+        string configuredWriteBackend,
+        bool expected)
+    {
+        var method = typeof(NativeApfsBackend).GetMethod(
+            "IsMountStartupReady",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+
+        var result = method!.Invoke(
+            null,
+            [driveVisible, hostMountReady, accessMode, configuredWriteBackend]);
+        Assert.Equal(expected, Assert.IsType<bool>(result));
+    }
+
     [Fact]
     public async Task ReadHostRuntimeStatusAsync_ReturnsFallback_WhenStatusFileMissing()
     {
@@ -374,6 +1186,38 @@ public sealed class NativeApfsBackendRuntimeStatusTests
         Assert.False(status.CanonicalPathActive);
         Assert.Equal((ulong)182, status.LastCommitXid);
         Assert.Equal("DowngradedAfterCanonicalGateFailure", status.LastRecoveryAction);
+    }
+
+    [Theory]
+    [InlineData("ImmutableRecoveryIdentityMissing")]
+    [InlineData("ImmutableRecoveryIdentityInvalid")]
+    [InlineData("LegacyRecoveryEvidenceAmbiguous")]
+    public async Task ReadHostRuntimeStatusAsync_PreservesMountedIdentityDowngradeForRegistration(
+        string recoveryReason)
+    {
+        using var statusFile = new TemporaryStatusFile($$"""
+            {
+              "writeBackend": "Disabled",
+              "nativeWriteReadiness": "Degraded",
+              "nativeWriteSafetyState": "ReadOnlyFallback",
+              "recoveryActive": true,
+              "recoveryReason": "{{recoveryReason}}"
+            }
+            """);
+
+        var status = await InvokeReadHostRuntimeStatusAsync(
+            statusFilePath: statusFile.Path,
+            accessMode: MountAccessMode.ReadWrite,
+            configuredWriteBackend: "Native",
+            timeout: TimeSpan.FromMilliseconds(220));
+
+        Assert.Equal("Disabled", status.WriteBackend);
+        Assert.Equal(
+            recoveryReason,
+            InvokeMountedReadOnlyIdentityFallbackReason(
+                MountAccessMode.ReadWrite,
+                status.WriteBackend,
+                status.RecoveryReason));
     }
 
     [Fact]
@@ -979,7 +1823,7 @@ public sealed class NativeApfsBackendRuntimeStatusTests
     }
 
     [Fact]
-    public async Task ReadHostRuntimeStatusCachedAsync_ReusesUnchangedStatusWithinTtl()
+    public async Task ReadHostRuntimeStatusCachedAsync_InvalidatesSameLengthContentChangeWithPreservedTimestamp()
     {
         using var statusFile = new TemporaryStatusFile("""
             {
@@ -1013,7 +1857,7 @@ public sealed class NativeApfsBackendRuntimeStatusTests
             timeout: TimeSpan.FromMilliseconds(220));
 
         Assert.Equal((ulong)10, first.LastCommitXid);
-        Assert.Equal((ulong)10, second.LastCommitXid);
+        Assert.Equal((ulong)99, second.LastCommitXid);
     }
 
     [Fact]
@@ -1079,6 +1923,21 @@ public sealed class NativeApfsBackendRuntimeStatusTests
         Assert.NotNull(result);
 
         return ProjectHostRuntimeStatus(result!);
+    }
+
+    private static string? InvokeMountedReadOnlyIdentityFallbackReason(
+        MountAccessMode requestedAccessMode,
+        string hostWriteBackend,
+        string? recoveryReason)
+    {
+        var method = typeof(NativeApfsBackend).GetMethod(
+            "GetMountedReadOnlyIdentityFallbackReason",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+
+        return (string?)method!.Invoke(
+            null,
+            [requestedAccessMode, hostWriteBackend, recoveryReason]);
     }
 
     private static async Task<HostRuntimeStatusProjection> InvokeReadHostRuntimeStatusCachedAsync(
@@ -1228,6 +2087,15 @@ public sealed class NativeApfsBackendRuntimeStatusTests
             }
 
             File.SetLastWriteTimeUtc(Path, nextTimestamp);
+        }
+
+        public async Task WritePreservingIdentityMetadataAsync(string content)
+        {
+            var creationTime = File.GetCreationTimeUtc(Path);
+            var lastWriteTime = File.GetLastWriteTimeUtc(Path);
+            await File.WriteAllTextAsync(Path, content);
+            File.SetCreationTimeUtc(Path, creationTime);
+            File.SetLastWriteTimeUtc(Path, lastWriteTime);
         }
 
         public void Dispose()

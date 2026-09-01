@@ -4,18 +4,20 @@ public enum DriveDashboardState
 {
     Idle = 0,
     HealthyReadWrite = 1,
-    ReadOnly = 2,
-    Attention = 3,
-    Problem = 4,
+    FinishingWrites = 2,
+    ReadOnly = 3,
+    Attention = 4,
+    Problem = 5,
 }
 
 public enum DashboardPalette
 {
     Gray = 0,
     Green = 1,
-    Yellow = 2,
-    Orange = 3,
-    Red = 4,
+    Blue = 2,
+    Yellow = 3,
+    Orange = 4,
+    Red = 5,
 }
 
 public sealed record DriveDashboardRow(

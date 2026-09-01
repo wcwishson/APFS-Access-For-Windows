@@ -96,6 +96,11 @@ public sealed record NativeWriteDiagnostic(
 
 public sealed record DeviceInfo(string DeviceId, string DisplayName, bool IsConnected);
 
+public sealed record DeviceInventory(
+    DeviceInfo Device,
+    IReadOnlyList<VolumeInfo> Volumes
+);
+
 public sealed record VolumeInfo(
     string VolumeId,
     string DeviceId,
@@ -108,7 +113,8 @@ public sealed record VolumeInfo(
     string? WriteBlockReason = null,
     IReadOnlyList<string>? WriteIncompatibilities = null,
     IReadOnlyList<string>? WriteUnsupportedFeatures = null,
-    NativeWriteReadiness NativeWriteReadiness = NativeWriteReadiness.Unavailable
+    NativeWriteReadiness NativeWriteReadiness = NativeWriteReadiness.Unavailable,
+    string? RecoveryIdentity = null
 );
 
 public sealed record MountRequest(string VolumeId, char DriveLetter, MountAccessMode AccessMode);
@@ -135,10 +141,24 @@ public sealed record MountResult(
     bool ShutdownDrainActive = false,
     int InFlightMutationCallbacks = 0,
     NativeWriteValidationEvidence? NativeWriteValidationEvidence = null,
-    IReadOnlyList<NativeWriteDiagnostic>? NativeWriteDiagnostics = null
+    IReadOnlyList<NativeWriteDiagnostic>? NativeWriteDiagnostics = null,
+    bool MountReady = false,
+    int HostProcessId = 0,
+    ulong WalAcceptedSequence = 0,
+    ulong WalApfsDurableSequence = 0,
+    ulong WalCleanupSequence = 0,
+    bool RecoveryActive = false,
+    string? RecoveryReason = null,
+    ulong? LastCommitXid = null
 );
 
-public sealed record UnmountResult(bool Success, string MountPoint, string? Error);
+public sealed record UnmountResult(
+    bool Success,
+    string MountPoint,
+    string? Error,
+    bool MountRemoved = false,
+    bool HostOwnershipReleased = false,
+    bool PendingDurabilityCleared = false);
 
 public sealed record MountedVolumeState(
     string VolumeId,
@@ -163,5 +183,11 @@ public sealed record MountedVolumeState(
     bool ShutdownDrainActive = false,
     int InFlightMutationCallbacks = 0,
     NativeWriteValidationEvidence? NativeWriteValidationEvidence = null,
-    IReadOnlyList<NativeWriteDiagnostic>? NativeWriteDiagnostics = null
+    IReadOnlyList<NativeWriteDiagnostic>? NativeWriteDiagnostics = null,
+    string? RecoveryIdentity = null,
+    bool MountReady = false,
+    int HostProcessId = 0,
+    ulong WalAcceptedSequence = 0,
+    ulong WalApfsDurableSequence = 0,
+    ulong WalCleanupSequence = 0
 );

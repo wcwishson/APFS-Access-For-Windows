@@ -7,23 +7,36 @@ public sealed class DashboardForm : Form
     private readonly Func<string?, Task> _openAsync;
     private readonly Func<string?, Task> _ejectAsync;
     private readonly Func<string?, Task> _fixAsync;
+    private readonly Func<bool, Task>? _setStartWithWindowsAsync;
+    private readonly Func<bool, Task>? _setStartMinimizedAsync;
     private readonly Label _summaryLabel;
     private readonly FlowLayoutPanel _rowsPanel;
     private readonly List<Button> _actionButtons = [];
     private readonly List<RenderedDashboardRow> _renderedRows = [];
+    private CheckBox? _startWithWindowsCheckBox;
+    private CheckBox? _startMinimizedCheckBox;
     private string? _renderedDashboardKey;
+    private string? _renderedSummary;
     private bool _allowClose;
+    private bool _actionsEnabled = true;
+    private bool _updatingStartupPreferences;
 
-    private sealed record RenderedDashboardRow(string Identity, string Key, Control Control, IReadOnlyList<Button> Buttons);
+    private sealed record RenderedDashboardRow(string Identity, Control Control, IReadOnlyList<Button> Buttons);
 
     public DashboardForm(
         Func<string?, Task> openAsync,
         Func<string?, Task> ejectAsync,
-        Func<string?, Task> fixAsync)
+        Func<string?, Task> fixAsync,
+        StartupPreferences? startupPreferences = null,
+        Func<bool, Task>? setStartWithWindowsAsync = null,
+        Func<bool, Task>? setStartMinimizedAsync = null)
     {
         _openAsync = openAsync ?? throw new ArgumentNullException(nameof(openAsync));
         _ejectAsync = ejectAsync ?? throw new ArgumentNullException(nameof(ejectAsync));
         _fixAsync = fixAsync ?? throw new ArgumentNullException(nameof(fixAsync));
+        _setStartWithWindowsAsync = setStartWithWindowsAsync;
+        _setStartMinimizedAsync = setStartMinimizedAsync;
+        startupPreferences ??= new StartupPreferences(StartWithWindows: false, StartMinimized: false);
 
         Text = "APFS Access";
         StartPosition = FormStartPosition.CenterScreen;
@@ -37,12 +50,13 @@ public sealed class DashboardForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 2,
+            RowCount = 3,
             Padding = new Padding(18),
             BackColor = BackColor,
         };
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         Controls.Add(root);
 
         _summaryLabel = new Label
@@ -67,6 +81,8 @@ public sealed class DashboardForm : Form
         };
         root.Controls.Add(_rowsPanel, 0, 1);
 
+        root.Controls.Add(BuildStartupPreferencesPanel(startupPreferences), 0, 2);
+
         ApplyStatus(new StatusChangedPayload(
             State: ApfsAccess.Core.RuntimeState.Starting,
             MountPoints: Array.Empty<string>(),
@@ -86,19 +102,30 @@ public sealed class DashboardForm : Form
 
         var rows = DriveDashboardPresenter.BuildRows(payload);
         var summary = DriveDashboardPresenter.BuildSummary(payload);
-        var key = BuildDashboardKey(summary, rows);
+        var key = BuildDashboardKey(rows);
+        var summaryChanged = !string.Equals(_renderedSummary, summary, StringComparison.Ordinal);
         if (string.Equals(_renderedDashboardKey, key, StringComparison.Ordinal))
         {
+            if (summaryChanged)
+            {
+                _summaryLabel.Text = summary;
+            }
+
+            UpdateRenderedRows(rows);
+            _renderedDashboardKey = key;
+            _renderedSummary = summary;
             return;
         }
 
-        if (!string.Equals(_summaryLabel.Text, summary, StringComparison.Ordinal))
+        if (summaryChanged)
         {
             _summaryLabel.Text = summary;
         }
 
         ReconcileRows(rows);
+
         _renderedDashboardKey = key;
+        _renderedSummary = summary;
     }
 
     public void SetFooter(string message)
@@ -108,6 +135,7 @@ public sealed class DashboardForm : Form
 
     public void SetActionsEnabled(bool enabled)
     {
+        _actionsEnabled = enabled;
         foreach (var button in _actionButtons)
         {
             button.Enabled = enabled && button.Tag is true;
@@ -174,10 +202,10 @@ public sealed class DashboardForm : Form
             foreach (var row in rows)
             {
                 var identity = BuildRowIdentity(row);
-                var rowKey = BuildRowKey(row);
                 if (currentRows.TryGetValue(identity, out var existing) &&
-                    string.Equals(existing.Key, rowKey, StringComparison.Ordinal))
+                    existing.Control is not null)
                 {
+                    UpdateRow(existing.Control, row);
                     nextRows.Add(existing);
                     _actionButtons.AddRange(existing.Buttons);
                 }
@@ -185,13 +213,15 @@ public sealed class DashboardForm : Form
                 {
                     if (existing is not null)
                     {
-                        _rowsPanel.Controls.Remove(existing.Control);
-                        existing.Control.Dispose();
+                        var existingControl = existing.Control;
+                        ArgumentNullException.ThrowIfNull(existingControl);
+                        _rowsPanel.Controls.Remove(existingControl);
+                        existingControl.Dispose();
                     }
 
                     var buttons = new List<Button>();
-                    var control = BuildRow(row, buttons);
-                    nextRows.Add(new RenderedDashboardRow(identity, rowKey, control, buttons));
+                    var newControl = BuildRow(row, buttons);
+                    nextRows.Add(new RenderedDashboardRow(identity, newControl, buttons));
                     _actionButtons.AddRange(buttons);
                 }
             }
@@ -229,34 +259,77 @@ public sealed class DashboardForm : Form
         }
     }
 
-    private static string BuildDashboardKey(string summary, IReadOnlyList<DriveDashboardRow> rows)
+    private void UpdateRenderedRows(IReadOnlyList<DriveDashboardRow> rows)
     {
-        return string.Join(
-            "\u001f",
-            new[] { summary }.Concat(rows.Select(BuildRowKey)));
+        if (_rowsPanel is null)
+        {
+            return;
+        }
+
+        var currentRows = _renderedRows.ToDictionary(static row => row.Identity, StringComparer.Ordinal);
+        foreach (var row in rows)
+        {
+            var identity = BuildRowIdentity(row);
+            if (currentRows.TryGetValue(identity, out var existing))
+            {
+                UpdateRow(existing.Control, row);
+            }
+        }
+    }
+
+    private static string BuildDashboardKey(IReadOnlyList<DriveDashboardRow> rows)
+    {
+        return string.Join("\u001f", rows.Select(BuildRowIdentity));
     }
 
     private static string BuildRowIdentity(DriveDashboardRow row)
-        => string.Join(
-            "\u001e",
-            string.IsNullOrWhiteSpace(row.VolumeId) ? "idle" : row.VolumeId,
-            row.MountPoint);
+        => string.IsNullOrWhiteSpace(row.VolumeId) ? "idle" : row.VolumeId;
 
-    private static string BuildRowKey(DriveDashboardRow row)
-        => string.Join(
-            "\u001e",
-            row.VolumeId,
-            row.DeviceName,
-            row.VolumeName,
-            row.MountPoint,
-            row.MountPath,
-            row.State,
-            row.Palette,
-            row.StateText,
-            row.Summary,
-            row.CanOpen,
-            row.CanEject,
-            row.CanFix);
+    private void UpdateRow(Control root, DriveDashboardRow row)
+    {
+        if (root.Controls.Count == 0 ||
+            root.Controls[0] is not TableLayoutPanel layout ||
+            layout.Controls.Count < 3)
+        {
+            return;
+        }
+
+        if (layout.Controls[0] is Control palette)
+        {
+            palette.BackColor = ToColor(row.Palette);
+        }
+
+        if (layout.Controls[1] is TableLayoutPanel textPanel)
+        {
+            var labels = textPanel.Controls.OfType<Label>().ToArray();
+            if (labels.Length >= 4)
+            {
+                labels[0].Text = row.DeviceName;
+                labels[1].Text = BuildVolumeLine(row);
+                labels[2].ForeColor = ToColor(row.Palette);
+                labels[2].Text = row.StateText;
+                labels[3].Text = row.Summary;
+            }
+        }
+
+        if (layout.Controls[2] is FlowLayoutPanel buttonsPanel)
+        {
+            var buttons = buttonsPanel.Controls.OfType<Button>().ToArray();
+            if (buttons.Length >= 4)
+            {
+                buttons[0].Tag = row.CanOpen;
+                buttons[0].Enabled = _actionsEnabled && row.CanOpen;
+                buttons[1].Tag = row.CanEject;
+                buttons[1].Enabled = _actionsEnabled && row.CanEject;
+                buttons[2].Tag = row.CanFix;
+                buttons[2].Enabled = _actionsEnabled && row.CanFix;
+                buttons[3].Tag = true;
+                buttons[3].Enabled = _actionsEnabled;
+            }
+        }
+
+        ResizeRowContent(root);
+    }
 
     private Control BuildRow(DriveDashboardRow row, List<Button> actionButtons)
     {
@@ -366,7 +439,92 @@ public sealed class DashboardForm : Form
         return container;
     }
 
-    private static Button BuildActionButton(List<Button> actionButtons, string text, bool enabled, Func<Task> action)
+    private Control BuildStartupPreferencesPanel(StartupPreferences startupPreferences)
+    {
+        var panel = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = true,
+            Margin = new Padding(0, 8, 0, 0),
+            Padding = new Padding(0),
+            BackColor = BackColor,
+        };
+
+        _startWithWindowsCheckBox = BuildStartupCheckBox(
+            "Start the program with Windows",
+            startupPreferences.StartWithWindows,
+            _setStartWithWindowsAsync);
+        _startMinimizedCheckBox = BuildStartupCheckBox(
+            "Start minimized",
+            startupPreferences.StartMinimized,
+            _setStartMinimizedAsync);
+
+        panel.Controls.Add(_startWithWindowsCheckBox);
+        panel.Controls.Add(_startMinimizedCheckBox);
+        return panel;
+    }
+
+    private CheckBox BuildStartupCheckBox(string text, bool isChecked, Func<bool, Task>? action)
+    {
+        var checkBox = new CheckBox
+        {
+            AutoSize = true,
+            Checked = isChecked,
+            Margin = new Padding(0, 0, 22, 8),
+            Text = text,
+            UseVisualStyleBackColor = true,
+        };
+
+        checkBox.CheckedChanged += async (_, _) =>
+        {
+            if (_updatingStartupPreferences)
+            {
+                return;
+            }
+
+            await RunStartupPreferenceActionAsync(checkBox, action).ConfigureAwait(true);
+        };
+
+        return checkBox;
+    }
+
+    private async Task RunStartupPreferenceActionAsync(CheckBox checkBox, Func<bool, Task>? action)
+    {
+        if (action is null)
+        {
+            return;
+        }
+
+        var requestedValue = checkBox.Checked;
+        checkBox.Enabled = false;
+        try
+        {
+            await action(requestedValue).ConfigureAwait(true);
+        }
+        catch (Exception ex)
+        {
+            _updatingStartupPreferences = true;
+            try
+            {
+                checkBox.Checked = !requestedValue;
+            }
+            finally
+            {
+                _updatingStartupPreferences = false;
+            }
+
+            MessageBox.Show(this, ex.Message, "APFS Access", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            checkBox.Enabled = true;
+        }
+    }
+
+    private Button BuildActionButton(List<Button> actionButtons, string text, bool enabled, Func<Task> action)
     {
         var button = new Button
         {
@@ -375,7 +533,7 @@ public sealed class DashboardForm : Form
             Margin = new Padding(4, 0, 0, 6),
             Padding = new Padding(12, 5, 12, 5),
             Text = text,
-            Enabled = enabled,
+            Enabled = _actionsEnabled && enabled,
             Tag = enabled,
             UseVisualStyleBackColor = true,
         };
@@ -511,6 +669,7 @@ public sealed class DashboardForm : Form
         => palette switch
         {
             DashboardPalette.Green => Color.FromArgb(34, 139, 84),
+            DashboardPalette.Blue => Color.FromArgb(49, 130, 206),
             DashboardPalette.Yellow => Color.FromArgb(214, 158, 46),
             DashboardPalette.Orange => Color.FromArgb(221, 107, 32),
             DashboardPalette.Red => Color.FromArgb(197, 48, 48),

@@ -38,7 +38,7 @@ public sealed class ServiceHostOptions
 
     public bool NativeWriteStrictMode { get; set; } = true;
 
-    public int NativeWriteMaxDirtyTransactions { get; set; } = 128;
+    public int NativeWriteMaxDirtyTransactions { get; set; } = 4096;
 
     public string NativeWriteRecoveryPolicy { get; set; } = "FailClosed";
 
@@ -86,7 +86,7 @@ public sealed class ServiceHostOptions
 
     public bool NativeWriteStableRequiresPowerLossPass { get; set; } = true;
 
-    public int NativeWriteValidationEvidenceMaxAgeDays { get; set; } = 30;
+    public int NativeWriteValidationEvidenceMaxAgeDays { get; set; } = 0;
 
     public bool NativeWriteAllowRuntimeEvidenceSeedForRawPhysicalDevices { get; set; } = false;
 

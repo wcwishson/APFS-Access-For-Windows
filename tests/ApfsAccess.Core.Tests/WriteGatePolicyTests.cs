@@ -5,6 +5,14 @@ namespace ApfsAccess.Core.Tests;
 public sealed class WriteGatePolicyTests
 {
     [Fact]
+    public void ServiceHostOptions_DisablesValidationEvidenceExpiryByDefault()
+    {
+        var options = new ServiceHostOptions();
+
+        Assert.Equal(0, options.NativeWriteValidationEvidenceMaxAgeDays);
+    }
+
+    [Fact]
     public void EvaluateForRequest_DisabledFeature_ReturnsDisabledGate()
     {
         var options = new ServiceHostOptions

@@ -13,8 +13,14 @@ public sealed class ApfsMountWorker : BackgroundService
     private readonly IOptionsMonitor<ServiceHostOptions> _optionsMonitor;
     private readonly HashSet<string> _mountedOnce = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _userEjectedVolumeIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _unsafeUnmountedVolumeIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _missingVolumeProbeCounts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, MountRetryState> _mountRetryStates = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _mountOperationLock = new(1, 1);
+    private readonly object _shutdownSync = new();
+    private Task<ShutdownPreparationResult>? _shutdownPreparation;
+    private long _mountCommandGeneration;
+    private int _shutdownRequested;
     private const int MissingVolumeUnmountThreshold = 2;
     public ApfsMountWorker(
         ILogger<ApfsMountWorker> logger,
@@ -29,6 +35,21 @@ public sealed class ApfsMountWorker : BackgroundService
         _mountPolicy = mountPolicy;
         _statusPublisher = statusPublisher;
         _optionsMonitor = optionsMonitor;
+    }
+
+    public Task<ShutdownPreparationResult> PrepareForShutdownAsync(CancellationToken cancellationToken)
+    {
+        Interlocked.Exchange(ref _shutdownRequested, 1);
+        Interlocked.Increment(ref _mountCommandGeneration);
+
+        Task<ShutdownPreparationResult> preparation;
+        lock (_shutdownSync)
+        {
+            _shutdownPreparation ??= PrepareForShutdownCoreAsync();
+            preparation = _shutdownPreparation;
+        }
+
+        return preparation.WaitAsync(cancellationToken);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -80,24 +101,31 @@ public sealed class ApfsMountWorker : BackgroundService
         }
         finally
         {
-            Publish(
-                RuntimeState.Stopping,
-                Array.Empty<MountedVolumeState>(),
-                null,
-                warnings: Array.Empty<string>(),
-                writeEnabled: false,
-                compatibilityWarnings: Array.Empty<string>()
-            );
-            await UnmountAllAsync(CancellationToken.None).ConfigureAwait(false);
+            var shutdown = await PrepareForShutdownAsync(CancellationToken.None).ConfigureAwait(false);
+            PublishShutdownState(shutdown);
         }
     }
 
     private async Task RunCycleAsync(CancellationToken cancellationToken)
     {
+        if (Volatile.Read(ref _shutdownRequested) != 0)
+        {
+            return;
+        }
+
+        var commandGeneration = Volatile.Read(ref _mountCommandGeneration);
+        var discovery = await DiscoverVolumesAsync(cancellationToken).ConfigureAwait(false);
+
         await _mountOperationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await RunCycleCoreAsync(cancellationToken).ConfigureAwait(false);
+            if (Volatile.Read(ref _shutdownRequested) != 0 ||
+                commandGeneration != Volatile.Read(ref _mountCommandGeneration))
+            {
+                return;
+            }
+
+            await RunCycleCoreAsync(discovery, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -105,7 +133,7 @@ public sealed class ApfsMountWorker : BackgroundService
         }
     }
 
-    private async Task RunCycleCoreAsync(CancellationToken cancellationToken)
+    private async Task<DiscoverySnapshot> DiscoverVolumesAsync(CancellationToken cancellationToken)
     {
         var options = _optionsMonitor.CurrentValue;
         var warnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -115,11 +143,13 @@ public sealed class ApfsMountWorker : BackgroundService
         var connectedDevices = devices.Where(x => x.IsConnected).ToArray();
 
         var discoveredVolumeById = new Dictionary<string, VolumeInfo>(StringComparer.OrdinalIgnoreCase);
+        var discoveredVolumes = new List<VolumeInfo>();
         foreach (var device in connectedDevices)
         {
             var volumes = await _backend.ProbeVolumesAsync(device.DeviceId, cancellationToken).ConfigureAwait(false);
             foreach (var volume in volumes)
             {
+                discoveredVolumes.Add(volume);
                 discoveredVolumeById[volume.VolumeId] = volume;
 
                 if (options.SkipEncryptedVolumes && volume.IsEncrypted)
@@ -142,6 +172,32 @@ public sealed class ApfsMountWorker : BackgroundService
             }
         }
 
+        return new DiscoverySnapshot(
+            options,
+            connectedDevices,
+            discoveredVolumeById,
+            discoveredVolumes,
+            warnings.ToArray(),
+            compatibilityWarnings.ToArray());
+    }
+
+    private async Task RunCycleCoreAsync(
+        DiscoverySnapshot discovery,
+        CancellationToken cancellationToken,
+        IReadOnlyList<MountedVolumeState>? mountedOverride = null,
+        string? requestedVolumeId = null,
+        string? requestedDeviceId = null,
+        MountAccessMode? requestedAccessMode = null,
+        string? requestedRecoveryIdentity = null)
+    {
+        var options = discovery.Options;
+        var connectedDevices = discovery.ConnectedDevices;
+        var discoveredVolumeById = discovery.VolumeById;
+        var warnings = new HashSet<string>(discovery.Warnings, StringComparer.OrdinalIgnoreCase);
+        var compatibilityWarnings = new HashSet<string>(
+            discovery.CompatibilityWarnings,
+            StringComparer.OrdinalIgnoreCase);
+
         if (discoveredVolumeById.Count > 0)
         {
             var disconnectedEjectedVolumes = _userEjectedVolumeIds
@@ -153,17 +209,17 @@ public sealed class ApfsMountWorker : BackgroundService
             }
         }
 
-        var mounted = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+        var mounted = (mountedOverride ?? await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false)).ToList();
         var unmountMissingResult = await UnmountMissingVolumesAsync(
             mounted,
             discoveredVolumeById.Keys,
             warnings,
             cancellationToken
         ).ConfigureAwait(false);
-        mounted = unmountMissingResult.Mounted;
+        mounted = unmountMissingResult.Mounted.ToList();
         var mountStateChanged = unmountMissingResult.Changed;
 
-        if (connectedDevices.Length == 0)
+        if (connectedDevices.Count == 0)
         {
             if (mounted.Count == 0)
             {
@@ -174,7 +230,7 @@ public sealed class ApfsMountWorker : BackgroundService
             return;
         }
 
-        if (!options.AutoMountEnabled)
+        if (!options.AutoMountEnabled && string.IsNullOrWhiteSpace(requestedVolumeId))
         {
             PublishFromMounts(mounted, null, warnings, compatibilityWarnings);
             return;
@@ -187,14 +243,17 @@ public sealed class ApfsMountWorker : BackgroundService
                 .Where(ch => ch.HasValue)
                 .Select(ch => ch!.Value)
         );
-        foreach (var drive in DriveInfo.GetDrives())
+        // DriveInfo.GetDrives() asks each filesystem for volume information.
+        // A stalled WinFsp provider must not block drive-letter allocation for
+        // unrelated volumes, so use the kernel logical-drive bitmask instead.
+        foreach (var drive in Environment.GetLogicalDrives())
         {
-            if (string.IsNullOrWhiteSpace(drive.Name))
+            if (string.IsNullOrWhiteSpace(drive))
             {
                 continue;
             }
 
-            var letter = char.ToUpperInvariant(drive.Name[0]);
+            var letter = char.ToUpperInvariant(drive[0]);
             if (letter is >= 'A' and <= 'Z')
             {
                 usedLetters.Add(letter);
@@ -202,9 +261,30 @@ public sealed class ApfsMountWorker : BackgroundService
         }
 
         string? firstMountError = null;
+        var requiresMountStateRefresh = false;
+        var deviceDisplayNames = connectedDevices.ToDictionary(
+            static device => device.DeviceId,
+            static device => device.DisplayName,
+            StringComparer.OrdinalIgnoreCase);
 
-        foreach (var volume in discoveredVolumeById.Values.OrderBy(x => x.VolumeName, StringComparer.OrdinalIgnoreCase))
+        var volumesToProcess = string.IsNullOrWhiteSpace(requestedDeviceId)
+            ? discoveredVolumeById.Values
+            : discovery.Volumes.Where(volume =>
+                string.Equals(volume.DeviceId, requestedDeviceId, StringComparison.OrdinalIgnoreCase));
+
+        foreach (var volume in volumesToProcess.OrderBy(x => x.VolumeName, StringComparer.OrdinalIgnoreCase))
         {
+            if (!string.IsNullOrWhiteSpace(requestedVolumeId) &&
+                !string.Equals(volume.VolumeId, requestedVolumeId, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (!RecoveryIdentityMatches(volume.RecoveryIdentity, requestedRecoveryIdentity))
+            {
+                continue;
+            }
+
             if (options.SkipEncryptedVolumes && volume.IsEncrypted)
             {
                 continue;
@@ -226,21 +306,42 @@ public sealed class ApfsMountWorker : BackgroundService
                 continue;
             }
 
+            if (_unsafeUnmountedVolumeIds.Contains(volume.VolumeId))
+            {
+                warnings.Add($"'{volume.VolumeName}' remains unmounted after an unsafe host stop; use Fix to recover it before remounting.");
+                continue;
+            }
+
             if (!options.NativeAutoRemountOnReconnect && _mountedOnce.Contains(volume.VolumeId))
             {
                 warnings.Add($"Auto-remount disabled for '{volume.VolumeName}' after prior disconnect.");
                 continue;
             }
 
-            var (success, error, warning, compatibilityWarning) = await TryMountAsync(
+            if (string.IsNullOrWhiteSpace(requestedVolumeId) &&
+                IsMountRetryBackoffActive(volume.VolumeId, out var retryWarning))
+            {
+                warnings.Add(retryWarning);
+                continue;
+            }
+
+            var (success, error, warning, compatibilityWarning, mountedState) = await TryMountAsync(
                 volume,
                 options,
                 usedLetters,
-                cancellationToken
+                cancellationToken,
+                deviceDisplayNames.GetValueOrDefault(volume.DeviceId),
+                requestedAccessMode
             ).ConfigureAwait(false);
             if (success)
             {
+                _mountRetryStates.Remove(volume.VolumeId);
                 mountStateChanged = true;
+                requiresMountStateRefresh = true;
+                if (mountedState is not null)
+                {
+                    mounted.Add(mountedState);
+                }
                 mountedVolumeIds.Add(volume.VolumeId);
                 _mountedOnce.Add(volume.VolumeId);
                 _missingVolumeProbeCounts.Remove(volume.VolumeId);
@@ -261,15 +362,17 @@ public sealed class ApfsMountWorker : BackgroundService
                 firstMountError = error;
             }
 
+            RecordMountFailure(volume.VolumeId, error);
+
             if (!string.IsNullOrWhiteSpace(error))
             {
                 warnings.Add($"Mount failed for '{volume.VolumeName}': {error}");
             }
         }
 
-        if (mountStateChanged)
+        if (requiresMountStateRefresh)
         {
-            mounted = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+            mounted = (await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false)).ToList();
         }
 
         PublishFromMounts(mounted, firstMountError, warnings, compatibilityWarnings);
@@ -277,6 +380,19 @@ public sealed class ApfsMountWorker : BackgroundService
 
     public async Task<(bool Success, string Message)> EjectAllAsync(CancellationToken cancellationToken)
         => await EjectAsync(null, cancellationToken).ConfigureAwait(false);
+
+    public async Task<IReadOnlyList<DeviceInventory>> GetInventoryAsync(CancellationToken cancellationToken)
+    {
+        var devices = await _backend.ProbeDevicesAsync(cancellationToken).ConfigureAwait(false);
+        var inventory = new List<DeviceInventory>();
+        foreach (var device in devices.Where(static item => item.IsConnected))
+        {
+            var volumes = await _backend.ProbeVolumesAsync(device.DeviceId, cancellationToken).ConfigureAwait(false);
+            inventory.Add(new DeviceInventory(device, volumes));
+        }
+
+        return inventory;
+    }
 
     public async Task<(bool Success, string Message)> RefreshAsync(
         bool clearUserEjectedVolumes,
@@ -289,25 +405,176 @@ public sealed class ApfsMountWorker : BackgroundService
         string? volumeId,
         CancellationToken cancellationToken
     )
+        => await RefreshCoreAsync(
+            clearUserEjectedVolumes,
+            volumeId,
+            requireTargetMounted: false,
+            cancellationToken: cancellationToken).ConfigureAwait(false);
+
+    public async Task<(bool Success, string Message)> EnsureMountedAsync(
+        string? volumeId,
+        CancellationToken cancellationToken)
+        => await RefreshCoreAsync(
+            clearUserEjectedVolumes: true,
+            volumeId,
+            requireTargetMounted: true,
+            cancellationToken: cancellationToken).ConfigureAwait(false);
+
+    public async Task<(bool Success, string Message)> EnsureMountedAsync(
+        string? volumeId,
+        MountAccessMode requestedAccessMode,
+        CancellationToken cancellationToken)
+        => await RefreshCoreAsync(
+            clearUserEjectedVolumes: true,
+            volumeId,
+            requireTargetMounted: true,
+            cancellationToken: cancellationToken,
+            requestedAccessMode: requestedAccessMode).ConfigureAwait(false);
+
+    public Task<(bool Success, string Message)> EnsureMountedExactAsync(
+        string deviceId,
+        string volumeId,
+        MountAccessMode? requestedAccessMode,
+        CancellationToken cancellationToken,
+        string? recoveryIdentity = null)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(deviceId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(volumeId);
+        return RefreshCoreAsync(
+            clearUserEjectedVolumes: true,
+            volumeId: volumeId,
+            requireTargetMounted: true,
+            cancellationToken: cancellationToken,
+            requestedAccessMode: requestedAccessMode,
+            requestedDeviceId: deviceId,
+            requestedRecoveryIdentity: recoveryIdentity);
+    }
+
+    public Task<IReadOnlyList<MountedVolumeState>> GetAuthoritativeMountStateAsync(
+        CancellationToken cancellationToken)
+        => _backend.GetMountStateAsync(cancellationToken);
+
+    private async Task<(bool Success, string Message)> RefreshCoreAsync(
+        bool clearUserEjectedVolumes,
+        string? volumeId,
+        bool requireTargetMounted,
+        CancellationToken cancellationToken,
+        MountAccessMode? requestedAccessMode = null,
+        string? requestedDeviceId = null,
+        string? requestedRecoveryIdentity = null)
+    {
+        var commandGeneration = Interlocked.Increment(ref _mountCommandGeneration);
+        var discovery = await DiscoverVolumesAsync(cancellationToken).ConfigureAwait(false);
+
         await _mountOperationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            if (Volatile.Read(ref _shutdownRequested) != 0)
+            {
+                return (false, "Refresh was rejected because APFS shutdown cleanup has started.");
+            }
+
+            if (commandGeneration != Volatile.Read(ref _mountCommandGeneration))
+            {
+                return (false, "Refresh was superseded by a newer drive command.");
+            }
+
+            if (!string.IsNullOrWhiteSpace(requestedDeviceId) &&
+                !string.IsNullOrWhiteSpace(volumeId))
+            {
+                // The first discovery happened before waiting for the mutation lock.
+                // Re-probe while holding the lock so a reconnect cannot replace the
+                // requested recovery identity between admission and mutation.
+                discovery = await DiscoverVolumesAsync(cancellationToken).ConfigureAwait(false);
+                if (Volatile.Read(ref _shutdownRequested) != 0)
+                {
+                    return (false, "Refresh was rejected because APFS shutdown cleanup has started.");
+                }
+
+                if (commandGeneration != Volatile.Read(ref _mountCommandGeneration))
+                {
+                    return (false, "Refresh was superseded by a newer drive command.");
+                }
+
+                var exactMatches = discovery.Volumes
+                    .Where(volume =>
+                        string.Equals(volume.DeviceId, requestedDeviceId, StringComparison.OrdinalIgnoreCase) &&
+                        string.Equals(volume.VolumeId, volumeId, StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+                if (exactMatches.Length != 1)
+                {
+                    return (false, $"Requested APFS volume '{volumeId}' was not uniquely found on device '{requestedDeviceId}'; mutation was not attempted.");
+                }
+
+                if (!RecoveryIdentityMatches(exactMatches[0].RecoveryIdentity, requestedRecoveryIdentity))
+                {
+                    return (false, $"Requested APFS volume '{volumeId}' recovery identity did not match the connected volume; mutation was not attempted.");
+                }
+            }
+            else if (!string.IsNullOrWhiteSpace(volumeId) &&
+                     !discovery.VolumeById.ContainsKey(volumeId))
+            {
+                return (false, $"Requested APFS volume '{volumeId}' was not found.");
+            }
+
+            IReadOnlyList<MountedVolumeState>? refreshedMounted = null;
+            var remountWarnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (clearUserEjectedVolumes)
             {
                 if (string.IsNullOrWhiteSpace(volumeId))
                 {
                     _userEjectedVolumeIds.Clear();
+                    _unsafeUnmountedVolumeIds.Clear();
                 }
                 else
                 {
                     _userEjectedVolumeIds.Remove(volumeId);
+                    _unsafeUnmountedVolumeIds.Remove(volumeId);
                 }
 
-                await RemountUpgradeableReadOnlyVolumesAsync(volumeId, cancellationToken).ConfigureAwait(false);
+                refreshedMounted = await RemountUpgradeableReadOnlyVolumesAsync(
+                    volumeId,
+                    requestedDeviceId,
+                    requestedAccessMode,
+                    discovery,
+                    remountWarnings,
+                    cancellationToken).ConfigureAwait(false);
             }
 
-            await RunCycleCoreAsync(cancellationToken).ConfigureAwait(false);
+            if (remountWarnings.Count > 0)
+            {
+                discovery = discovery with
+                {
+                    Warnings = discovery.Warnings.Concat(remountWarnings).ToArray(),
+                };
+            }
+
+            await RunCycleCoreAsync(
+                discovery,
+                cancellationToken,
+                refreshedMounted,
+                requestedVolumeId: volumeId,
+                requestedDeviceId: requestedDeviceId,
+                requestedAccessMode: requestedAccessMode,
+                requestedRecoveryIdentity: requestedRecoveryIdentity).ConfigureAwait(false);
+
+            if (requireTargetMounted && !string.IsNullOrWhiteSpace(volumeId))
+            {
+                var mountedAfterRefresh = await _backend
+                    .GetMountStateAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                if (!mountedAfterRefresh.Any(mount =>
+                        string.Equals(mount.VolumeId, volumeId, StringComparison.OrdinalIgnoreCase) &&
+                        (string.IsNullOrWhiteSpace(requestedDeviceId) ||
+                         string.Equals(mount.DeviceId, requestedDeviceId, StringComparison.OrdinalIgnoreCase)) &&
+                        RecoveryIdentityMatches(mount.RecoveryIdentity, requestedRecoveryIdentity)))
+                {
+                    return (false, $"APFS volume '{volumeId}' could not be mounted.");
+                }
+
+                return (true, $"APFS volume '{volumeId}' is mounted.");
+            }
+
             return (true, "APFS drives refreshed.");
         }
         finally
@@ -316,35 +583,41 @@ public sealed class ApfsMountWorker : BackgroundService
         }
     }
 
-    private async Task RemountUpgradeableReadOnlyVolumesAsync(string? volumeId, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<MountedVolumeState>> RemountUpgradeableReadOnlyVolumesAsync(
+        string? volumeId,
+        string? deviceId,
+        MountAccessMode? requestedAccessMode,
+        DiscoverySnapshot discovery,
+        HashSet<string> warnings,
+        CancellationToken cancellationToken)
     {
-        var options = _optionsMonitor.CurrentValue;
+        var options = discovery.Options;
         if (!options.AutoMountEnabled || !options.EnableNativeWrite)
         {
-            return;
+            return await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        var mounted = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
-        var readOnlyMounts = mounted
-            .Where(static mount => mount.AccessMode == MountAccessMode.ReadOnly)
+        var mounted = (await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false)).ToList();
+        var remountCandidates = mounted
+            .Where(mount =>
+                IsUpgradeableOrDegradedMount(mount) ||
+                requestedAccessMode.HasValue &&
+                string.Equals(mount.VolumeId, volumeId, StringComparison.OrdinalIgnoreCase) &&
+                (string.IsNullOrWhiteSpace(deviceId) ||
+                 string.Equals(mount.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase)) &&
+                mount.AccessMode != requestedAccessMode.Value)
             .ToArray();
-        if (readOnlyMounts.Length == 0)
+        if (remountCandidates.Length == 0)
         {
-            return;
+            return mounted;
         }
 
-        var volumeById = new Dictionary<string, VolumeInfo>(StringComparer.OrdinalIgnoreCase);
-        var devices = await _backend.ProbeDevicesAsync(cancellationToken).ConfigureAwait(false);
-        foreach (var device in devices.Where(static device => device.IsConnected))
-        {
-            var volumes = await _backend.ProbeVolumesAsync(device.DeviceId, cancellationToken).ConfigureAwait(false);
-            foreach (var volume in volumes)
-            {
-                volumeById[volume.VolumeId] = volume;
-            }
-        }
+        var volumeById = discovery.VolumeById;
+        var deviceDisplayNames = discovery.ConnectedDevices.ToDictionary(
+            static device => device.DeviceId,
+            static device => device.DisplayName,
+            StringComparer.OrdinalIgnoreCase);
 
-        var warnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var mountedVolumeIds = new HashSet<string>(mounted.Select(static mount => mount.VolumeId), StringComparer.OrdinalIgnoreCase);
         var usedLetters = new HashSet<char>(
             mounted
@@ -352,8 +625,10 @@ public sealed class ApfsMountWorker : BackgroundService
                 .Where(static ch => ch.HasValue)
                 .Select(static ch => ch!.Value)
         );
+        var stateChanged = false;
+        var requiresAuthoritativeRefresh = false;
 
-        foreach (var mount in readOnlyMounts)
+        foreach (var mount in remountCandidates)
         {
             if (!string.IsNullOrWhiteSpace(volumeId) &&
                 !string.Equals(mount.VolumeId, volumeId, StringComparison.OrdinalIgnoreCase))
@@ -361,7 +636,18 @@ public sealed class ApfsMountWorker : BackgroundService
                 continue;
             }
 
-            if (!volumeById.TryGetValue(mount.VolumeId, out var volume))
+            if (!string.IsNullOrWhiteSpace(deviceId) &&
+                !string.Equals(mount.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var volume = string.IsNullOrWhiteSpace(deviceId)
+                ? volumeById.GetValueOrDefault(mount.VolumeId)
+                : discovery.Volumes.SingleOrDefault(candidate =>
+                    string.Equals(candidate.VolumeId, mount.VolumeId, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(candidate.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase));
+            if (volume is null)
             {
                 continue;
             }
@@ -385,25 +671,50 @@ public sealed class ApfsMountWorker : BackgroundService
                 continue;
             }
 
-            var unmounted = await UnmountAsync([mount], cancellationToken, warnings).ConfigureAwait(false);
-            if (unmounted.Count == 0)
+            var unmount = await UnmountAsync([mount], cancellationToken, warnings).ConfigureAwait(false);
+            if (unmount.Removed.Count > 0)
+            {
+                stateChanged = true;
+                mountedVolumeIds.Remove(mount.VolumeId);
+                usedLetters.Remove(driveLetter.Value);
+                mounted.RemoveAll(candidate => string.Equals(
+                    candidate.VolumeId,
+                    mount.VolumeId,
+                    StringComparison.OrdinalIgnoreCase));
+            }
+            foreach (var unsafeRemoved in unmount.UnsafeRemoved)
+            {
+                _unsafeUnmountedVolumeIds.Add(unsafeRemoved.VolumeId);
+                warnings.Add(BuildUnsafeUnmountWarning(unsafeRemoved));
+            }
+            if (unmount.SafelyUnmounted.Count == 0)
             {
                 continue;
             }
 
-            mountedVolumeIds.Remove(mount.VolumeId);
-            usedLetters.Remove(driveLetter.Value);
-            var (success, _, warning, _) = await TryMountAsync(
+            var (success, _, warning, _, remountedState) = await TryMountAsync(
                 volume,
                 options,
                 usedLetters,
-                cancellationToken
+                cancellationToken,
+                deviceDisplayNames.GetValueOrDefault(volume.DeviceId),
+                requestedAccessMode
             ).ConfigureAwait(false);
             if (!success)
             {
                 continue;
             }
 
+            stateChanged = true;
+            requiresAuthoritativeRefresh = true;
+            if (remountedState is not null)
+            {
+                mounted.Add(remountedState);
+            }
+            else
+            {
+                return await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+            }
             mountedVolumeIds.Add(mount.VolumeId);
             _mountedOnce.Add(mount.VolumeId);
             _missingVolumeProbeCounts.Remove(mount.VolumeId);
@@ -412,39 +723,107 @@ public sealed class ApfsMountWorker : BackgroundService
                 warnings.Add(warning);
             }
         }
+
+        if (requiresAuthoritativeRefresh)
+        {
+            return await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        if (!stateChanged)
+        {
+            return mounted;
+        }
+
+        return mounted;
     }
+
+    private static bool IsUpgradeableOrDegradedMount(MountedVolumeState mount)
+        => mount.AccessMode == MountAccessMode.ReadOnly ||
+           mount.RecoveryActive ||
+           mount.NativeWriteReadiness is NativeWriteReadiness.RecoveryMode or NativeWriteReadiness.Degraded ||
+           mount.NativeWriteSafetyState is NativeWriteSafetyState.ReadOnlyFallback or NativeWriteSafetyState.RecoveryBlocked;
 
     public async Task<(bool Success, string Message)> EjectAsync(string? volumeId, CancellationToken cancellationToken)
     {
+        var result = await EjectCoreAsync(volumeId, deviceId: null, recoveryIdentity: null, cancellationToken).ConfigureAwait(false);
+        return (result.Success, result.Message);
+    }
+
+    public Task<EjectOperationResult> EjectExactAsync(
+        string volumeId,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(volumeId);
+        return EjectCoreAsync(volumeId, deviceId: null, recoveryIdentity: null, cancellationToken);
+    }
+
+    public Task<EjectOperationResult> EjectExactAsync(
+        string deviceId,
+        string volumeId,
+        CancellationToken cancellationToken,
+        string? recoveryIdentity = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(deviceId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(volumeId);
+        return EjectCoreAsync(volumeId, deviceId, recoveryIdentity, cancellationToken);
+    }
+
+    private async Task<EjectOperationResult> EjectCoreAsync(
+        string? volumeId,
+        string? deviceId,
+        string? recoveryIdentity,
+        CancellationToken cancellationToken)
+    {
+        Interlocked.Increment(ref _mountCommandGeneration);
         await _mountOperationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             var warnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var mountedBeforeEject = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
-            var selectedMounts = SelectMountsForEject(mountedBeforeEject, volumeId);
+            var selectedMounts = SelectMountsForEject(mountedBeforeEject, volumeId, deviceId, recoveryIdentity);
             if (selectedMounts.Count == 0)
             {
                 PublishFromMounts(mountedBeforeEject, null, warnings, Array.Empty<string>());
-                return string.IsNullOrWhiteSpace(volumeId)
-                    ? (true, "No APFS drives are mounted.")
-                    : (false, "That APFS drive is no longer mounted.");
+                return new EjectOperationResult(
+                    Success: string.IsNullOrWhiteSpace(volumeId),
+                    Message: string.IsNullOrWhiteSpace(volumeId)
+                        ? "No APFS drives are mounted."
+                        : string.IsNullOrWhiteSpace(recoveryIdentity)
+                            ? "That APFS drive is no longer mounted."
+                            : "That APFS drive no longer matches the requested recovery identity; eject was not attempted.",
+                    RemainingMounts: mountedBeforeEject,
+                    UnmountResults: new Dictionary<string, UnmountResult>(StringComparer.OrdinalIgnoreCase));
             }
 
-            var unmounted = await UnmountAsync(selectedMounts, cancellationToken, warnings).ConfigureAwait(false);
-            var unmountedIds = unmounted.Select(static x => x.VolumeId).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var refreshedRemaining = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
-            var remaining = refreshedRemaining
+            if (!string.IsNullOrWhiteSpace(volumeId) && selectedMounts.Count != 1)
+            {
+                PublishFromMounts(mountedBeforeEject, null, warnings, Array.Empty<string>());
+                return new EjectOperationResult(
+                    Success: false,
+                    Message: $"The exact APFS volume has {selectedMounts.Count} matching mount entries; eject was not attempted.",
+                    RemainingMounts: mountedBeforeEject,
+                    UnmountResults: new Dictionary<string, UnmountResult>(StringComparer.OrdinalIgnoreCase));
+            }
+
+            var unmount = await UnmountAsync(selectedMounts, cancellationToken, warnings).ConfigureAwait(false);
+            var unmountedIds = unmount.Removed.Select(static x => x.VolumeId).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var remaining = mountedBeforeEject
                 .Where(mount => !unmountedIds.Contains(mount.VolumeId))
                 .ToArray();
             var remainingIds = remaining.Select(static x => x.VolumeId).ToHashSet(StringComparer.OrdinalIgnoreCase);
             var remainingCount = remaining.Length;
-            foreach (var mount in unmounted)
+            var statusWarnings = new HashSet<string>(warnings, StringComparer.OrdinalIgnoreCase);
+            foreach (var mount in unmount.SafelyUnmounted)
             {
                 _userEjectedVolumeIds.Add(mount.VolumeId);
             }
+            foreach (var mount in unmount.UnsafeRemoved)
+            {
+                _unsafeUnmountedVolumeIds.Add(mount.VolumeId);
+                statusWarnings.Add(BuildUnsafeUnmountWarning(mount));
+            }
 
-            var statusWarnings = new HashSet<string>(warnings, StringComparer.OrdinalIgnoreCase);
-            foreach (var mount in unmounted)
+            foreach (var mount in unmount.SafelyUnmounted)
             {
                 statusWarnings.Add(BuildSafelyEjectedWarning(mount));
             }
@@ -453,29 +832,49 @@ public sealed class ApfsMountWorker : BackgroundService
 
             if (remainingCount == 0 && warnings.Count == 0)
             {
-                return string.IsNullOrWhiteSpace(volumeId)
-                    ? (true, "All APFS drives were safely ejected.")
-                    : (true, $"APFS drive {BuildMountDisplayName(selectedMounts[0])} was safely ejected.");
+                return new EjectOperationResult(
+                    Success: true,
+                    Message: string.IsNullOrWhiteSpace(volumeId)
+                        ? "All APFS drives were safely ejected."
+                        : $"APFS drive {BuildMountDisplayName(selectedMounts[0])} was safely ejected.",
+                    RemainingMounts: remaining,
+                    UnmountResults: unmount.Results);
             }
 
             if (!string.IsNullOrWhiteSpace(volumeId) && !remainingIds.Contains(volumeId) && warnings.Count == 0)
             {
-                return (true, $"APFS drive {BuildMountDisplayName(selectedMounts[0])} was safely ejected.");
+                return new EjectOperationResult(
+                    Success: true,
+                    Message: $"APFS drive {BuildMountDisplayName(selectedMounts[0])} was safely ejected.",
+                    RemainingMounts: remaining,
+                    UnmountResults: unmount.Results);
             }
 
             if (!string.IsNullOrWhiteSpace(volumeId) && !remainingIds.Contains(volumeId))
             {
-                return (false, string.Join(" ", warnings));
+                return new EjectOperationResult(
+                    Success: false,
+                    Message: string.Join(" ", warnings),
+                    RemainingMounts: remaining,
+                    UnmountResults: unmount.Results);
             }
 
             if (remainingCount == 0)
             {
-                return (false, string.Join(" ", warnings));
+                return new EjectOperationResult(
+                    Success: false,
+                    Message: string.Join(" ", warnings),
+                    RemainingMounts: remaining,
+                    UnmountResults: unmount.Results);
             }
 
             var stillMounted = string.Join(", ", remaining.Select(static x => x.MountPoint));
             var detail = warnings.Count == 0 ? string.Empty : $" {string.Join(" ", warnings)}";
-            return (false, $"Some APFS drives are still mounted: {stillMounted}.{detail}");
+            return new EjectOperationResult(
+                Success: false,
+                Message: $"Some APFS drives are still mounted: {stillMounted}.{detail}",
+                RemainingMounts: remaining,
+                UnmountResults: unmount.Results);
         }
         finally
         {
@@ -485,7 +884,9 @@ public sealed class ApfsMountWorker : BackgroundService
 
     private static IReadOnlyList<MountedVolumeState> SelectMountsForEject(
         IReadOnlyList<MountedVolumeState> mounted,
-        string? volumeId
+        string? volumeId,
+        string? deviceId = null,
+        string? recoveryIdentity = null
     )
     {
         if (string.IsNullOrWhiteSpace(volumeId))
@@ -494,9 +895,16 @@ public sealed class ApfsMountWorker : BackgroundService
         }
 
         return mounted
-            .Where(mount => string.Equals(mount.VolumeId, volumeId, StringComparison.OrdinalIgnoreCase))
+            .Where(mount =>
+                string.Equals(mount.VolumeId, volumeId, StringComparison.OrdinalIgnoreCase) &&
+                (string.IsNullOrWhiteSpace(deviceId) ||
+                 string.Equals(mount.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase)) &&
+                RecoveryIdentityMatches(mount.RecoveryIdentity, recoveryIdentity))
             .ToArray();
     }
+
+    private static bool RecoveryIdentityMatches(string? actual, string? requested)
+        => requested is null || string.Equals(actual, requested, StringComparison.Ordinal);
 
     private static string BuildMountDisplayName(MountedVolumeState mount)
     {
@@ -521,6 +929,17 @@ public sealed class ApfsMountWorker : BackgroundService
         return $"'{label}' is safely ejected; unplug and reinsert it to mount again.";
     }
 
+    private static string BuildUnsafeUnmountWarning(MountedVolumeState mount)
+    {
+        var volumeName = !string.IsNullOrWhiteSpace(mount.VolumeName)
+            ? mount.VolumeName
+            : TryParseVolumeNameFromVolumeId(mount.VolumeId);
+        var label = string.IsNullOrWhiteSpace(volumeName)
+            ? BuildMountDisplayName(mount)
+            : volumeName;
+        return $"'{label}' eject was not completed safely because pending writes were not proven durable; use Fix to recover it before remounting.";
+    }
+
     private static string? TryParseVolumeNameFromVolumeId(string? volumeId)
     {
         if (string.IsNullOrWhiteSpace(volumeId))
@@ -538,11 +957,18 @@ public sealed class ApfsMountWorker : BackgroundService
         return string.IsNullOrWhiteSpace(parsed) ? null : parsed;
     }
 
-    private async Task<(bool Success, string? Error, string? Warning, string? CompatibilityWarning)> TryMountAsync(
+    private async Task<(
+        bool Success,
+        string? Error,
+        string? Warning,
+        string? CompatibilityWarning,
+        MountedVolumeState? MountedState)> TryMountAsync(
         VolumeInfo volume,
         ServiceHostOptions options,
         HashSet<char> usedLetters,
-        CancellationToken cancellationToken
+        CancellationToken cancellationToken,
+        string? deviceDisplayName = null,
+        MountAccessMode? requestedAccessMode = null
     )
     {
         char letter;
@@ -553,13 +979,15 @@ public sealed class ApfsMountWorker : BackgroundService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Could not allocate drive letter for {VolumeId}", volume.VolumeId);
-            return (false, ex.Message, null, null);
+            return (false, ex.Message, null, null, null);
         }
 
         var writeDecision = WriteGatePolicy.EvaluateForVolume(options, volume);
-        var shouldAttemptWrite = writeDecision.AllowWrite;
-        var requestedAccess = shouldAttemptWrite ? MountAccessMode.ReadWrite : MountAccessMode.ReadOnly;
-        var primaryRequest = new MountRequest(volume.VolumeId, letter, requestedAccess);
+        var requestedAccess = requestedAccessMode ??
+            (writeDecision.AllowWrite ? MountAccessMode.ReadWrite : MountAccessMode.ReadOnly);
+        var shouldAttemptWrite = requestedAccess == MountAccessMode.ReadWrite && writeDecision.AllowWrite;
+        var primaryAccess = shouldAttemptWrite ? MountAccessMode.ReadWrite : MountAccessMode.ReadOnly;
+        var primaryRequest = new MountRequest(volume.VolumeId, letter, primaryAccess);
         var result = await _backend.MountAsync(primaryRequest, cancellationToken).ConfigureAwait(false);
         MountResult? primaryFailureResult = null;
 
@@ -603,16 +1031,11 @@ public sealed class ApfsMountWorker : BackgroundService
                 error,
                 result.DiagnosticCode ?? "n/a"
             );
-            return (false, error, null, compatibilityWarning);
+            return (false, error, null, compatibilityWarning, null);
         }
 
         usedLetters.Add(letter);
-        var warning = result.DiagnosticCode switch
-        {
-            "Phase1ShellMount" => $"Mounted '{volume.VolumeName}' as read-only APFS snapshot. Copy-out is supported; writes do not go back to APFS.",
-            null => null,
-            _ => $"Mounted '{volume.VolumeName}' with diagnostic '{result.DiagnosticCode}'.",
-        };
+        var warning = BuildMountWarning(volume, result);
 
         _logger.LogInformation(
             "Mounted volume {VolumeId} at {MountPoint} ({Mode}, ReadOnly={ReadOnly}).",
@@ -621,40 +1044,390 @@ public sealed class ApfsMountWorker : BackgroundService
             result.EffectiveAccessMode,
             result.IsReadOnly
         );
-        return (true, null, warning, compatibilityWarning);
+        return (
+            true,
+            null,
+            warning,
+            compatibilityWarning,
+            BuildMountedStateFromMountResult(volume, result, deviceDisplayName));
     }
 
-    private async Task UnmountAllAsync(CancellationToken cancellationToken, HashSet<string>? warnings = null)
+    private bool IsMountRetryBackoffActive(string volumeId, out string warning)
     {
-        var mounted = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
-        await UnmountAsync(mounted, cancellationToken, warnings).ConfigureAwait(false);
+        warning = string.Empty;
+        if (!_mountRetryStates.TryGetValue(volumeId, out var state))
+        {
+            return false;
+        }
+
+        var remaining = state.NextAttemptUtc - DateTime.UtcNow;
+        if (remaining <= TimeSpan.Zero)
+        {
+            _mountRetryStates.Remove(volumeId);
+            return false;
+        }
+
+        warning = $"Automatic mount retry for '{volumeId}' is paused for {Math.Ceiling(remaining.TotalSeconds):n0}s after a failed startup; use Fix or an explicit mount command to retry now.";
+        return true;
     }
 
-    private async Task<IReadOnlyList<MountedVolumeState>> UnmountAsync(
+    private void RecordMountFailure(string volumeId, string? error)
+    {
+        _mountRetryStates.TryGetValue(volumeId, out var previous);
+        var failureCount = Math.Min((previous?.FailureCount ?? 0) + 1, 6);
+        var delaySeconds = Math.Min(60, 1 << Math.Min(failureCount - 1, 5));
+        _mountRetryStates[volumeId] = new MountRetryState(
+            failureCount,
+            DateTime.UtcNow.AddSeconds(delaySeconds),
+            error);
+        _logger.LogWarning(
+            "Backing off automatic mount retry for {VolumeId} for {DelaySeconds}s after failure {FailureCount}: {Error}",
+            volumeId,
+            delaySeconds,
+            failureCount,
+            error ?? "unknown error");
+    }
+
+    private static MountedVolumeState? BuildMountedStateFromMountResult(
+        VolumeInfo volume,
+        MountResult result,
+        string? deviceDisplayName)
+    {
+        if (!result.Success || string.IsNullOrWhiteSpace(result.MountPoint))
+        {
+            return null;
+        }
+
+        var recoveryDiagnostic = result.NativeWriteDiagnostics?
+            .FirstOrDefault(static diagnostic => diagnostic.IsFailClosed);
+        return new MountedVolumeState(
+            VolumeId: volume.VolumeId,
+            MountPoint: result.MountPoint,
+            AccessMode: result.EffectiveAccessMode,
+            VolumeName: volume.VolumeName,
+            DeviceId: volume.DeviceId,
+            DeviceDisplayName: deviceDisplayName,
+            WriteBackend: result.WriteBackend,
+            CommitModel: result.CommitModel,
+            NativeWriteReadiness: result.NativeWriteReadiness,
+            NativeWriteEngineState: result.NativeWriteEngineState,
+            NativeWriteValidationState: result.NativeWriteValidationState,
+            RecoveryActive: result.RecoveryActive ||
+                result.NativeWriteSafetyState == NativeWriteSafetyState.RecoveryBlocked,
+            LastCommitXid: result.LastCommitXid,
+            RecoveryReason: result.RecoveryReason ?? recoveryDiagnostic?.RecoveryReason,
+            NativeWriteSafetyState: result.NativeWriteSafetyState,
+            WriteIncompatibilities: result.WriteIncompatibilities ?? volume.WriteIncompatibilities,
+            WriteUnsupportedFeatures: result.WriteUnsupportedFeatures ?? volume.WriteUnsupportedFeatures,
+            LastRecoveryAction: result.LastRecoveryAction,
+            DirtyTransactionCount: result.DirtyTransactionCount,
+            ShutdownDrainActive: result.ShutdownDrainActive,
+            InFlightMutationCallbacks: result.InFlightMutationCallbacks,
+            NativeWriteValidationEvidence: result.NativeWriteValidationEvidence,
+            NativeWriteDiagnostics: result.NativeWriteDiagnostics,
+            RecoveryIdentity: volume.RecoveryIdentity,
+            MountReady: result.MountReady,
+            HostProcessId: result.HostProcessId,
+            WalAcceptedSequence: result.WalAcceptedSequence,
+            WalApfsDurableSequence: result.WalApfsDurableSequence,
+            WalCleanupSequence: result.WalCleanupSequence);
+    }
+
+    private static string? BuildMountWarning(VolumeInfo volume, MountResult result)
+    {
+        if (result.WriteEnabled &&
+            result.EffectiveAccessMode == MountAccessMode.ReadWrite &&
+            !result.IsReadOnly &&
+            result.NativeWriteSafetyState is NativeWriteSafetyState.PilotReadWrite or NativeWriteSafetyState.StableReadWrite)
+        {
+            return null;
+        }
+
+        return result.DiagnosticCode switch
+        {
+            "Phase1ShellMount" => $"Mounted '{volume.VolumeName}' as read-only APFS snapshot. Copy-out is supported; writes do not go back to APFS.",
+            null => null,
+            _ => $"Mounted '{volume.VolumeName}' with diagnostic '{result.DiagnosticCode}'.",
+        };
+    }
+
+    private async Task<ShutdownPreparationResult> PrepareForShutdownCoreAsync()
+    {
+        var stopTimeout = TimeSpan.FromSeconds(Math.Clamp(
+            _optionsMonitor.CurrentValue.NativeHostStopTimeoutSeconds,
+            1,
+            60));
+        using var stopCts = new CancellationTokenSource(stopTimeout);
+        var warnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        IReadOnlyList<MountedVolumeState> remaining = Array.Empty<MountedVolumeState>();
+        UnmountBatchResult? unmount = null;
+
+        try
+        {
+            await _mountOperationLock.WaitAsync(stopCts.Token).ConfigureAwait(false);
+            try
+            {
+                var mountedBefore = (await _backend
+                    .GetMountStateAsync(stopCts.Token)
+                    .ConfigureAwait(false))
+                    .ToArray();
+                remaining = mountedBefore;
+
+                unmount = await UnmountAsync(
+                    mountedBefore,
+                    stopCts.Token,
+                    warnings).ConfigureAwait(false);
+                var reconciliation = await ReconcileRemainingMountsAsync(
+                    remaining,
+                    stopTimeout).ConfigureAwait(false);
+                remaining = reconciliation.Mounts;
+
+                var allSelectedHaveResults = mountedBefore.All(mount =>
+                    unmount.Results.ContainsKey(mount.VolumeId));
+                var ownershipReleased = reconciliation.Succeeded &&
+                                        remaining.Count == 0 &&
+                                        allSelectedHaveResults &&
+                                        mountedBefore.All(mount =>
+                                        {
+                                            var result = unmount.Results[mount.VolumeId];
+                                            return result.Success &&
+                                                   result.MountRemoved &&
+                                                   result.HostOwnershipReleased;
+                                        });
+                var durabilityCleared = reconciliation.Succeeded &&
+                                        remaining.Count == 0 &&
+                                        allSelectedHaveResults &&
+                                        mountedBefore.All(mount =>
+                                        {
+                                            var result = unmount.Results[mount.VolumeId];
+                                            return result.Success &&
+                                                   result.MountRemoved &&
+                                                   result.PendingDurabilityCleared;
+                                        });
+                var cleanupCompleted = ownershipReleased && durabilityCleared;
+                var diagnostic = cleanupCompleted
+                    ? null
+                    : BuildShutdownDiagnostic(
+                        warnings,
+                        remaining,
+                        reconciliation.Diagnostic);
+
+                return new ShutdownPreparationResult(
+                    CleanupCompleted: cleanupCompleted,
+                    RemainingMounts: remaining,
+                    HostOwnershipReleased: ownershipReleased,
+                    PendingDurabilityCleared: durabilityCleared,
+                    Diagnostic: diagnostic,
+                    UnmountResults: unmount.Results);
+            }
+            finally
+            {
+                _mountOperationLock.Release();
+            }
+        }
+        catch (OperationCanceledException) when (stopCts.IsCancellationRequested)
+        {
+            var reconciliation = await ReconcileRemainingMountsAsync(
+                remaining,
+                stopTimeout).ConfigureAwait(false);
+            remaining = reconciliation.Mounts;
+            var diagnostic = BuildShutdownDiagnostic(
+                warnings,
+                remaining,
+                AppendDiagnostic(
+                    $"APFS shutdown cleanup did not complete within {stopTimeout.TotalSeconds:n0} seconds.",
+                    reconciliation.Diagnostic));
+            _logger.LogError("{Diagnostic}", diagnostic);
+            return new ShutdownPreparationResult(
+                CleanupCompleted: false,
+                RemainingMounts: remaining,
+                HostOwnershipReleased: false,
+                PendingDurabilityCleared: false,
+                Diagnostic: diagnostic,
+                UnmountResults: unmount?.Results);
+        }
+        catch (Exception ex)
+        {
+            var reconciliation = await ReconcileRemainingMountsAsync(
+                remaining,
+                stopTimeout).ConfigureAwait(false);
+            remaining = reconciliation.Mounts;
+            var diagnostic = BuildShutdownDiagnostic(
+                warnings,
+                remaining,
+                AppendDiagnostic(
+                    $"APFS shutdown cleanup failed: {ex.Message}",
+                    reconciliation.Diagnostic));
+            _logger.LogError(ex, "APFS shutdown cleanup failed.");
+            return new ShutdownPreparationResult(
+                CleanupCompleted: false,
+                RemainingMounts: remaining,
+                HostOwnershipReleased: false,
+                PendingDurabilityCleared: false,
+                Diagnostic: diagnostic,
+                UnmountResults: unmount?.Results);
+        }
+    }
+
+    private async Task<MountStateReconciliation> ReconcileRemainingMountsAsync(
+        IReadOnlyList<MountedVolumeState> fallback,
+        TimeSpan stopTimeout)
+    {
+        var timeout = TimeSpan.FromSeconds(Math.Clamp(
+            (int)Math.Ceiling(stopTimeout.TotalSeconds),
+            1,
+            5));
+        using var reconciliationCts = new CancellationTokenSource(timeout);
+        try
+        {
+            var mounts = await _backend
+                .GetMountStateAsync(reconciliationCts.Token)
+                .ConfigureAwait(false);
+            return new MountStateReconciliation(true, mounts.ToArray(), null);
+        }
+        catch (OperationCanceledException) when (reconciliationCts.IsCancellationRequested)
+        {
+            return new MountStateReconciliation(
+                false,
+                fallback,
+                $"Authoritative remaining-mount reconciliation timed out after {timeout.TotalSeconds:n0} seconds.");
+        }
+        catch (Exception ex)
+        {
+            return new MountStateReconciliation(
+                false,
+                fallback,
+                $"Authoritative remaining-mount reconciliation failed: {ex.Message}");
+        }
+    }
+
+    private static string BuildShutdownDiagnostic(
+        IEnumerable<string> warnings,
+        IReadOnlyList<MountedVolumeState> remaining,
+        string? prefix = null)
+    {
+        var details = warnings
+            .Where(static warning => !string.IsNullOrWhiteSpace(warning))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var remainingText = remaining.Count == 0
+            ? null
+            : $"Remaining mounts: {string.Join(", ", remaining.Select(static mount => mount.MountPoint))}.";
+        return string.Join(
+            " ",
+            new[] { prefix, remainingText, string.Join(" ", details) }
+                .Where(static text => !string.IsNullOrWhiteSpace(text)));
+    }
+
+    private static string AppendDiagnostic(string? first, string? second)
+        => string.Join(
+            " ",
+            new[] { first, second }.Where(static value => !string.IsNullOrWhiteSpace(value)));
+
+    private void PublishShutdownState(ShutdownPreparationResult shutdown)
+    {
+        var warnings = shutdown.CleanupCompleted || string.IsNullOrWhiteSpace(shutdown.Diagnostic)
+            ? Array.Empty<string>()
+            : new[] { shutdown.Diagnostic! };
+        Publish(
+            RuntimeState.Stopping,
+            shutdown.RemainingMounts,
+            shutdown.CleanupCompleted ? null : shutdown.Diagnostic,
+            warnings,
+            writeEnabled: false,
+            compatibilityWarnings: Array.Empty<string>());
+    }
+
+    private async Task<UnmountBatchResult> UnmountAsync(
         IReadOnlyList<MountedVolumeState> mounted,
         CancellationToken cancellationToken,
         HashSet<string>? warnings = null
     )
     {
-        var unmounted = new List<MountedVolumeState>(mounted.Count);
-        foreach (var mount in mounted)
+        var removed = new List<MountedVolumeState>(mounted.Count);
+        var safelyUnmounted = new List<MountedVolumeState>(mounted.Count);
+        var unsafeRemoved = new List<MountedVolumeState>(mounted.Count);
+        var results = new Dictionary<string, UnmountResult>(StringComparer.OrdinalIgnoreCase);
+        for (var index = 0; index < mounted.Count; index++)
         {
-            var result = await _backend.UnmountAsync(mount.MountPoint, cancellationToken).ConfigureAwait(false);
-            if (result.Success)
+            var mount = mounted[index];
+            UnmountResult result;
+            try
             {
-                unmounted.Add(mount);
+                result = await _backend
+                    .UnmountAsync(mount.MountPoint, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                result = new UnmountResult(
+                    Success: false,
+                    MountPoint: mount.MountPoint,
+                    Error: "Unmount was cancelled before terminal safety proof was returned.");
+                results[mount.VolumeId] = result;
+                AddNotReachedUnmountResults(mounted, index + 1, results, "shutdown cancellation");
+                warnings?.Add($"Unmount cancelled for '{mount.MountPoint}' before terminal safety proof was returned.");
+                break;
+            }
+            catch (Exception ex)
+            {
+                result = new UnmountResult(
+                    Success: false,
+                    MountPoint: mount.MountPoint,
+                    Error: $"Unmount failed before terminal safety proof was returned: {ex.Message}");
+                results[mount.VolumeId] = result;
+                AddNotReachedUnmountResults(mounted, index + 1, results, "an earlier unmount failure");
+                warnings?.Add($"Unmount failed for '{mount.MountPoint}': {ex.Message}");
+                break;
+            }
+
+            results[mount.VolumeId] = result;
+            var safelyRemoved = result.Success &&
+                                result.MountRemoved &&
+                                result.HostOwnershipReleased &&
+                                result.PendingDurabilityCleared;
+            if (result.MountRemoved)
+            {
+                removed.Add(mount);
+            }
+            if (safelyRemoved)
+            {
+                safelyUnmounted.Add(mount);
             }
             else
             {
-                _logger.LogWarning("Failed to unmount {MountPoint}: {Error}", mount.MountPoint, result.Error);
-                if (!string.IsNullOrWhiteSpace(result.Error))
+                var error = string.IsNullOrWhiteSpace(result.Error)
+                    ? "Unmount did not prove mount removal, host ownership release, and pending durability clearance."
+                    : result.Error;
+                _logger.LogWarning("Failed to safely unmount {MountPoint}: {Error}", mount.MountPoint, error);
+                if (!string.IsNullOrWhiteSpace(error))
                 {
-                    warnings?.Add($"Unmount failed for '{mount.MountPoint}': {result.Error}");
+                    warnings?.Add($"Unmount failed for '{mount.MountPoint}': {error}");
+                }
+                if (result.MountRemoved)
+                {
+                    unsafeRemoved.Add(mount);
                 }
             }
         }
 
-        return unmounted;
+        return new UnmountBatchResult(removed, safelyUnmounted, unsafeRemoved, results);
+    }
+
+    private static void AddNotReachedUnmountResults(
+        IReadOnlyList<MountedVolumeState> mounted,
+        int startIndex,
+        IDictionary<string, UnmountResult> results,
+        string reason)
+    {
+        for (var index = startIndex; index < mounted.Count; index++)
+        {
+            var mount = mounted[index];
+            results[mount.VolumeId] = new UnmountResult(
+                Success: false,
+                MountPoint: mount.MountPoint,
+                Error: $"Unmount was not reached because of {reason}.");
+        }
     }
 
     private async Task<(IReadOnlyList<MountedVolumeState> Mounted, bool Changed)> UnmountMissingVolumesAsync(
@@ -689,7 +1462,7 @@ public sealed class ApfsMountWorker : BackgroundService
             }
 
             var result = await _backend.UnmountAsync(mount.MountPoint, cancellationToken).ConfigureAwait(false);
-            if (!result.Success)
+            if (!result.Success && !result.MountRemoved)
             {
                 _logger.LogWarning(
                     "Failed to unmount stale mount {MountPoint}: {Error}",
@@ -707,16 +1480,61 @@ public sealed class ApfsMountWorker : BackgroundService
             {
                 changed = true;
                 _missingVolumeProbeCounts.Remove(mount.VolumeId);
-                _logger.LogInformation(
-                    "Unmounted stale mount {MountPoint} (volume {VolumeId}).",
-                    mount.MountPoint,
-                    mount.VolumeId
-                );
+                if (result.Success)
+                {
+                    _logger.LogInformation(
+                        "Unmounted stale mount {MountPoint} (volume {VolumeId}).",
+                        mount.MountPoint,
+                        mount.VolumeId
+                    );
+                }
+                else
+                {
+                    _unsafeUnmountedVolumeIds.Add(mount.VolumeId);
+                    _logger.LogWarning(
+                        "Stale mount {MountPoint} disappeared, but final write drain failed: {Error}",
+                        mount.MountPoint,
+                        result.Error
+                    );
+                    warnings.Add(BuildUnsafeUnmountWarning(mount));
+                    if (!string.IsNullOrWhiteSpace(result.Error))
+                    {
+                        warnings.Add($"Stale unmount failed for '{mount.MountPoint}': {result.Error}");
+                    }
+                }
             }
         }
 
         return (remaining, changed);
     }
+
+    private sealed record UnmountBatchResult(
+        IReadOnlyList<MountedVolumeState> Removed,
+        IReadOnlyList<MountedVolumeState> SafelyUnmounted,
+        IReadOnlyList<MountedVolumeState> UnsafeRemoved,
+        IReadOnlyDictionary<string, UnmountResult> Results
+    );
+
+    private sealed record MountStateReconciliation(
+        bool Succeeded,
+        IReadOnlyList<MountedVolumeState> Mounts,
+        string? Diagnostic
+    );
+
+    private sealed record MountRetryState(
+        int FailureCount,
+        DateTime NextAttemptUtc,
+        string? LastError
+    );
+
+    private sealed record DiscoverySnapshot(
+        ServiceHostOptions Options,
+        IReadOnlyList<DeviceInfo> ConnectedDevices,
+        IReadOnlyDictionary<string, VolumeInfo> VolumeById,
+        IReadOnlyList<VolumeInfo> Volumes,
+        IReadOnlyList<string> Warnings,
+        IReadOnlyList<string> CompatibilityWarnings
+    );
 
     private static char? TryGetDriveLetter(MountedVolumeState state)
     {
@@ -1284,7 +2102,39 @@ public sealed class ApfsMountWorker : BackgroundService
                 DeviceDisplayName: !string.IsNullOrWhiteSpace(mount.DeviceDisplayName)
                     ? mount.DeviceDisplayName
                     : TryParseDeviceIdFromVolumeId(mount.VolumeId) ?? "APFS drive",
-                AccessMode: mount.AccessMode))
+                AccessMode: mount.AccessMode,
+                RecoveryIdentity: mount.RecoveryIdentity,
+                State: mount.AccessMode == MountAccessMode.ReadWrite
+                    ? RuntimeState.MountedRw
+                    : RuntimeState.MountedRo,
+                WriteEnabled: mount.AccessMode == MountAccessMode.ReadWrite,
+                WriteBackend: mount.WriteBackend,
+                CommitModel: mount.CommitModel,
+                NativeWriteReadiness: mount.NativeWriteReadiness,
+                NativeWriteEngineState: mount.NativeWriteEngineState,
+                NativeWriteValidationState: mount.NativeWriteValidationState,
+                NativeWriteSafetyState: mount.NativeWriteSafetyState,
+                RecoveryActive: mount.RecoveryActive,
+                RecoveryReason: mount.RecoveryReason,
+                LastRecoveryAction: mount.LastRecoveryAction,
+                LastCommitXid: mount.LastCommitXid,
+                WriteIncompatibilities: mount.WriteIncompatibilities,
+                WriteUnsupportedFeatures: mount.WriteUnsupportedFeatures,
+                DirtyTransactionCount: mount.DirtyTransactionCount,
+                ShutdownDrainActive: mount.ShutdownDrainActive,
+                InFlightMutationCallbacks: mount.InFlightMutationCallbacks,
+                NativeWriteValidationEvidence: mount.NativeWriteValidationEvidence,
+                NativeWriteDiagnostics: mount.NativeWriteDiagnostics,
+                MountReady: mount.MountReady,
+                HostProcessId: mount.HostProcessId,
+                WalAcceptedSequence: mount.WalAcceptedSequence,
+                WalApfsDurableSequence: mount.WalApfsDurableSequence,
+                WalCleanupSequence: mount.WalCleanupSequence,
+                PendingDurability: mount.WalAcceptedSequence > mount.WalApfsDurableSequence ||
+                    mount.DirtyTransactionCount > 0 ||
+                    mount.ShutdownDrainActive ||
+                    mount.InFlightMutationCallbacks > 0,
+                HostOwnershipState: mount.HostProcessId > 0 ? "owned" : "unknown"))
             .OrderBy(static volume => volume.MountPoint, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
@@ -1537,3 +2387,28 @@ public sealed class ApfsMountWorker : BackgroundService
         return "Disabled";
     }
 }
+
+public sealed record ShutdownPreparationResult(
+    bool CleanupCompleted,
+    IReadOnlyList<MountedVolumeState> RemainingMounts,
+    bool HostOwnershipReleased,
+    bool PendingDurabilityCleared,
+    string? Diagnostic,
+    IReadOnlyDictionary<string, UnmountResult>? UnmountResults = null)
+{
+    public IReadOnlyList<string> RemainingMountPoints => RemainingMounts
+        .Select(static mount => mount.MountPoint)
+        .ToArray();
+
+    public IReadOnlyDictionary<string, UnmountResult> UnmountResultsOrEmpty =>
+        UnmountResults ?? EmptyUnmountResults;
+
+    private static IReadOnlyDictionary<string, UnmountResult> EmptyUnmountResults { get; } =
+        new Dictionary<string, UnmountResult>(StringComparer.OrdinalIgnoreCase);
+}
+
+public sealed record EjectOperationResult(
+    bool Success,
+    string Message,
+    IReadOnlyList<MountedVolumeState> RemainingMounts,
+    IReadOnlyDictionary<string, UnmountResult> UnmountResults);

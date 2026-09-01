@@ -98,8 +98,7 @@ function Write-Ico {
 
 Write-Ico -Path (Join-Path $iconDir "tray_idle.ico")       -PrimaryColor ([System.Drawing.Color]::FromArgb(255, 111, 122, 133))
 Write-Ico -Path (Join-Path $iconDir "tray_mounted_rw.ico") -PrimaryColor ([System.Drawing.Color]::FromArgb(255, 33, 150, 83))
-Write-Ico -Path (Join-Path $iconDir "tray_mounted_ro.ico") -PrimaryColor ([System.Drawing.Color]::FromArgb(255, 33, 150, 83))
+Write-Ico -Path (Join-Path $iconDir "tray_mounted_ro.ico") -PrimaryColor ([System.Drawing.Color]::FromArgb(255, 214, 158, 46))
 Write-Ico -Path (Join-Path $iconDir "tray_error.ico")      -PrimaryColor ([System.Drawing.Color]::FromArgb(255, 192, 57, 43))
 
 Write-Host "Created tray icons in $iconDir"
-

@@ -22,6 +22,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\ApfsAccess.Core\ApfsAccess.Core.csproj" />
     <ProjectReference Include="..\..\src\ApfsAccess.Ipc\ApfsAccess.Ipc.csproj" />
+    <ProjectReference Include="..\..\src\ApfsAccess.Bootstrap\ApfsAccess.Bootstrap.csproj" />
     <ProjectReference Include="..\..\src\ApfsAccess.Tray\ApfsAccess.Tray.csproj" />
   </ItemGroup>
 

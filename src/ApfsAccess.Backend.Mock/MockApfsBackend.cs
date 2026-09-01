@@ -180,7 +180,13 @@ public sealed class MockApfsBackend : IApfsBackend
 
         if (_mounts.TryRemove(mountPoint, out _))
         {
-            return Task.FromResult(new UnmountResult(true, mountPoint, null));
+            return Task.FromResult(new UnmountResult(
+                true,
+                mountPoint,
+                null,
+                MountRemoved: true,
+                HostOwnershipReleased: true,
+                PendingDurabilityCleared: true));
         }
 
         return Task.FromResult(new UnmountResult(false, mountPoint, $"Mount point '{mountPoint}' was not mounted."));

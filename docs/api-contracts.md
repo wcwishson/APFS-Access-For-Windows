@@ -147,7 +147,7 @@
 - `NativeWriteEvidenceStorePath` (default `%ProgramData%\\ApfsAccess\\write-evidence.json`)
 - Raw physical-device counter promotion above `CanonicalImageValidated` requires explicit validation-evidence signal payloads (or persisted evidence store records); runtime validation-state alone does not advance pilot/stable counters.
 - Runtime validation-evidence payloads are profile-bound: mismatched `lastValidationProfileId` payloads are ignored for promotion/evidence accrual.
-- In the current repo state, raw physical-device native write remains pilot-only; promotion to `PilotHardware` / `Stable` depends on external evidence imported into `NativeWriteEvidenceStorePath` and checked with `scripts/evaluate_write_promotion.ps1`.
+- Raw physical-device write promotion remains evidence-bound and fail-closed; runtime safety checks and profile-matched records in `NativeWriteEvidenceStorePath` determine whether writable mode is allowed.
 - `SkipEncryptedVolumes`
 - `NativeAutoRemountOnReconnect`
 - `NativeHostStartupTimeoutSeconds`

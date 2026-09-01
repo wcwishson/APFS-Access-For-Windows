@@ -13,6 +13,7 @@ public static class SyntheticApfsTestImage
     private const ulong SpacemanObjectId = 0x2A;
     private const ulong VolumeRootObjectId = 0x54;
     private const uint NxsbMagic = 0x4253584E;
+    private static readonly Guid ContainerUuid = new("A9CB92D2-8B7C-4B59-9EAB-633C7625F491");
 
     public static SyntheticApfsTestImageResult Create(string imagePath, int sizeMiB = DefaultSizeMiB)
     {
@@ -82,11 +83,30 @@ public static class SyntheticApfsTestImage
         BinaryPrimitives.WriteUInt32LittleEndian(block.Slice(0x20, 4), NxsbMagic);
         BinaryPrimitives.WriteUInt32LittleEndian(block.Slice(0x24, 4), BlockSize);
         BinaryPrimitives.WriteUInt64LittleEndian(block.Slice(0x28, 8), totalBlocks);
+        ContainerUuid.TryWriteBytes(block.Slice(0x48, 16));
         BinaryPrimitives.WriteUInt64LittleEndian(block.Slice(0x98, 8), SpacemanObjectId);
         BinaryPrimitives.WriteUInt64LittleEndian(block.Slice(0xA0, 8), VolumeRootObjectId);
+        BinaryPrimitives.WriteUInt64LittleEndian(block.Slice(0xB8, 8), VolumeRootObjectId);
+        BinaryPrimitives.WriteUInt64LittleEndian(block, ComputeApfsObjectChecksum(block[8..]));
 
         stream.Seek(offsetBytes, SeekOrigin.Begin);
         stream.Write(block);
+    }
+
+    private static ulong ComputeApfsObjectChecksum(ReadOnlySpan<byte> bytes)
+    {
+        const ulong modulus = uint.MaxValue;
+        ulong sum1 = 0;
+        ulong sum2 = 0;
+        for (var offset = 0; offset < bytes.Length; offset += sizeof(uint))
+        {
+            sum1 += BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(offset, sizeof(uint)));
+            sum2 += sum1;
+        }
+
+        var low = modulus - ((sum1 + sum2) % modulus);
+        var high = modulus - ((sum1 + low) % modulus);
+        return (high << 32) | low;
     }
 
     private static bool HasSupportedImageExtension(string imagePath)
