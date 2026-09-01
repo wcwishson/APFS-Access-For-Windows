@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text.Json;
 using ApfsAccess.Core;
 using ApfsAccess.Ipc;
 
@@ -12,6 +14,8 @@ public sealed class TrayApplicationContext : ApplicationContext
     private static readonly TimeSpan ServiceStartThrottle = TimeSpan.FromSeconds(4);
     private static readonly TimeSpan EjectRequestTimeout = TimeSpan.FromSeconds(130);
     private static readonly TimeSpan FixRequestTimeout = TimeSpan.FromSeconds(90);
+    private static readonly TimeSpan UpdateShutdownTimeout = TimeSpan.FromSeconds(150);
+    private static readonly Uri LatestReleasePage = new("https://github.com/wcwishson/APFS-Access-For-Windows/releases/latest");
     private static readonly object DiagnosticLogSync = new();
 
     private readonly SynchronizationContext _uiContext;
@@ -19,6 +23,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly NotifyIcon _notifyIcon;
     private readonly DashboardForm _dashboard;
     private readonly StartupSettingsManager _startupSettingsManager;
+    private readonly GitHubReleaseUpdateClient _updateClient = new();
     private readonly ToolStripMenuItem _ejectItem;
     private readonly List<Icon> _ownedIcons = [];
     private readonly Dictionary<RuntimeState, Icon> _iconByState;
@@ -27,11 +32,13 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly ConcurrentDictionary<string, TaskCompletionSource<AckPayload>> _pendingAcks = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _statusPeerSync = new();
     private string? _ejectMenuSignature;
+    private AppUpdateDownload? _readyUpdate;
 
 private PipePeer? _statusPeer;
     private StatusChangedPayload? _latestStatus;
     private DriveDashboardState? _lastStatusBalloonState;
     private int _exitRequested;
+    private int _updateHandoffActive;
     private DateTime _lastServiceStartAttemptUtc = DateTime.MinValue;
     private readonly DateTime _trayStartedUtc;
 
@@ -77,7 +84,8 @@ private PipePeer? _statusPeer;
             RequestFixAsync,
             startupPreferences,
             SetStartWithWindowsAsync,
-            SetStartMinimizedAsync);
+            SetStartMinimizedAsync,
+            HandleUpdateButtonAsync);
 if (!startupPreferences.StartMinimized)
         {
             _dashboard.Show();
@@ -86,6 +94,7 @@ if (!startupPreferences.StartMinimized)
         HandleIntentionalQuitMarker();
         TryStartServiceProcessIfMissing();
         _ = Task.Run(() => RunStatusListenerAsync(_shutdownCts.Token));
+        UpdateReceiptPublisher.TryWriteCurrentProcessPhase("ready");
     }
 
     private void OnNotifyIconMouseClick(object? sender, MouseEventArgs e)
@@ -186,6 +195,257 @@ if (!startupPreferences.StartMinimized)
         _startupSettingsManager.SetStartMinimized(enabled);
         return Task.CompletedTask;
     }
+
+    private async Task HandleUpdateButtonAsync()
+    {
+        if (_readyUpdate is not null)
+        {
+            await InstallReadyUpdateAsync(_readyUpdate).ConfigureAwait(true);
+            return;
+        }
+
+        if (!TryResolveInstalledLauncherPath(out var launcherPath))
+        {
+            _dashboard.SetUpdateStatus(
+                "Automatic install is available when running APFS Access.exe.",
+                "Check for updates",
+                enabled: true);
+            var open = MessageBox.Show(
+                _dashboard,
+                "This copy was started from the extracted zip. Download APFS Access.exe from the latest release page to update.",
+                "APFS Access",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Information);
+            if (open == DialogResult.OK)
+            {
+                Process.Start(new ProcessStartInfo { FileName = LatestReleasePage.AbsoluteUri, UseShellExecute = true });
+            }
+            return;
+        }
+
+        _dashboard.SetUpdateStatus("Checking GitHub and downloading any available update...", "Checking...", enabled: false);
+        var progress = new Progress<AppUpdateProgress>(value =>
+            _dashboard.SetUpdateStatus($"Downloading update: {value.Percentage}%", "Checking...", enabled: false));
+
+        var currentVersion = typeof(TrayApplicationContext).Assembly.GetName().Version ?? new Version(1, 0, 5);
+        var result = await _updateClient.CheckAndDownloadAsync(
+            launcherPath,
+            currentVersion,
+            progress,
+            _shutdownCts.Token).ConfigureAwait(true);
+
+        switch (result.Decision)
+        {
+            case AppUpdateDecision.UpToDate:
+                _dashboard.SetUpdateStatus("APFS Access is up to date.", "Check for updates", enabled: true);
+                break;
+            case AppUpdateDecision.Ready when result.Download is not null:
+                _readyUpdate = result.Download;
+                _dashboard.SetUpdateStatus(
+                    $"Version {result.Download.Release.Version.ToString(3)} is downloaded and verified.",
+                    "Install update",
+                    enabled: true);
+                break;
+            default:
+                _dashboard.SetUpdateStatus(
+                    result.Error ?? "The update could not be downloaded.",
+                    "Check for updates",
+                    enabled: true);
+                break;
+        }
+    }
+
+    private async Task InstallReadyUpdateAsync(AppUpdateDownload download)
+    {
+        var updaterPath = Path.Combine(AppContext.BaseDirectory, "ApfsAccess.Updater.exe");
+        if (!File.Exists(updaterPath) ||
+            !File.Exists(download.ReadyPath) ||
+            !TryResolveInstalledLauncherPath(out var launcherPath) ||
+            !string.Equals(launcherPath, download.LauncherPath, StringComparison.OrdinalIgnoreCase))
+        {
+            _readyUpdate = null;
+            _dashboard.SetUpdateStatus(
+                "The verified update is no longer available. Check again.",
+                "Check for updates",
+                enabled: true);
+            return;
+        }
+
+        var choice = MessageBox.Show(
+            _dashboard,
+            "APFS Access will safely eject its mounted drives, install the downloaded update, and restart. Continue?",
+            "Install APFS Access update",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question,
+            MessageBoxDefaultButton.Button2);
+        if (choice != DialogResult.Yes)
+        {
+            _dashboard.SetUpdateStatus(
+                $"Version {download.Release.Version.ToString(3)} is ready to install.",
+                "Install update",
+                enabled: true);
+            return;
+        }
+
+        Interlocked.Exchange(ref _updateHandoffActive, 1);
+        _dashboard.SetActionsEnabled(false);
+        _dashboard.SetUpdateStatus("Safely ejecting APFS drives...", "Installing...", enabled: false);
+
+        var shutdown = await RequestVerifiedShutdownForUpdateAsync().ConfigureAwait(true);
+        if (!IsCompleteShutdownProof(shutdown))
+        {
+            Interlocked.Exchange(ref _updateHandoffActive, 0);
+            _dashboard.SetActionsEnabled(true);
+            _dashboard.SetUpdateStatus(
+                shutdown?.Diagnostic ?? "APFS Access could not safely release every mounted drive.",
+                "Install update",
+                enabled: true);
+            MessageBox.Show(
+                _dashboard,
+                "The update was not installed because APFS Access could not verify a clean drive shutdown. Close files using the APFS drive and try again.",
+                "APFS Access",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        var manifestPath = WriteUpdateManifest(download);
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = updaterPath,
+            WorkingDirectory = AppContext.BaseDirectory,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        startInfo.ArgumentList.Add("--apply");
+        startInfo.ArgumentList.Add(manifestPath);
+        _ = Process.Start(startInfo) ?? throw new InvalidOperationException("The update installer could not be started.");
+
+        Interlocked.Exchange(ref _exitRequested, 1);
+        ExitTrayForShutdown();
+    }
+
+    private async Task<ServiceStoppingPayload?> RequestVerifiedShutdownForUpdateAsync()
+    {
+        var requestId = Guid.NewGuid().ToString("N");
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_shutdownCts.Token);
+        timeoutCts.CancelAfter(UpdateShutdownTimeout);
+
+        try
+        {
+            await using var peer = await NamedPipeMessageClient
+                .ConnectAsync(ApfsPipeConstants.PipeName, timeoutMilliseconds: 1500, timeoutCts.Token)
+                .ConfigureAwait(false);
+            await peer.SendAsync(
+                PipeMessageCodec.Create(
+                    ApfsMessageTypes.QuitRequested,
+                    new QuitRequestedPayload(Environment.UserName, DateTime.UtcNow),
+                    requestId),
+                timeoutCts.Token).ConfigureAwait(false);
+
+            var acknowledged = false;
+            while (!timeoutCts.Token.IsCancellationRequested)
+            {
+                var message = await peer.ReadMessageAsync(timeoutCts.Token).ConfigureAwait(false);
+                if (message is null)
+                {
+                    return null;
+                }
+
+                if (message.Type == ApfsMessageTypes.Ack &&
+                    string.Equals(message.RequestId, requestId, StringComparison.OrdinalIgnoreCase) &&
+                    PipeMessageCodec.TryGetPayload<AckPayload>(message, out var ack))
+                {
+                    acknowledged = ack?.Success == true;
+                    continue;
+                }
+
+                if (acknowledged &&
+                    message.Type == ApfsMessageTypes.ServiceStopping &&
+                    PipeMessageCodec.TryGetPayload<ServiceStoppingPayload>(message, out var stopping))
+                {
+                    return stopping;
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or TimeoutException or OperationCanceledException)
+        {
+            LogDiagnostic($"Update shutdown handoff failed: {ex.Message}");
+        }
+
+        return null;
+    }
+
+    private static bool IsCompleteShutdownProof(ServiceStoppingPayload? payload)
+        => payload is
+        {
+            CleanupCompleted: true,
+            HostOwnershipReleased: true,
+            PendingDurabilityCleared: true,
+            RemainingMountPoints.Count: 0,
+        };
+
+    private static bool TryResolveInstalledLauncherPath(out string launcherPath)
+    {
+        launcherPath = string.Empty;
+        var value = Environment.GetEnvironmentVariable("APFSACCESS_LAUNCHER_PATH");
+        if (string.IsNullOrWhiteSpace(value) || !Path.IsPathFullyQualified(value))
+        {
+            return false;
+        }
+
+        try
+        {
+            var fullPath = Path.GetFullPath(value);
+            if (!File.Exists(fullPath) ||
+                !string.Equals(Path.GetFileName(fullPath), "APFS Access.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            launcherPath = fullPath;
+            return true;
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static string WriteUpdateManifest(AppUpdateDownload download)
+    {
+        using var process = Process.GetCurrentProcess();
+        var directory = Path.GetDirectoryName(download.LauncherPath)!;
+        var id = Guid.NewGuid().ToString("N");
+        var manifestPath = Path.Combine(directory, $".APFS.Access.update.{id}.json");
+        var manifest = new UpdateHandoffManifest(
+            process.Id,
+            process.StartTime.ToUniversalTime().Ticks,
+            download.LauncherPath,
+            download.ReadyPath,
+            Path.Combine(directory, $".APFS.Access.update.{id}.backup"),
+            Path.Combine(directory, $".APFS.Access.update.{id}.receipt.json"),
+            download.CurrentSha256,
+            download.Release.Sha256,
+            download.Release.Version.ToString(3),
+            Convert.ToHexString(RandomNumberGenerator.GetBytes(32)));
+        File.WriteAllText(
+            manifestPath,
+            JsonSerializer.Serialize(manifest, new JsonSerializerOptions(JsonSerializerDefaults.Web)));
+        return manifestPath;
+    }
+
+    private sealed record UpdateHandoffManifest(
+        int OldTrayProcessId,
+        long OldTrayStartTimeUtcTicks,
+        string LauncherPath,
+        string ReadyPath,
+        string BackupPath,
+        string ReceiptPath,
+        string CurrentSha256,
+        string ExpectedSha256,
+        string ExpectedVersion,
+        string Token);
 
     private static Task OpenMountPointAsync(string? mountPoint)
     {
@@ -313,7 +573,8 @@ if (!startupPreferences.StartMinimized)
 
 private void TryStartServiceProcessIfMissing()
     {
-        if (Volatile.Read(ref _exitRequested) != 0)
+        if (Volatile.Read(ref _exitRequested) != 0 ||
+            Volatile.Read(ref _updateHandoffActive) != 0)
         {
             return;
         }
@@ -655,6 +916,12 @@ private void TryStartServiceProcessIfMissing()
 
 private void HandleServiceStopping()
     {
+        if (Volatile.Read(ref _updateHandoffActive) != 0)
+        {
+            LogDiagnostic("Service stopping notification received during update handoff; waiting for the dedicated shutdown proof.");
+            return;
+        }
+
         if (Interlocked.Exchange(ref _exitRequested, 1) != 0)
         {
             return;
@@ -1532,6 +1799,7 @@ private void HandleServiceStopping()
         _dashboard.Dispose();
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
+        _updateClient.Dispose();
 
         foreach (var icon in _ownedIcons)
         {

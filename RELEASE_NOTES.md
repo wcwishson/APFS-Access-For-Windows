@@ -4,6 +4,8 @@
 
 APFS Access 1.0.5 improves day-to-day reliability, control, and performance for supported writable APFS data volumes. It also makes read-only states clearer and gives scripts and AI agents a complete command-line interface.
 
+This revised 1.0.5 build adds in-app updating. People using the original 1.0.5 build need to download `APFS Access.exe` manually one more time; later updates can be checked and installed from the dashboard.
+
 ### Download
 
 Most users should download:
@@ -29,6 +31,17 @@ Advanced users may also download the click-run zip for the same release.
 - Added `ApfsAccess.Cli.exe` with structured commands for status, discovery, mounting, fixing, ejecting, and quitting.
 - Made read-only status consistent: the tray icon is yellow and user-facing text says `read-only` instead of abbreviations.
 - Added `Start with Windows` and `Start minimized` dashboard options.
+- Added `Check for updates`. The first click downloads and verifies the latest launcher; a second confirmation safely ejects APFS drives, installs it, and restarts the app.
+
+Representative same-drive medians for 1,000 files of 16 KiB each:
+
+| Workload | 1.0.4 | Revised 1.0.5 |
+| --- | ---: | ---: |
+| Copy in | 11.964 files/s | 54.622 files/s |
+| Move out and back | 5.906 files/s | 24.788 files/s |
+| Delete | 6.365 files/s | 52.129 files/s |
+
+These workload-specific runs completed with zero SHA-256 mismatches.
 
 ### User-Facing Behavior
 

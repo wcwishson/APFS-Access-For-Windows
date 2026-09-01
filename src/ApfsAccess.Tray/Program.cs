@@ -36,6 +36,9 @@ public static class Program
         "APFSACCESS_DISABLE_CHECKPOINT_SLOT_INDEX",
         "APFSACCESS_DISABLE_CHECKPOINT_BLOCK_INDEX_CACHE",
         "APFSACCESS_DISABLE_INDEX_DELTA",
+        UpdateReceiptPublisher.TokenEnvironmentKey,
+        UpdateReceiptPublisher.VersionEnvironmentKey,
+        UpdateReceiptPublisher.ReceiptPathEnvironmentKey,
     ];
 
     [STAThread]
@@ -50,6 +53,7 @@ public static class Program
         }
 
         ConfigurePortableRuntimeEnvironment();
+        UpdateReceiptPublisher.TryWriteCurrentProcessPhase("launched");
         ApplicationConfiguration.Initialize();
         using var context = new TrayApplicationContext();
         Application.Run(context);

@@ -903,6 +903,9 @@ internal static class Program
         psi.Environment["APFSACCESS_DISABLE_CHECKPOINT_BLOCK_INDEX_CACHE"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_CHECKPOINT_BLOCK_INDEX_CACHE") ?? string.Empty;
         psi.Environment["APFSACCESS_DISABLE_INDEX_DELTA"] = Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_INDEX_DELTA") ?? string.Empty;
         psi.Environment["APFSACCESS_LAUNCHER_PATH"] = Environment.ProcessPath ?? Application.ExecutablePath;
+        psi.Environment["APFSACCESS_UPDATE_TOKEN"] = Environment.GetEnvironmentVariable("APFSACCESS_UPDATE_TOKEN") ?? string.Empty;
+        psi.Environment["APFSACCESS_UPDATE_EXPECTED_VERSION"] = Environment.GetEnvironmentVariable("APFSACCESS_UPDATE_EXPECTED_VERSION") ?? string.Empty;
+        psi.Environment["APFSACCESS_UPDATE_RECEIPT_PATH"] = Environment.GetEnvironmentVariable("APFSACCESS_UPDATE_RECEIPT_PATH") ?? string.Empty;
 
         Process.Start(psi);
     }

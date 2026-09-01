@@ -12,6 +12,7 @@ $serviceOut = Join-Path $repoRoot "artifacts/publish/service"
 $trayOut = Join-Path $repoRoot "artifacts/publish/tray"
 $probeOut = Join-Path $repoRoot "artifacts/publish/native-probe"
 $cliOut = Join-Path $repoRoot "artifacts/publish/cli"
+$updaterOut = Join-Path $repoRoot "artifacts/publish/updater"
 $probeDebugSmokeOut = Join-Path $repoRoot "artifacts/publish/native-probe-debug-smoke"
 $bundleOut = Join-Path $repoRoot "artifacts/publish/click-run"
 $portableOut = Join-Path $repoRoot "artifacts/publish/portable"
@@ -27,7 +28,7 @@ $nativeBuildRoot = if ([string]::IsNullOrWhiteSpace($env:APFSACCESS_NATIVE_BUILD
     [System.IO.Path]::GetFullPath($env:APFSACCESS_NATIVE_BUILD_ROOT)
 }
 
-$publishOutputDirs = @($serviceOut, $trayOut, $probeOut, $cliOut, $bundleOut, $portableOut)
+$publishOutputDirs = @($serviceOut, $trayOut, $probeOut, $cliOut, $updaterOut, $bundleOut, $portableOut)
 foreach ($publishOutputDir in $publishOutputDirs) {
     if (Test-Path -LiteralPath $publishOutputDir) {
         Get-ChildItem -LiteralPath $publishOutputDir -Force |
@@ -65,6 +66,9 @@ dotnet publish .\src\ApfsAccess.NativeProbe\ApfsAccess.NativeProbe.csproj -c $Co
 Write-Host "[publish] publishing CLI (split output)..."
 dotnet publish .\src\ApfsAccess.Cli\ApfsAccess.Cli.csproj -c $Configuration -r $Runtime --self-contained $SelfContained -o $cliOut
 
+Write-Host "[publish] publishing updater (split output)..."
+dotnet publish .\src\ApfsAccess.Updater\ApfsAccess.Updater.csproj -c $Configuration -r $Runtime --self-contained $SelfContained -o $updaterOut
+
 Write-Host "[publish] publishing service (click-run bundle)..."
 dotnet publish .\src\ApfsAccess.Service\ApfsAccess.Service.csproj -c $Configuration -r $Runtime --self-contained $bundleSelfContained -o $bundleOut
 
@@ -77,7 +81,10 @@ dotnet publish .\src\ApfsAccess.NativeProbe\ApfsAccess.NativeProbe.csproj -c $Co
 Write-Host "[publish] publishing CLI (click-run bundle)..."
 dotnet publish .\src\ApfsAccess.Cli\ApfsAccess.Cli.csproj -c $Configuration -r $Runtime --self-contained $bundleSelfContained -o $bundleOut
 
-foreach ($publishOutputDir in @($serviceOut, $trayOut, $probeOut, $cliOut, $bundleOut)) {
+Write-Host "[publish] publishing updater (click-run bundle)..."
+dotnet publish .\src\ApfsAccess.Updater\ApfsAccess.Updater.csproj -c $Configuration -r $Runtime --self-contained $bundleSelfContained -o $bundleOut
+
+foreach ($publishOutputDir in @($serviceOut, $trayOut, $probeOut, $cliOut, $updaterOut, $bundleOut)) {
     $developmentSettings = Join-Path $publishOutputDir "appsettings.Development.json"
     if (Test-Path -LiteralPath $developmentSettings) {
         Remove-Item -LiteralPath $developmentSettings -Force
@@ -250,5 +257,6 @@ Write-Host " service   : $serviceOut"
 Write-Host " tray      : $trayOut"
 Write-Host " probe     : $probeOut"
 Write-Host " cli       : $cliOut"
+Write-Host " updater   : $updaterOut"
 Write-Host " click-run : $bundleOut"
 Write-Host " portable  : $portableOut"

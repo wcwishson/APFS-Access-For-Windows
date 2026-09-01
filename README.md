@@ -29,6 +29,7 @@ APFS Access opens a small dashboard and also runs from the Windows system tray.
 - The dashboard has `Open`, `Eject`, `Fix`, and `Details` actions for each volume.
 - `Start with Windows` launches APFS Access automatically after sign-in.
 - `Start minimized` keeps the dashboard hidden at startup while leaving the tray icon available.
+- `Check for updates` downloads and verifies the latest `APFS Access.exe`; installation happens only after a second confirmation and a safe drive eject.
 - Closing the dashboard keeps APFS Access running in the tray.
 - Left-click the tray icon to reopen the dashboard.
 - Right-click the tray icon to eject APFS drives or quit the app.
@@ -95,6 +96,8 @@ Advanced users may also download:
 - `APFSAccess-<version>-win-x64-click-run.zip`
 
 The zip contains the extracted app folder, helper scripts, and `README_RUN.txt`. It is useful if you want to inspect or run the app without the single-file portable wrapper.
+
+Automatic installation is available when you run `APFS Access.exe`. Zip users can use the same dashboard button to open the latest release page and update manually.
 
 ## Safety Notes
 

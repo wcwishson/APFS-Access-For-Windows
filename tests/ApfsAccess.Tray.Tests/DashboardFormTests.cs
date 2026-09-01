@@ -347,6 +347,47 @@ public sealed class DashboardFormTests
     }
 
     [Fact]
+    public void CheckForUpdatesButtonInvokesCallback()
+    {
+        Exception? exception = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var clicks = 0;
+                using var form = new DashboardForm(
+                    _ => Task.CompletedTask,
+                    _ => Task.CompletedTask,
+                    _ => Task.CompletedTask,
+                    checkForUpdatesAsync: () =>
+                    {
+                        clicks++;
+                        return Task.CompletedTask;
+                    });
+
+                form.Show();
+                Application.DoEvents();
+                Assert.Single(
+                    EnumerateControls(form).OfType<Button>(),
+                    static button => button.Text == "Check for updates").PerformClick();
+                Application.DoEvents();
+
+                Assert.Equal(1, clicks);
+            }
+            catch (Exception ex)
+            {
+                exception = ex;
+            }
+        });
+
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+
+        Assert.Null(exception);
+    }
+
+    [Fact]
     public void HealthyReadWriteStatusDisablesFixButton()
     {
         Exception? exception = null;

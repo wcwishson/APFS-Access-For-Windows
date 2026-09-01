@@ -9,12 +9,15 @@ public sealed class DashboardForm : Form
     private readonly Func<string?, Task> _fixAsync;
     private readonly Func<bool, Task>? _setStartWithWindowsAsync;
     private readonly Func<bool, Task>? _setStartMinimizedAsync;
+    private readonly Func<Task>? _checkForUpdatesAsync;
     private readonly Label _summaryLabel;
     private readonly FlowLayoutPanel _rowsPanel;
     private readonly List<Button> _actionButtons = [];
     private readonly List<RenderedDashboardRow> _renderedRows = [];
     private CheckBox? _startWithWindowsCheckBox;
     private CheckBox? _startMinimizedCheckBox;
+    private Button? _updateButton;
+    private Label? _updateStatusLabel;
     private string? _renderedDashboardKey;
     private string? _renderedSummary;
     private bool _allowClose;
@@ -29,13 +32,15 @@ public sealed class DashboardForm : Form
         Func<string?, Task> fixAsync,
         StartupPreferences? startupPreferences = null,
         Func<bool, Task>? setStartWithWindowsAsync = null,
-        Func<bool, Task>? setStartMinimizedAsync = null)
+        Func<bool, Task>? setStartMinimizedAsync = null,
+        Func<Task>? checkForUpdatesAsync = null)
     {
         _openAsync = openAsync ?? throw new ArgumentNullException(nameof(openAsync));
         _ejectAsync = ejectAsync ?? throw new ArgumentNullException(nameof(ejectAsync));
         _fixAsync = fixAsync ?? throw new ArgumentNullException(nameof(fixAsync));
         _setStartWithWindowsAsync = setStartWithWindowsAsync;
         _setStartMinimizedAsync = setStartMinimizedAsync;
+        _checkForUpdatesAsync = checkForUpdatesAsync;
         startupPreferences ??= new StartupPreferences(StartWithWindows: false, StartMinimized: false);
 
         Text = "APFS Access";
@@ -139,6 +144,25 @@ public sealed class DashboardForm : Form
         foreach (var button in _actionButtons)
         {
             button.Enabled = enabled && button.Tag is true;
+        }
+    }
+
+    public void SetUpdateStatus(string message, string buttonText, bool enabled)
+    {
+        if (IsDisposed)
+        {
+            return;
+        }
+
+        if (_updateStatusLabel is not null)
+        {
+            _updateStatusLabel.Text = message;
+        }
+
+        if (_updateButton is not null)
+        {
+            _updateButton.Text = buttonText;
+            _updateButton.Enabled = enabled && _checkForUpdatesAsync is not null;
         }
     }
 
@@ -464,7 +488,48 @@ public sealed class DashboardForm : Form
 
         panel.Controls.Add(_startWithWindowsCheckBox);
         panel.Controls.Add(_startMinimizedCheckBox);
+
+        _updateButton = new Button
+        {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Enabled = _checkForUpdatesAsync is not null,
+            Margin = new Padding(0, 0, 12, 8),
+            Padding = new Padding(12, 5, 12, 5),
+            Text = "Check for updates",
+            UseVisualStyleBackColor = true,
+        };
+        _updateButton.Click += async (_, _) => await RunUpdateActionAsync().ConfigureAwait(true);
+        panel.Controls.Add(_updateButton);
+
+        _updateStatusLabel = new Label
+        {
+            AutoSize = true,
+            ForeColor = Color.FromArgb(75, 85, 99),
+            Margin = new Padding(0, 7, 0, 8),
+            Text = string.Empty,
+        };
+        panel.Controls.Add(_updateStatusLabel);
         return panel;
+    }
+
+    private async Task RunUpdateActionAsync()
+    {
+        if (_checkForUpdatesAsync is null || _updateButton is null || !_updateButton.Enabled)
+        {
+            return;
+        }
+
+        _updateButton.Enabled = false;
+        try
+        {
+            await _checkForUpdatesAsync().ConfigureAwait(true);
+        }
+        catch (Exception ex)
+        {
+            SetUpdateStatus(ex.Message, "Check for updates", enabled: true);
+            MessageBox.Show(this, ex.Message, "APFS Access", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
     }
 
     private CheckBox BuildStartupCheckBox(string text, bool isChecked, Func<bool, Task>? action)
