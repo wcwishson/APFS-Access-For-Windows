@@ -11,6 +11,7 @@ public static class Program
 
     private static readonly string[] PropagatedEnvironmentKeys =
     [
+        "APFSACCESS_LAUNCHER_PATH",
         "APFSACCESS_PORTABLE_ROOT",
         "APFSACCESS_RUNTIME_ROOT",
         "APFSACCESS_SPOOL_ROOT",

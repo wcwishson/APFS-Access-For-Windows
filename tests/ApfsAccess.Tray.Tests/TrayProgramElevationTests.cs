@@ -64,6 +64,38 @@ public sealed class TrayProgramElevationTests
     }
 
     [Fact]
+    public void Program_AppliesLauncherPathFromElevatedEnvironmentHandoff()
+    {
+        var method = typeof(Program).GetMethod("ApplyElevatedEnvironment", BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+
+        const string launcherKey = "APFSACCESS_LAUNCHER_PATH";
+        var previousLauncherPath = Environment.GetEnvironmentVariable(launcherKey);
+        var expectedLauncherPath = Path.Combine(Path.GetTempPath(), "APFS Access.exe");
+        var path = Path.Combine(
+            Path.GetTempPath(),
+            $"elevation-environment-{Guid.NewGuid():N}.json");
+        try
+        {
+            Environment.SetEnvironmentVariable(launcherKey, null);
+            File.WriteAllText(path, JsonSerializer.Serialize(new Dictionary<string, string>
+            {
+                [launcherKey] = expectedLauncherPath,
+            }));
+
+            method!.Invoke(null, [new[] { "--apfsaccess-elevated-environment", path }]);
+
+            Assert.Equal(expectedLauncherPath, Environment.GetEnvironmentVariable(launcherKey));
+            Assert.False(File.Exists(path));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(launcherKey, previousLauncherPath);
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
     public void Program_IgnoresMalformedElevatedEnvironmentAndDeletesHandoff()
     {
         var method = typeof(Program).GetMethod("ApplyElevatedEnvironment", BindingFlags.NonPublic | BindingFlags.Static);
