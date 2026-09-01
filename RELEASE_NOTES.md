@@ -25,6 +25,7 @@ Advanced users may also download the click-run zip for the same release.
 - Improved responsiveness for common copy, move, rename, delete, and many-small-file workloads while preserving guarded commits and recovery behavior.
 - Removed an arbitrary age limit that could make an otherwise healthy validated volume fall back to read-only.
 - Improved mount, fix, eject, quit, and restart lifecycle handling so stale hosts and stale drive state are less likely to survive an operation.
+- Supported drives on a fresh installation can reach read/write mode after passing the current-volume safety checks; old machine-specific validation history is no longer required.
 - Added `ApfsAccess.Cli.exe` with structured commands for status, discovery, mounting, fixing, ejecting, and quitting.
 - Made read-only status consistent: the tray icon is yellow and user-facing text says `read-only` instead of abbreviations.
 - Added `Start with Windows` and `Start minimized` dashboard options.

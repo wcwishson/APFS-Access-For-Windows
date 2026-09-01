@@ -117,7 +117,7 @@
 - `NativeWritePilotVolumeAllowList` (default empty)
 - `NativeWriteIntegrityCheckOnMount` (default `true`)
 - `NativeWriteCrashReplayMode` (`FailClosed|ReplayIfSafe`)
-- `NativeWritePromotionPolicy` (`ScaffoldOnly|PilotHardware|Stable`)
+- `NativeWritePromotionPolicy` (`ScaffoldOnly|CanonicalImage|PilotHardware|Stable`)
 - `NativeWriteRequireCanonicalCommit` (default `true`)
 - `NativeWriteAllowLegacyScaffoldForFixtures` (default `true`)
 - `NativeWriteDisallowScaffoldCommitOnNonFixture` / `NativeWriteRejectScaffoldReplayBlobOnNonFixture` / `NativeWriteRequireCanonicalReplayCandidateOnNonFixture`:

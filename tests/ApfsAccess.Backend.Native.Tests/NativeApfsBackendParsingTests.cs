@@ -526,6 +526,7 @@ public sealed class NativeApfsBackendParsingTests
 
     [Theory]
     [InlineData("ScaffoldOnly", NativeWriteValidationState.CanonicalImageValidated, "NativeValidationCanonicalImageRequired", "NativeWriteValidationCanonicalImageRequired")]
+    [InlineData("CanonicalImage", NativeWriteValidationState.CanonicalImageValidated, "NativeValidationCanonicalImageRequired", "NativeWriteValidationCanonicalImageRequired")]
     [InlineData("PilotHardware", NativeWriteValidationState.HardwarePilotValidated, "NativeValidationHardwarePilotRequired", "NativeWriteValidationHardwarePilotRequired")]
     [InlineData("Stable", NativeWriteValidationState.Stable, "NativeValidationStableRequired", "NativeWriteValidationStableRequired")]
     [InlineData("unknown", NativeWriteValidationState.CanonicalImageValidated, "NativeValidationCanonicalImageRequired", "NativeWriteValidationCanonicalImageRequired")]

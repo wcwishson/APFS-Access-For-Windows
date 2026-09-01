@@ -190,6 +190,34 @@ public sealed class WriteGatePolicyTests
     }
 
     [Fact]
+    public void EvaluateForVolume_CanonicalImagePolicyAllowsCapableRawDevice()
+    {
+        var options = new ServiceHostOptions
+        {
+            EnableNativeWrite = true,
+            WriteRolloutChannel = "Pilot",
+            NativeWriteAllowRawPhysicalDevices = true,
+            NativeWritePromotionPolicy = "CanonicalImage",
+        };
+        var volume = new VolumeInfo(
+            VolumeId: @"\\.\PhysicalDrive5|Main",
+            DeviceId: @"\\.\PhysicalDrive5",
+            VolumeName: "Main",
+            SupportsReadWrite: true,
+            IsEncrypted: false,
+            SupportsExplorerMount: true,
+            NativeVolumePath: "ApfsAccess_Volumes/Main",
+            SupportsNativeWrite: true,
+            WriteBlockReason: null
+        );
+
+        var decision = WriteGatePolicy.EvaluateForVolume(options, volume);
+
+        Assert.True(decision.AllowWrite);
+        Assert.Equal("Enabled", decision.GateState);
+    }
+
+    [Fact]
     public void EvaluateForVolume_WriteIncompatibilitiesBlockByDefault()
     {
         var options = new ServiceHostOptions
