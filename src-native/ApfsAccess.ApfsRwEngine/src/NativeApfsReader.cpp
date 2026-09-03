@@ -404,7 +404,15 @@ bool NativeApfsReader::TryLoadVolumeProjection(
     const auto total_blocks = ReadLe64(nxsb, 0x28);
     const auto checkpoint_xid = ReadLe64(nxsb, 0x10);
     const auto nx_omap_oid = ReadLe64(nxsb, 0xA0);
-    const auto selected_volume_oid = volume_object_id != 0 ? volume_object_id : ReadLe64(nxsb, 0xB8);
+    // Production volume selection is always explicit: callers resolve the
+    // volume object ID through the container catalog (name or --volume-oid)
+    // before projecting. Object ID 0 (first-volume fallback) is rejected.
+    if (volume_object_id == 0)
+    {
+        out_error = L"NativeApfsVolumeOidZero";
+        return false;
+    }
+    const auto selected_volume_oid = volume_object_id;
     ProjectionLookupCache lookup_cache{};
     if (block_size == 0 || nx_omap_oid == 0 || selected_volume_oid == 0)
     {

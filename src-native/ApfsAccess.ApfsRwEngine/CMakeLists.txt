@@ -3,6 +3,8 @@ project(ApfsAccessApfsRwEngine LANGUAGES CXX)
 include(CTest)
 
 add_library(ApfsAccess.ApfsRwEngine STATIC
+    src/ApfsContainerCatalog.cpp
+    src/ApfsFormat.cpp
     src/ApfsObjectMapStore.cpp
     src/ApfsSpacemanStore.cpp
     src/ApfsVolumeTreeStore.cpp
@@ -25,6 +27,23 @@ target_include_directories(ApfsAccess.ApfsRwEngine
 )
 
 target_compile_features(ApfsAccess.ApfsRwEngine PUBLIC cxx_std_20)
+
+# Fixed repo-owned read-only APFS observer: emits C0a evidence records.
+add_executable(ApfsObserver
+    tools/ApfsObserver.cpp
+)
+
+target_link_libraries(ApfsObserver
+    PRIVATE
+        ApfsAccess.ApfsRwEngine
+        bcrypt
+)
+
+target_compile_features(ApfsObserver PRIVATE cxx_std_20)
+
+if(MSVC)
+    target_compile_options(ApfsObserver PRIVATE /W4 /permissive-)
+endif()
 
 if(MSVC)
     target_compile_options(ApfsAccess.ApfsRwEngine PRIVATE
@@ -76,6 +95,14 @@ if(BUILD_TESTING)
         tests/WritePipelineTests.cpp
     )
 
+    add_executable(ApfsAccess.ApfsRwEngine.CompatibilityTests
+        tests/ApfsCompatibilityTests.cpp
+    )
+
+    target_link_libraries(ApfsAccess.ApfsRwEngine.CompatibilityTests
+        PRIVATE
+            ApfsAccess.ApfsRwEngine
+    )
     target_link_libraries(ApfsAccess.ApfsRwEngine.Tests
         PRIVATE
             ApfsAccess.ApfsRwEngine
@@ -125,6 +152,10 @@ if(BUILD_TESTING)
             ApfsAccess.ApfsRwEngine
     )
 
+    target_include_directories(ApfsAccess.ApfsRwEngine.CompatibilityTests
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
     target_include_directories(ApfsAccess.ApfsRwEngine.Tests
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -174,6 +205,7 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    target_compile_features(ApfsAccess.ApfsRwEngine.CompatibilityTests PRIVATE cxx_std_20)
     target_compile_features(ApfsAccess.ApfsRwEngine.Tests PRIVATE cxx_std_20)
     target_compile_features(ApfsAccess.ApfsRwEngine.CanonicalStoreTests PRIVATE cxx_std_20)
     target_compile_features(ApfsAccess.ApfsRwEngine.ConformanceTests PRIVATE cxx_std_20)
@@ -188,6 +220,7 @@ if(BUILD_TESTING)
     target_compile_features(ApfsAccess.ApfsRwEngine.WritePipelineTests PRIVATE cxx_std_20)
 
     if(MSVC)
+        target_compile_options(ApfsAccess.ApfsRwEngine.CompatibilityTests PRIVATE /W4 /permissive-)
         target_compile_options(ApfsAccess.ApfsRwEngine.Tests PRIVATE /W4 /permissive-)
         target_compile_options(ApfsAccess.ApfsRwEngine.CanonicalStoreTests PRIVATE /W4 /permissive-)
         target_compile_options(ApfsAccess.ApfsRwEngine.ConformanceTests PRIVATE /W4 /permissive-)
@@ -202,6 +235,7 @@ if(BUILD_TESTING)
         target_compile_options(ApfsAccess.ApfsRwEngine.WritePipelineTests PRIVATE /W4 /permissive-)
 
         foreach(_apfsaccess_rw_test_target
+            ApfsAccess.ApfsRwEngine.CompatibilityTests
             ApfsAccess.ApfsRwEngine.Tests
             ApfsAccess.ApfsRwEngine.CanonicalStoreTests
             ApfsAccess.ApfsRwEngine.ConformanceTests
@@ -219,6 +253,10 @@ if(BUILD_TESTING)
         endforeach()
     endif()
 
+    add_test(
+        NAME ApfsAccess.ApfsRwEngine.Compatibility
+        COMMAND ApfsAccess.ApfsRwEngine.CompatibilityTests
+    )
     add_test(
         NAME ApfsAccess.ApfsRwEngine.MetadataStorePersistence
         COMMAND ApfsAccess.ApfsRwEngine.Tests

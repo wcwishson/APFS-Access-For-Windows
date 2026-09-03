@@ -175,6 +175,9 @@ public:
         bool reject_scaffold_replay_blob_on_non_fixture = true;
         bool require_canonical_replay_candidate_on_non_fixture = true;
         std::uint64_t device_offset_bytes = 0;
+        // Explicitly selected APFS volume object ID (catalog-resolved). Zero
+        // preserves legacy behavior; native projection sites fail closed on 0.
+        std::uint64_t volume_object_id = 0;
     };
 
     explicit MetadataStore(VolumeContext context);

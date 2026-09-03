@@ -1,0 +1,200 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apfsaccess.local/schemas/observer-evidence-v1.json",
+  "title": "APFS repo-owned observer evidence record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "version",
+    "observerId",
+    "observerVersion",
+    "mode",
+    "profile",
+    "synthetic",
+    "source",
+    "secondarySources",
+    "topology"
+  ],
+  "properties": {
+    "format": { "const": "apfs-access-raw-evidence" },
+    "version": { "const": 1 },
+    "observerId": { "const": "apfs-access-owned-raw-observer" },
+    "observerVersion": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+$" },
+    "mode": { "enum": ["collect", "fusion"] },
+    "profile": { "type": "string", "minLength": 1 },
+    "synthetic": { "const": false },
+    "source": { "$ref": "#/$defs/source" },
+    "secondarySources": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/source" }
+    },
+    "topology": { "$ref": "#/$defs/topology" }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z-]+:[A-Za-z0-9_.:-]+$"
+    },
+    "guid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "hex32": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "u64": {
+      "type": "string",
+      "pattern": "^[0-9]+$"
+    },
+    "featureBits": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^0x[0-9a-f]+$"
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "sizeBytes", "hashScope", "sha256"],
+      "properties": {
+        "kind": { "enum": ["image", "device"] },
+        "path": { "type": "string", "minLength": 1 },
+        "sizeBytes": { "type": "integer", "minimum": 1 },
+        "hashScope": { "enum": ["full", "none"] },
+        "sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "disk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "deviceIdentifier", "uuid", "sizeBytes"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "deviceIdentifier": { "type": "string", "minLength": 1 },
+        "uuid": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "sizeBytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "partition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "uuid", "diskId", "index", "startByte", "sizeBytes", "typeGuid", "usage"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "uuid": { "$ref": "#/$defs/guid" },
+        "diskId": { "$ref": "#/$defs/id" },
+        "index": { "type": "integer", "minimum": 1 },
+        "startByte": { "type": "integer", "minimum": 0 },
+        "sizeBytes": { "type": "integer", "minimum": 1 },
+        "typeGuid": { "$ref": "#/$defs/guid" },
+        "usage": { "enum": ["apfs", "other", "empty"] }
+      }
+    },
+    "store": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "uuid", "partitionId", "containerId", "offsetBytes", "sizeBytes"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "uuid": { "$ref": "#/$defs/hex32" },
+        "partitionId": { "type": "string" },
+        "containerId": { "$ref": "#/$defs/id" },
+        "offsetBytes": { "type": "integer", "minimum": 0 },
+        "sizeBytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "container": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "uuid", "blockSizeBytes", "storeIds", "volumeIds", "fusion", "checkpointXid", "compatibleFeatureBits", "readonlyFeatureBits", "unknownFeatureBits", "incompatibleFeatureBits"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "uuid": { "$ref": "#/$defs/hex32" },
+        "blockSizeBytes": { "type": "integer", "minimum": 512 },
+        "storeIds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "volumeIds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "fusion": { "type": "boolean" },
+        "checkpointXid": { "$ref": "#/$defs/u64" },
+        "compatibleFeatureBits": { "$ref": "#/$defs/featureBits" },
+        "readonlyFeatureBits": { "$ref": "#/$defs/featureBits" },
+        "unknownFeatureBits": { "$ref": "#/$defs/featureBits" },
+        "incompatibleFeatureBits": { "$ref": "#/$defs/featureBits" }
+      }
+    },
+    "volume": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "uuid", "objectId", "containerId", "name", "nameUtf8Valid", "roles", "roleRaw", "groupId", "caseMode", "encryptionMode", "locked", "compatibleFeatureBits", "readonlyFeatureBits", "unknownFeatureBits", "incompatibleFeatureBits", "superblockBlock", "superblockXid"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "uuid": { "type": "string", "pattern": "^([0-9a-f]{32})?$" },
+        "objectId": { "$ref": "#/$defs/u64" },
+        "containerId": { "$ref": "#/$defs/id" },
+        "name": { "type": "string" },
+        "nameUtf8Valid": { "type": "boolean" },
+        "roles": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "roleRaw": { "type": "integer", "minimum": 0 },
+        "groupId": { "type": ["string", "null"] },
+        "caseMode": { "enum": ["sensitive", "insensitive", "unknown"] },
+        "encryptionMode": { "enum": ["none", "password", "hardware-bound", "unknown"] },
+        "locked": { "type": "boolean" },
+        "compatibleFeatureBits": { "$ref": "#/$defs/featureBits" },
+        "readonlyFeatureBits": { "$ref": "#/$defs/featureBits" },
+        "unknownFeatureBits": { "$ref": "#/$defs/featureBits" },
+        "incompatibleFeatureBits": { "$ref": "#/$defs/featureBits" },
+        "superblockBlock": { "$ref": "#/$defs/u64" },
+        "superblockXid": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "uuid", "volumeIds"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "uuid": { "$ref": "#/$defs/hex32" },
+        "volumeIds": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        }
+      }
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["disks", "partitions", "stores", "containers", "volumes", "groups"],
+      "properties": {
+        "disks": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/disk" } },
+        "partitions": { "type": "array", "items": { "$ref": "#/$defs/partition" } },
+        "stores": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/store" } },
+        "containers": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/container" } },
+        "volumes": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/volume" } },
+        "groups": { "type": "array", "items": { "$ref": "#/$defs/group" } }
+      }
+    }
+  }
+}

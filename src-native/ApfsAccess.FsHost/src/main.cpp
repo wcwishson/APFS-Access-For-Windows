@@ -45,6 +45,7 @@ typedef NTSTATUS* PNTSTATUS;
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
 #include "MetadataStore.h"
+#include "ApfsContainerCatalog.h"
 #include "PayloadSpool.h"
 #include "TransactionManager.h"
 #include "WritePipeline.h"
@@ -197,6 +198,9 @@ struct Arguments
     std::wstring status_file;
     std::uint32_t parent_pid = 0;
     std::uint64_t device_offset_bytes = 0;
+    // Explicitly selected APFS volume object ID (0 = unresolved; the catalog
+    // resolution below fills it when the device catalog loads).
+    std::uint64_t volume_object_id = 0;
     std::wstring write_safety_level = L"Conservative";
     std::wstring write_backend = L"Disabled";
     int write_commit_timeout_seconds = 15;
@@ -20835,6 +20839,84 @@ NTSTATUS CB_ReadDirectory(FSP_FILE_SYSTEM* fs, PVOID dir_ctx, PWSTR, PWSTR marke
     return STATUS_SUCCESS;
 }
 
+// Resolves the mount volume to an explicit nonzero object ID through the
+// authoritative container catalog. Returns true with args.volume_object_id
+// set, true with it left 0 for legacy devices whose catalog does not load
+// (byte-identical legacy behavior there), or false when selection would be a
+// guess (ambiguity or unknown explicit OID). Never falls back to the first
+// volume or to object ID 0 on cataloged media.
+bool ResolveMountVolumeObjectId(Arguments& args)
+{
+    if (args.volume_object_id != 0)
+    {
+        apfsaccess::rw::BlockDevice device(args.device, args.device_offset_bytes);
+        apfsaccess::catalog::ApfsContainerCatalog catalog;
+        std::wstring catalog_error;
+        if (apfsaccess::catalog::ApfsContainerCatalog::TryLoadDevice(
+                device, catalog, catalog_error))
+        {
+            apfsaccess::catalog::ResolvedMountVolume resolved;
+            std::string resolve_error;
+            if (!catalog.TryResolveVolumeByOid(
+                    args.volume_object_id, resolved, resolve_error))
+            {
+                std::wcerr << L"[FsHost] --volume-oid " << args.volume_object_id
+                           << L" is not present on the device catalog." << std::endl;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    apfsaccess::rw::BlockDevice device(args.device, args.device_offset_bytes);
+    apfsaccess::catalog::ApfsContainerCatalog catalog;
+    std::wstring catalog_error;
+    if (!apfsaccess::catalog::ApfsContainerCatalog::TryLoadDevice(
+            device, catalog, catalog_error))
+    {
+        // Legacy/scaffold devices keep byte-identical legacy behavior; the
+        // native reader still fails closed on object ID 0 where it already
+        // failed on unresolvable media.
+        return true;
+    }
+
+    const std::string name = WideToUtf8(args.volume);
+    apfsaccess::catalog::ResolvedMountVolume resolved;
+    std::string resolve_error;
+    if (catalog.TryResolveVolumeByName(name, resolved, resolve_error))
+    {
+        args.volume_object_id = resolved.object_id;
+        std::wcerr << L"[FsHost] Resolved volume '" << args.volume
+                   << L"' to object ID " << resolved.object_id << L"." << std::endl;
+        return true;
+    }
+
+    std::size_t volume_count = 0;
+    std::uint64_t sole_oid = 0;
+    for (const auto& container : catalog.Containers())
+    {
+        for (const auto& volume : container.volumes)
+        {
+            ++volume_count;
+            sole_oid = volume.object_id;
+        }
+    }
+    if (volume_count == 1)
+    {
+        // Exactly one volume overall: the selection is deterministic and
+        // explicit, not a first-volume fallback.
+        args.volume_object_id = sole_oid;
+        std::wcerr << L"[FsHost] Resolved sole cataloged volume to object ID "
+                   << sole_oid << L"." << std::endl;
+        return true;
+    }
+
+    std::wcerr << L"[FsHost] Unable to resolve volume '" << args.volume
+               << L"' against the device catalog; pass an explicit --volume-oid."
+               << std::endl;
+    return false;
+}
+
 bool ParseArgs(int argc, wchar_t** argv, Arguments& a)
 {
     for (int i = 1; i < argc; ++i)
@@ -20869,6 +20951,24 @@ bool ParseArgs(int argc, wchar_t** argv, Arguments& a)
             }
         }
         else if (IsOption(arg, L"--device-offset")) { try { a.device_offset_bytes = static_cast<std::uint64_t>(std::stoull(NextArgValue(i, argc, argv))); } catch (...) { return false; } }
+        else if (IsOption(arg, L"--volume-oid"))
+        {
+            try
+            {
+                const auto value = NextArgValue(i, argc, argv);
+                std::size_t consumed = 0;
+                const auto parsed = std::stoull(value, &consumed);
+                if (consumed != value.size() || parsed == 0)
+                {
+                    return false;
+                }
+                a.volume_object_id = static_cast<std::uint64_t>(parsed);
+            }
+            catch (...)
+            {
+                return false;
+            }
+        }
         else if (IsOption(arg, L"--readonly")) a.readonly = true;
         else if (IsOption(arg, L"--readwrite")) a.readwrite = true;
         else if (IsOption(arg, L"--write-safety-level")) a.write_safety_level = NextArgValue(i, argc, argv);
@@ -21166,7 +21266,7 @@ void RefreshReportedVolumeInfoFromMetadata(MountContext& ctx)
 
 void PrintUsage()
 {
-    std::wcerr << L"Usage: ApfsAccess.FsHost --device <path> [--device-offset <bytes>] --volume <name-or-id> [--recovery-identity <immutable-id>] --mount <X:|directory> (--readonly|--readwrite) --parent-pid <pid> --lifetime-file <file> --startup-gate-file <file> --startup-gate-token <token> [--status-file <file>] [--write-backend <Disabled|Overlay|Native>] [--write-safety-level <mode>] [--write-commit-timeout <seconds>] [--write-max-dirty-transactions <count>] [--write-recovery-policy <mode>] [--write-crash-replay-mode <FailClosed|ReplayIfSafe>] [--write-require-canonical-commit <true|false>] [--write-integrity-check-on-mount <true|false>] [--allow-legacy-scaffold-for-fixtures <true|false>] [--write-disallow-scaffold-commit-on-non-fixture <true|false>] [--write-reject-scaffold-replay-blob-on-non-fixture <true|false>] [--write-require-canonical-replay-candidate-on-non-fixture <true|false>] [--validation-crash-fault-passes <count>] [--validation-crash-stage-matrix-passes <count>] [--validation-hardware-pilot-passes <count>] [--validation-hot-unplug-passes <count>] [--validation-macos-validation-passes <count>] [--validation-macos-consistency-passes <count>] [--validation-power-loss-replay-passes <count>] [--validation-power-loss-pass-verified <true|false>] [--validation-last-validated-utc <iso-8601>] [--validation-last-profile-id <id>] [--allow-raw-physical-write]" << std::endl;
+    std::wcerr << L"Usage: ApfsAccess.FsHost --device <path> [--device-offset <bytes>] --volume <name-or-id> [--volume-oid <nonzero-id>] [--recovery-identity <immutable-id>] --mount <X:|directory> (--readonly|--readwrite) --parent-pid <pid> --lifetime-file <file> --startup-gate-file <file> --startup-gate-token <token> [--status-file <file>] [--write-backend <Disabled|Overlay|Native>] [--write-safety-level <mode>] [--write-commit-timeout <seconds>] [--write-max-dirty-transactions <count>] [--write-recovery-policy <mode>] [--write-crash-replay-mode <FailClosed|ReplayIfSafe>] [--write-require-canonical-commit <true|false>] [--write-integrity-check-on-mount <true|false>] [--allow-legacy-scaffold-for-fixtures <true|false>] [--write-disallow-scaffold-commit-on-non-fixture <true|false>] [--write-reject-scaffold-replay-blob-on-non-fixture <true|false>] [--write-require-canonical-replay-candidate-on-non-fixture <true|false>] [--validation-crash-fault-passes <count>] [--validation-crash-stage-matrix-passes <count>] [--validation-hardware-pilot-passes <count>] [--validation-hot-unplug-passes <count>] [--validation-macos-validation-passes <count>] [--validation-macos-consistency-passes <count>] [--validation-power-loss-replay-passes <count>] [--validation-power-loss-pass-verified <true|false>] [--validation-last-validated-utc <iso-8601>] [--validation-last-profile-id <id>] [--allow-raw-physical-write]" << std::endl;
 }
 
 HANDLE OpenOwningParentProcess(std::uint32_t parent_pid) noexcept
@@ -21284,6 +21384,12 @@ int wmain(int argc, wchar_t** argv)
     {
         PrintUsage();
         return 2;
+    }
+    if (!ResolveMountVolumeObjectId(args))
+    {
+        std::wcerr << L"[FsHost] Volume identity resolution failed; mount initialization cancelled."
+                   << std::endl;
+        return 3;
     }
     HANDLE parent_process = OpenOwningParentProcess(args.parent_pid);
     if (!parent_process)
@@ -21488,7 +21594,8 @@ int wmain(int argc, wchar_t** argv)
             args.write_disallow_scaffold_commit_on_non_fixture,
             args.write_reject_scaffold_replay_blob_on_non_fixture,
             args.write_require_canonical_replay_candidate_on_non_fixture,
-            args.device_offset_bytes
+            args.device_offset_bytes,
+            args.volume_object_id
         };
         ctx.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
         ctx.metadata_store->SetFilePayloadProvider(

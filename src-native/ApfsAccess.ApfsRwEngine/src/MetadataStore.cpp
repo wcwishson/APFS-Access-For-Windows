@@ -2510,7 +2510,7 @@ bool MetadataStore::LoadObjectMap()
         if (IsLikelyRawDevicePath(context_.device_path) &&
             NativeApfsReader::TryLoadVolumeProjection(
                 device_,
-                0,
+                context_.volume_object_id,
                 projection,
                 projection_error))
         {
@@ -4879,7 +4879,7 @@ bool MetadataStore::RefreshNativeReadExtentProjection()
     std::wstring projection_error;
     if (!NativeApfsReader::TryLoadVolumeProjection(
             device_,
-            0,
+            context_.volume_object_id,
             projection,
             projection_error))
     {
@@ -23560,7 +23560,7 @@ bool MetadataStore::LoadPersistentState()
         std::wstring projection_error;
         if (!NativeApfsReader::TryLoadVolumeProjection(
                 device_,
-                0,
+                context_.volume_object_id,
                 projection,
                 projection_error))
         {
