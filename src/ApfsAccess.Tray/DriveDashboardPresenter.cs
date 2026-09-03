@@ -97,7 +97,10 @@ public static class DriveDashboardPresenter
             CanEject: !string.IsNullOrWhiteSpace(volume.VolumeId) || !string.IsNullOrWhiteSpace(mountPoint),
             CanFix: state is DriveDashboardState.ReadOnly or DriveDashboardState.Attention or DriveDashboardState.Problem,
             Details: details,
-            FixGuidance: BuildFixGuidance(state, payload));
+            FixGuidance: BuildFixGuidance(state, payload),
+            CatalogVolumeId: volume.CatalogVolumeId,
+            CatalogContainerUuid: volume.CatalogContainerUuid,
+            CatalogVolumeObjectId: volume.CatalogVolumeObjectId);
     }
 
     private static DriveDashboardState Classify(StatusChangedPayload payload, MountedVolumeDisplay volume)
@@ -268,6 +271,9 @@ public static class DriveDashboardPresenter
             $"Last commit: {(payload.LastCommitXid.HasValue ? payload.LastCommitXid.Value.ToString() : "none")}",
             $"Warnings: {(warnings.Length == 0 ? "none" : string.Join(" | ", warnings))}",
             $"Diagnostics: {(diagnostics.Count == 0 ? "none" : string.Join(" | ", diagnostics.Select(static x => $"{x.Code}: {x.Message}")))}",
+            $"Catalog volume: {FirstNonBlank(volume.CatalogVolumeId, "none")}",
+            $"Catalog container: {FirstNonBlank(volume.CatalogContainerUuid, "none")}",
+            $"Catalog OID: {(volume.CatalogVolumeObjectId.HasValue ? volume.CatalogVolumeObjectId.Value.ToString() : "none")}",
         };
 
         return details;

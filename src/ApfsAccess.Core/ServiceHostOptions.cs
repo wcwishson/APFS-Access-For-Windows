@@ -8,6 +8,8 @@ public sealed class ServiceHostOptions
 
     public string? NativeFsHostPath { get; set; }
 
+    public string? NativeObserverPath { get; set; }
+
     public string[] NativeDeviceCandidates { get; set; } = [];
 
     public bool NativeAutoDiscoverPhysicalDrives { get; set; } = false;

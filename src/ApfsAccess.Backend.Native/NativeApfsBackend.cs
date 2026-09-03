@@ -69,6 +69,10 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
 
     private readonly ServiceHostOptions _options;
     private readonly string? _nativeFsHostPath;
+    // Lazily resolved (and cached) so backend construction performs no
+    // filesystem search; first observer-backed discovery pays once.
+    private readonly Lazy<string?> _nativeObserverPath;
+    private readonly IObserverRunner _observerRunner;
     private readonly IReadOnlyList<string> _deviceCandidates;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly ConcurrentDictionary<string, MountedVolumeState> _mounts = new(StringComparer.OrdinalIgnoreCase);
@@ -107,13 +111,26 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
 
     internal NativeApfsBackend(
         ServiceHostOptions options,
-        HostProcessLifecycleTestHooks? lifecycleTestHooks)
+        HostProcessLifecycleTestHooks? lifecycleTestHooks,
+        IObserverRunner? observerRunner = null)
+        : this(options, lifecycleTestHooks, observerRunner, observerPathOverride: null)
+    {
+    }
+
+    internal NativeApfsBackend(
+        ServiceHostOptions options,
+        HostProcessLifecycleTestHooks? lifecycleTestHooks,
+        IObserverRunner? observerRunner,
+        string? observerPathOverride)
     {
         ArgumentNullException.ThrowIfNull(options);
 
         _options = options;
         _lifecycleTestHooks = lifecycleTestHooks;
         _nativeFsHostPath = ResolveNativeFsHostPath(options);
+        _nativeObserverPath = new Lazy<string?>(
+            () => observerPathOverride ?? NativeApfsObserver.ResolveNativeObserverPath(_options));
+        _observerRunner = observerRunner ?? new ProcessObserverRunner();
         _deviceCandidates = BuildDeviceCandidates(options);
         Directory.CreateDirectory(_writeDiagnosticsRoot);
         LoadValidationEvidenceFromDisk();
@@ -939,7 +956,13 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                     HostProcessId: hostRuntimeStatus.HostProcessId,
                     WalAcceptedSequence: hostRuntimeStatus.WalAcceptedSequence,
                     WalApfsDurableSequence: hostRuntimeStatus.WalApfsDurableSequence,
-                    WalCleanupSequence: hostRuntimeStatus.WalCleanupSequence
+                    WalCleanupSequence: hostRuntimeStatus.WalCleanupSequence,
+                    CatalogVolumeId: volume.CatalogVolumeId,
+                    CatalogContainerUuid: volume.CatalogContainerUuid,
+                    CatalogVolumeObjectId: volume.CatalogVolumeObjectId,
+                    CatalogDecision: volume.CatalogDecision,
+                    CatalogReasons: volume.CatalogReasons,
+                    CatalogAutoMountAllowed: volume.CatalogAutoMountAllowed
                 );
             Interlocked.Increment(ref _mountStateVersion);
 
@@ -2426,8 +2449,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             psi.ArgumentList.Add(mountTarget.DeviceOffsetBytes.ToString(CultureInfo.InvariantCulture));
         }
         AppendRecoveryIdentityArgument(psi, mountTarget.RecoveryIdentity);
-        psi.ArgumentList.Add("--volume");
-        psi.ArgumentList.Add(volume.VolumeName);
+        AppendVolumeSelectorArguments(psi, volume.VolumeName, mountTarget.VolumeObjectId);
         psi.ArgumentList.Add("--mount");
         psi.ArgumentList.Add(mountPoint);
         if (accessMode == MountAccessMode.ReadOnly)
@@ -4014,7 +4036,13 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
             WriteIncompatibilities: writeIncompatibilities,
             WriteUnsupportedFeatures: writeUnsupportedFeatures,
             NativeWriteReadiness: nativeWriteReadiness,
-            RecoveryIdentity: discoveredVolume.MountTarget.RecoveryIdentity
+            RecoveryIdentity: discoveredVolume.MountTarget.RecoveryIdentity,
+            CatalogVolumeId: discoveredVolume.Catalog?.CatalogVolumeId,
+            CatalogContainerUuid: discoveredVolume.Catalog?.ContainerUuidHex,
+            CatalogVolumeObjectId: discoveredVolume.Catalog?.VolumeObjectId,
+            CatalogDecision: discoveredVolume.Catalog?.Decision,
+            CatalogReasons: discoveredVolume.Catalog?.Reasons,
+            CatalogAutoMountAllowed: discoveredVolume.Catalog?.AutoMountAllowed
         );
     }
 
@@ -4138,31 +4166,81 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
 
     private IReadOnlyList<DiscoveredVolume> DiscoverVolumes(string deviceId)
     {
-        var discoveredVolumes = new List<DiscoveredVolume>();
+        // Phase 1 is the untouched legacy discovery (names, offsets, and the
+        // first-observed recovery identity). Phase 2 overlays opaque observer
+        // catalog evidence; when the observer is absent the result is exactly
+        // the legacy list.
+        var legacyVolumes = DiscoverLegacyVolumes(deviceId);
+        if (legacyVolumes.Count == 0)
+        {
+            return Array.Empty<DiscoveredVolume>();
+        }
+
+        var snapshot = TryDiscoverTopologySnapshot(deviceId, NativeApfsObserver.DiscoveryProfile);
+        var attachments = NativeApfsObserver.ResolveCatalogAttachments(
+            legacyVolumes.Select(static entry => entry.VolumeName).ToArray(),
+            snapshot);
+
+        var discoveredVolumes = new List<DiscoveredVolume>(legacyVolumes.Count);
+        for (var index = 0; index < legacyVolumes.Count; index++)
+        {
+            discoveredVolumes.Add(BuildDiscoveredVolume(deviceId, legacyVolumes[index], attachments[index]));
+        }
+
+        return discoveredVolumes;
+    }
+
+    private DiscoveredVolume BuildDiscoveredVolume(
+        string deviceId, LegacyDiscoveredVolume legacy, CatalogAttachment? catalog)
+    {
+        // The recovery identity uses the SELECTED (attached ?? first-observed)
+        // volume OID via the existing component builder; with no attachment
+        // the arguments are exactly the legacy ones.
+        string? recoveryIdentity = null;
+        if (legacy.ContainerHeader.IdentityMetadataTrusted)
+        {
+            recoveryIdentity = BuildRecoveryIdentityFromComponents(
+                legacy.PartitionUniqueGuid,
+                legacy.ContainerHeader.ContainerUuid,
+                catalog?.VolumeObjectId ?? legacy.ContainerHeader.FirstVolumeObjectId,
+                legacy.AllowPartitionlessIdentity);
+        }
+
+        return new DiscoveredVolume(
+            VolumeName: legacy.VolumeName,
+            IsEncrypted: false,
+            WriteIncompatibilities: Array.Empty<string>(),
+            WriteUnsupportedFeatures: Array.Empty<string>(),
+            NativeVolumePath: BuildNativeVolumePath(deviceId, legacy.VolumeName),
+            MountTarget: new VolumeMountTarget(
+                deviceId,
+                legacy.DeviceOffsetBytes,
+                recoveryIdentity,
+                catalog?.VolumeObjectId,
+                catalog?.ContainerUuidHex),
+            Catalog: catalog);
+    }
+
+    private static List<LegacyDiscoveredVolume> DiscoverLegacyVolumes(string deviceId)
+    {
+        var legacyVolumes = new List<LegacyDiscoveredVolume>();
         var usedVolumeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         if (TryReadApfsContainerHeader(deviceId, 0, out var directContainerHeader) &&
             directContainerHeader is not null)
         {
-            discoveredVolumes.Add(new DiscoveredVolume(
+            legacyVolumes.Add(new LegacyDiscoveredVolume(
                 VolumeName: DefaultMainVolumeName,
-                IsEncrypted: false,
-                WriteIncompatibilities: Array.Empty<string>(),
-                WriteUnsupportedFeatures: Array.Empty<string>(),
-                NativeVolumePath: BuildNativeVolumePath(deviceId, DefaultMainVolumeName),
-                MountTarget: new VolumeMountTarget(
-                    deviceId,
-                    0,
-                    BuildRecoveryIdentity(
-                        partitionUniqueGuid: null,
-                        directContainerHeader,
-                        allowPartitionlessIdentity: !IsRawPhysicalDevicePath(deviceId)))));
-            return discoveredVolumes;
+                DeviceOffsetBytes: 0,
+                PartitionUniqueGuid: null,
+                ContainerHeader: directContainerHeader,
+                AllowPartitionlessIdentity: !IsRawPhysicalDevicePath(deviceId)));
+            return legacyVolumes;
         }
 
         if (!TryReadGptPartitions(deviceId, out var partitions))
         {
-            return discoveredVolumes;
+            return legacyVolumes;
         }
 
         var apfsPartitions = new List<(GptPartitionInfo Partition, ApfsContainerHeader ContainerHeader)>();
@@ -4187,22 +4265,15 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
                 volumeName = $"{baseName}_{suffix}";
             }
 
-            discoveredVolumes.Add(new DiscoveredVolume(
+            legacyVolumes.Add(new LegacyDiscoveredVolume(
                 VolumeName: volumeName,
-                IsEncrypted: false,
-                WriteIncompatibilities: Array.Empty<string>(),
-                WriteUnsupportedFeatures: Array.Empty<string>(),
-                NativeVolumePath: BuildNativeVolumePath(deviceId, volumeName),
-                MountTarget: new VolumeMountTarget(
-                    deviceId,
-                    partition.StartOffsetBytes,
-                    BuildRecoveryIdentity(
-                        partition.IdentityMetadataTrusted ? partition.PartitionUniqueGuid : null,
-                        containerHeader,
-                        allowPartitionlessIdentity: false))));
+                DeviceOffsetBytes: partition.StartOffsetBytes,
+                PartitionUniqueGuid: partition.IdentityMetadataTrusted ? partition.PartitionUniqueGuid : null,
+                ContainerHeader: containerHeader,
+                AllowPartitionlessIdentity: false));
         }
 
-        return discoveredVolumes;
+        return legacyVolumes;
     }
 
     private static bool TryGetDiscoveryFingerprint(string deviceId, out DiscoveryFingerprint fingerprint)
@@ -4546,23 +4617,6 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
 
         header = parsedHeader;
         return true;
-    }
-
-    private static string? BuildRecoveryIdentity(
-        Guid? partitionUniqueGuid,
-        ApfsContainerHeader containerHeader,
-        bool allowPartitionlessIdentity)
-    {
-        if (!containerHeader.IdentityMetadataTrusted)
-        {
-            return null;
-        }
-
-        return BuildRecoveryIdentityFromComponents(
-            partitionUniqueGuid,
-            containerHeader.ContainerUuid,
-            containerHeader.FirstVolumeObjectId,
-            allowPartitionlessIdentity);
     }
 
     private static string? BuildRecoveryIdentityFromComponents(
@@ -5087,6 +5141,72 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         };
 
         return candidates.FirstOrDefault(File.Exists);
+    }
+
+    // Task-1 observer discovery seam. Fail-closed: any observer absence,
+    // failure, or malformed evidence yields null and legacy discovery stands.
+    internal ApfsTopologySnapshot? TryDiscoverTopologySnapshot(string devicePath, string profile)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(devicePath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(profile);
+        try
+        {
+            return RunObserverEvidenceOrThrow(devicePath, profile).Topology;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    internal ApfsObserverEvidence RunObserverEvidenceOrThrow(string devicePath, string profile)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(devicePath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(profile);
+        var observerPath = _nativeObserverPath.Value;
+        if (string.IsNullOrWhiteSpace(observerPath) || !File.Exists(observerPath))
+        {
+            throw new InvalidOperationException(
+                $"No native APFS observer is available for discovery target '{devicePath}'.");
+        }
+
+        var slug = NativeApfsObserver.BuildDeviceSlug(devicePath);
+        var arguments = NativeApfsObserver.BuildObserverArguments(devicePath, profile, slug);
+        var result = _observerRunner.Run(observerPath, arguments);
+        if (result.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"ApfsObserver.exe failed with exit code {result.ExitCode} for '{devicePath}': {result.StandardError.Trim()}");
+        }
+
+        if (string.IsNullOrWhiteSpace(result.StandardOutput))
+        {
+            throw new InvalidOperationException(
+                $"ApfsObserver.exe returned empty evidence for '{devicePath}': {result.StandardError.Trim()}");
+        }
+
+        try
+        {
+            return NativeApfsObserver.ParseAndValidateEvidence(result.StandardOutput);
+        }
+        catch (Exception ex) when (ex is not InvalidOperationException)
+        {
+            throw new InvalidOperationException(
+                $"ApfsObserver.exe emitted malformed evidence for '{devicePath}': {ex.Message}", ex);
+        }
+    }
+
+    internal static void AppendVolumeSelectorArguments(ProcessStartInfo psi, string volumeName, ulong? volumeObjectId)
+    {
+        ArgumentNullException.ThrowIfNull(psi);
+        ArgumentException.ThrowIfNullOrWhiteSpace(volumeName);
+        psi.ArgumentList.Add("--volume");
+        psi.ArgumentList.Add(volumeName);
+        if (volumeObjectId.HasValue && volumeObjectId.Value != 0)
+        {
+            psi.ArgumentList.Add("--volume-oid");
+            psi.ArgumentList.Add(volumeObjectId.Value.ToString(CultureInfo.InvariantCulture));
+        }
     }
 
     private static IReadOnlyList<string> BuildDeviceCandidates(ServiceHostOptions options)
@@ -8702,7 +8822,17 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
     private sealed record VolumeMountTarget(
         string DevicePath,
         ulong DeviceOffsetBytes,
-        string? RecoveryIdentity);
+        string? RecoveryIdentity,
+        ulong? VolumeObjectId = null,
+        string? ContainerUuidHex = null)
+    {
+        // Legacy 3-argument construction: source-, binary-, and
+        // reflection-arity-compatible with pre-catalog callers.
+        public VolumeMountTarget(string devicePath, ulong deviceOffsetBytes, string? recoveryIdentity)
+            : this(devicePath, deviceOffsetBytes, recoveryIdentity, null, null)
+        {
+        }
+    }
 
     private sealed record DiscoveredVolume(
         string VolumeName,
@@ -8710,7 +8840,18 @@ public sealed class NativeApfsBackend : IApfsBackend, IDisposable
         IReadOnlyList<string> WriteIncompatibilities,
         IReadOnlyList<string> WriteUnsupportedFeatures,
         string NativeVolumePath,
-        VolumeMountTarget MountTarget
+        VolumeMountTarget MountTarget,
+        CatalogAttachment? Catalog = null
+    );
+
+    // Legacy discovery entry with the identity components needed to rebuild
+    // the recovery identity once the catalog attachment is known.
+    private sealed record LegacyDiscoveredVolume(
+        string VolumeName,
+        ulong DeviceOffsetBytes,
+        Guid? PartitionUniqueGuid,
+        ApfsContainerHeader ContainerHeader,
+        bool AllowPartitionlessIdentity
     );
 
     private sealed record DiscoveredDevice(

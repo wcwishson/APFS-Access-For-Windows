@@ -217,5 +217,11 @@ public sealed record MountedVolumeDisplay(
     ulong WalApfsDurableSequence = 0,
     ulong WalCleanupSequence = 0,
     bool PendingDurability = false,
-    string HostOwnershipState = "unknown"
+    string HostOwnershipState = "unknown",
+    string? CatalogVolumeId = null,
+    string? CatalogContainerUuid = null,
+    ulong? CatalogVolumeObjectId = null,
+    ApfsCapabilityDecision? CatalogDecision = null,
+    IReadOnlyList<string>? CatalogReasons = null,
+    bool? CatalogAutoMountAllowed = null
 );

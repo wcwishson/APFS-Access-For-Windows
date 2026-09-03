@@ -905,7 +905,11 @@ public sealed class HostProcessGuardianTests
         {
             StartProcess = _ =>
             {
-                var child = StartLongRunningChild();
+                // The supplemental host must outlive the ~3s pre-remount phase
+                // yet still exit on its own for the release half below; the
+                // historical 4-count ping sat exactly on that edge and flaked
+                // (proven 2/12 failures on the unmodified tree).
+                var child = StartPingChild(8);
                 startedChildren.Add(child);
                 return child;
             },

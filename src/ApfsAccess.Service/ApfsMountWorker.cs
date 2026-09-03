@@ -2134,7 +2134,13 @@ public sealed class ApfsMountWorker : BackgroundService
                     mount.DirtyTransactionCount > 0 ||
                     mount.ShutdownDrainActive ||
                     mount.InFlightMutationCallbacks > 0,
-                HostOwnershipState: mount.HostProcessId > 0 ? "owned" : "unknown"))
+                HostOwnershipState: mount.HostProcessId > 0 ? "owned" : "unknown",
+                CatalogVolumeId: mount.CatalogVolumeId,
+                CatalogContainerUuid: mount.CatalogContainerUuid,
+                CatalogVolumeObjectId: mount.CatalogVolumeObjectId,
+                CatalogDecision: mount.CatalogDecision,
+                CatalogReasons: mount.CatalogReasons,
+                CatalogAutoMountAllowed: mount.CatalogAutoMountAllowed))
             .OrderBy(static volume => volume.MountPoint, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 

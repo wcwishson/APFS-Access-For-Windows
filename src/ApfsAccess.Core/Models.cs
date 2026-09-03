@@ -114,7 +114,13 @@ public sealed record VolumeInfo(
     IReadOnlyList<string>? WriteIncompatibilities = null,
     IReadOnlyList<string>? WriteUnsupportedFeatures = null,
     NativeWriteReadiness NativeWriteReadiness = NativeWriteReadiness.Unavailable,
-    string? RecoveryIdentity = null
+    string? RecoveryIdentity = null,
+    string? CatalogVolumeId = null,
+    string? CatalogContainerUuid = null,
+    ulong? CatalogVolumeObjectId = null,
+    ApfsCapabilityDecision? CatalogDecision = null,
+    IReadOnlyList<string>? CatalogReasons = null,
+    bool? CatalogAutoMountAllowed = null
 );
 
 public sealed record MountRequest(string VolumeId, char DriveLetter, MountAccessMode AccessMode);
@@ -189,5 +195,11 @@ public sealed record MountedVolumeState(
     int HostProcessId = 0,
     ulong WalAcceptedSequence = 0,
     ulong WalApfsDurableSequence = 0,
-    ulong WalCleanupSequence = 0
+    ulong WalCleanupSequence = 0,
+    string? CatalogVolumeId = null,
+    string? CatalogContainerUuid = null,
+    ulong? CatalogVolumeObjectId = null,
+    ApfsCapabilityDecision? CatalogDecision = null,
+    IReadOnlyList<string>? CatalogReasons = null,
+    bool? CatalogAutoMountAllowed = null
 );

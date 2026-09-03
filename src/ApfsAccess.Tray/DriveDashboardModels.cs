@@ -34,5 +34,8 @@ public sealed record DriveDashboardRow(
     bool CanEject,
     bool CanFix,
     IReadOnlyList<string> Details,
-    IReadOnlyList<string> FixGuidance
+    IReadOnlyList<string> FixGuidance,
+    string? CatalogVolumeId = null,
+    string? CatalogContainerUuid = null,
+    ulong? CatalogVolumeObjectId = null
 );
