@@ -1,0 +1,548 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apfsaccess.local/schemas/compatibility-manifest-v1.json",
+  "title": "APFS compatibility fixture manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "fixtureId",
+    "profile",
+    "macOS",
+    "features",
+    "topology",
+    "mountPolicies",
+    "credentials",
+    "observation",
+    "content",
+    "artifacts",
+    "corruption",
+    "fusion",
+    "sha256",
+    "expectedManifest"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "fixtureId": { "$ref": "#/$defs/name" },
+    "profile": {
+      "enum": [
+        "single-volume",
+        "multi-volume",
+        "case-sensitive",
+        "case-insensitive",
+        "unicode",
+        "incompatible-names",
+        "links",
+        "acl-xattrs",
+        "resource-forks",
+        "compression",
+        "sparse-files",
+        "clones",
+        "snapshots",
+        "volume-groups",
+        "password-encryption",
+        "backup-role",
+        "corruption",
+        "fusion"
+      ]
+    },
+    "macOS": { "$ref": "#/$defs/macOS" },
+    "features": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/name" }
+    },
+    "topology": { "$ref": "#/$defs/topology" },
+    "mountPolicies": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/mountPolicy" }
+    },
+    "credentials": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/credential" }
+    },
+    "observation": { "$ref": "#/$defs/observation" },
+    "content": { "$ref": "#/$defs/content" },
+    "artifacts": {
+      "type": "array",
+      "minItems": 2,
+      "items": { "$ref": "#/$defs/artifact" }
+    },
+    "corruption": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": [
+        "sourceArtifactId",
+        "targetArtifactId",
+        "mutationOffsetBytes",
+        "beforeSha256",
+        "afterSha256",
+        "sourceMode",
+        "sourceFlags"
+      ],
+      "properties": {
+        "sourceArtifactId": { "$ref": "#/$defs/id" },
+        "targetArtifactId": { "$ref": "#/$defs/id" },
+        "mutationOffsetBytes": { "type": "integer", "minimum": 0 },
+        "beforeSha256": { "$ref": "#/$defs/sha256" },
+        "afterSha256": { "$ref": "#/$defs/sha256" },
+        "sourceMode": { "type": "integer", "minimum": 0 },
+        "sourceFlags": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/name" }
+        }
+      }
+    },
+    "fusion": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["containerId", "memberStoreIds", "artifactIds"],
+      "properties": {
+        "containerId": { "$ref": "#/$defs/id" },
+        "memberStoreIds": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "artifactIds": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        }
+      }
+    },
+    "sha256": { "$ref": "#/$defs/sha256" },
+    "expectedManifest": { "$ref": "#/$defs/artifactPath" }
+  },
+  "$defs": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z]+:[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "featureBits": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^0x[0-9A-Fa-f]+$"
+      }
+    },
+    "idArray": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/id" }
+    },
+    "contentPath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+    },
+    "artifactPath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
+    },
+    "macOS": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "build"],
+      "properties": {
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$"
+        },
+        "build": {
+          "type": "string",
+          "pattern": "^[0-9]{2}[A-Z][0-9A-Z]+$"
+        }
+      }
+    },
+    "observedIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "uuid", "evidenceArtifactId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "evidenceArtifactId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "disk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "deviceIdentifier", "uuid", "sizeBytes", "evidenceArtifactId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "deviceIdentifier": { "$ref": "#/$defs/name" },
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "sizeBytes": { "type": "integer", "minimum": 1 },
+        "evidenceArtifactId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "partition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "uuid", "diskId", "index", "startByte", "sizeBytes", "evidenceArtifactId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "diskId": { "$ref": "#/$defs/id" },
+        "index": { "type": "integer", "minimum": 1 },
+        "startByte": { "type": "integer", "minimum": 0 },
+        "sizeBytes": { "type": "integer", "minimum": 1 },
+        "evidenceArtifactId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "store": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "uuid", "partitionId", "containerId", "artifactId", "sizeBytes", "evidenceArtifactId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "partitionId": { "$ref": "#/$defs/id" },
+        "containerId": { "$ref": "#/$defs/id" },
+        "artifactId": { "$ref": "#/$defs/id" },
+        "sizeBytes": { "type": "integer", "minimum": 1 },
+        "evidenceArtifactId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "container": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "uuid",
+        "blockSizeBytes",
+        "storeIds",
+        "volumeIds",
+        "fusion",
+        "compatibleFeatureBits",
+        "unknownFeatureBits",
+        "incompatibleFeatureBits",
+        "evidenceArtifactId"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "blockSizeBytes": { "type": "integer", "minimum": 512 },
+        "storeIds": { "$ref": "#/$defs/idArray" },
+        "volumeIds": { "$ref": "#/$defs/idArray" },
+        "fusion": { "type": "boolean" },
+        "compatibleFeatureBits": { "$ref": "#/$defs/featureBits" },
+        "unknownFeatureBits": { "$ref": "#/$defs/featureBits" },
+        "incompatibleFeatureBits": { "$ref": "#/$defs/featureBits" },
+        "evidenceArtifactId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "volume": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "uuid",
+        "objectId",
+        "containerId",
+        "name",
+        "roles",
+        "groupId",
+        "caseMode",
+        "encryptionMode",
+        "locked",
+        "compatibleFeatureBits",
+        "unknownFeatureBits",
+        "incompatibleFeatureBits",
+        "evidenceArtifactId"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "objectId": { "type": "string", "pattern": "^[0-9]+$" },
+        "containerId": { "$ref": "#/$defs/id" },
+        "name": { "type": "string", "minLength": 1 },
+        "roles": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "data",
+              "system",
+              "preboot",
+              "recovery",
+              "vm",
+              "update",
+              "backup",
+              "installer",
+              "xart",
+              "hardware",
+              "enterprise",
+              "prelogin",
+              "reserved"
+            ]
+          }
+        },
+        "groupId": { "type": ["string", "null"], "pattern": "^[a-z]+:[A-Za-z0-9][A-Za-z0-9._-]*$" },
+        "caseMode": { "enum": ["sensitive", "insensitive"] },
+        "encryptionMode": { "enum": ["none", "password", "hardware-bound"] },
+        "locked": { "type": "boolean" },
+        "compatibleFeatureBits": { "$ref": "#/$defs/featureBits" },
+        "unknownFeatureBits": { "$ref": "#/$defs/featureBits" },
+        "incompatibleFeatureBits": { "$ref": "#/$defs/featureBits" },
+        "evidenceArtifactId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "uuid", "volumeIds", "evidenceArtifactId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "volumeIds": { "$ref": "#/$defs/idArray" },
+        "evidenceArtifactId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["disks", "partitions", "stores", "containers", "volumes", "groups"],
+      "properties": {
+        "disks": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/disk" } },
+        "partitions": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/partition" } },
+        "stores": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/store" } },
+        "containers": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/container" } },
+        "volumes": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/volume" } },
+        "groups": { "type": "array", "items": { "$ref": "#/$defs/group" } }
+      }
+    },
+    "mountPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["volumeId", "requestedAccess", "decision", "autoMount", "reasons"],
+      "properties": {
+        "volumeId": { "$ref": "#/$defs/id" },
+        "requestedAccess": { "enum": ["read-only", "read-write"] },
+        "decision": { "enum": ["read-only", "read-write", "unsupported"] },
+        "autoMount": { "type": "boolean" },
+        "reasons": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "credential": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["volumeId", "externalReference"],
+      "properties": {
+        "volumeId": { "$ref": "#/$defs/id" },
+        "externalReference": {
+          "type": "string",
+          "pattern": "^keychain:[A-Za-z0-9][A-Za-z0-9._/-]*$"
+        }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "version", "observerId", "observerVersion", "mode", "evidenceArtifactId", "recordSha256"],
+      "properties": {
+        "format": { "const": "apfs-access-raw-evidence" },
+        "version": { "const": 1 },
+        "observerId": { "const": "apfs-access-owned-raw-observer" },
+        "observerVersion": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+$" },
+        "mode": { "enum": ["collect", "fusion"] },
+        "evidenceArtifactId": { "$ref": "#/$defs/id" },
+        "recordSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "volumeId", "path", "sha256", "sizeBytes", "metadataId", "xattrIds", "extentIds", "linkIds", "cloneId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "volumeId": { "$ref": "#/$defs/id" },
+        "path": { "$ref": "#/$defs/contentPath" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "sizeBytes": { "type": "integer", "minimum": 0 },
+        "metadataId": { "$ref": "#/$defs/id" },
+        "xattrIds": { "$ref": "#/$defs/idArray" },
+        "extentIds": { "$ref": "#/$defs/idArray" },
+        "linkIds": { "$ref": "#/$defs/idArray" },
+        "cloneId": { "type": ["string", "null"], "pattern": "^[a-z]+:[A-Za-z0-9][A-Za-z0-9._-]*$" }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "fileId", "inode", "mode", "uid", "gid", "nlink", "logicalSizeBytes", "allocatedSizeBytes", "flags", "evidenceArtifactId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "fileId": { "$ref": "#/$defs/id" },
+        "inode": { "type": "integer", "minimum": 1 },
+        "mode": { "type": "integer", "minimum": 0 },
+        "uid": { "type": "integer", "minimum": 0 },
+        "gid": { "type": "integer", "minimum": 0 },
+        "nlink": { "type": "integer", "minimum": 1 },
+        "logicalSizeBytes": { "type": "integer", "minimum": 0 },
+        "allocatedSizeBytes": { "type": "integer", "minimum": 0 },
+        "flags": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/name" } },
+        "evidenceArtifactId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "acl": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "fileId", "entryCount", "entriesSha256", "evidenceArtifactId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "fileId": { "$ref": "#/$defs/id" },
+        "entryCount": { "type": "integer", "minimum": 1 },
+        "entriesSha256": { "$ref": "#/$defs/sha256" },
+        "evidenceArtifactId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "xattr": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "fileId", "name", "sizeBytes", "sha256", "evidenceArtifactId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "fileId": { "$ref": "#/$defs/id" },
+        "name": { "type": "string", "minLength": 1 },
+        "sizeBytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "evidenceArtifactId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "resourceFork": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "fileId", "sizeBytes", "sha256", "evidenceArtifactId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "fileId": { "$ref": "#/$defs/id" },
+        "sizeBytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "evidenceArtifactId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "compression": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "fileId", "algorithm", "logicalSizeBytes", "allocatedSizeBytes", "evidenceArtifactId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "fileId": { "$ref": "#/$defs/id" },
+        "algorithm": { "$ref": "#/$defs/name" },
+        "logicalSizeBytes": { "type": "integer", "minimum": 0 },
+        "allocatedSizeBytes": { "type": "integer", "minimum": 0 },
+        "evidenceArtifactId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "extent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "fileIds", "logicalOffset", "lengthBytes", "physicalOffset", "kind", "refCount", "evidenceArtifactId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "fileIds": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "logicalOffset": { "type": "integer", "minimum": 0 },
+        "lengthBytes": { "type": "integer", "minimum": 1 },
+        "physicalOffset": { "type": ["integer", "null"], "minimum": 0 },
+        "kind": { "enum": ["data", "hole"] },
+        "refCount": { "type": "integer", "minimum": 1 },
+        "evidenceArtifactId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "link": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "sourceFileId", "targetFileId", "targetPath", "evidenceArtifactId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["hard", "symbolic"] },
+        "sourceFileId": { "$ref": "#/$defs/id" },
+        "targetFileId": { "type": ["string", "null"], "pattern": "^[a-z]+:[A-Za-z0-9][A-Za-z0-9._-]*$" },
+        "targetPath": { "type": ["string", "null"], "minLength": 1 },
+        "evidenceArtifactId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "clone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sourceFileId", "cloneFileId", "sharedExtentIds", "evidenceArtifactId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "sourceFileId": { "$ref": "#/$defs/id" },
+        "cloneFileId": { "$ref": "#/$defs/id" },
+        "sharedExtentIds": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "evidenceArtifactId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "volumeId", "uuid", "name", "xid", "evidenceArtifactId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "volumeId": { "$ref": "#/$defs/id" },
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "name": { "type": "string", "minLength": 1 },
+        "xid": { "type": "string", "pattern": "^[0-9]+$" },
+        "evidenceArtifactId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["files", "metadata", "acls", "xattrs", "resourceForks", "compression", "extents", "links", "clones", "snapshots"],
+      "properties": {
+        "files": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/file" } },
+        "metadata": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/metadata" } },
+        "acls": { "type": "array", "items": { "$ref": "#/$defs/acl" } },
+        "xattrs": { "type": "array", "items": { "$ref": "#/$defs/xattr" } },
+        "resourceForks": { "type": "array", "items": { "$ref": "#/$defs/resourceFork" } },
+        "compression": { "type": "array", "items": { "$ref": "#/$defs/compression" } },
+        "extents": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/extent" } },
+        "links": { "type": "array", "items": { "$ref": "#/$defs/link" } },
+        "clones": { "type": "array", "items": { "$ref": "#/$defs/clone" } },
+        "snapshots": { "type": "array", "items": { "$ref": "#/$defs/snapshot" } }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "path", "kind", "storage", "sha256", "sizeBytes", "readOnly", "storeId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "path": { "$ref": "#/$defs/artifactPath" },
+        "kind": { "enum": ["sparse-image", "raw-store", "diskutil-output", "observer-output", "corruption-source", "corruption-target"] },
+        "storage": { "const": "destination" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "sizeBytes": { "type": "integer", "minimum": 1 },
+        "readOnly": { "const": true },
+        "storeId": { "type": ["string", "null"], "pattern": "^[a-z]+:[A-Za-z0-9][A-Za-z0-9._-]*$" }
+      }
+    }
+  }
+}
