@@ -229,6 +229,74 @@ public sealed class CompatibilityCorpusContractTests
     }
 
     [Fact]
+    public async Task ProbeSymlink_CreatesFileDirectoryAndDanglingLinks()
+    {
+        var root = ScratchPath($"probe-symlinks-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var target = Path.Combine(root, "target.txt");
+        await File.WriteAllTextAsync(target, "probe");
+        var dirTarget = Path.Combine(root, "realdir");
+        Directory.CreateDirectory(dirTarget);
+        var missing = Path.Combine(root, "missing.txt");
+        var fileLink = Path.Combine(root, "file-link");
+        var dirLink = Path.Combine(root, "dir-link");
+        var danglingLink = Path.Combine(root, "dangling-link");
+        var script = BashQuote(ToBashPath(RepoFile("scripts/create_apfs_compatibility_fixtures.sh")));
+
+        var result = await RunBashAsync([
+            "-c",
+            $"source {script} && " +
+            $"make_probe_symlink file {BashQuote(ToBashPath(target))} {BashQuote(ToBashPath(fileLink))} && " +
+            $"make_probe_symlink dir {BashQuote(ToBashPath(dirTarget))} {BashQuote(ToBashPath(dirLink))} && " +
+            $"make_probe_symlink dangling {BashQuote(ToBashPath(missing))} {BashQuote(ToBashPath(danglingLink))}"
+        ], timeout: TimeSpan.FromSeconds(60));
+
+        Assert.True(result.ExitCode == 0, result.StdErr);
+        Assert.Equal(CanonicalLinkTarget(target), CanonicalLinkTarget(new FileInfo(fileLink).LinkTarget));
+        Assert.Equal(CanonicalLinkTarget(dirTarget), CanonicalLinkTarget(new DirectoryInfo(dirLink).LinkTarget));
+        Assert.Equal(CanonicalLinkTarget(missing), CanonicalLinkTarget(new FileInfo(danglingLink).LinkTarget));
+    }
+
+    private static string? CanonicalLinkTarget(string? target)
+    {
+        // Windows may report symlink targets in extended-length (\\?\) form.
+        if (target is null)
+        {
+            return null;
+        }
+
+        var canonical = target.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+        const string extendedPrefix = @"\\?\";
+        if (canonical.StartsWith(extendedPrefix, StringComparison.Ordinal))
+        {
+            canonical = canonical[extendedPrefix.Length..];
+        }
+
+        return canonical;
+    }
+
+    [Fact]
+    public async Task ProbeSymlink_RefusesOrdinaryDestination()
+    {
+        var root = ScratchPath($"probe-symlink-refusal-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var target = Path.Combine(root, "target.txt");
+        await File.WriteAllTextAsync(target, "probe");
+        var occupied = Path.Combine(root, "occupied.txt");
+        await File.WriteAllTextAsync(occupied, "ordinary file, not a link");
+        var script = BashQuote(ToBashPath(RepoFile("scripts/create_apfs_compatibility_fixtures.sh")));
+
+        var result = await RunBashAsync([
+            "-c",
+            $"source {script} && make_probe_symlink file {BashQuote(ToBashPath(target))} {BashQuote(ToBashPath(occupied))}"
+        ], timeout: TimeSpan.FromSeconds(60));
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("not a symlink", result.StdErr, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(new FileInfo(occupied).LinkTarget);
+    }
+
+    [Fact]
     public async Task Validator_RejectsFusionMissingObservedMember()
     {
         await AssertRejectedAsync(
@@ -290,6 +358,50 @@ public sealed class CompatibilityCorpusContractTests
         await AssertRejectedAsync(
             manifest => manifest["observation"]!["recordSha256"] = new string('e', 64),
             "observation hash");
+    }
+
+    [Fact]
+    public async Task SelfTest_LateFailureRemovesSelfTestRoot()
+    {
+        var tempRoot = ScratchPath("temp");
+        Directory.CreateDirectory(tempRoot);
+        var beforeRoots = SelfTestRoots(tempRoot);
+        var beforeStaging = StagingEntries(tempRoot);
+        var extraEnvironment = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["APFS_SELF_TEST_FAIL_AT"] = "late-probes"
+        };
+
+        var result = await RunScriptAsync(["--self-test"], timeout: TimeSpan.FromMinutes(10), extraEnvironment: extraEnvironment);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("injected self-test failure", result.StdErr, StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(SelfTestRoots(tempRoot).Except(beforeRoots, StringComparer.OrdinalIgnoreCase));
+        Assert.Empty(StagingEntries(tempRoot).Except(beforeStaging, StringComparer.OrdinalIgnoreCase));
+    }
+
+    private static HashSet<string> SelfTestRoots(string tempRoot)
+    {
+        try
+        {
+            return new HashSet<string>(Directory.GetDirectories(tempRoot, "apfs-compat-self-test.*"), StringComparer.OrdinalIgnoreCase);
+        }
+        catch (Exception exception) when (exception is IOException || exception is UnauthorizedAccessException)
+        {
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    private static HashSet<string> StagingEntries(string tempRoot)
+    {
+        try
+        {
+            return new HashSet<string>(Directory.EnumerateFileSystemEntries(tempRoot, "*.task0.*", SearchOption.AllDirectories), StringComparer.OrdinalIgnoreCase);
+        }
+        catch (Exception exception) when (exception is IOException || exception is UnauthorizedAccessException)
+        {
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
     }
 
     [Fact]
@@ -541,17 +653,19 @@ public sealed class CompatibilityCorpusContractTests
     private static async Task<ScriptResult> RunScriptAsync(
         IReadOnlyList<string> arguments,
         string? standardInput = null,
-        TimeSpan? timeout = null)
+        TimeSpan? timeout = null,
+        IDictionary<string, string>? extraEnvironment = null)
     {
         var bashArguments = new List<string> { "scripts/create_apfs_compatibility_fixtures.sh" };
         bashArguments.AddRange(arguments);
-        return await RunBashAsync(bashArguments, standardInput, timeout);
+        return await RunBashAsync(bashArguments, standardInput, timeout, extraEnvironment);
     }
 
     private static async Task<ScriptResult> RunBashAsync(
         IReadOnlyList<string> arguments,
         string? standardInput = null,
-        TimeSpan? timeout = null)
+        TimeSpan? timeout = null,
+        IDictionary<string, string>? extraEnvironment = null)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -575,6 +689,13 @@ public sealed class CompatibilityCorpusContractTests
         startInfo.Environment["TEMP"] = scriptTemp;
         startInfo.Environment["TMP"] = scriptTemp;
         startInfo.Environment["TMPDIR"] = ToBashPath(scriptTemp);
+        if (extraEnvironment is not null)
+        {
+            foreach (var entry in extraEnvironment)
+            {
+                startInfo.Environment[entry.Key] = entry.Value;
+            }
+        }
 
         using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("Unable to start Bash.");
         if (standardInput is not null)
@@ -623,6 +744,9 @@ public sealed class CompatibilityCorpusContractTests
 
     private static string RepoFile(string relativePath)
         => Path.Combine(RepoRoot(), relativePath.Replace('/', Path.DirectorySeparatorChar));
+
+    private static string BashQuote(string value)
+        => "'" + value.Replace("'", "'\\''", StringComparison.Ordinal) + "'";
 
     private static string ToBashPath(string path)
     {

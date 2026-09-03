@@ -613,6 +613,76 @@ remove_tree() {
     command rm -rf "$target"
 }
 
+make_probe_symlink() {
+    local kind="$1" target="$2" link="$3"
+    log_command probe-symlink "$kind" "$target" "$link"
+    python3 - "$kind" "$target" "$link" <<'PY'
+import os
+import stat
+import sys
+import time
+
+kind, target, link = sys.argv[1], sys.argv[2], sys.argv[3]
+if kind not in ("file", "dir", "dangling"):
+    raise SystemExit("unknown probe symlink kind: %s" % kind)
+
+
+def canonical_target(text):
+    # Windows stores forward-slash targets in extended-length form, so the
+    # readlink result is compared canonically rather than byte-for-byte.
+    value = os.path.normcase(os.path.abspath(text))
+    prefix = os.path.normcase("\\\\?\\")
+    if value.startswith(prefix):
+        value = value[len(prefix):]
+    return value
+
+
+def link_ready():
+    try:
+        metadata = os.lstat(link)
+        if not stat.S_ISLNK(metadata.st_mode):
+            return False
+        return canonical_target(os.readlink(link)) == canonical_target(target)
+    except OSError:
+        return False
+
+
+try:
+    preexisting = os.lstat(link)
+    if not stat.S_ISLNK(preexisting.st_mode):
+        raise SystemExit("probe destination is not a symlink: %s" % link)
+except OSError:
+    pass
+
+# Symlink creation can fail transiently on locked-down Windows hosts even
+# though a retry succeeds, so probe setup retries on a bounded backoff and
+# still fails closed when the exact link never materializes.
+attempts = 5
+created = link_ready()
+for attempt in range(attempts):
+    if created:
+        break
+    try:
+        os.symlink(target, link, target_is_directory=(kind == "dir"))
+    except OSError:
+        pass
+    created = link_ready()
+    if not created:
+        time.sleep(0.2 * (attempt + 1))
+if not created:
+    parent = os.path.dirname(link)
+    raise SystemExit(
+        "probe symlink was not created after %d attempts: %s "
+        "(parent exists: %s; link present: %s)" % (
+            attempts, link, os.path.isdir(parent), os.path.lexists(link)))
+if kind == "dangling":
+    if os.path.lexists(target):
+        raise SystemExit("dangling probe target unexpectedly exists: %s" % target)
+elif not os.path.exists(target):
+    raise SystemExit("probe symlink target is missing: %s" % target)
+PY
+}
+
 assert_no_staging_leftovers() {
     local scope="$1"
     local prefix="$2"
@@ -890,6 +960,11 @@ cleanup() {
     fi
     if [[ -n "$destination_lock" && -d "$destination_lock" ]]; then
         command rmdir "$destination_lock" 2>/dev/null || true
+    fi
+    if [[ "$BASH_SUBSHELL" -eq 0 && "${generation_owner:-standalone}" == 'self-test' && -n "${test_self_root:-}" && -d "$test_self_root" ]]; then
+        command chmod -R u+w "$test_self_root" 2>/dev/null || true
+        command rm -rf "$test_self_root" 2>/dev/null || true
+        test_self_root=''
     fi
 }
 
@@ -1513,7 +1588,11 @@ PY
     command rmdir "$destination_lock"
     destination_lock=''
     stage_root=''
-    trap - EXIT INT TERM
+    if [[ "${generation_owner:-standalone}" != 'self-test' ]]; then
+        trap - EXIT INT TERM
+    fi
+    # Under self-test ownership the cleanup trap stays armed: it owns
+    # test_self_root removal on every later failure, signal, or exception path.
 }
 
 parse_arguments() {
@@ -1575,8 +1654,21 @@ prepare_generation() {
     fi
 }
 
+self_test_checkpoint() {
+    if [[ "${APFS_SELF_TEST_FAIL_AT:-}" == "$1" ]]; then
+        self_test_fail_consumed=1
+        die "injected self-test failure at $1"
+    fi
+}
+
 run_self_test() {
     test_mode=1
+    test_self_root=''
+    generation_owner='self-test'
+    self_test_fail_consumed=0
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     test_self_root="$(mktemp -d "${TMPDIR:-/tmp}/apfs-compat-self-test.XXXXXXXX")"
     test_command_log="$test_self_root/commands.log"
     : >"$test_command_log"
@@ -1630,11 +1722,7 @@ PY
     local dangling_destination="$test_self_root/dangling-destination"
     command mkdir "$dangling_source"
     printf 'source-survives\n' >"$dangling_source/sentinel.txt"
-    python3 - "$test_self_root/missing-destination-target" "$dangling_destination" <<'PY'
-import os
-import sys
-os.symlink(sys.argv[1], sys.argv[2])
-PY
+    make_probe_symlink dangling "$test_self_root/missing-destination-target" "$dangling_destination"
     if atomic_move_no_replace "$dangling_source" "$dangling_destination" >/dev/null 2>&1; then
         die 'atomic no-replace publication replaced a dangling destination'
     fi
@@ -1644,14 +1732,8 @@ PY
     command mkdir -p "$output_link_root/evidence" "$output_link_root/manifests" "$output_link_root/external"
     printf '{}\n' >"$output_link_root/external/evidence.json"
     printf '{}\n' >"$output_link_root/external/manifest.json"
-    python3 - "$output_link_root" <<'PY'
-import os
-import pathlib
-import sys
-root = pathlib.Path(sys.argv[1])
-os.symlink(root / "external/evidence.json", root / "evidence/profile-observer.json")
-os.symlink(root / "external/manifest.json", root / "manifests/profile.draft.json")
-PY
+    make_probe_symlink file "$output_link_root/external/evidence.json" "$output_link_root/evidence/profile-observer.json"
+    make_probe_symlink file "$output_link_root/external/manifest.json" "$output_link_root/manifests/profile.draft.json"
     if require_regular_file_nofollow "$output_link_root/evidence/profile-observer.json" "$output_link_root/evidence" >/dev/null 2>&1; then
         die 'symlinked observer evidence unexpectedly passed no-follow validation'
     fi
@@ -1789,6 +1871,7 @@ PY
     if validate_manifest "$envelope_manifest" "$envelope_root" >/dev/null 2>&1; then
         die 'manifest with a mismatched evidence envelope unexpectedly succeeded'
     fi
+    self_test_checkpoint after-authority
 
     local fusion_unrelated="$test_self_root/fusion-unrelated-probe.json"
     copy_file "$destination/manifests/fusion.json" "$fusion_unrelated"
@@ -1833,6 +1916,7 @@ PY
         die 'same-file fusion inputs unexpectedly passed distinct-file validation'
     fi
     remove_file "$alias_input"
+    self_test_checkpoint after-fusion
 
     local portable_probe_root="$test_self_root/portable-depth-probe"
     command mkdir -p "$portable_probe_root/.portable-depth.task0.probe"
@@ -1846,16 +1930,11 @@ PY
     local parent_link_root="$test_self_root/output-parent-probes"
     command mkdir -p "$parent_link_root/real-evidence" "$parent_link_root/manifests"
     printf 'evidence\n' >"$parent_link_root/real-evidence/profile-observer.json"
-    python3 - "$parent_link_root" <<'PY'
-import os
-import pathlib
-import sys
-root = pathlib.Path(sys.argv[1])
-os.symlink(root / "real-evidence", root / "evidence")
-PY
+    make_probe_symlink dir "$parent_link_root/real-evidence" "$parent_link_root/evidence"
     if require_regular_file_nofollow "$parent_link_root/evidence/profile-observer.json" "$parent_link_root/evidence" >/dev/null 2>&1; then
         die 'symlinked output parent unexpectedly passed no-follow validation'
     fi
+    self_test_checkpoint after-parent-probe
 
     local missing_manifest="$test_self_root/missing-observation.json"
     copy_file "$destination/manifests/single-volume.json" "$missing_manifest"
@@ -1876,9 +1955,9 @@ PY
 
     local symlink_root="$test_self_root/symlink-corpus"
     local symlink_manifest="$test_self_root/symlink-manifest.json"
-    python3 - "$destination" "$symlink_root" "$symlink_manifest" <<'PY'
+    local symlink_pairs="$test_self_root/symlink-pairs.tsv"
+    python3 - "$destination" "$symlink_root" "$symlink_manifest" >"$symlink_pairs" <<'PY'
 import json
-import os
 import pathlib
 import shutil
 import sys
@@ -1891,14 +1970,26 @@ for artifact in data["artifacts"]:
     target_file = target / artifact["path"]
     target_file.parent.mkdir(parents=True, exist_ok=True)
     if artifact["id"] == "artifact:image":
-        os.symlink(source_file, target_file)
+        print(str(source_file) + "\t" + str(target_file))
     else:
         shutil.copy2(source_file, target_file)
 manifest_path.write_text(json.dumps(data, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 PY
+    local pair_source pair_target
+    while IFS=$'\t' read -r pair_source pair_target || [[ -n "$pair_source" ]]; do
+        # Python stdout uses CRLF on Windows; strip the carriage return so the
+        # leaf path handed to the no-follow helper is exact.
+        pair_target="${pair_target%$'\r'}"
+        [[ -n "$pair_source" && -n "$pair_target" ]] || continue
+        make_probe_symlink file "$pair_source" "$pair_target"
+    done <"$symlink_pairs"
+    remove_file "$symlink_pairs"
     if validate_manifest "$symlink_manifest" "$symlink_root" >/dev/null 2>&1; then
         die 'symlink-bearing artifact path unexpectedly succeeded'
     fi
+    self_test_checkpoint late-probes
+
+    [[ -z "${APFS_SELF_TEST_FAIL_AT:-}" || "$self_test_fail_consumed" -eq 1 ]] || die "unconsumed self-test failure injection: $APFS_SELF_TEST_FAIL_AT"
 
     printf 'SELF-TEST PASS: 18 generated profiles\n'
     printf 'SELF-TEST PASS: authoritative observations enforced\n'
@@ -1923,6 +2014,9 @@ PY
     stage_root=''
     command chmod -R u+w "$test_self_root"
     command rm -rf "$test_self_root"
+    test_self_root=''
+    generation_owner='standalone'
+    trap - EXIT INT TERM
 }
 
 main() {
@@ -1941,4 +2035,6 @@ main() {
     run_generation
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
