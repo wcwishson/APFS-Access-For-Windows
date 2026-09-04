@@ -51,7 +51,7 @@ public sealed class CatalogFixtureWriterTests
                         [
                             new CatalogVolumeSpec(
                                 Name: "Data",
-                                Role: 32,
+                                Role: 0x40,
                                 VolumeUuid: volumeGuid,
                                 FsFlags: 0x1,
                                 Features: 0x1),
@@ -66,7 +66,7 @@ public sealed class CatalogFixtureWriterTests
         Assert.Equal(1, part.Index);
         Assert.Equal(partitionGuid, part.PartitionUuid);
         Assert.Equal(4096L, part.StartByte);
-        Assert.Equal((4 + 1 + 8) * BlockSize, part.SizeBytes);
+        Assert.Equal(22 * BlockSize, part.SizeBytes);
         Assert.Equal(containerGuid, part.ContainerUuid);
         Assert.Equal(7UL, part.CheckpointXid);
         var vol = Assert.Single(part.Volumes);
@@ -85,7 +85,7 @@ public sealed class CatalogFixtureWriterTests
         Assert.Equal(1UL, ReadU64(image, 512 + 24));
         Assert.Equal(32767UL, ReadU64(image, 512 + 32));
         Assert.Equal(8UL, ReadU64(image, 512 + 40));
-        Assert.Equal(111UL, ReadU64(image, 512 + 48));
+        Assert.Equal(183UL, ReadU64(image, 512 + 48));
         Assert.Equal(diskGuid.ToByteArray(), image.AsSpan(512 + 56, 16).ToArray());
         Assert.Equal(2UL, ReadU64(image, 512 + 72));
         Assert.Equal(1u, ReadU32(image, 512 + 80));
@@ -97,30 +97,29 @@ public sealed class CatalogFixtureWriterTests
         Assert.Equal(ExpectedApfsTypeGuidBytes, image.AsSpan(entry, 16).ToArray());
         Assert.Equal(partitionGuid.ToByteArray(), image.AsSpan(entry + 16, 16).ToArray());
         Assert.Equal(8UL, ReadU64(image, entry + 32));
-        Assert.Equal(111UL, ReadU64(image, entry + 40));
+        Assert.Equal(183UL, ReadU64(image, entry + 40));
         Assert.Equal(0UL, ReadU64(image, entry + 48));
         Assert.Equal("TestContainer", Encoding.Unicode.GetString(image.AsSpan(entry + 56, 26).ToArray()));
 
-        // Dual NXSB checkpoints: identical bytes when xids match, valid checksums.
+        // The block-zero NXSB anchors ring geometry; the selected NXSB is the
+        // second object in the descriptor generation at block 12.
         var nx0 = (int)part.StartByte;
-        var nx1 = nx0 + BlockSize;
-        Assert.Equal(
-            image.AsSpan(nx0, BlockSize).ToArray(),
-            image.AsSpan(nx1, BlockSize).ToArray());
-        foreach (var nx in new[] { nx0, nx1 })
+        var selectedNx = nx0 + 12 * BlockSize;
+        foreach (var nx in new[] { nx0, selectedNx })
         {
             AssertValidFletcher64(image, nx);
             Assert.Equal(1UL, ReadU64(image, nx + 8));
-            Assert.Equal(7UL, ReadU64(image, nx + 16));
             Assert.Equal(1u, ReadU32(image, nx + 24));
             Assert.Equal(0u, ReadU32(image, nx + 28));
             Assert.Equal(0x4253584Eu, ReadU32(image, nx + 32));
             Assert.Equal(4096u, ReadU32(image, nx + 36));
-            Assert.Equal(13UL, ReadU64(image, nx + 40));
+            Assert.Equal(22UL, ReadU64(image, nx + 40));
             Assert.Equal(containerGuid.ToByteArray(), image.AsSpan(nx + 72, 16).ToArray());
             Assert.Equal(2UL, ReadU64(image, nx + 160));
             Assert.Equal(101UL, ReadU64(image, nx + 184));
         }
+        Assert.Equal(6UL, ReadU64(image, nx0 + 16));
+        Assert.Equal(7UL, ReadU64(image, selectedNx + 16));
 
         // OMAP object @ block 2.
         var omap = nx0 + 2 * BlockSize;
@@ -138,8 +137,8 @@ public sealed class CatalogFixtureWriterTests
         Assert.Equal(1u, ReadU32(image, btree + 36));
         Assert.Equal(0u, ReadU16(image, btree + 40));
         Assert.Equal(8u, ReadU16(image, btree + 42));
-        Assert.Equal(0u, ReadU16(image, btree + 44));
-        Assert.Equal(0u, ReadU16(image, btree + 46));
+        Assert.Equal(16u, ReadU16(image, btree + 44));
+        Assert.Equal(3960u, ReadU16(image, btree + 46));
         // Entry: key @ keys area, value measured backward from 4056.
         Assert.Equal(0u, ReadU16(image, btree + 56));
         Assert.Equal(16u, ReadU16(image, btree + 58));
@@ -167,11 +166,135 @@ public sealed class CatalogFixtureWriterTests
         Assert.NotEqual(0UL, ReadU64(image, apsb + 136));
         Assert.Equal(volumeGuid.ToByteArray(), image.AsSpan(apsb + 240, 16).ToArray());
         Assert.Equal(1UL, ReadU64(image, apsb + 264));
-        Assert.Equal("Data"u8.ToArray(), image.AsSpan(apsb + 288, 4).ToArray());
-        Assert.Equal(0, image[apsb + 292]);
-        Assert.Equal(32u, ReadU16(image, apsb + 548));
-        Assert.Equal(new byte[16], image.AsSpan(apsb + 552, 16).ToArray());
+        Assert.Equal("Data"u8.ToArray(), image.AsSpan(apsb + 0x2C0, 4).ToArray());
+        Assert.Equal(0, image[apsb + 0x2C4]);
+        Assert.Equal(0x40u, ReadU16(image, apsb + 0x3C4));
+        Assert.Equal(new byte[16], image.AsSpan(apsb + 0x3F0, 16).ToArray());
         Assert.Equal(0UL, ReadU64(image, apsb + 1032));
+    }
+
+    [Fact]
+    public void CreateCatalogFixture_WritesOneAuthoritativeCheckpointGraph()
+    {
+        using var temp = CatalogTemp.Create();
+        var imagePath = temp.File("authoritative.apfs.img");
+        var result = SyntheticApfsTestImage.CreateCatalogFixture(
+            imagePath,
+            new CatalogFixtureSpec(
+                Partitions:
+                [
+                    new CatalogPartitionSpec(
+                        Xid: 7,
+                        Volumes: [new CatalogVolumeSpec(Name: "Data", ObjectId: 101)]),
+                ]));
+
+        var partition = Assert.Single(result.Partitions);
+        Assert.Equal(22L * BlockSize, partition.SizeBytes);
+        var image = File.ReadAllBytes(imagePath);
+        var start = checked((int)partition.StartByte);
+
+        // Block 0 is only the geometry anchor; block 12 is the selected NXSB
+        // reached through the four-block descriptor ring beginning at block 11.
+        Assert.Equal(6UL, ReadU64(image, start + 0x10));
+        Assert.Equal(4u, ReadU32(image, start + 0x68));
+        Assert.Equal(4u, ReadU32(image, start + 0x6C));
+        Assert.Equal(11UL, ReadU64(image, start + 0x70));
+        Assert.Equal(15UL, ReadU64(image, start + 0x78));
+        Assert.Equal(0u, ReadU32(image, start + 0x8C));
+
+        var checkpointMap = start + 11 * BlockSize;
+        AssertValidFletcher64(image, checkpointMap);
+        Assert.Equal(0x4000000Cu, ReadU32(image, checkpointMap + 0x18));
+        Assert.Equal(11UL, ReadU64(image, checkpointMap + 0x08));
+        Assert.Equal(3u, ReadU32(image, checkpointMap + 0x24));
+        Assert.Equal(0x4000UL, ReadU64(image, checkpointMap + 0x28 + 0x18));
+        Assert.Equal(15UL, ReadU64(image, checkpointMap + 0x28 + 0x20));
+        Assert.Equal(0x4001UL, ReadU64(image, checkpointMap + 0x50 + 0x18));
+        Assert.Equal(16UL, ReadU64(image, checkpointMap + 0x50 + 0x20));
+        Assert.Equal(0x4002UL, ReadU64(image, checkpointMap + 0x78 + 0x18));
+        Assert.Equal(17UL, ReadU64(image, checkpointMap + 0x78 + 0x20));
+
+        var selectedNxsb = start + 12 * BlockSize;
+        AssertValidFletcher64(image, selectedNxsb);
+        Assert.Equal(7UL, ReadU64(image, selectedNxsb + 0x10));
+        Assert.Equal(2u, ReadU32(image, selectedNxsb + 0x8C));
+        Assert.Equal(3u, ReadU32(image, selectedNxsb + 0x84));
+        Assert.Equal(3u, ReadU32(image, selectedNxsb + 0x94));
+        Assert.Equal(0x4000UL, ReadU64(image, selectedNxsb + 0x98));
+
+        // Physical container OMAP and its typed root map APSB 101 to block 4.
+        var containerOmap = start + 2 * BlockSize;
+        Assert.Equal(0x4000000Bu, ReadU32(image, containerOmap + 0x18));
+        Assert.Equal(0x40000002u, ReadU32(image, containerOmap + 0x28));
+        var containerOmapRoot = start + 3 * BlockSize;
+        Assert.Equal(3UL, ReadU64(image, containerOmapRoot + 0x08));
+        Assert.Equal(0x40000002u, ReadU32(image, containerOmapRoot + 0x18));
+        Assert.Equal(0xBu, ReadU32(image, containerOmapRoot + 0x1C));
+
+        // APSB 101 binds its volume OMAP plus virtual FS/snapshot roots and a
+        // physical extent-reference root from the same selected transaction.
+        var apsb = start + 4 * BlockSize;
+        Assert.Equal(0x2u, ReadU32(image, apsb + 0x74));
+        Assert.Equal(0x40000002u, ReadU32(image, apsb + 0x78));
+        Assert.Equal(0x2u, ReadU32(image, apsb + 0x7C));
+        Assert.Equal(5UL, ReadU64(image, apsb + 0x80));
+        Assert.Equal(0x2065UL, ReadU64(image, apsb + 0x88));
+        Assert.Equal(8UL, ReadU64(image, apsb + 0x90));
+        Assert.Equal(0x3065UL, ReadU64(image, apsb + 0x98));
+
+        var volumeOmap = start + 5 * BlockSize;
+        Assert.Equal(5UL, ReadU64(image, volumeOmap + 0x08));
+        Assert.Equal(0x4000000Bu, ReadU32(image, volumeOmap + 0x18));
+        Assert.Equal(6UL, ReadU64(image, volumeOmap + 0x30));
+        var fsRoot = start + 7 * BlockSize;
+        Assert.Equal(0x2065UL, ReadU64(image, fsRoot + 0x08));
+        Assert.Equal(0xEu, ReadU32(image, fsRoot + 0x1C));
+        var extentRoot = start + 8 * BlockSize;
+        Assert.Equal(8UL, ReadU64(image, extentRoot + 0x08));
+        Assert.Equal(0xFu, ReadU32(image, extentRoot + 0x1C));
+        var snapshotRoot = start + 9 * BlockSize;
+        Assert.Equal(0x3065UL, ReadU64(image, snapshotRoot + 0x08));
+        Assert.Equal(0x10u, ReadU32(image, snapshotRoot + 0x1C));
+
+        var spaceman = start + 15 * BlockSize;
+        AssertValidFletcher64(image, spaceman);
+        Assert.Equal(0x4000UL, ReadU64(image, spaceman + 0x08));
+        Assert.Equal(0x80000005u, ReadU32(image, spaceman + 0x18));
+        Assert.Equal(22UL, ReadU64(image, spaceman + 0x30));
+        Assert.Equal(1UL, ReadU64(image, spaceman + 0x38));
+        Assert.Equal(1u, ReadU32(image, spaceman + 0x40));
+        Assert.Equal(2UL, ReadU64(image, spaceman + 0x48));
+        Assert.Equal(2UL, ReadU64(image, spaceman + 0x98));
+        Assert.Equal(19UL, ReadU64(image, spaceman + 0xA8));
+        Assert.Equal(20UL, ReadU64(image, spaceman + 0xB0));
+        Assert.Equal(0x4001UL, ReadU64(image, spaceman + 0xD0));
+        Assert.Equal(0x4002UL, ReadU64(image, spaceman + 0xF8));
+        Assert.Equal(20UL, ReadU64(image, spaceman + 0x600));
+
+        foreach (var (block, oid) in new[] { (16, 0x4001UL), (17, 0x4002UL) })
+        {
+            var freeQueue = start + block * BlockSize;
+            AssertValidFletcher64(image, freeQueue);
+            Assert.Equal(oid, ReadU64(image, freeQueue + 0x08));
+            Assert.Equal(0x9u, ReadU32(image, freeQueue + 0x1C));
+            Assert.Equal(0x7u, ReadU16(image, freeQueue + 0x20));
+            Assert.Equal(0xFu, ReadU32(image, freeQueue + BlockSize - 40));
+            Assert.Equal(16u, ReadU32(image, freeQueue + BlockSize - 32));
+            Assert.Equal(8u, ReadU32(image, freeQueue + BlockSize - 28));
+        }
+
+        var internalPoolBitmap = start + 19 * BlockSize;
+        Assert.Equal(0x03, image[internalPoolBitmap]);
+        var cib = start + 20 * BlockSize;
+        AssertValidFletcher64(image, cib);
+        Assert.Equal(20UL, ReadU64(image, cib + 0x08));
+        Assert.Equal(0x40000007u, ReadU32(image, cib + 0x18));
+        Assert.Equal(22u, ReadU32(image, cib + 0x38));
+        Assert.Equal(2u, ReadU32(image, cib + 0x3C));
+        Assert.Equal(21UL, ReadU64(image, cib + 0x40));
+        var allocationBitmap = start + 21 * BlockSize;
+        Assert.Equal(0, image[allocationBitmap] & (1 << 1));
+        Assert.Equal(0, image[allocationBitmap + 1] & (1 << 2));
     }
 
     [Fact]
@@ -195,7 +318,7 @@ public sealed class CatalogFixtureWriterTests
                         Features: 0x1,
                         Volumes:
                         [
-                            new CatalogVolumeSpec(Name: "Data", Role: 32, GroupUuid: group),
+                            new CatalogVolumeSpec(Name: "Data", Role: 0x40, GroupUuid: group),
                             new CatalogVolumeSpec(
                                 Name: "Données",
                                 Role: 1,
@@ -210,8 +333,8 @@ public sealed class CatalogFixtureWriterTests
                         Xid: 9,
                         Volumes:
                         [
-                            new CatalogVolumeSpec(Name: "Data", Role: 32),
-                            new CatalogVolumeSpec(Name: "Backup", Role: 2048, GroupUuid: group),
+                            new CatalogVolumeSpec(Name: "Data", Role: 0x40),
+                            new CatalogVolumeSpec(Name: "Backup", Role: 0x180, GroupUuid: group),
                         ]),
                 ]));
 
@@ -234,11 +357,11 @@ public sealed class CatalogFixtureWriterTests
         Assert.Equal(2u, ReadU32(image, 512 + 80));
         AssertValidGptCrc(image, headerOffset: 512, entriesOffset: 2 * SectorSize, entriesBytes: 256);
 
-        // Volume names: UTF-8 NUL-terminated at +288.
+        // Volume names: UTF-8 NUL-terminated at apfs_volname (+0x2C0).
         var firstApsb1 = (int)first.StartByte + 5 * BlockSize;
-        Assert.Equal("Données"u8.ToArray(), image.AsSpan(firstApsb1 + 288, 8).ToArray());
-        Assert.Equal(0, image[firstApsb1 + 296]);
-        Assert.Equal(1u, ReadU16(image, firstApsb1 + 548));
+        Assert.Equal("Données"u8.ToArray(), image.AsSpan(firstApsb1 + 0x2C0, 8).ToArray());
+        Assert.Equal(0, image[firstApsb1 + 0x2C8]);
+        Assert.Equal(1u, ReadU16(image, firstApsb1 + 0x3C4));
         Assert.Equal(0x8UL, ReadU64(image, firstApsb1 + 264));
         Assert.Equal(0x4000UL, ReadU64(image, firstApsb1 + 56));
         AssertValidFletcher64(image, firstApsb1);
@@ -247,19 +370,19 @@ public sealed class CatalogFixtureWriterTests
         var firstApsb0 = (int)first.StartByte + 4 * BlockSize;
         var secondApsb1 = (int)second.StartByte + 5 * BlockSize;
         Assert.Equal(
-            image.AsSpan(firstApsb0 + 552, 16).ToArray(),
-            image.AsSpan(secondApsb1 + 552, 16).ToArray());
-        Assert.Equal(group.ToByteArray(), image.AsSpan(firstApsb0 + 552, 16).ToArray());
-        Assert.Equal(2048u, ReadU16(image, secondApsb1 + 548));
+            image.AsSpan(firstApsb0 + 0x3F0, 16).ToArray(),
+            image.AsSpan(secondApsb1 + 0x3F0, 16).ToArray());
+        Assert.Equal(group.ToByteArray(), image.AsSpan(firstApsb0 + 0x3F0, 16).ToArray());
+        Assert.Equal(0x180u, ReadU16(image, secondApsb1 + 0x3C4));
 
         // Container feature bits and xids land at NXSB offsets.
         Assert.Equal(0x1UL, ReadU64(image, (int)first.StartByte + 48));
-        Assert.Equal(7UL, ReadU64(image, (int)first.StartByte + 16));
-        Assert.Equal(9UL, ReadU64(image, (int)second.StartByte + 16));
+        Assert.Equal(7UL, ReadU64(image, (int)first.StartByte + 19 * BlockSize + 16));
+        Assert.Equal(9UL, ReadU64(image, (int)second.StartByte + 19 * BlockSize + 16));
 
         // Same volume name in different containers keeps distinct object layouts.
         var secondApsb0 = (int)second.StartByte + 4 * BlockSize;
-        Assert.Equal("Data"u8.ToArray(), image.AsSpan(secondApsb0 + 288, 4).ToArray());
+        Assert.Equal("Data"u8.ToArray(), image.AsSpan(secondApsb0 + 0x2C0, 4).ToArray());
         AssertValidFletcher64(image, secondApsb0);
     }
 
@@ -339,7 +462,7 @@ public sealed class CatalogFixtureWriterTests
         var image = File.ReadAllBytes(imagePath);
         var firstApsb = (int)part.StartByte + 4 * BlockSize;
         Assert.Equal(8UL, ReadU64(image, firstApsb + 16));
-        Assert.Equal(7UL, ReadU64(image, (int)part.StartByte + 16));
+        Assert.Equal(7UL, ReadU64(image, (int)part.StartByte + 19 * BlockSize + 16));
         AssertValidFletcher64(image, firstApsb);
     }
 

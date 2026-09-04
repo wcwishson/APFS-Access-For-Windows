@@ -107,7 +107,9 @@
         "partitionId": { "type": "string" },
         "containerId": { "$ref": "#/$defs/id" },
         "offsetBytes": { "type": "integer", "minimum": 0 },
-        "sizeBytes": { "type": "integer", "minimum": 1 }
+        "sizeBytes": { "type": "integer", "minimum": 1 },
+        "blockSizeBytes": { "type": "integer", "minimum": 512 },
+        "totalBlocks": { "type": "integer", "minimum": 1 }
       }
     },
     "container": {

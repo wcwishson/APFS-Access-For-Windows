@@ -272,6 +272,7 @@ public sealed class ApfsMountWorker : BackgroundService
             : discovery.Volumes.Where(volume =>
                 string.Equals(volume.DeviceId, requestedDeviceId, StringComparison.OrdinalIgnoreCase));
 
+        var pendingVolumes = new List<VolumeInfo>();
         foreach (var volume in volumesToProcess.OrderBy(x => x.VolumeName, StringComparer.OrdinalIgnoreCase))
         {
             if (!string.IsNullOrWhiteSpace(requestedVolumeId) &&
@@ -325,14 +326,44 @@ public sealed class ApfsMountWorker : BackgroundService
                 continue;
             }
 
-            var (success, error, warning, compatibilityWarning, mountedState) = await TryMountAsync(
-                volume,
+            pendingVolumes.Add(volume);
+        }
+
+        var mountOutcomes = new List<(VolumeInfo Volume, MountAttemptOutcome Outcome)>(pendingVolumes.Count);
+        if (_backend is IContainerMountBackend containerBackend && pendingVolumes.Count > 1)
+        {
+            mountOutcomes.AddRange(await TryMountContainerBatchAsync(
+                containerBackend,
+                pendingVolumes,
                 options,
                 usedLetters,
                 cancellationToken,
-                deviceDisplayNames.GetValueOrDefault(volume.DeviceId),
-                requestedAccessMode
-            ).ConfigureAwait(false);
+                deviceDisplayNames,
+                requestedAccessMode).ConfigureAwait(false));
+        }
+        else
+        {
+            foreach (var volume in pendingVolumes)
+            {
+                var outcome = await TryMountAsync(
+                    volume,
+                    options,
+                    usedLetters,
+                    cancellationToken,
+                    deviceDisplayNames.GetValueOrDefault(volume.DeviceId),
+                    requestedAccessMode).ConfigureAwait(false);
+                mountOutcomes.Add((volume, new MountAttemptOutcome(
+                    outcome.Success,
+                    outcome.Error,
+                    outcome.Warning,
+                    outcome.CompatibilityWarning,
+                    outcome.MountedState)));
+            }
+        }
+
+        foreach (var (volume, outcome) in mountOutcomes)
+        {
+            var (success, error, warning, compatibilityWarning, mountedState) = outcome;
             if (success)
             {
                 _mountRetryStates.Remove(volume.VolumeId);
@@ -955,6 +986,163 @@ public sealed class ApfsMountWorker : BackgroundService
 
         var parsed = volumeId[(separatorIndex + 1)..].Trim();
         return string.IsNullOrWhiteSpace(parsed) ? null : parsed;
+    }
+
+    private sealed record MountAttemptOutcome(
+        bool Success,
+        string? Error,
+        string? Warning,
+        string? CompatibilityWarning,
+        MountedVolumeState? MountedState);
+
+    private sealed record PreparedContainerMount(
+        VolumeInfo Volume,
+        MountRequest Request,
+        MountAccessMode RequestedAccess,
+        bool ShouldAttemptWrite,
+        string? CompatibilityWarning,
+        string? DeviceDisplayName);
+
+    private async Task<IReadOnlyList<(VolumeInfo Volume, MountAttemptOutcome Outcome)>> TryMountContainerBatchAsync(
+        IContainerMountBackend containerBackend,
+        IReadOnlyList<VolumeInfo> volumes,
+        ServiceHostOptions options,
+        HashSet<char> usedLetters,
+        CancellationToken cancellationToken,
+        IReadOnlyDictionary<string, string> deviceDisplayNames,
+        MountAccessMode? requestedAccessMode)
+    {
+        var completed = new List<(VolumeInfo, MountAttemptOutcome)>(volumes.Count);
+        var prepared = new List<PreparedContainerMount>(volumes.Count);
+        foreach (var volume in volumes)
+        {
+            char letter;
+            try
+            {
+                letter = _mountPolicy.SelectDriveLetter(volume, usedLetters);
+                usedLetters.Add(letter);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Could not allocate drive letter for {VolumeId}", volume.VolumeId);
+                completed.Add((volume, new MountAttemptOutcome(false, ex.Message, null, null, null)));
+                continue;
+            }
+
+            var writeDecision = WriteGatePolicy.EvaluateForVolume(options, volume);
+            var requestedAccess = requestedAccessMode ??
+                (writeDecision.AllowWrite ? MountAccessMode.ReadWrite : MountAccessMode.ReadOnly);
+            var shouldAttemptWrite = requestedAccess == MountAccessMode.ReadWrite && writeDecision.AllowWrite;
+            var primaryAccess = shouldAttemptWrite ? MountAccessMode.ReadWrite : MountAccessMode.ReadOnly;
+            string? compatibilityWarning = null;
+            if (!shouldAttemptWrite && options.EnableNativeWrite)
+            {
+                compatibilityWarning = $"Write gate is active but '{volume.VolumeName}' mounted read-only " +
+                                       $"(gate={writeDecision.GateState}, reason={writeDecision.Reason ?? "n/a"}).";
+            }
+            prepared.Add(new PreparedContainerMount(
+                volume,
+                new MountRequest(volume.VolumeId, letter, primaryAccess),
+                requestedAccess,
+                shouldAttemptWrite,
+                compatibilityWarning,
+                deviceDisplayNames.GetValueOrDefault(volume.DeviceId)));
+        }
+        if (prepared.Count == 0)
+        {
+            return completed;
+        }
+
+        IReadOnlyList<MountResult> primaryResults;
+        try
+        {
+            primaryResults = await containerBackend.MountContainerAsync(
+                prepared.Select(static item => item.Request).ToArray(),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            primaryResults = prepared.Select(_ => new MountResult(
+                false, null, ex.Message, MountAccessMode.ReadOnly,
+                DiagnosticCode: "ContainerBatchFailed", IsReadOnly: true)).ToArray();
+        }
+        if (primaryResults.Count != prepared.Count)
+        {
+            primaryResults = prepared.Select(_ => new MountResult(
+                false, null, "Container backend returned an incomplete mount result set.",
+                MountAccessMode.ReadOnly,
+                DiagnosticCode: "ContainerBatchResultMismatch",
+                IsReadOnly: true)).ToArray();
+        }
+
+        var finalResults = primaryResults.ToArray();
+        var fallbackIndexes = Enumerable.Range(0, prepared.Count)
+            .Where(index => !primaryResults[index].Success &&
+                string.Equals(options.ReadWriteMode, "RwWithRoFallback", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (fallbackIndexes.Length > 0)
+        {
+            var fallbackRequests = fallbackIndexes
+                .Select(index => prepared[index].Request with { AccessMode = MountAccessMode.ReadOnly })
+                .ToArray();
+            var fallbackResults = await containerBackend.MountContainerAsync(
+                fallbackRequests, cancellationToken).ConfigureAwait(false);
+            if (fallbackResults.Count == fallbackIndexes.Length)
+            {
+                for (var index = 0; index < fallbackIndexes.Length; index++)
+                {
+                    finalResults[fallbackIndexes[index]] = fallbackResults[index];
+                }
+            }
+        }
+
+        for (var index = 0; index < prepared.Count; index++)
+        {
+            var attempt = prepared[index];
+            var primary = primaryResults[index];
+            var result = finalResults[index];
+            var compatibilityWarning = attempt.CompatibilityWarning;
+            if (!primary.Success && result.Success && attempt.RequestedAccess == MountAccessMode.ReadWrite)
+            {
+                var detail = string.IsNullOrWhiteSpace(primary.Error) ? string.Empty : $" detail={primary.Error}";
+                compatibilityWarning = $"Write request for '{attempt.Volume.VolumeName}' fell back to read-only " +
+                                       $"(gate={result.SafetyGateState ?? "unknown"}, code={result.DiagnosticCode ?? "n/a"}{detail}).";
+            }
+            else if (result.Success && attempt.RequestedAccess == MountAccessMode.ReadWrite &&
+                     result.EffectiveAccessMode != MountAccessMode.ReadWrite)
+            {
+                compatibilityWarning = $"Write request for '{attempt.Volume.VolumeName}' stayed read-only " +
+                                       $"(gate={result.SafetyGateState ?? "unknown"}, code={result.DiagnosticCode ?? "n/a"}).";
+            }
+
+            if (!result.Success)
+            {
+                var error = result.Error ?? "Unknown error";
+                _logger.LogWarning(
+                    "Failed to mount volume {VolumeId}: {Error} (DiagnosticCode={DiagnosticCode})",
+                    attempt.Volume.VolumeId,
+                    error,
+                    result.DiagnosticCode ?? "n/a");
+                completed.Add((attempt.Volume, new MountAttemptOutcome(
+                    false, error, null, compatibilityWarning, null)));
+                continue;
+            }
+
+            var warning = BuildMountWarning(attempt.Volume, result);
+            _logger.LogInformation(
+                "Mounted volume {VolumeId} at {MountPoint} ({Mode}, ReadOnly={ReadOnly}).",
+                attempt.Volume.VolumeId,
+                result.MountPoint,
+                result.EffectiveAccessMode,
+                result.IsReadOnly);
+            completed.Add((attempt.Volume, new MountAttemptOutcome(
+                true,
+                null,
+                warning,
+                compatibilityWarning,
+                BuildMountedStateFromMountResult(attempt.Volume, result, attempt.DeviceDisplayName))));
+        }
+        return completed;
     }
 
     private async Task<(

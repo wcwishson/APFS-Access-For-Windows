@@ -1598,12 +1598,20 @@ internal static class Program
 
         if (!VolumeBelongsToDevice(deviceId, volumeId))
         {
-            throw new CliArgumentException("The exact volume ID must begin with the exact device ID followed by '|'.");
+            throw new CliArgumentException(
+                "The volume ID must be a canonical APFS ID or begin with the exact device ID followed by '|'.");
         }
     }
 
     private static bool VolumeBelongsToDevice(string deviceId, string volumeId)
     {
+        // Canonical APFS IDs are device-independent. The service re-probes
+        // the exact device/volume pair under its mutation lock.
+        if (ApfsTopology.TryParseVolumeId(volumeId, out _, out _))
+        {
+            return true;
+        }
+
         var separatorIndex = volumeId.IndexOf('|');
         return separatorIndex > 0 &&
                separatorIndex < volumeId.Length - 1 &&

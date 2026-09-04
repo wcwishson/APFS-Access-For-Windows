@@ -19,6 +19,9 @@
 
 #define APFSACCESS_FSHOST_UNIT_TEST 1
 #include "../src/main.cpp"
+#ifdef APFSACCESS_HAS_RW_ENGINE
+#include "TestFixtureBuilder.h"
+#endif
 
 namespace
 {
@@ -79,6 +82,23 @@ std::atomic<int> g_shutdown_teardown_sequence{0};
 std::atomic<int> g_shutdown_stop_return_order{0};
 std::atomic<int> g_shutdown_remove_order{0};
 std::atomic<int> g_shutdown_delete_order{0};
+HANDLE g_teardown_stop_entered = nullptr;
+HANDLE g_teardown_stop_release = nullptr;
+HANDLE g_teardown_remove_entered = nullptr;
+HANDLE g_teardown_remove_release = nullptr;
+HANDLE g_teardown_delete_entered = nullptr;
+HANDLE g_teardown_delete_release = nullptr;
+std::atomic<MountContext*> g_teardown_stop_user_context{nullptr};
+std::atomic<MountContext*> g_teardown_remove_user_context{nullptr};
+std::atomic<MountContext*> g_teardown_delete_user_context{nullptr};
+std::atomic<int> g_manifest_partial_stop_count{0};
+std::atomic<int> g_manifest_partial_remove_count{0};
+std::atomic<int> g_manifest_partial_delete_count{0};
+std::atomic<int> g_manifest_control_create_count{0};
+std::atomic<int> g_manifest_control_set_mount_count{0};
+std::atomic<int> g_manifest_control_start_count{0};
+FSP_FILE_SYSTEM g_manifest_control_fs{};
+const FSP_FILE_SYSTEM_INTERFACE* g_manifest_control_interface = nullptr;
 HANDLE g_shutdown_stop_read_handle = nullptr;
 std::filesystem::path g_shutdown_terminal_status_path;
 MountContext* g_shutdown_terminal_status_context = nullptr;
@@ -135,6 +155,14 @@ void StopDispatcherForShutdownTest(FSP_FILE_SYSTEM* fs)
             std::memory_order_release);
     }
     g_shutdown_dispatcher_stopped_fs.store(fs, std::memory_order_release);
+}
+
+void RemoveMountForCompletedShutdownTest(FSP_FILE_SYSTEM*)
+{
+}
+
+void DeleteFileSystemForCompletedShutdownTest(FSP_FILE_SYSTEM*)
+{
 }
 
 void StopDispatcherAndInspectTerminalStatusForShutdownTest(FSP_FILE_SYSTEM* fs)
@@ -225,6 +253,81 @@ void DeleteFileSystemForSerializedTeardownTest(FSP_FILE_SYSTEM*)
     g_shutdown_delete_order.store(
         g_shutdown_teardown_sequence.fetch_add(1, std::memory_order_acq_rel) + 1,
         std::memory_order_release);
+}
+
+void StopDispatcherForOwnedTeardownTest(FSP_FILE_SYSTEM* fs)
+{
+    g_teardown_stop_user_context.store(
+        static_cast<MountContext*>(fs->UserContext),
+        std::memory_order_release);
+    SetEvent(g_teardown_stop_entered);
+    WaitForSingleObject(g_teardown_stop_release, INFINITE);
+    g_shutdown_stop_return_order.store(
+        g_shutdown_teardown_sequence.fetch_add(1, std::memory_order_acq_rel) + 1,
+        std::memory_order_release);
+}
+
+void RemoveMountForOwnedTeardownTest(FSP_FILE_SYSTEM* fs)
+{
+    g_teardown_remove_user_context.store(
+        static_cast<MountContext*>(fs->UserContext),
+        std::memory_order_release);
+    SetEvent(g_teardown_remove_entered);
+    WaitForSingleObject(g_teardown_remove_release, INFINITE);
+    g_shutdown_remove_order.store(
+        g_shutdown_teardown_sequence.fetch_add(1, std::memory_order_acq_rel) + 1,
+        std::memory_order_release);
+}
+
+void DeleteFileSystemForOwnedTeardownTest(FSP_FILE_SYSTEM* fs)
+{
+    g_teardown_delete_user_context.store(
+        static_cast<MountContext*>(fs->UserContext),
+        std::memory_order_release);
+    SetEvent(g_teardown_delete_entered);
+    WaitForSingleObject(g_teardown_delete_release, INFINITE);
+    g_shutdown_delete_order.store(
+        g_shutdown_teardown_sequence.fetch_add(1, std::memory_order_acq_rel) + 1,
+        std::memory_order_release);
+}
+
+void StopDispatcherForManifestPartialStartupTest(FSP_FILE_SYSTEM*)
+{
+    g_manifest_partial_stop_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RemoveMountForManifestPartialStartupTest(FSP_FILE_SYSTEM*)
+{
+    g_manifest_partial_remove_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void DeleteFileSystemForManifestPartialStartupTest(FSP_FILE_SYSTEM*)
+{
+    g_manifest_partial_delete_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+NTSTATUS CreateFileSystemForManifestControlTest(
+    PWSTR,
+    const FSP_FSCTL_VOLUME_PARAMS*,
+    const FSP_FILE_SYSTEM_INTERFACE* iface,
+    FSP_FILE_SYSTEM** fs)
+{
+    g_manifest_control_create_count.fetch_add(1, std::memory_order_relaxed);
+    g_manifest_control_interface = iface;
+    *fs = &g_manifest_control_fs;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS SetMountForManifestControlTest(FSP_FILE_SYSTEM*, PWSTR)
+{
+    g_manifest_control_set_mount_count.fetch_add(1, std::memory_order_relaxed);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS StartDispatcherForManifestControlTest(FSP_FILE_SYSTEM*, ULONG)
+{
+    g_manifest_control_start_count.fetch_add(1, std::memory_order_relaxed);
+    return STATUS_SUCCESS;
 }
 
 bool Require(bool condition, const char* message)
@@ -4648,7 +4751,8 @@ bool TestDeferredCloseAllowsNewFileIngestBatch()
     rw_context.disallow_scaffold_commit_on_non_fixture = false;
     rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
     rw_context.require_canonical_replay_candidate_on_non_fixture = false;
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     context.metadata_store->SetFilePayloadRangeProvider(
         [&context](
             const std::wstring& path,
@@ -4967,7 +5071,8 @@ bool TestDeferredCloseAllowsDirectoryCreateBatch()
     rw_context.disallow_scaffold_commit_on_non_fixture = false;
     rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
     rw_context.require_canonical_replay_candidate_on_non_fixture = false;
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
         if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Deferred directory create test should load container superblocks") ||
@@ -5080,7 +5185,8 @@ bool TestReadOnlyReopenSeesDeferredSpoolWriteOnReadWriteMount()
     rw_context.disallow_scaffold_commit_on_non_fixture = false;
     rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
     rw_context.require_canonical_replay_candidate_on_non_fixture = false;
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     context.metadata_store->SetFilePayloadRangeProvider(
         [&context](
             const std::wstring& path,
@@ -5307,7 +5413,8 @@ bool TestFreshDeferredSpoolMoveOutSourceReadsPayload()
     rw_context.disallow_scaffold_commit_on_non_fixture = false;
     rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
     rw_context.require_canonical_replay_candidate_on_non_fixture = false;
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     context.metadata_store->SetFilePayloadRangeProvider(
         [&context](
             const std::wstring& path,
@@ -5581,7 +5688,8 @@ bool TestMetadataOnlyReopenAfterDeferredSpoolWriteDoesNotHydrate()
     rw_context.disallow_scaffold_commit_on_non_fixture = false;
     rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
     rw_context.require_canonical_replay_candidate_on_non_fixture = false;
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     context.metadata_store->SetFilePayloadRangeProvider(
         [&context](
             const std::wstring& path,
@@ -5746,7 +5854,8 @@ bool TestImmediateRenameAfterDeferredFreshWriteBatchesBeforeFlush()
     rw_context.disallow_scaffold_commit_on_non_fixture = false;
     rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
     rw_context.require_canonical_replay_candidate_on_non_fixture = false;
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     context.metadata_store->SetFilePayloadRangeProvider(
         [&context](
             const std::wstring& path,
@@ -8791,7 +8900,8 @@ bool TestExperimentalDeferredRenameImmediateReadUsesCommittedSourcePath()
     rw_context.disallow_scaffold_commit_on_non_fixture = false;
     rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
     rw_context.require_canonical_replay_candidate_on_non_fixture = false;
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
 
     const auto committed_payload = BuildPatternPayloadForTest(128 * 1024, 0x47);
     std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
@@ -9718,7 +9828,8 @@ bool TestDeferredDirectoryRenameOpenDescendantFallbackReadsOldCommittedPath()
     rw_context.disallow_scaffold_commit_on_non_fixture = false;
     rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
     rw_context.require_canonical_replay_candidate_on_non_fixture = false;
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
 
     const auto committed_payload = BuildPatternPayloadForTest(64 * 1024, 0x38);
     std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
@@ -12600,7 +12711,8 @@ bool TestSerialDeferredWorkerRevalidatesWriterOpenBeforeCommit()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     std::optional<apfsaccess::rw::MetadataStore::PayloadIdentity> payload_identity;
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
@@ -12690,7 +12802,8 @@ bool TestSerialDeferredWorkerRevalidatesWriterOpenBeforeCommit()
             }
             delete writer;
         }
-        context.metadata_store.reset();
+        context.owned_metadata_store.reset();
+        context.metadata_store = nullptr;
         context.tx_manager.reset();
         context.payload_spool.reset();
         std::filesystem::remove_all(run_root, ec);
@@ -13160,7 +13273,8 @@ bool TestSerialDeferredShutdownDrainConvergesQueuedTarget()
         return false;
     }
 
-    MountContext context{};
+    auto context_owner = std::make_unique<MountContext>();
+    auto& context = *context_owner;
     ConfigureGroupedAcceptanceTestContext(
         context,
         run_root,
@@ -13202,6 +13316,8 @@ bool TestSerialDeferredShutdownDrainConvergesQueuedTarget()
     auto fs = BuildFileSystem(&context);
     context.fs = &fs;
     context.api.Stop = StopDispatcherForShutdownTest;
+    context.api.RemoveMount = RemoveMountForCompletedShutdownTest;
+    context.api.Delete = DeleteFileSystemForCompletedShutdownTest;
     g_shutdown_dispatcher_stopped_fs.store(nullptr, std::memory_order_release);
     g_shutdown_durable_before_dispatcher_stop.store(false, std::memory_order_release);
     g_shutdown_order_context = &context;
@@ -13210,7 +13326,7 @@ bool TestSerialDeferredShutdownDrainConvergesQueuedTarget()
         g_shutdown_order_context = nullptr;
     }};
 
-    const auto shutdown_exit = RunFsHostShutdownDrain(&context);
+    const auto shutdown_exit = RunFsHostShutdownDrain(context_owner);
     const auto watermarks = context.tx_manager->Watermarks();
     return Require(shutdown_exit == 0, "Production shutdown/eject entry should report a complete drain") &&
            Require(
@@ -13246,7 +13362,8 @@ bool TestShutdownStopsPublishingDiagnosticsAtWinFspBoundary()
         return false;
     }
 
-    MountContext context{};
+    auto context_owner = std::make_unique<MountContext>();
+    auto& context = *context_owner;
     context.args.status_file = (run_root / "host.status.json").wstring();
     context.mount_ready.store(true, std::memory_order_release);
     if (!Require(
@@ -13259,8 +13376,10 @@ bool TestShutdownStopsPublishingDiagnosticsAtWinFspBoundary()
     FSP_FILE_SYSTEM fs{};
     context.fs = &fs;
     context.api.Stop = StopDispatcherForShutdownTest;
+    context.api.RemoveMount = RemoveMountForCompletedShutdownTest;
+    context.api.Delete = DeleteFileSystemForCompletedShutdownTest;
 
-    const auto shutdown_exit = RunFsHostShutdownDrain(&context);
+    const auto shutdown_exit = RunFsHostShutdownDrain(context_owner);
     const auto stage_path = std::filesystem::path(context.args.status_file + L".shutdown.json");
     std::ifstream stage_in(stage_path, std::ios::binary);
     const std::string stage_json{
@@ -13288,7 +13407,8 @@ bool TestShutdownPublishesMountNotReadyBeforeWinFspTeardown()
     }
     ScopeExit cleanup{[&]() { std::filesystem::remove_all(run_root, ec); }};
 
-    MountContext context{};
+    auto context_owner = std::make_unique<MountContext>();
+    auto& context = *context_owner;
     context.args.status_file = (run_root / "host.status.json").wstring();
     context.mount_ready.store(true, std::memory_order_release);
     if (!Require(
@@ -13305,8 +13425,10 @@ bool TestShutdownPublishesMountNotReadyBeforeWinFspTeardown()
     g_shutdown_terminal_active_callbacks_at_stop.store(0, std::memory_order_release);
     context.active_callback_count.store(1, std::memory_order_release);
     context.api.Stop = StopDispatcherAndInspectTerminalStatusForShutdownTest;
+    context.api.RemoveMount = RemoveMountForCompletedShutdownTest;
+    context.api.Delete = DeleteFileSystemForCompletedShutdownTest;
 
-    const auto shutdown_exit = RunFsHostShutdownDrain(&context);
+    const auto shutdown_exit = RunFsHostShutdownDrain(context_owner);
     context.active_callback_count.store(0, std::memory_order_release);
     g_shutdown_terminal_status_context = nullptr;
     g_shutdown_terminal_status_path.clear();
@@ -13347,60 +13469,273 @@ bool TestShutdownFailsWhenTerminalStatusCannotBePersisted()
         blocker << "not-a-directory";
     }
 
-    MountContext context{};
+    auto context_owner = std::make_unique<MountContext>();
+    auto& context = *context_owner;
     context.args.status_file = (blocked_parent / "host.status.json").wstring();
     context.mount_ready.store(true, std::memory_order_release);
     FSP_FILE_SYSTEM fs{};
     context.fs = &fs;
     context.api.Stop = StopDispatcherForShutdownTest;
+    context.api.RemoveMount = RemoveMountForCompletedShutdownTest;
+    context.api.Delete = DeleteFileSystemForCompletedShutdownTest;
 
-    const auto shutdown_exit = RunFsHostShutdownDrain(&context);
+    const auto shutdown_exit = RunFsHostShutdownDrain(context_owner);
     return Require(
         shutdown_exit != 0,
         "Shutdown must fail closed when terminal mount status cannot be persisted");
 }
 
-bool TestWinFspTeardownCallsAreSerialized()
+struct OwnedTeardownEvents
 {
-    g_shutdown_dispatcher_release.store(false, std::memory_order_release);
-    g_shutdown_mount_removed.store(false, std::memory_order_release);
-    g_shutdown_dispatcher_stopped_fs.store(nullptr, std::memory_order_release);
+    OwnedTeardownEvents()
+    {
+        g_teardown_stop_entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        g_teardown_stop_release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        g_teardown_remove_entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        g_teardown_remove_release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        g_teardown_delete_entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        g_teardown_delete_release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    }
+
+    ~OwnedTeardownEvents()
+    {
+        CloseHandle(g_teardown_stop_entered);
+        CloseHandle(g_teardown_stop_release);
+        CloseHandle(g_teardown_remove_entered);
+        CloseHandle(g_teardown_remove_release);
+        CloseHandle(g_teardown_delete_entered);
+        CloseHandle(g_teardown_delete_release);
+        g_teardown_stop_entered = nullptr;
+        g_teardown_stop_release = nullptr;
+        g_teardown_remove_entered = nullptr;
+        g_teardown_remove_release = nullptr;
+        g_teardown_delete_entered = nullptr;
+        g_teardown_delete_release = nullptr;
+    }
+
+    bool Valid() const
+    {
+        return g_teardown_stop_entered && g_teardown_stop_release &&
+            g_teardown_remove_entered && g_teardown_remove_release &&
+            g_teardown_delete_entered && g_teardown_delete_release;
+    }
+};
+
+void ResetOwnedTeardownObservations()
+{
     g_shutdown_teardown_sequence.store(0, std::memory_order_release);
     g_shutdown_stop_return_order.store(0, std::memory_order_release);
     g_shutdown_remove_order.store(0, std::memory_order_release);
     g_shutdown_delete_order.store(0, std::memory_order_release);
+    g_teardown_stop_user_context.store(nullptr, std::memory_order_release);
+    g_teardown_remove_user_context.store(nullptr, std::memory_order_release);
+    g_teardown_delete_user_context.store(nullptr, std::memory_order_release);
+}
 
-    MountContext context{};
-    context.args.write_commit_timeout_seconds = 1;
-    FSP_FILE_SYSTEM fs{};
-    context.fs = &fs;
-    context.api.Stop = StopDispatcherForSerializedTeardownTest;
-    context.api.RemoveMount = RemoveMountForSerializedTeardownTest;
-    context.api.Delete = DeleteFileSystemForSerializedTeardownTest;
+std::unique_ptr<MountContext> BuildOwnedTeardownContext(FSP_FILE_SYSTEM& fs)
+{
+    auto context = std::make_unique<MountContext>();
+    context->args.winfsp_teardown_timeout_ms = 25;
+    context->fs = &fs;
+    context->fs->UserContext = context.get();
+    context->winfsp_lifecycle_phase.store(
+        WinFspLifecyclePhase::Dispatching,
+        std::memory_order_release);
+    context->api.Stop = StopDispatcherForOwnedTeardownTest;
+    context->api.RemoveMount = RemoveMountForOwnedTeardownTest;
+    context->api.Delete = DeleteFileSystemForOwnedTeardownTest;
+    return context;
+}
 
-    std::thread delayed_release([]()
+bool TestWinFspTeardownTimeoutPinsOwnershipAtEachPhase()
+{
+    bool ok = true;
+    for (int blocked_phase = 0; blocked_phase < 3; ++blocked_phase)
     {
-        Sleep(1'500);
-        g_shutdown_dispatcher_release.store(true, std::memory_order_release);
-    });
+        OwnedTeardownEvents events;
+        if (!Require(events.Valid(), "Owned teardown test should create synchronization events"))
+        {
+            return false;
+        }
+        ResetOwnedTeardownObservations();
+        if (blocked_phase > 0)
+        {
+            SetEvent(g_teardown_stop_release);
+        }
+        if (blocked_phase > 1)
+        {
+            SetEvent(g_teardown_remove_release);
+        }
 
-    const auto shutdown_exit = RunFsHostShutdownDrain(&context);
-    delayed_release.join();
+        FSP_FILE_SYSTEM fs{};
+        auto owner = BuildOwnedTeardownContext(fs);
+        auto* const original_context = owner.get();
+        const auto result = StartBoundedWinFspTeardown(
+            owner,
+            owner->args.winfsp_teardown_timeout_ms);
+        const HANDLE entered[] = {
+            g_teardown_stop_entered,
+            g_teardown_remove_entered,
+            g_teardown_delete_entered,
+        };
+        const HANDLE releases[] = {
+            g_teardown_stop_release,
+            g_teardown_remove_release,
+            g_teardown_delete_release,
+        };
 
-    return Require(shutdown_exit == 0, "Serialized WinFsp teardown fixture should drain successfully") &&
-           Require(
-               g_shutdown_dispatcher_stopped_fs.load(std::memory_order_acquire) == &fs,
-               "Serialized WinFsp teardown should execute the stop callback") &&
-           Require(
-               g_shutdown_stop_return_order.load(std::memory_order_acquire) == 1,
-               "StopDispatcher must return before any mount-removal or delete call begins") &&
-           Require(
-               g_shutdown_remove_order.load(std::memory_order_acquire) == 2,
-               "Mount removal must run exactly after StopDispatcher returns") &&
-           Require(
-               g_shutdown_delete_order.load(std::memory_order_acquire) == 3,
-               "File-system deletion must run only after dispatcher stop and mount removal") &&
-           Require(context.fs == nullptr, "Serialized WinFsp teardown must relinquish the file-system object");
+        ok &= Require(
+            result.status == WinFspTeardownStatus::TimedOut,
+            "Blocked WinFsp teardown should report its bounded timeout");
+        ok &= Require(owner == nullptr, "Timed-out teardown should remove the caller's ownership");
+        ok &= Require(
+            result.task && result.task->context.get() == original_context,
+            "Timed-out teardown task should retain the exact MountContext");
+        ok &= Require(
+            WaitForSingleObject(entered[blocked_phase], 0) == WAIT_OBJECT_0,
+            "The selected teardown phase should have entered before timeout");
+        ok &= Require(
+            result.task->context->fs == &fs && fs.UserContext == original_context,
+            "Timed-out teardown should keep WinFsp UserContext valid");
+        for (int later = blocked_phase + 1; later < 3; ++later)
+        {
+            ok &= Require(
+                WaitForSingleObject(entered[later], 0) == WAIT_TIMEOUT,
+                "A blocked teardown phase must prevent later phases from starting");
+        }
+
+        SetEvent(g_teardown_stop_release);
+        SetEvent(g_teardown_remove_release);
+        SetEvent(g_teardown_delete_release);
+        ok &= Require(
+            WaitForSingleObject(result.task->worker_thread, 2'000) == WAIT_OBJECT_0,
+            "Released teardown worker should exit through its real thread handle");
+        ok &= Require(
+            ReclaimCompletedWinFspTeardown(result.task, owner),
+            "Completed teardown should restore MountContext ownership");
+        ok &= Require(
+            owner.get() == original_context && owner->fs == nullptr,
+            "Delete completion should be the only point that clears fs");
+        ok &= Require(
+            owner->winfsp_lifecycle_phase.load(std::memory_order_acquire) ==
+                WinFspLifecyclePhase::Destroyed,
+            "Completed teardown should publish the destroyed lifecycle phase");
+        ok &= Require(
+            g_teardown_stop_user_context.load(std::memory_order_acquire) == original_context &&
+                g_teardown_remove_user_context.load(std::memory_order_acquire) == original_context &&
+                g_teardown_delete_user_context.load(std::memory_order_acquire) == original_context,
+            "Every teardown phase should observe the pinned MountContext");
+        ok &= Require(
+            g_shutdown_stop_return_order.load(std::memory_order_acquire) == 1 &&
+                g_shutdown_remove_order.load(std::memory_order_acquire) == 2 &&
+                g_shutdown_delete_order.load(std::memory_order_acquire) == 3,
+            "Owned teardown should serialize Stop, RemoveMount, and Delete exactly");
+    }
+    return ok;
+}
+
+bool TestWinFspTeardownTimeoutStopsManifestSiblingCleanup()
+{
+    OwnedTeardownEvents events;
+    if (!Require(events.Valid(), "Manifest timeout test should create synchronization events"))
+    {
+        return false;
+    }
+    ResetOwnedTeardownObservations();
+    FSP_FILE_SYSTEM first_fs{};
+    FSP_FILE_SYSTEM second_fs{};
+    std::vector<std::unique_ptr<MountContext>> contexts;
+    contexts.push_back(BuildOwnedTeardownContext(first_fs));
+    contexts.push_back(BuildOwnedTeardownContext(second_fs));
+    contexts[0]->container_volume_oid = 101;
+    contexts[1]->container_volume_oid = 202;
+    contexts[0]->manifest_mount_attached.store(true, std::memory_order_release);
+    contexts[1]->manifest_mount_attached.store(true, std::memory_order_release);
+    auto* const first_context = contexts[0].get();
+    auto* const second_context = contexts[1].get();
+    std::shared_ptr<WinFspTeardownTask> pinned_task;
+    g_winfsp_teardown_fail_stop_hook_for_test =
+        [&](const std::shared_ptr<WinFspTeardownTask>& task)
+        {
+            pinned_task = task;
+            throw std::runtime_error("expected-winfsp-teardown-fail-stop");
+        };
+    ScopeExit clear_hook{[]() { g_winfsp_teardown_fail_stop_hook_for_test = {}; }};
+
+    bool fail_stop_observed = false;
+    try
+    {
+        (void)DrainManifestContextsAfterServe(contexts, 7);
+    }
+    catch (const std::runtime_error& error)
+    {
+        fail_stop_observed = std::string(error.what()) ==
+            "expected-winfsp-teardown-fail-stop";
+    }
+
+    bool ok = Require(fail_stop_observed, "Timed-out manifest teardown should enter fail-stop") &&
+        Require(contexts[0] == nullptr, "Timed-out first manifest context should remain task-owned") &&
+        Require(
+            pinned_task && pinned_task->context.get() == first_context &&
+                pinned_task->context->container_volume_oid == 101,
+            "Fail-stop should retain the first session context and binding") &&
+        Require(
+            contexts[1].get() == second_context && contexts[1]->fs == &second_fs &&
+                contexts[1]->container_volume_oid == 202,
+            "First teardown timeout should prevent sibling teardown and session cleanup") &&
+        Require(
+            WaitForSingleObject(g_teardown_remove_entered, 0) == WAIT_TIMEOUT &&
+                g_shutdown_teardown_sequence.load(std::memory_order_acquire) == 0,
+            "Timed-out first Stop must not begin later teardown phases");
+
+    SetEvent(g_teardown_stop_release);
+    SetEvent(g_teardown_remove_release);
+    SetEvent(g_teardown_delete_release);
+    ok &= Require(
+        pinned_task && WaitForSingleObject(pinned_task->worker_thread, 2'000) == WAIT_OBJECT_0,
+        "Released manifest teardown worker should exit");
+    ok &= Require(
+        pinned_task && ReclaimCompletedWinFspTeardown(pinned_task, contexts[0]),
+        "Manifest timeout test should reclaim ownership only after worker exit");
+    return ok;
+}
+
+bool TestWinFspTeardownWorkerStartFailurePinsOwnership()
+{
+    FSP_FILE_SYSTEM fs{};
+    auto owner = std::make_unique<MountContext>();
+    auto* const original_context = owner.get();
+    owner->fs = &fs;
+    fs.UserContext = original_context;
+    owner->winfsp_lifecycle_phase.store(
+        WinFspLifecyclePhase::Created,
+        std::memory_order_release);
+    owner->api.Delete = DeleteFileSystemForManifestPartialStartupTest;
+    g_winfsp_teardown_force_worker_start_failure_for_test = true;
+    ScopeExit clear_failure{[]()
+    {
+        g_winfsp_teardown_force_worker_start_failure_for_test = false;
+    }};
+
+    auto result = StartBoundedWinFspTeardown(owner, 25);
+    const bool ok = Require(
+            result.status == WinFspTeardownStatus::StartFailed,
+            "Injected teardown worker-start failure should be reported") &&
+        Require(owner == nullptr, "Worker-start failure should transfer caller ownership") &&
+        Require(
+            result.task && result.task->context.get() == original_context &&
+                result.task->context->fs == &fs && fs.UserContext == original_context,
+            "Worker-start failure should pin context, API, and WinFsp identity") &&
+        Require(
+            result.task->context->winfsp_lifecycle_phase.load(std::memory_order_acquire) ==
+                WinFspLifecyclePhase::TeardownOwned,
+            "Worker-start failure should remain in teardown-owned state");
+    owner = std::move(result.task->context);
+    owner->fs = nullptr;
+    owner->winfsp_lifecycle_phase.store(
+        WinFspLifecyclePhase::Destroyed,
+        std::memory_order_release);
+    return ok;
 }
 
 bool TestWinFspRuntimeVersionRejectsKnownDeadlockBuilds()
@@ -16130,7 +16465,8 @@ bool TestPostStagePayloadSpoolFailureCannotExitShutdownCleanly()
         }
         context.payload_spool.reset();
         context.tx_manager.reset();
-        context.metadata_store.reset();
+        context.owned_metadata_store.reset();
+        context.metadata_store = nullptr;
         std::filesystem::remove_all(run_root, ec);
     }};
 
@@ -16171,8 +16507,9 @@ bool TestPostStagePayloadSpoolFailureCannotExitShutdownCleanly()
     rw_context.disallow_scaffold_commit_on_non_fixture = false;
     rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
     rw_context.require_canonical_replay_candidate_on_non_fixture = false;
-    context.metadata_store =
+    context.owned_metadata_store =
         std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     if (!Require(
             context.metadata_store->LoadContainerSuperblocks(),
             "Post-stage spool failure test should load container superblocks") ||
@@ -16944,7 +17281,8 @@ bool VerifyAcceptedWriteProcessKillRestart(
     context.tx_manager = std::make_unique<apfsaccess::rw::TransactionManager>(L"DeferredContent");
     context.tx_manager->SetVolumeIdentity(kAcceptedWriteKillVolumeIdentityWide);
     context.tx_manager->SetJournalPath((spool_root / "write-ahead.wal").wstring());
-    context.metadata_store = MakeAcceptedWriteKillStore(image_path);
+    context.owned_metadata_store = MakeAcceptedWriteKillStore(image_path);
+    context.metadata_store = context.owned_metadata_store.get();
     if (!Require(context.metadata_store != nullptr, "Process-kill restart should load the APFS image"))
     {
         return false;
@@ -17157,7 +17495,8 @@ bool VerifyAcceptedWriteProcessKillRestart(
 
     const auto converged_xid = after_xid.value();
     const auto accepted_sequence = after_watermarks.accepted_sequence;
-    context.metadata_store.reset();
+    context.owned_metadata_store.reset();
+    context.metadata_store = nullptr;
     context.payload_spool.reset();
     context.tx_manager.reset();
 
@@ -17866,7 +18205,8 @@ bool TestMalformedRecoveryMarkerCannotBeClearedByCleanBootstrap()
             return false;
         }
     }
-    context.metadata_store = MakeAcceptedWriteKillStore(image_path);
+    context.owned_metadata_store = MakeAcceptedWriteKillStore(image_path);
+    context.metadata_store = context.owned_metadata_store.get();
     if (!Require(context.metadata_store != nullptr,
             "Malformed marker clear test should retain its clean metadata store"))
     {
@@ -18077,7 +18417,8 @@ bool TestNativeMutationRequiresDurableRecoveryMarkerBeforeStaging()
     rw_context.disallow_scaffold_commit_on_non_fixture = false;
     rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
     rw_context.require_canonical_replay_candidate_on_non_fixture = false;
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     if (!Require(context.metadata_store->LoadContainerSuperblocks(),
             "Production marker-staging test should load container superblocks") ||
         !Require(context.metadata_store->LoadObjectMap(),
@@ -18146,7 +18487,8 @@ bool TestRecoveryMarkerArmCannotRaceCleanCommitBoundary()
     rw_context.disallow_scaffold_commit_on_non_fixture = false;
     rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
     rw_context.require_canonical_replay_candidate_on_non_fixture = false;
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     if (!Require(context.metadata_store->LoadContainerSuperblocks(),
             "Marker arm/stage race test should load container superblocks") ||
         !Require(context.metadata_store->LoadObjectMap(),
@@ -18481,7 +18823,8 @@ bool TestAcceptedWriteReplayCommitsAndConvergesWatermarks()
     context.tx_manager = std::make_unique<apfsaccess::rw::TransactionManager>(L"DeferredContent");
     context.tx_manager->SetVolumeIdentity(L"accepted-replay-volume");
     context.tx_manager->SetJournalPath(wal_path.wstring());
-    context.metadata_store = make_store();
+    context.owned_metadata_store = make_store();
+    context.metadata_store = context.owned_metadata_store.get();
     if (!Require(context.metadata_store != nullptr, "Accepted replay target should prepare metadata store"))
     {
         return false;
@@ -19169,7 +19512,8 @@ bool TestAcceptedReplayRecognizesFinalDeleteState()
     context.tx_manager = std::make_unique<apfsaccess::rw::TransactionManager>(L"DeferredContent");
     context.tx_manager->SetVolumeIdentity(L"accepted-final-delete-volume");
     context.tx_manager->SetJournalPath(wal_path.wstring());
-    context.metadata_store = make_store();
+    context.owned_metadata_store = make_store();
+    context.metadata_store = context.owned_metadata_store.get();
     if (!Require(context.metadata_store != nullptr, "Accepted final-delete target should prepare metadata"))
     {
         return false;
@@ -19422,7 +19766,8 @@ bool TestAcceptedReplayDeleteHidesEarlierWriteAcrossBatch()
         context.tx_manager = std::make_unique<apfsaccess::rw::TransactionManager>(L"DeferredContent");
         context.tx_manager->SetVolumeIdentity(L"accepted-batch-delete-hides-volume");
         context.tx_manager->SetJournalPath(journal.wstring());
-        context.metadata_store = make_store();
+        context.owned_metadata_store = make_store();
+    context.metadata_store = context.owned_metadata_store.get();
         return context.metadata_store != nullptr;
     };
 
@@ -19634,7 +19979,8 @@ bool TestAcceptedReplayRejectsMissingIdentity()
         }
 
         MountContext context{};
-        context.metadata_store = make_store();
+        context.owned_metadata_store = make_store();
+    context.metadata_store = context.owned_metadata_store.get();
         context.tx_manager = std::make_unique<apfsaccess::rw::TransactionManager>(L"NamespaceIdentity");
         context.tx_manager->SetVolumeIdentity(L"accepted-namespace-identity");
         context.tx_manager->SetJournalPath(wal_path.wstring());
@@ -20125,7 +20471,8 @@ bool TestCloseStagesNativeSubtreeDeleteBottomUp()
     rw_context.disallow_scaffold_commit_on_non_fixture = false;
     rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
     rw_context.require_canonical_replay_candidate_on_non_fixture = false;
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
     context.metadata_store->SetFilePayloadProvider(
         [&staged_payloads](const std::wstring& path, std::uint64_t logical_size) -> std::optional<std::vector<std::byte>>
@@ -20342,7 +20689,8 @@ bool TestStatusFileIncludesNativeMutationFailureDetail()
     rw_context.disallow_scaffold_commit_on_non_fixture = false;
     rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
     rw_context.require_canonical_replay_candidate_on_non_fixture = false;
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Native mutation failure-detail test should load container superblocks") ||
         !Require(context.metadata_store->LoadObjectMap(), "Native mutation failure-detail test should load object map") ||
         !Require(context.metadata_store->LoadSpacemanState(), "Native mutation failure-detail test should load spaceman state") ||
@@ -20428,7 +20776,8 @@ bool TestSetBasicInfoOnStaleDeletedHandleDoesNotDowngradeNativeWrite()
     rw_context.disallow_scaffold_commit_on_non_fixture = false;
     rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
     rw_context.require_canonical_replay_candidate_on_non_fixture = false;
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Stale SetBasicInfo test should load container superblocks") ||
         !Require(context.metadata_store->LoadObjectMap(), "Stale SetBasicInfo test should load object map") ||
         !Require(context.metadata_store->LoadSpacemanState(), "Stale SetBasicInfo test should load spaceman state") ||
@@ -20534,7 +20883,8 @@ bool TestSetBasicInfoOnVisibleNativeMissingDirectoryDoesNotDowngradeNativeWrite(
     rw_context.disallow_scaffold_commit_on_non_fixture = false;
     rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
     rw_context.require_canonical_replay_candidate_on_non_fixture = false;
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Visible-native-missing SetBasicInfo test should load container superblocks") ||
         !Require(context.metadata_store->LoadObjectMap(), "Visible-native-missing SetBasicInfo test should load object map") ||
         !Require(context.metadata_store->LoadSpacemanState(), "Visible-native-missing SetBasicInfo test should load spaceman state") ||
@@ -20658,7 +21008,8 @@ bool TestDeleteTargetMissingOnStaleDeletedHandleDoesNotDowngradeNativeWrite()
     rw_context.disallow_scaffold_commit_on_non_fixture = false;
     rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
     rw_context.require_canonical_replay_candidate_on_non_fixture = false;
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Stale delete test should load container superblocks") ||
         !Require(context.metadata_store->LoadObjectMap(), "Stale delete test should load object map") ||
         !Require(context.metadata_store->LoadSpacemanState(), "Stale delete test should load spaceman state") ||
@@ -24437,7 +24788,8 @@ bool TestReadOnlyOpenUsesMetadataRangeReadWithoutHydration()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
     context.metadata_store->SetFilePayloadProvider(
         [&staged_payloads](const std::wstring& path, std::uint64_t logical_size) -> std::optional<std::vector<std::byte>>
@@ -24695,7 +25047,8 @@ bool TestCommittedMoveSourceOpenSkipsPreOpenDrain()
     rw_context.disallow_scaffold_commit_on_non_fixture = false;
     rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
     rw_context.require_canonical_replay_candidate_on_non_fixture = false;
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     const auto payload = BuildPatternPayloadForTest(64 * 1024, 0x72);
     std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
     context.metadata_store->SetFilePayloadProvider(
@@ -24907,7 +25260,8 @@ bool TestCommittedInodeDeltaMergeEmptyNoOpSkipsSnapshot()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
 
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
@@ -24996,7 +25350,8 @@ bool TestCommittedInodeDeltaMergeHandlesDirectoryRenameWithoutSnapshot()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
 
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
@@ -25096,7 +25451,8 @@ bool TestCommittedInodeDeltaMergeKeepsSiblingChildIndexIntact()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
 
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
@@ -25233,7 +25589,8 @@ bool TestEnsureDirectoryLoadedUsesCommittedDeltaBeforeSnapshot()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
 
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
@@ -25348,7 +25705,8 @@ bool TestEnsureDirectoryLoadedUsesCommittedChildIndexBeforeSnapshot()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
 
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
@@ -25525,7 +25883,8 @@ bool TestHandleReadOverlaysPayloadSpoolWhenHydrationIsStale()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
         if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Spool read test should load container superblocks") ||
@@ -25705,7 +26064,8 @@ bool TestPayloadRangeProviderOverlaysSpoolWhenHydrationIsEmpty()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
         if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Empty hydration spool test should load container superblocks") ||
@@ -25859,11 +26219,12 @@ bool TestPayloadRangeProviderUsesNativeCommitHydrationBase()
         return false;
     }
 
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(
         apfsaccess::rw::MetadataStore::VolumeContext{
             (context.session_root / "unused.apfs.img").wstring(),
             L"Main",
         });
+    context.metadata_store = context.owned_metadata_store.get();
     context.payload_spool_volume_identity = "unit-native-commit-hydration-base";
     context.payload_spool = std::make_unique<apfsaccess::rw::PayloadSpool>(
         apfsaccess::rw::PayloadSpool::Options{
@@ -25889,7 +26250,8 @@ bool TestPayloadRangeProviderUsesNativeCommitHydrationBase()
             "Native commit hydration-base test should append the dirty range"))
     {
         context.payload_spool.reset();
-        context.metadata_store.reset();
+        context.owned_metadata_store.reset();
+        context.metadata_store = nullptr;
         std::filesystem::remove_all(context.session_root, ec);
         return false;
     }
@@ -25913,7 +26275,8 @@ bool TestPayloadRangeProviderUsesNativeCommitHydrationBase()
     };
     const auto sidecar_open_count = context.hydration_read_cache_open_count;
     context.payload_spool.reset();
-    context.metadata_store.reset();
+    context.owned_metadata_store.reset();
+    context.metadata_store = nullptr;
     std::filesystem::remove_all(context.session_root, ec);
 
     return Require(
@@ -26080,7 +26443,8 @@ bool TestDeferredOverlayHydrationReusesPayloadIdentitySnapshot()
     ScopeExit cleanup{[&]()
     {
         context.payload_spool.reset();
-        context.metadata_store.reset();
+        context.owned_metadata_store.reset();
+        context.metadata_store = nullptr;
         context.tx_manager.reset();
         std::filesystem::remove_all(context.session_root, ec);
     }};
@@ -26098,7 +26462,8 @@ bool TestDeferredOverlayHydrationReusesPayloadIdentitySnapshot()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
         if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Deferred overlay hydration test should load superblocks") ||
@@ -26209,7 +26574,8 @@ bool PreparePostCheckpointHydrationFixture(
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
         if (!context.metadata_store->LoadContainerSuperblocks() ||
@@ -26305,7 +26671,8 @@ bool TestPostCheckpointHydrationPromotionDefaultsOnAndSupportsOptOut()
         ScopeExit cleanup{[&]()
         {
             context.payload_spool.reset();
-            context.metadata_store.reset();
+            context.owned_metadata_store.reset();
+        context.metadata_store = nullptr;
             std::filesystem::remove_all(context.session_root, ec);
         }};
         if (!Require(
@@ -26378,7 +26745,8 @@ bool TestPostCheckpointHydrationPromotionFailureDoesNotFailCleanup()
     ScopeExit cleanup{[&]()
     {
         context.payload_spool.reset();
-        context.metadata_store.reset();
+        context.owned_metadata_store.reset();
+        context.metadata_store = nullptr;
         std::filesystem::remove_all(context.session_root, ec);
     }};
     if (!Require(
@@ -26446,7 +26814,8 @@ bool TestPostCheckpointHydrationPromotionRejectsConcurrentMutation()
     ScopeExit cleanup{[&]()
     {
         context.payload_spool.reset();
-        context.metadata_store.reset();
+        context.owned_metadata_store.reset();
+        context.metadata_store = nullptr;
         std::filesystem::remove_all(context.session_root, ec);
     }};
     if (!Require(
@@ -26512,7 +26881,8 @@ bool TestPostCheckpointHydrationPromotionTracksRenameAndSkipsDelete()
         ScopeExit cleanup{[&]()
         {
             context.payload_spool.reset();
-            context.metadata_store.reset();
+            context.owned_metadata_store.reset();
+        context.metadata_store = nullptr;
             std::filesystem::remove_all(context.session_root, ec);
         }};
         if (!PreparePostCheckpointHydrationFixture(
@@ -26560,7 +26930,8 @@ bool TestPostCheckpointHydrationPromotionTracksRenameAndSkipsDelete()
         ScopeExit cleanup{[&]()
         {
             context.payload_spool.reset();
-            context.metadata_store.reset();
+            context.owned_metadata_store.reset();
+        context.metadata_store = nullptr;
             std::filesystem::remove_all(context.session_root, ec);
         }};
         if (!PreparePostCheckpointHydrationFixture(
@@ -26696,7 +27067,8 @@ bool TestNativeRecycleDesktopIniSpoolCommitStaysWritable()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     context.metadata_store->SetFilePayloadProvider(
         [&context](const std::wstring& path, std::uint64_t logical_size) -> std::optional<std::vector<std::byte>>
         {
@@ -26892,7 +27264,8 @@ bool TestRecoveredMarkerClearsPayloadSpoolResidue()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
         if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Recovered-spool test should load container superblocks") ||
@@ -27025,7 +27398,8 @@ bool TestDirtyRecoveryMarkerAheadOfCheckpointBlocksPayloadSpoolCleanup()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
         if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Dirty-marker-ahead spool test should load container superblocks") ||
@@ -27126,7 +27500,8 @@ bool TestCleanMetadataBootstrapClearsPayloadSpoolRecovery()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
         if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Clean-bootstrap spool test should load container superblocks") ||
@@ -27223,10 +27598,11 @@ bool TestCleanHydratedReadSkipsPayloadSpoolProbe()
 
     MountContext context{};
     context.args.volume = L"Main";
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(
         apfsaccess::rw::MetadataStore::VolumeContext{
             (run_root / "unused.apfs.img").wstring(),
             L"Main"});
+    context.metadata_store = context.owned_metadata_store.get();
     context.payload_spool_volume_identity = "unit-clean-read-bypass";
     context.payload_spool = std::make_unique<apfsaccess::rw::PayloadSpool>(
         apfsaccess::rw::PayloadSpool::Options{
@@ -27408,7 +27784,8 @@ bool TestPreWalCrashOrphanedPayloadRecoversCleanReadWrite()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
         if (!Require(
@@ -27563,7 +27940,8 @@ bool TestCleanMarkerUnindexedPayloadRecoversReadWrite(
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
         if (!Require(
@@ -27760,7 +28138,8 @@ bool TestDirtyRecoveryMarkerBlocksPayloadSpoolCleanup()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
         if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Dirty-marker spool test should load container superblocks") ||
@@ -27861,7 +28240,8 @@ bool TestNativeWriteBackStagesSpoolWithoutHydrationRewrite()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
         if (!Require(context.metadata_store->LoadContainerSuperblocks(), "Write-back spool test should load container superblocks") ||
@@ -28049,7 +28429,8 @@ bool TestPayloadSpoolQuotaDrainsAcceptedWorkAndRetriesOnce()
         }
         context.payload_spool.reset();
         context.tx_manager.reset();
-        context.metadata_store.reset();
+        context.owned_metadata_store.reset();
+        context.metadata_store = nullptr;
         std::filesystem::remove_all(context.session_root, ec);
     }};
 
@@ -28067,7 +28448,8 @@ bool TestPayloadSpoolQuotaDrainsAcceptedWorkAndRetriesOnce()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     context.metadata_store->SetFilePayloadProvider(
         [&context](const std::wstring& path, std::uint64_t logical_size) -> std::optional<std::vector<std::byte>>
         {
@@ -28248,7 +28630,8 @@ bool TestPayloadSpoolCapacityPressurePreservesReadWriteMount()
     {
         context.payload_spool.reset();
         context.tx_manager.reset();
-        context.metadata_store.reset();
+        context.owned_metadata_store.reset();
+        context.metadata_store = nullptr;
         std::filesystem::remove_all(context.session_root, ec);
     }};
 
@@ -28273,7 +28656,8 @@ bool TestPayloadSpoolCapacityPressurePreservesReadWriteMount()
         (context.session_root / "unused-quota-image.apfs.img").wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     context.payload_spool_volume_identity = "unit-payload-spool-capacity-pressure";
     context.payload_spool = std::make_unique<apfsaccess::rw::PayloadSpool>(
         apfsaccess::rw::PayloadSpool::Options{
@@ -28489,7 +28873,8 @@ bool TestCommittedSpoolWriteReopenReadsCommittedPayload()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     context.metadata_store->SetFilePayloadProvider(
         [&context](const std::wstring& path, std::uint64_t logical_size) -> std::optional<std::vector<std::byte>>
         {
@@ -28669,7 +29054,8 @@ bool TestCommittedSpoolWriteRenameMovePreservesPayload()
     rw_context.disallow_scaffold_commit_on_non_fixture = false;
     rw_context.reject_scaffold_replay_blob_on_non_fixture = false;
     rw_context.require_canonical_replay_candidate_on_non_fixture = false;
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     context.metadata_store->SetFilePayloadProvider(
         [&context](const std::wstring& path, std::uint64_t logical_size) -> std::optional<std::vector<std::byte>>
         {
@@ -29053,7 +29439,8 @@ bool TestWritableOpenHydratesSparseMetadataWithoutDenseCache()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     std::unordered_map<std::wstring, std::vector<std::byte>> staged_payloads;
     context.metadata_store->SetFilePayloadProvider(
         [&staged_payloads](const std::wstring& path, std::uint64_t logical_size) -> std::optional<std::vector<std::byte>>
@@ -31231,7 +31618,8 @@ bool TestRecoveryIdentityBlockCannotBeClearedByMetadataReplay()
         image_path.wstring(),
         L"Main",
     };
-    context.metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(std::move(rw_context));
+    context.metadata_store = context.owned_metadata_store.get();
     {
         std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
         if (!Require(
@@ -32396,8 +32784,1231 @@ bool TestFsHostStatusSeparatesLockWaitCounters()
                "Disabled status should omit payload-spool wait telemetry");
 }
 
+bool TestParseArgsContainerId()
+{
+    auto parse_with_container = [](const std::wstring& container_id, Arguments& parsed)
+    {
+        std::vector<std::wstring> raw_args
+        {
+            L"ApfsAccess.FsHost.exe",
+            L"--device", L"fixture.img",
+            L"--volume", L"Main",
+            L"--container-id", container_id,
+            L"--mount", L"P:",
+            L"--readonly",
+            L"--parent-pid", std::to_wstring(GetCurrentProcessId()),
+            L"--lifetime-file", L"parent.alive",
+            L"--startup-gate-file", L"parent.gate",
+            L"--startup-gate-token", L"authorized-token"
+        };
+        std::vector<wchar_t*> argv;
+        argv.reserve(raw_args.size());
+        for (auto& token : raw_args)
+        {
+            argv.push_back(token.data());
+        }
+        return ParseArgs(static_cast<int>(argv.size()), argv.data(), parsed);
+    };
+
+    Arguments accepted{};
+    if (!Require(parse_with_container(
+            L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", accepted) &&
+            accepted.container_id == L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "ParseArgs should accept a 32-hex container ID"))
+    {
+        return false;
+    }
+    Arguments rejected_short{};
+    if (!Require(!parse_with_container(L"abc", rejected_short),
+        "ParseArgs should reject a short container ID"))
+    {
+        return false;
+    }
+    Arguments rejected_upper{};
+    if (!Require(!parse_with_container(
+            L"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", rejected_upper),
+        "ParseArgs should reject uppercase container hex"))
+    {
+        return false;
+    }
+    Arguments rejected_garbage{};
+    return Require(!parse_with_container(
+            L"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", rejected_garbage),
+        "ParseArgs should reject non-hex container IDs");
+}
+
+#ifdef APFSACCESS_HAS_RW_ENGINE
+namespace
+{
+std::atomic<std::uint64_t> g_resolve_fixture_counter{0};
+}
+
+// RAII fixture image for catalog-backed resolution tests.
+struct ResolveFixtureFile
+{
+    std::filesystem::path path;
+    explicit ResolveFixtureFile(
+        const apfsaccess::testfixture::BuilderImage& spec, const std::string& tag)
+    {
+        const auto name = "apfs-fshost-resolve-" + tag + "-" +
+            std::to_string(g_resolve_fixture_counter.fetch_add(1)) + ".img";
+        path = std::filesystem::temp_directory_path() / name;
+        const auto image = apfsaccess::testfixture::BuildTestImage(spec);
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(image.data()),
+            static_cast<std::streamsize>(image.size()));
+        out.close();
+    }
+    ~ResolveFixtureFile()
+    {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+    ResolveFixtureFile(const ResolveFixtureFile&) = delete;
+    ResolveFixtureFile& operator=(const ResolveFixtureFile&) = delete;
+};
+
+apfsaccess::testfixture::BuilderImage SingleVolumeStoreImage(
+    const std::string& volume_name, const std::string& container_uuid)
+{
+    apfsaccess::testfixture::BuilderImage spec;
+    spec.gpt = false;
+    spec.stores.front().uuid_hex = container_uuid;
+    spec.stores.front().volumes.front().name = volume_name;
+    spec.stores.front().authoritative_checkpoint = true;
+    return spec;
+}
+
+Arguments ResolveTestArgs(
+    const std::filesystem::path& device, const std::wstring& volume,
+    std::uint64_t oid, const std::wstring& container_id)
+{
+    Arguments args{};
+    args.device = device.wstring();
+    args.volume = volume;
+    args.volume_object_id = oid;
+    args.container_id = container_id;
+    return args;
+}
+
+bool TestResolveMountVolumeRejectsWrongNameOnSoleVolume()
+{
+    // A wrong explicit name must fail even when the catalog holds exactly
+    // one volume: no sole-volume fallback.
+    ResolveFixtureFile fixture(
+        SingleVolumeStoreImage("Alpha", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "wrongname");
+    Arguments args = ResolveTestArgs(fixture.path, L"Beta", 0, L"");
+    return Require(!ResolveMountVolumeObjectId(args),
+        "wrong explicit name on a sole volume must fail resolution");
+}
+
+bool TestResolveMountVolumeOidRequiresCatalog()
+{
+    // An explicit OID that cannot be verified against a loaded catalog is
+    // rejected; unreadable catalogs are never trusted.
+    Arguments args = ResolveTestArgs(
+        std::filesystem::temp_directory_path() / "apfs-fshost-resolve-missing-0.img",
+        L"Main", 101, L"");
+    return Require(!ResolveMountVolumeObjectId(args),
+        "explicit OID with an unreadable catalog must fail resolution");
+}
+
+bool TestResolveMountVolumeOidContainerMismatch()
+{
+    ResolveFixtureFile fixture(
+        SingleVolumeStoreImage("Alpha", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "oidmismatch");
+    Arguments args = ResolveTestArgs(fixture.path, L"Alpha", 101,
+        L"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    return Require(!ResolveMountVolumeObjectId(args),
+        "explicit OID with a mismatching container ID must fail resolution");
+}
+
+bool TestResolveMountVolumeNameContainerScoped()
+{
+    ResolveFixtureFile fixture(
+        SingleVolumeStoreImage("Alpha", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "scoped");
+    bool ok = true;
+    Arguments matched = ResolveTestArgs(fixture.path, L"Alpha",
+        0, L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    ok &= Require(ResolveMountVolumeObjectId(matched) && matched.volume_object_id == 101,
+        "name plus matching container resolves the volume");
+    Arguments mismatched = ResolveTestArgs(fixture.path, L"Alpha",
+        0, L"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    ok &= Require(!ResolveMountVolumeObjectId(mismatched),
+        "name plus mismatching container fails resolution");
+    return ok;
+}
+
+bool TestResolveMountVolumeLegacyCatalogUnreadable()
+{    // Garbage devices keep the legacy path: resolution succeeds with the OID
+    // left at 0 and the reader fails closed downstream as before.
+    std::error_code ec;
+    const auto path = std::filesystem::temp_directory_path() /
+        ("apfs-fshost-resolve-garbage-" +
+            std::to_string(g_resolve_fixture_counter.fetch_add(1)) + ".img");
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        const char junk[4096] = {};
+        out.write(junk, sizeof(junk));
+    }
+    Arguments args = ResolveTestArgs(path, L"Main", 0, L"");
+    const bool resolved = ResolveMountVolumeObjectId(args);
+    std::filesystem::remove(path, ec);
+    return Require(resolved && args.volume_object_id == 0,
+        "unreadable catalogs keep the legacy unresolved path");
+}
+
+namespace
+{
+std::atomic<std::uint64_t> g_manifest_fixture_counter{0};
+
+std::vector<wchar_t*> ManifestArgv(std::vector<std::wstring>& raw)
+{
+    std::vector<wchar_t*> argv;
+    argv.reserve(raw.size());
+    for (auto& token : raw)
+    {
+        argv.push_back(token.data());
+    }
+    return argv;
+}
+
+std::vector<std::wstring> ManifestBaseArgv()
+{
+    return std::vector<std::wstring>{
+        L"ApfsAccess.FsHost.exe",
+        L"--container-manifest", L"manifest.json",
+        L"--container-manifest-sha256",
+        L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        L"--container-control-file", L"container.control",
+        L"--container-control-token",
+        L"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        L"--readwrite",
+        L"--parent-pid", std::to_wstring(GetCurrentProcessId()),
+        L"--lifetime-file", L"parent.alive",
+        L"--startup-gate-file", L"parent.gate",
+        L"--startup-gate-token", L"authorized-token",
+        L"--status-file", L"container.status.json",
+    };
+}
+
+apfsaccess::testfixture::BuilderStore TwoProjectableVolumeStore()
+{
+    apfsaccess::testfixture::BuilderVolume alpha;
+    alpha.oid = 101;
+    alpha.name = "Alpha";
+    alpha.projectable = true;
+    apfsaccess::testfixture::BuilderVolume beta;
+    beta.oid = 102;
+    beta.name = "Beta";
+    beta.projectable = true;
+    apfsaccess::testfixture::BuilderStore store;
+    store.volumes = {alpha, beta};
+    store.spaceman_oid = 8;
+    store.spaceman_block = 60;
+    store.block_count = 512;
+    return store;
+}
+
+struct ContainerFixtureFile
+{
+    std::filesystem::path path;
+    explicit ContainerFixtureFile(
+        const std::string& tag, bool authoritative_checkpoint = false)
+    {
+        const auto name = "apfs-fshost-container-" + tag + "-" +
+            std::to_string(g_manifest_fixture_counter.fetch_add(1)) + ".apfs.img";
+        path = std::filesystem::temp_directory_path() / name;
+        auto store = TwoProjectableVolumeStore();
+        if (authoritative_checkpoint)
+        {
+            store.authoritative_checkpoint = true;
+            store.dual_checkpoint = false;
+            store.xid = 20;
+        }
+        const auto image = apfsaccess::testfixture::BuildStoreImage(store);
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(image.data()),
+            static_cast<std::streamsize>(image.size()));
+        out.close();
+    }
+    ~ContainerFixtureFile()
+    {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+    ContainerFixtureFile(const ContainerFixtureFile&) = delete;
+    ContainerFixtureFile& operator=(const ContainerFixtureFile&) = delete;
+};
+
+std::unique_ptr<apfsaccess::catalog::ContainerMountCoordinator>
+OpenContainerFixtureCoordinator(
+    const ContainerFixtureFile& fixture,
+    std::string& error,
+    apfsaccess::catalog::CatalogLoadPolicy policy =
+        apfsaccess::catalog::CatalogLoadPolicy::AllowLegacySynthetic)
+{
+    return apfsaccess::catalog::ContainerMountCoordinator::Open(
+        fixture.path.string(),
+        0,
+        error,
+        policy);
+}
+
+Arguments ManifestSessionArgs(
+    const std::filesystem::path& device, std::uint64_t oid,
+    const std::wstring& container_id, const std::wstring& mount, bool readwrite)
+{
+    Arguments args{};
+    // Mirror manifest expansion: the volume carries its own device, and
+    // fixture-backed volumes run the relaxed (non-canonical) path.
+    args.device = device.wstring();
+    args.volume_object_id = oid;
+    args.container_id = container_id;
+    args.mount = mount;
+    args.readwrite = readwrite;
+    args.readonly = !readwrite;
+    args.write_require_canonical_commit = false;
+    args.write_disallow_scaffold_commit_on_non_fixture = false;
+    args.write_reject_scaffold_replay_blob_on_non_fixture = false;
+    args.write_require_canonical_replay_candidate_on_non_fixture = false;
+    return args;
+}
+} // namespace
+
+bool TestManifestArgsValidation()
+{
+    bool ok = true;
+    {
+        auto raw = ManifestBaseArgv();
+        auto argv = ManifestArgv(raw);
+        Arguments parsed{};
+        ok &= Require(
+            ParseArgs(static_cast<int>(argv.size()), argv.data(), parsed),
+            "manifest: full manifest argv accepted");
+        ok &= Require(
+            parsed.container_manifest == L"manifest.json",
+            "manifest: manifest path parsed");
+        ok &= Require(
+            parsed.container_manifest_sha256 ==
+                L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "manifest: launch-bound checksum parsed");
+    }
+    const auto rejects = [&](std::vector<std::wstring> raw, const char* message)
+    {
+        auto argv = ManifestArgv(raw);
+        Arguments parsed{};
+        ok &= Require(
+            !ParseArgs(static_cast<int>(argv.size()), argv.data(), parsed),
+            message);
+    };
+    {
+        auto raw = ManifestBaseArgv();
+        const auto checksum = std::find(
+            raw.begin(), raw.end(), L"--container-manifest-sha256");
+        if (checksum != raw.end())
+        {
+            raw.erase(checksum, checksum + 2);
+        }
+        rejects(raw, "manifest: missing launch-bound checksum fails closed");
+    }
+    {
+        auto raw = ManifestBaseArgv();
+        const auto checksum = std::find(
+            raw.begin(), raw.end(), L"--container-manifest-sha256");
+        if (checksum != raw.end())
+        {
+            *(checksum + 1) = L"not-a-sha256";
+        }
+        rejects(raw, "manifest: malformed launch-bound checksum fails closed");
+    }
+    {
+        auto raw = ManifestBaseArgv();
+        const auto control = std::find(
+            raw.begin(), raw.end(), L"--container-control-file");
+        if (control != raw.end())
+        {
+            raw.erase(control, control + 2);
+        }
+        rejects(raw, "manifest: missing lifecycle control file fails closed");
+    }
+    {
+        auto raw = ManifestBaseArgv();
+        const auto token = std::find(
+            raw.begin(), raw.end(), L"--container-control-token");
+        if (token != raw.end())
+        {
+            *(token + 1) = L"not-a-control-token";
+        }
+        rejects(raw, "manifest: malformed lifecycle control token fails closed");
+    }
+    {
+        auto raw = ManifestBaseArgv();
+        raw.insert(raw.end(), {L"--device", L"\\\\.\\PhysicalDrive2"});
+        rejects(raw, "manifest: --device mixed in fails closed");
+    }
+    {
+        auto raw = ManifestBaseArgv();
+        raw.insert(raw.end(), {L"--volume", L"Main"});
+        rejects(raw, "manifest: --volume mixed in fails closed");
+    }
+    {
+        auto raw = ManifestBaseArgv();
+        raw.insert(raw.end(), {L"--mount", L"P:"});
+        rejects(raw, "manifest: --mount mixed in fails closed");
+    }
+    {
+        auto raw = ManifestBaseArgv();
+        raw.insert(raw.end(), {L"--volume-oid", L"101"});
+        rejects(raw, "manifest: --volume-oid mixed in fails closed");
+    }
+    {
+        auto raw = ManifestBaseArgv();
+        raw.insert(raw.end(), {L"--container-id", L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"});
+        rejects(raw, "manifest: --container-id mixed in fails closed");
+    }
+    {
+        auto raw = ManifestBaseArgv();
+        raw.erase(std::remove(raw.begin(), raw.end(), L"--status-file"), raw.end());
+        raw.erase(std::remove(raw.begin(), raw.end(), L"container.status.json"), raw.end());
+        rejects(raw, "manifest: missing status file fails closed");
+    }
+    {
+        auto raw = ManifestBaseArgv();
+        raw.erase(std::remove(raw.begin(), raw.end(), L"--readwrite"), raw.end());
+        rejects(raw, "manifest: missing mode fails closed");
+    }
+    {
+        auto raw = ManifestBaseArgv();
+        raw.insert(raw.end(), {L"--readonly"});
+        rejects(raw, "manifest: readonly+readwrite fails closed");
+    }
+    return ok;
+}
+
+bool TestManifestVolumeArgsExpansion()
+{
+    apfsaccess::catalog::ContainerManifest manifest{};
+    manifest.container_uuid_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    manifest.manifest_sha256 =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    manifest.device_path = "D:\\dev\\c.img";
+    manifest.device_offset_bytes = 0;
+    apfsaccess::catalog::ManifestVolumeEntry alpha{};
+    alpha.object_id = 101;
+    alpha.container_uuid_hex = manifest.container_uuid_hex;
+    alpha.name_utf8 = "Alpha";
+    alpha.mount_point = "A:\\mnt\\Alpha";
+    alpha.requested_write = true;
+    alpha.recovery_identity = "ident-a";
+    apfsaccess::catalog::ManifestVolumeEntry beta{};
+    beta.object_id = 102;
+    beta.container_uuid_hex = manifest.container_uuid_hex;
+    beta.name_utf8 = "Beta";
+    beta.mount_point = "B:";
+    beta.requested_write = false;
+    manifest.volumes = {alpha, beta};
+
+    bool ok = true;
+    Arguments process_args{};
+    process_args.readwrite = true;
+    process_args.write_backend = L"Native";
+    process_args.container_manifest_sha256 =
+        L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    std::vector<Arguments> volumes;
+    std::wstring error;
+    ok &= Require(
+        BuildManifestVolumeArgs(process_args, manifest, volumes, error),
+        "manifest: expansion succeeds");
+    ok &= Require(
+        IsContainerManifestChecksumBound(process_args, manifest),
+        "manifest: parsed semantics match the parent-bound checksum");
+    manifest.manifest_sha256[0] = 'b';
+    ok &= Require(
+        !IsContainerManifestChecksumBound(process_args, manifest),
+        "manifest: checksum substitution is rejected");
+    manifest.manifest_sha256[0] = 'a';
+    if (!ok || volumes.size() != 2)
+    {
+        return false;
+    }
+    ok &= Require(
+        volumes[0].device == L"D:\\dev\\c.img" &&
+            volumes[0].volume == L"Alpha" &&
+            volumes[0].volume_object_id == 101 &&
+            volumes[0].container_id == L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" &&
+            volumes[0].mount == L"A:\\mnt\\Alpha" &&
+            volumes[0].readwrite && !volumes[0].readonly &&
+            volumes[0].recovery_identity == L"ident-a" &&
+            volumes[0].status_file.empty(),
+        "manifest: writable volume inherits process writability");
+    ok &= Require(
+        volumes[1].volume == L"Beta" && !volumes[1].readwrite &&
+            volumes[1].readonly && volumes[1].recovery_identity.empty(),
+        "manifest: read-only entry stays read-only under a readwrite process");
+    process_args.readwrite = false;
+    process_args.readonly = true;
+    ok &= Require(
+        BuildManifestVolumeArgs(process_args, manifest, volumes, error) &&
+            !volumes[0].readwrite,
+        "manifest: read-only process forces every volume read-only");
+    return ok;
+}
+
+bool TestManifestSessionFunnel()
+{
+    ContainerFixtureFile fixture("funnel");
+    std::string error;
+    auto coordinator = OpenContainerFixtureCoordinator(fixture, error);
+    if (!Require(coordinator != nullptr, "manifest-funnel: open container"))
+    {
+        return false;
+    }
+    const std::wstring uuid = Utf8ToWide(coordinator->ContainerUuidHex());
+    bool ok = true;
+    MountContext ctx_alpha{};
+    ctx_alpha.args = ManifestSessionArgs(fixture.path, 101, uuid, L"A:\\mnt\\Alpha", true);
+    ctx_alpha.native_write_enabled = true;
+    std::wstring mount_error;
+    ok &= Require(
+        MountManifestSession(*coordinator, ctx_alpha.args, ctx_alpha, mount_error),
+        "manifest-funnel: mount Alpha");
+    MountContext ctx_beta{};
+    ctx_beta.args = ManifestSessionArgs(fixture.path, 102, uuid, L"B:", true);
+    ctx_beta.native_write_enabled = true;
+    ok &= Require(
+        MountManifestSession(*coordinator, ctx_beta.args, ctx_beta, mount_error),
+        "manifest-funnel: mount Beta");
+    if (!ok)
+    {
+        return false;
+    }
+    ok &= Require(
+        IsManifestSession(&ctx_alpha) && IsManifestSession(&ctx_beta),
+        "manifest-funnel: sessions flagged");
+    ok &= Require(
+        ctx_alpha.metadata_store != nullptr &&
+            ctx_alpha.metadata_store == coordinator->FindSessionStore(101),
+        "manifest-funnel: context borrows the coordinator session");
+    bool staged_alpha = true;
+    ok &= Require(
+        RecordNativeMutationBestEffort(
+            &ctx_alpha,
+            apfsaccess::rw::MetadataStore::MutationOperation::CreateFile,
+            L"\\f-a.bin", L"", 0, 0, false, 0, nullptr, &staged_alpha),
+        "manifest-funnel: foreground mutation accepted");
+    ok &= Require(
+        !staged_alpha && ManifestQueuedRequestCount(&ctx_alpha) == 1,
+        "manifest-funnel: always-defer (queued, not staged)");
+    bool staged_beta = true;
+    ok &= Require(
+        RecordNativeMutationBestEffort(
+            &ctx_beta,
+            apfsaccess::rw::MetadataStore::MutationOperation::CreateFile,
+            L"\\f-b.bin", L"", 0, 0, false, 0, nullptr, &staged_beta) &&
+            !staged_beta,
+        "manifest-funnel: sibling defers too");
+    const auto outcome_alpha = CommitManifestMutations(
+        &ctx_alpha, DrainManifestRequests(&ctx_alpha));
+    if (outcome_alpha.status !=
+        apfsaccess::rw::MetadataStore::CommitStatus::Committed)
+    {
+        std::fprintf(
+            stderr, "[INFO] alpha commit: %s stage=%s\n",
+            outcome_alpha.error.c_str(), outcome_alpha.stage.c_str());
+    }
+    ok &= Require(
+        outcome_alpha.status ==
+            apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "manifest-funnel: worker-equivalent commit persists Alpha");
+    const auto outcome_beta = CommitManifestMutations(
+        &ctx_beta, DrainManifestRequests(&ctx_beta));
+    ok &= Require(
+        outcome_beta.status ==
+            apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "manifest-funnel: sibling commit persists Beta");
+    ok &= Require(
+        !coordinator->IsRecoveryRequired(),
+        "manifest-funnel: no overlap or refresh failure latched");
+    ok &= Require(
+        coordinator->UnmountVolume(101, error) &&
+            coordinator->MountedVolumeCount() == 1 &&
+            coordinator->RawLeaseHeld(),
+        "manifest-funnel: unmount is sibling-safe");
+    bool staged_beta2 = true;
+    ok &= Require(
+        RecordNativeMutationBestEffort(
+            &ctx_beta,
+            apfsaccess::rw::MetadataStore::MutationOperation::CreateFile,
+            L"\\f-b2.bin", L"", 0, 0, false, 0, nullptr, &staged_beta2),
+        "manifest-funnel: surviving session still accepts work");
+    const auto outcome_beta2 = CommitManifestMutations(
+        &ctx_beta, DrainManifestRequests(&ctx_beta));
+    ok &= Require(
+        outcome_beta2.status ==
+            apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+        "manifest-funnel: surviving session still commits");
+    std::string drain_error;
+    (void)coordinator->DrainAndStop(std::chrono::seconds(5));
+    (void)drain_error;
+    return ok;
+}
+
+bool TestManifestCallbacksBindWalIdentityBeforeCanonicalPublication()
+{
+    ContainerFixtureFile fixture("callback-wal-identity", true);
+    std::string error;
+    auto coordinator = OpenContainerFixtureCoordinator(
+        fixture,
+        error,
+        apfsaccess::catalog::CatalogLoadPolicy::StrictApple);
+    if (!Require(coordinator != nullptr, "manifest-callback: open strict container"))
+    {
+        return false;
+    }
+
+    auto context_owner = std::make_unique<MountContext>();
+    auto& context = *context_owner;
+    context.args = ManifestSessionArgs(
+        fixture.path,
+        101,
+        Utf8ToWide(coordinator->ContainerUuidHex()),
+        L"A:\\mnt\\Alpha",
+        true);
+    context.args.write_backend = L"Native";
+    context.args.write_require_canonical_commit = true;
+    context.args.allow_legacy_scaffold_for_fixtures = false;
+    context.args.write_disallow_scaffold_commit_on_non_fixture = true;
+    context.args.write_reject_scaffold_replay_blob_on_non_fixture = true;
+    context.args.write_require_canonical_replay_candidate_on_non_fixture = true;
+    context.native_write_enabled = true;
+    SeedRoot(context);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+    if (!Require(
+            PrepareUnitHydrationRoot(context, L"manifest-callback-wal-identity"),
+            "manifest-callback: prepare hydration root") ||
+        !Require(
+            ConfigureUnitRecoveryMarker(context, L"manifest-callback-wal-identity"),
+            "manifest-callback: configure recovery marker"))
+    {
+        return false;
+    }
+
+    std::error_code ec;
+    ScopeExit cleanup{[&]()
+    {
+        StopDeferredCommitWorker(&context);
+        std::filesystem::remove(context.recovery_marker_file, ec);
+        std::filesystem::remove_all(context.session_root, ec);
+        (void)coordinator->DrainAndStop(std::chrono::seconds(5));
+    }};
+
+    std::wstring mount_error;
+    if (!Require(
+            MountManifestSession(
+                *coordinator, context.args, context, mount_error),
+            "manifest-callback: mount Alpha") ||
+        !Require(
+            context.metadata_store != nullptr &&
+                context.metadata_store->IsCanonicalCommitReady(),
+            "manifest-callback: canonical writer ready"))
+    {
+        return false;
+    }
+
+    context.metadata_store->SetFilePayloadRangeProvider(
+        [&context](
+            const std::wstring& path,
+            apfsaccess::rw::MetadataStore::PayloadIdentity identity,
+            std::uint64_t offset,
+            std::span<std::byte> destination) -> bool
+        {
+            return ReadHydratedPayloadRangeForPath(
+                &context, path, identity, offset, destination);
+        });
+    context.payload_spool_volume_identity = "unit-manifest-callback";
+    context.payload_spool = std::make_unique<apfsaccess::rw::PayloadSpool>(
+        apfsaccess::rw::PayloadSpool::Options{
+            context.session_root / "payload-spool",
+            context.payload_spool_volume_identity,
+            1024 * 1024,
+        });
+    context.tx_manager =
+        std::make_unique<apfsaccess::rw::TransactionManager>(L"Conservative");
+    context.tx_manager->SetVolumeIdentity(L"unit-manifest-callback");
+    context.tx_manager->SetJournalPath(
+        (context.session_root / "manifest-callback.wal").wstring());
+
+    auto fs = BuildFileSystem(&context);
+    PVOID open_handle = nullptr;
+    FSP_FSCTL_FILE_INFO info{};
+    const auto create_status = CB_Create(
+        &fs,
+        const_cast<PWSTR>(L"\\callback.bin"),
+        FILE_NON_DIRECTORY_FILE,
+        FILE_READ_DATA | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES,
+        0,
+        nullptr,
+        0,
+        &open_handle,
+        &info);
+    if (!Require(
+            create_status == STATUS_SUCCESS,
+            "manifest-callback: create must not downgrade to read-only") ||
+        !Require(open_handle != nullptr, "manifest-callback: create returns handle"))
+    {
+        return false;
+    }
+
+    const std::array<std::byte, 8> payload{
+        std::byte{'A'}, std::byte{'P'}, std::byte{'F'}, std::byte{'S'},
+        std::byte{'-'}, std::byte{'R'}, std::byte{'W'}, std::byte{'!'},
+    };
+    ULONG written = 0;
+    const auto write_status = CB_Write(
+        &fs,
+        open_handle,
+        const_cast<std::byte*>(payload.data()),
+        0,
+        static_cast<ULONG>(payload.size()),
+        FALSE,
+        FALSE,
+        &written,
+        &info);
+    CB_Close(&fs, open_handle);
+
+    std::vector<std::byte> committed;
+    const bool read_committed = context.metadata_store->ReadCommittedFileRange(
+        L"\\callback.bin", 0, payload.size(), committed);
+    const auto watermarks = context.tx_manager->Watermarks();
+    return Require(
+               write_status == STATUS_SUCCESS && written == payload.size(),
+               "manifest-callback: payload write remains writable") &&
+           Require(
+               read_committed && committed ==
+                   std::vector<std::byte>(payload.begin(), payload.end()),
+               "manifest-callback: canonical checkpoint contains exact payload") &&
+           Require(
+               ManifestQueuedRequestCount(&context) == 0,
+               "manifest-callback: no identity-less request remains queued") &&
+           Require(
+               watermarks.accepted_sequence != 0 &&
+                   watermarks.accepted_sequence == watermarks.apfs_durable_sequence &&
+                   watermarks.apfs_durable_sequence == watermarks.cleanup_sequence,
+               "manifest-callback: WAL identity is accepted, checkpointed, and cleaned") &&
+           Require(
+               context.native_write_enabled && !context.write_degraded &&
+                   !context.recovery_active,
+               "manifest-callback: healthy RW state is retained");
+}
+
+bool TestManifestMetadataPolicyProjection()
+{
+    Arguments args{};
+    args.device = L"\\\\.\\PhysicalDrive9";
+    args.volume = L"Data";
+    args.allow_raw_physical_write = true;
+    args.write_integrity_check_on_mount = false;
+    args.write_crash_replay_mode = L"ReplayIfSafe";
+    args.allow_legacy_scaffold_for_fixtures = true;
+    args.write_disallow_scaffold_commit_on_non_fixture = false;
+    args.write_reject_scaffold_replay_blob_on_non_fixture = false;
+    args.write_require_canonical_replay_candidate_on_non_fixture = false;
+    args.device_offset_bytes = 4096;
+    args.volume_object_id = 101;
+
+    const auto context = BuildMetadataStoreVolumeContext(args);
+    return Require(context.device_path == args.device &&
+                       context.volume_name == args.volume &&
+                       context.allow_raw_physical_write &&
+                       !context.integrity_check_on_mount &&
+                       context.crash_replay_mode == L"ReplayIfSafe" &&
+                       context.allow_legacy_scaffold_for_fixtures &&
+                       !context.disallow_scaffold_commit_on_non_fixture &&
+                       !context.reject_scaffold_replay_blob_on_non_fixture &&
+                       !context.require_canonical_replay_candidate_on_non_fixture &&
+                       context.device_offset_bytes == 4096 &&
+                       context.volume_object_id == 101,
+                   "Manifest metadata context must preserve every legacy write policy");
+}
+
+bool TestManifestBackpressureCommitUsesMetadataLock()
+{
+    ContainerFixtureFile fixture("backpressure-lock");
+    std::string error;
+    auto coordinator = OpenContainerFixtureCoordinator(fixture, error);
+    if (!Require(
+            coordinator != nullptr, "manifest-backpressure-lock: open container"))
+    {
+        return false;
+    }
+    auto context_owner = std::make_unique<MountContext>();
+    auto& context = *context_owner;
+    context.args = ManifestSessionArgs(
+        fixture.path, 101, Utf8ToWide(coordinator->ContainerUuidHex()),
+        L"A:\\mnt\\Alpha", true);
+    context.args.write_max_dirty_transactions = 1;
+    context.native_write_enabled = true;
+    std::wstring mount_error;
+    if (!Require(
+            MountManifestSession(
+                *coordinator, context.args, context, mount_error),
+            "manifest-backpressure-lock: mount Alpha"))
+    {
+        return false;
+    }
+
+    apfsaccess::rw::MetadataStore::MutationRequest queued{};
+    queued.operation =
+        apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+    queued.path = L"\\queued-before-pressure.bin";
+    EnqueueManifestRequest(&context, queued);
+
+    bool ok = true;
+    ok &= Require(
+        !RecordNativeMutationBestEffort(
+            &context,
+            apfsaccess::rw::MetadataStore::MutationOperation::CreateFile,
+            L"\\queued-after-pressure.bin"),
+        "manifest-backpressure-lock: identityless overflow fails closed");
+    ok &= Require(
+        context.last_native_mutation_failure_status ==
+            L"manifest-unjournaled-queue-limit",
+        "manifest-backpressure-lock: overflow reports the replay-safety reason");
+    const auto preserved = DrainManifestRequests(&context);
+    ok &= Require(
+        preserved.size() == 1 &&
+            preserved.front().path == L"\\queued-before-pressure.bin",
+        "manifest-backpressure-lock: preserves the boundable request without adding overflow");
+    (void)coordinator->DrainAndStop(std::chrono::seconds(5));
+    return ok;
+}
+
+bool TestManifestContainerStatusFile()
+{
+    ContainerFixtureFile fixture("status");
+    std::string error;
+    auto coordinator = OpenContainerFixtureCoordinator(fixture, error);
+    if (!Require(coordinator != nullptr, "manifest-status: open container"))
+    {
+        return false;
+    }
+    const std::wstring uuid = Utf8ToWide(coordinator->ContainerUuidHex());
+    std::vector<std::unique_ptr<MountContext>> contexts;
+    contexts.push_back(std::make_unique<MountContext>());
+    contexts.back()->args = ManifestSessionArgs(fixture.path, 101, uuid, L"A:\\mnt\\Alpha", true);
+    contexts.back()->native_write_enabled = true;
+    contexts.back()->recovery_active = true;
+    contexts.back()->write_degraded = true;
+    contexts.back()->runtime_recovery_reason = L"CommitPersistFailed";
+    contexts.back()->manifest_mount_attached.store(true, std::memory_order_release);
+    std::wstring mount_error;
+    if (!Require(
+            MountManifestSession(
+                *coordinator, contexts.back()->args, *contexts.back(), mount_error),
+            "manifest-status: mount session"))
+    {
+        return false;
+    }
+    const auto status_path = std::filesystem::temp_directory_path() /
+        ("apfs-fshost-container-status-" +
+            std::to_string(g_manifest_fixture_counter.fetch_add(1)) + ".json");
+    Arguments process_args{};
+    process_args.status_file = status_path.wstring();
+    bool ok = true;
+    ok &= Require(
+        WriteContainerStatusFile(process_args, *coordinator, contexts),
+        "manifest-status: status written");
+    std::string text;
+    {
+        std::ifstream input(status_path, std::ios::binary);
+        std::ostringstream body;
+        body << input.rdbuf();
+        text = body.str();
+    }
+    std::error_code ec;
+    const std::string uuid_narrow = coordinator->ContainerUuidHex();
+    ok &= Require(
+        text.find("\"containerUuid\":\"" + uuid_narrow + "\"") != std::string::npos,
+        "manifest-status: container uuid reported");
+    ok &= Require(
+        text.find("\"ownerStartFileTimeUtc\":") != std::string::npos &&
+            text.find("\"ownerStartFileTimeUtc\":0") == std::string::npos,
+        "manifest-status: owner process instance reported");
+    ok &= Require(
+        text.find("\"canonicalId\":\"apfs-vol:" + uuid_narrow + ":101\"") !=
+            std::string::npos,
+        "manifest-status: canonical volume id reported");
+    ok &= Require(
+        text.find("\"mounted\":true") != std::string::npos &&
+            text.find("\"ready\":false") != std::string::npos,
+        "manifest-status: mounted pre-serve session is not yet ready");
+    ok &= Require(
+        text.find("\"recoveryActive\":true") != std::string::npos &&
+            text.find("\"writeDegraded\":true") != std::string::npos &&
+            text.find("\"recoveryReason\":\"CommitPersistFailed\"") !=
+                std::string::npos,
+        "manifest-status: per-volume recovery state reported");
+    (void)coordinator->DrainAndStop(std::chrono::seconds(5));
+    // Serve teardown clears session bindings before the terminal write, so
+    // the tombstone reports no mounted volumes and a dropped lease.
+    contexts.back()->container_coordinator = nullptr;
+    contexts.back()->container_volume_oid = 0;
+    ok &= Require(
+        WriteContainerStatusFile(process_args, *coordinator, contexts),
+        "manifest-status: terminal status atomically replaces the live snapshot");
+    std::ifstream tombstone(status_path, std::ios::binary);
+    std::ostringstream tombstone_body;
+    tombstone_body << tombstone.rdbuf();
+    const std::string tombstone_text = tombstone_body.str();
+    std::filesystem::remove(status_path, ec);
+    ok &= Require(
+        tombstone_text.find("\"leaseHeld\":false") != std::string::npos &&
+            tombstone_text.find("\"volumes\":[]") != std::string::npos,
+        "manifest-status: drained tombstone drops lease and sessions");
+    return ok;
+}
+
+bool TestManifestPartialStartupDrainsStartedSibling()
+{
+    g_manifest_partial_stop_count.store(0, std::memory_order_relaxed);
+    g_manifest_partial_remove_count.store(0, std::memory_order_relaxed);
+    g_manifest_partial_delete_count.store(0, std::memory_order_relaxed);
+
+    std::vector<std::unique_ptr<MountContext>> contexts;
+    contexts.push_back(std::make_unique<MountContext>());
+    contexts.push_back(std::make_unique<MountContext>());
+    FSP_FILE_SYSTEM first_fs{};
+    contexts[0]->fs = &first_fs;
+    contexts[0]->manifest_mount_attached.store(true, std::memory_order_release);
+    contexts[0]->mount_ready.store(true, std::memory_order_release);
+    contexts[0]->api.Stop = StopDispatcherForManifestPartialStartupTest;
+    contexts[0]->api.RemoveMount = RemoveMountForManifestPartialStartupTest;
+    contexts[0]->api.Delete = DeleteFileSystemForManifestPartialStartupTest;
+
+    const int exit_code = DrainManifestContextsAfterServe(contexts, 7);
+    return Require(exit_code == 7,
+                   "Manifest partial-start cleanup must preserve the startup failure code") &&
+           Require(g_manifest_partial_stop_count.load(std::memory_order_relaxed) == 1,
+                   "Manifest partial-start cleanup must stop the started sibling dispatcher") &&
+           Require(g_manifest_partial_remove_count.load(std::memory_order_relaxed) == 1,
+                   "Manifest partial-start cleanup must remove the started sibling mount") &&
+           Require(g_manifest_partial_delete_count.load(std::memory_order_relaxed) == 1,
+                   "Manifest partial-start cleanup must delete the started sibling filesystem") &&
+           Require(contexts[0]->fs == nullptr,
+                   "Manifest partial-start cleanup must relinquish the started filesystem") &&
+           Require(!contexts[0]->mount_ready.load(std::memory_order_acquire),
+                   "Manifest partial-start cleanup must publish the sibling as not ready");
+}
+
+bool TestManifestWorkerStartFailureTearsDownMount()
+{
+    g_manifest_partial_stop_count.store(0, std::memory_order_relaxed);
+    g_manifest_partial_remove_count.store(0, std::memory_order_relaxed);
+    g_manifest_partial_delete_count.store(0, std::memory_order_relaxed);
+
+    auto context_owner = std::make_unique<MountContext>();
+    auto& context = *context_owner;
+    FSP_FILE_SYSTEM fs{};
+    context.fs = &fs;
+    context.winfsp_lifecycle_phase.store(
+        WinFspLifecyclePhase::Dispatching,
+        std::memory_order_release);
+    context.api.Stop = StopDispatcherForManifestPartialStartupTest;
+    context.api.RemoveMount = RemoveMountForManifestPartialStartupTest;
+    context.api.Delete = DeleteFileSystemForManifestPartialStartupTest;
+
+    const auto result = FinalizeManifestMountStartup(
+        context_owner,
+        [](MountContext*) { throw std::runtime_error("worker-start-fault"); });
+    return Require(!result.success && result.code == "DeferredWorkerStartFailed",
+                   "Manifest worker-start failure must be reported") &&
+           Require(context.fs == nullptr,
+                   "Manifest worker-start failure must relinquish WinFsp") &&
+           Require(!context.manifest_mount_attached.load(std::memory_order_acquire),
+                   "Manifest worker-start failure must stay detached") &&
+           Require(g_manifest_partial_stop_count.load(std::memory_order_relaxed) == 1 &&
+                       g_manifest_partial_remove_count.load(std::memory_order_relaxed) == 1 &&
+                       g_manifest_partial_delete_count.load(std::memory_order_relaxed) == 1,
+                   "Manifest worker-start failure must execute complete WinFsp teardown");
+}
+
+bool TestManifestControlRequestValidation()
+{
+    const std::string token(64, 'b');
+    ContainerControlRequest parsed{};
+    std::string error;
+    bool ok = true;
+    ok &= Require(
+        ParseContainerControlRequestContents(
+            "APFS-CONTROL/1\n0123456789abcdef0123456789abcdef\n" + token +
+                "\ndetach\n101\n",
+            token,
+            parsed,
+            error),
+        "Manifest control request should accept the exact authenticated protocol");
+    ok &= Require(
+        parsed.request_id == "0123456789abcdef0123456789abcdef" &&
+            parsed.action == ContainerControlAction::Detach &&
+            parsed.volume_object_id == 101,
+        "Manifest control request should preserve request identity, action, and volume OID");
+    ok &= Require(
+        !ParseContainerControlRequestContents(
+            "APFS-CONTROL/1\n0123456789abcdef0123456789abcdef\n" +
+                std::string(64, 'c') + "\ndetach\n101\n",
+            token,
+            parsed,
+            error),
+        "Manifest control request should reject the wrong authorization token");
+    ok &= Require(
+        !ParseContainerControlRequestContents(
+            "APFS-CONTROL/1\n0123456789abcdef0123456789abcdef\n" + token +
+                "\nattach\n0\n",
+            token,
+            parsed,
+            error),
+        "Manifest control request should reject object ID zero");
+    return ok;
+}
+
+bool TestManifestControlDetachAndAttachLifecycle()
+{
+    SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", L"0");
+    ScopeExit restore_defer{[]()
+    {
+        SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", nullptr);
+    }};
+    g_manifest_partial_stop_count.store(0, std::memory_order_relaxed);
+    g_manifest_partial_remove_count.store(0, std::memory_order_relaxed);
+    g_manifest_partial_delete_count.store(0, std::memory_order_relaxed);
+    g_manifest_control_create_count.store(0, std::memory_order_relaxed);
+    g_manifest_control_set_mount_count.store(0, std::memory_order_relaxed);
+    g_manifest_control_start_count.store(0, std::memory_order_relaxed);
+    g_manifest_control_interface = nullptr;
+
+    auto context_owner = std::make_unique<MountContext>();
+    auto& context = *context_owner;
+    context.args.mount = L"R:";
+    context.fs = &g_manifest_control_fs;
+    context.winfsp_lifecycle_phase.store(
+        WinFspLifecyclePhase::Dispatching,
+        std::memory_order_release);
+    context.manifest_mount_attached.store(true, std::memory_order_release);
+    context.mount_ready.store(true, std::memory_order_release);
+    context.api.Stop = StopDispatcherForManifestPartialStartupTest;
+    context.api.RemoveMount = RemoveMountForManifestPartialStartupTest;
+    context.api.Delete = DeleteFileSystemForManifestPartialStartupTest;
+    context.api.Create = CreateFileSystemForManifestControlTest;
+    context.api.SetMount = SetMountForManifestControlTest;
+    context.api.Start = StartDispatcherForManifestControlTest;
+
+    const auto detached = DetachManifestMountForControl(context_owner);
+    bool ok = true;
+    ok &= Require(detached.success, "Manifest control detach should drain and stop one mount");
+    ok &= Require(
+        context.fs == nullptr &&
+            !context.manifest_mount_attached.load(std::memory_order_acquire) &&
+            !context.mount_ready.load(std::memory_order_acquire),
+        "Manifest control detach should leave the selected mount absent and not ready");
+    ok &= Require(
+        g_manifest_partial_stop_count.load(std::memory_order_relaxed) == 1 &&
+            g_manifest_partial_remove_count.load(std::memory_order_relaxed) == 1 &&
+            g_manifest_partial_delete_count.load(std::memory_order_relaxed) == 1,
+        "Manifest control detach should execute the complete WinFsp teardown");
+
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+    const auto attached = AttachManifestMountForControl(context_owner, now);
+    ok &= Require(attached.success, "Manifest control attach should recreate one mount");
+    ok &= Require(
+        context.fs == &g_manifest_control_fs &&
+            context.manifest_mount_attached.load(std::memory_order_acquire) &&
+            context.mount_ready.load(std::memory_order_acquire),
+        "Manifest control attach should publish the selected mount ready");
+    ok &= Require(
+        g_manifest_control_create_count.load(std::memory_order_relaxed) == 1 &&
+            g_manifest_control_set_mount_count.load(std::memory_order_relaxed) == 1 &&
+            g_manifest_control_start_count.load(std::memory_order_relaxed) == 1,
+        "Manifest control attach should create, mount, and start exactly one WinFsp filesystem");
+    ok &= Require(
+        g_manifest_control_interface == &ContainerServeInterface(),
+        "Manifest control attach must retain a process-lifetime WinFsp callback interface");
+    return ok;
+}
+
+bool TestManifestControlFileRoundTrip()
+{
+    SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", L"0");
+    ScopeExit restore_defer{[]()
+    {
+        SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", nullptr);
+    }};
+    ContainerFixtureFile fixture("control-file");
+    std::string coordinator_error;
+    auto coordinator = OpenContainerFixtureCoordinator(
+        fixture, coordinator_error);
+    if (!Require(coordinator != nullptr, "Manifest control file should open its container"))
+    {
+        return false;
+    }
+
+    std::vector<std::unique_ptr<MountContext>> contexts;
+    contexts.push_back(std::make_unique<MountContext>());
+    auto& context = *contexts.back();
+    context.args = ManifestSessionArgs(
+        fixture.path, 101, Utf8ToWide(coordinator->ContainerUuidHex()), L"R:", false);
+    std::wstring mount_error;
+    if (!Require(
+            MountManifestSession(*coordinator, context.args, context, mount_error),
+            "Manifest control file should bind its volume session"))
+    {
+        return false;
+    }
+    context.fs = &g_manifest_control_fs;
+    context.manifest_mount_attached.store(true, std::memory_order_release);
+    context.mount_ready.store(true, std::memory_order_release);
+    context.api.Stop = StopDispatcherForManifestPartialStartupTest;
+    context.api.RemoveMount = RemoveMountForManifestPartialStartupTest;
+    context.api.Delete = DeleteFileSystemForManifestPartialStartupTest;
+    context.api.Create = CreateFileSystemForManifestControlTest;
+    context.api.SetMount = SetMountForManifestControlTest;
+    context.api.Start = StartDispatcherForManifestControlTest;
+
+    const auto root = fixture.path.parent_path() /
+        ("control-endpoint-" + std::to_string(g_manifest_fixture_counter.fetch_add(1)));
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    ScopeExit cleanup{[&]() { std::filesystem::remove_all(root, ec); }};
+    Arguments process_args{};
+    process_args.container_control_file = (root / "request.control").wstring();
+    process_args.container_control_token = std::wstring(64, L'b');
+    process_args.status_file = (root / "status.json").wstring();
+    const auto write_request = [&](const char* request_id, const char* action)
+    {
+        std::ofstream output(process_args.container_control_file, std::ios::binary | std::ios::trunc);
+        output << "APFS-CONTROL/1\n" << request_id << "\n"
+               << std::string(64, 'b') << "\n" << action << "\n101\n";
+    };
+
+    write_request("11111111111111111111111111111111", "detach");
+    bool ok = true;
+    ok &= Require(
+        ProcessContainerControlRequest(process_args, *coordinator, contexts),
+        "Manifest control file should process an authenticated detach");
+    ok &= Require(
+        !std::filesystem::exists(process_args.container_control_file) &&
+            !context.manifest_mount_attached.load(std::memory_order_acquire),
+        "Manifest control file should consume the request and detach the selected volume");
+    const auto response_path = process_args.container_control_file + L".response";
+    std::ifstream detach_response(response_path, std::ios::binary);
+    const std::string detach_text{
+        std::istreambuf_iterator<char>(detach_response),
+        std::istreambuf_iterator<char>()};
+    detach_response.close();
+    ok &= Require(
+        detach_text.find("11111111111111111111111111111111\nok\nDetached") != std::string::npos,
+        "Manifest control file should acknowledge the exact detach request");
+    std::filesystem::remove(response_path, ec);
+
+    write_request("22222222222222222222222222222222", "attach");
+    ok &= Require(
+        ProcessContainerControlRequest(process_args, *coordinator, contexts),
+        "Manifest control file should process an authenticated attach");
+    ok &= Require(
+        context.manifest_mount_attached.load(std::memory_order_acquire) &&
+            context.mount_ready.load(std::memory_order_acquire),
+        "Manifest control file should reattach only the requested volume");
+    std::ifstream status(process_args.status_file, std::ios::binary);
+    const std::string status_text{
+        std::istreambuf_iterator<char>(status),
+        std::istreambuf_iterator<char>()};
+    ok &= Require(
+        status_text.find("\"objectId\":101") != std::string::npos &&
+            status_text.find("\"mounted\":true") != std::string::npos &&
+            status_text.find("\"ready\":true") != std::string::npos,
+        "Manifest control file should publish attached readiness before acknowledging");
+    (void)coordinator->DrainAndStop(std::chrono::seconds(5));
+    return ok;
+}
+#endif // APFSACCESS_HAS_RW_ENGINE
+
 bool RunSelectedTest(const std::string& name)
 {
+    if (name == "parse-args-container-id")
+    {
+        return TestParseArgsContainerId();
+    }
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (name == "resolve-mount-volume-wrong-name")
+    {
+        return TestResolveMountVolumeRejectsWrongNameOnSoleVolume();
+    }
+    if (name == "resolve-mount-volume-oid-catalog")
+    {
+        return TestResolveMountVolumeOidRequiresCatalog();
+    }
+    if (name == "resolve-mount-volume-oid-container")
+    {
+        return TestResolveMountVolumeOidContainerMismatch();
+    }
+    if (name == "resolve-mount-volume-name-scoped")
+    {
+        return TestResolveMountVolumeNameContainerScoped();
+    }
+    if (name == "resolve-mount-volume-legacy")
+    {
+        return TestResolveMountVolumeLegacyCatalogUnreadable();
+    }
+    if (name == "manifest-args-validation")
+    {
+        return TestManifestArgsValidation();
+    }
+    if (name == "manifest-volume-args-expansion")
+    {
+        return TestManifestVolumeArgsExpansion();
+    }
+    if (name == "manifest-session-funnel")
+    {
+        return TestManifestSessionFunnel();
+    }
+    if (name == "manifest-callback-wal-identity")
+    {
+        return TestManifestCallbacksBindWalIdentityBeforeCanonicalPublication();
+    }
+    if (name == "manifest-metadata-policy")
+    {
+        return TestManifestMetadataPolicyProjection();
+    }
+    if (name == "manifest-backpressure-metadata-lock")
+    {
+        return TestManifestBackpressureCommitUsesMetadataLock();
+    }
+    if (name == "manifest-container-status-file")
+    {
+        return TestManifestContainerStatusFile();
+    }
+    if (name == "manifest-partial-startup-drain")
+    {
+        return TestManifestPartialStartupDrainsStartedSibling();
+    }
+    if (name == "manifest-worker-start-failure")
+    {
+        return TestManifestWorkerStartFailureTearsDownMount();
+    }
+    if (name == "manifest-control-request")
+    {
+        return TestManifestControlRequestValidation();
+    }
+    if (name == "manifest-control-lifecycle")
+    {
+        return TestManifestControlDetachAndAttachLifecycle();
+    }
+    if (name == "manifest-control-file")
+    {
+        return TestManifestControlFileRoundTrip();
+    }
+#endif
     if (name == "recycle-bin-attributes")
     {
         return TestRecycleBinPathsExposeExplorerCompatibleAttributes();
@@ -32438,9 +34049,17 @@ bool RunSelectedTest(const std::string& name)
     {
         return TestFsHostDispatcherThreadCountIsBoundedAndReported();
     }
-    if (name == "winfsp-teardown-calls-are-serialized")
+    if (name == "winfsp-teardown-timeout-pins-ownership")
     {
-        return TestWinFspTeardownCallsAreSerialized();
+        return TestWinFspTeardownTimeoutPinsOwnershipAtEachPhase();
+    }
+    if (name == "winfsp-teardown-timeout-stops-siblings")
+    {
+        return TestWinFspTeardownTimeoutStopsManifestSiblingCleanup();
+    }
+    if (name == "winfsp-teardown-worker-start-failure")
+    {
+        return TestWinFspTeardownWorkerStartFailurePinsOwnership();
     }
     if (name == "winfsp-shutdown-diagnostic-boundary")
     {
@@ -33751,7 +35370,9 @@ int main(int argc, char** argv)
     ok &= TestShutdownStopsPublishingDiagnosticsAtWinFspBoundary();
     ok &= TestShutdownPublishesMountNotReadyBeforeWinFspTeardown();
     ok &= TestShutdownFailsWhenTerminalStatusCannotBePersisted();
-    ok &= TestWinFspTeardownCallsAreSerialized();
+    ok &= TestWinFspTeardownTimeoutPinsOwnershipAtEachPhase();
+    ok &= TestWinFspTeardownTimeoutStopsManifestSiblingCleanup();
+    ok &= TestWinFspTeardownWorkerStartFailurePinsOwnership();
     ok &= TestWinFspRuntimeVersionRejectsKnownDeadlockBuilds();
     ok &= TestWinFspCleanStartupStartsVerifiedDriver();
     ok &= TestWinFspActiveDriverRequiresExactBinaryIdentity();
@@ -33931,6 +35552,26 @@ int main(int argc, char** argv)
     ok &= TestApplyNonFixtureCanonicalSafetyOverrides_FixtureNamedDirectoryWithoutPatternStaysStrict();
     ok &= TestFsHostDispatcherThreadCountIsBoundedAndReported();
     ok &= TestFsHostStatusSeparatesLockWaitCounters();
+    ok &= TestParseArgsContainerId();
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    ok &= TestResolveMountVolumeRejectsWrongNameOnSoleVolume();
+    ok &= TestResolveMountVolumeOidRequiresCatalog();
+    ok &= TestResolveMountVolumeOidContainerMismatch();
+    ok &= TestResolveMountVolumeNameContainerScoped();
+    ok &= TestResolveMountVolumeLegacyCatalogUnreadable();
+    ok &= TestManifestArgsValidation();
+    ok &= TestManifestVolumeArgsExpansion();
+    ok &= TestManifestSessionFunnel();
+    ok &= TestManifestCallbacksBindWalIdentityBeforeCanonicalPublication();
+    ok &= TestManifestMetadataPolicyProjection();
+    ok &= TestManifestBackpressureCommitUsesMetadataLock();
+    ok &= TestManifestContainerStatusFile();
+    ok &= TestManifestPartialStartupDrainsStartedSibling();
+    ok &= TestManifestWorkerStartFailureTearsDownMount();
+    ok &= TestManifestControlRequestValidation();
+    ok &= TestManifestControlDetachAndAttachLifecycle();
+    ok &= TestManifestControlFileRoundTrip();
+#endif
 
     if (!ok)
     {

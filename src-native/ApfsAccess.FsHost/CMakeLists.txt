@@ -85,6 +85,9 @@ if(APFSACCESS_BUILD_FSHOST_TESTS)
         APFSACCESS_FSHOST_UNIT_TEST=1
     )
     target_include_directories(ApfsAccess.FsHost.SemanticsTests PRIVATE ${WINFSP_INCLUDE_DIR})
+    # Shared synthetic fixture builder (test-only writer) from the engine tests.
+    target_include_directories(ApfsAccess.FsHost.SemanticsTests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ApfsAccess.ApfsRwEngine/tests")
 
     if(MSVC)
         target_compile_options(ApfsAccess.FsHost.SemanticsTests PRIVATE /W4 /permissive-)

@@ -50,14 +50,30 @@ bool AppendUnique(std::vector<std::string>& list, const std::string& value)
 struct StoreCheckpoint
 {
     NxSuperblock superblock;
+    std::optional<AppleCheckpointView> apple;
 };
 
 bool LoadStoreCheckpoint(
     const RandomAccessSource& store_view,
     const std::string& what,
+    CatalogLoadPolicy policy,
     StoreCheckpoint& out,
     std::string& out_error)
 {
+    if (policy == CatalogLoadPolicy::StrictApple)
+    {
+        std::string checkpoint_error;
+        auto checkpoint = LoadAppleCheckpointView(
+            store_view, 0, store_view.SizeBytes(), checkpoint_error);
+        if (!checkpoint.has_value())
+        {
+            out_error = "CatalogCheckpointInvalid:" + what + ":" + checkpoint_error;
+            return false;
+        }
+        out.superblock = checkpoint->container.superblock;
+        out.apple = std::move(checkpoint.value());
+        return true;
+    }
     auto checkpoint = SelectContainerCheckpoint(store_view, 0, store_view.SizeBytes());
     if (!checkpoint.has_value())
     {
@@ -66,6 +82,42 @@ bool LoadStoreCheckpoint(
     }
     out.superblock = std::move(checkpoint.value());
     return true;
+}
+
+ApfsVolumeDescriptor DescribeVolume(
+    const ApsbVolume& volume,
+    std::uint64_t superblock_block)
+{
+    ApfsVolumeDescriptor descriptor;
+    descriptor.object_id = volume.object_id;
+    descriptor.volume_uuid_hex = volume.uuid_hex;
+    descriptor.group_uuid_hex = volume.group_hex;
+    descriptor.name_utf8 = volume.name_utf8;
+    descriptor.name_valid = volume.name_valid;
+    descriptor.role_raw = volume.role_raw;
+    descriptor.roles = RolesFor(volume.role_raw);
+    descriptor.case_mode = CaseModeFor(volume.incompatible_features);
+    descriptor.encryption_mode = EncryptionModeFor(volume.fs_flags);
+    descriptor.locked = descriptor.encryption_mode != "none";
+    descriptor.compatible_features = volume.features;
+    descriptor.readonly_features = volume.readonly_features;
+    descriptor.incompatible_features = volume.incompatible_features &
+        ~kVolumeSupportedIncompatibleFeaturesMask;
+    descriptor.compatible_bits = HexBits(volume.features);
+    descriptor.readonly_bits = HexBits(volume.readonly_features);
+    descriptor.incompatible_bits = HexBits(descriptor.incompatible_features);
+    descriptor.unknown_bits = UnknownBits(volume.readonly_features, 0);
+    const auto unknown_incompat =
+        UnknownBits(volume.incompatible_features, kVolumeKnownIncompatibleFeaturesMask);
+    descriptor.unknown_bits.insert(
+        descriptor.unknown_bits.end(), unknown_incompat.begin(), unknown_incompat.end());
+    std::sort(descriptor.unknown_bits.begin(), descriptor.unknown_bits.end());
+    descriptor.unknown_bits.erase(
+        std::unique(descriptor.unknown_bits.begin(), descriptor.unknown_bits.end()),
+        descriptor.unknown_bits.end());
+    descriptor.superblock_block = superblock_block;
+    descriptor.superblock_xid = volume.xid;
+    return descriptor;
 }
 
 bool LoadStoreVolumes(
@@ -93,6 +145,27 @@ bool LoadStoreVolumes(
             return false;
         }
     }
+    if (checkpoint.apple.has_value())
+    {
+        if (checkpoint.apple->volumes.size() != nxsb.fs_oids.size())
+        {
+            out_error = "CatalogVolumeSetMismatch:" + container_hex;
+            return false;
+        }
+        for (std::size_t index = 0; index < checkpoint.apple->volumes.size(); ++index)
+        {
+            const auto& volume = checkpoint.apple->volumes[index];
+            if (volume.superblock.object_id != nxsb.fs_oids[index])
+            {
+                out_error = "CatalogVolumeOidMismatch:" +
+                    std::to_string(nxsb.fs_oids[index]);
+                return false;
+            }
+            out_volumes.push_back(DescribeVolume(
+                volume.superblock, volume.superblock_object.physical_block));
+        }
+        return true;
+    }
     std::vector<std::byte> block;
     for (const std::uint64_t oid : nxsb.fs_oids)
     {
@@ -102,6 +175,11 @@ bool LoadStoreVolumes(
         if (!mapping.has_value() || mapping->physical_block == 0)
         {
             out_error = "CatalogVolumeUnresolvable:" + std::to_string(oid) + ":" + resolve_error;
+            return false;
+        }
+        if (mapping->physical_block > (0xFFFFFFFFFFFFFFFFull / nxsb.block_size))
+        {
+            out_error = "CatalogVolumeBlockOverflow:" + std::to_string(oid);
             return false;
         }
         const std::uint64_t byte_offset = mapping->physical_block * nxsb.block_size;
@@ -128,36 +206,7 @@ bool LoadStoreVolumes(
             out_error = "CatalogVolumeStaleXid:" + std::to_string(oid);
             return false;
         }
-        ApfsVolumeDescriptor descriptor;
-        descriptor.object_id = oid;
-        descriptor.volume_uuid_hex = volume.uuid_hex;
-        descriptor.group_uuid_hex = volume.group_hex;
-        descriptor.name_utf8 = volume.name_utf8;
-        descriptor.name_valid = volume.name_valid;
-        descriptor.role_raw = volume.role_raw;
-        descriptor.roles = RolesFor(volume.role_raw);
-        descriptor.case_mode = CaseModeFor(volume.incompatible_features);
-        descriptor.encryption_mode = EncryptionModeFor(volume.fs_flags);
-        descriptor.locked = descriptor.encryption_mode != "none";
-        descriptor.compatible_features = volume.features;
-        descriptor.readonly_features = volume.readonly_features;
-        descriptor.incompatible_features =
-            volume.incompatible_features & ~kIncompatKnownBenignMask;
-        descriptor.compatible_bits = HexBits(volume.features);
-        descriptor.readonly_bits = HexBits(volume.readonly_features);
-        descriptor.incompatible_bits = HexBits(descriptor.incompatible_features);
-        descriptor.unknown_bits = UnknownBits(volume.readonly_features, 0);
-        const auto unknown_incompat =
-            UnknownBits(volume.incompatible_features, kIncompatKnownBenignMask);
-        descriptor.unknown_bits.insert(
-            descriptor.unknown_bits.end(), unknown_incompat.begin(), unknown_incompat.end());
-        std::sort(descriptor.unknown_bits.begin(), descriptor.unknown_bits.end());
-        descriptor.unknown_bits.erase(
-            std::unique(descriptor.unknown_bits.begin(), descriptor.unknown_bits.end()),
-            descriptor.unknown_bits.end());
-        descriptor.superblock_block = mapping->physical_block;
-        descriptor.superblock_xid = volume.xid;
-        out_volumes.push_back(std::move(descriptor));
+        out_volumes.push_back(DescribeVolume(volume, mapping->physical_block));
     }
     return true;
 }
@@ -169,7 +218,8 @@ bool ApfsContainerCatalog::TryLoadImage(
     const std::string& disk_id,
     const std::string& device_identifier,
     ApfsContainerCatalog& out_catalog,
-    std::string& out_error)
+    std::string& out_error,
+    CatalogLoadPolicy policy)
 {
     out_catalog = ApfsContainerCatalog{};
     out_error.clear();
@@ -207,10 +257,14 @@ bool ApfsContainerCatalog::TryLoadImage(
             descriptor.partition_guid = partition.unique_guid;
             descriptor.type_guid = partition.type_guid;
             descriptor.name_utf8 = partition.name_utf8;
+            descriptor.usage = partition.type_guid ==
+                    GuidToStringLower(kApfsPartitionTypeGuidBytes.data())
+                ? "apfs"
+                : "other";
             descriptor.offset_bytes = partition.start_bytes;
             descriptor.length_bytes = partition.size_bytes;
             out_catalog.partitions_.push_back(descriptor);
-            if (partition.type_guid == GuidToStringLower(kApfsPartitionTypeGuidBytes.data()))
+            if (descriptor.usage == "apfs")
             {
                 slots.push_back({descriptor.stable_partition_id, partition.start_bytes, partition.size_bytes});
             }
@@ -266,7 +320,7 @@ bool ApfsContainerCatalog::TryLoadImage(
         if (!LoadStoreCheckpoint(
                 entry.view,
                 entry.slot.partition_id.empty() ? "raw" : entry.slot.partition_id,
-                entry.checkpoint, out_error))
+                policy, entry.checkpoint, out_error))
         {
             return false;
         }
@@ -283,6 +337,8 @@ bool ApfsContainerCatalog::TryLoadImage(
         store.container_uuid_hex = uuid;
         store.offset_bytes = entry.slot.offset;
         store.size_bytes = entry.slot.size;
+        store.block_size_bytes = entry.checkpoint.superblock.block_size;
+        store.total_blocks = entry.checkpoint.superblock.block_count;
         // Duplicate stable store IDs mean two partitions share one GUID.
         for (const auto& existing : out_catalog.stores_)
         {
@@ -293,6 +349,13 @@ bool ApfsContainerCatalog::TryLoadImage(
             }
         }
         out_catalog.stores_.push_back(store);
+        if (entry.checkpoint.apple.has_value())
+        {
+            out_catalog.checkpoint_views_.push_back({
+                store.stable_store_id,
+                entry.checkpoint.apple.value(),
+            });
+        }
 
         auto found = container_index.find(uuid);
         if (found == container_index.end())
@@ -305,14 +368,15 @@ bool ApfsContainerCatalog::TryLoadImage(
             container.compatible_features = entry.checkpoint.superblock.features;
             container.readonly_features = entry.checkpoint.superblock.readonly_features;
             container.incompatible_features = entry.checkpoint.superblock.incompatible_features &
-                ~kIncompatKnownBenignMask;
+                ~kNxSupportedIncompatibleFeaturesMask;
             container.compatible_bits = HexBits(container.compatible_features);
             container.readonly_bits = HexBits(container.readonly_features);
             container.incompatible_bits = HexBits(container.incompatible_features);
             container.unknown_bits =
                 UnknownBits(entry.checkpoint.superblock.readonly_features, 0);
             const auto unknown_incompat = UnknownBits(
-                entry.checkpoint.superblock.incompatible_features, kIncompatKnownBenignMask);
+                entry.checkpoint.superblock.incompatible_features,
+                kNxKnownIncompatibleFeaturesMask);
             container.unknown_bits.insert(
                 container.unknown_bits.end(), unknown_incompat.begin(), unknown_incompat.end());
             std::sort(container.unknown_bits.begin(), container.unknown_bits.end());
@@ -408,7 +472,8 @@ bool ApfsContainerCatalog::TryLoadImage(
 bool ApfsContainerCatalog::TryLoadDevice(
     const rw::BlockDevice& device,
     ApfsContainerCatalog& out_catalog,
-    std::wstring& out_error)
+    std::wstring& out_error,
+    CatalogLoadPolicy policy)
 {
     out_error.clear();
     const std::wstring path = device.Path();
@@ -468,12 +533,22 @@ bool ApfsContainerCatalog::TryLoadDevice(
     {
         slug = "device";
     }
-    if (!TryLoadImage(source, slug, narrow, out_catalog, error))
+    if (!TryLoadImage(source, slug, narrow, out_catalog, error, policy))
     {
         out_error.assign(error.begin(), error.end());
         return false;
     }
     return true;
+}
+
+const AppleCheckpointView* ApfsContainerCatalog::TryGetAppleCheckpointView(
+    const std::string& stable_store_id) const noexcept
+{
+    const auto found = std::find_if(checkpoint_views_.begin(), checkpoint_views_.end(),
+        [&stable_store_id](const ApfsStoreCheckpointView& item) {
+            return item.stable_store_id == stable_store_id;
+        });
+    return found == checkpoint_views_.end() ? nullptr : &found->checkpoint;
 }
 
 bool ApfsContainerCatalog::TryResolveVolumeByName(
@@ -544,6 +619,100 @@ bool ApfsContainerCatalog::TryResolveVolumeByOid(
         }
     }
     out_error = "CatalogVolumeOidMissing:" + std::to_string(object_id);
+    return false;
+}
+
+bool ApfsContainerCatalog::TryResolveVolume(
+    const std::string& container_uuid_hex, std::uint64_t object_id,
+    ResolvedMountVolume& out_volume, std::string& out_error) const
+{
+    out_volume = ResolvedMountVolume{};
+    out_error.clear();
+    if (container_uuid_hex.empty())
+    {
+        out_error = "CatalogContainerUuidMissing";
+        return false;
+    }
+    if (object_id == 0)
+    {
+        out_error = "CatalogVolumeOidZero";
+        return false;
+    }
+    bool container_found = false;
+    for (const ApfsContainerDescriptor& container : containers_)
+    {
+        if (container.container_uuid_hex != container_uuid_hex)
+        {
+            continue;
+        }
+        container_found = true;
+        for (const ApfsVolumeDescriptor& volume : container.volumes)
+        {
+            if (volume.object_id != object_id)
+            {
+                continue;
+            }
+            out_volume.container_uuid_hex = container.container_uuid_hex;
+            out_volume.volume_uuid_hex = volume.volume_uuid_hex;
+            out_volume.name_utf8 = volume.name_utf8;
+            out_volume.object_id = volume.object_id;
+            return true;
+        }
+    }
+    out_error = container_found
+        ? "CatalogVolumeOidMissing:" + std::to_string(object_id)
+        : "CatalogContainerUuidMissing:" + container_uuid_hex;
+    return false;
+}
+
+bool ApfsContainerCatalog::TryResolveVolumeByNameInContainer(
+    const std::string& container_uuid_hex, const std::string& name_utf8,
+    ResolvedMountVolume& out_volume, std::string& out_error) const
+{
+    out_volume = ResolvedMountVolume{};
+    out_error.clear();
+    if (container_uuid_hex.empty())
+    {
+        out_error = "CatalogContainerUuidMissing";
+        return false;
+    }
+    if (name_utf8.empty())
+    {
+        out_error = "CatalogVolumeNameMissing";
+        return false;
+    }
+    for (const ApfsContainerDescriptor& container : containers_)
+    {
+        if (container.container_uuid_hex != container_uuid_hex)
+        {
+            continue;
+        }
+        const ApfsVolumeDescriptor* match = nullptr;
+        for (const ApfsVolumeDescriptor& volume : container.volumes)
+        {
+            if (volume.name_utf8 != name_utf8)
+            {
+                continue;
+            }
+            if (match != nullptr)
+            {
+                out_error = "CatalogVolumeNameAmbiguous:" + name_utf8;
+                return false;
+            }
+            match = &volume;
+        }
+        if (match == nullptr)
+        {
+            out_error = "CatalogVolumeNameMissing:" + name_utf8;
+            return false;
+        }
+        out_volume.container_uuid_hex = container.container_uuid_hex;
+        out_volume.volume_uuid_hex = match->volume_uuid_hex;
+        out_volume.name_utf8 = match->name_utf8;
+        out_volume.object_id = match->object_id;
+        return true;
+    }
+    out_error = "CatalogContainerUuidMissing:" + container_uuid_hex;
     return false;
 }
 

@@ -956,4 +956,6 @@ internal sealed class HostProcessLifecycleTestHooks
     public Action<Process>? BeforeObserverProof { get; set; }
 
     public Action<string>? OnLifecycleDiagnostic { get; set; }
+
+    public Func<string, bool>? IsMountVisible { get; set; }
 }

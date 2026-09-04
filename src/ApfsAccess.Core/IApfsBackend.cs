@@ -12,3 +12,10 @@ public interface IApfsBackend
 
     Task<IReadOnlyList<MountedVolumeState>> GetMountStateAsync(CancellationToken cancellationToken);
 }
+
+public interface IContainerMountBackend
+{
+    Task<IReadOnlyList<MountResult>> MountContainerAsync(
+        IReadOnlyList<MountRequest> requests,
+        CancellationToken cancellationToken);
+}

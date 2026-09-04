@@ -12,14 +12,23 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifdef _WIN32
 #include <Windows.h>
-#include <bcrypt.h>
+#endif
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include "ApfsContainerCatalog.h"
 #include "ApfsFormat.h"
+#ifdef _WIN32
 #include "BlockDevice.h"
+#endif
 #include "RandomAccessSource.h"
+#include "Sha256.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -76,6 +85,7 @@ bool IsValidSlug(const std::string& slug)
     return true;
 }
 
+#ifdef _WIN32
 std::wstring ToWide(const std::string& text)
 {
     if (text.empty())
@@ -92,6 +102,7 @@ std::wstring ToWide(const std::string& text)
     MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, wide.data(), needed);
     return wide;
 }
+#endif
 
 void RequireRegularInputFile(const std::string& path, const std::string& what)
 {
@@ -107,32 +118,149 @@ void RequireRegularInputFile(const std::string& path, const std::string& what)
     }
 }
 
+// True when both paths name the same file. Errors (e.g. missing files)
+// report false and let the later open/parse stages fail with context.
+bool SameFile(const std::string& first, const std::string& second)
+{
+    std::error_code code;
+    const bool same = std::filesystem::equivalent(first, second, code);
+    return !code && same;
+}
+
+namespace
+{
+std::atomic<std::uint64_t> g_publish_counter{0};
+}
+
+// Atomically publishes evidence text: never overwrites inputs or existing
+// outputs, never follows a symlinked --out path or parent directory, and
+// never leaves a partial file behind (temp + rename; any failure removes
+// the temp file and exits nonzero).
+void PublishEvidence(
+    const std::string& text,
+    const std::string& out_path,
+    const std::vector<std::string>& input_paths)
+{
+    namespace fs = std::filesystem;
+    std::error_code code;
+    for (const std::string& input : input_paths)
+    {
+        if (fs::equivalent(out_path, input, code) && !code)
+        {
+            Fail("refusing to overwrite observer input: " + out_path);
+        }
+        code.clear();
+    }
+    if (fs::symlink_status(out_path, code).type() == fs::file_type::symlink && !code)
+    {
+        Fail("refusing symlinked --out path: " + out_path);
+    }
+    code.clear();
+    if (fs::exists(out_path, code) && !code)
+    {
+        Fail("--out already exists (delete first to re-run): " + out_path);
+    }
+    code.clear();
+    fs::path parent = fs::path(out_path).parent_path();
+    if (parent.empty())
+    {
+        parent = ".";
+    }
+    // N1: walk every ancestor (not just the immediate parent) without
+    // following anything; a symlinked grandparent redirects the atomic
+    // rename just as fatally as a symlinked parent.
+    {
+        fs::path ancestor = parent;
+        for (int depth = 0; depth < 64; ++depth)
+        {
+            const fs::file_type kind = fs::symlink_status(ancestor, code).type();
+            if (code || kind == fs::file_type::symlink)
+            {
+                Fail("refusing --out under a symlinked or unreadable directory: " +
+                    ancestor.string());
+            }
+            if (kind == fs::file_type::not_found)
+            {
+                Fail("--out directory does not exist: " + ancestor.string());
+            }
+            const fs::path up = ancestor.parent_path();
+            if (up.empty() || up == ancestor)
+            {
+                break;
+            }
+            ancestor = up;
+        }
+    }
+    if (!fs::is_directory(parent, code) || code)
+    {
+        Fail("--out directory does not exist: " + parent.string());
+    }
+#ifdef _WIN32
+    const std::uint64_t process_id = static_cast<std::uint64_t>(GetCurrentProcessId());
+#else
+    const std::uint64_t process_id = static_cast<std::uint64_t>(::getpid());
+#endif
+    const std::uint64_t stamp =
+        static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+    for (int attempt = 0; attempt < 10; ++attempt)
+    {
+        // N2: the process id joins the temp name so two observer processes
+        // can never deterministically collide (the pre-exists check still
+        // guards planted names).
+        const std::string temp = out_path + ".tmp-" + std::to_string(process_id) + "-" +
+            std::to_string(stamp) + "-" +
+            std::to_string(g_publish_counter.fetch_add(1));
+        if (fs::symlink_status(temp, code).type() != fs::file_type::not_found)
+        {
+            code.clear();
+            continue;
+        }
+        {
+            std::ofstream out(temp, std::ios::out | std::ios::binary | std::ios::trunc);
+            if (!out.is_open())
+            {
+                Fail("cannot open --out temp file: " + temp);
+            }
+            out << text << "\n";
+            out.close();
+            if (!out.good())
+            {
+                std::error_code remove_code;
+                fs::remove(temp, remove_code);
+                Fail("writing --out temp file failed: " + temp);
+            }
+        }
+        fs::rename(temp, out_path, code);
+        if (code)
+        {
+            std::error_code remove_code;
+            fs::remove(temp, remove_code);
+            Fail("atomic --out publish failed: " + out_path);
+        }
+        return;
+    }
+    Fail("could not pick a fresh --out temp name beside: " + out_path);
+}
+
 struct SourceHash
 {
     std::string hex; // "" when unhashed
     std::uint64_t size_bytes = 0;
 };
 
-// Streams SHA-256 over an image file in 1 MiB chunks (CNG, per plan crypto).
-SourceHash HashImageFile(const std::string& path)
+// Streams SHA-256 over one held source in 1 MiB chunks through the
+// platform-selected implementation (CNG on Windows, portable elsewhere).
+// The SAME open handle feeds both hashing and parsing; callers re-verify
+// the source identity afterwards.
+SourceHash HashHeldSource(const apfsaccess::catalog::HeldFileSource& source, const std::string& path)
 {
     SourceHash out;
-    apfsaccess::catalog::FileRandomAccessSource source(path);
-    if (!source.IsOpen())
-    {
-        Fail("cannot open observer input for hashing: " + path);
-    }
     out.size_bytes = source.SizeBytes();
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
+    std::string error;
+    auto hash = apfsaccess::observer::Sha256Stream::Create(error);
+    if (!hash)
     {
-        Fail("CNG SHA-256 provider unavailable");
-    }
-    if (BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0) != 0)
-    {
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        Fail("CNG SHA-256 init failed");
+        Fail("hash init failed for " + path + ": " + error);
     }
     bool failed = false;
     std::vector<std::byte> chunk;
@@ -145,30 +273,16 @@ SourceHash HashImageFile(const std::string& path)
             failed = true;
             break;
         }
-        if (BCryptHashData(
-                hash, reinterpret_cast<PUCHAR>(chunk.data()), static_cast<ULONG>(want), 0) != 0)
+        if (!hash->Update(chunk.data(), chunk.size()))
         {
             failed = true;
             break;
         }
         offset += want;
     }
-    unsigned char digest[32] = {};
-    if (!failed && BCryptFinishHash(hash, digest, sizeof(digest), 0) != 0)
-    {
-        failed = true;
-    }
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(algorithm, 0);
-    if (failed)
+    if (failed || !hash->FinalHex(out.hex))
     {
         Fail("hashing observer input failed: " + path);
-    }
-    static constexpr char kHex[] = "0123456789abcdef";
-    for (unsigned char byte : digest)
-    {
-        out.hex.push_back(kHex[(byte >> 4) & 0xF]);
-        out.hex.push_back(kHex[byte & 0xF]);
     }
     return out;
 }
@@ -394,7 +508,7 @@ void WritePartition(JsonWriter& json, const std::string& disk_id,
     json.Key("typeGuid");
     json.String(partition.type_guid);
     json.Key("usage");
-    json.String("apfs");
+    json.String(partition.usage);
     json.EndObject();
 }
 
@@ -413,6 +527,10 @@ void WriteStore(JsonWriter& json, const apfsaccess::catalog::ApfsPhysicalStoreDe
     json.Integer(store.offset_bytes);
     json.Key("sizeBytes");
     json.Integer(store.size_bytes);
+    json.Key("blockSizeBytes");
+    json.Integer(store.block_size_bytes);
+    json.Key("totalBlocks");
+    json.Integer(store.total_blocks);
     json.EndObject();
 }
 
@@ -842,7 +960,7 @@ int main(int argc, char** argv)
     ValidateOptions(options);
 
     using apfsaccess::catalog::ApfsContainerCatalog;
-    using apfsaccess::catalog::FileRandomAccessSource;
+    using apfsaccess::catalog::HeldFileSource;
 
     JsonWriter json;
     json.BeginObject();
@@ -870,13 +988,14 @@ int main(int argc, char** argv)
 
     if (!options.device.empty())
     {
+#ifdef _WIN32
         apfsaccess::rw::BlockDevice device(ToWide(options.device));
         ApfsContainerCatalog catalog;
-        std::wstring error;
-        if (!ApfsContainerCatalog::TryLoadDevice(device, catalog, error))
+        std::wstring werror;
+        if (!ApfsContainerCatalog::TryLoadDevice(device, catalog, werror))
         {
             std::string narrow;
-            for (wchar_t ch : error)
+            for (wchar_t ch : werror)
             {
                 narrow.push_back(ch < 0x80 ? static_cast<char>(ch) : '?');
             }
@@ -890,64 +1009,114 @@ int main(int argc, char** argv)
         json.EndArray();
         json.Key("topology");
         WriteTopology(json, catalog, disk_id, options.device, size, catalog.DiskGuid());
+#else
+        Fail("--device requires a Windows observer build");
+#endif
     }
     else
     {
+        if (!options.store_b.empty() && SameFile(options.store_a, options.store_b))
+        {
+            Fail("fusion inputs are hard-link aliases of the same file");
+        }
+        // One held handle feeds hashing AND parsing for each input; the
+        // identity is re-verified afterwards, closing the open-hash-parse
+        // replacement window to a same-size same-mtime swap (documented
+        // residual in HeldFileSource).
         RequireRegularInputFile(primary_path, "primary input");
-        const SourceHash primary_hash = HashImageFile(primary_path);
-        FileRandomAccessSource primary_source(primary_path);
+        HeldFileSource primary_source(primary_path);
+        if (!primary_source.IsOpen())
+        {
+            Fail("cannot open observer input: " + primary_path);
+        }
+        const SourceHash primary_hash = HashHeldSource(primary_source, primary_path);
         ApfsContainerCatalog primary_catalog;
         std::string error;
         if (!ApfsContainerCatalog::TryLoadImage(
-                primary_source, disk_id, primary_path, primary_catalog, error))
+                primary_source, disk_id, primary_path, primary_catalog, error,
+                apfsaccess::catalog::CatalogLoadPolicy::StrictApple))
         {
             Fail("primary input catalog failed: " + error);
         }
+        if (!primary_source.VerifyUnchanged(error))
+        {
+            Fail("primary input changed during observation: " + error);
+        }
         json.Key("source");
         WriteSource(json, "image", primary_path, primary_hash.size_bytes, "full", primary_hash.hex);
-        json.Key("secondarySources");
-        json.BeginArray();
-        std::vector<std::pair<std::string, SourceHash>> secondary;
-        if (!options.store_b.empty())
+        // F1: store B is opened, hashed, parsed, and verified EXACTLY ONCE
+        // here; the validated catalog and digest below feed BOTH the
+        // secondarySources entry and the merge, so no second handle can
+        // bind a different byte generation to the recorded hash.
+        ApfsContainerCatalog second_catalog;
+        SourceHash second_hash;
+        std::string second_disk;
+        const bool is_fusion = !options.store_b.empty();
+        if (is_fusion)
         {
             RequireRegularInputFile(options.store_b, "fusion store B");
-            secondary.emplace_back(options.store_b, HashImageFile(options.store_b));
+            HeldFileSource second_source(options.store_b);
+            if (!second_source.IsOpen())
+            {
+                Fail("cannot open observer input: " + options.store_b);
+            }
+            second_hash = HashHeldSource(second_source, options.store_b);
+            second_disk = disk_id + "-b";
+            std::string second_error;
+            if (!ApfsContainerCatalog::TryLoadImage(
+                    second_source, second_disk, options.store_b, second_catalog, second_error,
+                    apfsaccess::catalog::CatalogLoadPolicy::StrictApple))
+            {
+                Fail("fusion store B catalog failed: " + second_error);
+            }
+            if (!second_source.VerifyUnchanged(second_error))
+            {
+                Fail("fusion store B changed during observation: " + second_error);
+            }
         }
-        for (const auto& [path, hash] : secondary)
+        json.Key("secondarySources");
+        json.BeginArray();
+        if (is_fusion)
         {
-            WriteSource(json, "image", path, hash.size_bytes, "full", hash.hex);
+            WriteSource(json, "image", options.store_b,
+                second_hash.size_bytes, "full", second_hash.hex);
         }
         json.EndArray();
         json.Key("topology");
-        if (options.store_b.empty())
+        if (!is_fusion)
         {
             WriteTopology(json, primary_catalog, disk_id, primary_path,
                 primary_hash.size_bytes, primary_catalog.DiskGuid());
         }
         else
         {
-            // Fusion: the two inputs must describe the same container; the
-            // merged view carries both member stores under one container.
-            FileRandomAccessSource second_source(options.store_b);
-            ApfsContainerCatalog second_catalog;
-            const std::string second_disk = disk_id + "-b";
-            if (!ApfsContainerCatalog::TryLoadImage(
-                    second_source, second_disk, options.store_b, second_catalog, error))
-            {
-                Fail("fusion store B catalog failed: " + error);
-            }
+            // Fusion: the two inputs must each contribute exactly one member
+            // store of the same container, with disjoint partition identities.
             if (primary_catalog.Containers().size() != 1 ||
                 second_catalog.Containers().size() != 1)
             {
                 Fail("fusion inputs must each describe exactly one container");
             }
+            if (primary_catalog.Stores().size() != 1 || second_catalog.Stores().size() != 1)
+            {
+                Fail("fusion inputs must each contribute exactly one member store");
+            }
             if (primary_catalog.Partitions().empty() || second_catalog.Partitions().empty())
             {
                 Fail("fusion inputs must be GPT-partitioned images with distinct partition GUIDs");
             }
+            for (const auto& first_partition : primary_catalog.Partitions())
+            {
+                for (const auto& second_partition : second_catalog.Partitions())
+                {
+                    if (first_partition.partition_guid == second_partition.partition_guid)
+                    {
+                        Fail("fusion inputs share a partition identity");
+                    }
+                }
+            }
             const auto merged = MergeFusionContainer(
                 primary_catalog.Containers()[0], second_catalog.Containers()[0]);
-            const SourceHash& second_hash = secondary.front().second;
             WriteFusionTopology(json, primary_catalog, disk_id, primary_path,
                 primary_hash.size_bytes, second_catalog, second_disk, options.store_b,
                 second_hash.size_bytes, merged);
@@ -958,17 +1127,12 @@ int main(int argc, char** argv)
 
     if (!options.out_path.empty())
     {
-        std::ofstream out(options.out_path, std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!out.is_open())
+        std::vector<std::string> inputs{primary_path};
+        if (!options.store_b.empty())
         {
-            Fail("cannot open --out file: " + options.out_path);
+            inputs.push_back(options.store_b);
         }
-        out << text << "\n";
-        out.close();
-        if (!out.good())
-        {
-            Fail("writing --out file failed: " + options.out_path);
-        }
+        PublishEvidence(text, options.out_path, inputs);
         return 0;
     }
     std::cout << text << "\n";

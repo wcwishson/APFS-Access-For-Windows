@@ -3,14 +3,20 @@ project(ApfsAccessApfsRwEngine LANGUAGES CXX)
 include(CTest)
 
 add_library(ApfsAccess.ApfsRwEngine STATIC
+    src/AppleCheckpointPublisher.cpp
+    src/AppleSpacemanAllocator.cpp
+    src/AppleTransactionCommit.cpp
+    src/AppleVolumeTransaction.cpp
     src/ApfsContainerCatalog.cpp
     src/ApfsFormat.cpp
     src/ApfsObjectMapStore.cpp
     src/ApfsSpacemanStore.cpp
+    src/ApfsTransactionWriter.cpp
     src/ApfsVolumeTreeStore.cpp
     src/BtreeMutationCodec.cpp
     src/BlockDevice.cpp
     src/CheckpointDelta.cpp
+    src/ContainerMountCoordinator.cpp
     src/ExtentAllocator.cpp
     src/MetadataStore.cpp
     src/MutationCompactor.cpp
@@ -29,14 +35,22 @@ target_include_directories(ApfsAccess.ApfsRwEngine
 target_compile_features(ApfsAccess.ApfsRwEngine PUBLIC cxx_std_20)
 
 # Fixed repo-owned read-only APFS observer: emits C0a evidence records.
+# Hashing adapter is platform-selected (CNG on Windows, portable elsewhere);
+# the portable implementation is also unit-tested on every platform.
+if(WIN32)
+    set(APFSACCESS_OBSERVER_HASH_SRC tools/Sha256Win32.cpp)
+else()
+    set(APFSACCESS_OBSERVER_HASH_SRC tools/Sha256Portable.cpp)
+endif()
 add_executable(ApfsObserver
     tools/ApfsObserver.cpp
+    ${APFSACCESS_OBSERVER_HASH_SRC}
 )
 
 target_link_libraries(ApfsObserver
     PRIVATE
         ApfsAccess.ApfsRwEngine
-        bcrypt
+        $<$<PLATFORM_ID:Windows>:bcrypt>
 )
 
 target_compile_features(ApfsObserver PRIVATE cxx_std_20)
@@ -97,6 +111,38 @@ if(BUILD_TESTING)
 
     add_executable(ApfsAccess.ApfsRwEngine.CompatibilityTests
         tests/ApfsCompatibilityTests.cpp
+        tools/Sha256Portable.cpp
+    )
+    add_executable(ApfsAccess.ApfsRwEngine.ContainerCoordinatorTests
+        tests/ContainerMountCoordinatorTests.cpp
+        tools/Sha256Portable.cpp
+    )
+    add_executable(ApfsAccess.ApfsRwEngine.AppleTransactionWriterTests
+        tests/ApfsTransactionWriterTests.cpp
+    )
+    add_executable(ApfsAccess.ApfsRwEngine.AppleSpacemanAllocatorTests
+        tests/AppleSpacemanAllocatorTests.cpp
+    )
+    add_executable(ApfsAccess.ApfsRwEngine.AppleCheckpointPublisherTests
+        tests/AppleCheckpointPublisherTests.cpp
+    )
+
+    target_link_libraries(ApfsAccess.ApfsRwEngine.AppleTransactionWriterTests
+        PRIVATE
+            ApfsAccess.ApfsRwEngine
+    )
+    target_link_libraries(ApfsAccess.ApfsRwEngine.AppleSpacemanAllocatorTests
+        PRIVATE
+            ApfsAccess.ApfsRwEngine
+    )
+    target_link_libraries(ApfsAccess.ApfsRwEngine.AppleCheckpointPublisherTests
+        PRIVATE
+            ApfsAccess.ApfsRwEngine
+    )
+
+    target_link_libraries(ApfsAccess.ApfsRwEngine.ContainerCoordinatorTests
+        PRIVATE
+            ApfsAccess.ApfsRwEngine
     )
 
     target_link_libraries(ApfsAccess.ApfsRwEngine.CompatibilityTests
@@ -204,6 +250,24 @@ if(BUILD_TESTING)
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
+    target_include_directories(ApfsAccess.ApfsRwEngine.ContainerCoordinatorTests
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_include_directories(ApfsAccess.ApfsRwEngine.AppleTransactionWriterTests
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_include_directories(ApfsAccess.ApfsRwEngine.AppleSpacemanAllocatorTests
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    )
+    target_include_directories(ApfsAccess.ApfsRwEngine.AppleCheckpointPublisherTests
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    )
 
     target_compile_features(ApfsAccess.ApfsRwEngine.CompatibilityTests PRIVATE cxx_std_20)
     target_compile_features(ApfsAccess.ApfsRwEngine.Tests PRIVATE cxx_std_20)
@@ -218,6 +282,10 @@ if(BUILD_TESTING)
     target_compile_features(ApfsAccess.ApfsRwEngine.CheckpointDeltaTests PRIVATE cxx_std_20)
     target_compile_features(ApfsAccess.ApfsRwEngine.WriteAheadLogTests PRIVATE cxx_std_20)
     target_compile_features(ApfsAccess.ApfsRwEngine.WritePipelineTests PRIVATE cxx_std_20)
+    target_compile_features(ApfsAccess.ApfsRwEngine.ContainerCoordinatorTests PRIVATE cxx_std_20)
+    target_compile_features(ApfsAccess.ApfsRwEngine.AppleTransactionWriterTests PRIVATE cxx_std_20)
+    target_compile_features(ApfsAccess.ApfsRwEngine.AppleSpacemanAllocatorTests PRIVATE cxx_std_20)
+    target_compile_features(ApfsAccess.ApfsRwEngine.AppleCheckpointPublisherTests PRIVATE cxx_std_20)
 
     if(MSVC)
         target_compile_options(ApfsAccess.ApfsRwEngine.CompatibilityTests PRIVATE /W4 /permissive-)
@@ -233,6 +301,10 @@ if(BUILD_TESTING)
         target_compile_options(ApfsAccess.ApfsRwEngine.CheckpointDeltaTests PRIVATE /W4 /permissive-)
         target_compile_options(ApfsAccess.ApfsRwEngine.WriteAheadLogTests PRIVATE /W4 /permissive-)
         target_compile_options(ApfsAccess.ApfsRwEngine.WritePipelineTests PRIVATE /W4 /permissive-)
+        target_compile_options(ApfsAccess.ApfsRwEngine.ContainerCoordinatorTests PRIVATE /W4 /permissive-)
+        target_compile_options(ApfsAccess.ApfsRwEngine.AppleTransactionWriterTests PRIVATE /W4 /permissive-)
+        target_compile_options(ApfsAccess.ApfsRwEngine.AppleSpacemanAllocatorTests PRIVATE /W4 /permissive-)
+        target_compile_options(ApfsAccess.ApfsRwEngine.AppleCheckpointPublisherTests PRIVATE /W4 /permissive-)
 
         foreach(_apfsaccess_rw_test_target
             ApfsAccess.ApfsRwEngine.CompatibilityTests
@@ -248,6 +320,10 @@ if(BUILD_TESTING)
             ApfsAccess.ApfsRwEngine.CheckpointDeltaTests
             ApfsAccess.ApfsRwEngine.WriteAheadLogTests
             ApfsAccess.ApfsRwEngine.WritePipelineTests
+            ApfsAccess.ApfsRwEngine.ContainerCoordinatorTests
+            ApfsAccess.ApfsRwEngine.AppleTransactionWriterTests
+            ApfsAccess.ApfsRwEngine.AppleSpacemanAllocatorTests
+            ApfsAccess.ApfsRwEngine.AppleCheckpointPublisherTests
         )
             set_property(TARGET ${_apfsaccess_rw_test_target} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
         endforeach()
@@ -304,5 +380,21 @@ if(BUILD_TESTING)
     add_test(
         NAME ApfsAccess.ApfsRwEngine.WritePipeline
         COMMAND ApfsAccess.ApfsRwEngine.WritePipelineTests
+    )
+    add_test(
+        NAME ApfsAccess.ApfsRwEngine.ContainerCoordinator
+        COMMAND ApfsAccess.ApfsRwEngine.ContainerCoordinatorTests
+    )
+    add_test(
+        NAME ApfsAccess.ApfsRwEngine.AppleTransactionWriter
+        COMMAND ApfsAccess.ApfsRwEngine.AppleTransactionWriterTests
+    )
+    add_test(
+        NAME ApfsAccess.ApfsRwEngine.AppleSpacemanAllocator
+        COMMAND ApfsAccess.ApfsRwEngine.AppleSpacemanAllocatorTests
+    )
+    add_test(
+        NAME ApfsAccess.ApfsRwEngine.AppleCheckpointPublisher
+        COMMAND ApfsAccess.ApfsRwEngine.AppleCheckpointPublisherTests
     )
 endif()

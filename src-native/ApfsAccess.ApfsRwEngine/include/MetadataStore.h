@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ApfsFormat.h"
 #include "BtreeMutationCodec.h"
 #include "BlockDevice.h"
 #include "CheckpointDelta.h"
@@ -21,6 +22,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace apfsaccess::rw
@@ -174,13 +176,32 @@ public:
         bool disallow_scaffold_commit_on_non_fixture = true;
         bool reject_scaffold_replay_blob_on_non_fixture = true;
         bool require_canonical_replay_candidate_on_non_fixture = true;
+        // Test-only bridge for exercising the legacy APFSRW private checkpoint
+        // format on regular files. Raw devices can never enable this path.
+        bool allow_legacy_private_checkpoint_writer_for_tests = false;
         std::uint64_t device_offset_bytes = 0;
         // Explicitly selected APFS volume object ID (catalog-resolved). Zero
         // preserves legacy behavior; native projection sites fail closed on 0.
         std::uint64_t volume_object_id = 0;
+        // A sibling volume may legitimately advance the shared container XID
+        // while this volume's own persisted state remains unchanged.
+        bool shared_container_session = false;
+        // Volume-local checkpoint families are partitioned deterministically
+        // across every catalogued volume in a shared container. A single-
+        // volume session keeps the legacy full checkpoint ranges.
+        std::size_t container_volume_slot_index = 0;
+        std::size_t container_volume_slot_count = 1;
+        // Exact identity for shared-container recovery records. Empty keeps
+        // the legacy single-volume on-disk format byte-for-byte unchanged.
+        std::string container_uuid_hex;
+        std::string volume_uuid_hex;
     };
 
     explicit MetadataStore(VolumeContext context);
+    // Shares an externally owned raw-device lease (container sessions). A
+    // null lease falls back to a private device opened from the context.
+    explicit MetadataStore(
+        VolumeContext context, std::shared_ptr<BlockDevice> device);
 
     [[nodiscard]] const VolumeContext& Context() const noexcept;
     [[nodiscard]] const BlockDevice& Device() const noexcept;
@@ -196,6 +217,7 @@ public:
     [[nodiscard]] std::optional<std::uint64_t> TotalSizeBytes() const noexcept;
     [[nodiscard]] std::optional<std::uint64_t> FreeSizeBytes() const noexcept;
     [[nodiscard]] std::optional<std::uint64_t> CheckpointXid() const noexcept;
+    [[nodiscard]] const catalog::AppleCheckpointView* AuthoritativeAppleCheckpointView() const noexcept;
     [[nodiscard]] bool PrepareNativeWritePath();
     [[nodiscard]] bool IsNativeWriteReady() const noexcept;
     [[nodiscard]] bool IsCommitPathReady() const noexcept;
@@ -411,6 +433,8 @@ private:
     [[nodiscard]] std::uint64_t RootDirectoryObjectId() const;
     [[nodiscard]] bool IsLegacyFixtureFallbackAllowedForCurrentContext() const noexcept;
     [[nodiscard]] bool RequiresCanonicalNonFixtureCommitPath() const noexcept;
+    [[nodiscard]] bool CanUseAppleTransactionWriter(std::wstring* out_reason = nullptr) const;
+    [[nodiscard]] CommitStatus CommitApplePendingMutations();
     [[nodiscard]] bool CanLoadNativeCheckpointXid(std::uint64_t persisted_xid) const noexcept;
     [[nodiscard]] std::optional<std::uint64_t> ResolveObjectBlockIndex(std::uint64_t object_or_block) const;
     [[nodiscard]] bool ReadMetadataBlock(std::uint64_t block_index, std::vector<std::byte>& out_block) const;
@@ -466,6 +490,8 @@ private:
     [[nodiscard]] std::vector<std::uint64_t> ResolveInodeCheckpointBlockIndices() const;
     [[nodiscard]] std::vector<std::uint64_t> ResolveBtreeCheckpointBlockIndices() const;
     [[nodiscard]] std::vector<std::uint64_t> ResolveReplayCheckpointBlockIndices() const;
+    [[nodiscard]] std::vector<std::uint64_t> SelectVolumeCheckpointPartition(
+        std::vector<std::uint64_t> block_indices) const;
     [[nodiscard]] bool LoadObjectMapCheckpointBlock(std::uint64_t block_index, const std::vector<std::byte>& block);
     [[nodiscard]] bool LoadSpacemanCheckpointBlock(std::uint64_t block_index, const std::vector<std::byte>& block);
     [[nodiscard]] bool LoadSpacemanChunkInfoState(std::uint64_t spaceman_block_index, const std::vector<std::byte>& block);
@@ -765,7 +791,9 @@ private:
     static void WriteLe64(std::vector<std::byte>& buffer, std::size_t offset, std::uint64_t value);
 
     VolumeContext context_;
-    BlockDevice device_;
+    // Shared raw-device lease: private per store by default, shared across
+    // sibling sessions when a container coordinator supplies one.
+    std::shared_ptr<BlockDevice> device_;
     bool container_loaded_ = false;
     bool object_map_loaded_ = false;
     bool spaceman_loaded_ = false;
@@ -786,13 +814,18 @@ private:
     std::uint64_t active_superblock_offset_ = 0;
     std::uint64_t alternate_superblock_offset_ = 0;
     std::vector<std::byte> active_superblock_bytes_;
+    std::unordered_map<std::uint64_t, std::uint64_t> checkpoint_ephemeral_object_block_map_;
+    std::vector<std::uint64_t> active_checkpoint_map_blocks_;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> active_checkpoint_ephemeral_block_ranges_;
+    std::optional<catalog::AppleCheckpointView> authoritative_apple_checkpoint_view_;
     std::uint64_t first_superblock_block_ = 0;
     std::uint64_t first_meta_block_ = 0;
     std::uint32_t current_superblock_map_index_ = 0;
     std::uint32_t current_meta_index_ = 0;
     std::uint32_t next_meta_index_ = 0;
     std::uint64_t spaceman_object_id_ = 0;
-    std::uint64_t volume_root_block_ = 0;
+    std::uint64_t container_omap_object_id_ = 0;
+    std::uint64_t root_directory_object_id_ = 0;
     std::uint64_t checkpoint_anchor_block_ = 0;
     std::optional<std::uint64_t> spaceman_free_bytes_;
     std::uint64_t next_ephemeral_extent_ = 0;

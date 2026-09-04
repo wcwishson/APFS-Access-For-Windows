@@ -13,6 +13,7 @@ public sealed class CliSchema2ContractTests
     private const string DeviceId = @"\\.\PhysicalDrive2";
     private const string FirstVolumeId = DeviceId + "|Main";
     private const string SecondVolumeId = DeviceId + "|Data";
+    private const string CanonicalVolumeId = "apfs-vol:055066cd975a4448954c4eab521a5263:1026";
 
     [Fact]
     public async Task MutationUsesSchema2ExactTargetAndCanonicalOperationId()
@@ -61,6 +62,44 @@ public sealed class CliSchema2ContractTests
         Assert.True(json.RootElement.GetProperty("success").GetBoolean());
         Assert.Equal("succeeded", json.RootElement.GetProperty("operationState").GetString());
         Assert.Equal(DateTimeKind.Utc, json.RootElement.GetProperty("expiresAtUtc").GetDateTime().Kind);
+    }
+
+    [Fact]
+    public async Task MutationAcceptsCanonicalCatalogVolumeIdWithExactDeviceTarget()
+    {
+        var pipeName = NewPipeName("CanonicalCatalogMutation");
+        using var serverCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var serverTask = RunSingleServerAsync(pipeName, async (peer, cancellationToken) =>
+        {
+            var request = await ReadMessageAsync(peer, cancellationToken);
+            Assert.True(PipeMessageCodec.TryGetPayload<ControlOperationRequestPayload>(request, out var payload));
+            Assert.NotNull(payload);
+            Assert.Equal(DeviceId, payload!.Target!.DeviceId);
+            Assert.Equal(CanonicalVolumeId, payload.Target.VolumeId);
+            await SendResultAsync(
+                peer,
+                payload.OperationId,
+                payload.Command,
+                payload.Target,
+                ApfsOperationStates.Succeeded,
+                ApfsOperationCodes.OperationSucceeded,
+                success: true,
+                cancellationToken,
+                expiresAtUtc: payload.ExpiresAtUtc);
+        }, serverCancellation.Token);
+
+        var result = await InvokeAsync(
+            "fix",
+            "--device-id", DeviceId,
+            "--volume-id", CanonicalVolumeId,
+            "--pipe-name", pipeName,
+            "--no-start-service",
+            "--timeout-ms", "2000");
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(0, result.ExitCode);
+        using var json = JsonDocument.Parse(result.Output);
+        Assert.True(json.RootElement.GetProperty("success").GetBoolean());
     }
 
     [Theory]

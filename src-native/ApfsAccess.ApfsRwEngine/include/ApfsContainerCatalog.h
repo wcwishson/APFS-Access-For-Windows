@@ -34,6 +34,7 @@ struct GptPartitionDescriptor
     std::string partition_guid; // lowercase GUID-D
     std::string type_guid; // lowercase GUID-D
     std::string name_utf8; // best effort
+    std::string usage; // apfs|other
     std::uint64_t offset_bytes = 0;
     std::uint64_t length_bytes = 0;
 };
@@ -45,6 +46,8 @@ struct ApfsPhysicalStoreDescriptor
     std::string container_uuid_hex;
     std::uint64_t offset_bytes = 0;
     std::uint64_t size_bytes = 0;
+    std::uint32_t block_size_bytes = 0; // from the store checkpoint
+    std::uint64_t total_blocks = 0; // from the store checkpoint
 };
 
 struct ApfsVolumeDescriptor
@@ -104,6 +107,18 @@ struct ResolvedMountVolume
     std::uint64_t object_id = 0;
 };
 
+enum class CatalogLoadPolicy
+{
+    AllowLegacySynthetic,
+    StrictApple,
+};
+
+struct ApfsStoreCheckpointView
+{
+    std::string stable_store_id;
+    AppleCheckpointView checkpoint;
+};
+
 class ApfsContainerCatalog
 {
 public:
@@ -114,13 +129,15 @@ public:
         const std::string& disk_id,
         const std::string& device_identifier,
         ApfsContainerCatalog& out_catalog,
-        std::string& out_error);
+        std::string& out_error,
+        CatalogLoadPolicy policy = CatalogLoadPolicy::AllowLegacySynthetic);
 
     // Loads a Windows block device (the plan's TryLoadDevice signature).
     static bool TryLoadDevice(
         const rw::BlockDevice& device,
         ApfsContainerCatalog& out_catalog,
-        std::wstring& out_error);
+        std::wstring& out_error,
+        CatalogLoadPolicy policy = CatalogLoadPolicy::StrictApple);
 
     // Name resolution for mount: exactly one volume with `name_utf8` across
     // all containers, else false (ambiguity and absence both fail closed).
@@ -129,6 +146,18 @@ public:
         const std::string& name_utf8, ResolvedMountVolume& out_volume, std::string& out_error) const;
     [[nodiscard]] bool TryResolveVolumeByOid(
         std::uint64_t object_id, ResolvedMountVolume& out_volume, std::string& out_error) const;
+    // Container-qualified exact resolution: the volume must live in the named
+    // container. Fails closed on absent containers, absent OIDs, and (by
+    // construction) cross-container ambiguity.
+    [[nodiscard]] bool TryResolveVolume(
+        const std::string& container_uuid_hex, std::uint64_t object_id,
+        ResolvedMountVolume& out_volume, std::string& out_error) const;
+    // Container-scoped name resolution: exactly one volume with `name_utf8`
+    // in the named container, else false. Lets duplicate display names stay
+    // independently addressable under --container-id.
+    [[nodiscard]] bool TryResolveVolumeByNameInContainer(
+        const std::string& container_uuid_hex, const std::string& name_utf8,
+        ResolvedMountVolume& out_volume, std::string& out_error) const;
 
     [[nodiscard]] const std::string& DiskId() const noexcept { return disk_id_; }
     [[nodiscard]] const std::string& DeviceIdentifier() const noexcept { return device_identifier_; }
@@ -137,6 +166,8 @@ public:
     [[nodiscard]] const std::vector<GptPartitionDescriptor>& Partitions() const noexcept { return partitions_; }
     [[nodiscard]] const std::vector<ApfsPhysicalStoreDescriptor>& Stores() const noexcept { return stores_; }
     [[nodiscard]] const std::vector<ApfsContainerDescriptor>& Containers() const noexcept { return containers_; }
+    [[nodiscard]] const AppleCheckpointView* TryGetAppleCheckpointView(
+        const std::string& stable_store_id) const noexcept;
 
 private:
     std::string disk_id_;
@@ -146,6 +177,7 @@ private:
     std::vector<GptPartitionDescriptor> partitions_;
     std::vector<ApfsPhysicalStoreDescriptor> stores_;
     std::vector<ApfsContainerDescriptor> containers_;
+    std::vector<ApfsStoreCheckpointView> checkpoint_views_;
 };
 
 } // namespace apfsaccess::catalog

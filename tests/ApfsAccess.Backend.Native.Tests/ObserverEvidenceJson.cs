@@ -133,7 +133,7 @@ internal static class ObserverEvidenceJson
             ["compatibleFeatureBits"] = ToBits(volume.Features),
             ["readonlyFeatureBits"] = ToBits(volume.ReadonlyFeatures),
             ["unknownFeatureBits"] = new JsonArray(),
-            ["incompatibleFeatureBits"] = volume.IncompatibleFeatures == 0x10 ? new JsonArray() : ToBits(volume.IncompatibleFeatures),
+            ["incompatibleFeatureBits"] = volume.IncompatibleFeatures == 0x1 ? new JsonArray() : ToBits(volume.IncompatibleFeatures),
             ["superblockBlock"] = "12",
             ["superblockXid"] = checkpointXid.ToString(),
         };

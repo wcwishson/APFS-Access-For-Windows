@@ -10,6 +10,20 @@ public sealed class ObserverPathEnvCollection
 public sealed class NativeObserverLocationTests
 {
     [Fact]
+    public void ProductionBuildAndPublish_IncludePackagedObserver()
+    {
+        var repoRoot = FindRepositoryRoot();
+        var nativeBuild = File.ReadAllText(Path.Combine(repoRoot, "scripts", "build_native_host.ps1"));
+        var publish = File.ReadAllText(Path.Combine(repoRoot, "build", "publish.ps1"));
+
+        Assert.Contains("ApfsObserver.exe", nativeBuild, StringComparison.Ordinal);
+        Assert.Contains("$observerExe", nativeBuild, StringComparison.Ordinal);
+        Assert.Contains("$nativeObserverExe", publish, StringComparison.Ordinal);
+        Assert.Contains("Join-Path $serviceOut \"ApfsObserver.exe\"", publish, StringComparison.Ordinal);
+        Assert.Contains("Join-Path $bundleOut \"ApfsObserver.exe\"", publish, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void MissingEverywhere_ReturnsNull()
     {
         using var temp = DTempDirectory.Create("observer-missing");
@@ -148,6 +162,36 @@ public sealed class NativeObserverLocationTests
         var resolved = NativeApfsObserver.ResolveNativeObserverPath(new ServiceHostOptions(), baseDir);
 
         Assert.Equal(buildExe, resolved);
+    }
+
+    private static string FindRepositoryRoot(
+        [System.Runtime.CompilerServices.CallerFilePath] string sourceFile = "")
+    {
+        foreach (var start in new[]
+                 {
+                     Path.GetDirectoryName(sourceFile) ?? string.Empty,
+                     Directory.GetCurrentDirectory(),
+                     AppContext.BaseDirectory,
+                 })
+        {
+            if (string.IsNullOrWhiteSpace(start))
+            {
+                continue;
+            }
+
+            var directory = new DirectoryInfo(start);
+            while (directory is not null)
+            {
+                if (File.Exists(Path.Combine(directory.FullName, "APFSAccess.sln")))
+                {
+                    return directory.FullName;
+                }
+
+                directory = directory.Parent;
+            }
+        }
+
+        throw new DirectoryNotFoundException("Could not locate the APFS Access repository root.");
     }
 }
 

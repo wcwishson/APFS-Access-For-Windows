@@ -8,6 +8,31 @@ namespace ApfsAccess.Service.Tests;
 public sealed class ApfsMountWorkerAutoMountTests
 {
     [Fact]
+    public async Task RunCycle_MultipleVolumesUsesOneContainerBatch()
+    {
+        var backend = new ControllableBackend
+        {
+            IncludeSecondaryVolume = true,
+        };
+        using var worker = CreateWorker(
+            backend,
+            new RuntimeStatusPublisher(),
+            new ServiceHostOptions
+            {
+                AutoMountEnabled = true,
+                EnableNativeWrite = false,
+                ReadWriteMode = "RwWithRoFallback",
+            },
+            new FirstFreeMountPolicy(["R", "S"]));
+
+        await InvokeRunCycleAsync(worker);
+
+        Assert.Equal(1, backend.BatchMountCalls);
+        Assert.Equal(2, backend.MountAttempts);
+        Assert.Equal(2, (await backend.GetMountStateAsync(CancellationToken.None)).Count);
+    }
+
+    [Fact]
     public async Task StopAsync_CancelsBlockedUnmountAtConfiguredDeadline()
     {
         var backend = new ControllableBackend();
@@ -850,7 +875,7 @@ public sealed class ApfsMountWorkerAutoMountTests
         return await task;
     }
 
-    private sealed class ControllableBackend : IApfsBackend
+    private sealed class ControllableBackend : IApfsBackend, IContainerMountBackend
     {
         public const string DeviceId = @"\\.\PhysicalDrive9";
         public const string VolumeId = DeviceId + "|Main";
@@ -907,6 +932,8 @@ public sealed class ApfsMountWorkerAutoMountTests
         public IReadOnlyDictionary<string, int> MountAttemptsByVolumeId => _mountAttemptsByVolumeId;
 
         public int MountAttempts { get; private set; }
+
+        public int BatchMountCalls { get; private set; }
 
         public int GetMountStateCalls { get; set; }
 
@@ -1028,6 +1055,19 @@ public sealed class ApfsMountWorkerAutoMountTests
                 NativeWriteSafetyState: request.AccessMode == MountAccessMode.ReadWrite
                     ? NativeWriteSafetyState.PilotReadWrite
                     : NativeWriteSafetyState.ReadOnlyFallback));
+        }
+
+        public async Task<IReadOnlyList<MountResult>> MountContainerAsync(
+            IReadOnlyList<MountRequest> requests,
+            CancellationToken cancellationToken)
+        {
+            BatchMountCalls++;
+            var results = new List<MountResult>(requests.Count);
+            foreach (var request in requests)
+            {
+                results.Add(await MountAsync(request, cancellationToken));
+            }
+            return results;
         }
 
         public void MarkMountedVolumeDegraded(string volumeId)

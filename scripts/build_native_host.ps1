@@ -126,6 +126,10 @@ $candidatePaths = @(
     (Join-Path $BuildDir "$Configuration\ApfsAccess.FsHost.exe"),
     (Join-Path $BuildDir "ApfsAccess.FsHost.exe")
 )
+$observerCandidatePaths = @(
+    (Join-Path $BuildDir "ApfsAccess.ApfsRwEngine\$Configuration\ApfsObserver.exe"),
+    (Join-Path $BuildDir "ApfsAccess.ApfsRwEngine\ApfsObserver.exe")
+)
 
 $hostExe = $candidatePaths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 if ([string]::IsNullOrWhiteSpace($hostExe)) {
@@ -133,9 +137,16 @@ if ([string]::IsNullOrWhiteSpace($hostExe)) {
         return
     }
 }
+$observerExe = $observerCandidatePaths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if ([string]::IsNullOrWhiteSpace($observerExe)) {
+    if (-not (Handle-MissingTooling "ApfsObserver.exe was not produced by the build.")) {
+        return
+    }
+}
 
 try {
     Copy-Item -LiteralPath $hostExe -Destination (Join-Path $OutputDir "ApfsAccess.FsHost.exe") -Force
+    Copy-Item -LiteralPath $observerExe -Destination (Join-Path $OutputDir "ApfsObserver.exe") -Force
 }
 catch {
     if ($SkipIfUnavailable) {
@@ -156,3 +167,4 @@ if (Test-Path -LiteralPath $candidatePdb) {
 }
 
 Write-Host "[native-build] success: $(Join-Path $OutputDir "ApfsAccess.FsHost.exe")"
+Write-Host "[native-build] success: $(Join-Path $OutputDir "ApfsObserver.exe")"

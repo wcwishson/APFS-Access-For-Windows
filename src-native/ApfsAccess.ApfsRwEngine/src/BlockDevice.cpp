@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cwchar>
+#include <cwctype>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -38,6 +39,28 @@ constexpr std::size_t kReadCacheMaxWindowBytes = 64 * 1024;
 constexpr std::size_t kReadCacheMaxBytes = 8 * 1024 * 1024;
 constexpr std::size_t kReadCacheMaxEntries = 256;
 constexpr std::size_t kReadThreadLocalScratchMaxBytes = 1024 * 1024;
+
+bool IsRawPhysicalDevicePath(std::wstring_view path) noexcept
+{
+    constexpr std::array<std::wstring_view, 2> prefixes = {
+        LR"(\\.\PhysicalDrive)",
+        LR"(\\?\PhysicalDrive)",
+    };
+    for (const auto prefix : prefixes)
+    {
+        if (path.size() <= prefix.size() ||
+            _wcsnicmp(path.data(), prefix.data(), prefix.size()) != 0)
+        {
+            continue;
+        }
+
+        return std::all_of(
+            path.begin() + static_cast<std::ptrdiff_t>(prefix.size()),
+            path.end(),
+            [](wchar_t ch) { return std::iswdigit(ch) != 0; });
+    }
+    return false;
+}
 
 struct ThreadLocalOverlappedEvent
 {
@@ -374,6 +397,13 @@ BlockDevice::BlockDevice(std::wstring path, std::uint64_t base_offset_bytes)
     , base_offset_bytes_(base_offset_bytes)
     , read_cache_enabled_(IsExperimentalBlockReadCacheEnabled())
 {
+}
+
+DWORD BlockDevice::WriteHandleShareMode(std::wstring_view path) noexcept
+{
+    return IsRawPhysicalDevicePath(path)
+        ? FILE_SHARE_READ
+        : FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 }
 
 struct BlockDevice::ScopedPerfTimer
@@ -779,6 +809,11 @@ bool BlockDevice::IsWritable() const
         (void)EnsureWriteHandle();
     }
     return writable_.load(std::memory_order_acquire);
+}
+
+bool BlockDevice::HasWriteHandle() const noexcept
+{
+    return write_handle_.load(std::memory_order_acquire) != INVALID_HANDLE_VALUE;
 }
 
 BlockDevice::Geometry BlockDevice::GetGeometry() const
@@ -2292,7 +2327,7 @@ HANDLE BlockDevice::EnsureWriteHandle() const
     handle = CreateFileW(
         path_.c_str(),
         GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        WriteHandleShareMode(path_),
         nullptr,
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,

@@ -79,10 +79,10 @@ public static class SyntheticApfsTestImage
 
     // ---- Task 1 catalog fixture writer (additive; legacy Create above untouched) ----
     //
-    // Writes a GPT image whose APFS partitions each hold an NXSB checkpoint
-    // pair + omap object + single-leaf omap btree + K APSB volume superblocks,
-    // with byte offsets per task-1-interface-freeze.md section 5. Managed code
-    // never parses these bytes back; the native observer cross-validates them.
+    // Writes a GPT image whose APFS partitions each hold one descriptor-ring
+    // checkpoint plus the typed object graph needed by the strict native
+    // observer. Managed code never parses these bytes back; byte-level tests
+    // and the native observer independently cross-validate them.
     // Conventions: Guid bytes via Guid.TryWriteBytes (same as legacy Create);
     // block_size is fixed at 4096; object ids equal their block index for the
     // omap (2) and omap btree (3); volume oids default to 101+i.
@@ -92,7 +92,13 @@ public static class SyntheticApfsTestImage
     private const ulong CatalogOmapObjectId = 2;
     private const ulong CatalogOmapBtreeObjectId = 3;
     private const int CatalogFirstVolumeBlock = 4;
-    private const int CatalogSpareBlocks = 8;
+    private const int CatalogPerVolumeObjectBlocks = 6;
+    private const int CatalogCheckpointDescriptorBlocks = 4;
+    private const int CatalogCheckpointDataBlocks = 4;
+    private const int CatalogFixedBlocks = 15;
+    private const ulong CatalogSpacemanObjectId = 0x4000;
+    private const ulong CatalogFreeQueueObjectId = 0x4001;
+    private const ulong CatalogMainFreeQueueObjectId = 0x4002;
     private const ulong CatalogFirstVolumeObjectId = 101;
     private const int CatalogMaxVolumesPerContainer = 100;
     private const int CatalogMaxPartitions = 512;
@@ -310,7 +316,7 @@ public static class SyntheticApfsTestImage
             spec.ContainerUuid != Guid.Empty ? spec.ContainerUuid : Guid.NewGuid(),
             oids,
             xids,
-            checked(CatalogFirstVolumeBlock + volumes.Count + CatalogSpareBlocks),
+            checked(CatalogFixedBlocks + volumes.Count * (1 + CatalogPerVolumeObjectBlocks)),
             spec.Corruption);
     }
 
@@ -364,11 +370,74 @@ public static class SyntheticApfsTestImage
 
     private static void WriteCatalogContainer(FileStream stream, long startByte, CatalogPartitionPlan plan)
     {
+        var volumeLayoutBase = checked(CatalogFirstVolumeBlock + plan.Volumes.Count);
+        var descriptorBase = checked(volumeLayoutBase + plan.Volumes.Count * CatalogPerVolumeObjectBlocks);
+        var dataBase = checked(descriptorBase + CatalogCheckpointDescriptorBlocks);
+        var internalPoolBitmapBlock = checked(dataBase + CatalogCheckpointDataBlocks);
+        var internalPoolBase = checked(internalPoolBitmapBlock + 1);
+        var cibBlock = internalPoolBase;
+        var chunkBitmapBlock = checked(internalPoolBase + 1);
+
+        WriteCatalogBlock(stream, startByte, 0, BuildCatalogNxsb(plan, selected: false, descriptorBase, dataBase));
+        WriteCatalogOmap(stream, startByte, CatalogOmapObjectId, CatalogOmapBtreeObjectId, plan.Spec.Xid);
+        WriteCatalogOmapBtree(stream, startByte, plan);
+        for (var i = 0; i < plan.Volumes.Count; i++)
+        {
+            WriteCatalogVolume(stream, startByte, plan, i, checked(volumeLayoutBase + i * CatalogPerVolumeObjectBlocks));
+        }
+
+        WriteCatalogCheckpointMap(stream, startByte, descriptorBase, dataBase, plan.Spec.Xid);
+        WriteCatalogBlock(
+            stream,
+            startByte,
+            descriptorBase + 1,
+            BuildCatalogNxsb(plan, selected: true, descriptorBase, dataBase));
+        var chunkBitmap = BuildCatalogAllocationBitmap(
+            plan,
+            volumeLayoutBase,
+            descriptorBase,
+            dataBase,
+            internalPoolBitmapBlock,
+            internalPoolBase);
+        var allocatedBlocks = CountSetBits(chunkBitmap, plan.TotalBlocks);
+        WriteCatalogSpaceman(
+            stream,
+            startByte,
+            dataBase,
+            plan.Spec.Xid,
+            plan.TotalBlocks,
+            allocatedBlocks,
+            internalPoolBitmapBlock,
+            internalPoolBase,
+            cibBlock);
+        WriteCatalogFreeQueue(stream, startByte, dataBase + 1, CatalogFreeQueueObjectId, plan.Spec.Xid);
+        WriteCatalogFreeQueue(stream, startByte, dataBase + 2, CatalogMainFreeQueueObjectId, plan.Spec.Xid);
+        WriteCatalogCib(
+            stream,
+            startByte,
+            cibBlock,
+            chunkBitmapBlock,
+            plan.Spec.Xid,
+            plan.TotalBlocks,
+            allocatedBlocks);
+        var internalPoolBitmap = new byte[BlockSize];
+        SetBitmapBit(internalPoolBitmap, 0);
+        SetBitmapBit(internalPoolBitmap, 1);
+        WriteCatalogBlock(stream, startByte, internalPoolBitmapBlock, internalPoolBitmap);
+        WriteCatalogBlock(stream, startByte, chunkBitmapBlock, chunkBitmap);
+    }
+
+    private static byte[] BuildCatalogNxsb(
+        CatalogPartitionPlan plan,
+        bool selected,
+        int descriptorBase,
+        int dataBase)
+    {
         var nxsb = new byte[BlockSize];
         BinaryPrimitives.WriteUInt64LittleEndian(nxsb.AsSpan(0x08, 8), CatalogNxsbObjectId);
-        BinaryPrimitives.WriteUInt64LittleEndian(nxsb.AsSpan(0x10, 8), plan.Spec.Xid);
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            nxsb.AsSpan(0x10, 8), selected || plan.Spec.Xid == 0 ? plan.Spec.Xid : plan.Spec.Xid - 1);
         BinaryPrimitives.WriteUInt32LittleEndian(nxsb.AsSpan(0x18, 4), 1);
-        BinaryPrimitives.WriteUInt32LittleEndian(nxsb.AsSpan(0x1C, 4), 0);
         BinaryPrimitives.WriteUInt32LittleEndian(nxsb.AsSpan(0x20, 4), NxsbMagic);
         BinaryPrimitives.WriteUInt32LittleEndian(nxsb.AsSpan(0x24, 4), BlockSize);
         BinaryPrimitives.WriteUInt64LittleEndian(nxsb.AsSpan(0x28, 8), (ulong)plan.TotalBlocks);
@@ -376,112 +445,456 @@ public static class SyntheticApfsTestImage
         BinaryPrimitives.WriteUInt64LittleEndian(nxsb.AsSpan(0x38, 8), plan.Spec.ReadonlyFeatures);
         BinaryPrimitives.WriteUInt64LittleEndian(nxsb.AsSpan(0x40, 8), plan.Spec.IncompatibleFeatures);
         plan.ContainerUuid.TryWriteBytes(nxsb.AsSpan(0x48, 16));
+        BinaryPrimitives.WriteUInt32LittleEndian(nxsb.AsSpan(0x68, 4), CatalogCheckpointDescriptorBlocks);
+        BinaryPrimitives.WriteUInt32LittleEndian(nxsb.AsSpan(0x6C, 4), CatalogCheckpointDataBlocks);
+        BinaryPrimitives.WriteUInt64LittleEndian(nxsb.AsSpan(0x70, 8), (ulong)descriptorBase);
+        BinaryPrimitives.WriteUInt64LittleEndian(nxsb.AsSpan(0x78, 8), (ulong)dataBase);
+        if (selected)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(nxsb.AsSpan(0x80, 4), 2);
+            BinaryPrimitives.WriteUInt32LittleEndian(nxsb.AsSpan(0x84, 4), 3);
+            BinaryPrimitives.WriteUInt32LittleEndian(nxsb.AsSpan(0x8C, 4), 2);
+            BinaryPrimitives.WriteUInt32LittleEndian(nxsb.AsSpan(0x94, 4), 3);
+        }
+
+        BinaryPrimitives.WriteUInt64LittleEndian(nxsb.AsSpan(0x98, 8), CatalogSpacemanObjectId);
         BinaryPrimitives.WriteUInt64LittleEndian(nxsb.AsSpan(0xA0, 8), CatalogOmapObjectId);
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            nxsb.AsSpan(0xB4, 4), (uint)Math.Max(1, plan.VolumeObjectIds.Length));
         for (var i = 0; i < plan.VolumeObjectIds.Length; i++)
         {
             BinaryPrimitives.WriteUInt64LittleEndian(nxsb.AsSpan(0xB8 + i * 8, 8), plan.VolumeObjectIds[i]);
         }
 
         SealApfsBlock(nxsb);
-        stream.Seek(startByte, SeekOrigin.Begin);
-        stream.Write(nxsb);
-        stream.Seek(startByte + BlockSize, SeekOrigin.Begin);
-        stream.Write(nxsb);
+        return nxsb;
+    }
 
+    private static void WriteCatalogOmap(
+        FileStream stream,
+        long startByte,
+        ulong objectId,
+        ulong treeBlock,
+        ulong xid)
+    {
         var omap = new byte[BlockSize];
-        BinaryPrimitives.WriteUInt64LittleEndian(omap.AsSpan(0x08, 8), CatalogOmapObjectId);
-        BinaryPrimitives.WriteUInt64LittleEndian(omap.AsSpan(0x10, 8), plan.Spec.Xid);
-        BinaryPrimitives.WriteUInt32LittleEndian(omap.AsSpan(0x18, 4), 0xB);
-        BinaryPrimitives.WriteUInt32LittleEndian(omap.AsSpan(0x1C, 4), 0);
-        BinaryPrimitives.WriteUInt64LittleEndian(omap.AsSpan(0x30, 8), CatalogOmapBtreeObjectId);
+        BinaryPrimitives.WriteUInt64LittleEndian(omap.AsSpan(0x08, 8), objectId);
+        BinaryPrimitives.WriteUInt64LittleEndian(omap.AsSpan(0x10, 8), xid);
+        BinaryPrimitives.WriteUInt32LittleEndian(omap.AsSpan(0x18, 4), 0x4000000B);
+        BinaryPrimitives.WriteUInt32LittleEndian(omap.AsSpan(0x28, 4), 0x40000002);
+        BinaryPrimitives.WriteUInt64LittleEndian(omap.AsSpan(0x30, 8), treeBlock);
         SealApfsBlock(omap);
-        stream.Seek(startByte + 2 * BlockSize, SeekOrigin.Begin);
-        stream.Write(omap);
-
-        WriteCatalogOmapBtree(stream, startByte, plan);
-        for (var i = 0; i < plan.Volumes.Count; i++)
-        {
-            WriteCatalogVolume(stream, startByte, plan, i);
-        }
+        WriteCatalogBlock(stream, startByte, checked((int)objectId), omap);
     }
 
     private static void WriteCatalogOmapBtree(FileStream stream, long startByte, CatalogPartitionPlan plan)
     {
-        var count = plan.Volumes.Count;
-        var node = new byte[BlockSize];
-        BinaryPrimitives.WriteUInt64LittleEndian(node.AsSpan(0x08, 8), CatalogOmapBtreeObjectId);
-        BinaryPrimitives.WriteUInt64LittleEndian(node.AsSpan(0x10, 8), plan.Spec.Xid);
-        BinaryPrimitives.WriteUInt32LittleEndian(node.AsSpan(0x18, 4), 0x3);
-        BinaryPrimitives.WriteUInt32LittleEndian(node.AsSpan(0x1C, 4), 0);
-        BinaryPrimitives.WriteUInt16LittleEndian(node.AsSpan(0x20, 2), 0x3);
-        BinaryPrimitives.WriteUInt16LittleEndian(node.AsSpan(0x22, 2), 0);
-        BinaryPrimitives.WriteUInt32LittleEndian(node.AsSpan(0x24, 4), (uint)count);
-        BinaryPrimitives.WriteUInt16LittleEndian(node.AsSpan(0x28, 2), 0);
-        BinaryPrimitives.WriteUInt16LittleEndian(node.AsSpan(0x2A, 2), checked((ushort)(count * 8)));
-        BinaryPrimitives.WriteUInt16LittleEndian(node.AsSpan(0x2C, 2), 0);
-        BinaryPrimitives.WriteUInt16LittleEndian(node.AsSpan(0x2E, 2), 0);
-
-        const int valueAreaEnd = BlockSize - 40;
-        for (var i = 0; i < count; i++)
+        var records = new CatalogOmapRecord[plan.Volumes.Count];
+        for (var i = 0; i < records.Length; i++)
         {
-            BinaryPrimitives.WriteUInt16LittleEndian(node.AsSpan(0x38 + i * 8, 2), checked((ushort)(i * 16)));
-            BinaryPrimitives.WriteUInt16LittleEndian(node.AsSpan(0x38 + i * 8 + 2, 2), 16);
-            BinaryPrimitives.WriteUInt16LittleEndian(node.AsSpan(0x38 + i * 8 + 4, 2), checked((ushort)((i + 1) * 16)));
-            BinaryPrimitives.WriteUInt16LittleEndian(node.AsSpan(0x38 + i * 8 + 6, 2), 16);
-
-            var key = 0x38 + count * 8 + i * 16;
-            BinaryPrimitives.WriteUInt64LittleEndian(node.AsSpan(key, 8), plan.VolumeObjectIds[i]);
-            BinaryPrimitives.WriteUInt64LittleEndian(node.AsSpan(key + 8, 8), plan.VolumeXids[i]);
-
-            var value = valueAreaEnd - (i + 1) * 16;
-            BinaryPrimitives.WriteUInt32LittleEndian(node.AsSpan(value, 4), 0);
-            BinaryPrimitives.WriteUInt32LittleEndian(node.AsSpan(value + 4, 4), BlockSize);
-            BinaryPrimitives.WriteUInt64LittleEndian(node.AsSpan(value + 8, 8), (ulong)(CatalogFirstVolumeBlock + i));
+            records[i] = new CatalogOmapRecord(
+                plan.VolumeObjectIds[i], plan.VolumeXids[i], (ulong)(CatalogFirstVolumeBlock + i));
         }
 
-        BinaryPrimitives.WriteUInt32LittleEndian(node.AsSpan(valueAreaEnd + 8, 4), 16);
-        BinaryPrimitives.WriteUInt32LittleEndian(node.AsSpan(valueAreaEnd + 12, 4), 16);
-
-        SealApfsBlock(node);
-        stream.Seek(startByte + 3 * BlockSize, SeekOrigin.Begin);
-        stream.Write(node);
+        WriteCatalogOmapLeaf(
+            stream, startByte, CatalogOmapBtreeObjectId, plan.Spec.Xid, records);
     }
 
-    private static void WriteCatalogVolume(FileStream stream, long startByte, CatalogPartitionPlan plan, int index)
+    private static void WriteCatalogVolume(
+        FileStream stream,
+        long startByte,
+        CatalogPartitionPlan plan,
+        int index,
+        int layoutBlock)
     {
         var volume = plan.Volumes[index];
+        var volumeOid = plan.VolumeObjectIds[index];
+        var volumeXid = plan.VolumeXids[index];
+        var volumeOmapBlock = layoutBlock;
+        var volumeOmapTreeBlock = checked(layoutBlock + 1);
+        var rootBlock = checked(layoutBlock + 2);
+        var extentrefBlock = checked(layoutBlock + 3);
+        var snapshotBlock = checked(layoutBlock + 4);
+        var rootOid = volume.RootOid != 0 ? volume.RootOid : checked(0x2000UL + volumeOid);
+        var snapshotOid = checked(0x3000UL + volumeOid);
         var apsb = new byte[BlockSize];
-        BinaryPrimitives.WriteUInt64LittleEndian(apsb.AsSpan(0x08, 8), plan.VolumeObjectIds[index]);
-        BinaryPrimitives.WriteUInt64LittleEndian(apsb.AsSpan(0x10, 8), plan.VolumeXids[index]);
+        BinaryPrimitives.WriteUInt64LittleEndian(apsb.AsSpan(0x08, 8), volumeOid);
+        BinaryPrimitives.WriteUInt64LittleEndian(apsb.AsSpan(0x10, 8), volumeXid);
         BinaryPrimitives.WriteUInt32LittleEndian(apsb.AsSpan(0x18, 4), 0xD);
-        BinaryPrimitives.WriteUInt32LittleEndian(apsb.AsSpan(0x1C, 4), 0);
         BinaryPrimitives.WriteUInt32LittleEndian(apsb.AsSpan(0x20, 4), 0x42535041);
+        BinaryPrimitives.WriteUInt32LittleEndian(apsb.AsSpan(0x24, 4), 1);
         BinaryPrimitives.WriteUInt64LittleEndian(apsb.AsSpan(0x28, 8), volume.Features);
         BinaryPrimitives.WriteUInt64LittleEndian(apsb.AsSpan(0x30, 8), volume.ReadonlyFeatures);
         BinaryPrimitives.WriteUInt64LittleEndian(apsb.AsSpan(0x38, 8), volume.IncompatibleFeatures);
-        BinaryPrimitives.WriteUInt64LittleEndian(
-            apsb.AsSpan(0x80, 8), volume.OmapOid != 0 ? volume.OmapOid : (0x1000 + (ulong)index));
-        BinaryPrimitives.WriteUInt64LittleEndian(
-            apsb.AsSpan(0x88, 8), volume.RootOid != 0 ? volume.RootOid : (0x2000 + (ulong)index));
-        BinaryPrimitives.WriteUInt64LittleEndian(apsb.AsSpan(0xB8, 8), 1);
-        BinaryPrimitives.WriteUInt64LittleEndian(apsb.AsSpan(0xC0, 8), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(apsb.AsSpan(0x74, 4), 0x00000002);
+        BinaryPrimitives.WriteUInt32LittleEndian(apsb.AsSpan(0x78, 4), 0x40000002);
+        BinaryPrimitives.WriteUInt32LittleEndian(apsb.AsSpan(0x7C, 4), 0x00000002);
+        BinaryPrimitives.WriteUInt64LittleEndian(apsb.AsSpan(0x80, 8), (ulong)volumeOmapBlock);
+        BinaryPrimitives.WriteUInt64LittleEndian(apsb.AsSpan(0x88, 8), rootOid);
+        BinaryPrimitives.WriteUInt64LittleEndian(apsb.AsSpan(0x90, 8), (ulong)extentrefBlock);
+        BinaryPrimitives.WriteUInt64LittleEndian(apsb.AsSpan(0x98, 8), snapshotOid);
+        BinaryPrimitives.WriteUInt64LittleEndian(apsb.AsSpan(0xB8, 8), 11);
+        BinaryPrimitives.WriteUInt64LittleEndian(apsb.AsSpan(0xC0, 8), 3);
         if (volume.VolumeUuid != Guid.Empty)
         {
             volume.VolumeUuid.TryWriteBytes(apsb.AsSpan(0xF0, 16));
         }
 
         BinaryPrimitives.WriteUInt64LittleEndian(apsb.AsSpan(0x108, 8), volume.FsFlags);
-        Encoding.UTF8.GetBytes(volume.Name).CopyTo(apsb.AsSpan(0x120));
-        BinaryPrimitives.WriteUInt16LittleEndian(apsb.AsSpan(0x224, 2), volume.Role);
+        Encoding.UTF8.GetBytes(volume.Name).CopyTo(apsb.AsSpan(0x2C0));
+        BinaryPrimitives.WriteUInt16LittleEndian(apsb.AsSpan(0x3C4, 2), volume.Role);
         if (volume.GroupUuid != Guid.Empty)
         {
-            volume.GroupUuid.TryWriteBytes(apsb.AsSpan(0x228, 16));
+            volume.GroupUuid.TryWriteBytes(apsb.AsSpan(0x3F0, 16));
         }
 
         SealApfsBlock(apsb);
-        stream.Seek(startByte + (CatalogFirstVolumeBlock + index) * (long)BlockSize, SeekOrigin.Begin);
-        stream.Write(apsb);
+        WriteCatalogBlock(stream, startByte, CatalogFirstVolumeBlock + index, apsb);
+
+        WriteCatalogOmap(stream, startByte, (ulong)volumeOmapBlock, (ulong)volumeOmapTreeBlock, volumeXid);
+        WriteCatalogOmapLeaf(
+            stream,
+            startByte,
+            (ulong)volumeOmapTreeBlock,
+            volumeXid,
+            [
+                new CatalogOmapRecord(rootOid, volumeXid, (ulong)rootBlock),
+                new CatalogOmapRecord(snapshotOid, volumeXid, (ulong)snapshotBlock),
+            ]);
+
+        var inodeKey = new byte[8];
+        BinaryPrimitives.WriteUInt64LittleEndian(inodeKey, 2UL | (3UL << 60));
+        var inodeValue = new byte[0x60];
+        BinaryPrimitives.WriteUInt64LittleEndian(inodeValue.AsSpan(0, 8), 2);
+        BinaryPrimitives.WriteUInt64LittleEndian(inodeValue.AsSpan(8, 8), 9);
+        inodeValue[0x50] = 0xED;
+        inodeValue[0x51] = 0x41;
+        WriteCatalogTypedLeaf(
+            stream,
+            startByte,
+            rootBlock,
+            rootOid,
+            volumeXid,
+            0x00000002,
+            0xE,
+            [new CatalogLeafRecord(inodeKey, inodeValue)]);
+        WriteCatalogTypedLeaf(
+            stream, startByte, extentrefBlock, (ulong)extentrefBlock, volumeXid, 0x40000002, 0xF, []);
+        WriteCatalogTypedLeaf(
+            stream, startByte, snapshotBlock, snapshotOid, volumeXid, 0x00000002, 0x10, []);
     }
+
+    private static void WriteCatalogCheckpointMap(
+        FileStream stream,
+        long startByte,
+        int descriptorBlock,
+        int dataBlock,
+        ulong xid)
+    {
+        var map = new byte[BlockSize];
+        BinaryPrimitives.WriteUInt64LittleEndian(map.AsSpan(0x08, 8), checked((ulong)descriptorBlock));
+        BinaryPrimitives.WriteUInt64LittleEndian(map.AsSpan(0x10, 8), xid);
+        BinaryPrimitives.WriteUInt32LittleEndian(map.AsSpan(0x18, 4), 0x4000000C);
+        BinaryPrimitives.WriteUInt32LittleEndian(map.AsSpan(0x20, 4), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(map.AsSpan(0x24, 4), 3);
+        WriteCheckpointMapping(map, 0x28, 0x80000005, 0, CatalogSpacemanObjectId, (ulong)dataBlock);
+        WriteCheckpointMapping(map, 0x50, 0x80000002, 0x9, CatalogFreeQueueObjectId, (ulong)(dataBlock + 1));
+        WriteCheckpointMapping(map, 0x78, 0x80000002, 0x9, CatalogMainFreeQueueObjectId, (ulong)(dataBlock + 2));
+        SealApfsBlock(map);
+        WriteCatalogBlock(stream, startByte, descriptorBlock, map);
+    }
+
+    private static void WriteCheckpointMapping(
+        byte[] map,
+        int offset,
+        uint type,
+        uint subtype,
+        ulong objectId,
+        ulong physicalBlock)
+    {
+        BinaryPrimitives.WriteUInt32LittleEndian(map.AsSpan(offset, 4), type);
+        BinaryPrimitives.WriteUInt32LittleEndian(map.AsSpan(offset + 4, 4), subtype);
+        BinaryPrimitives.WriteUInt32LittleEndian(map.AsSpan(offset + 8, 4), BlockSize);
+        BinaryPrimitives.WriteUInt64LittleEndian(map.AsSpan(offset + 0x18, 8), objectId);
+        BinaryPrimitives.WriteUInt64LittleEndian(map.AsSpan(offset + 0x20, 8), physicalBlock);
+    }
+
+    private static void WriteCatalogSpaceman(
+        FileStream stream,
+        long startByte,
+        int block,
+        ulong xid,
+        long totalBlocks,
+        long allocatedBlocks,
+        int internalPoolBitmapBlock,
+        int internalPoolBase,
+        int cibBlock)
+    {
+        var spaceman = new byte[BlockSize];
+        BinaryPrimitives.WriteUInt64LittleEndian(spaceman.AsSpan(0x08, 8), CatalogSpacemanObjectId);
+        BinaryPrimitives.WriteUInt64LittleEndian(spaceman.AsSpan(0x10, 8), xid);
+        BinaryPrimitives.WriteUInt32LittleEndian(spaceman.AsSpan(0x18, 4), 0x80000005);
+        BinaryPrimitives.WriteUInt32LittleEndian(spaceman.AsSpan(0x20, 4), BlockSize);
+        BinaryPrimitives.WriteUInt32LittleEndian(spaceman.AsSpan(0x24, 4), BlockSize * 8);
+        BinaryPrimitives.WriteUInt32LittleEndian(spaceman.AsSpan(0x28, 4), (BlockSize - 0x28) / 0x20);
+        BinaryPrimitives.WriteUInt32LittleEndian(spaceman.AsSpan(0x2C, 4), (BlockSize - 0x28) / 8);
+        BinaryPrimitives.WriteUInt64LittleEndian(spaceman.AsSpan(0x30, 8), checked((ulong)totalBlocks));
+        BinaryPrimitives.WriteUInt64LittleEndian(spaceman.AsSpan(0x38, 8), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(spaceman.AsSpan(0x40, 4), 1);
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            spaceman.AsSpan(0x48, 8), checked((ulong)(totalBlocks - allocatedBlocks)));
+        BinaryPrimitives.WriteUInt32LittleEndian(spaceman.AsSpan(0x50, 4), 0x600);
+        BinaryPrimitives.WriteUInt32LittleEndian(spaceman.AsSpan(0x94, 4), 1);
+        BinaryPrimitives.WriteUInt64LittleEndian(spaceman.AsSpan(0x98, 8), 2);
+        BinaryPrimitives.WriteUInt32LittleEndian(spaceman.AsSpan(0xA0, 4), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(spaceman.AsSpan(0xA4, 4), 1);
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            spaceman.AsSpan(0xA8, 8), checked((ulong)internalPoolBitmapBlock));
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            spaceman.AsSpan(0xB0, 8), checked((ulong)internalPoolBase));
+        BinaryPrimitives.WriteUInt64LittleEndian(spaceman.AsSpan(0xC0, 8), 0xDEADBEEFDEADBEEFUL);
+        BinaryPrimitives.WriteUInt64LittleEndian(spaceman.AsSpan(0xD0, 8), CatalogFreeQueueObjectId);
+        BinaryPrimitives.WriteUInt16LittleEndian(spaceman.AsSpan(0xE0, 2), 64);
+        BinaryPrimitives.WriteUInt64LittleEndian(spaceman.AsSpan(0xF8, 8), CatalogMainFreeQueueObjectId);
+        BinaryPrimitives.WriteUInt16LittleEndian(spaceman.AsSpan(0x108, 2), 64);
+        BinaryPrimitives.WriteUInt16LittleEndian(spaceman.AsSpan(0x140, 2), 0xFFFF);
+        BinaryPrimitives.WriteUInt16LittleEndian(spaceman.AsSpan(0x142, 2), 0xFFFF);
+        BinaryPrimitives.WriteUInt32LittleEndian(spaceman.AsSpan(0x144, 4), 0x700);
+        BinaryPrimitives.WriteUInt32LittleEndian(spaceman.AsSpan(0x148, 4), 0x708);
+        BinaryPrimitives.WriteUInt32LittleEndian(spaceman.AsSpan(0x14C, 4), 0x720);
+        BinaryPrimitives.WriteUInt32LittleEndian(spaceman.AsSpan(0x150, 4), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(spaceman.AsSpan(0x154, 4), 0x800);
+        BinaryPrimitives.WriteUInt64LittleEndian(spaceman.AsSpan(0x600, 8), checked((ulong)cibBlock));
+        BinaryPrimitives.WriteUInt64LittleEndian(spaceman.AsSpan(0x700, 8), xid);
+        BinaryPrimitives.WriteUInt16LittleEndian(spaceman.AsSpan(0x708, 2), 0);
+        BinaryPrimitives.WriteUInt16LittleEndian(spaceman.AsSpan(0x720, 2), 0xFFFF);
+        SealApfsBlock(spaceman);
+        WriteCatalogBlock(stream, startByte, block, spaceman);
+    }
+
+    private static void WriteCatalogFreeQueue(
+        FileStream stream,
+        long startByte,
+        int block,
+        ulong objectId,
+        ulong xid)
+    {
+        WriteCatalogTypedLeaf(
+            stream,
+            startByte,
+            block,
+            objectId,
+            xid,
+            0x80000002,
+            0x9,
+            [],
+            fixedKeyValue: true);
+    }
+
+    private static void WriteCatalogCib(
+        FileStream stream,
+        long startByte,
+        int block,
+        int chunkBitmapBlock,
+        ulong xid,
+        long totalBlocks,
+        long allocatedBlocks)
+    {
+        var cib = new byte[BlockSize];
+        BinaryPrimitives.WriteUInt64LittleEndian(cib.AsSpan(0x08, 8), checked((ulong)block));
+        BinaryPrimitives.WriteUInt64LittleEndian(cib.AsSpan(0x10, 8), xid);
+        BinaryPrimitives.WriteUInt32LittleEndian(cib.AsSpan(0x18, 4), 0x40000007);
+        BinaryPrimitives.WriteUInt32LittleEndian(cib.AsSpan(0x20, 4), 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(cib.AsSpan(0x24, 4), 1);
+        BinaryPrimitives.WriteUInt64LittleEndian(cib.AsSpan(0x28, 8), xid);
+        BinaryPrimitives.WriteUInt64LittleEndian(cib.AsSpan(0x30, 8), 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(cib.AsSpan(0x38, 4), checked((uint)totalBlocks));
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            cib.AsSpan(0x3C, 4), checked((uint)(totalBlocks - allocatedBlocks)));
+        BinaryPrimitives.WriteUInt64LittleEndian(cib.AsSpan(0x40, 8), checked((ulong)chunkBitmapBlock));
+        SealApfsBlock(cib);
+        WriteCatalogBlock(stream, startByte, block, cib);
+    }
+
+    private static byte[] BuildCatalogAllocationBitmap(
+        CatalogPartitionPlan plan,
+        int volumeLayoutBase,
+        int descriptorBase,
+        int dataBase,
+        int internalPoolBitmapBlock,
+        int internalPoolBase)
+    {
+        var bitmap = new byte[BlockSize];
+        SetBitmapBit(bitmap, 0);
+        SetBitmapBit(bitmap, CatalogOmapObjectId);
+        SetBitmapBit(bitmap, CatalogOmapBtreeObjectId);
+        for (var index = 0; index < plan.Volumes.Count; index++)
+        {
+            SetBitmapBit(bitmap, checked((ulong)(CatalogFirstVolumeBlock + index)));
+            var layout = checked(volumeLayoutBase + index * CatalogPerVolumeObjectBlocks);
+            for (var offset = 0; offset < 5; offset++)
+            {
+                SetBitmapBit(bitmap, checked((ulong)(layout + offset)));
+            }
+        }
+
+        for (var offset = 0; offset < CatalogCheckpointDescriptorBlocks; offset++)
+        {
+            SetBitmapBit(bitmap, checked((ulong)(descriptorBase + offset)));
+        }
+
+        for (var offset = 0; offset < CatalogCheckpointDataBlocks; offset++)
+        {
+            SetBitmapBit(bitmap, checked((ulong)(dataBase + offset)));
+        }
+
+        SetBitmapBit(bitmap, checked((ulong)internalPoolBitmapBlock));
+        SetBitmapBit(bitmap, checked((ulong)internalPoolBase));
+        SetBitmapBit(bitmap, checked((ulong)(internalPoolBase + 1)));
+        return bitmap;
+    }
+
+    private static void SetBitmapBit(byte[] bitmap, ulong bit)
+        => bitmap[checked((int)(bit / 8))] |= checked((byte)(1u << checked((int)(bit % 8))));
+
+    private static long CountSetBits(byte[] bitmap, long bitCount)
+    {
+        var count = 0;
+        for (var bit = 0; bit < bitCount; bit++)
+        {
+            if ((bitmap[bit / 8] & (1 << (bit % 8))) != 0)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private static void WriteCatalogOmapLeaf(
+        FileStream stream,
+        long startByte,
+        ulong block,
+        ulong xid,
+        IReadOnlyList<CatalogOmapRecord> mappings)
+    {
+        var records = new CatalogLeafRecord[mappings.Count];
+        for (var i = 0; i < mappings.Count; i++)
+        {
+            var key = new byte[16];
+            BinaryPrimitives.WriteUInt64LittleEndian(key.AsSpan(0, 8), mappings[i].ObjectId);
+            BinaryPrimitives.WriteUInt64LittleEndian(key.AsSpan(8, 8), mappings[i].Xid);
+            var value = new byte[16];
+            BinaryPrimitives.WriteUInt32LittleEndian(value.AsSpan(4, 4), BlockSize);
+            BinaryPrimitives.WriteUInt64LittleEndian(value.AsSpan(8, 8), mappings[i].PhysicalBlock);
+            records[i] = new CatalogLeafRecord(key, value);
+        }
+
+        WriteCatalogTypedLeaf(
+            stream,
+            startByte,
+            checked((int)block),
+            block,
+            xid,
+            0x40000002,
+            0xB,
+            records);
+    }
+
+    private static void WriteCatalogTypedLeaf(
+        FileStream stream,
+        long startByte,
+        int block,
+        ulong objectId,
+        ulong xid,
+        uint objectType,
+        uint objectSubtype,
+        IReadOnlyList<CatalogLeafRecord> records,
+        bool fixedKeyValue = false)
+    {
+        var node = new byte[BlockSize];
+        BinaryPrimitives.WriteUInt64LittleEndian(node.AsSpan(0x08, 8), objectId);
+        BinaryPrimitives.WriteUInt64LittleEndian(node.AsSpan(0x10, 8), xid);
+        BinaryPrimitives.WriteUInt32LittleEndian(node.AsSpan(0x18, 4), objectType);
+        BinaryPrimitives.WriteUInt32LittleEndian(node.AsSpan(0x1C, 4), objectSubtype);
+        BinaryPrimitives.WriteUInt16LittleEndian(node.AsSpan(0x20, 2), fixedKeyValue ? (ushort)0x7 : (ushort)0x3);
+        BinaryPrimitives.WriteUInt32LittleEndian(node.AsSpan(0x24, 4), checked((uint)records.Count));
+        BinaryPrimitives.WriteUInt16LittleEndian(node.AsSpan(0x2A, 2), checked((ushort)(records.Count * 8)));
+
+        var keyArea = checked(0x38 + records.Count * 8);
+        var keyCursor = 0;
+        var valuePrefix = 0;
+        for (var i = 0; i < records.Count; i++)
+        {
+            valuePrefix = checked(valuePrefix + records[i].Value.Length);
+            var table = 0x38 + i * 8;
+            BinaryPrimitives.WriteUInt16LittleEndian(node.AsSpan(table, 2), checked((ushort)keyCursor));
+            BinaryPrimitives.WriteUInt16LittleEndian(node.AsSpan(table + 2, 2), checked((ushort)records[i].Key.Length));
+            BinaryPrimitives.WriteUInt16LittleEndian(node.AsSpan(table + 4, 2), checked((ushort)valuePrefix));
+            BinaryPrimitives.WriteUInt16LittleEndian(node.AsSpan(table + 6, 2), checked((ushort)records[i].Value.Length));
+            keyCursor = checked(keyCursor + records[i].Key.Length);
+        }
+
+        var keyWrite = keyArea;
+        foreach (var record in records)
+        {
+            record.Key.CopyTo(node.AsSpan(keyWrite));
+            keyWrite = checked(keyWrite + record.Key.Length);
+        }
+
+        const int infoStart = BlockSize - 40;
+        var prefix = 0;
+        foreach (var record in records)
+        {
+            prefix = checked(prefix + record.Value.Length);
+            record.Value.CopyTo(node.AsSpan(infoStart - prefix));
+        }
+
+        var valuesStart = infoStart - prefix;
+        if (keyWrite > valuesStart)
+        {
+            throw new InvalidOperationException("Catalog fixture B-tree records exceed one block.");
+        }
+
+        BinaryPrimitives.WriteUInt16LittleEndian(node.AsSpan(0x2C, 2), checked((ushort)(keyWrite - keyArea)));
+        BinaryPrimitives.WriteUInt16LittleEndian(node.AsSpan(0x2E, 2), checked((ushort)(valuesStart - keyWrite)));
+        var storageType = objectType & 0xC0000000u;
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            node.AsSpan(infoStart, 4),
+            fixedKeyValue ? 0x0000000Fu : storageType == 0x40000000u ? 0x50u : storageType == 0x80000000u ? 0x48u : 0x40u);
+        BinaryPrimitives.WriteUInt32LittleEndian(node.AsSpan(infoStart + 4, 4), BlockSize);
+        if (fixedKeyValue)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(node.AsSpan(infoStart + 8, 4), 16);
+            BinaryPrimitives.WriteUInt32LittleEndian(node.AsSpan(infoStart + 12, 4), 8);
+            BinaryPrimitives.WriteUInt32LittleEndian(node.AsSpan(infoStart + 16, 4), 16);
+            BinaryPrimitives.WriteUInt32LittleEndian(node.AsSpan(infoStart + 20, 4), 8);
+        }
+        else
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                node.AsSpan(infoStart + 16, 4),
+                checked((uint)(records.Count == 0 ? 0 : records.Max(static record => record.Key.Length))));
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                node.AsSpan(infoStart + 20, 4),
+                checked((uint)(records.Count == 0 ? 0 : records.Max(static record => record.Value.Length))));
+        }
+
+        BinaryPrimitives.WriteUInt64LittleEndian(node.AsSpan(infoStart + 24, 8), checked((ulong)records.Count));
+        BinaryPrimitives.WriteUInt64LittleEndian(node.AsSpan(infoStart + 32, 8), 1);
+        SealApfsBlock(node);
+        WriteCatalogBlock(stream, startByte, block, node);
+    }
+
+    private static void WriteCatalogBlock(FileStream stream, long startByte, int block, byte[] bytes)
+    {
+        stream.Seek(checked(startByte + block * (long)BlockSize), SeekOrigin.Begin);
+        stream.Write(bytes);
+    }
+
+    private readonly record struct CatalogOmapRecord(ulong ObjectId, ulong Xid, ulong PhysicalBlock);
+
+    private readonly record struct CatalogLeafRecord(byte[] Key, byte[] Value);
 
     private static void SealApfsBlock(byte[] block)
         => BinaryPrimitives.WriteUInt64LittleEndian(block, ComputeApfsObjectChecksum(block.AsSpan(8)));
@@ -571,7 +984,7 @@ public enum CatalogCorruptionKind
 
 public sealed record CatalogVolumeSpec(
     string Name = "Data",
-    ushort Role = 32,
+    ushort Role = 0x40,
     Guid VolumeUuid = default,
     Guid GroupUuid = default,
     ulong ObjectId = 0,

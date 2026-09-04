@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using ApfsAccess.Core;
 using ApfsAccess.Ipc;
 
 namespace ApfsAccess.Service;
@@ -931,7 +932,7 @@ internal sealed class AgentControlOperationService
         if (!TryCanonicalId(payload.OperationId, out var payloadId) || !StringComparer.Ordinal.Equals(payloadId, id) || !StringComparer.Ordinal.Equals(payload.OperationId, payloadId)) return Invalid(out diagnostic, "The evidence operationId is not the canonical GUID for its filename.");
         if (!IsKnownCommand(payload.Command) || !StringComparer.Ordinal.Equals(payload.Command, NormalizeToken(payload.Command))) return Invalid(out diagnostic, "The evidence command is unknown or not normalized.");
         if (!TryNormalizeMode(payload.RequestedMode, out var mode) || !StringComparer.Ordinal.Equals(payload.RequestedMode, mode)) return Invalid(out diagnostic, "The evidence requested mode is unknown or not normalized.");
-        if (!TargetsEqual(payload.Target, NormalizeTarget(payload.Target)) || !HasValidTarget(payload.Command, payload.Target)) return Invalid(out diagnostic, "The evidence target is missing, not normalized, or violates the device prefix invariant.");
+        if (!TargetsEqual(payload.Target, NormalizeTarget(payload.Target)) || !HasValidTarget(payload.Command, payload.Target)) return Invalid(out diagnostic, "The evidence target is missing, not normalized, or has an invalid volume identity.");
         if (string.IsNullOrWhiteSpace(payload.Fingerprint) || string.IsNullOrWhiteSpace(payload.Code) || payload.RequestedAtUtc == default || !payload.ExpiresAtUtc.HasValue) return Invalid(out diagnostic, "The evidence is missing required operation identity fields.");
         if (payload.ExpiresAtUtc.Value <= payload.RequestedAtUtc &&
             !(payload.State == ApfsOperationStates.Failed && IsCode(payload.Code, ApfsOperationCodes.Timeout)))
@@ -1102,7 +1103,7 @@ internal sealed class AgentControlOperationService
         if (!TryCanonicalId(rawId, out _)) return normalized with { ValidationCode = ApfsOperationCodes.InvalidOperationId, ValidationDiagnostic = "The operationId is blank or is not a valid GUID." };
         if (!IsKnownCommand(command)) return normalized with { ValidationCode = ApfsOperationCodes.UnknownCommand, ValidationDiagnostic = "The operation command is missing or unknown." };
         if (!modeValid) return normalized with { ValidationCode = ApfsOperationCodes.InvalidArguments, ValidationDiagnostic = "RequestedMode must be null, read-only, or read-write." };
-        if (!HasValidTarget(command, target)) return normalized with { ValidationCode = command == ApfsControlCommands.Quit ? ApfsOperationCodes.InvalidArguments : ApfsOperationCodes.AmbiguousTarget, ValidationDiagnostic = command == ApfsControlCommands.Quit ? "The quit command must not include a target." : "Mount, fix, and eject require a nonblank target whose volume begins with device + '|'." };
+        if (!HasValidTarget(command, target)) return normalized with { ValidationCode = command == ApfsControlCommands.Quit ? ApfsOperationCodes.InvalidArguments : ApfsOperationCodes.AmbiguousTarget, ValidationDiagnostic = command == ApfsControlCommands.Quit ? "The quit command must not include a target." : "Mount, fix, and eject require a nonblank device and a canonical APFS or matching legacy volume ID." };
         if (!expiresAtUtc.HasValue) return normalized with { ValidationCode = ApfsOperationCodes.InvalidArguments, ValidationDiagnostic = "ExpiresAtUtc is required for every mutating operation." };
         if (expiresAtUtc.Value > requestedAtUtc + MaximumOperationLifetime) return normalized with { ValidationCode = ApfsOperationCodes.InvalidArguments, ValidationDiagnostic = $"ExpiresAtUtc cannot be more than {MaximumOperationLifetime.TotalMinutes:n0} minutes in the future." };
         return normalized;
@@ -1121,7 +1122,22 @@ internal sealed class AgentControlOperationService
     }
 
     private static string? NormalizeEffectiveMode(string? value) => TryNormalizeMode(value, out var normalized) ? normalized : NormalizeOpaque(value);
-    private static bool HasValidTarget(string command, ApfsControlTarget? target) => command == ApfsControlCommands.Quit ? target is null : target is not null && !string.IsNullOrWhiteSpace(target.DeviceId) && !string.IsNullOrWhiteSpace(target.VolumeId) && target.VolumeId.StartsWith(target.DeviceId + "|", StringComparison.OrdinalIgnoreCase);
+    private static bool HasValidTarget(string command, ApfsControlTarget? target)
+    {
+        if (command == ApfsControlCommands.Quit)
+        {
+            return target is null;
+        }
+        if (target is null ||
+            string.IsNullOrWhiteSpace(target.DeviceId) ||
+            string.IsNullOrWhiteSpace(target.VolumeId))
+        {
+            return false;
+        }
+        return ApfsTopology.TryParseVolumeId(target.VolumeId, out _, out _) ||
+            target.VolumeId.StartsWith(
+                target.DeviceId + "|", StringComparison.OrdinalIgnoreCase);
+    }
     private static bool TargetsEqual(ApfsControlTarget? first, ApfsControlTarget? second) => first is null || second is null ? first is null && second is null : StringComparer.Ordinal.Equals(first.DeviceId, second.DeviceId) && StringComparer.Ordinal.Equals(first.VolumeId, second.VolumeId) && StringComparer.Ordinal.Equals(first.RecoveryIdentity, second.RecoveryIdentity);
     private string EvidencePath(string id) => Path.Combine(_root, $"{id}.json");
     private DateTime UtcNow() => _clock.GetUtcNow().UtcDateTime;

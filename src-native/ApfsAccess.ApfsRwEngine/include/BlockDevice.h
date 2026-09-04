@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -44,6 +45,8 @@ public:
     [[nodiscard]] const std::wstring& Path() const noexcept;
     [[nodiscard]] Geometry GetGeometry() const;
     [[nodiscard]] bool IsWritable() const;
+    [[nodiscard]] bool HasWriteHandle() const noexcept;
+    [[nodiscard]] static DWORD WriteHandleShareMode(std::wstring_view path) noexcept;
 
     [[nodiscard]] bool Read(std::uint64_t offset_bytes, std::size_t size_bytes, std::vector<std::byte>& out_buffer) const;
     [[nodiscard]] bool ReadInto(

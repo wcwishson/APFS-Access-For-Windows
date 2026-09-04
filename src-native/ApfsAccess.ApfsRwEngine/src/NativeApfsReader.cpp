@@ -1,4 +1,6 @@
 #include "NativeApfsReader.h"
+#include "ApfsContainerCatalog.h"
+#include "RandomAccessSource.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -48,6 +50,38 @@ constexpr std::uint16_t kDrecTypeSymlink = 10;
 constexpr std::size_t kObjectHeaderBytes = 0x20;
 constexpr std::size_t kBtreeDataOffset = 0x38;
 constexpr std::size_t kBtreeInfoBytes = 40;
+
+// Read-only RandomAccessSource view over a BlockDevice (which already applies
+// its base offset, so this is a store-relative view for offset devices).
+class BlockDeviceSource final : public catalog::RandomAccessSource
+{
+public:
+    explicit BlockDeviceSource(const BlockDevice& device)
+        : device_(device)
+    {
+    }
+
+    [[nodiscard]] std::uint64_t SizeBytes() const override
+    {
+        return device_.GetGeometry().total_bytes;
+    }
+
+    [[nodiscard]] bool Read(
+        std::uint64_t offset,
+        std::size_t size,
+        std::vector<std::byte>& out_bytes) const override
+    {
+        out_bytes.clear();
+        if (size == 0)
+        {
+            return true;
+        }
+        return device_.Read(offset, size, out_bytes) && out_bytes.size() == size;
+    }
+
+private:
+    const BlockDevice& device_;
+};
 
 std::uint16_t ReadLe16(const std::vector<std::byte>& buffer, std::size_t offset)
 {
@@ -276,7 +310,7 @@ std::optional<MetadataStore::FileExtent> TryResolveSingleExtentProjection(
     {
         0,
         extent.physical_address,
-        logical_size
+        extent.bytes
     };
 }
 
@@ -314,14 +348,15 @@ std::optional<InodeDataStreamInfo> ReadInodeDataStreamInfo(const std::vector<std
     const auto metadata_bytes = field_count * 4;
     if (field_count > 1024 ||
         metadata_bytes > inode_value.size() - (kInodeExtendedFieldsOffset + 4) ||
-        used_data > inode_value.size() - (kInodeExtendedFieldsOffset + 4 + metadata_bytes))
+        used_data < metadata_bytes ||
+        used_data > inode_value.size() - (kInodeExtendedFieldsOffset + 4))
     {
         return std::nullopt;
     }
 
     const auto field_table_start = kInodeExtendedFieldsOffset + 4;
     auto data_cursor = field_table_start + metadata_bytes;
-    const auto data_end = data_cursor + used_data;
+    const auto data_end = field_table_start + used_data;
     if (data_cursor > data_end || data_end > inode_value.size())
     {
         return std::nullopt;
@@ -393,17 +428,6 @@ bool NativeApfsReader::TryLoadVolumeProjection(
     out_projection = {};
     out_error.clear();
 
-    std::vector<std::byte> nxsb;
-    if (!device.Read(0, 0xC0, nxsb) || nxsb.size() < 0xC0 || ReadLe32(nxsb, 0x20) != kNxsbMagic)
-    {
-        out_error = L"NativeApfsNxsbMissing";
-        return false;
-    }
-
-    const auto block_size = ReadLe32(nxsb, 0x24);
-    const auto total_blocks = ReadLe64(nxsb, 0x28);
-    const auto checkpoint_xid = ReadLe64(nxsb, 0x10);
-    const auto nx_omap_oid = ReadLe64(nxsb, 0xA0);
     // Production volume selection is always explicit: callers resolve the
     // volume object ID through the container catalog (name or --volume-oid)
     // before projecting. Object ID 0 (first-volume fallback) is rejected.
@@ -413,107 +437,130 @@ bool NativeApfsReader::TryLoadVolumeProjection(
         return false;
     }
     const auto selected_volume_oid = volume_object_id;
-    ProjectionLookupCache lookup_cache{};
-    if (block_size == 0 || nx_omap_oid == 0 || selected_volume_oid == 0)
-    {
-        out_error = L"NativeApfsNxsbIncomplete";
-        return false;
-    }
-    if (selected_volume_oid == nx_omap_oid)
-    {
-        out_error = L"CanonicalObjectMapCheckpointMissing";
-        return false;
-    }
 
-    const auto volume_map = ResolveObjectMapValue(device, block_size, nx_omap_oid, selected_volume_oid, checkpoint_xid, &lookup_cache);
-    if (!volume_map.has_value() || volume_map->physical_block == 0)
+    // A1: the container catalog is the sole location authority for cataloged
+    // media. There is no block-0 guess, no proximity scan, and every object
+    // traversed here is checksum- and xid-verified by the catalog walk.
+    BlockDeviceSource device_source(device);
+    catalog::ApfsContainerCatalog catalog;
+    std::wstring catalog_error;
+    if (!catalog::ApfsContainerCatalog::TryLoadDevice(device, catalog, catalog_error))
     {
-        out_error = L"NativeApfsVolumeObjectMapMissing";
+        out_error = L"NativeApfsCatalogLoadFailed";
         return false;
     }
-
-    std::vector<std::byte> volume_superblock;
-    if (!ReadBlock(device, block_size, volume_map->physical_block, volume_superblock))
+    const catalog::ApfsContainerDescriptor* matched_container = nullptr;
+    const catalog::ApfsVolumeDescriptor* matched_volume = nullptr;
+    for (const auto& container : catalog.Containers())
     {
-        out_error = L"NativeApfsVolumeSuperblockReadFailed";
-        return false;
-    }
-
-    VolumeSuperblock volume{};
-    if (!ParseVolumeSuperblock(volume_superblock, volume))
-    {
-        out_error = L"NativeApfsVolumeSuperblockInvalid";
-        return false;
-    }
-
-    auto selected_volume_superblock_block = volume_map->physical_block;
-    auto root_map = ResolveObjectMapValue(device, block_size, volume.object_map_oid, volume.root_tree_oid, checkpoint_xid, &lookup_cache);
-    if (!root_map.has_value() || root_map->physical_block == 0)
-    {
-        std::optional<ObjectMapValue> fallback_root_map;
-        VolumeSuperblock fallback_volume{};
-        std::uint64_t fallback_volume_block = 0;
-        const auto scan_radius = static_cast<std::uint64_t>(512);
-        const auto start_block = volume_map->physical_block > scan_radius
-            ? volume_map->physical_block - scan_radius
-            : 1;
-        const auto end_block = total_blocks == 0
-            ? volume_map->physical_block + scan_radius
-            : std::min(total_blocks - 1, volume_map->physical_block + scan_radius);
-        for (std::uint64_t candidate_block = start_block; candidate_block <= end_block; ++candidate_block)
+        for (const auto& volume : container.volumes)
         {
-            std::vector<std::byte> candidate_superblock;
-            if (!ReadBlock(device, block_size, candidate_block, candidate_superblock))
+            if (volume.object_id != selected_volume_oid)
             {
                 continue;
             }
-
-            VolumeSuperblock candidate_volume{};
-            if (!ParseVolumeSuperblock(candidate_superblock, candidate_volume) ||
-                candidate_volume.object_id != selected_volume_oid ||
-                candidate_volume.xid > checkpoint_xid)
+            if (matched_volume != nullptr)
             {
-                continue;
+                out_error = L"NativeApfsVolumeAmbiguous";
+                return false;
             }
-
-            auto candidate_root_map = ResolveObjectMapValue(
-                device,
-                block_size,
-                candidate_volume.object_map_oid,
-                candidate_volume.root_tree_oid,
-                checkpoint_xid,
-                &lookup_cache);
-            if (!candidate_root_map.has_value() || candidate_root_map->physical_block == 0)
-            {
-                continue;
-            }
-
-            if (!fallback_root_map.has_value() ||
-                candidate_volume.xid > fallback_volume.xid)
-            {
-                fallback_root_map = candidate_root_map;
-                fallback_volume = candidate_volume;
-                fallback_volume_block = candidate_block;
-            }
+            matched_container = &container;
+            matched_volume = &volume;
         }
-
-        if (!fallback_root_map.has_value())
+    }
+    if (matched_container == nullptr || matched_volume == nullptr)
+    {
+        out_error = L"NativeApfsVolumeNotCataloged";
+        return false;
+    }
+    if (matched_container->member_store_ids.size() != 1)
+    {
+        // Multi-store (Fusion) block routing belongs to a later phase; the
+        // legacy path could only mis-project it, so fail closed instead.
+        out_error = L"NativeApfsFusionUnsupported";
+        return false;
+    }
+    const catalog::ApfsPhysicalStoreDescriptor* matched_store = nullptr;
+    for (const auto& store : catalog.Stores())
+    {
+        if (store.stable_store_id == matched_container->member_store_ids.front())
         {
-            out_error = L"NativeApfsRootTreeMapMissing";
+            matched_store = &store;
+            break;
+        }
+    }
+    if (matched_store == nullptr)
+    {
+        out_error = L"NativeApfsStoreMissing";
+        return false;
+    }
+    const catalog::AppleCheckpointView* checkpoint =
+        catalog.TryGetAppleCheckpointView(matched_store->stable_store_id);
+    if (checkpoint == nullptr)
+    {
+        out_error = L"NativeApfsAuthoritativeCheckpointMissing";
+        return false;
+    }
+    const catalog::AppleVolumeCheckpointView* selected_volume = nullptr;
+    for (const auto& volume : checkpoint->volumes)
+    {
+        if (volume.superblock.object_id == selected_volume_oid)
+        {
+            selected_volume = &volume;
+            break;
+        }
+    }
+    if (selected_volume == nullptr)
+    {
+        out_error = L"NativeApfsAuthoritativeVolumeMissing";
+        return false;
+    }
+    const auto block_size = checkpoint->container.superblock.block_size;
+    const auto checkpoint_xid = checkpoint->container.superblock.xid;
+    const auto total_blocks = checkpoint->container.superblock.block_count;
+    if (block_size == 0 || block_size > (1u << 20) || total_blocks == 0)
+    {
+        out_error = L"NativeApfsContainerGeometryInvalid";
+        return false;
+    }
+    if (matched_store->offset_bytes % block_size != 0)
+    {
+        out_error = L"NativeApfsStoreUnaligned";
+        return false;
+    }
+    const std::uint64_t store_block_base = matched_store->offset_bytes / block_size;
+    catalog::OffsetRandomAccessSource store_view(
+        &device_source, matched_store->offset_bytes, matched_store->size_bytes);
+
+    auto to_device_block = [&](std::uint64_t store_block, std::uint64_t& out_device_block)
+    {
+        if (store_block > (std::numeric_limits<std::uint64_t>::max() - store_block_base))
+        {
             return false;
         }
+        out_device_block = store_block_base + store_block;
+        return true;
+    };
 
-        volume = fallback_volume;
-        root_map = fallback_root_map;
-        selected_volume_superblock_block = fallback_volume_block;
-        if (IsReadTraceEnabled())
-        {
-            std::wcerr << L"[NativeApfsReader] using older readable APFS volume checkpoint"
-                       << L" volumeBlock=" << selected_volume_superblock_block
-                       << L" volumeXid=" << volume.xid
-                       << L" rootTreeBlock=" << root_map->physical_block
-                       << std::endl;
-        }
+    std::uint64_t aps_block = 0;
+    if (!to_device_block(selected_volume->superblock_object.physical_block, aps_block))
+    {
+        out_error = L"NativeApfsVolumeBlockOverflow";
+        return false;
+    }
+    VolumeSuperblock volume{};
+    volume.object_id = selected_volume_oid;
+    volume.xid = selected_volume->superblock.xid;
+    volume.object_map_oid = selected_volume->superblock.omap_oid;
+    volume.root_tree_oid = selected_volume->superblock.root_oid;
+    volume.file_extent_tree_oid = selected_volume->superblock.fext_tree_oid;
+
+    const auto selected_volume_superblock_block = aps_block;
+    std::uint64_t root_device_block = 0;
+    if (!to_device_block(selected_volume->root_tree.physical_block, root_device_block))
+    {
+        out_error = L"NativeApfsRootTreeBlockOverflow";
+        return false;
     }
 
     out_projection.checkpoint_xid = checkpoint_xid;
@@ -521,72 +568,81 @@ bool NativeApfsReader::TryLoadVolumeProjection(
     out_projection.volume_superblock_block = selected_volume_superblock_block;
     out_projection.volume_object_map_oid = volume.object_map_oid;
     out_projection.root_tree_oid = volume.root_tree_oid;
-    out_projection.root_tree_block = root_map->physical_block;
+    out_projection.root_tree_block = root_device_block;
     out_projection.file_extent_tree_oid = volume.file_extent_tree_oid;
     out_projection.root_directory_inode = kRootDirectoryInode;
     out_projection.total_blocks = total_blocks;
     out_projection.block_size = block_size;
 
     std::vector<RawBtreeRecord> fs_records;
-    if (!ReadBtreeRecords(
-            device,
-            block_size,
-            root_map->physical_block,
-            /*child_addresses_are_physical=*/false,
-            volume.object_map_oid,
-            checkpoint_xid,
-            fs_records,
-            &lookup_cache))
+    std::string resolve_error;
     {
-        out_error = L"NativeApfsRootTreeReadFailed";
-        return false;
+        std::vector<catalog::BtreeRecord> catalog_records;
+        catalog::BtreeReadPolicy tree_policy;
+        tree_policy.enforce_object_identity = true;
+        tree_policy.root_object_id = selected_volume->root_tree.object_id;
+        tree_policy.storage_type = selected_volume->root_tree.type;
+        tree_policy.subtype = catalog::kObjectTypeFsTree;
+        if (!catalog::ReadBtreeLeafRecords(
+                store_view, block_size, selected_volume->root_tree.physical_block,
+                (selected_volume->root_tree.type & catalog::kObjectStorageTypeMask) ==
+                    catalog::kObjectPhysical,
+                volume.object_map_oid, checkpoint_xid, tree_policy,
+                catalog_records, resolve_error))
+        {
+            out_error = L"NativeApfsRootTreeReadFailed";
+            return false;
+        }
+        fs_records.reserve(catalog_records.size());
+        for (auto& record : catalog_records)
+        {
+            RawBtreeRecord raw{};
+            raw.key = std::move(record.key);
+            raw.value = std::move(record.value);
+            fs_records.push_back(std::move(raw));
+        }
     }
 
-    if (volume.file_extent_tree_oid != 0)
+    if (selected_volume->file_extent_tree.has_value())
     {
-        const auto file_extent_map = ResolveObjectMapValue(
-            device,
-            block_size,
-            volume.object_map_oid,
-            volume.file_extent_tree_oid,
-            checkpoint_xid,
-            &lookup_cache);
-        if (file_extent_map.has_value() && file_extent_map->physical_block != 0)
+        const auto& file_extent_tree = selected_volume->file_extent_tree.value();
+        std::vector<catalog::BtreeRecord> file_extent_records;
+        std::uint64_t extent_device_block = 0;
+        catalog::BtreeReadPolicy tree_policy;
+        tree_policy.enforce_object_identity = true;
+        tree_policy.root_object_id = file_extent_tree.object_id;
+        tree_policy.storage_type = file_extent_tree.type;
+        tree_policy.subtype = catalog::kObjectTypeFileExtentTree;
+        if (catalog::ReadBtreeLeafRecords(
+                store_view, block_size, file_extent_tree.physical_block,
+                (file_extent_tree.type & catalog::kObjectStorageTypeMask) ==
+                    catalog::kObjectPhysical,
+                volume.object_map_oid, checkpoint_xid, tree_policy,
+                file_extent_records, resolve_error) &&
+            to_device_block(file_extent_tree.physical_block, extent_device_block))
         {
-            std::vector<RawBtreeRecord> file_extent_records;
-            if (ReadBtreeRecords(
-                    device,
-                    block_size,
-                    file_extent_map->physical_block,
-                    /*child_addresses_are_physical=*/false,
-                    volume.object_map_oid,
-                    checkpoint_xid,
-                    file_extent_records,
-                    &lookup_cache))
+            out_projection.file_extent_tree_block = extent_device_block;
+            for (auto& record : file_extent_records)
             {
-                out_projection.file_extent_tree_block = file_extent_map->physical_block;
-                fs_records.insert(
-                    fs_records.end(),
-                    std::make_move_iterator(file_extent_records.begin()),
-                    std::make_move_iterator(file_extent_records.end()));
-            }
-            else if (IsReadTraceEnabled())
-            {
-                std::wcerr << L"[NativeApfsReader] file extent tree read failed"
-                           << L" oid=" << volume.file_extent_tree_oid
-                           << L" block=" << file_extent_map->physical_block
-                           << std::endl;
+                RawBtreeRecord raw{};
+                raw.key = std::move(record.key);
+                raw.value = std::move(record.value);
+                fs_records.push_back(std::move(raw));
             }
         }
         else if (IsReadTraceEnabled())
         {
-            std::wcerr << L"[NativeApfsReader] file extent tree map missing"
-                       << L" oid=" << volume.file_extent_tree_oid
-                       << std::endl;
+            std::wcerr << L"[NativeApfsReader] file extent tree read failed"
+                       << L" oid=" << volume.file_extent_tree_oid << std::endl;
         }
     }
 
-    if (!ProjectFileSystemTree(fs_records, block_size, total_blocks, checkpoint_xid, out_projection))
+    const auto directory_keys_are_hashed =
+        (selected_volume->superblock.incompatible_features &
+            catalog::kIncompatCaseInsensitive) != 0;
+    if (!ProjectFileSystemTree(
+            fs_records, block_size, total_blocks, checkpoint_xid,
+            directory_keys_are_hashed, out_projection))
     {
         out_error = L"NativeApfsRootTreeProjectionFailed";
         return false;
@@ -924,6 +980,7 @@ bool NativeApfsReader::ProjectFileSystemTree(
     std::uint32_t block_size,
     std::uint64_t total_blocks,
     std::uint64_t xid,
+    bool directory_keys_are_hashed,
     NativeApfsVolumeProjection& projection)
 {
     if (block_size == 0)
@@ -1011,19 +1068,21 @@ bool NativeApfsReader::ProjectFileSystemTree(
         }
         else if (record_type == kApfsTypeDirectoryRecord)
         {
-            if (record.key.size() < 12 || record.value.size() < 18)
+            const std::size_t name_offset = directory_keys_are_hashed ? 12u : 10u;
+            if (record.key.size() < name_offset || record.value.size() < 18)
             {
                 continue;
             }
-            const auto name_len_and_hash = ReadLe32(record.key, 8);
-            const auto name_length = static_cast<std::size_t>(name_len_and_hash & 0x3ffu);
-            if (name_length == 0 || record.key.size() < 12 + name_length)
+            const auto name_length = directory_keys_are_hashed
+                ? static_cast<std::size_t>(ReadLe32(record.key, 8) & 0x3ffu)
+                : static_cast<std::size_t>(ReadLe16(record.key, 8));
+            if (name_length == 0 || name_length > record.key.size() - name_offset)
             {
                 continue;
             }
             RawDirectoryEntry entry{};
             entry.parent_id = object_id;
-            entry.name = Utf8ToWide(record.key, 12, name_length);
+            entry.name = Utf8ToWide(record.key, name_offset, name_length);
             entry.child_id = ReadLe64(record.value, 0x00);
             entry.timestamp = ReadLe64(record.value, 0x08);
             entry.flags = ReadLe16(record.value, 0x10);

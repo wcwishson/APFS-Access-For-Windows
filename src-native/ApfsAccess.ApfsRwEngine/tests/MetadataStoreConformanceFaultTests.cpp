@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <string>
@@ -1401,6 +1402,7 @@ bool TestCanonicalCheckpointRequiredWhenLegacyFixtureFallbackDisabled(const std:
         L"CanonicalCheckpointRequiredStrict",
     };
     strict_context.allow_legacy_scaffold_for_fixtures = false;
+    strict_context.allow_legacy_private_checkpoint_writer_for_tests = true;
 
     {
         apfsaccess::rw::MetadataStore store(strict_context);
@@ -1447,6 +1449,7 @@ bool TestCanonicalCheckpointRequiredWhenLegacyFixtureFallbackDisabled(const std:
         L"CanonicalCheckpointRequiredNonFixture",
     };
     non_fixture_context.allow_legacy_scaffold_for_fixtures = true;
+    non_fixture_context.allow_legacy_private_checkpoint_writer_for_tests = true;
 
     {
         apfsaccess::rw::MetadataStore store(non_fixture_context);
@@ -1470,6 +1473,7 @@ bool TestCanonicalCheckpointRequiredWhenLegacyFixtureFallbackDisabled(const std:
         L"CanonicalCheckpointRequiredNonFixtureToken",
     };
     non_fixture_token_context.allow_legacy_scaffold_for_fixtures = true;
+    non_fixture_token_context.allow_legacy_private_checkpoint_writer_for_tests = true;
 
     {
         apfsaccess::rw::MetadataStore store(non_fixture_token_context);
@@ -1499,6 +1503,7 @@ bool TestCanonicalCheckpointRequiredWhenLegacyFixtureFallbackDisabled(const std:
         L"CanonicalCheckpointRequiredNonFixtureSegment",
     };
     non_fixture_segment_context.allow_legacy_scaffold_for_fixtures = true;
+    non_fixture_segment_context.allow_legacy_private_checkpoint_writer_for_tests = true;
 
     {
         apfsaccess::rw::MetadataStore store(non_fixture_segment_context);
@@ -1510,6 +1515,115 @@ bool TestCanonicalCheckpointRequiredWhenLegacyFixtureFallbackDisabled(const std:
             "CanonicalCheckpointRequired: non-fixture-segment LoadObjectMap failure should report canonical object-map checkpoint missing");
     }
 
+    return ok;
+}
+
+bool TestNonFixtureRejectsLegacyPrivateCheckpointOverlay(const std::filesystem::path& run_root)
+{
+    const auto fixture_path = run_root / "legacy_private_overlay_seed.apfs.img";
+    if (!CreateSyntheticContainer(fixture_path))
+    {
+        return Require(false, "LegacyPrivateOverlay: unable to create fixture seed");
+    }
+
+    bool ok = true;
+    apfsaccess::rw::MetadataStore::VolumeContext fixture_context
+    {
+        fixture_path.wstring(),
+        L"LegacyPrivateOverlayFixture",
+    };
+    fixture_context.allow_legacy_scaffold_for_fixtures = true;
+
+    {
+        apfsaccess::rw::MetadataStore fixture_store(fixture_context);
+        ok &= Require(
+            fixture_store.PrepareNativeWritePath(),
+            "LegacyPrivateOverlay: fixture seed should prepare");
+
+        apfsaccess::rw::MetadataStore::MutationRequest create_file{};
+        create_file.operation = apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
+        create_file.path = L"\\private-overlay.bin";
+        ok &= ExpectMutationStatus(
+            fixture_store,
+            create_file,
+            apfsaccess::rw::MetadataStore::MutationStatus::Applied,
+            "LegacyPrivateOverlay: fixture create should apply");
+        ok &= ExpectCommitStatus(
+            fixture_store,
+            apfsaccess::rw::MetadataStore::CommitStatus::Committed,
+            "LegacyPrivateOverlay: fixture commit should seed private checkpoints");
+    }
+
+    const auto production_path = run_root / "legacy_private_overlay_production.bin";
+    std::error_code ec;
+    std::filesystem::copy_file(
+        fixture_path,
+        production_path,
+        std::filesystem::copy_options::overwrite_existing,
+        ec);
+    if (ec)
+    {
+        return Require(false, "LegacyPrivateOverlay: unable to copy production vector");
+    }
+
+    std::ifstream before_input(production_path, std::ios::binary);
+    const std::vector<char> before(
+        (std::istreambuf_iterator<char>(before_input)),
+        std::istreambuf_iterator<char>());
+
+    apfsaccess::rw::MetadataStore::VolumeContext production_context
+    {
+        production_path.wstring(),
+        L"LegacyPrivateOverlayProduction",
+    };
+    production_context.allow_legacy_scaffold_for_fixtures = true;
+
+    apfsaccess::rw::MetadataStore production_store(production_context);
+    ok &= Require(
+        !production_store.PrepareNativeWritePath(),
+        "LegacyPrivateOverlay: production media must reject the private checkpoint writer");
+    ok &= Require(
+        production_store.IsRecoveryRequired(),
+        "LegacyPrivateOverlay: rejected production media should remain fail-closed");
+    if (production_store.RecoveryReason() != L"ContainerStateLoadFailed")
+    {
+        std::wcerr << L"[DETAIL] LegacyPrivateOverlay production recovery reason: "
+                   << production_store.RecoveryReason() << std::endl;
+    }
+    ok &= Require(
+        production_store.RecoveryReason() == L"ContainerStateLoadFailed",
+        "LegacyPrivateOverlay: rejection should name invalid authoritative container state");
+    ok &= Require(
+        !production_store.IsCommitPathReady() && !production_store.IsCanonicalCommitReady(),
+        "LegacyPrivateOverlay: rejected production media must not expose commit readiness");
+
+    std::ifstream after_input(production_path, std::ios::binary);
+    const std::vector<char> after(
+        (std::istreambuf_iterator<char>(after_input)),
+        std::istreambuf_iterator<char>());
+    ok &= Require(
+        before == after,
+        "LegacyPrivateOverlay: failed preparation must leave production media byte-identical");
+
+    apfsaccess::rw::MetadataStore::VolumeContext raw_bypass_context
+    {
+        LR"(\\.\PhysicalDrive18446744073709551615)",
+        L"LegacyPrivateOverlayRawBypass",
+    };
+    raw_bypass_context.allow_raw_physical_write = true;
+    raw_bypass_context.allow_legacy_private_checkpoint_writer_for_tests = true;
+    apfsaccess::rw::MetadataStore raw_bypass_store(raw_bypass_context);
+    const auto raw_prepared = raw_bypass_store.PrepareNativeWritePath();
+    if (raw_prepared ||
+        raw_bypass_store.RecoveryReason() != L"NativeAppleTransactionWriterUnavailable")
+    {
+        std::wcerr << L"[DETAIL] LegacyPrivateOverlay raw recovery reason: "
+                   << raw_bypass_store.RecoveryReason() << std::endl;
+    }
+    ok &= Require(
+        !raw_prepared &&
+            raw_bypass_store.RecoveryReason() == L"NativeAppleTransactionWriterUnavailable",
+        "LegacyPrivateOverlay: test override must never enable a raw-device writer");
     return ok;
 }
 
@@ -1673,6 +1787,7 @@ bool TestCommitBlobModeSeparationBetweenFixtureAndNonFixture(const std::filesyst
         L"CommitBlobModeCanonicalNonFixture",
     };
     canonical_non_fixture_context.allow_legacy_scaffold_for_fixtures = true;
+    canonical_non_fixture_context.allow_legacy_private_checkpoint_writer_for_tests = true;
     canonical_non_fixture_context.crash_replay_mode = L"ReplayIfSafe";
 
     {
@@ -1860,6 +1975,7 @@ bool TestCommitBlobModeSeparationBetweenFixtureAndNonFixture(const std::filesyst
         L"CommitBlobModeScaffoldNonFixture",
     };
     scaffold_non_fixture_context.allow_legacy_scaffold_for_fixtures = true;
+    scaffold_non_fixture_context.allow_legacy_private_checkpoint_writer_for_tests = true;
     scaffold_non_fixture_context.crash_replay_mode = L"ReplayIfSafe";
 
     {
@@ -2064,6 +2180,7 @@ bool TestCanonicalNonFixtureStatePersistIsBestEffort(const std::filesystem::path
         L"CanonicalNonFixtureStatePersistNonFixture",
     };
     non_fixture_context.allow_legacy_scaffold_for_fixtures = true;
+    non_fixture_context.allow_legacy_private_checkpoint_writer_for_tests = true;
     const auto non_fixture_sidecar_path =
         BuildPersistentStatePathForTest(non_fixture_context);
     if (!non_fixture_sidecar_path.empty())
@@ -2173,6 +2290,7 @@ int main()
     ok &= TestCommitBlobModeSeparationBetweenFixtureAndNonFixture(run_root);
     ok &= TestCanonicalNonFixtureStatePersistIsBestEffort(run_root);
     ok &= TestCanonicalCheckpointRequiredWhenLegacyFixtureFallbackDisabled(run_root);
+    ok &= TestNonFixtureRejectsLegacyPrivateCheckpointOverlay(run_root);
 
     std::filesystem::remove_all(run_root, ec);
     if (!ok)

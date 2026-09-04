@@ -437,6 +437,77 @@ bool TestBlockDeviceOffsetIo(const std::filesystem::path& run_root)
     return ok;
 }
 
+bool TestBlockDeviceRawWriterUsesExclusiveCrossProcessLease(const std::filesystem::path& run_root)
+{
+    bool ok = true;
+    const auto raw_share = apfsaccess::rw::BlockDevice::WriteHandleShareMode(
+        LR"(\\.\PhysicalDrive9)");
+    const auto image_share = apfsaccess::rw::BlockDevice::WriteHandleShareMode(
+        (run_root / "block-device-shared-image.bin").wstring());
+    ok &= Require(
+        raw_share == FILE_SHARE_READ,
+        "Raw BlockDevice writers should share reads but deny a second writer");
+    ok &= Require(
+        image_share == (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+        "Regular image BlockDevice writers should retain existing sharing semantics");
+
+    const auto lease_path = run_root / "block-device-exclusive-writer-lease.bin";
+    {
+        std::ofstream seed(lease_path, std::ios::binary | std::ios::trunc);
+        seed.write("lease", 5);
+    }
+    const auto first = CreateFileW(
+        lease_path.c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        raw_share,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    ok &= Require(
+        first != INVALID_HANDLE_VALUE,
+        "Exclusive raw-writer policy should acquire the first writer lease");
+
+    SetLastError(ERROR_SUCCESS);
+    const auto second = CreateFileW(
+        lease_path.c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        raw_share,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    const auto second_error = GetLastError();
+    ok &= Require(
+        second == INVALID_HANDLE_VALUE && second_error == ERROR_SHARING_VIOLATION,
+        "Exclusive raw-writer policy should reject a concurrent writer through the kernel");
+    if (second != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(second);
+    }
+    if (first != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(first);
+    }
+
+    const auto after_release = CreateFileW(
+        lease_path.c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        raw_share,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    ok &= Require(
+        after_release != INVALID_HANDLE_VALUE,
+        "Exclusive raw-writer policy should release with its owning handle");
+    if (after_release != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(after_release);
+    }
+    return ok;
+}
+
 bool TestBlockDeviceConcurrentUnalignedReadsUseThreadLocalScratch(const std::filesystem::path& run_root)
 {
     const auto image_path = run_root / "block_device_concurrent_unaligned_reads.bin";
@@ -3580,6 +3651,7 @@ int main(int argc, char** argv)
     ScopedEnvironmentVariable perf_counters(L"APFSACCESS_PERF_COUNTERS", L"1");
 
     ok &= TestBlockDeviceOffsetIo(run_root);
+    ok &= TestBlockDeviceRawWriterUsesExclusiveCrossProcessLease(run_root);
     ok &= TestBlockDeviceConcurrentUnalignedReadsUseThreadLocalScratch(run_root);
     ok &= TestBlockDeviceReadCacheDisabledByDefault(run_root);
     ok &= TestBlockDeviceReadCacheRejectsNonOptInValues(run_root);
@@ -4484,6 +4556,8 @@ int main(int argc, char** argv)
         canonical_non_fixture_disk_authoritative_non_fixture_image_path.wstring(),
         L"CanonicalNonFixtureDiskAuthoritative",
     };
+    canonical_non_fixture_disk_authoritative_non_fixture_context
+        .allow_legacy_private_checkpoint_writer_for_tests = true;
     std::filesystem::path canonical_non_fixture_injected_sidecar_path;
     {
         const auto non_fixture_sidecar_path =
@@ -4716,6 +4790,8 @@ int main(int argc, char** argv)
         coherent_rollback_non_fixture_image_path.wstring(),
         L"CoherentCheckpointRollback",
     };
+    coherent_rollback_non_fixture_context
+        .allow_legacy_private_checkpoint_writer_for_tests = true;
     {
         const auto non_fixture_sidecar_path = BuildPersistentStatePathForTest(coherent_rollback_non_fixture_context);
         if (!non_fixture_sidecar_path.empty())
@@ -5139,6 +5215,8 @@ int main(int argc, char** argv)
         non_fixture_partial_inode_image_path.wstring(),
         L"NonFixturePartialInodeState",
     };
+    non_fixture_partial_inode_context
+        .allow_legacy_private_checkpoint_writer_for_tests = true;
     const auto non_fixture_partial_inode_state_path = BuildPersistentStatePathForTest(non_fixture_partial_inode_context);
     if (!non_fixture_partial_inode_state_path.empty())
     {

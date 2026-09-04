@@ -45,16 +45,17 @@ public sealed class ObserverCatalogIntegrationTests
             new CatalogFixtureSpec(16, [new CatalogPartitionSpec("LegacyName", Volumes: [new CatalogVolumeSpec("Data")])]));
         var partition = Assert.Single(fixture.Partitions);
         var containerHex = Convert.ToHexString(partition.ContainerUuid.ToByteArray()).ToLowerInvariant();
+        var stagedObserver = StagedPackagedObserver.Stage(observerPath, "e2e-single");
         using var backend = new NativeApfsBackend(
             new ServiceHostOptions
             {
                 BackendMode = "Native",
                 NativeAutoDiscoverPhysicalDrives = false,
-                NativeObserverPath = observerPath,
+                NativeObserverPath = stagedObserver,
             },
             lifecycleTestHooks: null,
             observerRunner: null,
-            observerPathOverride: observerPath);
+            observerPathOverride: stagedObserver);
 
         var snapshot = backend.TryDiscoverTopologySnapshot(imagePath, "integration-single");
         Assert.NotNull(snapshot);
@@ -65,7 +66,10 @@ public sealed class ObserverCatalogIntegrationTests
 
         var volume = Assert.Single(
             await backend.ProbeVolumesAsync(imagePath, CancellationToken.None));
-        Assert.Equal("LegacyName", volume.VolumeName);
+        // A2: the row is the snapshot volume ("Data"); the legacy GPT name
+        // ("LegacyName") supplies only mount-path affordances.
+        Assert.Equal("Data", volume.VolumeName);
+        Assert.Equal($"apfs-vol:{containerHex}:101", volume.VolumeId);
         Assert.Equal($"apfs-vol:{containerHex}:101", volume.CatalogVolumeId);
         Assert.Equal(containerHex, volume.CatalogContainerUuid);
         Assert.Equal(101UL, volume.CatalogVolumeObjectId);
@@ -117,54 +121,66 @@ public sealed class ObserverCatalogIntegrationTests
                 Volumes: [new CatalogVolumeSpec("Data"), new CatalogVolumeSpec("Backup")])]));
         var containerHex = Convert.ToHexString(
             Assert.Single(fixture.Partitions).ContainerUuid.ToByteArray()).ToLowerInvariant();
+        var stagedObserver = StagedPackagedObserver.Stage(observerPath, "multivol");
         using var backend = new NativeApfsBackend(
             new ServiceHostOptions { BackendMode = "Native", NativeAutoDiscoverPhysicalDrives = false },
             lifecycleTestHooks: null,
             observerRunner: null,
-            observerPathOverride: observerPath);
+            observerPathOverride: stagedObserver);
 
-        var snapshot = backend.TryDiscoverTopologySnapshot(imagePath, "integration-multivol");
-        Assert.NotNull(snapshot);
+        var snapshot = backend.TryDiscoverTopologySnapshot(
+            imagePath, "integration-multivol", out var observerError);
+        Assert.True(snapshot is not null, observerError);
         Assert.Equal(2, snapshot!.Volumes.Count);
 
-        var volume = Assert.Single(
-            await backend.ProbeVolumesAsync(imagePath, CancellationToken.None));
-        Assert.Equal("Data", volume.VolumeName);
+        // A2: one row per snapshot volume (the single legacy GPT row only
+        // supplies affordances).
+        var volumes = (await backend.ProbeVolumesAsync(imagePath, CancellationToken.None))
+            .OrderBy(static volume => volume.VolumeName, StringComparer.Ordinal)
+            .ToArray();
+        Assert.Equal(2, volumes.Length);
+        var volume = volumes.First(static row => row.VolumeName == "Data");
         Assert.Equal(101UL, volume.CatalogVolumeObjectId);
+        Assert.Equal($"apfs-vol:{containerHex}:101", volume.VolumeId);
         Assert.Equal($"apfs-vol:{containerHex}:101", volume.CatalogVolumeId);
         Assert.Equal(ApfsCapabilityDecision.Writable, volume.CatalogDecision);
     }
 
     [Fact]
-    public async Task DuplicateVolumeNames_StayAmbiguousNull()
+    public async Task DuplicateVolumeNames_StayIndependentlyAddressable()
     {
         var observerPath = RealObserverPath();
         using var temp = DTempDirectory.Create("observer-dupname");
         var imagePath = Path.Combine(temp.Path, "dupname.apfs.img");
-        SyntheticApfsTestImage.CreateCatalogFixture(
+        var fixture = SyntheticApfsTestImage.CreateCatalogFixture(
             imagePath,
             new CatalogFixtureSpec(16, [new CatalogPartitionSpec(
                 "Data",
                 Volumes: [new CatalogVolumeSpec("Data"), new CatalogVolumeSpec("Data")])]));
+        var containerHex = Convert.ToHexString(
+            Assert.Single(fixture.Partitions).ContainerUuid.ToByteArray()).ToLowerInvariant();
         using var backend = new NativeApfsBackend(
             new ServiceHostOptions { BackendMode = "Native", NativeAutoDiscoverPhysicalDrives = false },
             lifecycleTestHooks: null,
             observerRunner: null,
             observerPathOverride: observerPath);
 
-        // Duplicate APSB names are reported (not fatal), but both legacy
-        // matches are ambiguous, so no OID attaches.
+        // Duplicate APSB names are reported (not fatal); A3 keeps both rows
+        // independently addressable by canonical ID.
         var snapshot = backend.TryDiscoverTopologySnapshot(imagePath, "integration-dupname");
         Assert.NotNull(snapshot);
         Assert.Equal(2, snapshot!.Volumes.Count);
 
-        var volume = Assert.Single(
-            await backend.ProbeVolumesAsync(imagePath, CancellationToken.None));
-        Assert.Equal("Data", volume.VolumeName);
-        Assert.Null(volume.CatalogVolumeObjectId);
-        Assert.Null(volume.CatalogVolumeId);
-        var target = ReadMountTarget(backend, volume);
-        Assert.Null(target.VolumeObjectId);
+        var volumes = (await backend.ProbeVolumesAsync(imagePath, CancellationToken.None))
+            .OrderBy(static volume => volume.VolumeId, StringComparer.Ordinal)
+            .ToArray();
+        Assert.Equal(2, volumes.Length);
+        Assert.NotEqual(volumes[0].VolumeId, volumes[1].VolumeId);
+        Assert.All(volumes, static volume => Assert.StartsWith("apfs-vol:", volume.VolumeId));
+        Assert.NotEqual(volumes[0].NativeVolumePath, volumes[1].NativeVolumePath);
+        var target = ReadMountTarget(backend, volumes[0]);
+        Assert.NotNull(target.VolumeObjectId);
+        Assert.Equal(containerHex, target.ContainerUuidHex);
     }
 
     private static (ulong? VolumeObjectId, string? ContainerUuidHex) ReadMountTarget(

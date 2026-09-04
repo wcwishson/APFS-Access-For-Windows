@@ -6706,6 +6706,8 @@ int main()
         L"ReplayInvalidXidWindowNonFixtureSidecarFallback",
     };
     replay_invalid_xid_window_non_fixture_sidecar_fallback_context.crash_replay_mode = L"ReplayIfSafe";
+    replay_invalid_xid_window_non_fixture_sidecar_fallback_context
+        .allow_legacy_private_checkpoint_writer_for_tests = true;
 
     {
         const auto fixture_persistent_state_path = BuildPersistentStatePath(
@@ -6791,6 +6793,8 @@ int main()
         L"ReplayInvalidXidWindowNonFixture",
     };
     replay_invalid_xid_window_non_fixture_context.crash_replay_mode = L"ReplayIfSafe";
+    replay_invalid_xid_window_non_fixture_context
+        .allow_legacy_private_checkpoint_writer_for_tests = true;
 
     {
         const auto fixture_persistent_state_path = BuildPersistentStatePath(
@@ -6835,6 +6839,8 @@ int main()
         L"ReplayInvalidXidWindowNonFixtureMissingCandidate",
     };
     replay_invalid_xid_window_non_fixture_missing_candidate_context.crash_replay_mode = L"ReplayIfSafe";
+    replay_invalid_xid_window_non_fixture_missing_candidate_context
+        .allow_legacy_private_checkpoint_writer_for_tests = true;
 
     {
         const auto fixture_persistent_state_path = BuildPersistentStatePath(
@@ -7050,6 +7056,8 @@ int main()
         L"ReplayNonFixtureDiskPresentSidecarIgnoredNonFixture",
     };
     replay_non_fixture_disk_present_sidecar_ignored_non_fixture_context.crash_replay_mode = L"ReplayIfSafe";
+    replay_non_fixture_disk_present_sidecar_ignored_non_fixture_context
+        .allow_legacy_private_checkpoint_writer_for_tests = true;
 
     const auto replay_non_fixture_pending_window_latch_path =
         run_root / "container_replay_pending_window_latch_non_fixture.bin";
@@ -7081,6 +7089,8 @@ int main()
     };
     replay_non_fixture_pending_window_latch_context.crash_replay_mode = L"ReplayIfSafe";
     replay_non_fixture_pending_window_latch_context.integrity_check_on_mount = false;
+    replay_non_fixture_pending_window_latch_context
+        .allow_legacy_private_checkpoint_writer_for_tests = true;
     {
         const auto persistent_state_path = BuildPersistentStatePath(
             replay_non_fixture_pending_window_latch_context.device_path,
@@ -7203,6 +7213,8 @@ int main()
     };
     replay_non_fixture_disk_present_sidecar_missing_context.crash_replay_mode = L"ReplayIfSafe";
     replay_non_fixture_disk_present_sidecar_missing_context.integrity_check_on_mount = false;
+    replay_non_fixture_disk_present_sidecar_missing_context
+        .allow_legacy_private_checkpoint_writer_for_tests = true;
 
     std::size_t corrupted_replay_blocks_non_fixture_disk_present_sidecar_missing = 0;
     std::size_t applied_window_replay_blocks_non_fixture_disk_present_sidecar_missing = 0;

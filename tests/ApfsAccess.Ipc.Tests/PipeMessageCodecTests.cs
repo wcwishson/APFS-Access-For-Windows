@@ -444,6 +444,25 @@ public sealed class PipeMessageCodecTests
     }
 
     [Fact]
+    public void Schema2ControlRequest_AcceptsCanonicalCatalogVolumeId()
+    {
+        const string operationId = "00000000-0000-0000-0000-000000000016";
+        const string payload = "{\"operationId\":\"00000000-0000-0000-0000-000000000016\",\"command\":\"fix\",\"target\":{" +
+                               "\"deviceId\":\"\\\\\\\\.\\\\PhysicalDrive2\",\"volumeId\":\"apfs-vol:055066cd975a4448954c4eab521a5263:1026\"}," +
+                               "\"expiresAtUtc\":\"2026-09-04T23:59:59Z\"}";
+
+        var success = PipeMessageCodec.TryDeserialize(
+            Schema2Json(2, ApfsMessageTypes.ControlOperationRequest, operationId, payload),
+            out var envelope,
+            out var code,
+            out var diagnostic);
+
+        Assert.True(success, diagnostic);
+        Assert.Equal(ApfsOperationCodes.OperationSucceeded, code);
+        Assert.NotNull(envelope);
+    }
+
+    [Fact]
     public void Schema2ControlRequest_RejectsMissingAbsoluteExpiry()
     {
         const string operationId = "00000000-0000-0000-0000-000000000008";

@@ -21,6 +21,7 @@ $legacyPortableExeNames = @("APFSAccess_Portable.exe", "APFSAccess.Portable.exe"
 $portablePayloadZip = Join-Path $repoRoot "artifacts/publish/click-run-payload.zip"
 $nativeOut = Join-Path $repoRoot "artifacts/native/$Configuration"
 $nativeHostExe = Join-Path $nativeOut "ApfsAccess.FsHost.exe"
+$nativeObserverExe = Join-Path $nativeOut "ApfsObserver.exe"
 $bundleSelfContained = $true
 $nativeBuildRoot = if ([string]::IsNullOrWhiteSpace($env:APFSACCESS_NATIVE_BUILD_ROOT)) {
     Join-Path ([System.IO.Path]::GetTempPath()) "apfsaccess_native"
@@ -45,6 +46,9 @@ pwsh -NoProfile -File (Join-Path $repoRoot "scripts/create_tray_icons.ps1")
 
 if (Test-Path -LiteralPath $nativeHostExe) {
     Remove-Item -LiteralPath $nativeHostExe -Force
+}
+if (Test-Path -LiteralPath $nativeObserverExe) {
+    Remove-Item -LiteralPath $nativeObserverExe -Force
 }
 
 Write-Host "[publish] building native fs host..."
@@ -94,10 +98,15 @@ foreach ($publishOutputDir in @($serviceOut, $trayOut, $probeOut, $cliOut, $upda
 if (-not (Test-Path -LiteralPath $nativeHostExe)) {
     throw "Native fs host was not produced at '$nativeHostExe'. Refusing to create an incomplete package."
 }
+if (-not (Test-Path -LiteralPath $nativeObserverExe)) {
+    throw "Native APFS observer was not produced at '$nativeObserverExe'. Refusing to create an incomplete package."
+}
 
-Write-Host "[publish] including native fs host..."
+Write-Host "[publish] including native fs host and APFS observer..."
 Copy-Item -LiteralPath $nativeHostExe -Destination (Join-Path $serviceOut "ApfsAccess.FsHost.exe") -Force
 Copy-Item -LiteralPath $nativeHostExe -Destination (Join-Path $bundleOut "ApfsAccess.FsHost.exe") -Force
+Copy-Item -LiteralPath $nativeObserverExe -Destination (Join-Path $serviceOut "ApfsObserver.exe") -Force
+Copy-Item -LiteralPath $nativeObserverExe -Destination (Join-Path $bundleOut "ApfsObserver.exe") -Force
 
 $winfspDoc = Join-Path $repoRoot "docs/winfsp-setup.md"
 if (Test-Path -LiteralPath $winfspDoc) {

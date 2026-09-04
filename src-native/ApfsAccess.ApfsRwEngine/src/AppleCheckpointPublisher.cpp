@@ -1,0 +1,754 @@
+#include "AppleCheckpointPublisher.h"
+
+#include "ApfsTransactionWriter.h"
+#include "BlockDevice.h"
+
+#include <algorithm>
+#include <limits>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace apfsaccess::rw
+{
+namespace
+{
+
+constexpr std::size_t kCheckpointMappingBytes = 0x28;
+
+bool Fail(std::string& out_error, const char* error)
+{
+    out_error = error;
+    return false;
+}
+
+bool AllowStage(const AppleCheckpointStageHook& hook,
+    std::string_view stage, std::string& out_error)
+{
+    if (hook && !hook(stage))
+    {
+        out_error = "AppleCheckpointPublicationInterrupted:";
+        out_error.append(stage.data(), stage.size());
+        return false;
+    }
+    return true;
+}
+
+void PutU32(std::vector<std::byte>& bytes, std::size_t offset,
+    std::uint32_t value)
+{
+    for (std::size_t index = 0; index < 4; ++index)
+    {
+        bytes[offset + index] =
+            static_cast<std::byte>((value >> (index * 8)) & 0xffu);
+    }
+}
+
+void PutU64(std::vector<std::byte>& bytes, std::size_t offset,
+    std::uint64_t value)
+{
+    for (std::size_t index = 0; index < 8; ++index)
+    {
+        bytes[offset + index] =
+            static_cast<std::byte>((value >> (index * 8)) & 0xffu);
+    }
+}
+
+bool RingFieldsValid(std::uint32_t index, std::uint32_t length,
+    std::uint32_t next, std::uint32_t count)
+{
+    return count != 0 && index < count && length <= count && next < count &&
+        next == static_cast<std::uint32_t>(
+            (static_cast<std::uint64_t>(index) + length) % count);
+}
+
+bool RingRangesOverlap(std::uint32_t first_index, std::uint32_t first_length,
+    std::uint32_t second_index, std::uint32_t second_length,
+    std::uint32_t count)
+{
+    std::vector<bool> occupied(count, false);
+    for (std::uint32_t offset = 0; offset < first_length; ++offset)
+    {
+        occupied[(first_index + offset) % count] = true;
+    }
+    for (std::uint32_t offset = 0; offset < second_length; ++offset)
+    {
+        if (occupied[(second_index + offset) % count])
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SameMapping(const catalog::CheckpointMapping& left,
+    const catalog::CheckpointMapping& right)
+{
+    return left.type == right.type && left.subtype == right.subtype &&
+        left.size_bytes == right.size_bytes &&
+        left.file_system_oid == right.file_system_oid &&
+        left.object_id == right.object_id &&
+        left.physical_block == right.physical_block;
+}
+
+bool SameCheckpoint(const catalog::ContainerCheckpointView& left,
+    const catalog::ContainerCheckpointView& right)
+{
+    return left.superblock.xid == right.superblock.xid &&
+        left.superblock_physical_block == right.superblock_physical_block &&
+        left.superblock_bytes == right.superblock_bytes &&
+        left.checkpoint_map_blocks == right.checkpoint_map_blocks &&
+        left.mappings.size() == right.mappings.size() &&
+        std::equal(left.mappings.begin(), left.mappings.end(),
+            right.mappings.begin(), SameMapping);
+}
+
+bool ReadBlock(const catalog::RandomAccessSource& source,
+    std::uint64_t physical_block, std::uint32_t block_size,
+    std::vector<std::byte>& out_bytes)
+{
+    if (physical_block >
+        std::numeric_limits<std::uint64_t>::max() / block_size)
+    {
+        return false;
+    }
+    return source.Read(physical_block * static_cast<std::uint64_t>(block_size),
+        block_size, out_bytes) && out_bytes.size() == block_size;
+}
+
+bool AddGuard(const catalog::RandomAccessSource& source,
+    std::uint64_t block, std::uint32_t block_size,
+    std::vector<AppleCheckpointGuardBlock>& guards)
+{
+    if (std::any_of(guards.begin(), guards.end(), [block](const auto& guard) {
+            return guard.physical_block == block;
+        }))
+    {
+        return true;
+    }
+    AppleCheckpointGuardBlock guard;
+    guard.physical_block = block;
+    if (!ReadBlock(source, block, block_size, guard.bytes))
+    {
+        return false;
+    }
+    guards.push_back(std::move(guard));
+    return true;
+}
+
+bool AreaContains(std::uint64_t base, std::uint32_t count,
+    std::uint64_t block)
+{
+    return block >= base && block - base < count;
+}
+
+bool ValidateEphemeralObject(
+    const AppleCheckpointEphemeralObject& object,
+    std::uint32_t block_size,
+    std::uint64_t transaction_xid)
+{
+    const auto& location = object.object;
+    if (location.object_id == 0 || location.xid != transaction_xid ||
+        location.physical_block != 0 || location.size_bytes == 0 ||
+        location.size_bytes != object.bytes.size() ||
+        location.size_bytes % block_size != 0 ||
+        (location.type & catalog::kObjectStorageTypeMask) !=
+            catalog::kObjectEphemeral ||
+        (location.type & catalog::kObjectNoHeader) != 0 ||
+        (location.subtype & catalog::kObjectStorageTypeMask) != 0 ||
+        catalog::ReadU64LE(object.bytes, 0x08).value_or(0) !=
+            location.object_id ||
+        catalog::ReadU64LE(object.bytes, 0x10).value_or(0) !=
+            transaction_xid ||
+        catalog::ReadU32LE(object.bytes, 0x18).value_or(0) !=
+            location.type ||
+        catalog::ReadU32LE(object.bytes, 0x1C).value_or(0) !=
+            location.subtype)
+    {
+        return false;
+    }
+    return catalog::VerifyObjectChecksum(object.bytes, object.bytes.size());
+}
+
+bool WriteAndVerify(AppleCheckpointWriteTarget& target,
+    const AppleCheckpointPlannedWrite& write, std::uint32_t block_size,
+    std::string& out_error)
+{
+    if (write.bytes.size() != block_size ||
+        !target.WriteBlock(write.physical_block, write.bytes))
+    {
+        return Fail(out_error, "AppleCheckpointWriteFailed");
+    }
+    std::vector<std::byte> readback;
+    if (!target.ReadBlock(write.physical_block, block_size, readback) ||
+        readback != write.bytes)
+    {
+        return Fail(out_error, "AppleCheckpointReadbackFailed");
+    }
+    return true;
+}
+
+bool WriteAndVerifyBatch(AppleCheckpointWriteTarget& target,
+    std::span<const AppleCheckpointPlannedWrite> writes,
+    std::uint32_t block_size, std::string& out_error)
+{
+    if (writes.empty() || std::any_of(writes.begin(), writes.end(),
+            [block_size](const auto& write) {
+                return write.bytes.size() != block_size;
+            }) ||
+        !target.WriteBlocks(writes))
+    {
+        return Fail(out_error, "AppleCheckpointWriteFailed");
+    }
+    for (const auto& write : writes)
+    {
+        std::vector<std::byte> readback;
+        if (!target.ReadBlock(write.physical_block, block_size, readback) ||
+            readback != write.bytes)
+        {
+            return Fail(out_error, "AppleCheckpointReadbackFailed");
+        }
+    }
+    return true;
+}
+
+bool VerifyGuards(AppleCheckpointWriteTarget& target,
+    const AppleCheckpointPublicationPlan& plan)
+{
+    for (const auto& guard : plan.guard_blocks)
+    {
+        std::vector<std::byte> current;
+        if (!target.ReadBlock(guard.physical_block, plan.block_size, current) ||
+            current != guard.bytes)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+class BlockDeviceCheckpointTarget final : public AppleCheckpointWriteTarget
+{
+public:
+    explicit BlockDeviceCheckpointTarget(BlockDevice& device)
+        : device_(device)
+    {
+    }
+
+    bool ReadBlock(std::uint64_t physical_block, std::uint32_t block_size,
+        std::vector<std::byte>& out_bytes) override
+    {
+        return physical_block <=
+                std::numeric_limits<std::uint64_t>::max() / block_size &&
+            device_.Read(physical_block * static_cast<std::uint64_t>(block_size),
+                block_size, out_bytes);
+    }
+
+    bool WriteBlock(std::uint64_t physical_block,
+        std::span<const std::byte> bytes) override
+    {
+        return !bytes.empty() && physical_block <=
+                std::numeric_limits<std::uint64_t>::max() / bytes.size() &&
+            device_.Write(physical_block * static_cast<std::uint64_t>(bytes.size()),
+                bytes);
+    }
+
+    bool WriteBlocks(
+        std::span<const AppleCheckpointPlannedWrite> writes) override
+    {
+        std::vector<BlockDevice::WriteSpan> spans;
+        spans.reserve(writes.size());
+        for (const auto& write : writes)
+        {
+            if (write.bytes.empty() || write.physical_block >
+                    std::numeric_limits<std::uint64_t>::max() /
+                        write.bytes.size())
+            {
+                return false;
+            }
+            spans.push_back({write.physical_block *
+                    static_cast<std::uint64_t>(write.bytes.size()),
+                write.bytes, &write});
+        }
+        return !spans.empty() && device_.WriteBatch(spans);
+    }
+
+    bool Flush() override
+    {
+        return device_.Flush();
+    }
+
+private:
+    BlockDevice& device_;
+};
+
+} // namespace
+
+bool PlanAppleCheckpointPublication(
+    const catalog::RandomAccessSource& source,
+    const catalog::ContainerCheckpointView& checkpoint,
+    const AppleCheckpointPublicationRequest& request,
+    AppleCheckpointPublicationPlan& out_plan,
+    std::string& out_error)
+{
+    out_plan = {};
+    out_error.clear();
+    const auto& nxsb = checkpoint.superblock;
+    if (request.expected_checkpoint_xid == 0 ||
+        request.expected_checkpoint_xid != nxsb.xid)
+    {
+        return Fail(out_error, "AppleCheckpointCheckpointDrift");
+    }
+    std::string current_error;
+    const auto current = catalog::LoadContainerCheckpointView(
+        source, 0, source.SizeBytes(), current_error);
+    if (!current.has_value() || !SameCheckpoint(current.value(), checkpoint))
+    {
+        return Fail(out_error, "AppleCheckpointCheckpointDrift");
+    }
+    if (nxsb.block_size < 4096 || nxsb.block_size > 65536 ||
+        (nxsb.block_size & (nxsb.block_size - 1)) != 0 ||
+        checkpoint.superblock_bytes.size() != nxsb.block_size ||
+        nxsb.xp_desc_noncontiguous || nxsb.xp_data_noncontiguous ||
+        !RingFieldsValid(nxsb.xp_desc_index, nxsb.xp_desc_len,
+            nxsb.xp_desc_next, nxsb.xp_desc_block_count) ||
+        !RingFieldsValid(nxsb.xp_data_index, nxsb.xp_data_len,
+            nxsb.xp_data_next, nxsb.xp_data_block_count))
+    {
+        return Fail(out_error, "AppleCheckpointGeometryInvalid");
+    }
+    if (nxsb.next_xid == 0 || request.transaction_xid != nxsb.next_xid ||
+        request.transaction_xid <= nxsb.xid ||
+        request.transaction_xid == std::numeric_limits<std::uint64_t>::max())
+    {
+        return Fail(out_error, "AppleCheckpointTransactionXidInvalid");
+    }
+    if (nxsb.next_oid == 0 || request.next_object_id < nxsb.next_oid ||
+        request.next_object_id == 0)
+    {
+        return Fail(out_error, "AppleCheckpointNextObjectIdInvalid");
+    }
+    if (request.container_object_map_oid != 0)
+    {
+        const auto replacement = std::find_if(
+            request.allocator_owned_writes.begin(),
+            request.allocator_owned_writes.end(),
+            [&request](const auto& write) {
+                return write.physical_block == request.container_object_map_oid;
+            });
+        if (request.container_object_map_oid >= nxsb.block_count ||
+            replacement == request.allocator_owned_writes.end() ||
+            replacement->bytes.size() < nxsb.block_size ||
+            catalog::ReadU64LE(replacement->bytes, 0x08).value_or(0) !=
+                request.container_object_map_oid ||
+            catalog::ReadU64LE(replacement->bytes, 0x10).value_or(0) !=
+                request.transaction_xid ||
+            catalog::ReadU32LE(replacement->bytes, 0x18).value_or(0) !=
+                (catalog::kObjectPhysical | catalog::kObjectTypeOmap) ||
+            !catalog::VerifyObjectChecksum(
+                replacement->bytes, nxsb.block_size))
+        {
+            return Fail(out_error, "AppleCheckpointContainerOmapInvalid");
+        }
+    }
+
+    std::unordered_map<std::uint64_t, const catalog::CheckpointMapping*>
+        old_mappings;
+    for (const auto& mapping : checkpoint.mappings)
+    {
+        if (!old_mappings.emplace(mapping.object_id, &mapping).second)
+        {
+            return Fail(out_error, "AppleCheckpointExistingMappingInvalid");
+        }
+    }
+    std::unordered_set<std::uint64_t> retired;
+    for (const auto object_id : request.retired_ephemeral_object_ids)
+    {
+        if (object_id == 0 || object_id == nxsb.spaceman_oid ||
+            object_id == nxsb.reaper_oid ||
+            old_mappings.find(object_id) == old_mappings.end() ||
+            !retired.insert(object_id).second)
+        {
+            return Fail(out_error,
+                "AppleCheckpointEphemeralRetirementInvalid");
+        }
+    }
+    std::unordered_map<std::uint64_t, const AppleCheckpointEphemeralObject*>
+        supplied;
+    for (const auto& object : request.ephemeral_objects)
+    {
+        if (!supplied.emplace(object.object.object_id, &object).second ||
+            retired.find(object.object.object_id) != retired.end())
+        {
+            return Fail(out_error,
+                retired.find(object.object.object_id) != retired.end()
+                    ? "AppleCheckpointEphemeralRetirementInvalid"
+                    : "AppleCheckpointEphemeralObjectDuplicate");
+        }
+        if (!ValidateEphemeralObject(
+                object, nxsb.block_size, request.transaction_xid))
+        {
+            return Fail(out_error, "AppleCheckpointEphemeralObjectInvalid");
+        }
+        const auto old = old_mappings.find(object.object.object_id);
+        if (old != old_mappings.end())
+        {
+            if (old->second->type != object.object.type ||
+                old->second->subtype != object.object.subtype ||
+                old->second->file_system_oid != object.file_system_oid)
+            {
+                return Fail(out_error, "AppleCheckpointEphemeralIdentityChanged");
+            }
+        }
+        else if (object.object.object_id < nxsb.next_oid ||
+                 object.object.object_id >= request.next_object_id)
+        {
+            return Fail(out_error, "AppleCheckpointNewObjectIdUnreserved");
+        }
+    }
+    for (const auto& [object_id, mapping] : old_mappings)
+    {
+        (void)mapping;
+        if (supplied.find(object_id) == supplied.end() &&
+            retired.find(object_id) == retired.end())
+        {
+            return Fail(out_error, "AppleCheckpointEphemeralSetIncomplete");
+        }
+    }
+    if (supplied.empty() || supplied.find(nxsb.spaceman_oid) == supplied.end() ||
+        (nxsb.reaper_oid != 0 && supplied.find(nxsb.reaper_oid) == supplied.end()))
+    {
+        return Fail(out_error, "AppleCheckpointEphemeralSetIncomplete");
+    }
+
+    std::vector<const AppleCheckpointEphemeralObject*> ordered;
+    ordered.reserve(supplied.size());
+    for (const auto& mapping : checkpoint.mappings)
+    {
+        const auto object = supplied.find(mapping.object_id);
+        if (object != supplied.end())
+        {
+            ordered.push_back(object->second);
+        }
+    }
+    std::vector<const AppleCheckpointEphemeralObject*> additions;
+    for (const auto& object : request.ephemeral_objects)
+    {
+        if (old_mappings.find(object.object.object_id) == old_mappings.end())
+        {
+            additions.push_back(&object);
+        }
+    }
+    std::sort(additions.begin(), additions.end(), [](const auto* left,
+                                                       const auto* right) {
+        return left->object.object_id < right->object.object_id;
+    });
+    ordered.insert(ordered.end(), additions.begin(), additions.end());
+
+    std::uint64_t data_blocks64 = 0;
+    for (const auto* object : ordered)
+    {
+        const auto blocks = object->bytes.size() / nxsb.block_size;
+        if (blocks > std::numeric_limits<std::uint32_t>::max() - data_blocks64)
+        {
+            return Fail(out_error, "AppleCheckpointDataRingExhausted");
+        }
+        data_blocks64 += blocks;
+    }
+    if (data_blocks64 == 0 || data_blocks64 > nxsb.xp_data_block_count ||
+        data_blocks64 > nxsb.xp_data_block_count - nxsb.xp_data_len)
+    {
+        return Fail(out_error, "AppleCheckpointDataRingExhausted");
+    }
+    const auto data_blocks = static_cast<std::uint32_t>(data_blocks64);
+    const auto data_index = nxsb.xp_data_next;
+    if (RingRangesOverlap(data_index, data_blocks, nxsb.xp_data_index,
+            nxsb.xp_data_len, nxsb.xp_data_block_count))
+    {
+        return Fail(out_error, "AppleCheckpointDataRingOverlap");
+    }
+
+    const auto mappings_per_block = static_cast<std::uint32_t>(
+        (nxsb.block_size - 0x28) / kCheckpointMappingBytes);
+    const auto map_blocks64 =
+        (ordered.size() + mappings_per_block - 1) / mappings_per_block;
+    if (mappings_per_block == 0 || map_blocks64 == 0 ||
+        map_blocks64 >= nxsb.xp_desc_block_count)
+    {
+        return Fail(out_error, "AppleCheckpointDescriptorRingExhausted");
+    }
+    const auto descriptor_length = static_cast<std::uint32_t>(map_blocks64 + 1);
+    if (descriptor_length > nxsb.xp_desc_block_count - nxsb.xp_desc_len)
+    {
+        return Fail(out_error, "AppleCheckpointDescriptorRingExhausted");
+    }
+    const auto descriptor_index = nxsb.xp_desc_next;
+    if (RingRangesOverlap(descriptor_index, descriptor_length,
+            nxsb.xp_desc_index, nxsb.xp_desc_len,
+            nxsb.xp_desc_block_count))
+    {
+        return Fail(out_error, "AppleCheckpointDescriptorRingOverlap");
+    }
+
+    AppleCheckpointPublicationPlan plan;
+    plan.block_size = nxsb.block_size;
+    plan.expected_checkpoint_xid = request.expected_checkpoint_xid;
+    plan.transaction_xid = request.transaction_xid;
+    plan.next_object_id = request.next_object_id;
+    if (!AddGuard(source, 0, nxsb.block_size, plan.guard_blocks) ||
+        !AddGuard(source, checkpoint.superblock_physical_block,
+            nxsb.block_size, plan.guard_blocks))
+    {
+        return Fail(out_error, "AppleCheckpointGuardUnreadable");
+    }
+    for (const auto block : checkpoint.checkpoint_map_blocks)
+    {
+        if (!AddGuard(source, block, nxsb.block_size, plan.guard_blocks))
+        {
+            return Fail(out_error, "AppleCheckpointGuardUnreadable");
+        }
+    }
+    for (const auto& mapping : checkpoint.mappings)
+    {
+        const auto first_relative =
+            mapping.physical_block - nxsb.xp_data_base_block;
+        const auto blocks = mapping.size_bytes / nxsb.block_size;
+        for (std::uint32_t ordinal = 0; ordinal < blocks; ++ordinal)
+        {
+            const auto relative = static_cast<std::uint32_t>(
+                (first_relative + ordinal) % nxsb.xp_data_block_count);
+            if (!AddGuard(source, nxsb.xp_data_base_block + relative,
+                    nxsb.block_size, plan.guard_blocks))
+            {
+                return Fail(out_error, "AppleCheckpointGuardUnreadable");
+            }
+        }
+    }
+
+    std::unordered_set<std::uint64_t> planned_blocks;
+    for (const auto& allocation : request.allocator_owned_writes)
+    {
+        if (allocation.physical_block == 0 || allocation.bytes.empty() ||
+            allocation.bytes.size() % nxsb.block_size != 0)
+        {
+            return Fail(out_error, "AppleCheckpointAllocatedWriteInvalid");
+        }
+        const auto blocks = allocation.bytes.size() / nxsb.block_size;
+        if (allocation.physical_block >= nxsb.block_count ||
+            blocks > nxsb.block_count - allocation.physical_block)
+        {
+            return Fail(out_error, "AppleCheckpointAllocatedWriteInvalid");
+        }
+        for (std::size_t ordinal = 0; ordinal < blocks; ++ordinal)
+        {
+            const auto block = allocation.physical_block + ordinal;
+            if (AreaContains(nxsb.xp_desc_base_block,
+                    nxsb.xp_desc_block_count, block) ||
+                AreaContains(nxsb.xp_data_base_block,
+                    nxsb.xp_data_block_count, block) ||
+                !planned_blocks.insert(block).second)
+            {
+                return Fail(out_error, "AppleCheckpointAllocatedWriteInvalid");
+            }
+            AppleCheckpointPlannedWrite write;
+            write.kind = AppleCheckpointWriteKind::AllocatorOwned;
+            write.physical_block = block;
+            const auto begin = allocation.bytes.begin() +
+                static_cast<std::ptrdiff_t>(ordinal * nxsb.block_size);
+            write.bytes.assign(begin, begin + nxsb.block_size);
+            plan.before_superblock_writes.push_back(std::move(write));
+        }
+    }
+
+    plan.published_checkpoint.mappings.reserve(ordered.size());
+    std::uint32_t data_cursor = 0;
+    for (const auto* object : ordered)
+    {
+        const auto first_relative = static_cast<std::uint32_t>(
+            (static_cast<std::uint64_t>(data_index) + data_cursor) %
+            nxsb.xp_data_block_count);
+        catalog::CheckpointMapping mapping;
+        mapping.type = object->object.type;
+        mapping.subtype = object->object.subtype;
+        mapping.size_bytes = object->object.size_bytes;
+        mapping.file_system_oid = object->file_system_oid;
+        mapping.object_id = object->object.object_id;
+        mapping.physical_block = nxsb.xp_data_base_block + first_relative;
+        plan.published_checkpoint.mappings.push_back(mapping);
+        const auto blocks = object->bytes.size() / nxsb.block_size;
+        for (std::size_t ordinal = 0; ordinal < blocks; ++ordinal)
+        {
+            const auto relative = static_cast<std::uint32_t>(
+                (static_cast<std::uint64_t>(first_relative) + ordinal) %
+                nxsb.xp_data_block_count);
+            AppleCheckpointPlannedWrite write;
+            write.kind = AppleCheckpointWriteKind::CheckpointData;
+            write.physical_block = nxsb.xp_data_base_block + relative;
+            write.object_id = object->object.object_id;
+            const auto begin = object->bytes.begin() +
+                static_cast<std::ptrdiff_t>(ordinal * nxsb.block_size);
+            write.bytes.assign(begin, begin + nxsb.block_size);
+            plan.before_superblock_writes.push_back(std::move(write));
+            ++data_cursor;
+        }
+    }
+
+    plan.published_checkpoint.checkpoint_map_blocks.reserve(map_blocks64);
+    for (std::size_t map_index = 0; map_index < map_blocks64; ++map_index)
+    {
+        const auto relative = static_cast<std::uint32_t>(
+            (static_cast<std::uint64_t>(descriptor_index) + map_index) %
+            nxsb.xp_desc_block_count);
+        const auto physical_block = nxsb.xp_desc_base_block + relative;
+        std::vector<std::byte> bytes(nxsb.block_size, std::byte{0});
+        PutU64(bytes, 0x08, physical_block);
+        PutU64(bytes, 0x10, request.transaction_xid);
+        PutU32(bytes, 0x18,
+            catalog::kObjectPhysical | catalog::kObjectTypeCheckpointMap);
+        PutU32(bytes, 0x20, map_index + 1 == map_blocks64 ? 1u : 0u);
+        const auto first = map_index * mappings_per_block;
+        const auto count = (std::min<std::size_t>)(
+            mappings_per_block,
+            plan.published_checkpoint.mappings.size() - first);
+        PutU32(bytes, 0x24, static_cast<std::uint32_t>(count));
+        for (std::size_t index = 0; index < count; ++index)
+        {
+            const auto& mapping =
+                plan.published_checkpoint.mappings[first + index];
+            const auto offset = 0x28 + index * kCheckpointMappingBytes;
+            PutU32(bytes, offset, mapping.type);
+            PutU32(bytes, offset + 0x04, mapping.subtype);
+            PutU32(bytes, offset + 0x08, mapping.size_bytes);
+            PutU64(bytes, offset + 0x10, mapping.file_system_oid);
+            PutU64(bytes, offset + 0x18, mapping.object_id);
+            PutU64(bytes, offset + 0x20, mapping.physical_block);
+        }
+        if (!FinalizeAppleObjectChecksum(bytes, out_error))
+        {
+            return false;
+        }
+        AppleCheckpointPlannedWrite write;
+        write.kind = AppleCheckpointWriteKind::CheckpointMap;
+        write.physical_block = physical_block;
+        write.object_id = physical_block;
+        write.bytes = std::move(bytes);
+        plan.before_superblock_writes.push_back(std::move(write));
+        plan.published_checkpoint.checkpoint_map_blocks.push_back(physical_block);
+    }
+
+    auto superblock = checkpoint.superblock_bytes;
+    PutU64(superblock, 0x10, request.transaction_xid);
+    PutU64(superblock, 0x58, request.next_object_id);
+    PutU64(superblock, 0x60, request.transaction_xid + 1);
+    if (request.container_object_map_oid != 0)
+    {
+        PutU64(superblock, 0xA0, request.container_object_map_oid);
+    }
+    PutU32(superblock, 0x80, (descriptor_index + descriptor_length) %
+        nxsb.xp_desc_block_count);
+    PutU32(superblock, 0x84,
+        (data_index + data_blocks) % nxsb.xp_data_block_count);
+    PutU32(superblock, 0x88, descriptor_index);
+    PutU32(superblock, 0x8C, descriptor_length);
+    PutU32(superblock, 0x90, data_index);
+    PutU32(superblock, 0x94, data_blocks);
+    if (!FinalizeAppleObjectChecksum(superblock, out_error))
+    {
+        return false;
+    }
+    const auto parsed = catalog::ParseNxSuperblock(superblock);
+    const auto expected_container_omap = request.container_object_map_oid != 0 ?
+        request.container_object_map_oid : nxsb.omap_oid;
+    if (!parsed.has_value() || parsed->omap_oid != expected_container_omap)
+    {
+        return Fail(out_error, "AppleCheckpointSuperblockInvalid");
+    }
+    const auto superblock_relative = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(descriptor_index) + map_blocks64) %
+        nxsb.xp_desc_block_count);
+    plan.superblock_write.kind = AppleCheckpointWriteKind::CheckpointSuperblock;
+    plan.superblock_write.physical_block =
+        nxsb.xp_desc_base_block + superblock_relative;
+    plan.superblock_write.object_id = parsed->object_id;
+    plan.superblock_write.bytes = superblock;
+    plan.published_checkpoint.superblock = parsed.value();
+    plan.published_checkpoint.superblock_physical_block =
+        plan.superblock_write.physical_block;
+    plan.published_checkpoint.superblock_bytes = std::move(superblock);
+    out_plan = std::move(plan);
+    return true;
+}
+
+bool ExecuteAppleCheckpointPublication(
+    AppleCheckpointWriteTarget& target,
+    const AppleCheckpointPublicationPlan& plan,
+    std::string& out_error,
+    const AppleCheckpointStageHook& stage_hook)
+{
+    out_error.clear();
+    if (plan.block_size == 0 || plan.transaction_xid == 0 ||
+        plan.before_superblock_writes.empty() ||
+        plan.superblock_write.kind !=
+            AppleCheckpointWriteKind::CheckpointSuperblock ||
+        plan.superblock_write.bytes.size() != plan.block_size)
+    {
+        return Fail(out_error, "AppleCheckpointPublicationPlanInvalid");
+    }
+    if (!VerifyGuards(target, plan))
+    {
+        return Fail(out_error, "AppleCheckpointGuardChanged");
+    }
+    if (!AllowStage(stage_hook, "before-apple-device-write", out_error))
+    {
+        return false;
+    }
+    if (!WriteAndVerifyBatch(target, plan.before_superblock_writes,
+            plan.block_size, out_error))
+    {
+        return false;
+    }
+    if (!AllowStage(
+            stage_hook, "before-apple-prepublication-flush", out_error))
+    {
+        return false;
+    }
+    if (!target.Flush())
+    {
+        return Fail(out_error, "AppleCheckpointPrepublicationFlushFailed");
+    }
+    if (!VerifyGuards(target, plan))
+    {
+        return Fail(out_error, "AppleCheckpointGuardChanged");
+    }
+    if (!AllowStage(
+            stage_hook, "before-apple-checkpoint-switch", out_error))
+    {
+        return false;
+    }
+    if (!WriteAndVerify(
+            target, plan.superblock_write, plan.block_size, out_error))
+    {
+        return false;
+    }
+    if (!AllowStage(stage_hook, "before-apple-final-flush", out_error))
+    {
+        return false;
+    }
+    if (!target.Flush())
+    {
+        return Fail(out_error, "AppleCheckpointFinalFlushFailed");
+    }
+    return true;
+}
+
+bool ExecuteAppleCheckpointPublication(
+    BlockDevice& device,
+    const AppleCheckpointPublicationPlan& plan,
+    std::string& out_error,
+    const AppleCheckpointStageHook& stage_hook)
+{
+    BlockDeviceCheckpointTarget target(device);
+    return ExecuteAppleCheckpointPublication(
+        target, plan, out_error, stage_hook);
+}
+
+} // namespace apfsaccess::rw

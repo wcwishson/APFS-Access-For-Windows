@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using ApfsAccess.Core;
 
 namespace ApfsAccess.Ipc;
 
@@ -678,14 +679,16 @@ public static class PipeMessageCodec
                 "Target must contain nonblank deviceId and volumeId values.");
         }
 
+        var canonicalVolumeId = ApfsTopology.TryParseVolumeId(volumeId, out _, out _);
         var separatorIndex = volumeId.IndexOf('|');
-        if (separatorIndex < 1 ||
-            separatorIndex == volumeId.Length - 1 ||
-            !string.Equals(volumeId[..separatorIndex], deviceId, StringComparison.OrdinalIgnoreCase))
+        var legacyVolumeIdMatchesDevice = separatorIndex > 0 &&
+            separatorIndex < volumeId.Length - 1 &&
+            string.Equals(volumeId[..separatorIndex], deviceId, StringComparison.OrdinalIgnoreCase);
+        if (!canonicalVolumeId && !legacyVolumeIdMatchesDevice)
         {
             return Invalid(
                 ApfsOperationCodes.AmbiguousTarget,
-                "Target volumeId must begin with the exact deviceId followed by '|'.");
+                "Target volumeId must be a canonical APFS volume ID or begin with the exact deviceId followed by '|'.");
         }
 
         if (TryGetProperty(target, "recoveryIdentity", out var recoveryIdentityNode) &&

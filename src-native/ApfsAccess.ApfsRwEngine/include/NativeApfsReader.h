@@ -161,6 +161,7 @@ private:
         std::uint32_t block_size,
         std::uint64_t total_blocks,
         std::uint64_t xid,
+        bool directory_keys_are_hashed,
         NativeApfsVolumeProjection& projection);
 };
 } // namespace apfsaccess::rw

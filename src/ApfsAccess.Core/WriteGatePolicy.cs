@@ -39,6 +39,24 @@ public static class WriteGatePolicy
             return requestDecision;
         }
 
+        // A4 single capability enforcement: with a catalog attachment,
+        // writability derives SOLELY from the capability decision. Any
+        // non-Writable decision blocks here, before (and regardless of) the
+        // pilot allow-lists, incompatibility flags, and the testing override
+        // below. No flag, config, or override path may re-enable it.
+        if (volume.CatalogDecision.HasValue &&
+            volume.CatalogDecision.Value != ApfsCapabilityDecision.Writable)
+        {
+            var catalogDetail = volume.CatalogReasons is { Count: > 0 }
+                ? string.Join(", ", volume.CatalogReasons)
+                : volume.CatalogDecision.Value.ToString();
+            return new WriteGateDecision(
+                false,
+                "CatalogCapabilityBlocked",
+                $"Observer catalog decision '{volume.CatalogDecision.Value}' disallows write ({catalogDetail})."
+            );
+        }
+
         var pilotChannel = string.Equals(options.WriteRolloutChannel, "Pilot", StringComparison.OrdinalIgnoreCase);
         if (pilotChannel &&
             options.NativeWritePilotVolumeAllowList is { Length: > 0 } &&

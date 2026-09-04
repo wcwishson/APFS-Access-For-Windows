@@ -17,6 +17,42 @@ public sealed class AgentControlOperationServiceTests
     };
 
     [Fact]
+    public async Task CanonicalCatalogVolumeId_ReachesExecutorWithExactDeviceTarget()
+    {
+        var root = CreateEvidenceRoot();
+        var executed = false;
+        var request = CreateRequest(
+            target: new ApfsControlTarget(
+                @"\\.\PhysicalDrive2",
+                "apfs-vol:055066cd975a4448954c4eab521a5263:1026"),
+            command: ApfsControlCommands.Fix);
+        var service = new AgentControlOperationService(
+            (operation, _) =>
+            {
+                executed = true;
+                return Task.FromResult(Success(operation));
+            },
+            root);
+
+        try
+        {
+            var result = await service.ExecuteOrReplayAsync(request);
+
+            Assert.True(result.Success, result.Diagnostic);
+            Assert.True(executed);
+            Assert.Equal(
+                "apfs-vol:055066cd975a4448954c4eab521a5263:1026",
+                result.Target!.VolumeId);
+            Assert.Equal(@"\\.\physicaldrive2", result.Target.DeviceId);
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None).WaitAsync(TestTimeout);
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task ExpiryOfUncooperativeExecutor_ReturnsDurableUnreconciledEvidenceWithinDeadline()
     {
         var root = CreateEvidenceRoot();

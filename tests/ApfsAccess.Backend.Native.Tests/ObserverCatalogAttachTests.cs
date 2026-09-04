@@ -40,8 +40,12 @@ public sealed class ObserverCatalogAttachTests
     }
 
     [Fact]
-    public async Task SingleContainerSingleVolume_AttachesOidDespiteNameMismatch()
+    public async Task SingleContainerSingleVolume_SnapshotRowCarriesSnapshotIdentityWithLegacyAffordances()
     {
+        // A2: rows come from the snapshot only. The legacy GPT name
+        // ("LegacyName") survives nowhere in the row; it only supplies
+        // mount-path affordances (device offset, partition GUID) matched by
+        // container UUID.
         using var temp = DTempDirectory.Create("attach-single");
         var imagePath = Path.Combine(temp.Path, "single.apfs.img");
         var fixture = SyntheticApfsTestImage.CreateCatalogFixture(
@@ -56,9 +60,8 @@ public sealed class ObserverCatalogAttachTests
         var volume = Assert.Single(
             await backend.ProbeVolumesAsync(imagePath, CancellationToken.None));
 
-        // Legacy identity surface is untouched; catalog IDs are additive.
-        Assert.Equal($"{imagePath}|LegacyName", volume.VolumeId);
-        Assert.Equal("LegacyName", volume.VolumeName);
+        Assert.Equal($"apfs-vol:{containerHex}:101", volume.VolumeId);
+        Assert.Equal("Data", volume.VolumeName);
         Assert.Equal($"apfs-vol:{containerHex}:101", volume.CatalogVolumeId);
         Assert.Equal(containerHex, volume.CatalogContainerUuid);
         Assert.Equal(101UL, volume.CatalogVolumeObjectId);
@@ -76,7 +79,7 @@ public sealed class ObserverCatalogAttachTests
     }
 
     [Fact]
-    public async Task NameMatch_SelectsAttachedOidForRecoveryIdentity()
+    public async Task SnapshotRows_EachCarryOwnOidForRecoveryIdentity()
     {
         using var temp = DTempDirectory.Create("attach-namematch");
         var imagePath = Path.Combine(temp.Path, "multi.apfs.img");
@@ -93,30 +96,37 @@ public sealed class ObserverCatalogAttachTests
              new ObserverEvidenceJson.VolumeJson("P", 102)]);
         using var backend = CreateBackend(evidence, temp);
 
-        var volume = Assert.Single(
-            await backend.ProbeVolumesAsync(imagePath, CancellationToken.None));
+        // A2: one row per snapshot volume, not one row per legacy partition.
+        var volumes = (await backend.ProbeVolumesAsync(imagePath, CancellationToken.None))
+            .OrderBy(static volume => volume.VolumeName, StringComparer.Ordinal)
+            .ToArray();
 
-        Assert.Equal("P", volume.VolumeName);
-        Assert.Equal(102UL, volume.CatalogVolumeObjectId);
-        var target = ReadMountTarget(backend, volume);
-        Assert.Equal(102UL, target.VolumeObjectId);
-        var expectedIdentity = BuildRecoveryIdentity(
-            partition.PartitionUuid,
-            Convert.ToHexString(partition.ContainerUuid.ToByteArray()),
-            102UL,
-            allowPartitionlessIdentity: false);
-        var legacyIdentity = BuildRecoveryIdentity(
-            partition.PartitionUuid,
-            Convert.ToHexString(partition.ContainerUuid.ToByteArray()),
-            101UL,
-            allowPartitionlessIdentity: false);
-        Assert.NotEqual(legacyIdentity, expectedIdentity);
-        Assert.Equal(expectedIdentity, target.RecoveryIdentity);
+        Assert.Equal(2, volumes.Length);
+        Assert.Equal($"apfs-vol:{containerHex}:101", volumes[0].VolumeId);
+        Assert.Equal($"apfs-vol:{containerHex}:102", volumes[1].VolumeId);
+        foreach (var volume in volumes)
+        {
+            var target = ReadMountTarget(backend, volume);
+            Assert.Equal(volume.CatalogVolumeObjectId, target.VolumeObjectId);
+            Assert.Equal(
+                BuildRecoveryIdentity(
+                    partition.PartitionUuid,
+                    Convert.ToHexString(partition.ContainerUuid.ToByteArray()),
+                    volume.CatalogVolumeObjectId,
+                    allowPartitionlessIdentity: false),
+                target.RecoveryIdentity);
+        }
+
+        Assert.NotEqual(
+            ReadMountTarget(backend, volumes[0]).RecoveryIdentity,
+            ReadMountTarget(backend, volumes[1]).RecoveryIdentity);
     }
 
     [Fact]
-    public async Task DuplicateObserverNames_StayAmbiguousNull()
+    public async Task DuplicateSnapshotNames_StayIndependentlyAddressable()
     {
+        // A3: duplicate display names are two rows with distinct canonical
+        // IDs (the old unique-or-null name-match rule is superseded).
         using var temp = DTempDirectory.Create("attach-ambiguous");
         var imagePath = Path.Combine(temp.Path, "dup.apfs.img");
         var fixture = SyntheticApfsTestImage.CreateCatalogFixture(
@@ -132,28 +142,43 @@ public sealed class ObserverCatalogAttachTests
              new ObserverEvidenceJson.VolumeJson("Data", 102)]);
         using var backend = CreateBackend(evidence, temp);
 
-        var volume = Assert.Single(
-            await backend.ProbeVolumesAsync(imagePath, CancellationToken.None));
+        var volumes = (await backend.ProbeVolumesAsync(imagePath, CancellationToken.None))
+            .OrderBy(static volume => volume.VolumeId, StringComparer.Ordinal)
+            .ToArray();
 
-        Assert.Equal("Data", volume.VolumeName);
-        Assert.Null(volume.CatalogVolumeId);
-        Assert.Null(volume.CatalogVolumeObjectId);
-        var target = ReadMountTarget(backend, volume);
-        Assert.Null(target.VolumeObjectId);
-        Assert.Null(target.ContainerUuidHex);
-        // Falls back to the first-observed (legacy) OID.
+        Assert.Equal(2, volumes.Length);
+        Assert.Equal($"apfs-vol:{containerHex}:101", volumes[0].VolumeId);
+        Assert.Equal($"apfs-vol:{containerHex}:102", volumes[1].VolumeId);
+        Assert.NotEqual(volumes[0].NativeVolumePath, volumes[1].NativeVolumePath);
+        Assert.Equal(101UL, volumes[0].CatalogVolumeObjectId);
+        Assert.Equal(102UL, volumes[1].CatalogVolumeObjectId);
+        var target0 = ReadMountTarget(backend, volumes[0]);
+        var target1 = ReadMountTarget(backend, volumes[1]);
+        Assert.Equal(101UL, target0.VolumeObjectId);
+        Assert.Equal(102UL, target1.VolumeObjectId);
+        Assert.Equal(containerHex, target0.ContainerUuidHex);
+        // Each row binds its own SELECTED oid in the recovery identity.
         Assert.Equal(
             BuildRecoveryIdentity(
                 partition.PartitionUuid,
                 Convert.ToHexString(partition.ContainerUuid.ToByteArray()),
                 101UL,
                 allowPartitionlessIdentity: false),
-            target.RecoveryIdentity);
+            target0.RecoveryIdentity);
+        Assert.Equal(
+            BuildRecoveryIdentity(
+                partition.PartitionUuid,
+                Convert.ToHexString(partition.ContainerUuid.ToByteArray()),
+                102UL,
+                allowPartitionlessIdentity: false),
+            target1.RecoveryIdentity);
     }
 
     [Fact]
-    public async Task UnmatchedNames_StayNull()
+    public async Task UnmatchedNames_SnapshotRowsStandAlone()
     {
+        // A2: snapshot rows never depend on legacy GPT names; evidence names
+        // unrelated to every legacy name still enumerate fully.
         using var temp = DTempDirectory.Create("attach-unmatched");
         var imagePath = Path.Combine(temp.Path, "unmatched.apfs.img");
         var fixture = SyntheticApfsTestImage.CreateCatalogFixture(
@@ -169,14 +194,17 @@ public sealed class ObserverCatalogAttachTests
              (hexes[1], [new ObserverEvidenceJson.VolumeJson("Y", 102)])]);
         using var backend = CreateBackend(evidence, temp);
 
-        var volumes = await backend.ProbeVolumesAsync(imagePath, CancellationToken.None);
+        var volumes = (await backend.ProbeVolumesAsync(imagePath, CancellationToken.None))
+            .OrderBy(static volume => volume.VolumeName, StringComparer.Ordinal)
+            .ToArray();
 
-        Assert.Equal(2, volumes.Count);
-        Assert.All(volumes, static volume =>
-        {
-            Assert.Null(volume.CatalogVolumeId);
-            Assert.Null(volume.CatalogVolumeObjectId);
-        });
+        Assert.Equal(2, volumes.Length);
+        Assert.Equal("X", volumes[0].VolumeName);
+        Assert.Equal("Y", volumes[1].VolumeName);
+        Assert.Equal($"apfs-vol:{hexes[0]}:101", volumes[0].VolumeId);
+        Assert.Equal($"apfs-vol:{hexes[1]}:102", volumes[1].VolumeId);
+        Assert.Equal(101UL, volumes[0].CatalogVolumeObjectId);
+        Assert.Equal(102UL, volumes[1].CatalogVolumeObjectId);
     }
 
     [Fact]
@@ -204,8 +232,10 @@ public sealed class ObserverCatalogAttachTests
         Assert.Equal(2, volumes.Length);
         Assert.Equal(103UL, volumes[0].CatalogVolumeObjectId);
         Assert.Equal($"apfs-vol:{hexes[1]}:103", volumes[0].CatalogVolumeId);
+        Assert.Equal($"apfs-vol:{hexes[1]}:103", volumes[0].VolumeId);
         Assert.Equal(101UL, volumes[1].CatalogVolumeObjectId);
         Assert.Equal($"apfs-vol:{hexes[0]}:101", volumes[1].CatalogVolumeId);
+        Assert.Equal($"apfs-vol:{hexes[0]}:101", volumes[1].VolumeId);
     }
 
     [Fact]
@@ -258,13 +288,14 @@ public sealed class ObserverCatalogAttachTests
 
     private static NativeApfsBackend CreateBackend(string evidence, DTempDirectory temp)
     {
-        var observerShim = Path.Combine(temp.Path, "ApfsObserver.exe");
-        File.WriteAllBytes(observerShim, [0x4D, 0x5A]);
+        // Stage under the test host base directory so provenance treats the
+        // seam override as packaged (trusted), matching production layout.
+        var stagedObserver = StagedPackagedObserver.StageStable("attach");
         return new NativeApfsBackend(
             new ServiceHostOptions { BackendMode = "Native", NativeAutoDiscoverPhysicalDrives = false },
             lifecycleTestHooks: null,
             observerRunner: new StubRunner(new ObserverRunResult(0, evidence, string.Empty)),
-            observerPathOverride: observerShim);
+            observerPathOverride: stagedObserver);
     }
 
     private sealed class StubRunner(ObserverRunResult result) : IObserverRunner

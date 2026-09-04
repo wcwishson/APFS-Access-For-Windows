@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <optional>
 #include <string>
@@ -145,6 +146,120 @@ class FileRandomAccessSource final : public RandomAccessSource
 private:
     std::string path_;
     std::uint64_t size_bytes_;
+    bool open_;
+};
+
+// Opens one read-only handle and holds it for its lifetime: every Read goes
+// through the held handle (no per-read reopens), and the size/mtime captured
+// at open can be re-checked afterwards with VerifyUnchanged. Single-threaded
+// use only. Residual risk (documented): a same-size same-mtime content swap
+// is not detectable portably.
+class HeldFileSource final : public RandomAccessSource
+{
+public:
+    explicit HeldFileSource(const std::string& path)
+        : path_(path)
+        , size_bytes_(0)
+        , open_(false)
+    {
+        stream_.open(path_, std::ios::in | std::ios::binary);
+        if (!stream_.is_open())
+        {
+            return;
+        }
+        std::error_code code;
+        const auto observed_size = std::filesystem::file_size(path_, code);
+        const auto observed_time = std::filesystem::last_write_time(path_, code);
+        if (code)
+        {
+            stream_.close();
+            return;
+        }
+        size_bytes_ = static_cast<std::uint64_t>(observed_size);
+        write_time_ = observed_time;
+        open_ = true;
+    }
+
+    [[nodiscard]] bool IsOpen() const noexcept
+    {
+        return open_ && stream_.is_open();
+    }
+
+    [[nodiscard]] std::uint64_t SizeBytes() const override
+    {
+        return size_bytes_;
+    }
+
+    [[nodiscard]] bool Read(
+        std::uint64_t offset,
+        std::size_t size,
+        std::vector<std::byte>& out_bytes) const override
+    {
+        out_bytes.clear();
+        if (!IsOpen())
+        {
+            return false;
+        }
+        if (size == 0)
+        {
+            return true;
+        }
+        if (offset >= size_bytes_ || size > size_bytes_ - offset)
+        {
+            return false;
+        }
+        std::vector<char> staging(size);
+        stream_.clear();
+        stream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        if (!stream_.good())
+        {
+            return false;
+        }
+        stream_.read(staging.data(), static_cast<std::streamsize>(size));
+        if (static_cast<std::size_t>(stream_.gcount()) != size)
+        {
+            return false;
+        }
+        out_bytes.resize(size);
+        for (std::size_t index = 0; index < size; ++index)
+        {
+            out_bytes[index] = static_cast<std::byte>(staging[index]);
+        }
+        return true;
+    }
+
+    // Re-checks size and mtime against the open-time capture. Fails closed
+    // on any difference or stat error.
+    [[nodiscard]] bool VerifyUnchanged(std::string& out_detail) const
+    {
+        out_detail.clear();
+        if (!IsOpen())
+        {
+            out_detail = "held source is not open";
+            return false;
+        }
+        std::error_code code;
+        const auto current_size = std::filesystem::file_size(path_, code);
+        const auto current_time = std::filesystem::last_write_time(path_, code);
+        if (code)
+        {
+            out_detail = "held source cannot be re-stated";
+            return false;
+        }
+        if (static_cast<std::uint64_t>(current_size) != size_bytes_ ||
+            current_time != write_time_)
+        {
+            out_detail = "held source changed during observation";
+            return false;
+        }
+        return true;
+    }
+
+private:
+    std::string path_;
+    mutable std::ifstream stream_;
+    std::uint64_t size_bytes_;
+    std::filesystem::file_time_type write_time_{};
     bool open_;
 };
 
