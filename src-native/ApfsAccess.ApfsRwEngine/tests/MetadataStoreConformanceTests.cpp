@@ -1,4 +1,5 @@
 #include "MetadataStore.h"
+#include "ApfsNameCodec.h"
 #include "TransactionManager.h"
 
 #include <algorithm>
@@ -1155,6 +1156,144 @@ bool TestRenameReplaceConformance(const std::filesystem::path& run_root)
         persisted_payload == source_payload,
         "RenameReplace: replacement target payload should match source payload bytes");
 
+    return ok;
+}
+
+bool TestApfsNamePolicyConformance(const std::filesystem::path& run_root)
+{
+    using apfsaccess::rw::ApfsNameCodec;
+    using apfsaccess::rw::ApfsNamePolicy;
+    using apfsaccess::rw::MetadataStore;
+
+    bool ok = true;
+    const auto open_store = [&](const std::filesystem::path& image_path,
+                                std::uint64_t incompatible_features,
+                                bool create_image = true)
+        -> std::unique_ptr<MetadataStore>
+    {
+        if (create_image && !CreateSyntheticContainer(image_path))
+        {
+            return nullptr;
+        }
+        MetadataStore::VolumeContext context{image_path.wstring(), L"NamePolicy"};
+        context.incompatible_features = incompatible_features;
+        auto store = std::make_unique<MetadataStore>(context);
+        if (!store->LoadContainerSuperblocks() ||
+            !store->LoadObjectMap() ||
+            !store->LoadSpacemanState() ||
+            !store->PrepareNativeWritePath())
+        {
+            return nullptr;
+        }
+        return store;
+    };
+    const auto create = [&](MetadataStore& store, const std::wstring& path)
+    {
+        MetadataStore::MutationRequest request{};
+        request.operation = MetadataStore::MutationOperation::CreateFile;
+        request.path = path;
+        return store.ApplyMutation(request);
+    };
+
+    const auto exact_path = run_root / "apfs_name_exact.apfs.img";
+    auto exact = open_store(exact_path, 0);
+    if (!Require(exact != nullptr, "NamePolicy: exact-mode store opens"))
+    {
+        return false;
+    }
+    ok &= Require(
+        create(*exact, L"\\File") == MetadataStore::MutationStatus::Applied &&
+            create(*exact, L"\\file") == MetadataStore::MutationStatus::Applied,
+        "NamePolicy: case-only siblings coexist in exact mode");
+    const auto upper = exact->DebugLookupWorkingInodeByPath(L"\\File");
+    const auto lower = exact->DebugLookupWorkingInodeByPath(L"\\file");
+    ok &= Require(upper.has_value() && lower.has_value() &&
+                      upper->object_id != lower->object_id,
+                  "NamePolicy: exact-mode lookups preserve case identity");
+    ok &= Require(
+        create(*exact, L"\\caf\u00e9") == MetadataStore::MutationStatus::Applied &&
+            create(*exact, L"\\cafe\u0301") == MetadataStore::MutationStatus::Applied,
+        "NamePolicy: normalization-sensitive names remain distinct");
+    ok &= Require(
+        create(*exact, L"\\CON") == MetadataStore::MutationStatus::InvalidRequest,
+        "NamePolicy: unsafe literal Windows name is rejected before staging");
+
+    const std::string raw_unsafe = "CON";
+    const auto raw_span = std::span(
+        reinterpret_cast<const std::byte*>(raw_unsafe.data()),
+        raw_unsafe.size());
+    const auto projected = ApfsNameCodec::Decode(
+        raw_span, ApfsNamePolicy::FromIncompatibleFeatures(0));
+    ok &= Require(projected.ok(), "NamePolicy: unsafe APFS name projects");
+    if (projected.ok())
+    {
+        const auto projected_path = L"\\" + projected.value->windows_display;
+        ok &= Require(
+            create(*exact, projected_path) == MetadataStore::MutationStatus::Applied,
+            "NamePolicy: canonical projected Windows name stages");
+        const auto projected_inode =
+            exact->DebugLookupWorkingInodeByPath(projected_path);
+        ok &= Require(projected_inode.has_value() &&
+                          projected_inode->name_utf8 == raw_unsafe,
+                      "NamePolicy: projected create retains original APFS bytes");
+        ok &= Require(
+            exact->CommitPendingMutations() == MetadataStore::CommitStatus::Committed,
+            "NamePolicy: projected names commit");
+
+        auto remounted = open_store(exact_path, 0, false);
+        ok &= Require(remounted != nullptr,
+                      "NamePolicy: projected-name checkpoint remounts");
+        if (remounted)
+        {
+            const auto persisted =
+                remounted->LookupCommittedInodeByPath(projected_path);
+            if (persisted.has_value() && persisted->name_utf8 != raw_unsafe)
+            {
+                std::cerr << "[DETAIL] projected remount name bytes="
+                          << persisted->name_utf8 << " displayUnits="
+                          << persisted->name.size() << std::endl;
+            }
+            ok &= Require(persisted.has_value() &&
+                              persisted->name_utf8 == raw_unsafe,
+                          "NamePolicy: projected name bytes survive remount");
+        }
+    }
+
+    auto folded = open_store(
+        run_root / "apfs_name_folded.apfs.img", 0x1);
+    if (!Require(folded != nullptr, "NamePolicy: folded store opens"))
+    {
+        return false;
+    }
+    ok &= Require(
+        create(*folded, L"\\File") == MetadataStore::MutationStatus::Applied,
+        "NamePolicy: folded first spelling stages");
+    ok &= Require(
+        create(*folded, L"\\file") == MetadataStore::MutationStatus::InvalidRequest,
+        "NamePolicy: folded case collision is rejected");
+    const auto folded_lookup = folded->DebugLookupWorkingInodeByPath(L"\\FILE");
+    ok &= Require(folded_lookup.has_value() && folded_lookup->name == L"File",
+                  "NamePolicy: folded lookup preserves stored spelling");
+    ok &= Require(
+        create(*folded, L"\\caf\u00e9") == MetadataStore::MutationStatus::Applied &&
+            create(*folded, L"\\cafe\u0301") == MetadataStore::MutationStatus::InvalidRequest,
+        "NamePolicy: folded normalization collision is rejected");
+
+    auto normalized = open_store(
+        run_root / "apfs_name_normalized.apfs.img", 0x8);
+    if (!Require(normalized != nullptr,
+                 "NamePolicy: normalization-only store opens"))
+    {
+        return false;
+    }
+    ok &= Require(
+        create(*normalized, L"\\File") == MetadataStore::MutationStatus::Applied &&
+            create(*normalized, L"\\file") == MetadataStore::MutationStatus::Applied,
+        "NamePolicy: normalization-only mode preserves case siblings");
+    ok &= Require(
+        create(*normalized, L"\\caf\u00e9") == MetadataStore::MutationStatus::Applied &&
+            create(*normalized, L"\\cafe\u0301") == MetadataStore::MutationStatus::InvalidRequest,
+        "NamePolicy: normalization-only mode rejects canonical collision");
     return ok;
 }
 
@@ -11173,8 +11312,22 @@ bool TestCommittedReadExtentsConformance(const std::filesystem::path& run_root)
             }),
         "ReadExtents: committed read extent table should accept sorted fragments and exact duplicates");
 
-    const auto first_fragmented_plan = store.SnapshotCommittedFileReadPlan(L"\\fragmented.bin");
-    const auto second_fragmented_plan = store.SnapshotCommittedFileReadPlan(L"\\fragmented.bin");
+    const auto fragmented_path_key =
+        apfsaccess::rw::ApfsNameCodec::CanonicalWindowsPathKey(
+            L"\\fragmented.bin",
+            apfsaccess::rw::ApfsNamePolicy::FromIncompatibleFeatures(
+                context.incompatible_features));
+    ok &= Require(
+        fragmented_path_key.ok(),
+        "ReadExtents: canonical fragmented path key should encode");
+    if (!fragmented_path_key.ok())
+    {
+        return false;
+    }
+    const auto first_fragmented_plan =
+        store.SnapshotCommittedFileReadPlan(*fragmented_path_key.value);
+    const auto second_fragmented_plan =
+        store.SnapshotCommittedFileReadPlan(*fragmented_path_key.value);
     ok &= Require(
         first_fragmented_plan.has_value() &&
             second_fragmented_plan.has_value() &&
@@ -11257,7 +11410,8 @@ bool TestCommittedReadExtentsConformance(const std::filesystem::path& run_root)
         "ReadExtents: adjacent split extents should be installed");
     if (adjacent_extents_installed)
     {
-        const auto adjacent_fragmented_plan = store.SnapshotCommittedFileReadPlan(L"\\fragmented.bin");
+        const auto adjacent_fragmented_plan =
+            store.SnapshotCommittedFileReadPlan(*fragmented_path_key.value);
         ok &= Require(
             adjacent_fragmented_plan.has_value() &&
                 adjacent_fragmented_plan->extents_snapshot != nullptr &&
@@ -13507,6 +13661,10 @@ int main(int argc, char** argv)
         {
             return TestPendingCheckpointDeltaBuilderConformance(run_root);
         }
+        if (selector == "apfs-name-policy")
+        {
+            return TestApfsNamePolicyConformance(run_root);
+        }
         if (selector == "namespace-replay-identity-binding")
         {
             return TestNamespaceReplayIdentityBindingConformance(run_root);
@@ -13546,6 +13704,7 @@ int main(int argc, char** argv)
     }
 
     ok &= TestPendingCheckpointDeltaBuilderConformance(run_root);
+    ok &= TestApfsNamePolicyConformance(run_root);
     ok &= TestNamespaceReplayIdentityBindingConformance(run_root);
     ok &= TestNamespaceReplayWalIdentityPropagationConformance(run_root);
     ok &= TestCheckpointDeltaShadowTelemetryConformance(run_root);

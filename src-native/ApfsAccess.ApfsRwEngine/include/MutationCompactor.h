@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ApfsNameCodec.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -37,5 +39,8 @@ public:
     };
 
     [[nodiscard]] static Summary Summarize(const std::vector<MutationView>& mutations);
+    [[nodiscard]] static Summary Summarize(
+        const std::vector<MutationView>& mutations,
+        const ApfsNamePolicy& name_policy);
 };
 }

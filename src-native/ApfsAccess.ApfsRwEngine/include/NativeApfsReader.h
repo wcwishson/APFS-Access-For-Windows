@@ -3,6 +3,7 @@
 #include "BlockDevice.h"
 #include "BtreeMutationCodec.h"
 #include "MetadataStore.h"
+#include "ApfsNameCodec.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +28,8 @@ struct NativeApfsVolumeProjection
     std::uint64_t root_directory_inode = 0;
     std::uint64_t total_blocks = 0;
     std::uint32_t block_size = 0;
+    std::uint64_t incompatible_features = 0;
+    ApfsNamePolicy name_policy{};
     std::vector<MetadataStore::InodeRecord> inodes;
     std::vector<BtreeRecord> btree_records;
     std::unordered_map<std::uint64_t, std::vector<MetadataStore::FileExtent>> read_extents_by_inode;
@@ -161,7 +164,7 @@ private:
         std::uint32_t block_size,
         std::uint64_t total_blocks,
         std::uint64_t xid,
-        bool directory_keys_are_hashed,
+        const ApfsNamePolicy& name_policy,
         NativeApfsVolumeProjection& projection);
 };
 } // namespace apfsaccess::rw

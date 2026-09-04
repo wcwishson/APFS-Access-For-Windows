@@ -1,7 +1,6 @@
 #include "MutationCompactor.h"
 
 #include <algorithm>
-#include <cwctype>
 #include <unordered_set>
 #include <utility>
 
@@ -51,18 +50,12 @@ std::wstring NormalizePath(std::wstring_view input)
     return normalized;
 }
 
-std::wstring CanonicalPathKey(std::wstring_view path)
+std::wstring CanonicalPathKey(
+    std::wstring_view path,
+    const ApfsNamePolicy& name_policy)
 {
-    auto key = NormalizePath(path);
-    std::transform(
-        key.begin(),
-        key.end(),
-        key.begin(),
-        [](wchar_t ch)
-        {
-            return static_cast<wchar_t>(std::towlower(ch));
-        });
-    return key;
+    const auto key = ApfsNameCodec::CanonicalWindowsPathKey(path, name_policy);
+    return key.ok() ? *key.value : NormalizePath(path);
 }
 
 bool IsDescendantPath(const std::wstring& candidate_key, const std::wstring& parent_key)
@@ -157,6 +150,15 @@ void ErasePayloadSubtree(
 
 MutationCompactor::Summary MutationCompactor::Summarize(const std::vector<MutationView>& mutations)
 {
+    return Summarize(
+        mutations,
+        ApfsNamePolicy{ApfsCaseMode::Insensitive, ApfsNormalizationMode::Insensitive});
+}
+
+MutationCompactor::Summary MutationCompactor::Summarize(
+    const std::vector<MutationView>& mutations,
+    const ApfsNamePolicy& name_policy)
+{
     Summary summary{};
     summary.raw_mutation_count = mutations.size();
 
@@ -165,7 +167,7 @@ MutationCompactor::Summary MutationCompactor::Summarize(const std::vector<Mutati
 
     for (const auto& mutation : mutations)
     {
-        const auto path_key = CanonicalPathKey(mutation.path);
+        const auto path_key = CanonicalPathKey(mutation.path, name_policy);
         switch (mutation.kind)
         {
         case MutationKind::Write:
@@ -185,7 +187,10 @@ MutationCompactor::Summary MutationCompactor::Summarize(const std::vector<Mutati
             }
             break;
         case MutationKind::Rename:
-            RemapPayloadSubtree(payload_paths, path_key, CanonicalPathKey(mutation.secondary_path));
+            RemapPayloadSubtree(
+                payload_paths,
+                path_key,
+                CanonicalPathKey(mutation.secondary_path, name_policy));
             break;
         case MutationKind::Delete:
             ErasePayloadSubtree(payload_paths, path_key);

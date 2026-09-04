@@ -1,5 +1,6 @@
 #include "MetadataStore.h"
 #include "ApfsFormat.h"
+#include "ApfsNameCodec.h"
 #include "ApfsObjectMapStore.h"
 #include "ApfsSpacemanStore.h"
 #include "ApfsTransactionWriter.h"
@@ -2226,35 +2227,59 @@ bool DecodeAppleInodeRecord(
 
 bool DecodeAppleDirectoryRecord(
     const catalog::BtreeRecord& record,
+    const ApfsNamePolicy& name_policy,
     AppleDirectoryRecord& out_directory)
 {
     std::uint64_t parent_id = 0;
     std::uint64_t record_type = 0;
     if (!ParseAppleFsKey(record, parent_id, record_type) ||
-        record_type != kAppleFsRecordTypeDirectory || record.key.size() < 11 ||
+        record_type != kAppleFsRecordTypeDirectory ||
         record.value.size() < 18)
     {
         return false;
     }
-    const auto length_value = catalog::ReadU16LE(record.key, 8);
     const auto file_id = catalog::ReadU64LE(record.value, 0);
     const auto date_added = catalog::ReadU64LE(record.value, 8);
     const auto flags = catalog::ReadU16LE(record.value, 16);
-    if (!length_value.has_value() || !file_id.has_value() ||
-        !date_added.has_value() || !flags.has_value())
+    if (!file_id.has_value() || !date_added.has_value() || !flags.has_value())
     {
         return false;
     }
-    const auto length = static_cast<std::size_t>(length_value.value());
-    if (length < 2 || length > record.key.size() - 10 ||
-        10 + length != record.key.size() ||
-        record.key[10 + length - 1] != std::byte{0})
+
+    std::size_t name_offset = 0;
+    std::size_t length = 0;
+    std::uint32_t name_length_and_hash = 0;
+    if (name_policy.UsesHashedDirectoryKeys())
+    {
+        const auto packed = catalog::ReadU32LE(record.key, 8);
+        if (!packed.has_value())
+        {
+            return false;
+        }
+        name_length_and_hash = packed.value();
+        length = static_cast<std::size_t>(name_length_and_hash & 0x3ffu);
+        name_offset = 12;
+    }
+    else
+    {
+        const auto serialized_length = catalog::ReadU16LE(record.key, 8);
+        if (!serialized_length.has_value())
+        {
+            return false;
+        }
+        length = static_cast<std::size_t>(serialized_length.value());
+        name_offset = 10;
+    }
+    if (length < 2 || name_offset > record.key.size() ||
+        length > record.key.size() - name_offset ||
+        name_offset + length != record.key.size() ||
+        record.key[name_offset + length - 1] != std::byte{0})
     {
         return false;
     }
     for (std::size_t index = 0; index + 1 < length; ++index)
     {
-        if (record.key[10 + index] == std::byte{0})
+        if (record.key[name_offset + index] == std::byte{0})
         {
             return false;
         }
@@ -2269,7 +2294,18 @@ bool DecodeAppleDirectoryRecord(
     for (std::size_t index = 0; index + 1 < length; ++index)
     {
         decoded.name_utf8.push_back(static_cast<char>(
-            std::to_integer<unsigned char>(record.key[10 + index])));
+            std::to_integer<unsigned char>(record.key[name_offset + index])));
+    }
+    const auto name_bytes = std::span(
+        reinterpret_cast<const std::byte*>(decoded.name_utf8.data()),
+        decoded.name_utf8.size());
+    const auto decoded_name = ApfsNameCodec::Decode(name_bytes, name_policy);
+    if (!decoded_name.ok() ||
+        (name_policy.UsesHashedDirectoryKeys() &&
+         !ApfsNameCodec::MatchesHashedDirectoryKey(
+             *decoded_name.value, name_length_and_hash)))
+    {
+        return false;
     }
     if (!DecodeAppleExtendedFields(
             record.value, 18, decoded.extended_fields))
@@ -2391,6 +2427,7 @@ bool SameProjectedInode(
     return left.object_id == right.object_id &&
         left.parent_object_id == right.parent_object_id &&
         left.name == right.name &&
+        left.name_utf8 == right.name_utf8 &&
         left.is_directory == right.is_directory &&
         left.logical_size == right.logical_size &&
         left.timestamp_utc == right.timestamp_utc;
@@ -2402,6 +2439,7 @@ bool SameDirectoryLink(
 {
     return left.parent_object_id == right.parent_object_id &&
         left.entry_name == right.entry_name &&
+        left.entry_name_utf8 == right.entry_name_utf8 &&
         left.child_object_id == right.child_object_id;
 }
 
@@ -2829,6 +2867,22 @@ bool MetadataStore::LoadContainerSuperblocks()
     active_checkpoint_map_blocks_ = std::move(selected_checkpoint_map_blocks);
     active_checkpoint_ephemeral_block_ranges_ = std::move(selected_ephemeral_ranges);
     authoritative_apple_checkpoint_view_ = std::move(selected_apple_checkpoint);
+    if (authoritative_apple_checkpoint_view_.has_value() &&
+        context_.volume_object_id != 0)
+    {
+        const auto selected_volume = std::find_if(
+            authoritative_apple_checkpoint_view_->volumes.begin(),
+            authoritative_apple_checkpoint_view_->volumes.end(),
+            [this](const auto& volume)
+            {
+                return volume.superblock.object_id == context_.volume_object_id;
+            });
+        if (selected_volume != authoritative_apple_checkpoint_view_->volumes.end())
+        {
+            context_.incompatible_features =
+                selected_volume->superblock.incompatible_features;
+        }
+    }
     if (IsCheckpointBlockIndexCacheEnabled())
     {
         (void)ResolveObjectMapCheckpointBlockIndices();
@@ -3055,6 +3109,7 @@ bool MetadataStore::LoadObjectMap()
                 projection,
                 projection_error))
         {
+            context_.incompatible_features = projection.incompatible_features;
             committed_object_map_.clear();
             InvalidateCommittedObjectMapOrderCache();
             committed_inodes_.clear();
@@ -5496,6 +5551,10 @@ bool MetadataStore::RefreshNativeReadExtentProjection()
     {
         return false;
     }
+    if (projection.incompatible_features != context_.incompatible_features)
+    {
+        return false;
+    }
 
     std::unordered_map<std::uint64_t, const InodeRecord*> native_inode_by_object_id;
     native_inode_by_object_id.reserve(projection.inodes.size());
@@ -5718,6 +5777,15 @@ bool MetadataStore::LoadInodeCheckpointBlock(std::uint64_t block_index, const st
         {
             return false;
         }
+        if (!inode.name.empty())
+        {
+            const auto encoded_name = ApfsNameCodec::EncodeWindowsName(inode.name);
+            if (!encoded_name.ok())
+            {
+                return false;
+            }
+            inode.name_utf8 = *encoded_name.value;
+        }
 
         auto [inode_it, inserted] = loaded_inodes.emplace(inode.object_id, inode);
         if (!inserted)
@@ -5741,7 +5809,8 @@ bool MetadataStore::LoadInodeCheckpointBlock(std::uint64_t block_index, const st
                     inode.parent_object_id,
                     inode.name,
                     inode.object_id,
-                    inode.xid
+                    inode.xid,
+                    inode.name_utf8
                 });
             }
         }
@@ -5870,7 +5939,8 @@ bool MetadataStore::LoadInodeCheckpointBlock(std::uint64_t block_index, const st
                     child_it->second.parent_object_id,
                     child_it->second.name,
                     child_id,
-                    child_it->second.xid
+                    child_it->second.xid,
+                    child_it->second.name_utf8
                 });
 
                 if (child_it->second.is_directory)
@@ -6094,7 +6164,6 @@ bool MetadataStore::LoadReplayCheckpointBlock(
     {
         return false;
     }
-
     const auto matches_magic = [&](const std::array<char, 12>& magic)
     {
         for (std::size_t index = 0; index < magic.size(); ++index)
@@ -6209,14 +6278,9 @@ bool MetadataStore::RebuildInodeStateFromBtreeRecords(
     std::unordered_map<std::uint64_t, std::vector<DecodedBtreeDirectoryEntry>> decoded_directory_entries_by_parent;
     std::unordered_set<std::wstring> seen_directory_entry_keys;
 
-    const auto canonical_name_key = [](const std::wstring& name)
+    const auto canonical_name_key = [this](const std::wstring& name)
     {
-        std::wstring key = name;
-        std::transform(key.begin(), key.end(), key.begin(), [](wchar_t ch)
-        {
-            return static_cast<wchar_t>(std::towlower(ch));
-        });
-        return key;
+        return CanonicalNameKey(name);
     };
     const auto build_directory_entry_key = [&](std::uint64_t parent_object_id, const std::wstring& entry_name)
     {
@@ -6423,13 +6487,21 @@ bool MetadataStore::RebuildInodeStateFromBtreeRecords(
             rebuilt_inode.data_physical_address = decoded_inode.data_physical_address;
             rebuilt_inode.xid = decoded_inode.xid;
             rebuilt_inode.timestamp_utc = decoded_inode.timestamp_utc;
+            const auto encoded_name =
+                ApfsNameCodec::EncodeWindowsName(rebuilt_inode.name);
+            if (!encoded_name.ok())
+            {
+                return false;
+            }
+            rebuilt_inode.name_utf8 = *encoded_name.value;
             out_inodes.emplace(rebuilt_inode.object_id, rebuilt_inode);
             out_directory_links.push_back(DirectoryLink
             {
                 parent_object_id,
                 rebuilt_inode.name,
                 rebuilt_inode.object_id,
-                entry.xid
+                entry.xid,
+                rebuilt_inode.name_utf8
             });
 
             if (rebuilt_inode.is_directory)
@@ -7895,6 +7967,10 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(
         return reject(L"EmptyPath");
     }
     const auto path_key = CanonicalPathKeyFromNormalizedPath(normalized_path);
+    if (path_key.empty())
+    {
+        return reject(L"InvalidApfsNameProjection");
+    }
     std::wstring normalized_secondary;
     std::wstring secondary_key_storage;
     const std::wstring* secondary_key = nullptr;
@@ -8483,10 +8559,20 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(
         remember_directory_link(parent_object_id, entry_name);
         RemoveWorkingDirectoryLink(parent_object_id, entry_name);
     };
-    const auto upsert_working_directory_link = [&](std::uint64_t parent_object_id, const std::wstring& entry_name, std::uint64_t child_object_id, std::uint64_t xid)
+    const auto upsert_working_directory_link = [&](
+        std::uint64_t parent_object_id,
+        const std::wstring& entry_name,
+        std::uint64_t child_object_id,
+        std::uint64_t xid,
+        std::string entry_name_utf8 = {})
     {
         remember_directory_link(parent_object_id, entry_name);
-        UpsertWorkingDirectoryLink(parent_object_id, entry_name, child_object_id, xid);
+        UpsertWorkingDirectoryLink(
+            parent_object_id,
+            entry_name,
+            child_object_id,
+            xid,
+            std::move(entry_name_utf8));
     };
     const auto allocate_extent = [&](std::uint64_t bytes) -> std::optional<std::uint64_t>
     {
@@ -8832,7 +8918,8 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(
                     restore.previous->parent_object_id,
                     restore.previous->entry_name,
                     restore.previous->child_object_id,
-                    restore.previous->xid);
+                    restore.previous->xid,
+                    restore.previous->entry_name_utf8);
             }
             else
             {
@@ -9896,6 +9983,11 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(
         {
             return reject(L"CreateLeafNameEmpty");
         }
+        const auto encoded_leaf_name = ApfsNameCodec::EncodeWindowsName(leaf_name);
+        if (!encoded_leaf_name.ok())
+        {
+            return reject(L"CreateNameInvalid");
+        }
 
         if (identity_bound && request.generation != target_xid)
         {
@@ -9959,6 +10051,7 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(
         }
         inode.parent_object_id = parent_inode->object_id;
         inode.name = leaf_name;
+        inode.name_utf8 = *encoded_leaf_name.value;
         inode.full_path = normalized_path;
         inode.is_directory = request.operation == MutationOperation::CreateDirectory;
         inode.logical_size = 0;
@@ -9967,7 +10060,12 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(
 
         set_working_inode(inode);
         set_working_path_index(path_key, inode.object_id);
-        upsert_working_directory_link(inode.parent_object_id, inode.name, inode.object_id, target_xid);
+        upsert_working_directory_link(
+            inode.parent_object_id,
+            inode.name,
+            inode.object_id,
+            target_xid,
+            inode.name_utf8);
 
         if (!stage_object_map_update(inode.object_id, inode.data_physical_address, inode.logical_size))
         {
@@ -10328,6 +10426,10 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(
             return reject(normalized_secondary.empty() ? L"RenameDestinationEmpty" : L"RenameRootPath");
         }
         secondary_key_storage = CanonicalPathKeyFromNormalizedPath(normalized_secondary);
+        if (secondary_key_storage.empty())
+        {
+            return reject(L"RenameDestinationNameInvalid");
+        }
         secondary_key = &secondary_key_storage;
 
         const auto* inode = LookupWorkingInodeByCanonicalPathKeyView(path_key);
@@ -10349,9 +10451,16 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(
         {
             return reject(L"RenameDestinationParentMissingOrNotDirectory:" + destination_parent_path);
         }
-        if (LeafName(normalized_secondary).empty())
+        const auto destination_leaf_name = LeafName(normalized_secondary);
+        if (destination_leaf_name.empty())
         {
             return reject(L"RenameDestinationLeafNameEmpty");
+        }
+        const auto encoded_destination_name =
+            ApfsNameCodec::EncodeWindowsName(destination_leaf_name);
+        if (!encoded_destination_name.ok())
+        {
+            return reject(L"RenameDestinationNameInvalid");
         }
         if (inode->is_directory &&
             (IsDescendantPath(destination_parent_path, normalized_path) ||
@@ -10456,11 +10565,17 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(
 
         auto& inode_ref = mutable_working_inode(inode->object_id);
         inode_ref.parent_object_id = destination_parent->object_id;
-        inode_ref.name = LeafName(normalized_secondary);
+        inode_ref.name = destination_leaf_name;
+        inode_ref.name_utf8 = *encoded_destination_name.value;
         inode_ref.full_path = normalized_secondary;
         inode_ref.xid = target_xid;
         set_working_path_index(destination_path_key, inode_ref.object_id);
-        upsert_working_directory_link(inode_ref.parent_object_id, inode_ref.name, inode_ref.object_id, target_xid);
+        upsert_working_directory_link(
+            inode_ref.parent_object_id,
+            inode_ref.name,
+            inode_ref.object_id,
+            target_xid,
+            inode_ref.name_utf8);
         stage_directory_record(inode_ref.parent_object_id, inode_ref.name, inode_ref.object_id, false);
         stage_inode_record(inode_ref, false);
 
@@ -10678,6 +10793,8 @@ MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations()
             "apple-volume-missing", L"AppleCommitVolumeMissing");
     }
     const auto& volume = *volume_it;
+    const auto name_policy = ApfsNamePolicy::FromIncompatibleFeatures(
+        volume.superblock.incompatible_features);
     const auto block_size = checkpoint.container.superblock.block_size;
     MetadataStoreDeviceSource source(*device_);
 
@@ -10757,7 +10874,7 @@ MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations()
         else if (record_type == kAppleFsRecordTypeDirectory)
         {
             AppleDirectoryRecord directory;
-            if (!DecodeAppleDirectoryRecord(record, directory) ||
+            if (!DecodeAppleDirectoryRecord(record, name_policy, directory) ||
                 !raw_drecs_by_child.emplace(
                     directory.file_id, std::move(directory)).second)
             {
@@ -10965,7 +11082,7 @@ MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations()
         if (record_type == kAppleFsRecordTypeDirectory)
         {
             AppleDirectoryRecord directory;
-            if (!DecodeAppleDirectoryRecord(record, directory))
+            if (!DecodeAppleDirectoryRecord(record, name_policy, directory))
             {
                 return fail(CommitStatus::InvariantFailed,
                     "apple-directory-record-invalid",
@@ -11085,8 +11202,16 @@ MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations()
         }
         if (object_id != RootDirectoryObjectId())
         {
-            std::string name_utf8;
-            if (!WideToUtf8Strict(projected.name, name_utf8))
+            std::string name_utf8 = projected.name_utf8;
+            if (name_utf8.empty())
+            {
+                const auto encoded = ApfsNameCodec::EncodeWindowsName(projected.name);
+                if (encoded.ok())
+                {
+                    name_utf8 = *encoded.value;
+                }
+            }
+            if (name_utf8.empty())
             {
                 return fail(CommitStatus::InvariantFailed,
                     "apple-name-invalid", L"AppleCommitNameInvalid");
@@ -11162,15 +11287,22 @@ MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations()
         }
         directory.parent_id = working_link->second.parent_object_id;
         directory.file_id = object_id;
-        if (!WideToUtf8Strict(
-                working_link->second.entry_name, directory.name_utf8))
+        directory.name_utf8 = working_link->second.entry_name_utf8;
+        if (directory.name_utf8.empty())
+        {
+            const auto encoded = ApfsNameCodec::EncodeWindowsName(
+                working_link->second.entry_name);
+            if (encoded.ok())
+            {
+                directory.name_utf8 = *encoded.value;
+            }
+        }
+        if (directory.name_utf8.empty())
         {
             return fail(CommitStatus::InvariantFailed,
                 "apple-directory-name-invalid",
                 L"AppleCommitDirectoryNameInvalid");
         }
-        directory.hashed_name = false;
-        directory.name_hash = 0;
         directory.flags = static_cast<std::uint16_t>(
             (directory.flags & ~kAppleDirectoryTypeMask) |
             (working_inode->second.is_directory
@@ -11182,7 +11314,8 @@ MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations()
                 working_inode->second.timestamp_utc);
         }
         catalog::BtreeRecord encoded;
-        if (!EncodeAppleDirectoryRecord(directory, encoded, apple_error))
+        if (!EncodeAppleDirectoryRecord(
+                directory, name_policy, encoded, apple_error))
         {
             return fail(CommitStatus::InvariantFailed,
                 "apple-directory-encode-failed",
@@ -12621,7 +12754,11 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
         committed_directory_link_index_.erase(key);
     };
     const auto upsert_committed_directory_link =
-        [&](std::uint64_t parent_object_id, const std::wstring& entry_name, std::uint64_t child_object_id, std::uint64_t xid)
+        [&](std::uint64_t parent_object_id,
+            const std::wstring& entry_name,
+            std::uint64_t child_object_id,
+            std::uint64_t xid,
+            std::string entry_name_utf8 = {})
     {
         const auto key = BuildWorkingDirectoryLinkIndexKey(parent_object_id, entry_name);
         auto index_it = committed_directory_link_index_.find(key);
@@ -12636,6 +12773,7 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
                 AddCommittedDirectoryChild(parent_object_id, child_object_id);
             }
             link.entry_name = entry_name;
+            link.entry_name_utf8 = std::move(entry_name_utf8);
             link.child_object_id = child_object_id;
             link.xid = xid;
             return;
@@ -12648,6 +12786,7 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
             entry_name,
             child_object_id,
             xid,
+            std::move(entry_name_utf8),
         });
         AddCommittedDirectoryChild(parent_object_id, child_object_id);
         committed_directory_link_index_[key] = new_index;
@@ -12772,7 +12911,8 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
                     restore.previous->parent_object_id,
                     restore.previous->entry_name,
                     restore.previous->child_object_id,
-                    restore.previous->xid);
+                    restore.previous->xid,
+                    restore.previous->entry_name_utf8);
             }
             else
             {
@@ -13169,7 +13309,8 @@ MetadataStore::CommitStatus MetadataStore::CommitPendingMutations()
                 working_inode->second.parent_object_id,
                 working_inode->second.name,
                 touched_key.object_id,
-                working_inode->second.xid);
+                working_inode->second.xid,
+                working_inode->second.name_utf8);
         }
     }
     if (committed_inode_order_changed)
@@ -14711,14 +14852,9 @@ bool MetadataStore::ReplayOrRecover()
         canonical_directory_entries_by_key.reserve(canonical_blob_btree_records.size());
         raw_inode_mutations_by_object.reserve(parsed_btree_records.size());
 
-        const auto canonical_name_key = [](const std::wstring& name)
+        const auto canonical_name_key = [this](const std::wstring& name)
         {
-            std::wstring key = name;
-            std::transform(key.begin(), key.end(), key.begin(), [](wchar_t ch)
-            {
-                return static_cast<wchar_t>(std::towlower(ch));
-            });
-            return key;
+            return CanonicalNameKey(name);
         };
         const auto build_directory_entry_triplet_key = [&](std::uint64_t parent_object_id, const std::wstring& entry_name, std::uint64_t child_object_id)
         {
@@ -18433,73 +18569,35 @@ std::wstring MetadataStore::NormalizePath(const std::wstring& path)
     return normalized;
 }
 
-std::wstring MetadataStore::CanonicalPathKey(const std::wstring& normalized_path)
+std::wstring MetadataStore::CanonicalPathKey(const std::wstring& normalized_path) const
 {
-    auto key = NormalizePath(normalized_path);
-    std::transform(key.begin(), key.end(), key.begin(), [](wchar_t ch)
-    {
-        return static_cast<wchar_t>(std::towlower(ch));
-    });
-    return key;
+    return CanonicalPathKeyFromNormalizedPath(NormalizePath(normalized_path));
 }
 
-std::wstring MetadataStore::CanonicalPathKeyFromPath(const std::wstring& path)
+std::wstring MetadataStore::CanonicalPathKeyFromPath(const std::wstring& path) const
 {
-    if (path.empty())
+    return CanonicalPathKeyFromNormalizedPath(NormalizePath(path));
+}
+
+std::wstring MetadataStore::CanonicalPathKeyFromNormalizedPath(
+    const std::wstring& normalized_path) const
+{
+    if (normalized_path.empty())
     {
         return {};
     }
-
-    std::wstring key;
-    key.reserve(path.size() + 1);
-    if (path.front() != L'\\' && path.front() != L'/')
-    {
-        key.push_back(L'\\');
-    }
-
-    bool previous_separator = false;
-    for (const auto ch : path)
-    {
-        const auto mapped = (ch == L'/') ? L'\\' : ch;
-        if (mapped == L'\\')
-        {
-            if (previous_separator)
-            {
-                continue;
-            }
-            previous_separator = true;
-            key.push_back(mapped);
-            continue;
-        }
-
-        previous_separator = false;
-        key.push_back(static_cast<wchar_t>(std::towlower(mapped)));
-    }
-
-    while (key.size() > 1 && key.back() == L'\\')
-    {
-        key.pop_back();
-    }
-
-    if (key.empty())
-    {
-        return {};
-    }
-    if (key.front() != L'\\')
-    {
-        key.insert(key.begin(), L'\\');
-    }
-    return key;
+    const auto result = ApfsNameCodec::CanonicalWindowsPathKey(
+        normalized_path,
+        ApfsNamePolicy::FromIncompatibleFeatures(context_.incompatible_features));
+    return result.ok() ? std::move(*result.value) : std::wstring{};
 }
 
-std::wstring MetadataStore::CanonicalPathKeyFromNormalizedPath(const std::wstring& normalized_path)
+std::wstring MetadataStore::CanonicalNameKey(const std::wstring& name) const
 {
-    std::wstring key = normalized_path;
-    std::transform(key.begin(), key.end(), key.begin(), [](wchar_t ch)
-    {
-        return static_cast<wchar_t>(std::towlower(ch));
-    });
-    return key;
+    const auto result = ApfsNameCodec::CanonicalWindowsComponentKey(
+        name,
+        ApfsNamePolicy::FromIncompatibleFeatures(context_.incompatible_features));
+    return result.ok() ? std::move(*result.value) : std::wstring{};
 }
 
 bool MetadataStore::IsRootPath(const std::wstring& normalized_path)
@@ -18507,7 +18605,9 @@ bool MetadataStore::IsRootPath(const std::wstring& normalized_path)
     return normalized_path == L"\\";
 }
 
-bool MetadataStore::IsDescendantPath(const std::wstring& candidate_path, const std::wstring& parent_path)
+bool MetadataStore::IsDescendantPath(
+    const std::wstring& candidate_path,
+    const std::wstring& parent_path) const
 {
     const auto candidate_key = CanonicalPathKey(candidate_path);
     const auto parent_key = CanonicalPathKey(parent_path);
@@ -18642,7 +18742,8 @@ bool MetadataStore::EnsureRootState()
             inode.parent_object_id,
             inode.name,
             object_id,
-            inode.xid
+            inode.xid,
+            inode.name_utf8
         });
     }
     RebuildCommittedDirectoryLinkIndex();
@@ -18677,14 +18778,9 @@ bool MetadataStore::ValidateInodeGraphState(
     const auto allow_unresolved_raw_read_extent =
         context_.allow_raw_physical_write &&
         IsLikelyRawDevicePath(context_.device_path);
-    const auto canonical_name_key = [](const std::wstring& name)
+    const auto canonical_name_key = [this](const std::wstring& name)
     {
-        std::wstring key = name;
-        std::transform(key.begin(), key.end(), key.begin(), [](wchar_t ch)
-        {
-            return static_cast<wchar_t>(std::towlower(ch));
-        });
-        return key;
+        return CanonicalNameKey(name);
     };
     const auto make_link_key = [&](std::uint64_t parent_object_id, const std::wstring& entry_name)
     {
@@ -19137,16 +19233,7 @@ MetadataStore::DirectoryLinkIndexKey MetadataStore::BuildWorkingDirectoryLinkInd
     std::uint64_t parent_object_id,
     const std::wstring& entry_name) const
 {
-    std::wstring normalized_entry_name = entry_name;
-    std::transform(
-        normalized_entry_name.begin(),
-        normalized_entry_name.end(),
-        normalized_entry_name.begin(),
-        [](wchar_t ch)
-        {
-            return static_cast<wchar_t>(std::towlower(ch));
-        });
-    return DirectoryLinkIndexKey{parent_object_id, std::move(normalized_entry_name)};
+    return DirectoryLinkIndexKey{parent_object_id, CanonicalNameKey(entry_name)};
 }
 
 void MetadataStore::RebuildWorkingDirectoryIndexes()
@@ -19412,7 +19499,8 @@ void MetadataStore::UpsertWorkingDirectoryLink(
     std::uint64_t parent_object_id,
     const std::wstring& entry_name,
     std::uint64_t child_object_id,
-    std::uint64_t xid
+    std::uint64_t xid,
+    std::string entry_name_utf8
 )
 {
     const auto key = BuildWorkingDirectoryLinkIndexKey(parent_object_id, entry_name);
@@ -19427,6 +19515,7 @@ void MetadataStore::UpsertWorkingDirectoryLink(
             AddWorkingDirectoryChild(parent_object_id, child_object_id);
         }
         link.entry_name = entry_name;
+        link.entry_name_utf8 = std::move(entry_name_utf8);
         link.child_object_id = child_object_id;
         link.xid = xid;
         return;
@@ -19438,7 +19527,8 @@ void MetadataStore::UpsertWorkingDirectoryLink(
         parent_object_id,
         entry_name,
         child_object_id,
-        xid
+        xid,
+        std::move(entry_name_utf8)
     });
     AddWorkingDirectoryChild(parent_object_id, child_object_id);
     working_directory_link_index_[key] = new_index;
@@ -21641,7 +21731,9 @@ MutationCompactor::Summary MetadataStore::SummarizePendingMutations() const
         });
     }
 
-    auto summary = MutationCompactor::Summarize(mutations);
+    auto summary = MutationCompactor::Summarize(
+        mutations,
+        ApfsNamePolicy::FromIncompatibleFeatures(context_.incompatible_features));
     last_raw_mutation_count_.store(
         static_cast<std::uint64_t>(summary.raw_mutation_count),
         std::memory_order_relaxed);
@@ -22325,11 +22417,7 @@ bool MetadataStore::CanUseAppleTransactionWriter(
         return fail(L"NativeAppleTransactionEncryptionUnsupported");
     }
     if ((volume->superblock.incompatible_features &
-            catalog::kIncompatCaseInsensitive) != 0)
-    {
-        return fail(L"NativeAppleTransactionHashedNamesUnsupported");
-    }
-    if (volume->superblock.incompatible_features != 0 ||
+            ~catalog::kVolumeSupportedIncompatibleFeaturesMask) != 0 ||
         volume->superblock.readonly_features != 0 ||
         (volume->superblock.role_raw != 0 &&
          volume->superblock.role_raw != 0x0040))
@@ -25235,6 +25323,7 @@ bool MetadataStore::LoadPersistentState()
         {
             return false;
         }
+        context_.incompatible_features = projection.incompatible_features;
 
         std::unordered_map<std::uint64_t, InodeRecord> projected_inodes;
         std::unordered_map<std::wstring, std::uint64_t> projected_path_index;
@@ -25258,7 +25347,8 @@ bool MetadataStore::LoadPersistentState()
                     inode.parent_object_id,
                     inode.name,
                     inode.object_id,
-                    inode.xid
+                    inode.xid,
+                    inode.name_utf8
                 });
             }
         }
@@ -26653,6 +26743,16 @@ bool MetadataStore::LoadPersistentState()
             }
 
             inode.is_directory = (flags & 0x1u) != 0;
+            if (!inode.name.empty())
+            {
+                const auto encoded_name =
+                    ApfsNameCodec::EncodeWindowsName(inode.name);
+                if (!encoded_name.ok())
+                {
+                    return false;
+                }
+                inode.name_utf8 = *encoded_name.value;
+            }
             committed_inodes_.emplace(inode.object_id, inode);
             const auto path_key = CanonicalPathKeyFromNormalizedPath(inode.full_path);
             if (!path_key.empty())

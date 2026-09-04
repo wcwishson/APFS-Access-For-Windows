@@ -9,6 +9,8 @@
 
 #include "ApfsContainerCatalog.h"
 #include "ApfsFormat.h"
+#include "ApfsNameCodec.h"
+#include "ApfsTransactionWriter.h"
 #include "BlockDevice.h"
 #include "MetadataStore.h"
 #include "NativeApfsReader.h"
@@ -528,8 +530,10 @@ AuthoritativeCheckpointFixture BuildAuthoritativeCheckpointFixture(
     volume.snap_meta_tree_oid = fixture.snapshot_root_oid;
     volume.fext_tree_type = 0x40000002;
     volume.fext_tree_oid = kFextRootBlock;
-    volume.file_system_allocated_blocks = 4;
-    volume.total_blocks_allocated = 4;
+    // Root, extent-reference, snapshot, and fext trees plus the volume object
+    // map object and its tree are all allocated to this volume.
+    volume.file_system_allocated_blocks = 6;
+    volume.total_blocks_allocated = 6;
     store.volumes.push_back(volume);
     fixture.image = BuildStoreImage(store);
 
@@ -2493,6 +2497,160 @@ bool TestCatalogResolveVolumeByNameInScopedContainer()
     return ok;
 }
 
+bool BuildUnicodeProjectionRecords(
+    std::uint64_t incompatible_features,
+    bool corrupt_hash,
+    std::vector<apfsaccess::catalog::BtreeRecord>& out_records)
+{
+    using namespace apfsaccess::rw;
+    out_records.clear();
+    std::string error;
+    apfsaccess::catalog::BtreeRecord root_record;
+    AppleInodeRecord root;
+    root.object_id = 2;
+    root.parent_id = 2;
+    root.private_id = 2;
+    root.children_or_links = 1;
+    root.write_generation = 1;
+    root.mode = 0040755;
+    if (!EncodeAppleInodeRecord(root, root_record, error))
+    {
+        return false;
+    }
+
+    apfsaccess::catalog::BtreeRecord child_record;
+    AppleInodeRecord child;
+    child.object_id = 17;
+    child.parent_id = 2;
+    child.private_id = 17;
+    child.children_or_links = 1;
+    child.write_generation = 1;
+    child.mode = 0100644;
+    if (!EncodeAppleInodeRecord(child, child_record, error))
+    {
+        return false;
+    }
+
+    apfsaccess::catalog::BtreeRecord directory_record;
+    AppleDirectoryRecord directory;
+    directory.parent_id = 2;
+    directory.file_id = 17;
+    directory.date_added = 500;
+    directory.flags = 8;
+    directory.name_utf8 = std::string("\xc3\xa9", 2);
+    const auto policy = ApfsNamePolicy::FromIncompatibleFeatures(
+        incompatible_features);
+    if (!EncodeAppleDirectoryRecord(
+            directory, policy, directory_record, error))
+    {
+        return false;
+    }
+    if (corrupt_hash)
+    {
+        if (!policy.UsesHashedDirectoryKeys() || directory_record.key.size() < 12)
+        {
+            return false;
+        }
+        directory_record.key[10] = static_cast<std::byte>(
+            std::to_integer<unsigned int>(directory_record.key[10]) ^ 0x04u);
+    }
+
+    out_records = {
+        std::move(root_record),
+        std::move(directory_record),
+        std::move(child_record),
+    };
+    return true;
+}
+
+bool TestReaderProjectsNormalizationInsensitiveUnicodeName()
+{
+    constexpr std::uint64_t kNormalizationInsensitive = 0x8;
+    BuilderStore store;
+    store.authoritative_checkpoint = true;
+    store.volumes[0].incompat = kNormalizationInsensitive;
+    if (!Require(BuildUnicodeProjectionRecords(
+            kNormalizationInsensitive, false,
+            store.volumes[0].filesystem_records),
+        "Unicode projection fixture records encode"))
+    {
+        return false;
+    }
+
+    TempImageFile file(BuildStoreImage(store), "unicode-name-reader");
+    apfsaccess::rw::BlockDevice device(file.path.wstring(), 0);
+    apfsaccess::rw::NativeApfsVolumeProjection projection{};
+    std::wstring error;
+    const bool loaded = apfsaccess::rw::NativeApfsReader::TryLoadVolumeProjection(
+        device, 101, projection, error);
+    bool ok = Require(loaded,
+        "normalization-insensitive projection loads a hashed directory key");
+    if (!loaded)
+    {
+        return false;
+    }
+    const auto child = std::find_if(
+        projection.inodes.begin(), projection.inodes.end(),
+        [](const auto& inode) { return inode.object_id == 17; });
+    ok &= Require(child != projection.inodes.end(),
+        "Unicode child is reachable from its directory record");
+    if (child != projection.inodes.end())
+    {
+        ok &= Require(child->name == L"\u00e9",
+            "reader exposes the exact Unicode name instead of lossy substitution");
+    }
+    return ok;
+}
+
+bool TestReaderRejectsMismatchedDirectoryHash()
+{
+    constexpr std::uint64_t kCaseInsensitive = 0x1;
+    BuilderStore store;
+    store.authoritative_checkpoint = true;
+    store.volumes[0].incompat = kCaseInsensitive;
+    if (!Require(BuildUnicodeProjectionRecords(
+            kCaseInsensitive, true,
+            store.volumes[0].filesystem_records),
+        "corrupt hash fixture records encode"))
+    {
+        return false;
+    }
+
+    TempImageFile file(BuildStoreImage(store), "bad-name-hash-reader");
+    apfsaccess::rw::BlockDevice device(file.path.wstring(), 0);
+    apfsaccess::rw::NativeApfsVolumeProjection projection{};
+    std::wstring error;
+    const bool loaded = apfsaccess::rw::NativeApfsReader::TryLoadVolumeProjection(
+        device, 101, projection, error);
+    return Require(!loaded,
+        "reader fails closed when a hashed directory key does not match its name");
+}
+
+bool TestReaderRejectsDirectoryKeyTrailingBytes()
+{
+    constexpr std::uint64_t kNormalizationInsensitive = 0x8;
+    BuilderStore store;
+    store.authoritative_checkpoint = true;
+    store.volumes[0].incompat = kNormalizationInsensitive;
+    if (!Require(BuildUnicodeProjectionRecords(
+            kNormalizationInsensitive, false,
+            store.volumes[0].filesystem_records),
+        "trailing-byte fixture records encode"))
+    {
+        return false;
+    }
+    store.volumes[0].filesystem_records[1].key.push_back(std::byte{0x5a});
+
+    TempImageFile file(BuildStoreImage(store), "trailing-name-key-reader");
+    apfsaccess::rw::BlockDevice device(file.path.wstring(), 0);
+    apfsaccess::rw::NativeApfsVolumeProjection projection{};
+    std::wstring error;
+    const bool loaded = apfsaccess::rw::NativeApfsReader::TryLoadVolumeProjection(
+        device, 101, projection, error);
+    return Require(!loaded,
+        "reader rejects trailing bytes outside the serialized directory name");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -2674,6 +2832,9 @@ int main(int argc, char** argv)
     ok &= run("TestReaderCatalogTombstoneShadows", TestReaderCatalogTombstoneShadows);
     ok &= run("TestReaderSelectsNewestCheckpoint", TestReaderSelectsNewestCheckpoint);
     ok &= run("TestReaderRejectsProximityScan", TestReaderRejectsProximityScan);
+    ok &= run("TestReaderProjectsNormalizationInsensitiveUnicodeName", TestReaderProjectsNormalizationInsensitiveUnicodeName);
+    ok &= run("TestReaderRejectsMismatchedDirectoryHash", TestReaderRejectsMismatchedDirectoryHash);
+    ok &= run("TestReaderRejectsDirectoryKeyTrailingBytes", TestReaderRejectsDirectoryKeyTrailingBytes);
     ok &= run("TestCatalogResolveVolumeContainerQualified", TestCatalogResolveVolumeContainerQualified);
     ok &= run("TestCatalogResolveVolumeByNameInScopedContainer", TestCatalogResolveVolumeByNameInScopedContainer);
     ok &= run("TestPortableSha256Vectors", TestPortableSha256Vectors);

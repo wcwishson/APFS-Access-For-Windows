@@ -1,6 +1,17 @@
 cmake_minimum_required(VERSION 3.20)
-project(ApfsAccessApfsRwEngine LANGUAGES CXX)
+project(ApfsAccessApfsRwEngine LANGUAGES C CXX)
 include(CTest)
+
+add_library(ApfsAccess.Utf8Proc STATIC
+    ../../third_party/utf8proc/utf8proc.c
+)
+
+target_include_directories(ApfsAccess.Utf8Proc
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/utf8proc
+)
+
+target_compile_definitions(ApfsAccess.Utf8Proc PRIVATE UTF8PROC_EXPORTS)
 
 add_library(ApfsAccess.ApfsRwEngine STATIC
     src/AppleCheckpointPublisher.cpp
@@ -9,6 +20,7 @@ add_library(ApfsAccess.ApfsRwEngine STATIC
     src/AppleVolumeTransaction.cpp
     src/ApfsContainerCatalog.cpp
     src/ApfsFormat.cpp
+    src/ApfsNameCodec.cpp
     src/ApfsObjectMapStore.cpp
     src/ApfsSpacemanStore.cpp
     src/ApfsTransactionWriter.cpp
@@ -33,6 +45,13 @@ target_include_directories(ApfsAccess.ApfsRwEngine
 )
 
 target_compile_features(ApfsAccess.ApfsRwEngine PUBLIC cxx_std_20)
+
+target_compile_definitions(ApfsAccess.ApfsRwEngine PRIVATE UTF8PROC_EXPORTS)
+
+target_link_libraries(ApfsAccess.ApfsRwEngine
+    PRIVATE
+        ApfsAccess.Utf8Proc
+)
 
 # Fixed repo-owned read-only APFS observer: emits C0a evidence records.
 # Hashing adapter is platform-selected (CNG on Windows, portable elsewhere);
@@ -126,6 +145,9 @@ if(BUILD_TESTING)
     add_executable(ApfsAccess.ApfsRwEngine.AppleCheckpointPublisherTests
         tests/AppleCheckpointPublisherTests.cpp
     )
+    add_executable(ApfsAccess.ApfsRwEngine.NameCodecTests
+        tests/ApfsNameCodecTests.cpp
+    )
 
     target_link_libraries(ApfsAccess.ApfsRwEngine.AppleTransactionWriterTests
         PRIVATE
@@ -136,6 +158,10 @@ if(BUILD_TESTING)
             ApfsAccess.ApfsRwEngine
     )
     target_link_libraries(ApfsAccess.ApfsRwEngine.AppleCheckpointPublisherTests
+        PRIVATE
+            ApfsAccess.ApfsRwEngine
+    )
+    target_link_libraries(ApfsAccess.ApfsRwEngine.NameCodecTests
         PRIVATE
             ApfsAccess.ApfsRwEngine
     )
@@ -268,6 +294,10 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/include
             ${CMAKE_CURRENT_SOURCE_DIR}/tests
     )
+    target_include_directories(ApfsAccess.ApfsRwEngine.NameCodecTests
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
 
     target_compile_features(ApfsAccess.ApfsRwEngine.CompatibilityTests PRIVATE cxx_std_20)
     target_compile_features(ApfsAccess.ApfsRwEngine.Tests PRIVATE cxx_std_20)
@@ -286,6 +316,7 @@ if(BUILD_TESTING)
     target_compile_features(ApfsAccess.ApfsRwEngine.AppleTransactionWriterTests PRIVATE cxx_std_20)
     target_compile_features(ApfsAccess.ApfsRwEngine.AppleSpacemanAllocatorTests PRIVATE cxx_std_20)
     target_compile_features(ApfsAccess.ApfsRwEngine.AppleCheckpointPublisherTests PRIVATE cxx_std_20)
+    target_compile_features(ApfsAccess.ApfsRwEngine.NameCodecTests PRIVATE cxx_std_20)
 
     if(MSVC)
         target_compile_options(ApfsAccess.ApfsRwEngine.CompatibilityTests PRIVATE /W4 /permissive-)
@@ -305,6 +336,7 @@ if(BUILD_TESTING)
         target_compile_options(ApfsAccess.ApfsRwEngine.AppleTransactionWriterTests PRIVATE /W4 /permissive-)
         target_compile_options(ApfsAccess.ApfsRwEngine.AppleSpacemanAllocatorTests PRIVATE /W4 /permissive-)
         target_compile_options(ApfsAccess.ApfsRwEngine.AppleCheckpointPublisherTests PRIVATE /W4 /permissive-)
+        target_compile_options(ApfsAccess.ApfsRwEngine.NameCodecTests PRIVATE /W4 /permissive-)
 
         foreach(_apfsaccess_rw_test_target
             ApfsAccess.ApfsRwEngine.CompatibilityTests
@@ -324,6 +356,7 @@ if(BUILD_TESTING)
             ApfsAccess.ApfsRwEngine.AppleTransactionWriterTests
             ApfsAccess.ApfsRwEngine.AppleSpacemanAllocatorTests
             ApfsAccess.ApfsRwEngine.AppleCheckpointPublisherTests
+            ApfsAccess.ApfsRwEngine.NameCodecTests
         )
             set_property(TARGET ${_apfsaccess_rw_test_target} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
         endforeach()
@@ -396,5 +429,9 @@ if(BUILD_TESTING)
     add_test(
         NAME ApfsAccess.ApfsRwEngine.AppleCheckpointPublisher
         COMMAND ApfsAccess.ApfsRwEngine.AppleCheckpointPublisherTests
+    )
+    add_test(
+        NAME ApfsAccess.ApfsRwEngine.NameCodec
+        COMMAND ApfsAccess.ApfsRwEngine.NameCodecTests
     )
 endif()

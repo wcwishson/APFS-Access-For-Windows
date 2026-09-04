@@ -5495,12 +5495,6 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
             features.Add("SnapshotOrClone");
         }
 
-        if (line.Contains("case-sensitive", StringComparison.OrdinalIgnoreCase) ||
-            line.Contains("casesensitive", StringComparison.OrdinalIgnoreCase))
-        {
-            features.Add("CaseSensitive");
-        }
-
         if (line.Contains("sealed", StringComparison.OrdinalIgnoreCase) ||
             line.Contains("system volume", StringComparison.OrdinalIgnoreCase) ||
             ContainsRoleValue(line, "system"))
@@ -5548,9 +5542,6 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
                     break;
                 case "SnapshotOrClone":
                     issues.Add("Snapshot/clone mutation semantics are not supported in v1 native write mode.");
-                    break;
-                case "CaseSensitive":
-                    issues.Add("Case-sensitive APFS volumes are not supported in v1 native write mode.");
                     break;
                 case "SealedSystemVolume":
                     issues.Add("Sealed/system APFS volumes are not writable in this release.");

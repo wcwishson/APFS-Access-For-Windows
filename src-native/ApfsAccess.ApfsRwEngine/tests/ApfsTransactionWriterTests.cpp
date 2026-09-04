@@ -1,4 +1,5 @@
 #include "ApfsFormat.h"
+#include "ApfsNameCodec.h"
 #include "ApfsTransactionWriter.h"
 #include "RandomAccessSource.h"
 
@@ -531,14 +532,15 @@ bool TestRecordEncoders()
     directory.name_utf8 = "Report.txt";
     directory.name_hash = 0x12345;
     directory.hashed_name = true;
-    ok &= Require(EncodeAppleDirectoryRecord(directory, record, error),
+    const auto foldedNames = ApfsNamePolicy::FromIncompatibleFeatures(0x1);
+    ok &= Require(EncodeAppleDirectoryRecord(directory, foldedNames, record, error),
         "hashed directory encoding: " + error);
     ok &= Require(ReadU64LE(record.key, 0).value_or(0) == ((9ull << 60) | 2),
         "directory key layout");
     ok &= Require((ReadU32LE(record.key, 8).value_or(0) & 0x3ffu) == 11,
         "directory key includes terminating nul length");
-    ok &= Require((ReadU32LE(record.key, 8).value_or(0) >> 10) == 0x12345,
-        "directory key includes hash");
+    ok &= Require((ReadU32LE(record.key, 8).value_or(0) >> 10) == 0x28c52d,
+        "directory key includes codec-computed APFS hash");
     ok &= Require(record.key.back() == std::byte{0}, "directory name is nul terminated");
     ok &= Require(ReadU64LE(record.value, 0).value_or(0) == 17, "directory child id");
     encoded_records.push_back(record);

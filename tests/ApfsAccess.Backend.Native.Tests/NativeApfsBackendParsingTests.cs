@@ -94,11 +94,24 @@ public sealed class NativeApfsBackendParsingTests
         Assert.Contains(
             "Snapshot/clone mutation semantics are not supported in v1 native write mode.",
             snapshot.WriteIncompatibilities);
-        Assert.Contains(
-            "Case-sensitive APFS volumes are not supported in v1 native write mode.",
-            snapshot.WriteIncompatibilities);
         Assert.Contains("SnapshotOrClone", snapshot.WriteUnsupportedFeatures);
-        Assert.Contains("CaseSensitive", snapshot.WriteUnsupportedFeatures);
+        Assert.DoesNotContain("CaseSensitive", snapshot.WriteUnsupportedFeatures);
+    }
+
+    [Fact]
+    public void ParseVolumeRows_KeepsOrdinaryCaseSensitiveDataVolumeWriteCapable()
+    {
+        var stdout = """
+                     Volumes:
+                       Volume[0]: Development case-sensitive
+                     APFS: listsubvolumes returns 0
+                     """;
+
+        var volume = Assert.Single(InvokeParseVolumeRows(stdout));
+
+        Assert.Equal("Development", volume.Name);
+        Assert.Empty(volume.WriteIncompatibilities);
+        Assert.Empty(volume.WriteUnsupportedFeatures);
     }
 
     [Fact]

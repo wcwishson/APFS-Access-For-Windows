@@ -65,6 +65,7 @@ struct ApfsVolumeDescriptor
     std::uint64_t compatible_features = 0;
     std::uint64_t readonly_features = 0;
     std::uint64_t incompatible_features = 0;
+    std::uint64_t name_policy_features = 0;
     std::vector<std::string> compatible_bits;
     std::vector<std::string> readonly_bits;
     std::vector<std::string> incompatible_bits;
@@ -105,6 +106,7 @@ struct ResolvedMountVolume
     std::string volume_uuid_hex;
     std::string name_utf8;
     std::uint64_t object_id = 0;
+    std::uint64_t incompatible_features = 0;
 };
 
 enum class CatalogLoadPolicy

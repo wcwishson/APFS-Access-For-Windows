@@ -470,8 +470,10 @@ std::shared_ptr<Node> MakeNode(const std::wstring& path, bool is_directory, bool
 
 void SeedRoot(MountContext& context)
 {
+    context.args.incompatible_features =
+        apfsaccess::catalog::kIncompatCaseInsensitive;
     auto root = MakeNode(L"\\", true, false);
-    context.nodes.emplace(Key(root->path), root);
+    context.nodes.emplace(Key(&context, root->path), root);
 }
 
 FSP_FILE_SYSTEM BuildFileSystem(MountContext* context)
@@ -30057,6 +30059,204 @@ bool TestVolumeParamsUseExplorerFriendlyCleanupFlags()
     return Require(params.PersistentAcls == 0, "Volume params should not advertise persistent ACLs while APFS Access returns synthetic security descriptors");
 }
 
+bool TestVolumeParamsReflectSelectedApfsCaseMode()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    context.args.volume = L"Main";
+    context.reported_allocation_unit_bytes = 4096;
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+
+    FSP_FSCTL_VOLUME_PARAMS params{};
+    context.args.incompatible_features = 0;
+    ConfigureVolumeParamsForExplorer(context, now, params);
+    if (!Require(
+            params.CaseSensitiveSearch != 0,
+            "Case-sensitive APFS volumes must be advertised as case-sensitive to WinFsp"))
+    {
+        return false;
+    }
+
+    context.args.incompatible_features = apfsaccess::catalog::kIncompatCaseInsensitive;
+    ConfigureVolumeParamsForExplorer(context, now, params);
+    return Require(
+        params.CaseSensitiveSearch == 0,
+        "Case-insensitive APFS volumes must be advertised as case-insensitive to WinFsp");
+}
+
+bool TestPathKeysReflectSelectedApfsNamePolicy()
+{
+    MountContext exact{};
+    exact.args.incompatible_features = 0;
+    if (!Require(
+            Key(&exact, L"\\File.txt") != Key(&exact, L"\\file.txt"),
+            "Case-sensitive APFS path keys must preserve case distinctions") ||
+        !Require(
+            Key(&exact, L"\\caf\u00e9.txt") !=
+                Key(&exact, L"\\cafe\u0301.txt"),
+            "Normalization-sensitive APFS path keys must preserve normalization distinctions"))
+    {
+        return false;
+    }
+
+    MountContext normalized{};
+    normalized.args.incompatible_features =
+        apfsaccess::catalog::kIncompatNormalizationInsensitive;
+    if (!Require(
+            Key(&normalized, L"\\File.txt") != Key(&normalized, L"\\file.txt"),
+            "Normalization-only APFS path keys must remain case-sensitive") ||
+        !Require(
+            Key(&normalized, L"\\caf\u00e9.txt") ==
+                Key(&normalized, L"\\cafe\u0301.txt"),
+            "Normalization-insensitive APFS path keys must coalesce canonical equivalents"))
+    {
+        return false;
+    }
+
+    MountContext folded{};
+    folded.args.incompatible_features =
+        apfsaccess::catalog::kIncompatCaseInsensitive;
+    Node exact_directory{};
+    exact_directory.is_directory = true;
+    exact_directory.incompatible_features = 0;
+    AddChildName(exact_directory, L"File.txt");
+    AddChildName(exact_directory, L"file.txt");
+    Node folded_directory{};
+    folded_directory.is_directory = true;
+    folded_directory.incompatible_features =
+        apfsaccess::catalog::kIncompatCaseInsensitive;
+    AddChildName(folded_directory, L"File.txt");
+    AddChildName(folded_directory, L"file.txt");
+
+    return Require(
+               Key(&folded, L"\\File.txt") == Key(&folded, L"\\file.txt"),
+               "Case-insensitive APFS path keys must coalesce case variants") &&
+           Require(
+               Key(&folded, L"\\caf\u00e9.txt") ==
+               Key(&folded, L"\\cafe\u0301.txt"),
+               "Case-insensitive APFS path keys must also normalize canonical equivalents") &&
+           Require(
+               exact_directory.children.size() == 2,
+               "Case-sensitive APFS directories must retain case-distinct children") &&
+           Require(
+               folded_directory.children.size() == 1,
+               "Case-insensitive APFS directories must coalesce case-equivalent children");
+}
+
+bool TestCallbacksRoundTripCaseSensitiveApfsNames()
+{
+    MountContext context{};
+    context.overlay_write_enabled = true;
+    context.args.incompatible_features = 0;
+    std::array<std::byte, 16> security{};
+    SeedSecurity(context, security);
+
+    auto root = std::make_shared<Node>();
+    SetNodePath(&context, *root, L"\\");
+    root->hydration_key = root->path_key;
+    root->is_directory = true;
+    root->loaded = true;
+    root->timestamp = UtcNow();
+    context.nodes.emplace(Key(&context, root->path), root);
+
+    auto fs = BuildFileSystem(&context);
+    const auto create = [&](const wchar_t* path) -> bool
+    {
+        PVOID open_context = nullptr;
+        FSP_FSCTL_FILE_INFO info{};
+        const auto status = CB_Create(
+            &fs,
+            const_cast<PWSTR>(path),
+            FILE_NON_DIRECTORY_FILE,
+            FILE_READ_DATA | FILE_WRITE_DATA | DELETE,
+            0,
+            nullptr,
+            0,
+            &open_context,
+            &info);
+        if (open_context != nullptr)
+        {
+            CB_Close(&fs, open_context);
+        }
+        return status == STATUS_SUCCESS;
+    };
+
+    if (!Require(create(L"\\File.txt"),
+            "Case-sensitive callback create must accept the first case variant") ||
+        !Require(create(L"\\file.txt"),
+            "Case-sensitive callback create must accept a distinct case variant"))
+    {
+        return false;
+    }
+
+    PVOID rename_context = nullptr;
+    FSP_FSCTL_FILE_INFO info{};
+    if (!Require(
+            CB_Open(
+                &fs,
+                const_cast<PWSTR>(L"\\File.txt"),
+                FILE_NON_DIRECTORY_FILE,
+                DELETE,
+                &rename_context,
+                &info) == STATUS_SUCCESS && rename_context != nullptr,
+            "Case-sensitive callback rename must open the exact source"))
+    {
+        return false;
+    }
+    const auto rename_status = CB_Rename(
+        &fs,
+        rename_context,
+        const_cast<PWSTR>(L"\\File.txt"),
+        const_cast<PWSTR>(L"\\caf\u00e9.txt"),
+        FALSE);
+    CB_Close(&fs, rename_context);
+    if (!Require(rename_status == STATUS_SUCCESS,
+            "Case-sensitive callback rename must preserve the Unicode target") ||
+        !Require(context.nodes.find(Key(&context, L"\\caf\u00e9.txt")) != context.nodes.end(),
+            "Renamed Unicode target must remain addressable by its exact spelling") ||
+        !Require(context.nodes.find(Key(&context, L"\\cafe\u0301.txt")) == context.nodes.end(),
+            "Normalization-sensitive lookup must not alias a decomposed spelling") ||
+        !Require(context.nodes.find(Key(&context, L"\\file.txt")) != context.nodes.end(),
+            "Case-distinct sibling must survive the other sibling's rename"))
+    {
+        return false;
+    }
+
+    const auto remove = [&](const wchar_t* path) -> bool
+    {
+        PVOID open_context = nullptr;
+        FSP_FSCTL_FILE_INFO delete_info{};
+        if (CB_Open(
+                &fs,
+                const_cast<PWSTR>(path),
+                FILE_NON_DIRECTORY_FILE,
+                DELETE,
+                &open_context,
+                &delete_info) != STATUS_SUCCESS ||
+            open_context == nullptr)
+        {
+            return false;
+        }
+        const auto status = CB_SetDelete(
+            &fs, open_context, const_cast<PWSTR>(path), TRUE);
+        if (status == STATUS_SUCCESS)
+        {
+            CB_Cleanup(
+                &fs, open_context, const_cast<PWSTR>(path), FspCleanupDelete);
+        }
+        CB_Close(&fs, open_context);
+        return status == STATUS_SUCCESS;
+    };
+
+    return Require(remove(L"\\caf\u00e9.txt"),
+               "Case-sensitive callback delete must remove the renamed Unicode target") &&
+           Require(remove(L"\\file.txt"),
+               "Case-sensitive callback delete must remove the remaining case variant") &&
+           Require(context.nodes.size() == 1 && root->children.empty(),
+               "Case-sensitive create/rename/delete round trip must leave only the root");
+}
+
 bool TestNamedStreamCopyCompatibility()
 {
     MountContext context{};
@@ -32925,13 +33125,20 @@ bool TestResolveMountVolumeOidContainerMismatch()
 
 bool TestResolveMountVolumeNameContainerScoped()
 {
-    ResolveFixtureFile fixture(
-        SingleVolumeStoreImage("Alpha", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "scoped");
+    auto image = SingleVolumeStoreImage(
+        "Alpha", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    image.stores.front().volumes.front().incompat =
+        apfsaccess::catalog::kIncompatNormalizationInsensitive;
+    ResolveFixtureFile fixture(image, "scoped");
     bool ok = true;
     Arguments matched = ResolveTestArgs(fixture.path, L"Alpha",
         0, L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    ok &= Require(ResolveMountVolumeObjectId(matched) && matched.volume_object_id == 101,
-        "name plus matching container resolves the volume");
+    ok &= Require(
+        ResolveMountVolumeObjectId(matched) &&
+            matched.volume_object_id == 101 &&
+            matched.incompatible_features ==
+                apfsaccess::catalog::kIncompatNormalizationInsensitive,
+        "name plus matching container resolves the volume and its APFS name policy");
     Arguments mismatched = ResolveTestArgs(fixture.path, L"Alpha",
         0, L"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     ok &= Require(!ResolveMountVolumeObjectId(mismatched),
@@ -33287,6 +33494,10 @@ bool TestManifestSessionFunnel()
         IsManifestSession(&ctx_alpha) && IsManifestSession(&ctx_beta),
         "manifest-funnel: sessions flagged");
     ok &= Require(
+        ctx_alpha.args.incompatible_features == 0 &&
+            ctx_beta.args.incompatible_features == 0,
+        "manifest-funnel: each session inherits its catalogued APFS name policy");
+    ok &= Require(
         ctx_alpha.metadata_store != nullptr &&
             ctx_alpha.metadata_store == coordinator->FindSessionStore(101),
         "manifest-funnel: context borrows the coordinator session");
@@ -33517,6 +33728,8 @@ bool TestManifestMetadataPolicyProjection()
     args.write_require_canonical_replay_candidate_on_non_fixture = false;
     args.device_offset_bytes = 4096;
     args.volume_object_id = 101;
+    args.incompatible_features =
+        apfsaccess::catalog::kIncompatNormalizationInsensitive;
 
     const auto context = BuildMetadataStoreVolumeContext(args);
     return Require(context.device_path == args.device &&
@@ -33529,7 +33742,9 @@ bool TestManifestMetadataPolicyProjection()
                        !context.reject_scaffold_replay_blob_on_non_fixture &&
                        !context.require_canonical_replay_candidate_on_non_fixture &&
                        context.device_offset_bytes == 4096 &&
-                       context.volume_object_id == 101,
+                       context.volume_object_id == 101 &&
+                       context.incompatible_features ==
+                           apfsaccess::catalog::kIncompatNormalizationInsensitive,
                    "Manifest metadata context must preserve every legacy write policy");
 }
 
@@ -34016,6 +34231,18 @@ bool RunSelectedTest(const std::string& name)
     if (name == "volume-acl-flag")
     {
         return TestVolumeParamsUseExplorerFriendlyCleanupFlags();
+    }
+    if (name == "apfs-case-mode")
+    {
+        return TestVolumeParamsReflectSelectedApfsCaseMode();
+    }
+    if (name == "apfs-path-keys")
+    {
+        return TestPathKeysReflectSelectedApfsNamePolicy();
+    }
+    if (name == "apfs-case-callback-roundtrip")
+    {
+        return TestCallbacksRoundTripCaseSensitiveApfsNames();
     }
     if (name == "stable-volume-serial")
     {
@@ -35502,6 +35729,9 @@ int main(int argc, char** argv)
     ok &= TestRecoveryRootOverrideSurvivesTempChange();
     ok &= TestBuildWinFspMountPointUsesGlobalDriveForExplorer();
     ok &= TestVolumeParamsUseExplorerFriendlyCleanupFlags();
+    ok &= TestVolumeParamsReflectSelectedApfsCaseMode();
+    ok &= TestPathKeysReflectSelectedApfsNamePolicy();
+    ok &= TestCallbacksRoundTripCaseSensitiveApfsNames();
     ok &= TestNamedStreamCopyCompatibility();
     ok &= TestNamedStreamCreateDoesNotCreateVisibleApfsFile();
     ok &= TestNamedStreamCreateOnStaleSpoolBackedFileKeepsPayloadReadable();

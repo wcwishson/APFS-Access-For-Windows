@@ -957,6 +957,27 @@ bool EncodeAppleDirectoryRecord(const AppleDirectoryRecord& value,
     return true;
 }
 
+bool EncodeAppleDirectoryRecord(const AppleDirectoryRecord& value,
+    const ApfsNamePolicy& name_policy,
+    catalog::BtreeRecord& out_record, std::string& out_error)
+{
+    const auto bytes = std::span(
+        reinterpret_cast<const std::byte*>(value.name_utf8.data()),
+        value.name_utf8.size());
+    const auto decoded = ApfsNameCodec::Decode(bytes, name_policy);
+    if (!decoded.ok())
+    {
+        out_record = {};
+        out_error = "AppleDirectoryNameInvalid:" + decoded.detail;
+        return false;
+    }
+
+    AppleDirectoryRecord canonical = value;
+    canonical.hashed_name = name_policy.UsesHashedDirectoryKeys();
+    canonical.name_hash = decoded.value->directory_hash.value_or(0);
+    return EncodeAppleDirectoryRecord(canonical, out_record, out_error);
+}
+
 bool EncodeAppleFileExtentRecord(const AppleFileExtentRecord& value,
     catalog::BtreeRecord& out_record, std::string& out_error)
 {

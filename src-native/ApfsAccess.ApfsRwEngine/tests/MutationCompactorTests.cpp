@@ -1,5 +1,7 @@
 #include "MutationCompactor.h"
 
+#include "ApfsNameCodec.h"
+
 #include <algorithm>
 #include <iostream>
 #include <string>
@@ -9,6 +11,9 @@
 namespace
 {
 using apfsaccess::rw::MutationCompactor;
+using apfsaccess::rw::ApfsCaseMode;
+using apfsaccess::rw::ApfsNamePolicy;
+using apfsaccess::rw::ApfsNormalizationMode;
 
 bool Require(bool condition, const char* message)
 {
@@ -41,6 +46,16 @@ bool HasPayloadPath(
     return std::find(summary.payload_paths.begin(), summary.payload_paths.end(), path) != summary.payload_paths.end();
 }
 
+std::wstring CanonicalPath(
+    std::wstring_view path,
+    const ApfsNamePolicy& policy = {
+        ApfsCaseMode::Insensitive,
+        ApfsNormalizationMode::Insensitive})
+{
+    const auto result = apfsaccess::rw::ApfsNameCodec::CanonicalWindowsPathKey(path, policy);
+    return result.ok() ? *result.value : std::wstring{};
+}
+
 bool TestWritesCollapseToFinalPayloadPath()
 {
     const std::vector<MutationCompactor::MutationView> mutations{
@@ -54,7 +69,7 @@ bool TestWritesCollapseToFinalPayloadPath()
     return Require(summary.raw_mutation_count == 3, "raw count should include ignored metadata") &&
            Require(summary.compacted_mutation_count == 1, "same file writes should compact to one payload path") &&
            Require(summary.payload_paths.size() == 1, "same file writes should emit one path") &&
-           Require(summary.payload_paths[0] == L"\\folder\\file.bin", "payload path should be normalized and canonical");
+           Require(summary.payload_paths[0] == CanonicalPath(L"\\folder\\file.bin"), "payload path should be normalized and canonical");
 }
 
 bool TestTruncateDropsPayloadPastEof()
@@ -79,7 +94,7 @@ bool TestSetFileSizeGrowthRequiresPayload()
     const auto summary = MutationCompactor::Summarize(mutations);
 
     return Require(summary.payload_paths.size() == 1, "growth should require final payload materialization") &&
-           Require(summary.payload_paths[0] == L"\\file.bin", "relative growth path should normalize to rooted path");
+           Require(summary.payload_paths[0] == CanonicalPath(L"\\file.bin"), "relative growth path should normalize to rooted path");
 }
 
 bool TestRenameChainsRemapPayloadPaths()
@@ -93,7 +108,7 @@ bool TestRenameChainsRemapPayloadPaths()
     const auto summary = MutationCompactor::Summarize(mutations);
 
     return Require(summary.payload_paths.size() == 1, "rename chain should leave one final payload path") &&
-           Require(summary.payload_paths[0] == L"\\c\\final.bin", "rename chain should remap to final destination");
+           Require(summary.payload_paths[0] == CanonicalPath(L"\\c\\final.bin"), "rename chain should remap to final destination");
 }
 
 bool TestDeleteSubtreeRemovesPayloadPaths()
@@ -124,7 +139,30 @@ bool TestMixedWorkloadKeepsOnlyFinalLivePayloads()
 
     return Require(summary.raw_mutation_count == 6, "mixed workload should report raw count") &&
            Require(summary.compacted_mutation_count == 1, "mixed workload should keep only one live payload") &&
-           Require(HasPayloadPath(summary, L"\\kept\\final.bin"), "mixed workload should keep renamed live payload");
+           Require(HasPayloadPath(summary, CanonicalPath(L"\\kept\\final.bin")), "mixed workload should keep renamed live payload");
+}
+
+bool TestCompactionHonorsApfsNamePolicy()
+{
+    const std::vector<MutationCompactor::MutationView> mutations{
+        Mutation(MutationCompactor::MutationKind::Write, L"\\File.bin", L"", 4),
+        Mutation(MutationCompactor::MutationKind::Write, L"\\file.bin", L"", 8),
+    };
+
+    const auto exact = MutationCompactor::Summarize(
+        mutations,
+        ApfsNamePolicy{ApfsCaseMode::Sensitive, ApfsNormalizationMode::Sensitive});
+    const auto folded = MutationCompactor::Summarize(
+        mutations,
+        ApfsNamePolicy{ApfsCaseMode::Insensitive, ApfsNormalizationMode::Insensitive});
+    const auto exact_policy = ApfsNamePolicy{
+        ApfsCaseMode::Sensitive,
+        ApfsNormalizationMode::Sensitive};
+
+    return Require(exact.compacted_mutation_count == 2, "case-sensitive APFS paths must not coalesce") &&
+           Require(HasPayloadPath(exact, CanonicalPath(L"\\File.bin", exact_policy)), "case-sensitive compaction should retain uppercase path") &&
+           Require(HasPayloadPath(exact, CanonicalPath(L"\\file.bin", exact_policy)), "case-sensitive compaction should retain lowercase path") &&
+           Require(folded.compacted_mutation_count == 1, "case-insensitive APFS paths should coalesce");
 }
 }
 
@@ -135,7 +173,8 @@ int main()
         !TestSetFileSizeGrowthRequiresPayload() ||
         !TestRenameChainsRemapPayloadPaths() ||
         !TestDeleteSubtreeRemovesPayloadPaths() ||
-        !TestMixedWorkloadKeepsOnlyFinalLivePayloads())
+        !TestMixedWorkloadKeepsOnlyFinalLivePayloads() ||
+        !TestCompactionHonorsApfsNamePolicy())
     {
         return 1;
     }

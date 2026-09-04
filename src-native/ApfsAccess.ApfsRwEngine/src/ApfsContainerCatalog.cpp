@@ -103,6 +103,8 @@ ApfsVolumeDescriptor DescribeVolume(
     descriptor.readonly_features = volume.readonly_features;
     descriptor.incompatible_features = volume.incompatible_features &
         ~kVolumeSupportedIncompatibleFeaturesMask;
+    descriptor.name_policy_features = volume.incompatible_features &
+        kVolumeSupportedIncompatibleFeaturesMask;
     descriptor.compatible_bits = HexBits(volume.features);
     descriptor.readonly_bits = HexBits(volume.readonly_features);
     descriptor.incompatible_bits = HexBits(descriptor.incompatible_features);
@@ -579,6 +581,7 @@ bool ApfsContainerCatalog::TryResolveVolumeByName(
                 candidate.volume_uuid_hex = volume.volume_uuid_hex;
                 candidate.name_utf8 = volume.name_utf8;
                 candidate.object_id = volume.object_id;
+                candidate.incompatible_features = volume.name_policy_features;
                 found = true;
             }
         }
@@ -615,6 +618,7 @@ bool ApfsContainerCatalog::TryResolveVolumeByOid(
             out_volume.volume_uuid_hex = volume.volume_uuid_hex;
             out_volume.name_utf8 = volume.name_utf8;
             out_volume.object_id = volume.object_id;
+            out_volume.incompatible_features = volume.name_policy_features;
             return true;
         }
     }
@@ -656,6 +660,7 @@ bool ApfsContainerCatalog::TryResolveVolume(
             out_volume.volume_uuid_hex = volume.volume_uuid_hex;
             out_volume.name_utf8 = volume.name_utf8;
             out_volume.object_id = volume.object_id;
+            out_volume.incompatible_features = volume.name_policy_features;
             return true;
         }
     }
@@ -710,6 +715,7 @@ bool ApfsContainerCatalog::TryResolveVolumeByNameInContainer(
         out_volume.volume_uuid_hex = match->volume_uuid_hex;
         out_volume.name_utf8 = match->name_utf8;
         out_volume.object_id = match->object_id;
+        out_volume.incompatible_features = match->name_policy_features;
         return true;
     }
     out_error = "CatalogContainerUuidMissing:" + container_uuid_hex;

@@ -586,9 +586,11 @@ bool TestPublishesReachableFileThroughBothObjectMaps()
     directory.file_id = kFileId;
     directory.flags = 8;
     directory.name_utf8 = "hello.bin";
-    directory.hashed_name = true;
-    directory.name_hash = 1;
-    ok &= Require(EncodeAppleDirectoryRecord(directory, record, error),
+    ok &= Require(EncodeAppleDirectoryRecord(
+            directory,
+            ApfsNamePolicy::FromIncompatibleFeatures(kIncompatCaseInsensitive),
+            record,
+            error),
         "encode reachable directory record: " + error);
     records.push_back(std::move(record));
 
@@ -835,22 +837,24 @@ bool TestVolumeTransactionMaintainsPhysicalExtentReferences()
             add_inode(kThirdFile, false),
         "shared-extent fixture inode encoding: " + error);
     const auto add_directory = [&](std::uint64_t file_id,
-                                   const std::string& name,
-                                   std::uint32_t hash) {
+                                   const std::string& name) {
         AppleDirectoryRecord directory;
         directory.parent_id = 2;
         directory.file_id = file_id;
         directory.flags = 8;
         directory.name_utf8 = name;
-        directory.hashed_name = true;
-        directory.name_hash = hash;
         apfsaccess::catalog::BtreeRecord record;
-        return EncodeAppleDirectoryRecord(directory, record, error) &&
+        return EncodeAppleDirectoryRecord(
+                   directory,
+                   ApfsNamePolicy::FromIncompatibleFeatures(
+                       kIncompatCaseInsensitive),
+                   record,
+                   error) &&
             (records.push_back(std::move(record)), true);
     };
-    ok &= Require(add_directory(kFirstFile, "first.bin", 1) &&
-            add_directory(kSecondFile, "second.bin", 2) &&
-            add_directory(kThirdFile, "third.bin", 3),
+    ok &= Require(add_directory(kFirstFile, "first.bin") &&
+            add_directory(kSecondFile, "second.bin") &&
+            add_directory(kThirdFile, "third.bin"),
         "shared-extent fixture directory encoding: " + error);
     const auto add_file_extent = [&](std::uint64_t object_id,
                                      std::uint64_t logical_address,

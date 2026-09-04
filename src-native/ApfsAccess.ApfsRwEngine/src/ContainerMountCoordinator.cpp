@@ -1258,6 +1258,7 @@ bool ContainerMountCoordinator::MountVolume(
     context.device_offset_bytes = device_offset_bytes_;
     context.volume_name = WidenUtf8(resolved.name_utf8);
     context.volume_object_id = resolved.object_id;
+    context.incompatible_features = resolved.incompatible_features;
     context.shared_container_session = true;
     const auto slot_it = std::lower_bound(
         container_volume_oids_.begin(),

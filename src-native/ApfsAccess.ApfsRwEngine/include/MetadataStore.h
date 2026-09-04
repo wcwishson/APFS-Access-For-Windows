@@ -113,6 +113,8 @@ public:
         std::uint64_t data_physical_address = 0;
         std::uint64_t xid = 0;
         std::uint64_t timestamp_utc = 0;
+        // Original APFS bytes. Empty only for legacy/private fixtures and root.
+        std::string name_utf8;
     };
 
     struct CommittedInodeChange
@@ -134,6 +136,7 @@ public:
         std::wstring entry_name;
         std::uint64_t child_object_id = 0;
         std::uint64_t xid = 0;
+        std::string entry_name_utf8;
     };
 
     using SpacemanAllocation = ExtentAllocator::Extent;
@@ -195,6 +198,9 @@ public:
         // the legacy single-volume on-disk format byte-for-byte unchanged.
         std::string container_uuid_hex;
         std::string volume_uuid_hex;
+        // Selected APSB name-policy bits. Legacy fixtures default to the
+        // historical case-insensitive behavior until a catalog supplies them.
+        std::uint64_t incompatible_features = catalog::kIncompatCaseInsensitive;
     };
 
     explicit MetadataStore(VolumeContext context);
@@ -420,11 +426,12 @@ private:
     [[nodiscard]] static std::uint64_t ReadLe64(const std::vector<std::byte>& buffer, std::size_t offset);
     [[nodiscard]] static std::uint64_t StableObjectIdFromPath(const std::wstring& path);
     [[nodiscard]] static std::wstring NormalizePath(const std::wstring& path);
-    [[nodiscard]] static std::wstring CanonicalPathKey(const std::wstring& normalized_path);
-    [[nodiscard]] static std::wstring CanonicalPathKeyFromPath(const std::wstring& path);
-    [[nodiscard]] static std::wstring CanonicalPathKeyFromNormalizedPath(const std::wstring& normalized_path);
+    [[nodiscard]] std::wstring CanonicalPathKey(const std::wstring& normalized_path) const;
+    [[nodiscard]] std::wstring CanonicalPathKeyFromPath(const std::wstring& path) const;
+    [[nodiscard]] std::wstring CanonicalPathKeyFromNormalizedPath(const std::wstring& normalized_path) const;
+    [[nodiscard]] std::wstring CanonicalNameKey(const std::wstring& name) const;
     [[nodiscard]] static bool IsRootPath(const std::wstring& normalized_path);
-    [[nodiscard]] static bool IsDescendantPath(const std::wstring& candidate_path, const std::wstring& parent_path);
+    [[nodiscard]] bool IsDescendantPath(const std::wstring& candidate_path, const std::wstring& parent_path) const;
     [[nodiscard]] static bool IsDescendantPathKey(const std::wstring& candidate_key, const std::wstring& parent_key);
     [[nodiscard]] static std::wstring ParentPath(const std::wstring& normalized_path);
     [[nodiscard]] static std::wstring LeafName(const std::wstring& normalized_path);
@@ -564,7 +571,12 @@ private:
     void RemoveWorkingDirectoryChild(std::uint64_t parent_object_id, std::uint64_t child_object_id);
     [[nodiscard]] std::vector<std::uint64_t> SnapshotWorkingDirectoryChildObjectIds(std::uint64_t parent_object_id) const;
     [[nodiscard]] std::vector<std::uint64_t> SnapshotWorkingDirectoryDescendantObjectIds(std::uint64_t parent_object_id) const;
-    void UpsertWorkingDirectoryLink(std::uint64_t parent_object_id, const std::wstring& entry_name, std::uint64_t child_object_id, std::uint64_t xid);
+    void UpsertWorkingDirectoryLink(
+        std::uint64_t parent_object_id,
+        const std::wstring& entry_name,
+        std::uint64_t child_object_id,
+        std::uint64_t xid,
+        std::string entry_name_utf8 = {});
     void RemoveWorkingDirectoryLink(std::uint64_t parent_object_id, const std::wstring& entry_name);
     void ClearCommittedDirectoryLinkIndexes();
     void RebuildCommittedDirectoryLinkIndex();

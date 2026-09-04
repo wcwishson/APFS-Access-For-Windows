@@ -47,6 +47,7 @@ typedef NTSTATUS* PNTSTATUS;
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
 #include "MetadataStore.h"
+#include "ApfsNameCodec.h"
 #include "ApfsContainerCatalog.h"
 #include "ContainerMountCoordinator.h"
 #include "PayloadSpool.h"
@@ -214,6 +215,9 @@ struct Arguments
     // Explicitly selected APFS volume object ID (0 = unresolved; the catalog
     // resolution below fills it when the device catalog loads).
     std::uint64_t volume_object_id = 0;
+    // Selected APSB name-policy bits. Catalog-backed mounts replace the
+    // legacy case-insensitive default during authoritative resolution.
+    std::uint64_t incompatible_features = 0x1ULL;
     // Container UUID scope (32 lowercase hex digits, "" = unscoped). Constrains
     // name/OID resolution to one container; mismatches fail closed.
     std::wstring container_id;
@@ -267,6 +271,7 @@ struct Node
 {
     std::wstring path;
     std::wstring path_key;
+    std::uint64_t incompatible_features = 0x1ULL;
     std::wstring apfs_path;
     std::wstring hydration_key;
     std::wstring committed_read_path;
@@ -3318,19 +3323,69 @@ std::wstring LowerPathKey(std::wstring p)
 
 std::wstring Key(std::wstring p)
 {
-    return LowerPathKey(NormalizePath(p));
+    const auto result = apfsaccess::rw::ApfsNameCodec::CanonicalWindowsPathKey(
+        NormalizePath(p),
+        apfsaccess::rw::ApfsNamePolicy::FromIncompatibleFeatures(
+            apfsaccess::catalog::kIncompatCaseInsensitive));
+    return result.ok() ? *result.value : std::wstring{};
+}
+
+apfsaccess::rw::ApfsNamePolicy NamePolicyForContext(const MountContext* context)
+{
+    return apfsaccess::rw::ApfsNamePolicy::FromIncompatibleFeatures(
+        context != nullptr
+            ? context->args.incompatible_features
+            : apfsaccess::catalog::kIncompatCaseInsensitive);
+}
+
+std::wstring LowerPathKey(
+    const MountContext* context,
+    const std::wstring& normalized_path)
+{
+    const auto result = apfsaccess::rw::ApfsNameCodec::CanonicalWindowsPathKey(
+        normalized_path,
+        NamePolicyForContext(context));
+    return result.ok() ? *result.value : std::wstring{};
+}
+
+std::wstring Key(const MountContext* context, const std::wstring& path)
+{
+    return LowerPathKey(context, NormalizePath(path));
 }
 
 void SetNodePath(Node& node, const std::wstring& path)
 {
     node.path = NormalizePath(path);
-    node.path_key = LowerPathKey(node.path);
+    node.incompatible_features = apfsaccess::catalog::kIncompatCaseInsensitive;
+    node.path_key = Key(node.path);
 }
 
 void SetNodePathNormalized(Node& node, const std::wstring& path)
 {
     node.path = path;
-    node.path_key = LowerPathKey(node.path);
+    node.incompatible_features = apfsaccess::catalog::kIncompatCaseInsensitive;
+    node.path_key = Key(node.path);
+}
+
+void SetNodePath(MountContext* context, Node& node, const std::wstring& path)
+{
+    node.path = NormalizePath(path);
+    node.incompatible_features = context != nullptr
+        ? context->args.incompatible_features
+        : 0x1ULL;
+    node.path_key = LowerPathKey(context, node.path);
+}
+
+void SetNodePathNormalized(
+    MountContext* context,
+    Node& node,
+    const std::wstring& path)
+{
+    node.path = path;
+    node.incompatible_features = context != nullptr
+        ? context->args.incompatible_features
+        : 0x1ULL;
+    node.path_key = LowerPathKey(context, node.path);
 }
 
 const std::wstring& EnsureNodePathKey(Node& node)
@@ -3347,13 +3402,27 @@ std::wstring NodePathKey(const Node& node)
     return node.path_key.empty() ? Key(node.path) : node.path_key;
 }
 
+const std::wstring& EnsureNodePathKey(MountContext* context, Node& node)
+{
+    if (node.path_key.empty())
+    {
+        node.path_key = Key(context, node.path);
+    }
+    return node.path_key;
+}
+
+std::wstring NodePathKey(const MountContext* context, const Node& node)
+{
+    return node.path_key.empty() ? Key(context, node.path) : node.path_key;
+}
+
 void IndexNodeLocked(MountContext* c, const std::shared_ptr<Node>& node)
 {
     if (!c || !node)
     {
         return;
     }
-    c->nodes[EnsureNodePathKey(*node)] = node;
+    c->nodes[EnsureNodePathKey(c, *node)] = node;
 }
 
 void EmplaceNodeLocked(MountContext* c, const std::shared_ptr<Node>& node)
@@ -3362,7 +3431,7 @@ void EmplaceNodeLocked(MountContext* c, const std::shared_ptr<Node>& node)
     {
         return;
     }
-    c->nodes.emplace(EnsureNodePathKey(*node), node);
+    c->nodes.emplace(EnsureNodePathKey(c, *node), node);
 }
 
 void EraseIndexedNodeLocked(MountContext* c, const std::shared_ptr<Node>& node)
@@ -3371,7 +3440,7 @@ void EraseIndexedNodeLocked(MountContext* c, const std::shared_ptr<Node>& node)
     {
         return;
     }
-    c->nodes.erase(EnsureNodePathKey(*node));
+    c->nodes.erase(EnsureNodePathKey(c, *node));
 }
 
 std::wstring ToLowerInvariant(std::wstring value)
@@ -3509,6 +3578,26 @@ bool IsDescendantPathNormalized(const std::wstring& candidate_path, const std::w
 bool IsDescendantPath(const std::wstring& candidate_path, const std::wstring& ancestor_path)
 {
     return IsDescendantPathNormalized(NormalizePath(candidate_path), NormalizePath(ancestor_path));
+}
+
+bool IsDescendantPathNormalized(
+    const MountContext* context,
+    const std::wstring& candidate_path,
+    const std::wstring& ancestor_path)
+{
+    const auto candidate_key = LowerPathKey(context, candidate_path);
+    const auto ancestor_key = LowerPathKey(context, ancestor_path);
+    if (candidate_key.empty() || ancestor_key.empty() || candidate_key == ancestor_key)
+    {
+        return false;
+    }
+    if (ancestor_key == L"\\")
+    {
+        return candidate_key.size() > 1 && candidate_key.front() == L'\\';
+    }
+    auto ancestor_prefix = ancestor_key;
+    ancestor_prefix.push_back(L'\\');
+    return candidate_key.rfind(ancestor_prefix, 0) == 0;
 }
 
 bool IsRecycleBinPathNormalized(const std::wstring& path)
@@ -6711,13 +6800,13 @@ bool AddDirectoryEntry(
 
 std::shared_ptr<Node> TryGetNodeLocked(MountContext* c, const std::wstring& path)
 {
-    auto it = c->nodes.find(Key(path));
+    auto it = c->nodes.find(Key(c, path));
     return it == c->nodes.end() ? std::shared_ptr<Node>{} : it->second;
 }
 
 std::shared_ptr<Node> TryGetNodeLockedNormalized(MountContext* c, const std::wstring& normalized_path)
 {
-    auto it = c->nodes.find(LowerPathKey(normalized_path));
+    auto it = c->nodes.find(LowerPathKey(c, normalized_path));
     return it == c->nodes.end() ? std::shared_ptr<Node>{} : it->second;
 }
 
@@ -6731,8 +6820,8 @@ std::shared_ptr<Node> TryReuseOpenContextNodeLockedNormalized(
         return {};
     }
 
-    const auto path_key = LowerPathKey(normalized_path);
-    if (NodePathKey(*open_ctx->node) != path_key)
+    const auto path_key = LowerPathKey(c, normalized_path);
+    if (NodePathKey(c, *open_ctx->node) != path_key)
     {
         return {};
     }
@@ -6764,15 +6853,13 @@ std::shared_ptr<Node> TryGetChildNodeByParentKeyLocked(
     ++g_child_node_cached_lookup_count_for_test;
 #endif
 
-    const auto child_key = ToLowerInvariant(child_name);
-    std::wstring lookup_key;
-    lookup_key.reserve(parent_key.size() + child_key.size() + 1);
-    lookup_key.append(parent_key);
-    if (lookup_key != L"\\")
+    std::wstring child_path = normalized_parent_path;
+    if (child_path != L"\\")
     {
-        lookup_key.push_back(L'\\');
+        child_path.push_back(L'\\');
     }
-    lookup_key.append(child_key);
+    child_path.append(child_name);
+    const auto lookup_key = LowerPathKey(c, child_path);
 
     auto it = c->nodes.find(lookup_key);
     if (it != c->nodes.end())
@@ -6796,7 +6883,11 @@ std::shared_ptr<Node> TryGetChildNodeLocked(
         return {};
     }
 
-    return TryGetChildNodeByParentKeyLocked(c, NodePathKey(*parent), parent->path, child_name);
+    return TryGetChildNodeByParentKeyLocked(
+        c,
+        NodePathKey(c, *parent),
+        parent->path,
+        child_name);
 }
 
 bool IsDeleteBlockedStateLocked(const std::shared_ptr<Node>& node)
@@ -6919,9 +7010,36 @@ void RemoveChildName(std::vector<std::wstring>& children, const std::wstring& na
     }
 }
 
-std::wstring ChildNameKey(const std::wstring& name)
+std::wstring ChildNameKey(const Node& directory, const std::wstring& name)
 {
-    return ToLowerInvariant(name);
+    const auto policy = apfsaccess::rw::ApfsNamePolicy::FromIncompatibleFeatures(
+        directory.incompatible_features);
+    const auto key = apfsaccess::rw::ApfsNameCodec::CanonicalWindowsComponentKey(
+        name,
+        policy);
+    return key.ok() ? *key.value : name;
+}
+
+int CompareChildNames(
+    const Node& directory,
+    const std::wstring& left,
+    const std::wstring& right)
+{
+    const auto left_key = ChildNameKey(directory, left);
+    const auto right_key = ChildNameKey(directory, right);
+    if (left_key < right_key)
+    {
+        return -1;
+    }
+    if (right_key < left_key)
+    {
+        return 1;
+    }
+    if (left < right)
+    {
+        return -1;
+    }
+    return right < left ? 1 : 0;
 }
 
 void RebuildChildNameIndex(Node& directory)
@@ -6930,7 +7048,7 @@ void RebuildChildNameIndex(Node& directory)
     directory.child_index_by_name_key.clear();
     for (std::size_t index = 0; index < directory.children.size();)
     {
-        const auto key = ChildNameKey(directory.children[index]);
+        const auto key = ChildNameKey(directory, directory.children[index]);
         if (directory.child_index_by_name_key.emplace(key, index).second)
         {
             ++index;
@@ -6960,10 +7078,9 @@ void EnsureSortedChildNamesLocked(Node& directory)
     std::sort(
         directory.sorted_children.begin(),
         directory.sorted_children.end(),
-        [](const std::wstring& left, const std::wstring& right)
+        [&directory](const std::wstring& left, const std::wstring& right)
         {
-            const auto comparison = _wcsicmp(left.c_str(), right.c_str());
-            return comparison < 0 || (comparison == 0 && left < right);
+            return CompareChildNames(directory, left, right) < 0;
         });
     directory.sorted_children_valid = true;
 #ifdef APFSACCESS_FSHOST_UNIT_TEST
@@ -6973,7 +7090,7 @@ void EnsureSortedChildNamesLocked(Node& directory)
 
 void AddChildName(Node& directory, const std::wstring& name)
 {
-    const auto key = ChildNameKey(name);
+    const auto key = ChildNameKey(directory, name);
     if (directory.child_index_by_name_key.size() != directory.children.size())
     {
         RebuildChildNameIndex(directory);
@@ -6995,7 +7112,7 @@ void RemoveChildName(Node& directory, const std::wstring& name)
         RebuildChildNameIndex(directory);
     }
 
-    const auto key = ChildNameKey(name);
+    const auto key = ChildNameKey(directory, name);
     auto it = directory.child_index_by_name_key.find(key);
     if (it == directory.child_index_by_name_key.end())
     {
@@ -7008,7 +7125,8 @@ void RemoveChildName(Node& directory, const std::wstring& name)
     if (index != last_index)
     {
         directory.children[index] = std::move(directory.children[last_index]);
-        directory.child_index_by_name_key[ChildNameKey(directory.children[index])] = index;
+        directory.child_index_by_name_key[
+            ChildNameKey(directory, directory.children[index])] = index;
     }
     directory.children.pop_back();
     directory.sorted_children_valid = false;
@@ -7357,26 +7475,56 @@ bool IsDirectChildPath(const std::wstring& parent_path, const std::wstring& cand
     return IsDirectChildPathNormalized(NormalizePath(parent_path), NormalizePath(candidate_path));
 }
 
-bool HasDeletePermissionForTargetNormalized(const OpenContext* open_ctx, const std::wstring& target_path)
+bool IsDirectChildPathNormalized(
+    const MountContext* context,
+    const std::wstring& parent_path,
+    const std::wstring& candidate_path)
+{
+    if (!IsDescendantPathNormalized(context, candidate_path, parent_path))
+    {
+        return false;
+    }
+    if (parent_path == L"\\")
+    {
+        return candidate_path.find(L'\\', 1) == std::wstring::npos;
+    }
+    const auto parent_components = static_cast<std::size_t>(std::count(
+        parent_path.begin(),
+        parent_path.end(),
+        L'\\'));
+    const auto candidate_components = static_cast<std::size_t>(std::count(
+        candidate_path.begin(),
+        candidate_path.end(),
+        L'\\'));
+    return candidate_components == parent_components + 1;
+}
+
+bool HasDeletePermissionForTargetNormalized(
+    MountContext* c,
+    const OpenContext* open_ctx,
+    const std::wstring& target_path)
 {
     if (!open_ctx || !open_ctx->node)
     {
         return false;
     }
 
-    if (NodePathKey(*open_ctx->node) == LowerPathKey(target_path))
+    if (NodePathKey(c, *open_ctx->node) == LowerPathKey(c, target_path))
     {
         return open_ctx->allow_delete;
     }
 
     return open_ctx->node->is_directory &&
         open_ctx->allow_delete_child &&
-        IsDirectChildPathNormalized(open_ctx->node->path, target_path);
+        IsDirectChildPathNormalized(c, open_ctx->node->path, target_path);
 }
 
-bool HasDeletePermissionForTarget(const OpenContext* open_ctx, const std::wstring& target_path)
+bool HasDeletePermissionForTarget(
+    MountContext* c,
+    const OpenContext* open_ctx,
+    const std::wstring& target_path)
 {
-    return HasDeletePermissionForTargetNormalized(open_ctx, NormalizePath(target_path));
+    return HasDeletePermissionForTargetNormalized(c, open_ctx, NormalizePath(target_path));
 }
 
 bool HasDirectoryInsertPermission(const OpenContext* open_ctx, bool inserting_directory)
@@ -7490,7 +7638,7 @@ std::shared_ptr<Node> FindNodeNormalized(MountContext* c, const std::wstring& no
 
 std::filesystem::path HydrationPath(MountContext* c, const Node& n)
 {
-    const auto node_key = n.hydration_key.empty() ? Key(n.path) : n.hydration_key;
+    const auto node_key = n.hydration_key.empty() ? Key(c, n.path) : n.hydration_key;
     auto key = node_key + L"|" + c->args.device + L"|" + c->args.volume;
     auto hash = (unsigned long long)std::hash<std::wstring>{}(key);
     const bool session_cache_root = c && !c->cache_root.empty();
@@ -7534,7 +7682,7 @@ bool HasCommittedReadPathMismatch(MountContext* c, const std::shared_ptr<Node>& 
 
     std::lock_guard<std::mutex> lock(c->mutex);
     return !n->committed_read_path.empty() &&
-           Key(n->committed_read_path) != Key(n->path);
+           Key(c, n->committed_read_path) != Key(c, n->path);
 }
 
 std::wstring HydrationStreamPath(MountContext* c, const Node& n, const std::wstring& canonical_stream_name)
@@ -7581,7 +7729,7 @@ void RememberNamedStreamSizeLocked(
         return;
     }
 
-    auto& streams = c->named_stream_sizes[Key(base_path)];
+    auto& streams = c->named_stream_sizes[Key(c, base_path)];
     const auto stream_key_lower = ToLowerInvariant(stream_key);
     for (auto it = streams.begin(); it != streams.end(); ++it)
     {
@@ -7625,7 +7773,7 @@ void ForgetNamedStreamsLocked(MountContext* c, const std::wstring& base_path)
         return;
     }
 
-    c->named_stream_sizes.erase(Key(base_path));
+    c->named_stream_sizes.erase(Key(c, base_path));
 }
 
 bool EnsureHydrationSidecarExistsForNamedStream(MountContext* c, const std::shared_ptr<Node>& node)
@@ -7670,7 +7818,7 @@ bool IsHydrationStaleLocked(MountContext* c, const std::shared_ptr<Node>& node)
     return c &&
            node &&
            !node->is_directory &&
-           c->stale_hydration_keys.find(NodePathKey(*node)) != c->stale_hydration_keys.end();
+           c->stale_hydration_keys.find(NodePathKey(c, *node)) != c->stale_hydration_keys.end();
 }
 
 void InvalidateHydrationReadHandle(MountContext* c)
@@ -7689,7 +7837,7 @@ void MarkHydrationStaleLocked(MountContext* c, const std::shared_ptr<Node>& node
     if (c && node && !node->is_directory)
     {
         InvalidateHydrationReadHandle(c);
-        c->stale_hydration_keys.insert(NodePathKey(*node));
+        c->stale_hydration_keys.insert(NodePathKey(c, *node));
     }
 }
 
@@ -7698,7 +7846,7 @@ void ClearHydrationStaleLocked(MountContext* c, const std::wstring& path)
     if (c)
     {
         InvalidateHydrationReadHandle(c);
-        c->stale_hydration_keys.erase(Key(path));
+        c->stale_hydration_keys.erase(Key(c, path));
     }
 }
 
@@ -7707,7 +7855,7 @@ void ClearHydrationStaleLockedNormalized(MountContext* c, const std::wstring& no
     if (c)
     {
         InvalidateHydrationReadHandle(c);
-        c->stale_hydration_keys.erase(LowerPathKey(normalized_path));
+        c->stale_hydration_keys.erase(LowerPathKey(c, normalized_path));
     }
 }
 
@@ -7723,7 +7871,7 @@ bool MoveFileAsideForRollbackLocked(
         return true;
     }
 
-    snapshot.path_key = NodePathKey(*node);
+    snapshot.path_key = NodePathKey(c, *node);
     auto stream_it = c->named_stream_sizes.find(snapshot.path_key);
     if (stream_it != c->named_stream_sizes.end())
     {
@@ -7775,7 +7923,7 @@ void IndexDeferredDeleteRollbackPlanLocked(MountContext* c, const DeferredDelete
 
     if (!plan.path.empty())
     {
-        c->deferred_delete_rollback_path_keys.insert(LowerPathKey(plan.path));
+        c->deferred_delete_rollback_path_keys.insert(LowerPathKey(c, plan.path));
     }
     if (!plan.subtree_snapshots.empty() || (plan.node && plan.node->is_directory))
     {
@@ -7789,7 +7937,7 @@ void IndexDeferredDeleteRollbackPlanLocked(MountContext* c, const DeferredDelete
     {
         if (entry.node)
         {
-            c->deferred_delete_rollback_path_keys.insert(NodePathKey(*entry.node));
+            c->deferred_delete_rollback_path_keys.insert(NodePathKey(c, *entry.node));
         }
         if (!entry.file_snapshot.path_key.empty())
         {
@@ -7842,7 +7990,7 @@ bool HasDeferredDeleteRollbackPlanForPathLocked(
         RebuildDeferredDeleteRollbackPathKeysLocked(c);
     }
 
-    return c->deferred_delete_rollback_path_keys.find(LowerPathKey(normalized_path)) !=
+    return c->deferred_delete_rollback_path_keys.find(LowerPathKey(c, normalized_path)) !=
         c->deferred_delete_rollback_path_keys.end();
 }
 
@@ -7996,7 +8144,7 @@ void RestoreDeleteRollbackPlanLocked(MountContext* c, DeferredDeleteRollbackPlan
         plan.node->delete_intent_count = 0;
         plan.node->delete_requested_after_children = false;
         plan.node->caller_delete_retry_required = false;
-        SetNodePath(*plan.node, plan.path);
+        SetNodePath(c, *plan.node, plan.path);
         IndexNodeLocked(c, plan.node);
         if (plan.parent && plan.parent->is_directory)
         {
@@ -8019,7 +8167,7 @@ void RestoreDeleteRollbackPlanLocked(MountContext* c, DeferredDeleteRollbackPlan
         entry.node->delete_intent_count = 0;
         entry.node->delete_requested_after_children = false;
         entry.node->caller_delete_retry_required = false;
-        SetNodePath(*entry.node, entry.node->path);
+        SetNodePath(c, *entry.node, entry.node->path);
         IndexNodeLocked(c, entry.node);
         if (entry.node->path != L"\\")
         {
@@ -8202,7 +8350,7 @@ bool EnsureHydrated(MountContext* c, const std::shared_ptr<Node>& n, bool allow_
         logical_size = n->file_size;
         committed_read_path = CommittedReadPathForNodeLocked(*n);
     }
-    const auto committed_read_path_key = LowerPathKey(committed_read_path);
+    const auto committed_read_path_key = LowerPathKey(c, committed_read_path);
     if (!stale_hydration)
     {
         WIN32_FILE_ATTRIBUTE_DATA hydration_attributes{};
@@ -8805,7 +8953,7 @@ bool ReadHydratedPayloadRangeForPath(
         committed_read_path = CommittedReadPathForNodeLocked(*node);
     }
     const auto committed_read_path_for_lookup = committed_read_path.empty() ? path : committed_read_path;
-    const auto committed_read_path_key = LowerPathKey(committed_read_path_for_lookup);
+    const auto committed_read_path_key = LowerPathKey(c, committed_read_path_for_lookup);
 
     const auto overlay_spool = [&](bool require_full_coverage, std::wstring_view base_source) -> bool
     {
@@ -9193,14 +9341,13 @@ bool MergeCommittedInodeStateIntoNodeIndex(MountContext* c)
     const auto now = UtcNow();
     std::lock_guard<std::mutex> lock(c->mutex);
 
-    const auto set_node_path_from_normalized = [](Node& node, const std::wstring& normalized_path)
+    const auto set_node_path_from_normalized = [c](Node& node, const std::wstring& normalized_path)
     {
-        node.path = normalized_path;
-        node.path_key = LowerPathKey(normalized_path);
+        SetNodePathNormalized(c, node, normalized_path);
     };
-    const auto normalized_path_key = [](const std::wstring& normalized_path) -> std::wstring
+    const auto normalized_path_key = [c](const std::wstring& normalized_path) -> std::wstring
     {
-        return LowerPathKey(normalized_path);
+        return LowerPathKey(c, normalized_path);
     };
     const auto parent_of_normalized = [](const std::wstring& normalized_path) -> std::wstring
     {
@@ -9393,14 +9540,13 @@ bool MergeCommittedDirectoryChildrenIntoNodeIndex(MountContext* c, const std::sh
     const auto now = UtcNow();
     std::lock_guard<std::mutex> lock(c->mutex);
 
-    const auto set_node_path_from_normalized = [](Node& node, const std::wstring& normalized_path)
+    const auto set_node_path_from_normalized = [c](Node& node, const std::wstring& normalized_path)
     {
-        node.path = normalized_path;
-        node.path_key = LowerPathKey(normalized_path);
+        SetNodePathNormalized(c, node, normalized_path);
     };
-    const auto normalized_path_key = [](const std::wstring& normalized_path) -> std::wstring
+    const auto normalized_path_key = [c](const std::wstring& normalized_path) -> std::wstring
     {
-        return LowerPathKey(normalized_path);
+        return LowerPathKey(c, normalized_path);
     };
     const auto try_get_node_by_normalized_path = [&](const std::wstring& normalized_path) -> std::shared_ptr<Node>
     {
@@ -9496,14 +9642,13 @@ bool MergeLastCommittedInodeChangesIntoNodeIndex(MountContext* c)
 
     const auto now = UtcNow();
 
-    const auto set_node_path_from_normalized = [](Node& node, const std::wstring& normalized_path)
+    const auto set_node_path_from_normalized = [c](Node& node, const std::wstring& normalized_path)
     {
-        node.path = normalized_path;
-        node.path_key = LowerPathKey(normalized_path);
+        SetNodePathNormalized(c, node, normalized_path);
     };
-    const auto normalized_path_key = [](const std::wstring& normalized_path) -> std::wstring
+    const auto normalized_path_key = [c](const std::wstring& normalized_path) -> std::wstring
     {
-        return LowerPathKey(normalized_path);
+        return LowerPathKey(c, normalized_path);
     };
     const auto parent_of_normalized = [](const std::wstring& normalized_path) -> std::wstring
     {
@@ -11364,9 +11509,9 @@ PayloadSpoolReadIdentities ResolvePayloadSpoolIdentities(
     return ResolvePayloadSpoolIdentitiesForCanonicalKeys(
         c,
         visible_path,
-        Key(visible_path),
+        Key(c, visible_path),
         committed_read_path,
-        Key(committed_read_path));
+        Key(c, committed_read_path));
 }
 
 PayloadSpoolReadIdentities ResolvePayloadSpoolIdentitiesForCanonicalKeys(
@@ -11429,7 +11574,7 @@ std::optional<apfsaccess::rw::MetadataStore::PayloadIdentity> ResolvePayloadSpoo
     MountContext* c,
     const std::wstring& path)
 {
-    const auto path_key = Key(path);
+    const auto path_key = Key(c, path);
     return ResolvePayloadSpoolIdentitiesForCanonicalKeys(
         c,
         path,
@@ -11802,9 +11947,12 @@ bool ReadPayloadSpoolRangeIfFullyCoveredWithIdentity(
     return true;
 }
 
-bool IsSameNormalizedPath(const std::wstring& left, const std::wstring& right)
+bool IsSameNormalizedPath(
+    const MountContext* c,
+    const std::wstring& left,
+    const std::wstring& right)
 {
-    return Key(left) == Key(right);
+    return Key(c, left) == Key(c, right);
 }
 
 std::uint64_t PayloadSpoolLogicalEndForReadPathsWithIdentities(
@@ -11974,7 +12122,7 @@ bool HasReadablePayloadSpoolRangeForReadPaths(
     std::size_t bytes_to_read)
 {
     return HasReadablePayloadSpoolRange(c, visible_path, offset, bytes_to_read) ||
-        (!IsSameNormalizedPath(visible_path, committed_read_path) &&
+        (!IsSameNormalizedPath(c, visible_path, committed_read_path) &&
             HasReadablePayloadSpoolRange(c, committed_read_path, offset, bytes_to_read));
 }
 
@@ -11984,7 +12132,7 @@ std::uint64_t PayloadSpoolLogicalEndForReadPaths(
     const std::wstring& committed_read_path)
 {
     auto logical_end = PayloadSpoolLogicalEndBestEffort(c, visible_path);
-    if (!IsSameNormalizedPath(visible_path, committed_read_path))
+    if (!IsSameNormalizedPath(c, visible_path, committed_read_path))
     {
         logical_end = std::max(logical_end, PayloadSpoolLogicalEndBestEffort(c, committed_read_path));
     }
@@ -12003,7 +12151,7 @@ bool OverlayPayloadSpoolForReadPathsBestEffort(
     {
         return false;
     }
-    if (!IsSameNormalizedPath(visible_path, committed_read_path))
+    if (!IsSameNormalizedPath(c, visible_path, committed_read_path))
     {
         return OverlayPayloadSpoolBestEffort(c, committed_read_path, offset, destination, destination_size);
     }
@@ -12031,7 +12179,7 @@ bool ReadPayloadSpoolRangeIfFullyCoveredForReadPaths(
     {
         return true;
     }
-    if (IsSameNormalizedPath(visible_path, committed_read_path))
+    if (IsSameNormalizedPath(c, visible_path, committed_read_path))
     {
         return false;
     }
@@ -12076,10 +12224,10 @@ bool TryHydrateFromCurrentPayloadOverlay(
         }
         logical_size = node->file_size;
         visible_path = node->path;
-        visible_path_key = NodePathKey(*node);
+        visible_path_key = NodePathKey(c, *node);
         committed_read_path = CommittedReadPathForNodeLocked(*node);
     }
-    const auto committed_read_path_key = LowerPathKey(committed_read_path);
+    const auto committed_read_path_key = LowerPathKey(c, committed_read_path);
 
     if (logical_size > static_cast<std::uint64_t>(std::numeric_limits<LONGLONG>::max()))
     {
@@ -12246,7 +12394,7 @@ bool TryHydrateFromCurrentPayloadOverlay(
     {
         std::lock_guard<std::mutex> lock(c->mutex);
         if (TryGetNodeLockedNormalized(c, visible_path) != node ||
-            NodePathKey(*node) != visible_path_key ||
+            NodePathKey(c, *node) != visible_path_key ||
             node->file_size != logical_size ||
             (required_payload_epoch.has_value() &&
              c->payload_identity_cache_epoch.load(std::memory_order_acquire) !=
@@ -12310,7 +12458,7 @@ void PromoteFullySpooledHydrationAfterCheckpointBestEffort(
             const auto node = node_it == c->nodes.end()
                 ? std::shared_ptr<Node>{}
                 : node_it->second;
-            if (!node || node->is_directory || NodePathKey(*node) != path_key ||
+            if (!node || node->is_directory || NodePathKey(c, *node) != path_key ||
                 node->file_size < minimum_bytes || node->file_size == 0)
             {
                 continue;
@@ -12359,7 +12507,7 @@ void PromoteFullySpooledHydrationAfterCheckpointBestEffort(
             }
             logical_size = node->file_size;
             visible_path = node->path;
-            visible_path_key = NodePathKey(*node);
+            visible_path_key = NodePathKey(c, *node);
             committed_read_path = CommittedReadPathForNodeLocked(*node);
         }
 
@@ -12375,7 +12523,7 @@ void PromoteFullySpooledHydrationAfterCheckpointBestEffort(
             continue;
         }
 
-        const auto committed_read_path_key = LowerPathKey(committed_read_path);
+        const auto committed_read_path_key = LowerPathKey(c, committed_read_path);
         const auto identities = ResolvePayloadSpoolIdentitiesForCanonicalKeys(
             c,
             visible_path,
@@ -13433,7 +13581,7 @@ bool IsBenignStaleDeletedSetBasicInfoFailure(MountContext* c, const std::shared_
         std::lock_guard<std::recursive_mutex> runtime_lock(c->runtime_state_mutex);
         if (_wcsicmp(c->last_native_mutation_failure_operation.c_str(), L"SetBasicInfo") ||
             _wcsicmp(c->last_native_mutation_failure_reason.c_str(), L"SetBasicInfoTargetMissing") ||
-            !EqualsIgnoreCase(c->last_native_mutation_failure_path, node->path))
+            !IsSameNormalizedPath(c, c->last_native_mutation_failure_path, node->path))
         {
             return false;
         }
@@ -13494,7 +13642,7 @@ bool IsBenignStaleDeletedDeleteFailure(MountContext* c, const std::shared_ptr<No
         std::lock_guard<std::recursive_mutex> runtime_lock(c->runtime_state_mutex);
         if (_wcsicmp(c->last_native_mutation_failure_operation.c_str(), L"Delete") ||
             _wcsicmp(c->last_native_mutation_failure_reason.c_str(), L"DeleteTargetMissing") ||
-            !EqualsIgnoreCase(c->last_native_mutation_failure_path, node->path))
+            !IsSameNormalizedPath(c, c->last_native_mutation_failure_path, node->path))
         {
             return false;
         }
@@ -15271,6 +15419,7 @@ bool CollectDeferredDirectoryRenameReadPathsLocked(
 }
 
 bool RenameDescendantReadPathSnapshotsEqual(
+    const MountContext* c,
     const std::vector<RenameDescendantReadPathSnapshot>& lhs,
     const std::vector<RenameDescendantReadPathSnapshot>& rhs)
 {
@@ -15282,8 +15431,8 @@ bool RenameDescendantReadPathSnapshotsEqual(
     for (std::size_t index = 0; index < lhs.size(); ++index)
     {
         if (lhs[index].node != rhs[index].node ||
-            !IsSameNormalizedPath(lhs[index].old_path, rhs[index].old_path) ||
-            !IsSameNormalizedPath(lhs[index].old_committed_read_path, rhs[index].old_committed_read_path))
+            !IsSameNormalizedPath(c, lhs[index].old_path, rhs[index].old_path) ||
+            !IsSameNormalizedPath(c, lhs[index].old_committed_read_path, rhs[index].old_committed_read_path))
         {
             return false;
         }
@@ -15315,10 +15464,10 @@ bool TryCoalesceDeferredRenameRollbackPlanLocked(
 
     const auto touches_snapshot_path = [&](const RenameLocalSnapshot& plan)
     {
-        return IsSameNormalizedPath(plan.old_path, snapshot.old_path) ||
-               IsSameNormalizedPath(plan.old_path, snapshot.new_path) ||
-               IsSameNormalizedPath(plan.new_path, snapshot.old_path) ||
-               IsSameNormalizedPath(plan.new_path, snapshot.new_path);
+        return IsSameNormalizedPath(c, plan.old_path, snapshot.old_path) ||
+               IsSameNormalizedPath(c, plan.old_path, snapshot.new_path) ||
+               IsSameNormalizedPath(c, plan.new_path, snapshot.old_path) ||
+               IsSameNormalizedPath(c, plan.new_path, snapshot.new_path);
     };
 
     for (auto it = c->deferred_rename_rollback_plans.rbegin();
@@ -15348,8 +15497,8 @@ bool TryCoalesceDeferredRenameRollbackPlanLocked(
         if (previous.new_path.empty() ||
             previous.new_parent != snapshot.old_parent ||
             previous.new_leaf != snapshot.old_leaf ||
-            !IsSameNormalizedPath(previous.new_path, snapshot.old_path) ||
-            IsSameNormalizedPath(previous.old_path, snapshot.new_path))
+            !IsSameNormalizedPath(c, previous.new_path, snapshot.old_path) ||
+            IsSameNormalizedPath(c, previous.old_path, snapshot.new_path))
         {
             return false;
         }
@@ -15359,7 +15508,7 @@ bool TryCoalesceDeferredRenameRollbackPlanLocked(
                 ? previous.old_path
                 : previous.old_committed_read_path;
         if (!snapshot.old_committed_read_path.empty() &&
-            !IsSameNormalizedPath(snapshot.old_committed_read_path, expected_committed_read_path))
+            !IsSameNormalizedPath(c, snapshot.old_committed_read_path, expected_committed_read_path))
         {
             return false;
         }
@@ -16232,7 +16381,7 @@ bool SourceNodeCarriesCommittedReadPathForExperimentalRename(
         return false;
     }
 
-    if (NodePathKey(*node) != LowerPathKey(source_path))
+    if (NodePathKey(c, *node) != LowerPathKey(c, source_path))
     {
         return false;
     }
@@ -17514,7 +17663,7 @@ bool HasRenameOpenHandleConflictLocked(
         }
 
         const auto is_source = candidate == source;
-        const auto is_descendant = IsDescendantPathNormalized(candidate->path, source->path);
+        const auto is_descendant = IsDescendantPathNormalized(c, candidate->path, source->path);
         if (!is_source && !is_descendant)
         {
             continue;
@@ -17587,7 +17736,7 @@ bool RemoveNodePostorderValidatedLocked(
             const auto preserve_file_hydration =
                 node == preserved_hydration_node ||
                 (preserved_hydration_keys &&
-                    preserved_hydration_keys->find(NodePathKey(*node)) != preserved_hydration_keys->end());
+                    preserved_hydration_keys->find(NodePathKey(c, *node)) != preserved_hydration_keys->end());
             if (!preserve_file_hydration)
             {
                 InvalidateHydrationReadHandle(c);
@@ -17773,8 +17922,8 @@ bool ReindexNodePathsLocked(MountContext* c, const std::shared_ptr<Node>& node, 
 
     InvalidateHydrationReadHandle(c);
 
-    const auto old_key = LowerPathKey(old_path);
-    const auto new_key = LowerPathKey(new_path);
+    const auto old_key = LowerPathKey(c, old_path);
+    const auto new_key = LowerPathKey(c, new_path);
     const auto old_hydration_key = node->hydration_key;
     const auto target_hydration_key =
         (node->hydration_key.empty() || node->hydration_key == old_key)
@@ -17826,7 +17975,7 @@ bool ReindexNodePathsLocked(MountContext* c, const std::shared_ptr<Node>& node, 
     }
 
     node->hydration_key = target_hydration_key;
-    SetNodePathNormalized(*node, new_path);
+    SetNodePathNormalized(c, *node, new_path);
     IndexNodeLocked(c, node);
 
     if (!node->is_directory)
@@ -18051,7 +18200,7 @@ NTSTATUS CB_GetStreamInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buffer, ULONG le
     std::vector<std::pair<std::wstring, std::uint64_t>> streams;
     {
         std::lock_guard<std::mutex> lock(c->mutex);
-        const auto stream_bucket = c->named_stream_sizes.find(NodePathKey(*o->node));
+        const auto stream_bucket = c->named_stream_sizes.find(NodePathKey(c, *o->node));
         if (stream_bucket != c->named_stream_sizes.end())
         {
             for (const auto& [stream_name, stream_size] : stream_bucket->second)
@@ -18098,7 +18247,10 @@ void ConfigureVolumeParamsForExplorer(MountContext& ctx, const FILETIME& now, FS
     vp.SecurityTimeout = 2000;
     vp.StreamInfoTimeoutValid = 1;
     vp.StreamInfoTimeout = 2000;
-    vp.CaseSensitiveSearch = 0;
+    const auto name_policy = apfsaccess::rw::ApfsNamePolicy::FromIncompatibleFeatures(
+        ctx.args.incompatible_features);
+    vp.CaseSensitiveSearch =
+        name_policy.case_mode == apfsaccess::rw::ApfsCaseMode::Sensitive ? 1 : 0;
     vp.CasePreservedNames = 1;
     vp.UnicodeOnDisk = 1;
     vp.PersistentAcls = 0;
@@ -18302,7 +18454,7 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
         }
 
         node = std::make_shared<Node>();
-        SetNodePathNormalized(*node, path);
+        SetNodePathNormalized(c, *node, path);
         node->apfs_path.clear();
         node->hydration_key = node->path_key;
         node->is_directory = request_directory;
@@ -19189,7 +19341,7 @@ NTSTATUS CB_CanDelete(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name)
     std::wstring target = file_name
         ? NormalizePath(std::wstring(file_name))
         : (o && o->node && !o->node->path.empty() ? o->node->path : L"\\");
-    if (o && !HasDeletePermissionForTargetNormalized(o, target))
+    if (o && !HasDeletePermissionForTargetNormalized(c, o, target))
     {
         return trace_return(STATUS_ACCESS_DENIED, L"permission");
     }
@@ -19292,7 +19444,8 @@ NTSTATUS CB_SetDelete(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, BOOLEAN d
     std::wstring target = file_name
         ? NormalizePath(std::wstring(file_name))
         : (o && o->node && !o->node->path.empty() ? o->node->path : L"\\");
-    if (!delete_file && o && o->node && NodePathKey(*o->node) == LowerPathKey(target))
+    if (!delete_file && o && o->node &&
+        NodePathKey(c, *o->node) == LowerPathKey(c, target))
     {
         std::lock_guard<std::mutex> lock(c->mutex);
         auto locked = TryGetNodeLockedNormalized(c, target);
@@ -19329,7 +19482,8 @@ NTSTATUS CB_SetDelete(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, BOOLEAN d
     }
 
     auto node = FindNodeNormalized(c, target);
-    if (!node && o && o->node && NodePathKey(*o->node) == LowerPathKey(target))
+    if (!node && o && o->node &&
+        NodePathKey(c, *o->node) == LowerPathKey(c, target))
     {
         node = o->node;
     }
@@ -19489,7 +19643,7 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
         const bool context_is_old_parent =
             has_open_context &&
             current_open->node->is_directory &&
-            NodePathKey(*current_open->node) == LowerPathKey(old_parent_path);
+            NodePathKey(c, *current_open->node) == LowerPathKey(c, old_parent_path);
         if (has_open_context && !context_is_source && !context_is_old_parent)
         {
             return trace_return(STATUS_INVALID_PARAMETER, L"same-path-stale-context");
@@ -19656,7 +19810,7 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
         {
             return trace_return(STATUS_OBJECT_NAME_NOT_FOUND, L"missing");
         }
-        if (NodePathKey(*node) != LowerPathKey(old_path))
+        if (NodePathKey(c, *node) != LowerPathKey(c, old_path))
         {
             // Prevent stale source-handle fallback from renaming an unrelated node.
             return trace_return(STATUS_OBJECT_NAME_NOT_FOUND, L"stale-source");
@@ -19666,11 +19820,11 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
         const bool context_is_old_parent =
             has_open_context &&
             current_open->node->is_directory &&
-            NodePathKey(*current_open->node) == LowerPathKey(old_parent_path);
+            NodePathKey(c, *current_open->node) == LowerPathKey(c, old_parent_path);
         const bool context_is_new_parent =
             has_open_context &&
             current_open->node->is_directory &&
-            NodePathKey(*current_open->node) == LowerPathKey(new_parent_path);
+            NodePathKey(c, *current_open->node) == LowerPathKey(c, new_parent_path);
 
         if (has_open_context &&
             !context_is_source &&
@@ -19722,7 +19876,8 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
             return trace_return(STATUS_ACCESS_DENIED, L"root-node");
         }
         if (node->is_directory &&
-            (LowerPathKey(new_parent_path) == LowerPathKey(old_path) || IsDescendantPathNormalized(new_parent_path, old_path)))
+            (LowerPathKey(c, new_parent_path) == LowerPathKey(c, old_path) ||
+             IsDescendantPathNormalized(c, new_parent_path, old_path)))
         {
             return trace_return(STATUS_ACCESS_DENIED, L"directory-descendant");
         }
@@ -19750,7 +19905,7 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
                 const bool can_replace_with_context =
                     context_is_new_parent &&
                     current_open->allow_delete_child &&
-                    IsDirectChildPathNormalized(current_open->node->path, new_path);
+                    IsDirectChildPathNormalized(c, current_open->node->path, new_path);
                 if (!can_replace_with_context)
                 {
                     return trace_return(STATUS_ACCESS_DENIED, L"replace-context");
@@ -19804,6 +19959,7 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
                     current_open,
                     current_directory_read_paths) &&
                 RenameDescendantReadPathSnapshotsEqual(
+                    c,
                     current_directory_read_paths,
                     deferred_directory_read_paths))
             {
@@ -20800,8 +20956,8 @@ NTSTATUS CB_Read(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG le
             const auto serve_stale_or_deferred_spool_read = [&]() -> std::optional<std::size_t>
             {
                 const auto committed_read_path = SnapshotCommittedReadPathForNode(c, o->node);
-                const auto visible_path_key = NodePathKey(*o->node);
-                const auto committed_read_path_key = LowerPathKey(committed_read_path);
+                const auto visible_path_key = NodePathKey(c, *o->node);
+                const auto committed_read_path_key = LowerPathKey(c, committed_read_path);
                 const auto payload_spool_identities = ResolvePayloadSpoolIdentitiesForCanonicalKeys(
                     c,
                     o->node->path,
@@ -20926,7 +21082,7 @@ NTSTATUS CB_Read(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG le
             needs_payload_overlay &&
             [&]()
             {
-                const auto visible_path_key = NodePathKey(*o->node);
+                const auto visible_path_key = NodePathKey(c, *o->node);
                 const auto payload_spool_identity = ResolvePayloadSpoolIdentitiesForCanonicalKeys(
                     c,
                     o->node->path,
@@ -21238,8 +21394,8 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
         const auto probe_metadata_or_spool = [&]()
         {
             const auto committed_read_path = SnapshotCommittedReadPathForNode(c, n);
-            const auto visible_path_key = NodePathKey(*n);
-            const auto committed_read_path_key = LowerPathKey(committed_read_path);
+            const auto visible_path_key = NodePathKey(c, *n);
+            const auto committed_read_path_key = LowerPathKey(c, committed_read_path);
             const auto payload_spool_identities = ResolvePayloadSpoolIdentitiesForCanonicalKeys(
                 c,
                 n->path,
@@ -21478,14 +21634,17 @@ NTSTATUS CB_ReadDirectory(FSP_FILE_SYSTEM* fs, PVOID dir_ctx, PWSTR, PWSTR marke
                 sorted_children.begin(),
                 sorted_children.end(),
                 mk,
-                [](const std::wstring& name, const std::wstring& value)
+                [&directory = *o->node](const std::wstring& name, const std::wstring& value)
                 {
-                    return _wcsicmp(name.c_str(), value.c_str()) < 0;
+                    return CompareChildNames(directory, name, value) < 0;
                 });
             first_child_index = static_cast<std::size_t>(
                 std::distance(sorted_children.begin(), marker_it));
             while (first_child_index < sorted_children.size() &&
-                   _wcsicmp(sorted_children[first_child_index].c_str(), mk.c_str()) <= 0)
+                   CompareChildNames(
+                       *o->node,
+                       sorted_children[first_child_index],
+                       mk) <= 0)
             {
                 ++first_child_index;
             }
@@ -21602,6 +21761,7 @@ bool ResolveMountVolumeObjectId(Arguments& args)
                            << L" is not present in the requested container." << std::endl;
                 return false;
             }
+            args.incompatible_features = resolved.incompatible_features;
             return true;
         }
         // Unscoped explicit OID: verify presence and reject cross-container
@@ -21620,6 +21780,7 @@ bool ResolveMountVolumeObjectId(Arguments& args)
                         resolved.volume_uuid_hex = volume.volume_uuid_hex;
                         resolved.name_utf8 = volume.name_utf8;
                         resolved.object_id = volume.object_id;
+                        resolved.incompatible_features = volume.name_policy_features;
                     }
                 }
             }
@@ -21632,6 +21793,7 @@ bool ResolveMountVolumeObjectId(Arguments& args)
                        << std::endl;
             return false;
         }
+        args.incompatible_features = resolved.incompatible_features;
         return true;
     }
 
@@ -21656,6 +21818,7 @@ bool ResolveMountVolumeObjectId(Arguments& args)
             return false;
         }
         args.volume_object_id = resolved.object_id;
+        args.incompatible_features = resolved.incompatible_features;
         std::wcerr << L"[FsHost] Resolved volume '" << args.volume
                    << L"' to object ID " << resolved.object_id << L"." << std::endl;
         return true;
@@ -21671,6 +21834,7 @@ bool ResolveMountVolumeObjectId(Arguments& args)
         return false;
     }
     args.volume_object_id = resolved.object_id;
+    args.incompatible_features = resolved.incompatible_features;
     std::wcerr << L"[FsHost] Resolved volume '" << args.volume
                << L"' to object ID " << resolved.object_id << L"." << std::endl;
     return true;
@@ -22197,19 +22361,23 @@ BOOL WINAPI CtrlHandler(DWORD type)
 apfsaccess::rw::MetadataStore::VolumeContext BuildMetadataStoreVolumeContext(
     const Arguments& args)
 {
-    return apfsaccess::rw::MetadataStore::VolumeContext{
-        args.device,
-        args.volume,
-        args.allow_raw_physical_write,
-        args.write_integrity_check_on_mount,
-        args.write_crash_replay_mode,
-        args.allow_legacy_scaffold_for_fixtures,
-        args.write_disallow_scaffold_commit_on_non_fixture,
-        args.write_reject_scaffold_replay_blob_on_non_fixture,
-        args.write_require_canonical_replay_candidate_on_non_fixture,
-        false,
-        args.device_offset_bytes,
-        args.volume_object_id};
+    apfsaccess::rw::MetadataStore::VolumeContext context{};
+    context.device_path = args.device;
+    context.volume_name = args.volume;
+    context.allow_raw_physical_write = args.allow_raw_physical_write;
+    context.integrity_check_on_mount = args.write_integrity_check_on_mount;
+    context.crash_replay_mode = args.write_crash_replay_mode;
+    context.allow_legacy_scaffold_for_fixtures = args.allow_legacy_scaffold_for_fixtures;
+    context.disallow_scaffold_commit_on_non_fixture =
+        args.write_disallow_scaffold_commit_on_non_fixture;
+    context.reject_scaffold_replay_blob_on_non_fixture =
+        args.write_reject_scaffold_replay_blob_on_non_fixture;
+    context.require_canonical_replay_candidate_on_non_fixture =
+        args.write_require_canonical_replay_candidate_on_non_fixture;
+    context.device_offset_bytes = args.device_offset_bytes;
+    context.volume_object_id = args.volume_object_id;
+    context.incompatible_features = args.incompatible_features;
+    return context;
 }
 
 // Expands a validated container manifest into per-volume arguments. Every
@@ -22295,6 +22463,8 @@ bool MountManifestSession(
         ctx.container_volume_oid = 0;
         return false;
     }
+    ctx.args.incompatible_features =
+        ctx.metadata_store->Context().incompatible_features;
     return true;
 }
 
@@ -23528,6 +23698,8 @@ int wmain(int argc, wchar_t** argv)
         }
         else
         {
+            ctx.args.incompatible_features =
+                ctx.metadata_store->Context().incompatible_features;
             const auto block_size = ctx.metadata_store->BlockSizeBytes().value_or(0);
             const auto total_blocks = ctx.metadata_store->TotalBlocks().value_or(0);
             const auto checkpoint_xid = ctx.metadata_store->CheckpointXid().value_or(0);
@@ -23711,7 +23883,7 @@ int wmain(int argc, wchar_t** argv)
 
     FILETIME now{}; GetSystemTimeAsFileTime(&now);
     auto root = std::make_shared<Node>();
-    SetNodePath(*root, L"\\");
+    SetNodePath(&ctx, *root, L"\\");
     root->hydration_key = root->path_key;
     root->apfs_path = ApfsRoot(args);
     root->is_directory = true;

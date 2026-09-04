@@ -177,22 +177,6 @@ std::wstring JoinPath(const std::wstring& parent, const std::wstring& name)
     return normalized_parent + L"\\" + name;
 }
 
-std::wstring Utf8ToWide(const std::vector<std::byte>& bytes, std::size_t offset, std::size_t length)
-{
-    while (length > 0 && std::to_integer<unsigned char>(bytes[offset + length - 1]) == 0)
-    {
-        --length;
-    }
-    std::wstring result;
-    result.reserve(length);
-    for (std::size_t index = 0; index < length; ++index)
-    {
-        const auto ch = std::to_integer<unsigned char>(bytes[offset + index]);
-        result.push_back(static_cast<wchar_t>(ch < 0x80 ? ch : L'?'));
-    }
-    return result;
-}
-
 bool IsSupportedFileTypeFromMode(std::uint16_t mode)
 {
     const auto type = static_cast<std::uint16_t>(mode & kModeTypeMask);
@@ -637,12 +621,13 @@ bool NativeApfsReader::TryLoadVolumeProjection(
         }
     }
 
-    const auto directory_keys_are_hashed =
-        (selected_volume->superblock.incompatible_features &
-            catalog::kIncompatCaseInsensitive) != 0;
+    out_projection.incompatible_features =
+        selected_volume->superblock.incompatible_features;
+    out_projection.name_policy = ApfsNamePolicy::FromIncompatibleFeatures(
+        selected_volume->superblock.incompatible_features);
     if (!ProjectFileSystemTree(
             fs_records, block_size, total_blocks, checkpoint_xid,
-            directory_keys_are_hashed, out_projection))
+            out_projection.name_policy, out_projection))
     {
         out_error = L"NativeApfsRootTreeProjectionFailed";
         return false;
@@ -980,7 +965,7 @@ bool NativeApfsReader::ProjectFileSystemTree(
     std::uint32_t block_size,
     std::uint64_t total_blocks,
     std::uint64_t xid,
-    bool directory_keys_are_hashed,
+    const ApfsNamePolicy& name_policy,
     NativeApfsVolumeProjection& projection)
 {
     if (block_size == 0)
@@ -1011,6 +996,7 @@ bool NativeApfsReader::ProjectFileSystemTree(
         std::uint64_t timestamp = 0;
         std::uint16_t flags = 0;
         std::wstring name;
+        std::string name_utf8;
     };
 
     std::unordered_map<std::uint64_t, RawInode> raw_inodes;
@@ -1068,6 +1054,8 @@ bool NativeApfsReader::ProjectFileSystemTree(
         }
         else if (record_type == kApfsTypeDirectoryRecord)
         {
+            const bool directory_keys_are_hashed =
+                name_policy.UsesHashedDirectoryKeys();
             const std::size_t name_offset = directory_keys_are_hashed ? 12u : 10u;
             if (record.key.size() < name_offset || record.value.size() < 18)
             {
@@ -1076,13 +1064,26 @@ bool NativeApfsReader::ProjectFileSystemTree(
             const auto name_length = directory_keys_are_hashed
                 ? static_cast<std::size_t>(ReadLe32(record.key, 8) & 0x3ffu)
                 : static_cast<std::size_t>(ReadLe16(record.key, 8));
-            if (name_length == 0 || name_length > record.key.size() - name_offset)
+            if (name_length <= 1 ||
+                name_length != record.key.size() - name_offset ||
+                record.key[name_offset + name_length - 1] != std::byte{0})
             {
-                continue;
+                return false;
+            }
+            const auto name_bytes = std::span(
+                record.key.data() + name_offset, name_length - 1);
+            const auto decoded = ApfsNameCodec::Decode(name_bytes, name_policy);
+            if (!decoded.ok() ||
+                (directory_keys_are_hashed &&
+                 !ApfsNameCodec::MatchesHashedDirectoryKey(
+                     *decoded.value, ReadLe32(record.key, 8))))
+            {
+                return false;
             }
             RawDirectoryEntry entry{};
             entry.parent_id = object_id;
-            entry.name = Utf8ToWide(record.key, name_offset, name_length);
+            entry.name = decoded.value->windows_display;
+            entry.name_utf8 = decoded.value->original_utf8;
             entry.child_id = ReadLe64(record.value, 0x00);
             entry.timestamp = ReadLe64(record.value, 0x08);
             entry.flags = ReadLe16(record.value, 0x10);
@@ -1149,13 +1150,19 @@ bool NativeApfsReader::ProjectFileSystemTree(
     projection.btree_records.clear();
     projection.inodes.reserve(raw_inodes.size());
     projection.btree_records.reserve(records.size());
-    std::queue<std::pair<std::uint64_t, std::wstring>> pending;
+    struct PendingInode
+    {
+        std::uint64_t object_id = 0;
+        std::wstring path;
+        std::string name_utf8;
+    };
+    std::queue<PendingInode> pending;
     std::unordered_set<std::uint64_t> visited_inodes;
-    pending.push({ kRootDirectoryInode, L"\\" });
+    pending.push({ kRootDirectoryInode, L"\\", {} });
 
     while (!pending.empty())
     {
-        auto [object_id, path] = std::move(pending.front());
+        auto [object_id, path, name_utf8] = std::move(pending.front());
         pending.pop();
         if (!visited_inodes.insert(object_id).second)
         {
@@ -1177,6 +1184,7 @@ bool NativeApfsReader::ProjectFileSystemTree(
         inode.logical_size = raw_inode.is_directory ? 0 : raw_inode.logical_size;
         inode.xid = xid;
         inode.timestamp_utc = raw_inode.timestamp;
+        inode.name_utf8 = std::move(name_utf8);
 
         if (!inode.is_directory && inode.logical_size > 0)
         {
@@ -1265,7 +1273,7 @@ bool NativeApfsReader::ProjectFileSystemTree(
                         child.child_id,
                         xid,
                         false));
-                pending.push({ child.child_id, child_path });
+                pending.push({ child.child_id, child_path, child.name_utf8 });
             }
         }
     }

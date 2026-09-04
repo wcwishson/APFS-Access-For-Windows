@@ -100,8 +100,9 @@ inline constexpr std::uint64_t kNxSupportedIncompatibleFeaturesMask = 0x2ULL;
 inline constexpr std::uint64_t kNxKnownIncompatibleFeaturesMask = 0x103ULL;
 inline constexpr std::uint64_t kVolumeKnownOptionalFeaturesMask = 0x1FULL;
 inline constexpr std::uint64_t kIncompatCaseInsensitive = 0x1ULL;
+inline constexpr std::uint64_t kIncompatNormalizationInsensitive = 0x8ULL;
 inline constexpr std::uint64_t kVolumeSupportedIncompatibleFeaturesMask =
-    kIncompatCaseInsensitive;
+    kIncompatCaseInsensitive | kIncompatNormalizationInsensitive;
 inline constexpr std::uint64_t kVolumeKnownIncompatibleFeaturesMask = 0x7FULL;
 inline constexpr std::uint64_t kFsFlagUnencrypted = 0x1ULL; // [APPLE]
 inline constexpr std::uint64_t kFsFlagOneKey = 0x8ULL; // [APPLE]

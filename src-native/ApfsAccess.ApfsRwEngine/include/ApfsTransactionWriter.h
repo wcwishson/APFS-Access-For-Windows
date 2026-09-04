@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ApfsFormat.h"
+#include "ApfsNameCodec.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -196,6 +197,11 @@ bool EncodeAppleInodeRecord(
     std::string& out_error);
 bool EncodeAppleDirectoryRecord(
     const AppleDirectoryRecord& value,
+    catalog::BtreeRecord& out_record,
+    std::string& out_error);
+bool EncodeAppleDirectoryRecord(
+    const AppleDirectoryRecord& value,
+    const ApfsNamePolicy& name_policy,
     catalog::BtreeRecord& out_record,
     std::string& out_error);
 bool EncodeAppleFileExtentRecord(
