@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <cwchar>
 #include <cwctype>
 #include <filesystem>
@@ -60,6 +61,42 @@ bool IsRawPhysicalDevicePath(std::wstring_view path) noexcept
             [](wchar_t ch) { return std::iswdigit(ch) != 0; });
     }
     return false;
+}
+
+bool QueryRegularFileIdentity(HANDLE handle, FILE_ID_INFO& identity)
+{
+    FILE_STANDARD_INFO standard{};
+    FILE_BASIC_INFO basic{};
+    if (handle == INVALID_HANDLE_VALUE || GetFileType(handle) != FILE_TYPE_DISK ||
+        !GetFileInformationByHandleEx(handle, FileStandardInfo, &standard, sizeof(standard)) ||
+        standard.Directory || standard.DeletePending || standard.NumberOfLinks == 0 ||
+        !GetFileInformationByHandleEx(handle, FileBasicInfo, &basic, sizeof(basic)) ||
+        (basic.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_DEVICE |
+            FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+        !GetFileInformationByHandleEx(handle, FileIdInfo, &identity, sizeof(identity)))
+    {
+        return false;
+    }
+
+    // A disk-type handle alone can also be a raw volume/device. Require a
+    // named file inside a local filesystem volume, from the opened handle.
+    constexpr DWORD flags = FILE_NAME_NORMALIZED | VOLUME_NAME_GUID;
+    const auto length = GetFinalPathNameByHandleW(handle, nullptr, 0, flags);
+    if (length == 0 || length > 32768)
+    {
+        return false;
+    }
+    std::wstring final_path(length, L'\0');
+    const auto copied = GetFinalPathNameByHandleW(handle, final_path.data(), length, flags);
+    if (copied == 0 || copied >= length)
+    {
+        return false;
+    }
+    final_path.resize(copied);
+    const auto volume_end = final_path.find(L"}\\");
+    return final_path.starts_with(LR"(\\?\Volume{)") &&
+        volume_end != std::wstring::npos && volume_end + 2 < final_path.size() &&
+        final_path.find(L':', volume_end + 2) == std::wstring::npos;
 }
 
 struct ThreadLocalOverlappedEvent
@@ -800,6 +837,12 @@ void BlockDevice::InsertReadCacheEntryLocked(
 const std::wstring& BlockDevice::Path() const noexcept
 {
     return path_;
+}
+
+bool BlockDevice::IsRegularFile() const
+{
+    return EnsureReadHandle() != INVALID_HANDLE_VALUE &&
+        regular_file_.load(std::memory_order_acquire);
 }
 
 bool BlockDevice::IsWritable() const
@@ -2305,6 +2348,8 @@ HANDLE BlockDevice::EnsureReadHandle() const
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
         nullptr);
+    FILE_ID_INFO identity{};
+    regular_file_.store(QueryRegularFileIdentity(handle, identity), std::memory_order_release);
     read_handle_.store(handle, std::memory_order_release);
     return handle;
 }
@@ -2317,6 +2362,16 @@ HANDLE BlockDevice::EnsureWriteHandle() const
         return handle;
     }
 
+    const auto read_handle = EnsureReadHandle();
+    FILE_ID_INFO read_identity{};
+    if (!QueryRegularFileIdentity(read_handle, read_identity))
+    {
+        // Physical/unknown sources remain read-only until independent native
+        // writer acceptance. No path spelling or test override bypasses this.
+        last_io_error_.store(ERROR_NOT_SUPPORTED, std::memory_order_relaxed);
+        return INVALID_HANDLE_VALUE;
+    }
+
     std::lock_guard<std::mutex> lock(handle_mutex_);
     handle = write_handle_.load(std::memory_order_relaxed);
     if (handle != INVALID_HANDLE_VALUE)
@@ -2324,14 +2379,26 @@ HANDLE BlockDevice::EnsureWriteHandle() const
         return handle;
     }
 
-    handle = CreateFileW(
-        path_.c_str(),
+    handle = ReOpenFile(
+        read_handle,
         GENERIC_READ | GENERIC_WRITE,
-        WriteHandleShareMode(path_),
-        nullptr,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-        nullptr);
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_FLAG_OVERLAPPED);
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        last_io_error_.store(GetLastError(), std::memory_order_relaxed);
+        return INVALID_HANDLE_VALUE;
+    }
+    FILE_ID_INFO write_identity{};
+    if (!QueryRegularFileIdentity(handle, write_identity) ||
+        read_identity.VolumeSerialNumber != write_identity.VolumeSerialNumber ||
+        std::memcmp(read_identity.FileId.Identifier, write_identity.FileId.Identifier,
+            sizeof(read_identity.FileId.Identifier)) != 0)
+    {
+        CloseHandle(handle);
+        last_io_error_.store(ERROR_NOT_SUPPORTED, std::memory_order_relaxed);
+        return INVALID_HANDLE_VALUE;
+    }
     write_handle_.store(handle, std::memory_order_release);
     writable_.store(handle != INVALID_HANDLE_VALUE, std::memory_order_release);
     return handle;
@@ -2362,6 +2429,7 @@ void BlockDevice::CloseHandlesLocked() const
         CloseHandle(write_handle);
     }
     writable_.store(false, std::memory_order_release);
+    regular_file_.store(false, std::memory_order_release);
 }
 
 bool BlockDevice::QueryGeometryLocked(HANDLE handle, Geometry& geometry) const

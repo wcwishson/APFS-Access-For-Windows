@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace apfsaccess::rw
@@ -21,7 +22,7 @@ public:
     [[nodiscard]] bool TryProjectFromBtreeRecords(
         const std::vector<BtreeRecord>& records,
         ApfsVolumeTreeProjection& out_projection,
-        std::wstring& out_error) const;
+        std::wstring& out_error,
+        const std::unordered_map<std::uint64_t, std::uint64_t>& native_allocations = {}) const;
 };
 } // namespace apfsaccess::rw
-

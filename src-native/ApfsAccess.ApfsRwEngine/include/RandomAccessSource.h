@@ -8,12 +8,57 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace apfsaccess::catalog
 {
+
+// One caller-owned, single-threaded cumulative allowance for an entire walk.
+// Failed reservations are sticky; retries must not silently reset the budget.
+// Bytes are logical materialization bytes, not an allocator/peak-RSS meter.
+class ApfsReadBudget final
+{
+public:
+    ApfsReadBudget(std::uint64_t reads, std::uint64_t read_bytes,
+        std::uint64_t records, std::uint64_t record_bytes)
+        : reads_left_(reads), read_bytes_left_(read_bytes),
+          records_left_(records), record_bytes_left_(record_bytes) {}
+    ApfsReadBudget(const ApfsReadBudget&) = delete;
+    ApfsReadBudget& operator=(const ApfsReadBudget&) = delete;
+
+    [[nodiscard]] bool Read(std::uint64_t bytes) noexcept
+    {
+        if (Failed()) return false;
+        if (reads_left_ == 0 || bytes > read_bytes_left_)
+            return Refuse("ApfsReadBudgetSourceLimit");
+        --reads_left_;
+        read_bytes_left_ -= bytes;
+        return true;
+    }
+    [[nodiscard]] bool Materialize(std::uint64_t count, std::uint64_t bytes) noexcept
+    {
+        if (Failed()) return false;
+        if (count > records_left_ || bytes > record_bytes_left_)
+            return Refuse("ApfsReadBudgetRecordLimit");
+        records_left_ -= count;
+        record_bytes_left_ -= bytes;
+        return true;
+    }
+    // reason must have static lifetime (all parser reasons are string literals).
+    bool Refuse(const char* reason) noexcept
+    {
+        if (!failure_) failure_ = reason;
+        return false;
+    }
+    [[nodiscard]] bool Failed() const noexcept { return failure_ != nullptr; }
+    [[nodiscard]] const char* Failure() const noexcept { return failure_ ? failure_ : ""; }
+private:
+    std::uint64_t reads_left_, read_bytes_left_, records_left_, record_bytes_left_;
+    const char* failure_ = nullptr;
+};
 
 class RandomAccessSource
 {
@@ -22,12 +67,45 @@ public:
 
     [[nodiscard]] virtual std::uint64_t SizeBytes() const = 0;
 
+    // Views forward this exact object. A source advertising a budget must
+    // reserve each read before allocating or dispatching it to its backing IO.
+    [[nodiscard]] virtual std::shared_ptr<ApfsReadBudget> ReadBudget() const { return {}; }
+
     // Reads exactly `size` bytes at `offset`. Returns false (leaving
     // `out_bytes` empty) on any short read, overflow, or I/O failure.
     [[nodiscard]] virtual bool Read(
         std::uint64_t offset,
         std::size_t size,
         std::vector<std::byte>& out_bytes) const = 0;
+};
+
+// Attach before any catalog/checkpoint/retention traversal. Nested views with
+// the same budget charge once; replacing an existing budget fails closed.
+class BudgetedRandomAccessSource final : public RandomAccessSource
+{
+public:
+    BudgetedRandomAccessSource(const RandomAccessSource& inner,
+        std::shared_ptr<ApfsReadBudget> budget)
+        : inner_(inner), budget_(budget ? std::move(budget) : inner.ReadBudget()) {}
+    std::uint64_t SizeBytes() const override { return inner_.SizeBytes(); }
+    std::shared_ptr<ApfsReadBudget> ReadBudget() const override { return budget_; }
+    bool Read(std::uint64_t offset, std::size_t size, std::vector<std::byte>& out) const override
+    {
+        out.clear();
+        const auto inherited = inner_.ReadBudget();
+        if (inherited && inherited != budget_)
+            return budget_->Refuse("ApfsReadBudgetIdentityMismatch");
+        if (budget_ && (budget_->Failed() || (!inherited && !budget_->Read(size)))) return false;
+        if (!inner_.Read(offset, size, out) || out.size() != size)
+        {
+            out.clear();
+            return false;
+        }
+        return true;
+    }
+private:
+    const RandomAccessSource& inner_;
+    std::shared_ptr<ApfsReadBudget> budget_;
 };
 
 class VectorRandomAccessSource final : public RandomAccessSource
@@ -268,6 +346,10 @@ private:
 class OffsetRandomAccessSource final : public RandomAccessSource
 {
 public:
+    std::shared_ptr<ApfsReadBudget> ReadBudget() const override
+    {
+        return inner_ ? inner_->ReadBudget() : nullptr;
+    }
     OffsetRandomAccessSource(
         const RandomAccessSource* inner, std::uint64_t base_offset, std::uint64_t view_size)
         : inner_(inner)
@@ -291,6 +373,7 @@ public:
         {
             return false;
         }
+        if (const auto budget = ReadBudget(); budget && budget->Failed()) return false;
         if (size == 0)
         {
             return offset <= view_size_bytes();

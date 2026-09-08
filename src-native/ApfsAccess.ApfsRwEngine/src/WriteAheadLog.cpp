@@ -1,4 +1,6 @@
 #include "WriteAheadLog.h"
+#include "InodeMetadataPatch.h"
+#include "CompressionRewrite.h"
 
 #include <algorithm>
 #include <atomic>
@@ -14,6 +16,9 @@
 #include <windows.h>
 #include <bcrypt.h>
 
+#undef CreateFile
+#undef CreateDirectory
+
 #pragma comment(lib, "bcrypt.lib")
 
 namespace apfsaccess::rw
@@ -23,8 +28,10 @@ namespace
 constexpr std::uint32_t kMagic = 0x574C4141; // AALW, little-endian on disk.
 constexpr std::uint16_t kLegacyVersion = 1;
 constexpr std::uint16_t kInlinePayloadVersion = 2;
+constexpr std::uint16_t kUnlinkOutcomeVersion = 3;
 constexpr std::uint16_t kLegacyHeaderSize = 148;
 constexpr std::uint16_t kInlinePayloadHeaderSize = 152;
+constexpr std::uint16_t kUnlinkOutcomeHeaderSize = 192;
 constexpr std::size_t kChecksumOffset = 12;
 constexpr std::size_t kMaxRecordBytes = 64u * 1024u * 1024u;
 constexpr std::string_view kCompactionIntentTag = "apfsaccess-wal-compaction-intent-v1";
@@ -137,8 +144,55 @@ bool ComputeSha256(
     return true;
 }
 
+bool IsStrictUtf8(std::string_view value)
+{
+    if (value.empty() || value.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
+    {
+        return false;
+    }
+    return MultiByteToWideChar(
+        CP_UTF8,
+        MB_ERR_INVALID_CHARS,
+        value.data(),
+        static_cast<int>(value.size()),
+        nullptr,
+        0) > 0;
+}
+
 bool InlinePayloadIsConsistentImpl(const WriteAheadLog::Record& record)
 {
+    if (record.operation == WriteAheadLog::OperationKind::RewriteCompressedContent)
+    {
+        CompressionRewrite proof;
+        std::array<std::uint8_t, WriteAheadLog::PayloadHashSize> digest{};
+        return DecodeCompressionRewrite(record.inline_payload, proof) &&
+            record.object_id == proof.object && record.parent_object_id == proof.generation &&
+            record.payload_length == record.inline_payload.size() &&
+            !record.path_utf8.empty() && IsStrictUtf8(record.path_utf8) &&
+            record.path_utf8.find('\0') == std::string::npos && record.secondary_path_utf8.empty() &&
+            record.flags == 0 && !record.unlink_outcome && record.logical_offset == 0 &&
+            record.logical_length == 0 && record.payload_offset == 0 && record.payload_spool_id == 0 &&
+            ComputeSha256(record.inline_payload, digest) && digest == record.payload_sha256;
+    }
+    if (record.operation == WriteAheadLog::OperationKind::SetInodeMetadata)
+    {
+        InodeMetadataPatch patch{};
+        std::array<std::uint8_t, WriteAheadLog::PayloadHashSize> digest{};
+        return record.payload_length == record.inline_payload.size() &&
+            DecodeInodeMetadataPatch(record.inline_payload, patch) &&
+            ComputeSha256(record.inline_payload, digest) && digest == record.payload_sha256;
+    }
+    if (record.operation == WriteAheadLog::OperationKind::SetExtendedAttribute)
+    {
+        if (record.inline_payload.size() > WriteAheadLog::MaxExtendedAttributePayloadBytes ||
+            record.payload_length != record.inline_payload.size())
+        {
+            return false;
+        }
+
+        std::array<std::uint8_t, WriteAheadLog::PayloadHashSize> digest{};
+        return ComputeSha256(record.inline_payload, digest) && digest == record.payload_sha256;
+    }
     if (record.inline_payload.empty())
     {
         return true;
@@ -153,6 +207,128 @@ bool InlinePayloadIsConsistentImpl(const WriteAheadLog::Record& record)
 
     std::array<std::uint8_t, WriteAheadLog::PayloadHashSize> digest{};
     return ComputeSha256(record.inline_payload, digest) && digest == record.payload_sha256;
+}
+
+bool IsKnownOperation(WriteAheadLog::OperationKind operation)
+{
+    switch (operation)
+    {
+    case WriteAheadLog::OperationKind::CreateFile:
+    case WriteAheadLog::OperationKind::CreateDirectory:
+    case WriteAheadLog::OperationKind::Write:
+    case WriteAheadLog::OperationKind::SetFileSize:
+    case WriteAheadLog::OperationKind::Rename:
+    case WriteAheadLog::OperationKind::Delete:
+    case WriteAheadLog::OperationKind::SetBasicInfo:
+    case WriteAheadLog::OperationKind::SetSymbolicLinkTarget:
+    case WriteAheadLog::OperationKind::RemoveSymbolicLinkTarget:
+    case WriteAheadLog::OperationKind::SetExtendedAttribute:
+    case WriteAheadLog::OperationKind::RemoveExtendedAttribute:
+    case WriteAheadLog::OperationKind::SetInodeMetadata:
+    case WriteAheadLog::OperationKind::SetAllocationSize:
+    case WriteAheadLog::OperationKind::RestoreDirectoryFromSymbolicLink:
+    case WriteAheadLog::OperationKind::RewriteCompressedContent:
+    case WriteAheadLog::OperationKind::TransactionMarker:
+    case WriteAheadLog::OperationKind::CompactionIndex:
+    case WriteAheadLog::OperationKind::DurabilityWatermark:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool ExtendedAttributeMutationIsConsistentImpl(const WriteAheadLog::Record& record)
+{
+    const bool set = record.operation == WriteAheadLog::OperationKind::SetExtendedAttribute;
+    const bool remove = record.operation == WriteAheadLog::OperationKind::RemoveExtendedAttribute;
+    if (!set && !remove)
+    {
+        return true;
+    }
+
+    const bool has_valid_name = !record.secondary_path_utf8.empty() &&
+        record.secondary_path_utf8.size() <= WriteAheadLog::MaxExtendedAttributeNameBytes &&
+        record.secondary_path_utf8.find('\0') == std::string::npos &&
+        IsStrictUtf8(record.secondary_path_utf8);
+    const bool has_valid_identity = record.object_id != 0 &&
+        record.parent_object_id != 0 &&
+        !record.path_utf8.empty() &&
+        record.path_utf8.find('\0') == std::string::npos &&
+        IsStrictUtf8(record.path_utf8);
+    if (!has_valid_name || !has_valid_identity || record.unlink_outcome || record.flags != 0 ||
+        record.payload_spool_id != 0 || record.payload_offset != 0 ||
+        record.logical_offset != 0 || record.logical_length != 0)
+    {
+        return false;
+    }
+
+    if (set)
+    {
+        return InlinePayloadIsConsistentImpl(record);
+    }
+
+    return record.payload_length == 0 && record.inline_payload.empty() &&
+        std::all_of(
+            record.payload_sha256.begin(),
+            record.payload_sha256.end(),
+            [](std::uint8_t byte) { return byte == 0; });
+}
+
+bool AllocationSizeMutationIsConsistentImpl(const WriteAheadLog::Record& record)
+{
+    if (record.operation != WriteAheadLog::OperationKind::SetAllocationSize) return true;
+    return record.object_id != 0 && record.parent_object_id != 0 &&
+        record.logical_length <= static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)()) &&
+        !record.path_utf8.empty() && IsStrictUtf8(record.path_utf8) &&
+        record.path_utf8.find('\0') == std::string::npos &&
+        record.secondary_path_utf8.empty() && !record.unlink_outcome && record.flags == 0 &&
+        record.logical_offset == 0 && record.payload_spool_id == 0 &&
+        record.payload_offset == 0 && record.payload_length == 0 && record.inline_payload.empty() &&
+        std::all_of(record.payload_sha256.begin(), record.payload_sha256.end(),
+            [](std::uint8_t byte) { return byte == 0; });
+}
+
+bool DirectoryRestoreMutationIsConsistentImpl(const WriteAheadLog::Record& record)
+{
+    if (record.operation != WriteAheadLog::OperationKind::RestoreDirectoryFromSymbolicLink) return true;
+    return record.object_id != 0 && record.parent_object_id != 0 &&
+        IsStrictUtf8(record.path_utf8) && record.path_utf8.find('\0') == std::string::npos &&
+        record.secondary_path_utf8.empty() && !record.unlink_outcome && record.flags == 0 &&
+        record.logical_offset == 0 && record.logical_length == 0 &&
+        record.payload_spool_id == 0 && record.payload_offset == 0 && record.payload_length == 0 &&
+        record.inline_payload.empty() &&
+        std::all_of(record.payload_sha256.begin(), record.payload_sha256.end(),
+            [](std::uint8_t byte) { return byte == 0; });
+}
+
+bool InodeMetadataMutationIsConsistentImpl(const WriteAheadLog::Record& record)
+{
+    if (record.operation != WriteAheadLog::OperationKind::SetInodeMetadata) return true;
+    return record.object_id != 0 && record.parent_object_id != 0 &&
+        IsStrictUtf8(record.path_utf8) && record.path_utf8.find('\0') == std::string::npos &&
+        record.secondary_path_utf8.empty() && !record.unlink_outcome && record.flags == 0 &&
+        record.payload_spool_id == 0 && record.payload_offset == 0 &&
+        record.logical_offset == 0 && record.logical_length == 0 &&
+        InlinePayloadIsConsistentImpl(record);
+}
+
+bool UnlinkOutcomeIsConsistentImpl(const WriteAheadLog::Record& record)
+{
+    if (!record.unlink_outcome) return true;
+    const auto& outcome = *record.unlink_outcome;
+    return record.operation == WriteAheadLog::OperationKind::Delete &&
+        outcome.object_id != 0 && outcome.object_id == record.object_id &&
+        outcome.generation_before != 0 && outcome.generation_before == record.parent_object_id &&
+        outcome.generation_after >= outcome.generation_before && outcome.parent_object_id != 0 &&
+        outcome.links_before != 0 && outcome.links_after == outcome.links_before - 1 &&
+        outcome.path_utf8 == record.path_utf8 && outcome.path_utf8.size() > 1 &&
+        outcome.path_utf8.size() <= 65536 && outcome.path_utf8.front() == '\\' &&
+        outcome.path_utf8.find('\0') == std::string::npos &&
+        record.secondary_path_utf8.empty() && record.inline_payload.empty() && record.flags == 0 &&
+        record.payload_spool_id == 0 && record.payload_offset == 0 && record.payload_length == 0 &&
+        record.logical_offset == 0 && record.logical_length == 0 &&
+        std::all_of(record.payload_sha256.begin(), record.payload_sha256.end(),
+            [](std::uint8_t byte) { return byte == 0; });
 }
 
 using WalRegistry = std::unordered_map<std::wstring, std::unordered_set<WriteAheadLog*>>;
@@ -822,14 +998,31 @@ bool FlushPathToDisk(const std::filesystem::path& path)
     return ok;
 }
 
-bool ReadFileBytes(const std::filesystem::path& path, std::vector<std::uint8_t>& bytes)
+bool ReadFileBytes(const std::filesystem::path& path, std::vector<std::uint8_t>& bytes,
+    std::uint64_t limit, bool& limited)
 {
+    limited = false;
+    bytes.clear();
     std::ifstream input(path, std::ios::binary);
     if (!input.good())
     {
         return false;
     }
 
+    if (limit != UINT64_MAX)
+    {
+        input.seekg(0, std::ios::end);
+        const auto length = input.tellg();
+        if (length < 0) return false;
+        const auto size = static_cast<std::uint64_t>(length);
+        if (size > limit || size > SIZE_MAX || size > static_cast<std::uint64_t>((std::numeric_limits<std::streamsize>::max)()))
+        { limited = true; return false; }
+        input.seekg(0, std::ios::beg);
+        bytes.resize(static_cast<std::size_t>(size));
+        if (size) input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size));
+        if (!input.good() || input.peek() != std::char_traits<char>::eof()) { bytes.clear(); return false; }
+        return true;
+    }
     bytes.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
     return input.good() || input.eof();
 }
@@ -933,6 +1126,8 @@ bool DecodeRecord(
     const auto volume_identity_length = ReadU32(record_bytes, cursor);
     cursor += sizeof(std::uint32_t);
     std::uint32_t inline_payload_length = 0;
+    std::uint32_t unlink_path_length = 0;
+    record.unlink_outcome.reset();
     if (version == kInlinePayloadVersion)
     {
         inline_payload_length = ReadU32(record_bytes, cursor);
@@ -942,6 +1137,17 @@ bool DecodeRecord(
             status = WriteAheadLog::ReadStatus::Corrupt;
             return false;
         }
+    }
+    else if (version == kUnlinkOutcomeVersion)
+    {
+        auto& outcome = record.unlink_outcome.emplace();
+        outcome.object_id = ReadU64(record_bytes, cursor); cursor += 8;
+        outcome.generation_before = ReadU64(record_bytes, cursor); cursor += 8;
+        outcome.generation_after = ReadU64(record_bytes, cursor); cursor += 8;
+        outcome.parent_object_id = ReadU64(record_bytes, cursor); cursor += 8;
+        outcome.links_before = ReadU32(record_bytes, cursor); cursor += 4;
+        outcome.links_after = ReadU32(record_bytes, cursor); cursor += 4;
+        unlink_path_length = ReadU32(record_bytes, cursor); cursor += 4;
     }
 
     if (cursor + WriteAheadLog::PayloadHashSize > record_bytes.size())
@@ -956,7 +1162,8 @@ bool DecodeRecord(
         static_cast<std::uint64_t>(path_length) +
         static_cast<std::uint64_t>(secondary_path_length) +
         static_cast<std::uint64_t>(volume_identity_length) +
-        static_cast<std::uint64_t>(inline_payload_length);
+        static_cast<std::uint64_t>(inline_payload_length) +
+        static_cast<std::uint64_t>(unlink_path_length);
     if (variable_bytes > record_bytes.size() ||
         cursor + static_cast<std::size_t>(variable_bytes) != record_bytes.size())
     {
@@ -979,8 +1186,27 @@ bool DecodeRecord(
     record.inline_payload.assign(
         reinterpret_cast<const std::byte*>(record_bytes.data() + cursor),
         reinterpret_cast<const std::byte*>(record_bytes.data() + cursor + inline_payload_length));
+    cursor += inline_payload_length;
+    if (record.unlink_outcome)
+    {
+        record.unlink_outcome->path_utf8.assign(
+            reinterpret_cast<const char*>(record_bytes.data() + cursor), unlink_path_length);
+    }
 
-    if (!InlinePayloadIsConsistentImpl(record))
+    const bool extended_attribute_version_is_valid =
+        (record.operation != WriteAheadLog::OperationKind::SetExtendedAttribute ||
+            version == kInlinePayloadVersion) &&
+        (record.operation != WriteAheadLog::OperationKind::RemoveExtendedAttribute ||
+            version == kLegacyVersion);
+    if (!IsKnownOperation(record.operation) || !extended_attribute_version_is_valid ||
+        (record.operation == WriteAheadLog::OperationKind::RewriteCompressedContent && version != kInlinePayloadVersion) ||
+        (record.operation == WriteAheadLog::OperationKind::SetInodeMetadata && version != kInlinePayloadVersion) ||
+        !InlinePayloadIsConsistentImpl(record) ||
+        !ExtendedAttributeMutationIsConsistentImpl(record) ||
+        !InodeMetadataMutationIsConsistentImpl(record) ||
+        !AllocationSizeMutationIsConsistentImpl(record) ||
+        !DirectoryRestoreMutationIsConsistentImpl(record) ||
+        !UnlinkOutcomeIsConsistentImpl(record))
     {
         status = WriteAheadLog::ReadStatus::Corrupt;
         return false;
@@ -1029,14 +1255,14 @@ WriteAheadLog::ReadResult DecodeWalBytes(
             result.status = WriteAheadLog::ReadStatus::Corrupt;
             return result;
         }
-        if (version != kLegacyVersion && version != kInlinePayloadVersion)
+        if (version != kLegacyVersion && version != kInlinePayloadVersion && version != kUnlinkOutcomeVersion)
         {
             result.status = WriteAheadLog::ReadStatus::VersionMismatch;
             return result;
         }
-        const auto expected_header_size = version == kInlinePayloadVersion
-            ? kInlinePayloadHeaderSize
-            : kLegacyHeaderSize;
+        const auto expected_header_size = version == kUnlinkOutcomeVersion
+            ? kUnlinkOutcomeHeaderSize
+            : version == kInlinePayloadVersion ? kInlinePayloadHeaderSize : kLegacyHeaderSize;
         if (header_size != expected_header_size ||
             record_size < expected_header_size ||
             record_size > kMaxRecordBytes)
@@ -3453,7 +3679,7 @@ WriteAheadLog::ReadResult WriteAheadLog::ReadAll() const
     return ReadAllInternal(options_.path, options_.volume_identity, false, nullptr);
 }
 
-WriteAheadLog::ReadResult WriteAheadLog::ReadAllWithExclusiveWriterLease() const
+WriteAheadLog::ReadResult WriteAheadLog::ReadAllWithExclusiveWriterLease(WalReadLimits limits) const
 {
     std::lock_guard<std::recursive_mutex> operation_lock(WalOperationMutex(options_.path));
     if (!AcquireExclusiveWriterLease())
@@ -3474,10 +3700,10 @@ WriteAheadLog::ReadResult WriteAheadLog::ReadAllWithExclusiveWriterLease() const
         options_.path,
         options_.volume_identity,
         false,
-        &complete_prefix_bytes);
+        &complete_prefix_bytes, limits);
     if (inspected.status != ReadStatus::Ok)
     {
-        (void)CloseAppendFileHandle();
+        if (inspected.status != ReadStatus::ResourceLimit) (void)CloseAppendFileHandle();
         return inspected;
     }
     if (inspected.recovered_torn_tail &&
@@ -3494,7 +3720,7 @@ WriteAheadLog::ReadResult WriteAheadLog::ReadAllWithExclusiveWriterLease() const
         options_.path,
         options_.volume_identity,
         false,
-        nullptr);
+        nullptr, limits);
     if ((fault_injection_hook_ && fault_injection_hook_("read-all-exclusive-revalidate")) ||
         verified.status != ReadStatus::Ok || verified.recovered_torn_tail)
     {
@@ -3545,7 +3771,8 @@ WriteAheadLog::ReadResult WriteAheadLog::ReadAllInternal(
     const std::filesystem::path& path,
     const std::string& expected_volume_identity,
     bool repair_torn_tail,
-    std::uint64_t* complete_prefix_bytes)
+    std::uint64_t* complete_prefix_bytes,
+    WalReadLimits limits)
 {
     ReadResult result{};
     if (complete_prefix_bytes)
@@ -3558,15 +3785,22 @@ WriteAheadLog::ReadResult WriteAheadLog::ReadAllInternal(
     }
 
     std::vector<std::uint8_t> bytes;
-    if (!ReadFileBytes(path, bytes))
+    bool limited = false;
+    if (!ReadFileBytes(path, bytes, limits.bytes, limited))
     {
-        result.status = ReadStatus::IoError;
+        result.status = limited ? ReadStatus::ResourceLimit : ReadStatus::IoError;
         return result;
     }
 
     std::size_t cursor = 0;
     while (cursor < bytes.size())
     {
+        if (result.records.size() >= limits.records)
+        {
+            result.records.clear();
+            result.status = ReadStatus::ResourceLimit;
+            return result;
+        }
         if (bytes.size() - cursor < kLegacyHeaderSize)
         {
             result.recovered_torn_tail = true;
@@ -3591,14 +3825,14 @@ WriteAheadLog::ReadResult WriteAheadLog::ReadAllInternal(
             result.status = ReadStatus::Corrupt;
             return result;
         }
-        if (version != kLegacyVersion && version != kInlinePayloadVersion)
+        if (version != kLegacyVersion && version != kInlinePayloadVersion && version != kUnlinkOutcomeVersion)
         {
             result.status = ReadStatus::VersionMismatch;
             return result;
         }
-        const auto expected_header_size = version == kInlinePayloadVersion
-            ? kInlinePayloadHeaderSize
-            : kLegacyHeaderSize;
+        const auto expected_header_size = version == kUnlinkOutcomeVersion
+            ? kUnlinkOutcomeHeaderSize
+            : version == kInlinePayloadVersion ? kInlinePayloadHeaderSize : kLegacyHeaderSize;
         if (header_size != expected_header_size ||
             record_size < expected_header_size ||
             record_size > kMaxRecordBytes)
@@ -3646,22 +3880,35 @@ std::vector<std::uint8_t> WriteAheadLog::EncodeForTest(
 {
     std::vector<std::uint8_t> buffer;
     const auto version = version_override == 0
-        ? (record.inline_payload.empty() ? kLegacyVersion : kInlinePayloadVersion)
+        ? (record.unlink_outcome ? kUnlinkOutcomeVersion :
+            record.operation == OperationKind::SetExtendedAttribute || !record.inline_payload.empty()
+                ? kInlinePayloadVersion
+                : kLegacyVersion)
         : version_override;
-    if ((!record.inline_payload.empty() && version != kInlinePayloadVersion) ||
-        !InlinePayloadIsConsistentImpl(record))
+    if ((record.operation == OperationKind::SetExtendedAttribute && version != kInlinePayloadVersion) ||
+        (record.operation == OperationKind::RewriteCompressedContent && version != kInlinePayloadVersion) ||
+        (record.operation == OperationKind::RemoveExtendedAttribute && version != kLegacyVersion) ||
+        (!record.inline_payload.empty() && version != kInlinePayloadVersion) ||
+        (record.unlink_outcome.has_value() != (version == kUnlinkOutcomeVersion)) ||
+        !InodeMetadataMutationIsConsistentImpl(record) ||
+        !AllocationSizeMutationIsConsistentImpl(record) ||
+        !DirectoryRestoreMutationIsConsistentImpl(record) ||
+        !InlinePayloadIsConsistentImpl(record) ||
+        !ExtendedAttributeMutationIsConsistentImpl(record) ||
+        !UnlinkOutcomeIsConsistentImpl(record))
     {
         return {};
     }
-    const auto header_size = version == kInlinePayloadVersion
-        ? kInlinePayloadHeaderSize
-        : kLegacyHeaderSize;
+    const auto header_size = version == kUnlinkOutcomeVersion
+        ? kUnlinkOutcomeHeaderSize
+        : version == kInlinePayloadVersion ? kInlinePayloadHeaderSize : kLegacyHeaderSize;
     const auto record_size =
         static_cast<std::uint64_t>(header_size) +
         record.path_utf8.size() +
         record.secondary_path_utf8.size() +
         record.volume_identity.size() +
-        record.inline_payload.size();
+        record.inline_payload.size() +
+        (record.unlink_outcome ? record.unlink_outcome->path_utf8.size() : 0);
     if (record_size > (std::numeric_limits<std::uint32_t>::max)())
     {
         return {};
@@ -3692,6 +3939,17 @@ std::vector<std::uint8_t> WriteAheadLog::EncodeForTest(
     {
         AppendU32(buffer, static_cast<std::uint32_t>(record.inline_payload.size()));
     }
+    else if (record.unlink_outcome)
+    {
+        const auto& outcome = *record.unlink_outcome;
+        AppendU64(buffer, outcome.object_id);
+        AppendU64(buffer, outcome.generation_before);
+        AppendU64(buffer, outcome.generation_after);
+        AppendU64(buffer, outcome.parent_object_id);
+        AppendU32(buffer, outcome.links_before);
+        AppendU32(buffer, outcome.links_after);
+        AppendU32(buffer, static_cast<std::uint32_t>(outcome.path_utf8.size()));
+    }
     buffer.insert(buffer.end(), record.payload_sha256.begin(), record.payload_sha256.end());
     buffer.insert(buffer.end(), record.path_utf8.begin(), record.path_utf8.end());
     buffer.insert(buffer.end(), record.secondary_path_utf8.begin(), record.secondary_path_utf8.end());
@@ -3703,6 +3961,11 @@ std::vector<std::uint8_t> WriteAheadLog::EncodeForTest(
             reinterpret_cast<const std::uint8_t*>(record.inline_payload.data()),
             reinterpret_cast<const std::uint8_t*>(record.inline_payload.data() + record.inline_payload.size()));
     }
+    if (record.unlink_outcome)
+    {
+        const auto& path = record.unlink_outcome->path_utf8;
+        buffer.insert(buffer.end(), path.begin(), path.end());
+    }
 
     StoreU32(buffer, kChecksumOffset, ChecksumRecord(buffer));
     return buffer;
@@ -3711,5 +3974,35 @@ std::vector<std::uint8_t> WriteAheadLog::EncodeForTest(
 bool WriteAheadLog::InlinePayloadIsConsistent(const Record& record)
 {
     return InlinePayloadIsConsistentImpl(record);
+}
+
+bool WriteAheadLog::AllocationSizeMutationIsConsistent(const Record& record)
+{
+    return AllocationSizeMutationIsConsistentImpl(record);
+}
+
+bool WriteAheadLog::DirectoryRestoreMutationIsConsistent(const Record& record)
+{
+    return DirectoryRestoreMutationIsConsistentImpl(record);
+}
+
+bool WriteAheadLog::InodeMetadataMutationIsConsistent(const Record& record)
+{
+    return InodeMetadataMutationIsConsistentImpl(record);
+}
+
+bool WriteAheadLog::CompressionRewriteIsConsistent(const Record& record)
+{
+    return record.operation != OperationKind::RewriteCompressedContent || InlinePayloadIsConsistentImpl(record);
+}
+
+bool WriteAheadLog::ExtendedAttributeMutationIsConsistent(const Record& record)
+{
+    return ExtendedAttributeMutationIsConsistentImpl(record);
+}
+
+bool WriteAheadLog::UnlinkOutcomeIsConsistent(const Record& record)
+{
+    return UnlinkOutcomeIsConsistentImpl(record);
 }
 } // namespace apfsaccess::rw

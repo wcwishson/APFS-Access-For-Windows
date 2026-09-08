@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <limits>
+#include <map>
 #include <optional>
 #include <process.h>
 #include <span>
@@ -31,6 +32,7 @@
 #include <vector>
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <winioctl.h>
 #include <winver.h>
 #include <winternl.h>
@@ -47,12 +49,18 @@ typedef NTSTATUS* PNTSTATUS;
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
 #include "MetadataStore.h"
+#include "ApfsExtendedRecordCodec.h"
+#include "AppleTransactionCommit.h"
+#include "InodeMetadataPatch.h"
+#include "NativeApfsReader.h"
 #include "ApfsNameCodec.h"
 #include "ApfsContainerCatalog.h"
 #include "ContainerMountCoordinator.h"
 #include "PayloadSpool.h"
 #include "TransactionManager.h"
 #include "WritePipeline.h"
+#include "NativeCompressionRewrite.h"
+#include "NativeCompressionReplay.h"
 #endif
 
 namespace
@@ -188,6 +196,7 @@ struct MountContext;
 void (*g_mutation_admission_pause_hook)(MountContext*) = nullptr;
 void (*g_hydration_read_before_io_hook)(MountContext*) = nullptr;
 void (*g_hydration_materialization_before_publish_hook)(MountContext*) = nullptr;
+void (*g_lazy_payload_handle_published_hook)() = nullptr;
 #endif
 
 enum class WinFspLifecyclePhase : std::uint8_t
@@ -267,8 +276,64 @@ struct DirEntry
     std::uint64_t file_size = 0;
 };
 
+enum class NodeKind : std::uint8_t
+{
+    RegularFile,
+    Directory,
+    SymbolicLink,
+    Fifo,
+    Socket,
+    CharacterDevice,
+    BlockDevice,
+};
+
+struct Node;
+struct InodeTimes
+{
+    std::uint64_t create_time_utc = 0;
+    std::uint64_t modification_time_utc = 0;
+    std::uint64_t change_time_utc = 0;
+    std::uint64_t access_time_utc = 0;
+    bool operator==(const InodeTimes&) const = default;
+};
+
+struct NativeInodeSecurity
+{
+    std::uint32_t owner = 0;
+    std::uint32_t group = 0;
+    std::uint16_t mode = 0;
+    std::uint16_t apple_security_flags = 0;
+    std::optional<std::vector<std::byte>> apple_security;
+    std::uint16_t windows_security_flags = 0;
+    std::optional<std::vector<std::byte>> windows_security;
+    bool operator==(const NativeInodeSecurity&) const = default;
+};
+
+struct SharedInodePayload
+{
+    // Volatile automatic atime; writers own MountContext::mutex. Keep it
+    // separate from checkpoint metadata so a read-side refresh cannot rewind it.
+    std::atomic<std::uint64_t> deferred_access_time{0};
+    std::wstring key;
+    std::uint64_t object_id = 0;
+    std::uint64_t materialized_generation = 0;
+    std::optional<std::uint64_t> visible_generation;
+    std::uint64_t file_size = 0;
+    std::optional<std::uint64_t> allocation_size;
+    FILETIME timestamp{};
+    std::optional<InodeTimes> inode_times;
+    std::vector<std::weak_ptr<Node>> aliases;
+    std::optional<UINT32> windows_attributes;
+    std::uint64_t attributes_generation = 0;
+    std::shared_ptr<const NativeInodeSecurity> native_security;
+    std::uint64_t security_generation = 0;
+};
+
 struct Node
 {
+    std::uint64_t object_id = 0;
+    std::uint64_t deferred_access_time = 0; // Protected with the other visible inode times.
+    std::shared_ptr<SharedInodePayload> shared_payload;
     std::wstring path;
     std::wstring path_key;
     std::uint64_t incompatible_features = 0x1ULL;
@@ -276,8 +341,16 @@ struct Node
     std::wstring hydration_key;
     std::wstring committed_read_path;
     bool is_directory = false;
+    NodeKind node_kind = NodeKind::RegularFile;
+    std::wstring symlink_target;
+    bool windows_directory_symlink = false;
+    std::uint64_t symlink_metadata_generation = 0;
     std::uint64_t file_size = 0;
+    std::optional<std::uint64_t> allocation_size;
+    std::uint64_t allocation_unit_bytes = 4096;
     FILETIME timestamp{};
+    std::optional<InodeTimes> inode_times;
+    std::uint64_t times_generation = 0;
     bool loaded = false;
     std::vector<std::wstring> children;
     // Directory callbacks can be paged by WinFsp with a marker. Keep the
@@ -286,41 +359,62 @@ struct Node
     bool sorted_children_valid = false;
     std::unordered_map<std::wstring, std::size_t> child_index_by_name_key;
     std::uint32_t open_handle_count = 0;
+    std::uint32_t live_context_count = 0;
+    // Retired contexts still pin payloads until their Close work has finished.
+    std::uint32_t closing_context_count = 0;
+    bool cancel_delete_after_closes = false;
     std::uint32_t write_handle_count = 0;
     std::uint32_t delete_intent_count = 0;
     bool delete_latched = false;
     bool delete_pending = false;
+    bool namespace_detached = false;
     bool delete_requested_after_children = false;
     bool caller_delete_retry_required = false;
     bool child_delete_observed_while_open = false;
     std::uint64_t last_child_delete_tick_ms = 0;
+    std::optional<UINT32> windows_attributes;
+    std::uint64_t attributes_generation = 0;
+    std::shared_ptr<const NativeInodeSecurity> native_security;
+    std::uint64_t security_generation = 0;
+};
+
+struct NativeXattrStreamState
+{
+    bool protocol = false;
+    bool removed = false;
+    std::vector<std::byte> removed_value;
+    std::optional<std::vector<std::byte>> unlinked_value;
 };
 
 struct OpenContext
 {
     std::shared_ptr<Node> node;
-    HANDLE file = INVALID_HANDLE_VALUE;
+    std::atomic<HANDLE> file{INVALID_HANDLE_VALUE};
     UINT32 granted_access = 0;
     bool named_stream = false;
+    std::string native_xattr_name;
+    std::shared_ptr<NativeXattrStreamState> native_xattr;
     std::wstring stream_name;
     std::uint64_t stream_size = 0;
+    // Local ADS disposition belongs to this handle, never to the base Node.
+    bool stream_delete_pending = false;
+    bool stream_delete_cancelled = false;
     bool allow_read_data = false;
     bool allow_list_directory = false;
     bool allow_write_data = false;
     bool allow_append_data = false;
     bool allow_set_basic_info = false;
     bool allow_set_file_size = false;
+    std::optional<bool> pending_overwrite_supersede;
     bool allow_delete = false;
     bool allow_delete_child = false;
     bool write_open = false;
-    std::uint64_t last_write_offset = 0;
-    std::uint64_t last_write_length = 0;
-    bool has_last_write = false;
     bool delete_on_cleanup = false;
     bool delete_on_close_requested = false;
     bool directory_delete_probe_failed_not_empty = false;
-    bool metadata_read_fallback = false;
+    std::atomic<bool> metadata_read_fallback{false};
     bool cleanup_seen = false;
+    bool lifetime_accounted = false;
     std::atomic<bool> mutation_observed{false};
 #ifdef APFSACCESS_HAS_RW_ENGINE
     // A dirty read may be issued many times against one open handle. Keep the
@@ -338,6 +432,8 @@ struct OpenContext
 struct LocalFileRollbackSnapshot
 {
     std::wstring path_key;
+    std::wstring hydration_state_key;
+    bool retain_shared_hydration = false;
     bool has_named_streams = false;
     std::unordered_map<std::wstring, std::uint64_t> named_streams;
     bool hydration_moved = false;
@@ -378,6 +474,8 @@ struct RenameLocalSnapshot
     std::wstring old_hydration_key;
     std::wstring old_committed_read_path;
     FILETIME old_timestamp{};
+    std::optional<InodeTimes> old_inode_times;
+    std::uint64_t old_times_generation = 0;
     std::shared_ptr<Node> old_parent;
     std::shared_ptr<Node> new_parent;
     std::wstring old_leaf;
@@ -960,6 +1058,10 @@ struct WinFspApi
     using PFN_Stop = VOID (*)(FSP_FILE_SYSTEM *);
     using PFN_AddDir = BOOLEAN (*)(FSP_FSCTL_DIR_INFO *, PVOID, ULONG, PULONG);
     using PFN_AddStream = BOOLEAN (*)(FSP_FSCTL_STREAM_INFO *, PVOID, ULONG, PULONG);
+    using PFN_FindReparsePoint = decltype(&FspFileSystemFindReparsePoint);
+    using PFN_ResolveReparsePoints = decltype(&FspFileSystemResolveReparsePoints);
+    using PFN_SetSecurityDescriptor = decltype(&FspSetSecurityDescriptor);
+    using PFN_DeleteSecurityDescriptor = decltype(&FspDeleteSecurityDescriptor);
     using PFN_ServiceVersion = NTSTATUS (*)(PUINT32);
     using PFN_StartService = NTSTATUS (*)();
 
@@ -972,6 +1074,10 @@ struct WinFspApi
     PFN_Stop Stop = nullptr;
     PFN_AddDir AddDir = nullptr;
     PFN_AddStream AddStream = nullptr;
+    PFN_FindReparsePoint FindReparsePoint = nullptr;
+    PFN_ResolveReparsePoints ResolveReparsePoints = nullptr;
+    PFN_SetSecurityDescriptor SetSecurityDescriptor = nullptr;
+    PFN_DeleteSecurityDescriptor DeleteSecurityDescriptor = nullptr;
     PFN_ServiceVersion ServiceVersion = nullptr;
     PFN_StartService StartService = nullptr;
 
@@ -1013,6 +1119,10 @@ struct WinFspApi
             Stop = nullptr;
             AddDir = nullptr;
             AddStream = nullptr;
+            FindReparsePoint = nullptr;
+            ResolveReparsePoints = nullptr;
+            SetSecurityDescriptor = nullptr;
+            DeleteSecurityDescriptor = nullptr;
             ServiceVersion = nullptr;
             StartService = nullptr;
         };
@@ -1034,10 +1144,14 @@ struct WinFspApi
                 !load(Delete, "FspFileSystemDelete") ||
                 !load(SetMount, "FspFileSystemSetMountPoint") ||
                 !load(RemoveMount, "FspFileSystemRemoveMountPoint") ||
-                !load(Start, "FspFileSystemStartDispatcher") ||
-                !load(Stop, "FspFileSystemStopDispatcher") ||
-                !load(AddDir, "FspFileSystemAddDirInfo") ||
-                !load(ServiceVersion, "FspFsctlServiceVersion") ||
+                 !load(Start, "FspFileSystemStartDispatcher") ||
+                 !load(Stop, "FspFileSystemStopDispatcher") ||
+                 !load(AddDir, "FspFileSystemAddDirInfo") ||
+                 !load(FindReparsePoint, "FspFileSystemFindReparsePoint") ||
+                 !load(ResolveReparsePoints, "FspFileSystemResolveReparsePoints") ||
+                 !load(SetSecurityDescriptor, "FspSetSecurityDescriptor") ||
+                 !load(DeleteSecurityDescriptor, "FspDeleteSecurityDescriptor") ||
+                 !load(ServiceVersion, "FspFsctlServiceVersion") ||
                 !load(StartService, "FspFsctlStartService"))
             {
                 last_error = L"An installed winfsp-x64.dll is missing required exports.";
@@ -2078,6 +2192,8 @@ struct MountContext
     std::atomic<bool> recovery_marker_blocked{false};
     std::atomic<bool> pending_native_writes{false};
     std::atomic<bool> unjournaled_native_mutation{false};
+    // Nonzero inode OID retains WAL/spool through proof and cache publication.
+    std::atomic<std::uint64_t> compression_verification_pending{0};
     std::optional<std::uint64_t> runtime_last_commit_xid;
     std::wstring runtime_recovery_reason;
     std::wstring runtime_last_recovery_action;
@@ -2109,6 +2225,26 @@ struct MountContext
     mutable std::mutex callback_activity_mutex;
     std::string active_callback_name;
     std::string last_callback_name;
+    struct OperationActivity
+    {
+        unsigned kind = 0;
+        bool waiting = true;
+        std::uint64_t started_tick_ms = 0;
+        std::uint64_t acquired_tick_ms = 0;
+        std::string callback;
+        std::uint64_t request_id = 0;
+        std::uint64_t stage_started_tick_ms = 0;
+        std::string stage;
+        UINT32 granted_access = 0;
+        UINT32 create_options = 0;
+        bool root = false;
+    };
+    std::uint64_t next_callback_request_id = 0;
+    std::unordered_map<DWORD, OperationActivity> operation_activity;
+    FSP_FILE_SYSTEM_OPERATION_GUARD* original_operation_enter = nullptr;
+    FSP_FILE_SYSTEM_OPERATION_GUARD* original_operation_leave = nullptr;
+    PerfCounter perf_operation_guard_wait;
+    PerfCounter perf_operation_guard_hold;
     std::optional<bool> last_recovery_marker_dirty;
     std::optional<std::uint64_t> last_recovery_marker_commit_xid;
     std::uint64_t recovery_marker_last_deep_validation_tick_ms = 0;
@@ -2141,11 +2277,32 @@ struct MountContext
     std::atomic<std::uint32_t> open_write_handle_count{0};
     // Serialize mutating callback flows to avoid namespace/delete-intent interleaving races.
     std::mutex mutation_callback_mutex;
+    struct DeferredAccessTime
+    {
+        std::shared_ptr<Node> node;
+        std::shared_ptr<SharedInodePayload> owner;
+        std::uint64_t time = 0;
+    };
+    // Only the owning mutation gate may inspect/change the inode queue.
+    std::map<std::uint64_t, DeferredAccessTime> deferred_access_times;
+    bool deferred_access_time_overflow = false;
+    bool draining_access_times = false;
+    // Scheduling fields use deferred_commit_mutex; never acquire the owning
+    // mutation gate while holding that scheduler mutex.
+    bool deferred_access_time_requested = false;
+    std::chrono::steady_clock::time_point deferred_access_time_first{};
+    std::chrono::steady_clock::time_point deferred_access_time_deadline{};
     mutable std::mutex grouped_acceptance_mutex;
     std::shared_ptr<GroupedDeferredAcceptanceBatch> grouped_acceptance_batch;
     std::unordered_map<std::wstring, std::shared_ptr<Node>> nodes;
+    std::unordered_map<std::wstring, std::shared_ptr<SharedInodePayload>> shared_payload_owners;
+    std::unordered_map<std::wstring, std::shared_ptr<SharedInodePayload>> unlinked_payload_candidates;
     std::unordered_map<std::wstring, std::unordered_map<std::wstring, std::uint64_t>> named_stream_sizes;
+    // Exact inode/name identity, independent of paths and NTFS ADS case rules.
+    // Protected by MutationCallbackScope, including reads and enumeration.
+    std::map<std::pair<std::uint64_t, std::string>, std::weak_ptr<NativeXattrStreamState>> native_xattr_streams;
     std::unordered_set<std::wstring> stale_hydration_keys;
+    std::unordered_map<std::wstring, std::filesystem::path> unrestored_hydration_backups;
     std::vector<DeferredDeleteRollbackPlan> deferred_delete_rollback_plans;
     std::unordered_set<std::wstring> deferred_delete_rollback_path_keys;
     bool deferred_delete_rollback_has_descendant_paths = false;
@@ -2217,7 +2374,11 @@ struct MountContext
     mutable std::shared_mutex committed_read_gate;
     mutable std::mutex commit_mutex;
     std::vector<apfsaccess::rw::MetadataStore::CommittedInodeChange> last_committed_inode_changes;
+    std::unordered_map<std::uint64_t, std::optional<UINT32>> last_committed_windows_attributes;
+    std::unordered_map<std::uint64_t, bool> last_committed_directory_symlinks;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const NativeInodeSecurity>> last_committed_native_security;
     std::optional<std::uint64_t> last_committed_inode_changes_xid;
+    std::uint64_t namespace_checkpoint_xid = 0;
     std::atomic<std::uint64_t> commit_deadline_tick_ms{0};
     std::atomic<bool> commit_timeout_latched{false};
     mutable std::mutex deferred_commit_mutex;
@@ -2273,6 +2434,13 @@ struct MountContext
     // manifest mode -- use CommitManifestMutations).
     apfsaccess::rw::MetadataStore* metadata_store = nullptr;
     std::unique_ptr<apfsaccess::rw::MetadataStore> owned_metadata_store;
+    // Scoped to startup replay and invoked only under metadata_mutex.
+    std::function<bool(apfsaccess::rw::MetadataStore::PayloadIdentity,
+        std::uint64_t, std::span<std::byte>)> accepted_replay_payload_reader;
+    // Rebased replay projections borrow the immutable original WAL payload
+    // authority for the duration of startup recovery under metadata_mutex.
+    std::unordered_map<const apfsaccess::rw::WriteAheadLog::Record*,
+        const apfsaccess::rw::WriteAheadLog::Record*> accepted_replay_original_records;
     // Container-session hosting (null/0 = legacy single-volume mode). The
     // coordinator outlives every session context; sessions unmount through
     // the coordinator before it drains.
@@ -2283,9 +2451,11 @@ struct MountContext
     // coordinator (stage+commit atomically under the container mutex).
     mutable std::mutex manifest_queue_mutex;
     std::vector<apfsaccess::rw::MetadataStore::MutationRequest> manifest_queued_requests;
+    std::atomic<NTSTATUS> manifest_preaccept_failure_status{STATUS_SUCCESS};
     std::atomic<std::uint64_t> payload_identity_cache_epoch{1};
 #ifdef APFSACCESS_FSHOST_UNIT_TEST
     bool test_force_native_mutation_staging_success = false;
+    std::function<void()> test_before_namespace_snapshot_apply;
     bool test_force_recovery_identity_scan_exception = false;
     std::optional<apfsaccess::rw::MetadataStore::CommitStatus> test_forced_native_commit_status;
     std::optional<bool> test_forced_native_mutations_pending;
@@ -2296,6 +2466,7 @@ struct MountContext
     std::uint64_t test_forced_native_payload_bytes = 0;
     bool test_forced_native_mutations_content_only = false;
     std::uint32_t test_native_commit_attempt_count = 0;
+    std::uint64_t test_native_commit_started_tick_ms = 0;
     std::uint32_t test_grouped_acceptance_window_ms = 0;
     bool test_force_grouped_acceptance_flush_failure = false;
     bool test_force_recovery_marker_finalize_failure = false;
@@ -2392,26 +2563,67 @@ struct ManifestCommitOutcome
     std::optional<std::uint64_t> committed_xid;
     std::wstring recovery_reason;
     bool recovery_required = false;
+    bool clean_prepublication_refusal = false;
+    std::optional<apfsaccess::rw::MetadataStore::MutationStatus> mutation_staging_status;
     std::vector<apfsaccess::rw::MetadataStore::PayloadIdentity> staged_identities;
 };
+
+NTSTATUS CleanManifestRefusalStatus(const ManifestCommitOutcome& outcome)
+{
+    using Status = apfsaccess::rw::MetadataStore::CommitStatus;
+    using Staging = apfsaccess::rw::MetadataStore::MutationStatus;
+    if (outcome.status == Status::RetentionBlocked || outcome.mutation_staging_status == Staging::NotReady)
+        return STATUS_DEVICE_BUSY;
+    if (outcome.status == Status::AllocationFailed || outcome.mutation_staging_status == Staging::AllocationFailed)
+        return STATUS_DISK_FULL;
+    return STATUS_NOT_SUPPORTED;
+}
 
 // Container-funneled commit for manifest sessions: stages + commits the
 // session store atomically under the container mutex (sibling refresh +
 // ledger recording included). The session store object is the same one the
 // context borrows, so post-commit introspection reads stay valid.
+std::string WideToUtf8(const std::wstring& in);
+bool CleanupDurableJournalPrefixWithoutPinRefresh(
+    MountContext& ctx, bool& cleaned, std::wstring& failure);
+
 ManifestCommitOutcome CommitManifestMutations(
     MountContext* context,
-    std::vector<apfsaccess::rw::MetadataStore::MutationRequest> requests,
+    const std::vector<apfsaccess::rw::MetadataStore::MutationRequest>& requests,
     const apfsaccess::catalog::ContainerPrepublicationHook&
-        prepublication_hook = {})
+        prepublication_hook = {},
+    const apfsaccess::catalog::ContainerMutationStagingHook& staging_hook = {},
+    bool accepted_replay = false,
+    std::optional<std::uint64_t> expected_replay_preimage = std::nullopt,
+    const apfsaccess::catalog::ContainerMutationPreparationHook& preparation_hook = {},
+    const apfsaccess::catalog::ContainerPostpublicationVerifierHook& verification_hook = {})
 {
     ManifestCommitOutcome outcome{};
     if (!IsManifestSession(context) || context->metadata_store == nullptr)
     {
         return outcome;
     }
+    apfsaccess::catalog::ContainerRetentionCleanupHook cleanup_prefix;
+    if (context->tx_manager && context->metadata_store->AuthoritativeAppleCheckpointView())
+    {
+        cleanup_prefix = [context](auto& pins, std::string& error)
+        {
+            bool cleaned = false;
+            std::wstring failure;
+            // The container and context commit locks are already held. Return
+            // the durable census to that owner instead of reacquiring either.
+            if (!CleanupDurableJournalPrefixWithoutPinRefresh(*context, cleaned, failure))
+            {
+                error = WideToUtf8(failure);
+                return false;
+            }
+            std::lock_guard<std::mutex> tx_lock(context->tx_mutex);
+            return context->tx_manager->LoadRequiredCheckpointXidsSinceCleanup(pins, &error);
+        };
+    }
     auto result = context->container_coordinator->Commit(
-        context->container_volume_oid, requests, prepublication_hook);
+        context->container_volume_oid, requests, prepublication_hook, staging_hook, cleanup_prefix,
+        accepted_replay, expected_replay_preimage, preparation_hook, verification_hook);
     outcome.status = static_cast<apfsaccess::rw::MetadataStore::CommitStatus>(
         result.commit_status_code);
     outcome.stage = result.commit_stage;
@@ -2422,6 +2634,8 @@ ManifestCommitOutcome CommitManifestMutations(
     }
     outcome.recovery_reason = result.commit_recovery_reason;
     outcome.recovery_required = result.commit_recovery_required;
+    outcome.clean_prepublication_refusal = result.clean_prepublication_refusal;
+    outcome.mutation_staging_status = result.mutation_staging_status;
     outcome.staged_identities = std::move(result.staged_identities);
     return outcome;
 }
@@ -2620,19 +2834,22 @@ void WriteHostStatusFileForCallback(MountContext* context, bool force_publish = 
 
 std::string EscapeJson(const std::string& value);
 
-void WriteCallbackWatchdogFile(MountContext& context)
+void WriteCallbackWatchdogFile(MountContext& context, const std::wstring& diagnostic_base = {})
 {
-    if (context.args.status_file.empty())
+    const auto& base = diagnostic_base.empty() ? context.args.status_file : diagnostic_base;
+    if (base.empty())
     {
         return;
     }
 
     std::string active_name;
     std::string last_name;
+    std::unordered_map<DWORD, MountContext::OperationActivity> operations;
     {
         std::lock_guard<std::mutex> lock(context.callback_activity_mutex);
         active_name = context.active_callback_name;
         last_name = context.last_callback_name;
+        operations = context.operation_activity;
     }
 
     std::ostringstream contents;
@@ -2653,11 +2870,53 @@ void WriteCallbackWatchdogFile(MountContext& context)
              << ",\"activeCallbackStartedTickMs\":"
              << context.active_callback_started_tick_ms.load(std::memory_order_acquire)
              << ",\"activeCallback\":\"" << EscapeJson(active_name)
-             << "\",\"lastCallback\":\"" << EscapeJson(last_name) << "\"}";
+             << "\",\"lastCallback\":\"" << EscapeJson(last_name) << "\""
+             << ",\"tickMs\":" << GetTickCount64() << ",\"operations\":[";
+    bool first_operation = true;
+    for (const auto& [thread, operation] : operations)
+    {
+        if (!first_operation) contents << ',';
+        first_operation = false;
+        contents << "{\"thread\":" << thread << ",\"kind\":" << operation.kind
+                 << ",\"waitingForGuard\":" << (operation.waiting ? "true" : "false")
+                 << ",\"startedTickMs\":" << operation.started_tick_ms
+                 << ",\"acquiredTickMs\":" << operation.acquired_tick_ms
+                 << ",\"callback\":\"" << EscapeJson(operation.callback)
+                 << "\",\"requestId\":" << operation.request_id
+                 << ",\"volumeObjectId\":" << context.args.volume_object_id
+                 << ",\"grantedAccess\":" << operation.granted_access
+                 << ",\"createOptions\":" << operation.create_options
+                 << ",\"root\":" << (operation.root ? "true" : "false")
+                 << ",\"stage\":\"" << EscapeJson(operation.stage)
+                 << "\",\"stageStartedTickMs\":" << operation.stage_started_tick_ms << '}';
+    }
+    contents << "],\"performance\":{";
+    bool first_counter = true;
+    const auto append = [&](const char* name, const PerfCounter& counter)
+    {
+        if (!first_counter) contents << ',';
+        first_counter = false;
+        AppendPerfCounterJson(contents, name, counter);
+    };
+    append("operationGuardWait", context.perf_operation_guard_wait);
+    append("operationGuardHold", context.perf_operation_guard_hold);
+    append("getVolumeInfo", context.perf_get_volume_info);
+    append("getSecurityByName", context.perf_get_security_by_name);
+    append("open", context.perf_open);
+    append("create", context.perf_create);
+    append("setFileSize", context.perf_set_file_size);
+    append("write", context.perf_write);
+    append("cleanup", context.perf_cleanup);
+    append("close", context.perf_close);
+    append("namespaceMutexWait", context.perf_namespace_mutex_wait);
+    append("namespaceMutexHold", context.perf_namespace_mutex_hold);
+    append("metadataMutexWait", context.perf_metadata_mutex_wait);
+    append("metadataMutexHold", context.perf_metadata_mutex_hold);
+    contents << "}}";
 
     try
     {
-        const auto diagnostic_path = std::filesystem::path(context.args.status_file + L".callback.json");
+        const auto diagnostic_path = std::filesystem::path(base + L".callback.json");
         const auto temp_path = std::filesystem::path(diagnostic_path.wstring() + L".tmp");
         if (diagnostic_path.has_parent_path())
         {
@@ -2865,8 +3124,41 @@ struct ScopedCallbackActivity
             std::lock_guard<std::mutex> lock(context_->callback_activity_mutex);
             context_->active_callback_name = name_;
             context_->last_callback_name = name_;
+            if (const auto entry = context_->operation_activity.find(GetCurrentThreadId());
+                entry != context_->operation_activity.end())
+            {
+                entry->second.callback = name_;
+                entry->second.request_id = ++context_->next_callback_request_id;
+                entry->second.stage = "entry";
+                entry->second.stage_started_tick_ms = GetTickCount64();
+            }
         }
         context_->callback_status_publish_pending.store(true, std::memory_order_release);
+    }
+
+    void OpenRequest(UINT32 access, UINT32 options, bool root)
+    {
+        if (!context_) return;
+        std::lock_guard<std::mutex> lock(context_->callback_activity_mutex);
+        if (const auto entry = context_->operation_activity.find(GetCurrentThreadId());
+            entry != context_->operation_activity.end())
+        {
+            entry->second.granted_access = access;
+            entry->second.create_options = options;
+            entry->second.root = root;
+        }
+    }
+
+    void Stage(const char* stage)
+    {
+        if (!context_) return;
+        std::lock_guard<std::mutex> lock(context_->callback_activity_mutex);
+        if (const auto entry = context_->operation_activity.find(GetCurrentThreadId());
+            entry != context_->operation_activity.end())
+        {
+            entry->second.stage = stage;
+            entry->second.stage_started_tick_ms = GetTickCount64();
+        }
     }
 
     ~ScopedCallbackActivity()
@@ -2893,6 +3185,60 @@ private:
     MountContext* context_ = nullptr;
     const char* name_ = "unknown";
 };
+
+NTSTATUS ObserveOperationEnter(FSP_FILE_SYSTEM* fs,
+    FSP_FSCTL_TRANSACT_REQ* request, FSP_FSCTL_TRANSACT_RSP* response)
+{
+    auto& context = *static_cast<MountContext*>(fs->UserContext);
+    const auto thread = GetCurrentThreadId();
+    const auto started = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(context.callback_activity_mutex);
+        context.operation_activity[thread] = {request->Kind, true, GetTickCount64(), 0, {}};
+    }
+    const auto status = context.original_operation_enter(fs, request, response);
+    context.perf_operation_guard_wait.Observe(ElapsedMicroseconds(started));
+    {
+        std::lock_guard<std::mutex> lock(context.callback_activity_mutex);
+        if (!NT_SUCCESS(status)) context.operation_activity.erase(thread);
+        else
+        {
+            auto& entry = context.operation_activity.at(thread);
+            entry.waiting = false;
+            entry.acquired_tick_ms = GetTickCount64();
+        }
+    }
+    return status;
+}
+
+NTSTATUS ObserveOperationLeave(FSP_FILE_SYSTEM* fs,
+    FSP_FSCTL_TRANSACT_REQ* request, FSP_FSCTL_TRANSACT_RSP* response)
+{
+    auto& context = *static_cast<MountContext*>(fs->UserContext);
+    const auto status = context.original_operation_leave(fs, request, response);
+    std::lock_guard<std::mutex> lock(context.callback_activity_mutex);
+    const auto found = context.operation_activity.find(GetCurrentThreadId());
+    if (found != context.operation_activity.end())
+    {
+        context.perf_operation_guard_hold.Observe(
+            (GetTickCount64() - found->second.acquired_tick_ms) * 1000);
+        context.operation_activity.erase(found);
+    }
+    return status;
+}
+
+void InstallOperationDiagnostics(FSP_FILE_SYSTEM* fs)
+{
+    if (!IsPerfCountersEnabled() || !fs || !fs->UserContext ||
+        !fs->EnterOperation || !fs->LeaveOperation || fs->EnterOperation == ObserveOperationEnter) return;
+    auto& context = *static_cast<MountContext*>(fs->UserContext);
+    // Preserve WinFsp's installed guard exactly. Observe waiting before callback
+    // entry so dispatcher saturation is not mistaken for a fast idle callback.
+    context.original_operation_enter = fs->EnterOperation;
+    context.original_operation_leave = fs->LeaveOperation;
+    fs->EnterOperation = ObserveOperationEnter;
+    fs->LeaveOperation = ObserveOperationLeave;
+}
 
 struct MutationCallbackScope
 {
@@ -2926,6 +3272,10 @@ struct MutationCallbackScope
             {
                 lock_ = std::unique_lock<std::mutex>(context_->mutation_callback_mutex);
             }
+#ifdef APFSACCESS_HAS_RW_ENGINE
+            if (lock_.owns_lock())
+                context_->manifest_preaccept_failure_status.store(STATUS_SUCCESS, std::memory_order_release);
+#endif
         }
         if (context_ && lock_wait_started != std::chrono::steady_clock::time_point{})
         {
@@ -3152,6 +3502,26 @@ std::wstring Utf8ToWide(const std::string& in)
     std::wstring out((size_t)n, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, in.c_str(), (int)in.size(), out.data(), n);
     return out;
+}
+
+bool TryUtf8ToWideStrict(const std::string& input, std::wstring& output)
+{
+    output.clear();
+    if (input.empty())
+    {
+        return true;
+    }
+    const auto input_size = static_cast<int>(input.size());
+    const int required = MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, input.data(), input_size, nullptr, 0);
+    if (required <= 0)
+    {
+        return false;
+    }
+    output.resize(static_cast<std::size_t>(required));
+    return MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, input.data(), input_size,
+        output.data(), required) == required;
 }
 
 std::wstring QuoteArg(const std::wstring& arg)
@@ -3423,6 +3793,7 @@ void IndexNodeLocked(MountContext* c, const std::shared_ptr<Node>& node)
         return;
     }
     c->nodes[EnsureNodePathKey(c, *node)] = node;
+    node->namespace_detached = false;
 }
 
 void EmplaceNodeLocked(MountContext* c, const std::shared_ptr<Node>& node)
@@ -3495,6 +3866,52 @@ std::wstring StreamNameForWin32Path(const std::wstring& canonical_stream_name)
     return name;
 }
 
+// 0: unrelated ADS, 1: native xattr, -1: malformed reserved name.
+int DecodeNativeXattrStream(const std::wstring& stream, std::string& name)
+{
+    name.clear();
+    const auto lower = ToLowerInvariant(stream);
+    if (lower.starts_with(L":apfs.xattrprotocol"))
+        return lower == L":apfs.xattrprotocol:$data" ? 1 : -1;
+    const bool generic = lower.starts_with(L":apfs.xattr.");
+    const bool resource = lower.starts_with(L":apfs.resourcefork");
+    const bool finder = lower.starts_with(L":apfs.finderinfo");
+    if (!generic && !resource && !finder) return 0;
+    if (resource || finder)
+    {
+        if (lower != (resource ? L":apfs.resourcefork:$data" : L":apfs.finderinfo:$data")) return -1;
+        name = resource ? "com.apple.ResourceFork" : "com.apple.FinderInfo";
+        return 1;
+    }
+    if (!lower.ends_with(L":$data")) return -1;
+    const auto hex = stream.substr(12, stream.size() - 12 - 6);
+    constexpr std::size_t max_name = 821; // WriteAheadLog::MaxExtendedAttributeNameBytes.
+    if (hex.empty() || (hex.size() & 1) || hex.size() > max_name * 2) return -1;
+    const auto digit = [](wchar_t ch) -> int {
+        if (ch >= L'0' && ch <= L'9') return ch - L'0';
+        if (ch >= L'A' && ch <= L'F') return ch - L'A' + 10;
+        if (ch >= L'a' && ch <= L'f') return ch - L'a' + 10;
+        return -1;
+    };
+    for (std::size_t i = 0; i < hex.size(); i += 2)
+    {
+        const auto hi = digit(hex[i]), lo = digit(hex[i + 1]);
+        if (hi < 0 || lo < 0 || (hi == 0 && lo == 0)) return -1;
+        name.push_back(static_cast<char>((hi << 4) | lo));
+    }
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name.data(),
+            static_cast<int>(name.size()), nullptr, 0) == 0) return -1;
+    return 1;
+}
+
+std::wstring NativeXattrStreamName(const std::string& name)
+{
+    constexpr wchar_t hex[] = L"0123456789ABCDEF";
+    std::wstring result = L":APFS.Xattr.";
+    for (unsigned char ch : name) { result += hex[ch >> 4]; result += hex[ch & 15]; }
+    return result + L":$DATA";
+}
+
 NamedStreamPath SplitNamedStreamPathNormalized(const std::wstring& path)
 {
     NamedStreamPath result{};
@@ -3507,9 +3924,14 @@ NamedStreamPath SplitNamedStreamPathNormalized(const std::wstring& path)
         return result;
     }
 
-    const auto stream_name = path.substr(colon);
-    const auto canonical_stream_name = CanonicalStreamName(stream_name);
-    if (canonical_stream_name.empty() || canonical_stream_name == L"::$DATA")
+    auto stream_name = path.substr(colon);
+    // WinFsp removes the type before forwarding a named-stream request.
+    // Preserve explicit types so malformed reserved requests still refuse.
+    if (stream_name.find(L':', 1) == std::wstring::npos) stream_name += L":$DATA";
+    std::string native_name;
+    const auto canonical_stream_name = DecodeNativeXattrStream(stream_name, native_name) != 0
+        ? stream_name : CanonicalStreamName(stream_name);
+    if (canonical_stream_name.empty() || ToLowerInvariant(canonical_stream_name) == L"::$data")
     {
         result.base_path = path.substr(0, colon);
         return result;
@@ -3613,23 +4035,194 @@ bool IsRecycleBinPath(const std::wstring& path)
     return IsRecycleBinPathNormalized(NormalizePath(path));
 }
 
+constexpr UINT32 kPersistedWindowsAttributeMask = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN |
+    FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+constexpr char kWindowsAttributesName[] = "com.apfsaccess.windows.attributes";
+constexpr wchar_t kWindowsAttributesNameWide[] = L"com.apfsaccess.windows.attributes";
+constexpr char kWindowsSymlinkKindName[] = "com.apfsaccess.windows.symlink-kind";
+constexpr wchar_t kWindowsSymlinkKindNameWide[] = L"com.apfsaccess.windows.symlink-kind";
+// Little-endian uint32 version 1, uint32 directory kind 1. Absence means unspecified/file.
+constexpr std::array<std::byte, 8> kWindowsDirectorySymlinkHint{
+    std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0},
+    std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
+constexpr char kAppleSecurityName[] = "com.apple.system.Security";
+constexpr char kWindowsSecurityName[] = "com.apfsaccess.windows.security";
+constexpr wchar_t kWindowsSecurityNameWide[] = L"com.apfsaccess.windows.security";
+constexpr std::size_t kWindowsSecurityPayloadLimit = 3804;
+
+bool ValidBoundedWindowsSecurity(std::span<const std::byte> bytes)
+{
+    if (bytes.size() < sizeof(SECURITY_DESCRIPTOR_RELATIVE)) return false;
+    SECURITY_DESCRIPTOR_RELATIVE header{};
+    std::memcpy(&header, bytes.data(), sizeof(header));
+    if (header.Revision != SECURITY_DESCRIPTOR_REVISION || !(header.Control & SE_SELF_RELATIVE)) return false;
+    const auto contains = [&](std::size_t offset, std::size_t length) {
+        return offset >= sizeof(header) && offset % sizeof(DWORD) == 0 &&
+            offset <= bytes.size() && length <= bytes.size() - offset;
+    };
+    const auto valid_sid = [&](DWORD offset) {
+        if (!offset) return true;
+        if (!contains(offset, 8)) return false;
+        const auto count = std::to_integer<unsigned>(bytes[offset + 1]);
+        return count <= SID_MAX_SUB_AUTHORITIES && contains(offset, 8 + 4 * count) &&
+            IsValidSid(const_cast<std::byte*>(bytes.data() + offset));
+    };
+    const auto valid_acl = [&](DWORD offset) {
+        if (!offset) return true;
+        if (!contains(offset, sizeof(ACL))) return false;
+        ACL acl{};
+        std::memcpy(&acl, bytes.data() + offset, sizeof(acl));
+        if (acl.AclSize < sizeof(ACL) || !contains(offset, acl.AclSize)) return false;
+        std::size_t cursor = sizeof(ACL);
+        for (unsigned i = 0; i < acl.AceCount; ++i)
+        {
+            if (cursor > acl.AclSize || sizeof(ACE_HEADER) > acl.AclSize - cursor) return false;
+            ACE_HEADER ace{};
+            std::memcpy(&ace, bytes.data() + offset + cursor, sizeof(ace));
+            if (ace.AceSize < sizeof(ACE_HEADER) || ace.AceSize % sizeof(DWORD) != 0 ||
+                ace.AceSize > acl.AclSize - cursor) return false;
+            cursor += ace.AceSize;
+        }
+        return IsValidAcl(reinterpret_cast<PACL>(const_cast<std::byte*>(bytes.data() + offset))) != FALSE;
+    };
+    if (!valid_sid(header.Owner) || !valid_sid(header.Group) ||
+        !valid_acl(header.Dacl) || !valid_acl(header.Sacl)) return false;
+    auto* descriptor = const_cast<std::byte*>(bytes.data());
+    return IsValidSecurityDescriptor(descriptor) && GetSecurityDescriptorLength(descriptor) == bytes.size();
+}
+
+NTSTATUS EncodeWindowsSecurity(PSECURITY_DESCRIPTOR descriptor, std::vector<std::byte>& payload)
+{
+    if (!descriptor || !IsValidSecurityDescriptor(descriptor)) return STATUS_INVALID_SECURITY_DESCR;
+    const auto length = GetSecurityDescriptorLength(descriptor);
+    if (length > kWindowsSecurityPayloadLimit - 4) return STATUS_NOT_SUPPORTED;
+    const std::span<const std::byte> bytes(static_cast<const std::byte*>(descriptor), length);
+    if (!ValidBoundedWindowsSecurity(bytes)) return STATUS_INVALID_SECURITY_DESCR;
+    SECURITY_DESCRIPTOR_RELATIVE header{};
+    std::memcpy(&header, bytes.data(), sizeof(header));
+    if ((header.Control & SE_SACL_PRESENT) || header.Sacl != 0) return STATUS_NOT_SUPPORTED;
+    payload = {std::byte{'W'}, std::byte{'S'}, std::byte{'D'}, std::byte{1}};
+    payload.insert(payload.end(), bytes.begin(), bytes.end());
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS ResolveWindowsSecurity(const NativeInodeSecurity* security, PSECURITY_DESCRIPTOR fallback,
+    SIZE_T fallback_size, std::span<const std::byte>& descriptor)
+{
+    if (!security || !security->windows_security)
+    {
+        descriptor = {static_cast<const std::byte*>(fallback), fallback_size};
+        return STATUS_SUCCESS;
+    }
+    const auto& bytes = *security->windows_security;
+    // Unsupported or damaged stored permissions must never become permissive defaults.
+    if (security->windows_security_flags != 2 || bytes.size() < 4 ||
+        bytes.size() > kWindowsSecurityPayloadLimit || bytes[0] != std::byte{'W'} ||
+        bytes[1] != std::byte{'S'} || bytes[2] != std::byte{'D'} || bytes[3] != std::byte{1})
+        return STATUS_INVALID_SECURITY_DESCR;
+    descriptor = std::span<const std::byte>(bytes).subspan(4);
+    return ValidBoundedWindowsSecurity(descriptor) ? STATUS_SUCCESS : STATUS_INVALID_SECURITY_DESCR;
+}
+
+bool IsWindowsDirectory(const Node& node)
+{
+    return node.is_directory ||
+        (node.node_kind == NodeKind::SymbolicLink && node.windows_directory_symlink);
+}
+
+std::shared_ptr<const NativeInodeSecurity> VisibleNativeSecurity(const Node& node)
+{
+    return node.shared_payload ? node.shared_payload->native_security : node.native_security;
+}
+
+void SetVisibleNativeSecurityLocked(const std::shared_ptr<Node>& node,
+    std::shared_ptr<const NativeInodeSecurity> security, std::uint64_t generation,
+    bool accepted_update = false)
+{
+    const auto replace = [&](const auto& current, std::uint64_t current_generation)
+    {
+        return security && (generation > current_generation ||
+            (generation == current_generation && (!current || accepted_update)));
+    };
+    if (node->shared_payload)
+    {
+        auto& owner = *node->shared_payload;
+        if (replace(owner.native_security, owner.security_generation))
+        {
+            owner.native_security = std::move(security);
+            owner.security_generation = generation;
+        }
+        for (const auto& weak : owner.aliases)
+            if (const auto alias = weak.lock(); alias && alias->shared_payload == node->shared_payload)
+            {
+                alias->native_security = owner.native_security;
+                alias->security_generation = owner.security_generation;
+            }
+    }
+    else if (replace(node->native_security, node->security_generation))
+    {
+        node->native_security = std::move(security);
+        node->security_generation = generation;
+    }
+}
+
+bool IsSpecialNode(NodeKind kind)
+{
+    return kind == NodeKind::Fifo || kind == NodeKind::Socket ||
+        kind == NodeKind::CharacterDevice || kind == NodeKind::BlockDevice;
+}
+
+UINT32 VisibleWindowsAttributes(const Node& node)
+{
+    const auto attributes = node.shared_payload ? node.shared_payload->windows_attributes : node.windows_attributes;
+    return attributes.value_or(node.is_directory || IsSpecialNode(node.node_kind) ? 0u : FILE_ATTRIBUTE_ARCHIVE);
+}
+
+void SetVisibleWindowsAttributesLocked(const std::shared_ptr<Node>& node,
+    std::optional<UINT32> attributes, std::uint64_t generation)
+{
+    if (node->shared_payload)
+    {
+        auto& owner = *node->shared_payload;
+        if (generation < owner.attributes_generation) return;
+        owner.windows_attributes = attributes;
+        owner.attributes_generation = generation;
+        for (const auto& weak : owner.aliases)
+            if (const auto alias = weak.lock(); alias && alias->shared_payload == node->shared_payload)
+            {
+                alias->windows_attributes = attributes;
+                alias->attributes_generation = generation;
+            }
+    }
+    else if (generation >= node->attributes_generation)
+    {
+        node->windows_attributes = attributes;
+        node->attributes_generation = generation;
+    }
+}
+
 UINT32 BuildFileAttributes(const Node& node, bool read_only)
 {
-    UINT32 attributes = node.is_directory
-        ? FILE_ATTRIBUTE_DIRECTORY
-        : FILE_ATTRIBUTE_ARCHIVE;
+    UINT32 attributes = VisibleWindowsAttributes(node);
+    if (IsWindowsDirectory(node)) attributes |= FILE_ATTRIBUTE_DIRECTORY;
+    if (IsSpecialNode(node.node_kind)) attributes |= FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+
+    if (node.node_kind == NodeKind::SymbolicLink)
+    {
+        attributes |= FILE_ATTRIBUTE_REPARSE_POINT;
+    }
 
     if (IsRecycleBinPathNormalized(node.path))
     {
         attributes |= FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
     }
 
-    if (!node.is_directory && read_only)
+    if (!IsWindowsDirectory(node) && read_only)
     {
         attributes |= FILE_ATTRIBUTE_READONLY;
     }
 
-    return attributes;
+    return attributes == 0 ? FILE_ATTRIBUTE_NORMAL : attributes;
 }
 
 std::uint32_t StableHashUtf16(std::uint32_t hash, const std::wstring& value)
@@ -4121,9 +4714,8 @@ PSECURITY_DESCRIPTOR BuildWritableVolumeSecurityDescriptor(ULONG* descriptor_siz
     }
 
     PSECURITY_DESCRIPTOR descriptor = nullptr;
-    // APFS does not persist Windows ACLs. Present a permissive removable-drive
-    // style descriptor so Explorer and Office shell extensions can create
-    // files/templates without interpreting the mount as read-only to the user.
+    // Imported Mac permissions keep easy Windows access by default. Explicit
+    // Windows file descriptors are stored separately from the original Mac ACL.
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
             L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;BU)(A;;FA;;;AU)(A;;FA;;;WD)",
             SDDL_REVISION_1,
@@ -6729,17 +7321,35 @@ bool ParseEnumLine(const std::string& line, DirEntry& e)
     return !e.name.empty();
 }
 
+InodeTimes VisibleInodeTimes(const Node& node)
+{
+    const auto timestamp = ToFileTimeValue(node.timestamp);
+    auto times = node.shared_payload && node.shared_payload->inode_times
+        ? *node.shared_payload->inode_times
+        : node.inode_times.value_or(InodeTimes{timestamp, timestamp, timestamp, timestamp});
+    if (node.deferred_access_time) times.access_time_utc = node.deferred_access_time;
+    if (node.shared_payload)
+        if (const auto deferred = node.shared_payload->deferred_access_time.load(std::memory_order_acquire))
+            times.access_time_utc = deferred;
+    return times;
+}
+
 void FillInfo(const Node& n, bool read_only, FSP_FSCTL_FILE_INFO* i)
 {
     std::memset(i, 0, sizeof(*i));
+    i->IndexNumber = n.object_id;
     i->FileAttributes = BuildFileAttributes(n, read_only);
-    i->FileSize = n.is_directory ? 0 : n.file_size;
-    i->AllocationSize = n.is_directory ? 0 : ((n.file_size + 4095ull) / 4096ull) * 4096ull;
-    const auto timestamp = ToFileTimeValue(n.timestamp);
-    i->CreationTime = timestamp;
-    i->LastAccessTime = timestamp;
-    i->LastWriteTime = timestamp;
-    i->ChangeTime = timestamp;
+    i->ReparseTag = n.node_kind == NodeKind::SymbolicLink
+        ? IO_REPARSE_TAG_SYMLINK
+        : 0;
+    const bool no_content = IsWindowsDirectory(n) || IsSpecialNode(n.node_kind);
+    i->FileSize = no_content ? 0 : n.file_size;
+    i->AllocationSize = no_content ? 0 : n.allocation_size.value_or(((n.file_size + 4095ull) / 4096ull) * 4096ull);
+    const auto times = VisibleInodeTimes(n);
+    i->CreationTime = times.create_time_utc;
+    i->LastAccessTime = times.access_time_utc;
+    i->LastWriteTime = times.modification_time_utc;
+    i->ChangeTime = times.change_time_utc;
 }
 
 std::optional<UINT16> DirectoryInfoSizeForName(const std::wstring& name)
@@ -7398,7 +8008,7 @@ void ReleaseOpenContextAccountingLocked(MountContext* c, OpenContext* open_ctx)
 void AcquireOpenContextAccountingLocked(
     MountContext* c,
     const std::shared_ptr<Node>& node,
-    const OpenContext* open_ctx)
+    OpenContext* open_ctx)
 {
     if (!c || !node || !open_ctx)
     {
@@ -7406,6 +8016,8 @@ void AcquireOpenContextAccountingLocked(
     }
 
     ++node->open_handle_count;
+    ++node->live_context_count;
+    open_ctx->lifetime_accounted = true;
     if (open_ctx->write_open)
     {
         ++node->write_handle_count;
@@ -7473,6 +8085,14 @@ bool IsDirectChildPathNormalized(const std::wstring& parent_path, const std::wst
 bool IsDirectChildPath(const std::wstring& parent_path, const std::wstring& candidate_path)
 {
     return IsDirectChildPathNormalized(NormalizePath(parent_path), NormalizePath(candidate_path));
+}
+
+void RetireOpenContextLifetimeLocked(OpenContext* open_ctx)
+{
+    if (!open_ctx || !open_ctx->node || !open_ctx->lifetime_accounted) return;
+    open_ctx->lifetime_accounted = false;
+    if (open_ctx->node->live_context_count != 0) --open_ctx->node->live_context_count;
+    ++open_ctx->node->closing_context_count;
 }
 
 bool IsDirectChildPathNormalized(
@@ -7638,7 +8258,8 @@ std::shared_ptr<Node> FindNodeNormalized(MountContext* c, const std::wstring& no
 
 std::filesystem::path HydrationPath(MountContext* c, const Node& n)
 {
-    const auto node_key = n.hydration_key.empty() ? Key(c, n.path) : n.hydration_key;
+    const auto node_key = n.shared_payload ? n.shared_payload->key :
+        (n.hydration_key.empty() ? Key(c, n.path) : n.hydration_key);
     auto key = node_key + L"|" + c->args.device + L"|" + c->args.volume;
     auto hash = (unsigned long long)std::hash<std::wstring>{}(key);
     const bool session_cache_root = c && !c->cache_root.empty();
@@ -7653,9 +8274,53 @@ std::filesystem::path HydrationPath(MountContext* c, const Node& n)
     return root / (std::to_wstring(hash) + L".bin");
 }
 
-std::wstring CommittedReadPathForNodeLocked(const Node& n)
+std::wstring CurrentDataPathForNodeLocked(MountContext* c, const Node& n)
 {
-    return n.committed_read_path.empty() ? n.path : n.committed_read_path;
+    if (!c || n.object_id == 0) return n.path;
+    const auto owns_path = [c, &n](const std::wstring& path) {
+        const auto indexed = TryGetNodeLockedNormalized(c, path);
+        return indexed && indexed->object_id == n.object_id;
+    };
+    if (owns_path(n.path)) return n.path;
+    // A replaced name no longer identifies an already-open inode.
+    if (n.shared_payload)
+        for (const auto& weak : n.shared_payload->aliases)
+            if (const auto alias = weak.lock(); alias && alias->shared_payload == n.shared_payload &&
+                owns_path(alias->path)) return alias->path;
+    return {};
+}
+
+std::wstring SnapshotMutationPathForNode(MountContext* c, const Node& n)
+{
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        auto path = CurrentDataPathForNodeLocked(c, n);
+        if (!path.empty()) return path;
+    }
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    std::wstring remaining_path;
+    if (c->metadata_store)
+    {
+        std::lock_guard<std::mutex> lock(c->metadata_mutex);
+        if (const auto inode = c->metadata_store->LookupCommittedInodeByObjectId(n.object_id))
+            remaining_path = inode->full_path;
+    }
+    if (!remaining_path.empty())
+        if (const auto alias = FindNodeNormalized(c, remaining_path); alias && alias->object_id == n.object_id)
+            return remaining_path;
+#endif
+    return {};
+}
+
+bool IsDetachedPayloadNode(MountContext* c, const Node& n)
+{
+    std::lock_guard<std::mutex> lock(c->mutex);
+    return n.namespace_detached && n.object_id != 0;
+}
+
+std::wstring CommittedReadPathForNodeLocked(MountContext* c, const Node& n)
+{
+    return n.committed_read_path.empty() ? CurrentDataPathForNodeLocked(c, n) : n.committed_read_path;
 }
 
 std::wstring SnapshotCommittedReadPathForNode(MountContext* c, const std::shared_ptr<Node>& n)
@@ -7666,11 +8331,11 @@ std::wstring SnapshotCommittedReadPathForNode(MountContext* c, const std::shared
     }
     if (!c)
     {
-        return CommittedReadPathForNodeLocked(*n);
+        return CommittedReadPathForNodeLocked(c, *n);
     }
 
     std::lock_guard<std::mutex> lock(c->mutex);
-    return CommittedReadPathForNodeLocked(*n);
+    return CommittedReadPathForNodeLocked(c, *n);
 }
 
 bool HasCommittedReadPathMismatch(MountContext* c, const std::shared_ptr<Node>& n)
@@ -7712,9 +8377,77 @@ std::uint64_t FileSizeFromHandle(HANDLE file)
     return static_cast<std::uint64_t>(size.QuadPart);
 }
 
-void RememberNamedStreamSizeLocked(
+std::wstring HydrationStateKey(MountContext* c, const Node& node)
+{
+    return node.shared_payload ? node.shared_payload->key : NodePathKey(c, node);
+}
+
+std::wstring HydrationStateKeyForPathKeyLocked(MountContext* c, const std::wstring& key)
+{
+    const auto found = c->nodes.find(key);
+    return found != c->nodes.end() ? HydrationStateKey(c, *found->second) : key;
+}
+
+bool SharedPayloadHasOpenHandles(const Node& node)
+{
+    if (!node.shared_payload) return node.open_handle_count != 0 || node.live_context_count != 0 || node.closing_context_count != 0;
+    for (const auto& weak : node.shared_payload->aliases)
+        if (const auto alias = weak.lock(); alias && alias->shared_payload == node.shared_payload &&
+            (alias->open_handle_count != 0 || alias->live_context_count != 0 || alias->closing_context_count != 0)) return true;
+    return false;
+}
+
+void SetVisibleAllocationSizeLocked(const std::shared_ptr<Node>& node, std::optional<std::uint64_t> size)
+{
+    node->allocation_size = size;
+    if (!node->shared_payload) return;
+    node->shared_payload->allocation_size = size;
+    for (const auto& weak : node->shared_payload->aliases)
+        if (const auto alias = weak.lock(); alias && alias->shared_payload == node->shared_payload)
+        {
+            alias->allocation_size = size;
+            alias->allocation_unit_bytes = node->allocation_unit_bytes;
+        }
+}
+
+void SetVisiblePayloadMetadataLocked(const std::shared_ptr<Node>& node, std::uint64_t size, const InodeTimes& times)
+{
+    const auto timestamp = ToFileTime(times.modification_time_utc);
+    const auto unit = node->allocation_unit_bytes;
+    if (node->allocation_size)
+        SetVisibleAllocationSizeLocked(node, size < node->file_size
+            ? ((size + unit - 1) / unit) * unit
+            : (std::max)(*node->allocation_size, ((size + unit - 1) / unit) * unit));
+    node->file_size = size;
+    node->timestamp = timestamp;
+    node->inode_times = times;
+    if (!node->shared_payload) return;
+    node->shared_payload->file_size = size;
+    node->shared_payload->timestamp = timestamp;
+    node->shared_payload->inode_times = times;
+    auto& aliases = node->shared_payload->aliases;
+    for (auto it = aliases.begin(); it != aliases.end();)
+    {
+        const auto alias = it->lock();
+        if (!alias || alias->shared_payload != node->shared_payload) { it = aliases.erase(it); continue; }
+        alias->file_size = size;
+        alias->timestamp = timestamp;
+        alias->inode_times = times;
+        alias->times_generation = node->times_generation;
+        ++it;
+    }
+}
+
+void SetVisiblePayloadMetadataLocked(const std::shared_ptr<Node>& node, std::uint64_t size, FILETIME timestamp)
+{
+    auto times = VisibleInodeTimes(*node);
+    times.modification_time_utc = times.change_time_utc = ToFileTimeValue(timestamp);
+    SetVisiblePayloadMetadataLocked(node, size, times);
+}
+
+void RememberNamedStreamSizeByStateKeyLocked(
     MountContext* c,
-    const std::wstring& base_path,
+    const std::wstring& state_key,
     const std::wstring& canonical_stream_name,
     std::uint64_t size)
 {
@@ -7729,7 +8462,7 @@ void RememberNamedStreamSizeLocked(
         return;
     }
 
-    auto& streams = c->named_stream_sizes[Key(c, base_path)];
+    auto& streams = c->named_stream_sizes[state_key];
     const auto stream_key_lower = ToLowerInvariant(stream_key);
     for (auto it = streams.begin(); it != streams.end(); ++it)
     {
@@ -7751,6 +8484,18 @@ void RememberNamedStreamSizeLocked(
     streams[stream_key] = size;
 }
 
+void RememberNamedStreamSizeLocked(
+    MountContext* c, const std::wstring& base_path, const std::wstring& stream_name, std::uint64_t size)
+{
+    if (c) RememberNamedStreamSizeByStateKeyLocked(c,
+        HydrationStateKeyForPathKeyLocked(c, Key(c, base_path)), stream_name, size);
+}
+
+bool HasUnrestoredHydrationLocked(MountContext* c, const std::shared_ptr<Node>& node)
+{
+    return c && node && c->unrestored_hydration_backups.contains(HydrationStateKey(c, *node));
+}
+
 std::uint64_t RememberNamedStreamSizeFromHandleLocked(
     MountContext* c,
     const std::shared_ptr<Node>& node,
@@ -7758,12 +8503,98 @@ std::uint64_t RememberNamedStreamSizeFromHandleLocked(
     HANDLE file)
 {
     const auto size = FileSizeFromHandle(file);
-    if (node)
+    FILE_STANDARD_INFO standard{};
+    if (node && !HasUnrestoredHydrationLocked(c, node) &&
+        GetFileInformationByHandleEx(file, FileStandardInfo, &standard, sizeof(standard)) &&
+        !standard.DeletePending)
     {
-        RememberNamedStreamSizeLocked(c, node->path, canonical_stream_name, size);
+        RememberNamedStreamSizeByStateKeyLocked(c, HydrationStateKey(c, *node), canonical_stream_name, size);
     }
 
     return size;
+}
+
+NTSTATUS LocalNamedStreamError(DWORD error)
+{
+    switch (error)
+    {
+    case ERROR_INVALID_HANDLE: return STATUS_INVALID_HANDLE;
+    case ERROR_FILE_NOT_FOUND: return STATUS_OBJECT_NAME_NOT_FOUND;
+    case ERROR_PATH_NOT_FOUND: return STATUS_OBJECT_PATH_NOT_FOUND;
+    case ERROR_INVALID_NAME: return STATUS_OBJECT_NAME_INVALID;
+    case ERROR_ACCESS_DENIED: return STATUS_ACCESS_DENIED;
+    case ERROR_WRITE_PROTECT: return STATUS_MEDIA_WRITE_PROTECTED;
+    case ERROR_SHARING_VIOLATION: return STATUS_SHARING_VIOLATION;
+    case ERROR_LOCK_VIOLATION: return STATUS_FILE_LOCK_CONFLICT;
+    case ERROR_DELETE_PENDING: return STATUS_DELETE_PENDING;
+    case ERROR_INVALID_PARAMETER: return STATUS_INVALID_PARAMETER;
+    case ERROR_NOT_SUPPORTED: case ERROR_INVALID_FUNCTION: return STATUS_NOT_SUPPORTED;
+    case ERROR_DISK_FULL: return STATUS_DISK_FULL;
+    case ERROR_NOT_READY: return STATUS_DEVICE_NOT_READY;
+    default: return STATUS_IO_DEVICE_ERROR;
+    }
+}
+
+NTSTATUS ValidateLocalNamedStreamHandle(const OpenContext* o)
+{
+    if (!o || !o->node || !o->named_stream) return STATUS_INVALID_PARAMETER;
+    if (o->file == INVALID_HANDLE_VALUE || o->file == nullptr) return STATUS_INVALID_HANDLE;
+    std::vector<std::byte> storage(sizeof(FILE_NAME_INFO) + 32768 * sizeof(WCHAR));
+    auto* name = reinterpret_cast<FILE_NAME_INFO*>(storage.data());
+    if (!GetFileInformationByHandleEx(o->file, FileNameInfo, name, static_cast<DWORD>(storage.size())))
+        return LocalNamedStreamError(GetLastError());
+    const auto actual = SplitNamedStreamPath(std::wstring(name->FileName, name->FileNameLength / sizeof(WCHAR)));
+    if (!actual.is_named_stream ||
+        ToLowerInvariant(actual.stream_name) != ToLowerInvariant(o->stream_name))
+        return STATUS_INVALID_HANDLE;
+    return STATUS_SUCCESS;
+}
+
+// Local ADS adapter boundary. A future persistent adapter must provide its own
+// acceptance/cancellation contract here; it must never reuse base-node deletion.
+// Caller holds c->mutex. Validate the actual handle, not a callback path (which
+// can be stale, colon-qualified, or even name the base file).
+NTSTATUS ValidateLocalNamedStreamDeleteLocked(MountContext* c, OpenContext* o, bool deleting)
+{
+    if (!c) return STATUS_INVALID_PARAMETER;
+    const auto status = ValidateLocalNamedStreamHandle(o);
+    if (!NT_SUCCESS(status)) return status;
+    if (!o->allow_delete) return STATUS_ACCESS_DENIED;
+    if (!deleting) return STATUS_SUCCESS;
+    if (!IsMutationWriteEnabled(c)) return STATUS_MEDIA_WRITE_PROTECTED;
+    if (HasUnrestoredHydrationLocked(c, o->node)) return STATUS_IO_DEVICE_ERROR;
+    FILE_BASIC_INFO basic{};
+    if (!GetFileInformationByHandleEx(o->file, FileBasicInfo, &basic, sizeof(basic)))
+        return LocalNamedStreamError(GetLastError());
+    if ((VisibleWindowsAttributes(*o->node) | basic.FileAttributes) & FILE_ATTRIBUTE_READONLY)
+        return STATUS_CANNOT_DELETE;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS SetLocalNamedStreamDeleteLocked(MountContext* c, OpenContext* o, bool deleting)
+{
+    const auto status = ValidateLocalNamedStreamDeleteLocked(c, o, deleting);
+    if (!NT_SUCCESS(status)) return status;
+    FILE_DISPOSITION_INFO disposition{};
+    disposition.DeleteFile = deleting ? TRUE : FALSE;
+    // Classic disposition preserves already-open readers and permits cancellation.
+    // Windows removes only this ADS after the final underlying handle closes.
+    if (!SetFileInformationByHandle(o->file, FileDispositionInfo, &disposition, sizeof(disposition)))
+        return LocalNamedStreamError(GetLastError());
+    o->stream_delete_pending = deleting;
+    o->stream_delete_cancelled = !deleting;
+    if (deleting)
+    {
+        auto bucket = c->named_stream_sizes.find(HydrationStateKey(c, *o->node));
+        if (bucket != c->named_stream_sizes.end())
+            for (auto it = bucket->second.begin(); it != bucket->second.end();)
+                if (ToLowerInvariant(it->first) == ToLowerInvariant(o->stream_name))
+                    it = bucket->second.erase(it);
+                else ++it;
+        MarkOpenContextMutation(o);
+    }
+    else o->stream_size = RememberNamedStreamSizeFromHandleLocked(c, o->node, o->stream_name, o->file);
+    return STATUS_SUCCESS;
 }
 
 void ForgetNamedStreamsLocked(MountContext* c, const std::wstring& base_path)
@@ -7776,9 +8607,9 @@ void ForgetNamedStreamsLocked(MountContext* c, const std::wstring& base_path)
     c->named_stream_sizes.erase(Key(c, base_path));
 }
 
-bool EnsureHydrationSidecarExistsForNamedStream(MountContext* c, const std::shared_ptr<Node>& node)
+bool EnsureHydrationSidecarExistsForNamedStreamLocked(MountContext* c, const std::shared_ptr<Node>& node)
 {
-    if (!c || !node || node->is_directory)
+    if (!c || !node || node->is_directory || HasUnrestoredHydrationLocked(c, node))
     {
         return false;
     }
@@ -7818,7 +8649,8 @@ bool IsHydrationStaleLocked(MountContext* c, const std::shared_ptr<Node>& node)
     return c &&
            node &&
            !node->is_directory &&
-           c->stale_hydration_keys.find(NodePathKey(c, *node)) != c->stale_hydration_keys.end();
+           (c->stale_hydration_keys.find(HydrationStateKey(c, *node)) != c->stale_hydration_keys.end() ||
+            HasUnrestoredHydrationLocked(c, node));
 }
 
 void InvalidateHydrationReadHandle(MountContext* c)
@@ -7837,7 +8669,7 @@ void MarkHydrationStaleLocked(MountContext* c, const std::shared_ptr<Node>& node
     if (c && node && !node->is_directory)
     {
         InvalidateHydrationReadHandle(c);
-        c->stale_hydration_keys.insert(NodePathKey(c, *node));
+        c->stale_hydration_keys.insert(HydrationStateKey(c, *node));
     }
 }
 
@@ -7846,7 +8678,7 @@ void ClearHydrationStaleLocked(MountContext* c, const std::wstring& path)
     if (c)
     {
         InvalidateHydrationReadHandle(c);
-        c->stale_hydration_keys.erase(Key(c, path));
+        c->stale_hydration_keys.erase(HydrationStateKeyForPathKeyLocked(c, Key(c, path)));
     }
 }
 
@@ -7855,7 +8687,7 @@ void ClearHydrationStaleLockedNormalized(MountContext* c, const std::wstring& no
     if (c)
     {
         InvalidateHydrationReadHandle(c);
-        c->stale_hydration_keys.erase(LowerPathKey(c, normalized_path));
+        c->stale_hydration_keys.erase(HydrationStateKeyForPathKeyLocked(c, LowerPathKey(c, normalized_path)));
     }
 }
 
@@ -7871,8 +8703,12 @@ bool MoveFileAsideForRollbackLocked(
         return true;
     }
 
+    if (HasUnrestoredHydrationLocked(c, node)) return false;
     snapshot.path_key = NodePathKey(c, *node);
-    auto stream_it = c->named_stream_sizes.find(snapshot.path_key);
+    snapshot.hydration_state_key = HydrationStateKey(c, *node);
+    snapshot.retain_shared_hydration = node->shared_payload != nullptr;
+    preserve_hydration_in_place |= snapshot.retain_shared_hydration;
+    auto stream_it = c->named_stream_sizes.find(snapshot.hydration_state_key);
     if (stream_it != c->named_stream_sizes.end())
     {
         snapshot.has_named_streams = true;
@@ -8031,43 +8867,56 @@ void RestoreFileRollbackSnapshotLocked(MountContext* c, const LocalFileRollbackS
     }
 
     InvalidateHydrationReadHandle(c);
+    const auto& state_key = snapshot.hydration_state_key.empty() ? snapshot.path_key : snapshot.hydration_state_key;
+
+    if (snapshot.hydration_moved && !snapshot.hydration_backup_path.empty())
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(snapshot.hydration_path.parent_path(), ec);
+        if (!ec)
+        {
+            // Replace in one rename. Removing the destination first would
+            // destroy it even when the recovery source has disappeared.
+            std::filesystem::rename(snapshot.hydration_backup_path, snapshot.hydration_path, ec);
+        }
+        if (ec)
+        {
+            c->stale_hydration_keys.insert(state_key);
+            c->unrestored_hydration_backups[state_key] = snapshot.hydration_backup_path;
+            std::wcerr << L"[FsHost] Cache rollback failed (" << ec.value()
+                       << L"); recovery copy retained when present: '"
+                       << snapshot.hydration_backup_path.wstring() << L"'." << std::endl;
+            return;
+        }
+    }
 
     if (snapshot.has_named_streams)
     {
-        c->named_stream_sizes[snapshot.path_key] = snapshot.named_streams;
+        c->named_stream_sizes[state_key] = snapshot.named_streams;
     }
     else
     {
-        c->named_stream_sizes.erase(snapshot.path_key);
+        c->named_stream_sizes.erase(state_key);
     }
 
-    std::error_code ec;
-    if (snapshot.hydration_moved && !snapshot.hydration_backup_path.empty())
-    {
-        std::filesystem::create_directories(snapshot.hydration_path.parent_path(), ec);
-        ec.clear();
-        std::filesystem::remove(snapshot.hydration_path, ec);
-        ec.clear();
-        std::filesystem::rename(
-            snapshot.hydration_backup_path,
-            snapshot.hydration_path,
-            ec);
-    }
-
-    c->stale_hydration_keys.erase(snapshot.path_key);
+    c->stale_hydration_keys.erase(state_key);
+    c->unrestored_hydration_backups.erase(state_key);
 }
 
 void DiscardFileRollbackSnapshot(
     const LocalFileRollbackSnapshot& snapshot,
-    bool remove_preserved_hydration = false)
+    bool mutation_committed = false)
 {
+    // Successful restoration already consumes the backup by renaming it.
+    // Any copy still present after rollback must remain available for recovery.
+    if (!mutation_committed) return;
+
     if (!snapshot.hydration_backup_path.empty())
     {
         std::error_code ec;
         std::filesystem::remove(snapshot.hydration_backup_path, ec);
     }
-    else if (remove_preserved_hydration &&
-             snapshot.hydration_preserved_in_place &&
+    else if (snapshot.hydration_preserved_in_place && !snapshot.retain_shared_hydration &&
              !snapshot.hydration_path.empty())
     {
         std::error_code ec;
@@ -8242,7 +9091,10 @@ bool CaptureSetFileSizeRollbackTail(
         read_ov.Offset = static_cast<DWORD>(offset & 0xffffffffull);
         read_ov.OffsetHigh = static_cast<DWORD>(offset >> 32);
         DWORD read = 0;
-        if (!ReadFile(file, buffer.data(), chunk, &read, &read_ov) || read != chunk)
+        BOOL read_ok = ReadFile(file, buffer.data(), chunk, &read, &read_ov);
+        if (!read_ok && GetLastError() == ERROR_IO_PENDING)
+            read_ok = GetOverlappedResult(file, &read_ov, &read, TRUE);
+        if (!read_ok || read != chunk)
         {
             ok = false;
             break;
@@ -8268,11 +9120,11 @@ bool CaptureSetFileSizeRollbackTail(
     return ok;
 }
 
-void RestoreSetFileSizeRollbackTail(HANDLE file, const SetFileSizeRollbackSnapshot& snapshot)
+bool RestoreSetFileSizeRollbackTail(HANDLE file, const SetFileSizeRollbackSnapshot& snapshot)
 {
     if (file == INVALID_HANDLE_VALUE || snapshot.tail_backup_path.empty())
     {
-        return;
+        return file != INVALID_HANDLE_VALUE && snapshot.previous_size == 0;
     }
 
     HANDLE backup = CreateFileW(
@@ -8285,16 +9137,20 @@ void RestoreSetFileSizeRollbackTail(HANDLE file, const SetFileSizeRollbackSnapsh
         nullptr);
     if (backup == INVALID_HANDLE_VALUE)
     {
-        return;
+        return false;
     }
 
     std::vector<std::byte> buffer(1024 * 1024);
     std::uint64_t offset = snapshot.tail_offset;
-    while (true)
+    bool ok = true;
+    while (offset < snapshot.previous_size)
     {
+        const auto chunk = static_cast<DWORD>((std::min)(snapshot.previous_size - offset,
+            static_cast<std::uint64_t>(buffer.size())));
         DWORD read = 0;
-        if (!ReadFile(backup, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr) || read == 0)
+        if (!ReadFile(backup, buffer.data(), chunk, &read, nullptr) || read != chunk)
         {
+            ok = false;
             break;
         }
 
@@ -8302,14 +9158,21 @@ void RestoreSetFileSizeRollbackTail(HANDLE file, const SetFileSizeRollbackSnapsh
         write_ov.Offset = static_cast<DWORD>(offset & 0xffffffffull);
         write_ov.OffsetHigh = static_cast<DWORD>(offset >> 32);
         DWORD written = 0;
-        if (!WriteFile(file, buffer.data(), read, &written, &write_ov) || written != read)
+        BOOL write_ok = WriteFile(file, buffer.data(), read, &written, &write_ov);
+        if (!write_ok && GetLastError() == ERROR_IO_PENDING)
+            write_ok = GetOverlappedResult(file, &write_ov, &written, TRUE);
+        if (!write_ok || written != read)
         {
+            ok = false;
             break;
         }
         offset += written;
     }
 
     CloseHandle(backup);
+    LARGE_INTEGER eof{};
+    eof.QuadPart = snapshot.previous_size;
+    return ok && SetFilePointerEx(file, eof, nullptr, FILE_BEGIN) && SetEndOfFile(file);
 }
 
 void DiscardSetFileSizeRollbackTail(const SetFileSizeRollbackSnapshot& snapshot)
@@ -8330,12 +9193,13 @@ bool ReadCommittedFileRangeWithoutMetadataLock(
     std::size_t bytes_to_read,
     std::byte* destination,
     std::size_t destination_size,
-    std::size_t& out_bytes_read);
+    std::size_t& out_bytes_read,
+    std::uint64_t expected_object_id = 0);
 #endif
 
 bool EnsureHydrated(MountContext* c, const std::shared_ptr<Node>& n, bool allow_empty_placeholder = false)
 {
-    if (!c || !n || n->is_directory)
+    if (!c || !n || n->node_kind != NodeKind::RegularFile)
     {
         return false;
     }
@@ -8346,9 +9210,10 @@ bool EnsureHydrated(MountContext* c, const std::shared_ptr<Node>& n, bool allow_
     std::wstring committed_read_path;
     {
         std::lock_guard<std::mutex> lock(c->mutex);
+        if (HasUnrestoredHydrationLocked(c, n)) return false;
         stale_hydration = IsHydrationStaleLocked(c, n);
         logical_size = n->file_size;
-        committed_read_path = CommittedReadPathForNodeLocked(*n);
+        committed_read_path = CommittedReadPathForNodeLocked(c, *n);
     }
     const auto committed_read_path_key = LowerPathKey(c, committed_read_path);
     if (!stale_hydration)
@@ -8369,6 +9234,12 @@ bool EnsureHydrated(MountContext* c, const std::shared_ptr<Node>& n, bool allow_
                 return true;
             }
 
+            if (n->shared_payload)
+            {
+                std::lock_guard<std::mutex> lock(c->mutex);
+                if (SharedPayloadHasOpenHandles(*n)) return false;
+            }
+
             InvalidateHydrationReadHandle(c);
             std::error_code remove_ec;
             std::filesystem::remove(file, remove_ec);
@@ -8387,6 +9258,11 @@ bool EnsureHydrated(MountContext* c, const std::shared_ptr<Node>& n, bool allow_
     }
     else
     {
+        if (n->shared_payload)
+        {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            if (SharedPayloadHasOpenHandles(*n)) return false;
+        }
         InvalidateHydrationReadHandle(c);
         std::error_code ec;
         std::filesystem::remove(file, ec);
@@ -8652,6 +9528,10 @@ std::optional<std::vector<std::byte>> LoadHydratedPayloadForPath(
         return std::nullopt;
     }
 
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (c->accepted_replay_payload_reader) return std::nullopt;
+#endif
+
     auto node = FindNode(c, path);
     if (!node || node->is_directory)
     {
@@ -8909,11 +9789,18 @@ bool ReadHydratedPayloadRangeForPath(
 
     RecordPayloadRangeProviderCall(c);
 
+    if (c->accepted_replay_payload_reader)
+    {
+        return c->accepted_replay_payload_reader(identity, offset, destination);
+    }
+
     // MetadataStore supplies normalized inode paths. Avoid normalizing the
     // same path again for every bounded commit-range callback.
     std::shared_ptr<Node> node;
     bool read_state_captured = false;
     bool hydration_stale = false;
+    bool hydration_unrestored = false;
+    bool materialized_shared_payload = false;
     std::wstring committed_read_path;
     {
         ObservedMutexGuard lock(
@@ -8923,8 +9810,18 @@ bool ReadHydratedPayloadRangeForPath(
         node = TryGetVisibleNodeLockedNormalized(c, path);
         if (node)
         {
+            if (identity.object_id != 0 && node->object_id != identity.object_id &&
+                (node->object_id != 0 || (c->metadata_store && c->metadata_store->AuthoritativeAppleCheckpointView())))
+            {
+                RecordPayloadRangeProviderFailure(c, L"inode-identity-mismatch", path, identity,
+                    offset, destination.size(), false, std::wstring());
+                return false;
+            }
             hydration_stale = IsHydrationStaleLocked(c, node);
-            committed_read_path = CommittedReadPathForNodeLocked(*node);
+            hydration_unrestored = HasUnrestoredHydrationLocked(c, node);
+            materialized_shared_payload = identity.object_id != 0 && identity.generation != 0 && node->shared_payload &&
+                node->shared_payload->materialized_generation == identity.generation;
+            committed_read_path = CommittedReadPathForNodeLocked(c, *node);
             read_state_captured = true;
         }
     }
@@ -8949,8 +9846,18 @@ bool ReadHydratedPayloadRangeForPath(
     if (!read_state_captured)
     {
         std::lock_guard<std::mutex> lock(c->mutex);
+        if (identity.object_id != 0 && node->object_id != identity.object_id &&
+            (node->object_id != 0 || (c->metadata_store && c->metadata_store->AuthoritativeAppleCheckpointView())))
+        {
+            RecordPayloadRangeProviderFailure(c, L"inode-identity-mismatch", path, identity,
+                offset, destination.size(), false, std::wstring());
+            return false;
+        }
         hydration_stale = IsHydrationStaleLocked(c, node);
-        committed_read_path = CommittedReadPathForNodeLocked(*node);
+        hydration_unrestored = HasUnrestoredHydrationLocked(c, node);
+        materialized_shared_payload = identity.object_id != 0 && identity.generation != 0 && node->shared_payload &&
+            node->shared_payload->materialized_generation == identity.generation;
+        committed_read_path = CommittedReadPathForNodeLocked(c, *node);
     }
     const auto committed_read_path_for_lookup = committed_read_path.empty() ? path : committed_read_path;
     const auto committed_read_path_key = LowerPathKey(c, committed_read_path_for_lookup);
@@ -8998,13 +9905,13 @@ bool ReadHydratedPayloadRangeForPath(
             logical_size = node->file_size;
         }
 
-        // Native foreground writes leave the hydration sidecar as an exact
-        // committed snapshot while dirty bytes live in the payload spool.
-        // Reuse that local snapshot during commit-range materialization; the
-        // raw APFS read below remains the fail-closed fallback for missing,
-        // incomplete, or unrelated stale caches.
+        // An Apple checkpoint can retire spooled bytes without refreshing the
+        // sidecar. Its length and requested generation do not prove freshness;
+        // use the committed APFS bytes as the base after a native publication.
         const auto can_use_hydration_base =
+            !hydration_unrestored &&
             c->metadata_store != nullptr &&
+            !c->metadata_store->AuthoritativeAppleCheckpointView() &&
             c->payload_spool != nullptr &&
             c->pending_native_writes.load(std::memory_order_acquire);
         if (can_use_hydration_base &&
@@ -9033,19 +9940,23 @@ bool ReadHydratedPayloadRangeForPath(
         }
 
         bool committed_read_ok = false;
+        std::fill(destination.begin(), destination.end(), std::byte{0});
         if (c->metadata_store)
         {
             std::size_t committed_bytes_read = 0;
             // The range provider is invoked while metadata_mutex is held by
             // the commit path, so call the store directly without re-locking.
-            committed_read_ok = c->metadata_store->ReadCommittedFileRangeIntoCanonicalPathKey(
-                committed_read_path_key,
-                committed_read_path_for_lookup,
-                offset,
-                destination.size(),
-                destination.data(),
-                destination.size(),
-                committed_bytes_read);
+            const auto plan = c->metadata_store->SnapshotCommittedFileReadPlan(committed_read_path_key);
+            if (plan && identity.object_id != 0 && plan->object_id == identity.object_id)
+            {
+                const auto expected_bytes = offset < plan->logical_size
+                    ? static_cast<std::size_t>((std::min)(
+                        plan->logical_size - offset, static_cast<std::uint64_t>(destination.size()))) : 0;
+                committed_read_ok = c->metadata_store->ReadCommittedFileRangeFromPlan(
+                    *plan, committed_read_path_for_lookup, offset, destination.size(),
+                    destination.data(), destination.size(), committed_bytes_read) &&
+                    committed_bytes_read == expected_bytes;
+            }
         }
         if (!committed_read_ok)
         {
@@ -9256,6 +10167,9 @@ bool ReadHydratedPayloadRangeForPath(
         }
     }
 
+    // The shared cache already reflects intervening truncation/zero extension;
+    // older spool bytes must not resurrect the discarded ranges.
+    if (materialized_shared_payload) return true;
     std::size_t bytes_overlayed = 0;
     const auto overlay_ok = OverlayPayloadSpoolBestEffort(
         c,
@@ -9318,6 +10232,245 @@ bool ReadHydratedPayloadRangeForPath(
     return ReadHydratedPayloadRangeForPath(c, path, *identity, offset, destination);
 }
 
+NodeKind NodeKindFromMetadataType(apfsaccess::rw::MetadataStore::NodeType type)
+{
+    using MetadataNodeType = apfsaccess::rw::MetadataStore::NodeType;
+    switch (type)
+    {
+    case MetadataNodeType::Directory:
+        return NodeKind::Directory;
+    case MetadataNodeType::SymbolicLink:
+        return NodeKind::SymbolicLink;
+    case MetadataNodeType::Fifo:
+        return NodeKind::Fifo;
+    case MetadataNodeType::Socket:
+        return NodeKind::Socket;
+    case MetadataNodeType::CharacterDevice:
+        return NodeKind::CharacterDevice;
+    case MetadataNodeType::BlockDevice:
+        return NodeKind::BlockDevice;
+    default:
+        return NodeKind::RegularFile;
+    }
+}
+
+bool ApplyCommittedInodeMetadataToNode(
+    MountContext* c,
+    const apfsaccess::rw::MetadataStore::InodeRecord& inode,
+    const FILETIME& fallback_timestamp,
+    const std::shared_ptr<Node>& node_ptr,
+    std::optional<UINT32> windows_attributes = std::nullopt,
+    std::shared_ptr<const NativeInodeSecurity> native_security = {},
+    bool directory_symlink = false)
+{
+    auto& node = *node_ptr;
+    const auto reported_unit = CaptureReportedVolumeInfo(*c).allocation_unit_bytes;
+    node.allocation_unit_bytes = reported_unit != 0 ? reported_unit : 4096;
+    const bool same_identity = node.object_id == inode.object_id;
+    if (!same_identity)
+    {
+        node.deferred_access_time = 0;
+        node.windows_attributes.reset();
+        node.attributes_generation = 0;
+        node.native_security.reset();
+        node.security_generation = 0;
+        node.windows_directory_symlink = false;
+        node.symlink_metadata_generation = 0;
+    }
+    if (node.shared_payload && node.shared_payload->object_id != inode.object_id) node.shared_payload.reset();
+    if (inode.object_id != 0 && !inode.is_directory)
+    {
+        const auto owner_key = L"$inode:" + std::to_wstring(inode.object_id);
+        auto owner = c->shared_payload_owners.find(owner_key);
+        if (inode.link_count > 1 || owner != c->shared_payload_owners.end())
+        {
+            if (owner == c->shared_payload_owners.end())
+            {
+                auto created = std::make_shared<SharedInodePayload>();
+                created->key = owner_key;
+                created->object_id = inode.object_id;
+                created->windows_attributes = node.windows_attributes;
+                created->attributes_generation = node.attributes_generation;
+                created->native_security = node.native_security;
+                created->security_generation = node.security_generation;
+                owner = c->shared_payload_owners.emplace(owner_key, std::move(created)).first;
+            }
+            if (node.shared_payload != owner->second)
+            {
+                node.shared_payload = owner->second;
+                node.shared_payload->aliases.push_back(node_ptr);
+            }
+            node.hydration_key = owner_key;
+        }
+    }
+    node.object_id = inode.object_id;
+    const bool apply_link_metadata = inode.xid >= node.symlink_metadata_generation;
+    if (apply_link_metadata)
+    {
+        node.is_directory = inode.is_directory;
+        node.node_kind = NodeKindFromMetadataType(inode.node_type);
+        node.windows_directory_symlink = node.node_kind == NodeKind::SymbolicLink && directory_symlink;
+        node.symlink_metadata_generation = inode.xid;
+    }
+    SetVisibleWindowsAttributesLocked(node_ptr, windows_attributes, inode.xid);
+    SetVisibleNativeSecurityLocked(node_ptr, std::move(native_security), inode.xid);
+    const auto timestamp = inode.timestamp_utc != 0
+        ? ToFileTime(inode.timestamp_utc)
+        : node.shared_payload && ToFileTimeValue(node.shared_payload->timestamp) != 0
+            ? node.shared_payload->timestamp
+            : same_identity && ToFileTimeValue(node.timestamp) != 0 ? node.timestamp : fallback_timestamp;
+    // Native zero nanoseconds is a nonzero FILETIME epoch; only legacy records lack the quartet.
+    const bool has_native_times = inode.create_time_utc != 0 || inode.modification_time_utc != 0 ||
+        inode.change_time_utc != 0 || inode.access_time_utc != 0;
+    const auto legacy_time = ToFileTimeValue(timestamp);
+    const InodeTimes times = has_native_times
+        ? InodeTimes{inode.create_time_utc, inode.modification_time_utc, inode.change_time_utc, inode.access_time_utc}
+        : InodeTimes{legacy_time, legacy_time, legacy_time, legacy_time};
+    if (node.shared_payload)
+    {
+        auto& owner = *node.shared_payload;
+        // A delayed directory snapshot must not rewind a live alias's EOF.
+        // Skip duplicate alias metadata, not legitimate changes in this generation.
+        if (!owner.visible_generation || inode.xid >= *owner.visible_generation)
+        {
+            const bool changed = !owner.visible_generation || owner.file_size != inode.logical_size ||
+                owner.allocation_size != inode.allocation_size ||
+                !owner.inode_times || *owner.inode_times != times;
+            owner.visible_generation = inode.xid;
+            node.times_generation = inode.xid;
+            if (changed) SetVisiblePayloadMetadataLocked(node_ptr, inode.logical_size, times);
+            SetVisibleAllocationSizeLocked(node_ptr, inode.allocation_size);
+        }
+        node.file_size = owner.file_size;
+        node.allocation_size = owner.allocation_size;
+        node.timestamp = owner.timestamp;
+        node.inode_times = owner.inode_times;
+        node.times_generation = owner.visible_generation.value_or(0);
+    }
+    else
+    {
+        node.file_size = inode.is_directory ? 0 : inode.logical_size;
+        node.allocation_size = inode.allocation_size;
+        if (!same_identity || inode.xid >= node.times_generation)
+        {
+            node.inode_times = times;
+            node.timestamp = ToFileTime(times.modification_time_utc);
+            node.times_generation = inode.xid;
+        }
+    }
+    if (!apply_link_metadata) return true;
+    node.symlink_target.clear();
+    if (node.node_kind == NodeKind::SymbolicLink)
+    {
+        return !inode.symlink_target_utf8.empty() &&
+            TryUtf8ToWideStrict(inode.symlink_target_utf8, node.symlink_target) &&
+            !node.symlink_target.empty();
+    }
+    return inode.symlink_target_utf8.empty();
+}
+
+// Built under the namespace lock; a committed view predates these local edits.
+class PendingNamespacePaths
+{
+public:
+    explicit PendingNamespacePaths(MountContext* context) : context_(context)
+    {
+        for (const auto& plan : context_->deferred_rename_rollback_plans)
+        {
+            if (!plan.node_reindexed) continue;
+            paths_.insert(LowerPathKey(context_, plan.old_path));
+            paths_.insert(LowerPathKey(context_, plan.new_path));
+        }
+    }
+
+    bool Contains(const std::wstring& path) const
+    {
+        if (path.empty()) return false;
+        if (!context_->deferred_delete_rollback_plans.empty() &&
+            HasDeferredDeleteRollbackPlanForPathOrAncestorLocked(context_, path)) return true;
+        if (paths_.empty()) return false;
+        auto key = LowerPathKey(context_, path);
+        for (;;)
+        {
+            if (paths_.contains(key)) return true;
+            if (key == L"\\") return false;
+            key = ParentOfNormalizedPath(key);
+        }
+    }
+
+private:
+    MountContext* context_;
+    std::unordered_set<std::wstring> paths_;
+};
+
+bool ReadWindowsAttributes(const std::optional<apfsaccess::rw::AppleXattrRecord>& attribute,
+    std::optional<UINT32>& value)
+{
+    value.reset();
+    if (!attribute) return true;
+    const auto& bytes = attribute->data;
+    if (attribute->flags != apfsaccess::rw::kAppleXattrDataEmbedded || bytes.size() != 8 ||
+        bytes[0] != std::byte{'D'} || bytes[1] != std::byte{'O'} ||
+        bytes[2] != std::byte{'S'} || bytes[3] != std::byte{1}) return false;
+    UINT32 decoded = 0;
+    for (unsigned i = 0; i != 4; ++i)
+        decoded |= static_cast<UINT32>(std::to_integer<unsigned char>(bytes[4 + i])) << (8 * i);
+    if ((decoded & ~kPersistedWindowsAttributeMask) != 0) return false;
+    value = decoded;
+    return true;
+}
+
+bool CaptureCommittedWindowsAttributes(const apfsaccess::rw::MetadataStore& store,
+    std::uint64_t object_id, std::unordered_map<std::uint64_t, std::optional<UINT32>>& values)
+{
+    auto [entry, inserted] = values.try_emplace(object_id);
+    return !inserted || ReadWindowsAttributes(
+        store.LookupCommittedExtendedAttribute(object_id, kWindowsAttributesName), entry->second);
+}
+
+bool ReadWindowsDirectorySymlink(const std::optional<apfsaccess::rw::AppleXattrRecord>& attribute,
+    bool& directory_symlink)
+{
+    directory_symlink = false;
+    if (!attribute) return true;
+    if (attribute->flags != apfsaccess::rw::kAppleXattrDataEmbedded ||
+        attribute->data.size() != kWindowsDirectorySymlinkHint.size() ||
+        !std::equal(attribute->data.begin(), attribute->data.end(), kWindowsDirectorySymlinkHint.begin())) return false;
+    directory_symlink = true;
+    return true;
+}
+
+bool CaptureCommittedDirectorySymlink(const apfsaccess::rw::MetadataStore& store,
+    std::uint64_t object_id, std::unordered_map<std::uint64_t, bool>& values)
+{
+    auto [entry, inserted] = values.try_emplace(object_id, false);
+    return !inserted || ReadWindowsDirectorySymlink(
+        store.LookupCommittedExtendedAttribute(object_id, kWindowsSymlinkKindName), entry->second);
+}
+
+void CaptureCommittedNativeSecurity(const apfsaccess::rw::MetadataStore& store,
+    const apfsaccess::rw::MetadataStore::InodeRecord& inode,
+    std::unordered_map<std::uint64_t, std::shared_ptr<const NativeInodeSecurity>>& values)
+{
+    const auto [entry, inserted] = values.try_emplace(inode.object_id);
+    if (!inserted || (inode.mode & 0170000) == 0) return;
+    auto security = std::make_shared<NativeInodeSecurity>();
+    security->owner = inode.owner;
+    security->group = inode.group;
+    security->mode = inode.mode;
+    if (auto attribute = store.LookupCommittedExtendedAttribute(inode.object_id, kAppleSecurityName))
+    {
+        security->apple_security_flags = attribute->flags;
+        security->apple_security = std::move(attribute->data);
+    }
+    if (auto attribute = store.LookupCommittedExtendedAttribute(inode.object_id, kWindowsSecurityName))
+    {
+        security->windows_security_flags = attribute->flags;
+        security->windows_security = std::move(attribute->data);
+    }
+    entry->second = std::move(security);
+}
+
 bool MergeCommittedInodeStateIntoNodeIndex(MountContext* c)
 {
     ScopedPerfTimer perf_scope(c ? &c->perf_merge_committed_inodes : nullptr);
@@ -9328,9 +10481,31 @@ bool MergeCommittedInodeStateIntoNodeIndex(MountContext* c)
     }
 
     std::vector<apfsaccess::rw::MetadataStore::InodeRecord> committed_inodes;
+    std::unordered_map<std::uint64_t, bool> directory_symlinks;
+    std::unordered_map<std::uint64_t, std::optional<UINT32>> windows_attributes;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const NativeInodeSecurity>> native_security;
+    std::optional<std::uint64_t> snapshot_xid;
     {
         std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
-        committed_inodes = c->metadata_store->SnapshotCommittedInodes();
+        snapshot_xid = c->metadata_store->LastCommittedXid();
+        // The inode snapshot has one primary path per inode. The Windows
+        // namespace needs every committed directory entry, including aliases.
+        const auto inode_snapshot = c->metadata_store->SnapshotCommittedInodes();
+        committed_inodes.reserve(inode_snapshot.size());
+        for (const auto& inode : inode_snapshot)
+        {
+            if (inode.full_path == L"\\") committed_inodes.push_back(inode);
+            if (!inode.is_directory) continue;
+            auto children = c->metadata_store->SnapshotCommittedDirectoryChildInodes(inode.object_id);
+            if (!children) return false;
+            committed_inodes.insert(committed_inodes.end(), children->begin(), children->end());
+        }
+        for (const auto& inode : committed_inodes)
+        {
+            if (!CaptureCommittedWindowsAttributes(*c->metadata_store, inode.object_id, windows_attributes)) return false;
+            if (!CaptureCommittedDirectorySymlink(*c->metadata_store, inode.object_id, directory_symlinks)) return false;
+            CaptureCommittedNativeSecurity(*c->metadata_store, inode, native_security);
+        }
     }
 
     if (committed_inodes.empty())
@@ -9338,8 +10513,14 @@ bool MergeCommittedInodeStateIntoNodeIndex(MountContext* c)
         return false;
     }
 
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+    if (auto hook = std::exchange(c->test_before_namespace_snapshot_apply, {})) hook();
+#endif
     const auto now = UtcNow();
     std::lock_guard<std::mutex> lock(c->mutex);
+
+    if (snapshot_xid.value_or(0) < c->namespace_checkpoint_xid) return true;
+    const PendingNamespacePaths pending_paths(c);
 
     const auto set_node_path_from_normalized = [c](Node& node, const std::wstring& normalized_path)
     {
@@ -9395,6 +10576,7 @@ bool MergeCommittedInodeStateIntoNodeIndex(MountContext* c)
             if (!existing->is_directory)
             {
                 existing->is_directory = true;
+                existing->node_kind = NodeKind::Directory;
                 existing->file_size = 0;
                 existing->delete_pending = false;
             }
@@ -9409,6 +10591,7 @@ bool MergeCommittedInodeStateIntoNodeIndex(MountContext* c)
         set_node_path_from_normalized(*created, normalized_path);
         created->hydration_key = created->path_key;
         created->is_directory = true;
+        created->node_kind = NodeKind::Directory;
         created->file_size = 0;
         created->timestamp = now;
         created->loaded = true;
@@ -9435,6 +10618,11 @@ bool MergeCommittedInodeStateIntoNodeIndex(MountContext* c)
     for (const auto& inode : committed_inodes)
     {
         const auto& normalized_path = inode.full_path;
+        if (pending_paths.Contains(normalized_path))
+        {
+            ++applied_entries;
+            continue;
+        }
         if (normalized_path.empty())
         {
             continue;
@@ -9456,9 +10644,11 @@ bool MergeCommittedInodeStateIntoNodeIndex(MountContext* c)
 
         set_node_path_from_normalized(*node, normalized_path);
         node->hydration_key = node->path_key;
-        node->is_directory = inode.is_directory;
-        node->file_size = inode.is_directory ? 0 : inode.logical_size;
-        node->timestamp = inode.timestamp_utc != 0 ? ToFileTime(inode.timestamp_utc) : now;
+        if (!ApplyCommittedInodeMetadataToNode(c, inode, now, node, windows_attributes.at(inode.object_id),
+                native_security.at(inode.object_id), directory_symlinks.at(inode.object_id)))
+        {
+            return false;
+        }
         node->delete_pending = false;
 
         if (normalized_path == L"\\")
@@ -9494,6 +10684,8 @@ bool MergeCommittedInodeStateIntoNodeIndex(MountContext* c)
         ++applied_entries;
     }
 
+    if (applied_entries == committed_inodes.size())
+        c->namespace_checkpoint_xid = (std::max)(c->namespace_checkpoint_xid, snapshot_xid.value_or(0));
     return applied_entries > 0;
 }
 
@@ -9522,14 +10714,26 @@ bool MergeCommittedDirectoryChildrenIntoNodeIndex(MountContext* c, const std::sh
 
     std::optional<apfsaccess::rw::MetadataStore::InodeRecord> committed_directory;
     std::optional<std::vector<apfsaccess::rw::MetadataStore::InodeRecord>> committed_children;
+    std::unordered_map<std::uint64_t, bool> directory_symlinks;
+    std::unordered_map<std::uint64_t, std::optional<UINT32>> windows_attributes;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const NativeInodeSecurity>> native_security;
+    std::optional<std::uint64_t> snapshot_xid;
     {
         std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
+        snapshot_xid = c->metadata_store->LastCommittedXid();
         committed_directory = c->metadata_store->LookupCommittedInodeByPath(directory_path);
         if (!committed_directory.has_value() || !committed_directory->is_directory)
         {
             return false;
         }
         committed_children = c->metadata_store->SnapshotCommittedDirectoryChildInodes(committed_directory->object_id);
+        if (committed_children)
+            for (const auto& inode : *committed_children)
+            {
+                if (!CaptureCommittedWindowsAttributes(*c->metadata_store, inode.object_id, windows_attributes)) return false;
+                if (!CaptureCommittedDirectorySymlink(*c->metadata_store, inode.object_id, directory_symlinks)) return false;
+                CaptureCommittedNativeSecurity(*c->metadata_store, inode, native_security);
+            }
     }
 
     if (!committed_children.has_value())
@@ -9537,8 +10741,17 @@ bool MergeCommittedDirectoryChildrenIntoNodeIndex(MountContext* c, const std::sh
         return false;
     }
 
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+    if (auto hook = std::exchange(c->test_before_namespace_snapshot_apply, {})) hook();
+#endif
     const auto now = UtcNow();
     std::lock_guard<std::mutex> lock(c->mutex);
+
+    if (snapshot_xid.value_or(0) < c->namespace_checkpoint_xid)
+        return dir->loaded && TryGetNodeLockedNormalized(c, dir->path) == dir;
+    const PendingNamespacePaths pending_paths(c);
+    if (pending_paths.Contains(directory_path))
+        return dir->loaded && TryGetNodeLockedNormalized(c, dir->path) == dir;
 
     const auto set_node_path_from_normalized = [c](Node& node, const std::wstring& normalized_path)
     {
@@ -9570,6 +10783,11 @@ bool MergeCommittedDirectoryChildrenIntoNodeIndex(MountContext* c, const std::sh
         {
             continue;
         }
+        if (pending_paths.Contains(normalized_path))
+        {
+            ++applied_entries;
+            continue;
+        }
 
         auto node = try_get_node_by_normalized_path(normalized_path);
         if (!node)
@@ -9581,9 +10799,11 @@ bool MergeCommittedDirectoryChildrenIntoNodeIndex(MountContext* c, const std::sh
 
         set_node_path_from_normalized(*node, normalized_path);
         node->hydration_key = node->path_key;
-        node->is_directory = inode.is_directory;
-        node->file_size = inode.is_directory ? 0 : inode.logical_size;
-        node->timestamp = inode.timestamp_utc != 0 ? ToFileTime(inode.timestamp_utc) : now;
+        if (!ApplyCommittedInodeMetadataToNode(c, inode, now, node, windows_attributes.at(inode.object_id),
+                native_security.at(inode.object_id), directory_symlinks.at(inode.object_id)))
+        {
+            return false;
+        }
         node->delete_pending = false;
         const auto leaf_name = LeafNameOfNormalizedPath(normalized_path);
         node->apfs_path = parent_apfs_path.empty()
@@ -9617,20 +10837,41 @@ bool MergeLastCommittedInodeChangesIntoNodeIndex(MountContext* c)
     }
 
     std::vector<apfsaccess::rw::MetadataStore::CommittedInodeChange> drained_changes;
+    std::unordered_map<std::uint64_t, bool> directory_symlinks;
+    std::unordered_map<std::uint64_t, std::optional<UINT32>> windows_attributes;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const NativeInodeSecurity>> native_security;
     std::optional<std::uint64_t> committed_xid;
     {
         std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
         committed_xid = c->metadata_store->LastCommittedXid();
         drained_changes = c->metadata_store->TakeLastCommittedInodeChanges();
+        for (const auto& change : drained_changes)
+            if (change.current)
+            {
+                if (!CaptureCommittedWindowsAttributes(
+                        *c->metadata_store, change.current->object_id, windows_attributes)) return false;
+                CaptureCommittedNativeSecurity(*c->metadata_store, *change.current, native_security);
+                if (!CaptureCommittedDirectorySymlink(
+                        *c->metadata_store, change.current->object_id, directory_symlinks)) return false;
+            }
     }
 
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+    if (auto hook = std::exchange(c->test_before_namespace_snapshot_apply, {})) hook();
+#endif
     std::lock_guard<std::mutex> lock(c->mutex);
+
+    if (committed_xid.value_or(0) < c->namespace_checkpoint_xid) return true;
+    const PendingNamespacePaths pending_paths(c);
 
     if (!committed_xid.has_value() ||
         c->last_committed_inode_changes_xid != committed_xid ||
         !drained_changes.empty())
     {
         c->last_committed_inode_changes = std::move(drained_changes);
+        c->last_committed_windows_attributes = std::move(windows_attributes);
+        c->last_committed_directory_symlinks = std::move(directory_symlinks);
+        c->last_committed_native_security = std::move(native_security);
         c->last_committed_inode_changes_xid = committed_xid;
     }
 
@@ -9691,6 +10932,7 @@ bool MergeLastCommittedInodeChangesIntoNodeIndex(MountContext* c)
             if (!existing->is_directory)
             {
                 existing->is_directory = true;
+                existing->node_kind = NodeKind::Directory;
                 existing->file_size = 0;
                 existing->delete_pending = false;
             }
@@ -9705,6 +10947,7 @@ bool MergeLastCommittedInodeChangesIntoNodeIndex(MountContext* c)
         set_node_path_from_normalized(*created, normalized_path);
         created->hydration_key = created->path_key;
         created->is_directory = true;
+        created->node_kind = NodeKind::Directory;
         created->file_size = 0;
         created->timestamp = now;
         created->loaded = true;
@@ -9730,17 +10973,27 @@ bool MergeLastCommittedInodeChangesIntoNodeIndex(MountContext* c)
     std::size_t applied_entries = 0;
     for (const auto& change : changes)
     {
+        if (pending_paths.Contains(change.previous_path) ||
+            (change.current && pending_paths.Contains(change.current->full_path)))
+        {
+            ++applied_entries;
+            continue;
+        }
         if (!change.previous_path.empty())
         {
             const auto& previous_path = change.previous_path;
+            const auto previous_node = try_get_node_by_normalized_path(previous_path);
+            const bool previous_owner_matches = !previous_node || previous_node->object_id == 0 ||
+                previous_node->object_id == change.object_id;
             if (auto previous_parent = try_get_node_by_normalized_path(parent_of_normalized(previous_path));
+                previous_owner_matches &&
                 previous_parent && previous_parent->is_directory)
             {
                 RemoveChildName(*previous_parent, leaf_of_normalized(previous_path));
             }
 
-            if (!change.current.has_value() ||
-                normalized_path_key(previous_path) != normalized_path_key(change.current->full_path))
+            if (previous_owner_matches && (!change.current.has_value() ||
+                normalized_path_key(previous_path) != normalized_path_key(change.current->full_path)))
             {
                 if (auto old_node = try_get_node_by_normalized_path(previous_path))
                 {
@@ -9778,9 +11031,13 @@ bool MergeLastCommittedInodeChangesIntoNodeIndex(MountContext* c)
 
         set_node_path_from_normalized(*node, normalized_path);
         node->hydration_key = node->path_key;
-        node->is_directory = inode.is_directory;
-        node->file_size = inode.is_directory ? 0 : inode.logical_size;
-        node->timestamp = inode.timestamp_utc != 0 ? ToFileTime(inode.timestamp_utc) : now;
+        if (!ApplyCommittedInodeMetadataToNode(c, inode, now, node,
+                c->last_committed_windows_attributes.at(inode.object_id),
+                c->last_committed_native_security.at(inode.object_id),
+                c->last_committed_directory_symlinks.at(inode.object_id)))
+        {
+            return false;
+        }
         node->delete_pending = false;
 
         if (normalized_path == L"\\")
@@ -9810,6 +11067,8 @@ bool MergeLastCommittedInodeChangesIntoNodeIndex(MountContext* c)
         ++applied_entries;
     }
 
+    if (applied_entries == changes.size())
+        c->namespace_checkpoint_xid = (std::max)(c->namespace_checkpoint_xid, committed_xid.value_or(0));
     return applied_entries > 0;
 }
 #endif
@@ -9964,6 +11223,16 @@ bool IsNativeMutationWriteEnabled(const MountContext* c)
 bool IsMutationWriteEnabled(const MountContext* c)
 {
     return IsOverlayWriteEnabled(c) || IsNativeMutationWriteEnabled(c);
+}
+
+bool ReportsReadOnly(const MountContext* context)
+{
+    // Published mount health is sufficient for attribute reporting. Admission
+    // to an actual mutation still validates the engine under metadata_mutex.
+    return !context || context->recovery_active.load(std::memory_order_acquire) ||
+        context->write_degraded.load(std::memory_order_acquire) ||
+        (!context->overlay_write_enabled.load(std::memory_order_acquire) &&
+         !context->native_write_enabled.load(std::memory_order_acquire));
 }
 
 bool HasRequiredRecoveryIdentityForNativeWrite(const Arguments& args)
@@ -10348,6 +11617,20 @@ bool InitializeSessionPaths(MountContext* c)
     }
 
     return true;
+}
+
+void CleanupHydrationSession(MountContext* c)
+{
+    if (!c || c->session_root.empty()) return;
+    std::lock_guard<std::mutex> lock(c->mutex);
+    if (!c->unrestored_hydration_backups.empty())
+    {
+        std::wcerr << L"[FsHost] Retaining session with unresolved cache rollback: '"
+                   << c->session_root.wstring() << L"'." << std::endl;
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(c->session_root, ec);
 }
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
@@ -10837,7 +12120,8 @@ std::uint64_t ComputeWriteCommitTimeoutBudgetSeconds(
         std::min<std::uint64_t>(timeout_seconds, kWriteCommitTimeoutPayloadExtensionMaxSeconds));
 }
 
-void ArmCommitDeadline(MountContext* c, std::uint64_t pending_payload_bytes)
+void ArmCommitDeadline(MountContext* c, std::uint64_t pending_payload_bytes,
+    std::uint64_t started_tick_ms = 0)
 {
     if (!c)
     {
@@ -10848,7 +12132,8 @@ void ArmCommitDeadline(MountContext* c, std::uint64_t pending_payload_bytes)
         c->args.write_commit_timeout_seconds,
         pending_payload_bytes);
     const auto timeout_ms = timeout_seconds * 1000ull;
-    const auto now = static_cast<std::uint64_t>(GetTickCount64());
+    const auto now = started_tick_ms != 0
+        ? started_tick_ms : static_cast<std::uint64_t>(GetTickCount64());
     std::uint64_t deadline = now;
     if (timeout_ms > (std::numeric_limits<std::uint64_t>::max() - now))
     {
@@ -10970,6 +12255,12 @@ NTSTATUS CommitNativeMutationsBestEffort(
 #ifdef APFSACCESS_HAS_RW_ENGINE
     , const apfsaccess::catalog::ContainerPrepublicationHook&
         manifest_prepublication_hook = {}
+    , const std::function<bool(const apfsaccess::rw::MetadataStore&, std::string&)>&
+        direct_postpublication_hook = {}
+    , const apfsaccess::catalog::ContainerMutationPreparationHook& manifest_preparation_hook = {}
+    , const apfsaccess::catalog::ContainerPostpublicationVerifierHook& manifest_verification_hook = {}
+    , ManifestCommitOutcome* manifest_result = nullptr
+    , bool preserve_unaccepted_manifest_queue = false
 #endif
 );
 bool HasPendingNativeMutations(MountContext* c);
@@ -11010,6 +12301,7 @@ NTSTATUS DrainNativeMutationsByPolicy(
     bool namespace_boundary = false);
 void RollbackRenameLocalStateLocked(MountContext* c, const RenameLocalSnapshot& snapshot);
 void DiscardDeferredRenameRollbackPlans(MountContext* c);
+void RetireUnlinkedPayloadCandidatesBestEffort(MountContext* c);
 void RestoreDeferredRenameRollbackPlans(MountContext* c);
 bool FinalizeMutationJournalBestEffort(MountContext* c, const wchar_t* origin);
 bool FlushPayloadSpoolForAcceptedBoundaryBestEffort(MountContext* c, const wchar_t* origin);
@@ -11019,7 +12311,8 @@ bool AcceptMutationJournalForDeferredCommitBestEffort(
     std::uint64_t* accepted_sequence = nullptr,
     GroupedDeferredAcceptanceFailureReason* failure_reason = nullptr,
     MutationCallbackScope* callback_scope = nullptr,
-    bool wait_for_durability = true);
+    bool wait_for_durability = true,
+    std::uint64_t preimage_checkpoint_xid = 0);
 bool AcceptMutationJournalForGroupedDeferredCommitBestEffort(
     MountContext* c,
     MutationCallbackScope& mutation_scope,
@@ -11047,8 +12340,14 @@ struct ManifestJournalExpectation
 bool CommitQueuedManifestMutationWithWalBestEffort(
     MountContext* c,
     const ManifestJournalExpectation& expectation,
-    const wchar_t* origin);
+    const wchar_t* origin,
+    const apfsaccess::catalog::ContainerMutationPreparationHook& preparation_hook = {},
+    const apfsaccess::catalog::ContainerPostpublicationVerifierHook& verification_hook = {},
+    bool defer_finalization = false,
+    ManifestCommitOutcome* manifest_result = nullptr,
+    bool preserve_unaccepted_manifest_queue = false);
 #endif
+NTSTATUS DrainDeferredAccessTimes(MountContext* c);
 void StartDeferredCommitWorker(MountContext* c);
 bool StopDeferredCommitWorker(MountContext* c);
 NTSTATUS LatchDeferredWalAcceptanceFailureBeforeApfsCommit(
@@ -11173,17 +12472,35 @@ const wchar_t* operation_text_for_manifest(
         return L"Write";
     case apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize:
         return L"SetFileSize";
+    case apfsaccess::rw::MetadataStore::MutationOperation::SetAllocationSize:
+        return L"SetAllocationSize";
     case apfsaccess::rw::MetadataStore::MutationOperation::Rename:
         return L"Rename";
     case apfsaccess::rw::MetadataStore::MutationOperation::Delete:
         return L"Delete";
     case apfsaccess::rw::MetadataStore::MutationOperation::SetBasicInfo:
         return L"SetBasicInfo";
+    case apfsaccess::rw::MetadataStore::MutationOperation::SetInodeMetadata:
+        return L"SetInodeMetadata";
+    case apfsaccess::rw::MetadataStore::MutationOperation::SetSymbolicLinkTarget:
+        return L"SetSymbolicLinkTarget";
+    case apfsaccess::rw::MetadataStore::MutationOperation::RemoveSymbolicLinkTarget:
+        return L"RemoveSymbolicLinkTarget";
+    case apfsaccess::rw::MetadataStore::MutationOperation::RestoreDirectoryFromSymbolicLink:
+        return L"RestoreDirectoryFromSymbolicLink";
+    case apfsaccess::rw::MetadataStore::MutationOperation::SetExtendedAttribute:
+        return L"SetExtendedAttribute";
+    case apfsaccess::rw::MetadataStore::MutationOperation::RemoveExtendedAttribute:
+        return L"RemoveExtendedAttribute";
+    case apfsaccess::rw::MetadataStore::MutationOperation::RewriteCompressedContent:
+        return L"RewriteCompressedContent";
     default:
         return L"Unknown";
     }
 }
 #endif
+
+NTSTATUS CaptureNativeXattrsBeforeUnlink(MountContext* c, const std::wstring& path);
 
 bool RecordNativeMutationBestEffort(
     MountContext* c,
@@ -11195,8 +12512,13 @@ bool RecordNativeMutationBestEffort(
     bool replace_if_exists = false,
     std::uint64_t timestamp_utc = 0,
     apfsaccess::rw::MetadataStore::PayloadIdentity* staged_payload_identity = nullptr,
-    bool* metadata_staged = nullptr)
+    bool* metadata_staged = nullptr,
+    std::optional<apfsaccess::rw::UnlinkOutcome>* unlink_outcome = nullptr,
+    std::size_t atomic_batch_limit = 0,
+    std::span<const std::byte> inline_payload = {},
+    bool start_atomic_batch = false)
 {
+    if (unlink_outcome) unlink_outcome->reset();
     if (metadata_staged)
     {
         *metadata_staged = false;
@@ -11210,13 +12532,45 @@ bool RecordNativeMutationBestEffort(
         return true;
     }
 
+    using Operation = apfsaccess::rw::MetadataStore::MutationOperation;
+    if (operation == Operation::Delete && !NT_SUCCESS(CaptureNativeXattrsBeforeUnlink(c, path))) return false;
+    if (operation == Operation::Rename && replace_if_exists)
+    {
+        bool unlinks_destination = false;
+        if (c->metadata_store)
+        {
+            // Rename staging can already hold the namespace lock. Resolve the
+            // actual unlink identities from metadata without reentering it.
+            std::lock_guard<std::mutex> metadata(c->metadata_mutex);
+            const auto source = c->metadata_store->LookupWorkingInodeByPath(path);
+            const auto destination = c->metadata_store->LookupWorkingInodeByPath(secondary_path);
+            unlinks_destination = source && destination && source->object_id != destination->object_id;
+        }
+        if (unlinks_destination && !NT_SUCCESS(CaptureNativeXattrsBeforeUnlink(c, secondary_path))) return false;
+    }
+    const bool attribute = operation == Operation::SetExtendedAttribute ||
+        operation == Operation::RemoveExtendedAttribute;
+    const bool inode_metadata = operation == Operation::SetInodeMetadata;
+    const bool compression_rewrite = operation == Operation::RewriteCompressedContent;
+    apfsaccess::rw::CompressionRewrite compression_source;
+    if (compression_rewrite && (offset != 0 || timestamp_utc != 0 || !secondary_path.empty() ||
+        replace_if_exists || length != inline_payload.size() ||
+        !apfsaccess::rw::DecodeCompressionRewrite(inline_payload, compression_source))) return false;
+    apfsaccess::rw::InodeMetadataPatch patch;
+    if (inode_metadata && (offset != 0 || timestamp_utc != 0 || !secondary_path.empty() ||
+        replace_if_exists || length != inline_payload.size() ||
+        !apfsaccess::rw::DecodeInodeMetadataPatch(inline_payload, patch))) return false;
+    if (!inode_metadata && !compression_rewrite && (attribute ? (offset != 0 || length != inline_payload.size() || inline_payload.size() > apfsaccess::rw::WriteAheadLog::MaxExtendedAttributePayloadBytes ||
+            replace_if_exists || (operation == Operation::RemoveExtendedAttribute && !inline_payload.empty())) :
+        !inline_payload.empty())) return false;
+
 #ifdef APFSACCESS_FSHOST_UNIT_TEST
     if (c->test_force_native_mutation_staging_success)
     {
         const auto pressure_reached =
             c->test_forced_native_payload_bytes >= kDeferredCloseCommitPayloadBytesThreshold ||
             c->test_forced_native_mutation_count >= kDeferredCloseCommitBurstThreshold;
-        if (pressure_reached && !DrainNativeMutationsForDeferredPressure(c))
+        if ((atomic_batch_limit == 0 || start_atomic_batch) && pressure_reached && !DrainNativeMutationsForDeferredPressure(c))
         {
             return false;
         }
@@ -11258,10 +12612,17 @@ bool RecordNativeMutationBestEffort(
     request.length = length;
     request.replace_if_exists = replace_if_exists;
     request.timestamp_utc = timestamp_utc;
+    request.inline_payload.assign(inline_payload.begin(), inline_payload.end());
+    if (compression_rewrite)
+    {
+        request.object_id = compression_source.object;
+        request.generation = compression_source.generation;
+    }
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
     if (IsManifestSession(c))
     {
+        c->manifest_preaccept_failure_status.store(STATUS_SUCCESS, std::memory_order_release);
         // Manifest sessions always defer: the worker commits the queued
         // batch through the container funnel (stage+commit atomically under
         // the container mutex), so nothing is staged eagerly here and the
@@ -11272,7 +12633,7 @@ bool RecordNativeMutationBestEffort(
             return false;
         }
         const auto manifest_dirty_limit =
-            static_cast<std::size_t>((std::max)(1, c->args.write_max_dirty_transactions));
+            (std::max)(atomic_batch_limit, static_cast<std::size_t>((std::max)(1, c->args.write_max_dirty_transactions)));
         if (ManifestQueuedRequestCount(c) >= manifest_dirty_limit)
         {
             // A manifest request has no replay-safe object identity until the
@@ -11302,7 +12663,10 @@ bool RecordNativeMutationBestEffort(
 
     apfsaccess::rw::MetadataStore::MutationStatus status = apfsaccess::rw::MetadataStore::MutationStatus::NotReady;
     std::wstring failure_reason;
-    const auto dirty_limit = static_cast<std::size_t>(std::max(1, c->args.write_max_dirty_transactions));
+    // Drain older work before the first member, never between members of a batch.
+    const auto configured_dirty_limit = static_cast<std::size_t>(std::max(1, c->args.write_max_dirty_transactions));
+    const auto dirty_limit = start_atomic_batch ? configured_dirty_limit :
+        (std::max)(atomic_batch_limit, configured_dirty_limit);
     bool drained_for_dirty_limit = false;
     bool drained_for_deferred_pressure = false;
     bool recovery_marker_armed = false;
@@ -11315,6 +12679,7 @@ bool RecordNativeMutationBestEffort(
         {
             auto metadata_lock = AcquireObservedMutex(c->metadata_mutex, &c->perf_metadata_mutex_wait);
             should_drain_deferred_pressure =
+                (atomic_batch_limit == 0 || start_atomic_batch) &&
                 IsDeferCloseCommitsEnabled() &&
                 (c->metadata_store->PendingPayloadDirtyByteEstimate() >=
                     kDeferredCloseCommitPayloadBytesThreshold ||
@@ -11337,7 +12702,7 @@ bool RecordNativeMutationBestEffort(
                     else
                     {
                         ScopedPerfTimer metadata_stage_scope(&c->perf_metadata_stage);
-                        status = c->metadata_store->StageMutation(request, staged_payload_identity);
+                        status = c->metadata_store->StageMutation(request, staged_payload_identity, unlink_outcome);
                         if (status != apfsaccess::rw::MetadataStore::MutationStatus::Applied)
                         {
                             failure_reason = c->metadata_store->LastMutationFailureReason();
@@ -11429,6 +12794,9 @@ bool RecordNativeMutationBestEffort(
         case apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize:
             operation_text = L"SetFileSize";
             break;
+        case apfsaccess::rw::MetadataStore::MutationOperation::SetAllocationSize:
+            operation_text = L"SetAllocationSize";
+            break;
         case apfsaccess::rw::MetadataStore::MutationOperation::Rename:
             operation_text = L"Rename";
             break;
@@ -11437,6 +12805,18 @@ bool RecordNativeMutationBestEffort(
             break;
         case apfsaccess::rw::MetadataStore::MutationOperation::SetBasicInfo:
             operation_text = L"SetBasicInfo";
+            break;
+        case apfsaccess::rw::MetadataStore::MutationOperation::SetInodeMetadata:
+            operation_text = L"SetInodeMetadata";
+            break;
+        case apfsaccess::rw::MetadataStore::MutationOperation::SetSymbolicLinkTarget:
+            operation_text = L"SetSymbolicLinkTarget";
+            break;
+        case apfsaccess::rw::MetadataStore::MutationOperation::RemoveSymbolicLinkTarget:
+            operation_text = L"RemoveSymbolicLinkTarget";
+            break;
+        case apfsaccess::rw::MetadataStore::MutationOperation::RestoreDirectoryFromSymbolicLink:
+            operation_text = L"RestoreDirectoryFromSymbolicLink";
             break;
         default:
             break;
@@ -12197,7 +13577,8 @@ bool TryHydrateFromCurrentPayloadOverlay(
     MountContext* c,
     const std::shared_ptr<Node>& node,
     std::optional<std::uint64_t> required_payload_epoch = std::nullopt,
-    bool require_closed_node = false)
+    bool require_closed_node = false,
+    bool converted_metadata_only_handles = false)
 {
     if (!c || !node || node->is_directory || !c->metadata_store)
     {
@@ -12211,6 +13592,9 @@ bool TryHydrateFromCurrentPayloadOverlay(
     {
         std::lock_guard<std::mutex> lock(c->mutex);
         if (TryGetNodeLockedNormalized(c, node->path) != node ||
+            (node->shared_payload && SharedPayloadHasOpenHandles(*node) &&
+                !(converted_metadata_only_handles &&
+                  c->compression_verification_pending.load(std::memory_order_acquire))) ||
             (required_payload_epoch.has_value() &&
              c->payload_identity_cache_epoch.load(std::memory_order_acquire) !=
                  required_payload_epoch.value()) ||
@@ -12225,7 +13609,7 @@ bool TryHydrateFromCurrentPayloadOverlay(
         logical_size = node->file_size;
         visible_path = node->path;
         visible_path_key = NodePathKey(c, *node);
-        committed_read_path = CommittedReadPathForNodeLocked(*node);
+        committed_read_path = CommittedReadPathForNodeLocked(c, *node);
     }
     const auto committed_read_path_key = LowerPathKey(c, committed_read_path);
 
@@ -12508,7 +13892,7 @@ void PromoteFullySpooledHydrationAfterCheckpointBestEffort(
             logical_size = node->file_size;
             visible_path = node->path;
             visible_path_key = NodePathKey(c, *node);
-            committed_read_path = CommittedReadPathForNodeLocked(*node);
+            committed_read_path = CommittedReadPathForNodeLocked(c, *node);
         }
 
         if (logical_size > static_cast<std::uint64_t>((std::numeric_limits<std::size_t>::max)()))
@@ -12563,6 +13947,7 @@ void PromoteFullySpooledHydrationAfterCheckpointBestEffort(
 
 bool CleanupPayloadSpoolAfterCheckpointBestEffort(MountContext* c, std::uint64_t committed_sequence)
 {
+    if (c && c->compression_verification_pending.load(std::memory_order_acquire)) return false;
     if (!c || !c->payload_spool || committed_sequence == 0)
     {
         return true;
@@ -12726,11 +14111,18 @@ bool BuildAcceptedReplayMutationRequest(
     apfsaccess::rw::MetadataStore::MutationRequest& request)
 {
     request = {};
+    if (record.operation == apfsaccess::rw::WriteAheadLog::OperationKind::RewriteCompressedContent)
+        return apfsaccess::fshost::NativeCompressionRewrite::ReplayRequest(record, request);
     request.path = Utf8ToWide(record.path_utf8);
     request.secondary_path = Utf8ToWide(record.secondary_path_utf8);
     request.object_id = record.object_id;
     request.generation = record.parent_object_id;
     request.replace_if_exists = (record.flags & 0x4u) != 0;
+    if (!apfsaccess::rw::WriteAheadLog::UnlinkOutcomeIsConsistent(record) ||
+        (record.unlink_outcome && WideToUtf8(request.path) != record.path_utf8))
+    {
+        return false;
+    }
     switch (record.operation)
     {
     case apfsaccess::rw::WriteAheadLog::OperationKind::CreateFile:
@@ -12748,15 +14140,77 @@ bool BuildAcceptedReplayMutationRequest(
         request.operation = apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize;
         request.length = record.logical_length;
         break;
+    case apfsaccess::rw::WriteAheadLog::OperationKind::SetAllocationSize:
+        if (!apfsaccess::rw::WriteAheadLog::AllocationSizeMutationIsConsistent(record) ||
+            WideToUtf8(request.path) != record.path_utf8) return false;
+        request.operation = apfsaccess::rw::MetadataStore::MutationOperation::SetAllocationSize;
+        request.length = record.logical_length;
+        break;
     case apfsaccess::rw::WriteAheadLog::OperationKind::Rename:
         request.operation = apfsaccess::rw::MetadataStore::MutationOperation::Rename;
         break;
     case apfsaccess::rw::WriteAheadLog::OperationKind::Delete:
         request.operation = apfsaccess::rw::MetadataStore::MutationOperation::Delete;
+        request.expected_unlink_outcome = record.unlink_outcome;
         break;
     case apfsaccess::rw::WriteAheadLog::OperationKind::SetBasicInfo:
         request.operation = apfsaccess::rw::MetadataStore::MutationOperation::SetBasicInfo;
         request.timestamp_utc = record.logical_offset;
+        break;
+    case apfsaccess::rw::WriteAheadLog::OperationKind::SetInodeMetadata:
+    {
+        apfsaccess::rw::InodeMetadataPatch patch;
+        if (!apfsaccess::rw::WriteAheadLog::InodeMetadataMutationIsConsistent(record) ||
+            !apfsaccess::rw::DecodeInodeMetadataPatch(record.inline_payload, patch) ||
+            record.payload_length != record.inline_payload.size() || record.logical_offset != 0 ||
+            record.logical_length != 0 || record.flags != 0 || !record.secondary_path_utf8.empty() ||
+            record.payload_spool_id != 0 || record.payload_offset != 0 ||
+            request.path.find(L'\0') != std::wstring::npos || WideToUtf8(request.path) != record.path_utf8)
+            return false;
+        request.operation = apfsaccess::rw::MetadataStore::MutationOperation::SetInodeMetadata;
+        request.length = record.payload_length;
+        request.inline_payload = record.inline_payload;
+        break;
+    }
+    case apfsaccess::rw::WriteAheadLog::OperationKind::SetSymbolicLinkTarget:
+    case apfsaccess::rw::WriteAheadLog::OperationKind::RemoveSymbolicLinkTarget:
+    case apfsaccess::rw::WriteAheadLog::OperationKind::RestoreDirectoryFromSymbolicLink:
+    {
+        const bool restoring = record.operation ==
+            apfsaccess::rw::WriteAheadLog::OperationKind::RestoreDirectoryFromSymbolicLink;
+        const bool removing = restoring || record.operation ==
+            apfsaccess::rw::WriteAheadLog::OperationKind::RemoveSymbolicLinkTarget;
+        request.operation = restoring
+            ? apfsaccess::rw::MetadataStore::MutationOperation::RestoreDirectoryFromSymbolicLink : removing
+            ? apfsaccess::rw::MetadataStore::MutationOperation::RemoveSymbolicLinkTarget
+            : apfsaccess::rw::MetadataStore::MutationOperation::SetSymbolicLinkTarget;
+        if (removing != request.secondary_path.empty() ||
+            request.path.find(L'\0') != std::wstring::npos ||
+            request.secondary_path.find(L'\0') != std::wstring::npos ||
+            WideToUtf8(request.path) != record.path_utf8 ||
+            WideToUtf8(request.secondary_path) != record.secondary_path_utf8 ||
+            record.flags != 0 || record.logical_offset != 0 || record.logical_length != 0 ||
+            record.payload_spool_id != 0 || record.payload_offset != 0 || record.payload_length != 0 ||
+            !record.inline_payload.empty() ||
+            std::any_of(record.payload_sha256.begin(), record.payload_sha256.end(),
+                [](std::uint8_t byte) { return byte != 0; }))
+        {
+            return false;
+        }
+        break;
+    }
+    case apfsaccess::rw::WriteAheadLog::OperationKind::SetExtendedAttribute:
+    case apfsaccess::rw::WriteAheadLog::OperationKind::RemoveExtendedAttribute:
+        if (!apfsaccess::rw::WriteAheadLog::ExtendedAttributeMutationIsConsistent(record) ||
+            WideToUtf8(request.path) != record.path_utf8 ||
+            WideToUtf8(request.secondary_path) != record.secondary_path_utf8 ||
+            record.secondary_path_utf8.rfind("com.apple.fs.", 0) == 0 ||
+            record.secondary_path_utf8 == "com.apple.decmpfs") return false;
+        request.operation = record.operation == apfsaccess::rw::WriteAheadLog::OperationKind::SetExtendedAttribute
+            ? apfsaccess::rw::MetadataStore::MutationOperation::SetExtendedAttribute
+            : apfsaccess::rw::MetadataStore::MutationOperation::RemoveExtendedAttribute;
+        request.length = record.payload_length;
+        request.inline_payload = record.inline_payload;
         break;
     default:
         return false;
@@ -12772,26 +14226,42 @@ bool BuildAcceptedReplayMutationRequest(
 bool AcceptedReplayMutationRequiresIdentity(
     apfsaccess::rw::MetadataStore::MutationOperation operation) noexcept
 {
+    if (operation == apfsaccess::rw::MetadataStore::MutationOperation::RewriteCompressedContent) return true;
     switch (operation)
     {
     case apfsaccess::rw::MetadataStore::MutationOperation::CreateFile:
     case apfsaccess::rw::MetadataStore::MutationOperation::CreateDirectory:
     case apfsaccess::rw::MetadataStore::MutationOperation::Write:
     case apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize:
+    case apfsaccess::rw::MetadataStore::MutationOperation::SetAllocationSize:
     case apfsaccess::rw::MetadataStore::MutationOperation::Rename:
     case apfsaccess::rw::MetadataStore::MutationOperation::Delete:
     case apfsaccess::rw::MetadataStore::MutationOperation::SetBasicInfo:
+    case apfsaccess::rw::MetadataStore::MutationOperation::SetInodeMetadata:
+    case apfsaccess::rw::MetadataStore::MutationOperation::SetSymbolicLinkTarget:
+    case apfsaccess::rw::MetadataStore::MutationOperation::RemoveSymbolicLinkTarget:
+    case apfsaccess::rw::MetadataStore::MutationOperation::RestoreDirectoryFromSymbolicLink:
+    case apfsaccess::rw::MetadataStore::MutationOperation::SetExtendedAttribute:
+    case apfsaccess::rw::MetadataStore::MutationOperation::RemoveExtendedAttribute:
         return true;
     default:
         return false;
     }
 }
 
+const apfsaccess::rw::WriteAheadLog::Record& AcceptedReplayPayloadAuthority(
+    const MountContext& ctx, const apfsaccess::rw::WriteAheadLog::Record& record)
+{
+    const auto original = ctx.accepted_replay_original_records.find(&record);
+    return original == ctx.accepted_replay_original_records.end() ? record : *original->second;
+}
+
 bool ReadAcceptedReplayPayload(
     MountContext& ctx,
-    const apfsaccess::rw::WriteAheadLog::Record& record,
+    const apfsaccess::rw::WriteAheadLog::Record& projected_record,
     std::vector<std::byte>& payload)
 {
+    const auto& record = AcceptedReplayPayloadAuthority(ctx, projected_record);
     payload.clear();
     if (record.operation != apfsaccess::rw::WriteAheadLog::OperationKind::Write ||
         record.object_id == 0 ||
@@ -12825,6 +14295,178 @@ bool ReadAcceptedReplayPayload(
         record.payload_sha256,
     }, payload);
 }
+
+bool ReadAppleReplayPayloadRange(
+    MountContext& ctx,
+    const std::vector<const apfsaccess::rw::WriteAheadLog::Record*>& records,
+    apfsaccess::rw::MetadataStore::PayloadIdentity identity,
+    std::uint64_t offset,
+    std::span<std::byte> destination)
+{
+    using Operation = apfsaccess::rw::WriteAheadLog::OperationKind;
+    using Store = apfsaccess::rw::MetadataStore;
+    using NodeType = Store::NodeType;
+    if (!ctx.metadata_store || identity.object_id == 0 || identity.generation == 0 ||
+        destination.size() > UINT64_MAX - offset) return false;
+    const auto end = offset + destination.size();
+    std::fill(destination.begin(), destination.end(), std::byte{0});
+    const auto original = ctx.metadata_store->LookupCommittedInodeByObjectId(identity.object_id);
+    bool exists = original.has_value();
+    std::uint64_t size = exists ? original->logical_size : 0;
+    std::uint64_t generation = exists ? (original->xid == 0 ? original->object_id : original->xid) : 0;
+    auto node_type = exists ? original->node_type : NodeType::RegularFile;
+    std::string symlink_target = exists ? original->symlink_target_utf8 : std::string{};
+    bool has_file_storage = exists && original->data_physical_address != 0;
+    const auto checkpoint = ctx.metadata_store->CheckpointXid();
+    if (!checkpoint || *checkpoint == UINT64_MAX) return false;
+    const auto target_generation = *checkpoint + 1;
+    if (exists)
+    {
+        if (node_type != NodeType::RegularFile && node_type != NodeType::SymbolicLink) return false;
+        if (node_type == NodeType::RegularFile)
+        {
+            const auto count = offset < size ? static_cast<std::size_t>(std::min<std::uint64_t>(destination.size(), size - offset)) : 0;
+            std::size_t read = 0;
+            if (count && (!ctx.metadata_store->ReadCommittedFileRangeInto(
+                    original->full_path, offset, count, destination.data(), destination.size(), read) || read != count)) return false;
+        }
+    }
+    const auto zero_range = [&](std::uint64_t begin, std::uint64_t finish)
+    {
+        const auto left = std::max(offset, begin);
+        const auto right = std::min(end, finish);
+        if (left < right) std::fill(destination.begin() + static_cast<std::size_t>(left - offset),
+            destination.begin() + static_cast<std::size_t>(right - offset), std::byte{0});
+    };
+    bool changed = false;
+    std::vector<std::byte> payload;
+    for (const auto* record : records)
+    {
+        if (record->object_id != identity.object_id) continue;
+        // WAL generations are post-mutation XIDs except for unlink and a
+        // same-inode no-op rename. Match the staging contract before reading.
+        if (record->operation != Operation::Delete && record->operation != Operation::Rename &&
+            record->parent_object_id != target_generation) return false;
+        switch (record->operation)
+        {
+        case Operation::CreateFile:
+            if (exists) return false;
+            exists = true; size = 0; generation = target_generation; changed = true;
+            node_type = NodeType::RegularFile; symlink_target.clear(); has_file_storage = false;
+            std::fill(destination.begin(), destination.end(), std::byte{0});
+            break;
+        case Operation::Write:
+        {
+            if (!exists || node_type != NodeType::RegularFile ||
+                record->logical_length > UINT64_MAX - record->logical_offset ||
+                !ReadAcceptedReplayPayload(ctx, *record, payload)) return false;
+            const auto write_end = record->logical_offset + record->logical_length;
+            if (record->logical_offset > size) zero_range(size, record->logical_offset);
+            const auto left = std::max(offset, record->logical_offset);
+            const auto right = std::min(end, write_end);
+            if (left < right) std::copy_n(payload.begin() + static_cast<std::size_t>(left - record->logical_offset),
+                static_cast<std::size_t>(right - left), destination.begin() + static_cast<std::size_t>(left - offset));
+            size = std::max(size, write_end); generation = target_generation; changed = true;
+            has_file_storage = true;
+            break;
+        }
+        case Operation::SetFileSize:
+            if (!exists || node_type != NodeType::RegularFile) return false;
+            zero_range(std::min(size, record->logical_length), std::max(size, record->logical_length));
+            size = record->logical_length; generation = target_generation; changed = true;
+            has_file_storage = size != 0;
+            break;
+        case Operation::SetAllocationSize:
+            if (!exists || node_type != NodeType::RegularFile ||
+                !apfsaccess::rw::WriteAheadLog::AllocationSizeMutationIsConsistent(*record)) return false;
+            // Reservation growth is invisible to reads. Truncation destroys the
+            // old tail even when a later EOF request exposes that range again.
+            zero_range(record->logical_length, size);
+            size = std::min(size, record->logical_length);
+            generation = target_generation; changed = true;
+            has_file_storage = record->logical_length != 0;
+            break;
+        case Operation::Delete:
+            if (!exists || record->parent_object_id != generation || !record->unlink_outcome) return false;
+            if (record->unlink_outcome->object_id != identity.object_id ||
+                record->unlink_outcome->generation_before != generation ||
+                record->unlink_outcome->generation_after != target_generation ||
+                record->unlink_outcome->parent_object_id == 0 ||
+                record->unlink_outcome->path_utf8 != record->path_utf8 ||
+                record->unlink_outcome->links_before == 0 ||
+                record->unlink_outcome->links_after != record->unlink_outcome->links_before - 1) return false;
+            exists = record->unlink_outcome->links_after != 0;
+            generation = exists ? target_generation : 0;
+            break;
+        case Operation::Rename:
+            if (!exists || (record->parent_object_id != generation &&
+                record->parent_object_id != target_generation)) return false;
+            generation = record->parent_object_id;
+            break;
+        case Operation::SetBasicInfo:
+        case Operation::SetInodeMetadata:
+        case Operation::SetExtendedAttribute:
+        case Operation::RemoveExtendedAttribute:
+            if (!exists) return false;
+            generation = target_generation;
+            break;
+        case Operation::SetSymbolicLinkTarget:
+        {
+            Store::MutationRequest request{};
+            if (!BuildAcceptedReplayMutationRequest(*record, request) || !exists ||
+                (node_type != NodeType::SymbolicLink &&
+                    (node_type != NodeType::RegularFile || size != 0 || has_file_storage))) return false;
+            node_type = NodeType::SymbolicLink;
+            symlink_target = record->secondary_path_utf8;
+            size = symlink_target.size();
+            has_file_storage = false;
+            generation = target_generation;
+            changed = true;
+            std::fill(destination.begin(), destination.end(), std::byte{0});
+            break;
+        }
+        case Operation::RemoveSymbolicLinkTarget:
+        {
+            Store::MutationRequest request{};
+            if (!BuildAcceptedReplayMutationRequest(*record, request) || !exists ||
+                node_type != NodeType::SymbolicLink) return false;
+            node_type = NodeType::RegularFile;
+            symlink_target.clear();
+            size = 0;
+            has_file_storage = false;
+            generation = target_generation;
+            changed = true;
+            std::fill(destination.begin(), destination.end(), std::byte{0});
+            break;
+        }
+        case Operation::RestoreDirectoryFromSymbolicLink:
+            // A restored directory cannot supply file payload bytes.
+            return false;
+        default:
+            break;
+        }
+    }
+    return exists && changed && node_type == NodeType::RegularFile && symlink_target.empty() &&
+        generation == identity.generation && end <= size;
+}
+
+bool InodeMetadataPatchMatches(const apfsaccess::rw::MetadataStore::InodeRecord& inode,
+    const apfsaccess::rw::InodeMetadataPatch& patch, std::uint32_t mask)
+{
+    using Patch = apfsaccess::rw::InodeMetadataPatch;
+    return (!(mask & Patch::Owner) || inode.owner == patch.owner) &&
+        (!(mask & Patch::Group) || inode.group == patch.group) &&
+        (!(mask & Patch::Mode) || (inode.mode & 07777) == patch.mode) &&
+        (!(mask & Patch::BsdFlags) || inode.bsd_flags == patch.bsd_flags) &&
+        (!(mask & Patch::CreateTime) || inode.create_time_utc == patch.create_time_utc) &&
+        (!(mask & Patch::ModificationTime) || inode.modification_time_utc == patch.modification_time_utc) &&
+        (!(mask & Patch::ChangeTime) || inode.change_time_utc == patch.change_time_utc) &&
+        (!(mask & Patch::AccessTime) || inode.access_time_utc == patch.access_time_utc);
+}
+
+using AcceptedReplayProvenDataMutations = std::unordered_set<const apfsaccess::rw::WriteAheadLog::Record*>;
+AcceptedReplayProvenDataMutations ProveAcceptedPayloadTransitions(
+    MountContext& ctx, const std::vector<const apfsaccess::rw::WriteAheadLog::Record*>& records);
 
 bool VerifyAcceptedReplayMutationApplied(
     MountContext& ctx,
@@ -12872,6 +14514,7 @@ bool VerifyAcceptedReplayMutationApplied(
         }
         if (!ReadAcceptedReplayPayload(ctx, record, expected))
         {
+            if (ctx.metadata_store->AuthoritativeAppleCheckpointView()) return false;
             // The payload can only be missing when the spool already cleaned the
             // range, which happens strictly after the write became APFS-durable;
             // a committed inode with the recorded identity and full extent then
@@ -12887,7 +14530,21 @@ bool VerifyAcceptedReplayMutationApplied(
                actual == expected;
     }
 
-    const auto inode = ctx.metadata_store->LookupCommittedInodeByPath(request.path);
+    const bool inode_scoped =
+        request.operation == apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize ||
+        request.operation == apfsaccess::rw::MetadataStore::MutationOperation::SetAllocationSize ||
+        request.operation == apfsaccess::rw::MetadataStore::MutationOperation::SetBasicInfo ||
+        request.operation == apfsaccess::rw::MetadataStore::MutationOperation::SetInodeMetadata ||
+        request.operation == apfsaccess::rw::MetadataStore::MutationOperation::SetSymbolicLinkTarget ||
+        request.operation == apfsaccess::rw::MetadataStore::MutationOperation::RemoveSymbolicLinkTarget ||
+        request.operation == apfsaccess::rw::MetadataStore::MutationOperation::RestoreDirectoryFromSymbolicLink ||
+        request.operation == apfsaccess::rw::MetadataStore::MutationOperation::SetExtendedAttribute ||
+        request.operation == apfsaccess::rw::MetadataStore::MutationOperation::RemoveExtendedAttribute;
+    // A later unlink can remove the original name while the exact inode
+    // incarnation and its data/metadata remain reachable through another link.
+    const auto inode = inode_scoped
+        ? ctx.metadata_store->LookupCommittedInodeByObjectId(record.object_id)
+        : ctx.metadata_store->LookupCommittedInodeByPath(request.path);
     switch (request.operation)
     {
     case apfsaccess::rw::MetadataStore::MutationOperation::CreateFile:
@@ -12898,13 +14555,64 @@ bool VerifyAcceptedReplayMutationApplied(
         return matches_recorded_identity(inode) &&
                !inode->is_directory &&
                inode->logical_size == request.length;
+    case apfsaccess::rw::MetadataStore::MutationOperation::SetAllocationSize:
+        // Exact allocation alone cannot prove which old bytes were truncated.
+        // Apple replay requires the ordered preimage/payload transition proof.
+        return false;
     case apfsaccess::rw::MetadataStore::MutationOperation::SetBasicInfo:
         return matches_recorded_identity(inode) &&
                inode->timestamp_utc == request.timestamp_utc;
+    case apfsaccess::rw::MetadataStore::MutationOperation::SetInodeMetadata:
+    {
+        using Patch = apfsaccess::rw::InodeMetadataPatch;
+        Patch patch;
+        if (!matches_recorded_identity(inode) ||
+            !apfsaccess::rw::DecodeInodeMetadataPatch(record.inline_payload, patch)) return false;
+        return InodeMetadataPatchMatches(*inode, patch, patch.mask);
+    }
+    case apfsaccess::rw::MetadataStore::MutationOperation::SetSymbolicLinkTarget:
+        return matches_recorded_identity(inode) &&
+               inode->node_type == apfsaccess::rw::MetadataStore::NodeType::SymbolicLink &&
+               inode->symlink_target_utf8 == record.secondary_path_utf8;
+    case apfsaccess::rw::MetadataStore::MutationOperation::SetExtendedAttribute:
+    case apfsaccess::rw::MetadataStore::MutationOperation::RemoveExtendedAttribute:
+    {
+        if (!matches_recorded_identity(inode)) return false;
+        const auto attribute = ctx.metadata_store->LookupCommittedExtendedAttribute(
+            record.object_id, record.secondary_path_utf8);
+        if (request.operation == apfsaccess::rw::MetadataStore::MutationOperation::RemoveExtendedAttribute)
+            return !attribute;
+        if (!attribute) return false;
+        if (attribute->flags == apfsaccess::rw::kAppleXattrDataEmbedded)
+            return attribute->data == record.inline_payload;
+        if (attribute->flags != apfsaccess::rw::kAppleXattrDataStream ||
+            apfsaccess::catalog::ReadU64LE(attribute->data, 8).value_or(0) != record.inline_payload.size()) return false;
+        std::vector<std::byte> bytes(record.inline_payload.size());
+        std::size_t read = 0;
+        return ctx.metadata_store->ReadCommittedExtendedAttributeRange(record.object_id,
+            record.secondary_path_utf8, 0, bytes, read) && read == bytes.size() && bytes == record.inline_payload;
+    }
+    case apfsaccess::rw::MetadataStore::MutationOperation::RemoveSymbolicLinkTarget:
+        return matches_recorded_identity(inode) &&
+               inode->node_type == apfsaccess::rw::MetadataStore::NodeType::RegularFile &&
+               inode->symlink_target_utf8.empty() &&
+               inode->logical_size == 0 && inode->data_physical_address == 0;
+    case apfsaccess::rw::MetadataStore::MutationOperation::RestoreDirectoryFromSymbolicLink:
+        return matches_recorded_identity(inode) &&
+               ProveAcceptedPayloadTransitions(ctx, {&record}).contains(&record);
     case apfsaccess::rw::MetadataStore::MutationOperation::Rename:
-        return !inode.has_value() &&
-               matches_recorded_identity(
-                   ctx.metadata_store->LookupCommittedInodeByPath(request.secondary_path));
+    {
+        const auto destination = ctx.metadata_store->LookupCommittedInodeByPath(request.secondary_path);
+        if (!inode.has_value()) return matches_recorded_identity(destination);
+        if (!matches_recorded_identity(inode) || !matches_recorded_identity(destination)) return false;
+        if (request.path == request.secondary_path ||
+            !IsSameNormalizedPath(&ctx, request.path, request.secondary_path)) return true;
+        // Case-insensitive lookup resolves both spellings. Only the stored
+        // directory entry proves that the requested case change was published.
+        const auto link = ctx.metadata_store->LookupCommittedDirectoryLinkByPath(request.secondary_path);
+        return link && link->child_object_id == record.object_id &&
+               link->entry_name == LeafNameOfNormalizedPath(NormalizePath(request.secondary_path));
+    }
     case apfsaccess::rw::MetadataStore::MutationOperation::Delete:
     {
         if (inode.has_value())
@@ -12913,38 +14621,867 @@ bool VerifyAcceptedReplayMutationApplied(
         }
         const auto object_inode =
             ctx.metadata_store->LookupCommittedInodeByObjectId(record.object_id);
-        return !object_inode.has_value();
+        const bool legacy_fixture = !ctx.metadata_store->AuthoritativeAppleCheckpointView() &&
+            ctx.metadata_store->Context().allow_legacy_scaffold_for_fixtures &&
+            ctx.metadata_store->Device().IsRegularFile();
+        if (record.unlink_outcome)
+        {
+            if (!legacy_fixture) return false;
+            const auto& outcome = *record.unlink_outcome;
+            const auto parent = ctx.metadata_store->LookupCommittedInodeByPath(
+                ParentOfNormalizedPath(NormalizePath(request.path)));
+            if (parent && (!parent->is_directory || parent->object_id != outcome.parent_object_id)) return false;
+            if (outcome.links_after != 0)
+            {
+                return object_inode && !object_inode->is_directory &&
+                    object_inode->xid == outcome.generation_after &&
+                    object_inode->link_count == outcome.links_after;
+            }
+            // Absence cannot prove an inode's earlier existence or its unlink.
+            // The accepted-prefix verifier supplies independently read history.
+            return !object_inode && legacy_fixture;
+        }
+        return !object_inode && legacy_fixture;
     }
     default:
         return false;
     }
 }
 
+using AcceptedReplayLatestMutations = std::unordered_map<
+    std::uint64_t, const apfsaccess::rw::WriteAheadLog::Record*>;
+
+using AcceptedReplayProvenUnlinks = std::unordered_set<const apfsaccess::rw::WriteAheadLog::Record*>;
+
+AcceptedReplayProvenDataMutations ProveAcceptedPayloadTransitions(
+    MountContext& ctx,
+    const std::vector<const apfsaccess::rw::WriteAheadLog::Record*>& records)
+{
+    using namespace apfsaccess::rw;
+    using Operation = WriteAheadLog::OperationKind;
+    using Kind = MetadataStore::NodeType;
+    AcceptedReplayProvenDataMutations proven;
+    if (!ctx.metadata_store || !ctx.metadata_store->AuthoritativeAppleCheckpointView()) return proven;
+    std::unordered_map<std::uint64_t, std::vector<const WriteAheadLog::Record*>> groups;
+    for (const auto* record : records)
+        if (record->operation == Operation::CreateFile || record->operation == Operation::Write ||
+            record->operation == Operation::SetFileSize || record->operation == Operation::SetAllocationSize ||
+            record->operation == Operation::SetSymbolicLinkTarget ||
+            record->operation == Operation::RemoveSymbolicLinkTarget ||
+            record->operation == Operation::RestoreDirectoryFromSymbolicLink)
+            groups[record->object_id].push_back(record);
+    std::map<std::uint64_t, std::optional<NativeApfsVolumeProjection>> before_views;
+    for (const auto& [object_id, chain] : groups)
+    {
+        const bool has_transition = std::any_of(chain.begin(), chain.end(), [](const auto* record) {
+            return record->operation == Operation::SetFileSize || record->operation == Operation::SetAllocationSize ||
+                record->operation == Operation::SetSymbolicLinkTarget ||
+                record->operation == Operation::RemoveSymbolicLinkTarget ||
+                record->operation == Operation::RestoreDirectoryFromSymbolicLink;
+        });
+        if (!has_transition) continue;
+        const auto final = ctx.metadata_store->LookupCommittedInodeByObjectId(object_id);
+        if (!final || final->xid < 2 ||
+            (final->node_type != Kind::RegularFile && final->node_type != Kind::SymbolicLink &&
+             final->node_type != Kind::Directory)) continue;
+        auto [view, inserted] = before_views.try_emplace(final->xid - 1);
+        if (inserted)
+        {
+            NativeApfsVolumeProjection projection;
+            std::string error;
+            std::wstring read_error;
+            // Historical bytes are authority only while their allocation and
+            // retirement history is independently intact, not just readable.
+            if (ctx.metadata_store->ValidateRequiredRecoveryCheckpoints({final->xid - 1}, error) &&
+                NativeApfsReader::TryLoadVolumeProjection(ctx.metadata_store->Device(),
+                    ctx.metadata_store->Context().volume_object_id, projection, read_error, final->xid - 1))
+                view->second = std::move(projection);
+        }
+        if (!view->second) continue;
+        const auto& before = *view->second;
+        const auto original = std::find_if(before.inodes.begin(), before.inodes.end(),
+            [&](const auto& inode) { return inode.object_id == object_id; });
+        bool exists = original != before.inodes.end();
+        Kind kind = exists ? original->node_type : Kind::RegularFile;
+        if (exists && kind != Kind::RegularFile && kind != Kind::SymbolicLink) continue;
+        std::uint64_t size = exists ? original->logical_size : 0;
+        const auto block_size = ctx.metadata_store->BlockSizeBytes().value_or(0);
+        if (!block_size) continue;
+        const auto aligned = [block_size](std::uint64_t bytes) {
+            return ((bytes + block_size - 1) / block_size) * block_size;
+        };
+        std::uint64_t allocation = exists ? original->allocation_size.value_or(aligned(size)) : 0;
+        bool allocation_changed = false;
+        std::string target = exists ? original->symlink_target_utf8 : std::string{};
+        const auto extents = before.read_extents_by_inode.find(object_id);
+        bool has_storage = exists && (original->data_physical_address != 0 ||
+            (extents != before.read_extents_by_inode.end() && !extents->second.empty()));
+        const auto attrs = before.extended_attributes_by_inode.find(object_id);
+        bool directory_hint = false;
+        const bool restore_eligible = exists && kind == Kind::SymbolicLink && !original->is_directory &&
+            original->directory_symlink_metadata_safe && original->link_count == 1 &&
+            object_id != before.root_directory_inode && !has_storage && original->allocation_size.value_or(0) == 0 &&
+            std::none_of(before.directory_links.begin(), before.directory_links.end(),
+                [&](const auto& link) { return link.parent_object_id == object_id; }) &&
+            attrs != before.extended_attributes_by_inode.end() &&
+            !attrs->second.contains("com.apple.ResourceFork") && !attrs->second.contains("com.apple.decmpfs") &&
+            attrs->second.contains(kWindowsSymlinkKindName) &&
+            ReadWindowsDirectorySymlink(attrs->second.at(kWindowsSymlinkKindName), directory_hint) && directory_hint;
+        bool restored_directory = false;
+        MetadataStore::CommittedFileReadPlan base;
+        if (exists && kind == Kind::RegularFile)
+        {
+            base.object_id = object_id; base.logical_size = size;
+            base.data_physical_address = original->data_physical_address;
+            if (extents != before.read_extents_by_inode.end())
+                base.extents_snapshot = std::make_shared<const std::vector<MetadataStore::FileExtent>>(extents->second);
+        }
+        struct Step { const WriteAheadLog::Record* record; std::uint64_t before_size; };
+        std::vector<Step> steps;
+        std::vector<std::byte> payload;
+        bool valid = true;
+        for (const auto* record : chain)
+        {
+            MetadataStore::MutationRequest request;
+            if (record->object_id == 0 || record->parent_object_id != final->xid ||
+                !BuildAcceptedReplayMutationRequest(*record, request)) { valid = false; break; }
+            steps.push_back({record, size});
+            switch (record->operation)
+            {
+            case Operation::CreateFile:
+                if (exists || request.replace_if_exists) { valid = false; break; }
+                exists = true; kind = Kind::RegularFile; size = 0; target.clear(); has_storage = false;
+                allocation = 0;
+                break;
+            case Operation::Write:
+                if (!exists || kind != Kind::RegularFile || record->logical_length > UINT64_MAX - record->logical_offset ||
+                    !ReadAcceptedReplayPayload(ctx, *record, payload)) { valid = false; break; }
+                size = (std::max)(size, record->logical_offset + record->logical_length);
+                allocation = (std::max)(allocation, aligned(size));
+                has_storage = allocation != 0;
+                break;
+            case Operation::SetFileSize:
+                if (!exists || kind != Kind::RegularFile || record->logical_offset != 0 || record->flags != 0 ||
+                    !record->secondary_path_utf8.empty() || record->payload_length != 0 ||
+                    record->payload_offset != 0 || record->payload_spool_id != 0 || !record->inline_payload.empty() ||
+                    std::any_of(record->payload_sha256.begin(), record->payload_sha256.end(),
+                        [](auto byte) { return byte != 0; })) { valid = false; break; }
+                allocation = record->logical_length < size ? aligned(record->logical_length) :
+                    (std::max)(allocation, aligned(record->logical_length));
+                size = record->logical_length;
+                has_storage = allocation != 0;
+                break;
+            case Operation::SetAllocationSize:
+                if (!exists || kind != Kind::RegularFile ||
+                    !WriteAheadLog::AllocationSizeMutationIsConsistent(*record) ||
+                    record->logical_length % block_size != 0) { valid = false; break; }
+                allocation = record->logical_length;
+                size = (std::min)(size, allocation);
+                has_storage = allocation != 0;
+                allocation_changed = true;
+                break;
+            case Operation::SetSymbolicLinkTarget:
+                if (!exists || (kind != Kind::SymbolicLink &&
+                    !(kind == Kind::Directory && restored_directory) &&
+                    (kind != Kind::RegularFile || size != 0 || has_storage))) { valid = false; break; }
+                kind = Kind::SymbolicLink; target = record->secondary_path_utf8; size = target.size(); has_storage = false;
+                allocation = 0;
+                break;
+            case Operation::RemoveSymbolicLinkTarget:
+                if (!exists || kind != Kind::SymbolicLink) { valid = false; break; }
+                kind = Kind::RegularFile; size = 0; target.clear(); has_storage = false;
+                allocation = 0;
+                break;
+            case Operation::RestoreDirectoryFromSymbolicLink:
+                if (!exists || kind != Kind::SymbolicLink || !restore_eligible || has_storage ||
+                    request.path != original->full_path)
+                    { valid = false; break; }
+                kind = Kind::Directory; size = 0; target.clear(); allocation = 0;
+                restored_directory = true;
+                break;
+            default:
+                valid = false;
+                break;
+            }
+            if (!valid) break;
+        }
+        if (!valid || !exists || kind != final->node_type || size != final->logical_size ||
+            target != final->symlink_target_utf8 ||
+            (allocation_changed && final->allocation_size != allocation)) continue;
+        if (final->node_type == Kind::Directory)
+        {
+            const auto children = ctx.metadata_store->SnapshotCommittedDirectoryChildInodes(object_id);
+            if (!restored_directory || !final->is_directory || final->link_count != 1 ||
+                final->full_path != original->full_path ||
+                final->directory_entry_count != 0 || !children || !children->empty() ||
+                final->data_physical_address != 0 || final->allocation_size.value_or(0) != 0 ||
+                final->mode != static_cast<std::uint16_t>((original->mode & ~0170000) | 0040000) ||
+                ctx.metadata_store->LookupCommittedExtendedAttribute(object_id, kWindowsSymlinkKindName)) continue;
+        }
+
+        // Walk backwards: check later writes/zero fills, then use them or a
+        // proven truncation to mask only the bytes they actually replace.
+        std::map<std::uint64_t, std::uint64_t> covered;
+        std::vector<std::byte> actual(64 * 1024), expected(actual.size());
+        const auto cover = [&](std::uint64_t begin, std::uint64_t end) {
+            if (begin >= end) return;
+            auto it = covered.lower_bound(begin);
+            if (it != covered.begin() && std::prev(it)->second >= begin) --it;
+            while (it != covered.end() && it->first <= end)
+            {
+                begin = (std::min)(begin, it->first); end = (std::max)(end, it->second);
+                it = covered.erase(it);
+            }
+            covered.emplace(begin, end);
+        };
+        const auto matches = [&](std::uint64_t begin, std::uint64_t end,
+            const WriteAheadLog::Record* write, bool baseline) {
+            if (begin == end) return true;
+            if (final->node_type != Kind::RegularFile || end > final->logical_size) return false;
+            while (begin < end)
+            {
+                const auto count = static_cast<std::size_t>((std::min)(end - begin, static_cast<std::uint64_t>(actual.size())));
+                std::size_t read = 0;
+                if (!ctx.metadata_store->ReadCommittedFileRangeInto(final->full_path, begin, count,
+                        actual.data(), actual.size(), read) || read != count) return false;
+                if (write)
+                {
+                    if (!std::equal(actual.begin(), actual.begin() + count,
+                            payload.begin() + static_cast<std::size_t>(begin - write->logical_offset))) return false;
+                }
+                else if (baseline)
+                {
+                    if (!ctx.metadata_store->ReadCommittedFileRangeFromPlan(base, final->full_path, begin, count,
+                            expected.data(), expected.size(), read) || read != count ||
+                        !std::equal(actual.begin(), actual.begin() + count, expected.begin())) return false;
+                }
+                else if (std::any_of(actual.begin(), actual.begin() + count,
+                             [](auto byte) { return byte != std::byte{0}; })) return false;
+                begin += count;
+            }
+            return true;
+        };
+        const auto check_uncovered = [&](std::uint64_t begin, std::uint64_t end,
+            const WriteAheadLog::Record* write = nullptr, bool baseline = false) {
+            if (begin >= end) return true;
+            auto it = covered.upper_bound(begin);
+            if (it != covered.begin()) --it;
+            for (; it != covered.end() && it->first < end; ++it)
+            {
+                if (it->second <= begin) continue;
+                if (it->first > begin && !matches(begin, (std::min)(it->first, end), write, baseline)) return false;
+                begin = (std::min)(end, (std::max)(begin, it->second));
+            }
+            return matches(begin, end, write, baseline);
+        };
+        for (auto it = steps.rbegin(); it != steps.rend() && valid; ++it)
+        {
+            const auto& record = *it->record;
+            if (record.operation == Operation::Write)
+            {
+                const auto end = record.logical_offset + record.logical_length;
+                valid = ReadAcceptedReplayPayload(ctx, record, payload) &&
+                    check_uncovered(record.logical_offset, end, &record) &&
+                    check_uncovered(it->before_size, record.logical_offset);
+                if (valid) cover((std::min)(it->before_size, record.logical_offset), end);
+            }
+            else if (record.operation == Operation::SetFileSize)
+            {
+                if (record.logical_length > it->before_size)
+                    valid = check_uncovered(it->before_size, record.logical_length);
+                if (valid) cover((std::min)(it->before_size, record.logical_length),
+                    (std::max)(it->before_size, record.logical_length));
+            }
+            else if (record.operation == Operation::SetAllocationSize)
+            {
+                cover(record.logical_length, it->before_size);
+            }
+        }
+        if (valid && final->node_type == Kind::RegularFile)
+            valid = check_uncovered(0, (std::min)(base.logical_size, final->logical_size), nullptr, true);
+        if (valid)
+            for (const auto* record : chain)
+                if (record->operation != Operation::CreateFile) proven.insert(record);
+    }
+    return proven;
+}
+
+AcceptedReplayProvenDataMutations ProveAcceptedDataMutations(
+    MountContext& ctx,
+    const std::vector<const apfsaccess::rw::WriteAheadLog::Record*>& records)
+{
+    using Operation = apfsaccess::rw::WriteAheadLog::OperationKind;
+    auto proven = ProveAcceptedPayloadTransitions(ctx, records);
+    if (!ctx.metadata_store) return proven;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint32_t> proven_metadata_fields;
+    for (auto it = records.rbegin(); it != records.rend(); ++it)
+    {
+        const auto& record = **it;
+        if (record.operation != Operation::SetInodeMetadata) continue;
+        apfsaccess::rw::MetadataStore::MutationRequest request;
+        apfsaccess::rw::InodeMetadataPatch patch;
+        if (!BuildAcceptedReplayMutationRequest(record, request) ||
+            !apfsaccess::rw::DecodeInodeMetadataPatch(record.inline_payload, patch)) continue;
+        const auto inode = ctx.metadata_store->LookupCommittedInodeByObjectId(record.object_id);
+        if (!inode || inode->xid != record.parent_object_id) continue;
+        auto& covered_fields = proven_metadata_fields[{record.object_id, record.parent_object_id}];
+        // Supersession is per field and per accepted inode generation.
+        if (InodeMetadataPatchMatches(*inode, patch, patch.mask & ~covered_fields))
+        {
+            covered_fields |= patch.mask;
+            proven.insert(&record);
+        }
+    }
+    std::map<std::pair<std::uint64_t, std::string>, const apfsaccess::rw::WriteAheadLog::Record*> latest_attributes;
+    for (auto it = records.rbegin(); it != records.rend(); ++it)
+    {
+        const auto& record = **it;
+        if (record.operation != Operation::SetExtendedAttribute &&
+            record.operation != Operation::RemoveExtendedAttribute) continue;
+        apfsaccess::rw::MetadataStore::MutationRequest request;
+        if (!BuildAcceptedReplayMutationRequest(record, request)) continue;
+        const auto [latest, inserted] = latest_attributes.try_emplace(
+            std::make_pair(record.object_id, record.secondary_path_utf8), &record);
+        // Only a verified final value in the same atomic checkpoint supersedes
+        // an earlier set/remove of this exact attribute, never another name.
+        if ((inserted && VerifyAcceptedReplayMutationApplied(ctx, record)) ||
+            (!inserted && proven.contains(latest->second) &&
+                record.parent_object_id == latest->second->parent_object_id))
+            proven.insert(&record);
+    }
+    using Range = std::pair<std::uint64_t, std::uint64_t>;
+    std::unordered_map<std::uint64_t, std::map<std::uint64_t, std::uint64_t>> covered;
+    for (auto it = records.rbegin(); it != records.rend(); ++it)
+    {
+        const auto& record = **it;
+        if (record.operation != Operation::Write)
+        {
+            if (record.operation == Operation::SetFileSize || record.operation == Operation::SetAllocationSize ||
+                record.operation == Operation::CreateFile ||
+                record.operation == Operation::SetSymbolicLinkTarget || record.operation == Operation::RemoveSymbolicLinkTarget ||
+                record.operation == Operation::RestoreDirectoryFromSymbolicLink)
+                covered.erase(record.object_id);
+            continue;
+        }
+        const auto inode = ctx.metadata_store->LookupCommittedInodeByObjectId(record.object_id);
+        std::vector<std::byte> expected;
+        if (!inode || inode->node_type != apfsaccess::rw::MetadataStore::NodeType::RegularFile ||
+            record.object_id == 0 || record.parent_object_id == 0 || inode->xid != record.parent_object_id ||
+            record.logical_length == 0 || record.logical_offset > UINT64_MAX - record.logical_length ||
+            record.logical_offset + record.logical_length > inode->logical_size ||
+            !ReadAcceptedReplayPayload(ctx, record, expected)) continue;
+        auto& ranges = covered[record.object_id];
+        const Range written{record.logical_offset, record.logical_offset + record.logical_length};
+        const auto matches = [&](std::uint64_t begin, std::uint64_t end)
+        {
+            if (begin == end) return true;
+            std::vector<std::byte> actual;
+            const auto size = static_cast<std::size_t>(end - begin);
+            return ctx.metadata_store->ReadCommittedFileRange(inode->full_path, begin, size, actual) &&
+                actual.size() == size && std::equal(actual.begin(), actual.end(),
+                    expected.begin() + static_cast<std::size_t>(begin - written.first));
+        };
+        auto cursor = written.first;
+        auto range = ranges.upper_bound(cursor);
+        if (range != ranges.begin()) --range;
+        bool valid = true;
+        for (; range != ranges.end() && range->first < written.second; ++range)
+        {
+            if (range->second <= cursor) continue;
+            if (range->first > cursor && !matches(cursor, (std::min)(range->first, written.second)))
+            { valid = false; break; }
+            cursor = (std::min)(written.second, (std::max)(cursor, range->second));
+        }
+        if (!valid || !matches(cursor, written.second)) continue;
+        proven.insert(*it);
+        // Only independently checked later bytes may mask an earlier write.
+        auto merged = written;
+        range = ranges.lower_bound(merged.first);
+        if (range != ranges.begin() && std::prev(range)->second >= merged.first) --range;
+        while (range != ranges.end() && range->first <= merged.second)
+        {
+            merged.first = (std::min)(merged.first, range->first);
+            merged.second = (std::max)(merged.second, range->second);
+            range = ranges.erase(range);
+        }
+        ranges.emplace(merged.first, merged.second);
+    }
+    return proven;
+}
+
+bool VerifyAcceptedTransientUnlink(MountContext& ctx,
+    const std::vector<const apfsaccess::rw::WriteAheadLog::Record*>& records,
+    const apfsaccess::rw::WriteAheadLog::Record& unlink,
+    const apfsaccess::rw::NativeApfsVolumeProjection& before,
+    const apfsaccess::rw::NativeApfsVolumeProjection& after)
+{
+    using Operation = apfsaccess::rw::WriteAheadLog::OperationKind;
+    using Store = apfsaccess::rw::MetadataStore;
+    if (!unlink.unlink_outcome || unlink.transaction_id == 0) return false;
+    const auto& outcome = *unlink.unlink_outcome;
+    if (outcome.links_before != 1 || outcome.links_after != 0 ||
+        outcome.generation_before != outcome.generation_after ||
+        outcome.generation_after != after.checkpoint_xid) return false;
+    Store::MutationRequest deleted;
+    if (!BuildAcceptedReplayMutationRequest(unlink, deleted)) return false;
+    const auto path = NormalizePath(deleted.path);
+    if (path == L"\\" || path.find(L'\0') != std::wstring::npos) return false;
+    const auto parent_path = ParentOfNormalizedPath(path);
+    const auto absent = [&](const auto& projection) {
+        return std::none_of(projection.inodes.begin(), projection.inodes.end(), [&](const auto& inode) {
+            return inode.object_id == unlink.object_id || IsSameNormalizedPath(&ctx, inode.full_path, path);
+        }) && std::none_of(projection.directory_links.begin(), projection.directory_links.end(), [&](const auto& link) {
+            return link.child_object_id == unlink.object_id || (link.parent_object_id == outcome.parent_object_id &&
+                IsSameNormalizedPath(&ctx, link.entry_name, LeafNameOfNormalizedPath(path)));
+        });
+    };
+    const auto has_parent = [&](const auto& projection, bool published) {
+        return std::count_if(projection.inodes.begin(), projection.inodes.end(), [&](const auto& inode) {
+            return inode.is_directory && inode.object_id == outcome.parent_object_id &&
+                IsSameNormalizedPath(&ctx, inode.full_path, parent_path) &&
+                (!published || inode.xid == outcome.generation_after);
+        }) == 1;
+    };
+    if (!absent(before) || !absent(after) || !has_parent(before, false) || !has_parent(after, true) ||
+        ctx.metadata_store->LookupCommittedInodeByObjectId(unlink.object_id) ||
+        ctx.metadata_store->LookupCommittedInodeByPath(path)) return false;
+    bool created = false;
+    bool removed = false;
+    for (const auto* record : records)
+    {
+        if (record->object_id != unlink.object_id)
+        {
+            // Reuse of this transient name needs its own replacement proof.
+            if (record->path_utf8 == unlink.path_utf8 || record->secondary_path_utf8 == unlink.path_utf8) return false;
+            continue;
+        }
+        Store::MutationRequest request;
+        if (removed || record->transaction_id != unlink.transaction_id ||
+            record->parent_object_id != outcome.generation_after ||
+            record->path_utf8 != unlink.path_utf8 || !BuildAcceptedReplayMutationRequest(*record, request)) return false;
+        if (record == &unlink)
+        {
+            if (!created) return false;
+            removed = true;
+        }
+        else if (record->operation == Operation::CreateFile)
+        {
+            if (created || record->sequence >= unlink.sequence || request.replace_if_exists ||
+                record->unlink_outcome || record->flags != 0 || !request.secondary_path.empty()) return false;
+            created = true;
+        }
+        else
+        {
+            if (!created || record->sequence >= unlink.sequence) return false;
+            if (record->operation == Operation::Write)
+            {
+                std::vector<std::byte> payload;
+                if (!ReadAcceptedReplayPayload(ctx, *record, payload)) return false;
+            }
+            else if (record->operation != Operation::SetFileSize && record->operation != Operation::SetAllocationSize &&
+                record->operation != Operation::SetBasicInfo && record->operation != Operation::SetInodeMetadata &&
+                record->operation != Operation::SetExtendedAttribute && record->operation != Operation::RemoveExtendedAttribute)
+                return false;
+        }
+    }
+    return created && removed;
+}
+
+AcceptedReplayProvenUnlinks ProveAcceptedUnlinks(
+    MountContext& ctx,
+    const std::vector<const apfsaccess::rw::WriteAheadLog::Record*>& records)
+{
+    using namespace apfsaccess::rw;
+    AcceptedReplayProvenUnlinks proven;
+    if (!ctx.metadata_store || !ctx.metadata_store->AuthoritativeAppleCheckpointView()) return proven;
+    const auto current_xid = ctx.metadata_store->CheckpointXid();
+    if (!current_xid) return proven;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, std::vector<const WriteAheadLog::Record*>> groups;
+    for (const auto* record : records)
+        if (record->operation == WriteAheadLog::OperationKind::Delete && record->unlink_outcome)
+            groups[{record->object_id, record->unlink_outcome->generation_after}].push_back(record);
+
+    // Cache only within this verification pass; publication invalidates it.
+    std::map<std::uint64_t, std::optional<NativeApfsVolumeProjection>> projections;
+    const auto load = [&](std::uint64_t xid) -> const NativeApfsVolumeProjection* {
+        auto [it, inserted] = projections.try_emplace(xid);
+        if (inserted)
+        {
+            NativeApfsVolumeProjection projection;
+            std::wstring error;
+            if (NativeApfsReader::TryLoadVolumeProjection(ctx.metadata_store->Device(),
+                    ctx.metadata_store->Context().volume_object_id, projection, error, xid))
+                it->second = std::move(projection);
+        }
+        return it->second ? &*it->second : nullptr;
+    };
+    for (const auto& [key, chain] : groups)
+    {
+        const auto [object_id, target_xid] = key;
+        if (target_xid < 2 || target_xid > *current_xid) continue;
+        std::string retention_error;
+        if (!ctx.metadata_store->ValidateRequiredRecoveryCheckpoints({target_xid - 1}, retention_error)) continue;
+        const auto* before = load(target_xid - 1);
+        const auto* after = load(target_xid);
+        if (!before || !after) continue;
+        const auto inode = std::find_if(before->inodes.begin(), before->inodes.end(),
+            [&](const auto& item) { return item.object_id == object_id; });
+        const auto after_inode = std::find_if(after->inodes.begin(), after->inodes.end(),
+            [&](const auto& item) { return item.object_id == object_id; });
+        const auto links_after = chain.back()->unlink_outcome->links_after;
+        if (inode == before->inodes.end() && chain.size() == 1 &&
+            VerifyAcceptedTransientUnlink(ctx, records, *chain.front(), *before, *after))
+        {
+            proven.insert(chain.front());
+            continue;
+        }
+        if (inode == before->inodes.end() ||
+            (links_after == 0 ? after_inode != after->inodes.end() ||
+                    ctx.metadata_store->LookupCommittedInodeByObjectId(object_id).has_value()
+                : after_inode == after->inodes.end() || after_inode->is_directory ||
+                    after_inode->xid != target_xid || after_inode->link_count != links_after)) continue;
+        const auto links = inode->is_directory ? 1u : inode->link_count;
+        if (links_after >= links || links - links_after != chain.size() ||
+            std::count_if(before->directory_links.begin(), before->directory_links.end(),
+                [&](const auto& link) { return link.child_object_id == object_id; }) != links) continue;
+        if (chain.front()->unlink_outcome->generation_before == target_xid)
+        {
+            bool earlier_generation_change = false;
+            for (const auto* prior : records)
+            {
+                if (prior == chain.front()) break;
+                MetadataStore::MutationRequest decoded;
+                if (!BuildAcceptedReplayMutationRequest(*prior, decoded)) continue;
+                const auto operation = prior->operation;
+                const bool changes_inode = operation == WriteAheadLog::OperationKind::Write ||
+                    operation == WriteAheadLog::OperationKind::SetFileSize ||
+                    operation == WriteAheadLog::OperationKind::SetAllocationSize ||
+                    operation == WriteAheadLog::OperationKind::SetBasicInfo ||
+                    operation == WriteAheadLog::OperationKind::SetInodeMetadata ||
+                    operation == WriteAheadLog::OperationKind::SetSymbolicLinkTarget ||
+                    operation == WriteAheadLog::OperationKind::RemoveSymbolicLinkTarget ||
+                    operation == WriteAheadLog::OperationKind::RestoreDirectoryFromSymbolicLink;
+                earlier_generation_change |= changes_inode && prior->object_id == object_id &&
+                    prior->parent_object_id == target_xid;
+                earlier_generation_change |= inode->is_directory && prior->unlink_outcome &&
+                    prior->unlink_outcome->parent_object_id == object_id &&
+                    prior->unlink_outcome->generation_after == target_xid;
+            }
+            if (!earlier_generation_change) continue;
+        }
+        bool valid = true;
+        std::unordered_set<std::wstring> removed_paths;
+        for (std::size_t i = 0; i < chain.size(); ++i)
+        {
+            const auto& record = *chain[i];
+            const auto& outcome = *record.unlink_outcome;
+            MetadataStore::MutationRequest request;
+            if (!BuildAcceptedReplayMutationRequest(record, request) || outcome.links_before != links - i ||
+                outcome.links_after != links - i - 1 ||
+                (outcome.generation_before != target_xid &&
+                    (i != 0 || outcome.generation_before != inode->xid)))
+            { valid = false; break; }
+            const auto path = NormalizePath(request.path);
+            const auto parent_path = ParentOfNormalizedPath(path);
+            const auto name = LeafNameOfNormalizedPath(path);
+            const auto parent = std::find_if(before->inodes.begin(), before->inodes.end(),
+                [&](const auto& item) { return item.is_directory && item.object_id == outcome.parent_object_id &&
+                    IsSameNormalizedPath(&ctx, item.full_path, parent_path); });
+            const auto same_link_name = [&](const auto& link) {
+                return link.parent_object_id == outcome.parent_object_id &&
+                    IsSameNormalizedPath(&ctx, link.entry_name, name);
+            };
+            const auto current_parent = ctx.metadata_store->LookupCommittedInodeByPath(parent_path);
+            if (parent == before->inodes.end() || !removed_paths.insert(LowerPathKey(&ctx, path)).second ||
+                (current_parent && (!current_parent->is_directory || current_parent->object_id != outcome.parent_object_id)) ||
+                std::count_if(before->directory_links.begin(), before->directory_links.end(),
+                    [&](const auto& link) { return same_link_name(link) && link.child_object_id == object_id; }) != 1)
+            { valid = false; break; }
+            const auto current_entry = ctx.metadata_store->LookupCommittedInodeByPath(path);
+            if (current_entry || std::any_of(after->directory_links.begin(), after->directory_links.end(), same_link_name))
+            {
+                // A reused path is not proof of deletion. Bind an ordered, fresh
+                // same-transaction create to the exact retained after-checkpoint.
+                const WriteAheadLog::Record* replacement = nullptr;
+                MetadataStore::MutationRequest created;
+                auto position = std::find(records.begin(), records.end(), &record);
+                for (++position; position != records.end(); ++position)
+                {
+                    const auto* candidate = *position;
+                    if (candidate->operation != WriteAheadLog::OperationKind::CreateFile ||
+                        candidate->transaction_id != record.transaction_id) continue;
+                    std::wstring candidate_path;
+                    if (!TryUtf8ToWideStrict(candidate->path_utf8, candidate_path) ||
+                        candidate_path.find(L'\0') != std::wstring::npos)
+                    { valid = false; break; }
+                    if (!IsSameNormalizedPath(&ctx, NormalizePath(candidate_path), path)) continue;
+                    if (replacement) { valid = false; break; }
+                    replacement = candidate;
+                }
+                if (!valid || !replacement || record.transaction_id == 0 ||
+                    replacement->sequence <= record.sequence || replacement->object_id == 0 ||
+                    replacement->object_id == object_id || replacement->parent_object_id != target_xid ||
+                    replacement->flags != 0 || !BuildAcceptedReplayMutationRequest(*replacement, created) ||
+                    created.replace_if_exists || !created.secondary_path.empty() ||
+                    replacement->logical_offset != 0 || replacement->logical_length != 0 ||
+                    replacement->payload_spool_id != 0 || replacement->payload_offset != 0 ||
+                    replacement->payload_length != 0 || !replacement->inline_payload.empty() ||
+                    replacement->unlink_outcome ||
+                    std::any_of(replacement->payload_sha256.begin(), replacement->payload_sha256.end(),
+                        [](std::uint8_t byte) { return byte != 0; }) ||
+                    std::any_of(before->inodes.begin(), before->inodes.end(),
+                        [&](const auto& item) { return item.object_id == replacement->object_id; }) ||
+                    !current_entry || current_entry->object_id != replacement->object_id ||
+                    current_entry->xid != target_xid)
+                { valid = false; break; }
+                const auto new_inode = std::find_if(after->inodes.begin(), after->inodes.end(),
+                    [&](const auto& item) { return item.object_id == replacement->object_id; });
+                if (new_inode == after->inodes.end() || new_inode->xid != target_xid ||
+                    new_inode->node_type != MetadataStore::NodeType::RegularFile || new_inode->link_count != 1 ||
+                    std::count_if(after->directory_links.begin(), after->directory_links.end(),
+                        [&](const auto& link) { return same_link_name(link) &&
+                            link.child_object_id == replacement->object_id && link.xid == target_xid &&
+                            link.entry_name == LeafNameOfNormalizedPath(NormalizePath(created.path)); }) != 1)
+                { valid = false; break; }
+            }
+        }
+        if (valid) proven.insert(chain.begin(), chain.end());
+    }
+    return proven;
+}
+
+bool VerifyAcceptedReplayUnlinkApplied(
+    MountContext& ctx,
+    const apfsaccess::rw::WriteAheadLog::Record& record,
+    const AcceptedReplayLatestMutations& later_unlinks,
+    const AcceptedReplayProvenUnlinks& proven_unlinks)
+{
+    using Operation = apfsaccess::rw::WriteAheadLog::OperationKind;
+    if (record.operation != Operation::Delete) return false;
+    if (proven_unlinks.contains(&record)) return true;
+    if (ctx.metadata_store && ctx.metadata_store->AuthoritativeAppleCheckpointView()) return false;
+    if (VerifyAcceptedReplayMutationApplied(ctx, record)) return true;
+    apfsaccess::rw::MetadataStore::MutationRequest request;
+    const auto later = later_unlinks.find(record.object_id);
+    if (!record.unlink_outcome || !BuildAcceptedReplayMutationRequest(record, request) ||
+        later == later_unlinks.end() || !later->second->unlink_outcome) return false;
+    const auto& before = *record.unlink_outcome;
+    const auto& after = *later->second->unlink_outcome;
+    if (before.generation_after != after.generation_before ||
+        before.links_after != after.links_before || before.path_utf8 == after.path_utf8 ||
+        ctx.metadata_store->LookupCommittedInodeByPath(request.path)) return false;
+    const auto parent = ctx.metadata_store->LookupCommittedInodeByPath(
+        ParentOfNormalizedPath(NormalizePath(request.path)));
+    return !parent || (parent->is_directory && parent->object_id == before.parent_object_id);
+}
+
+AcceptedReplayLatestMutations CollectAppliedLaterUnlinks(
+    MountContext& ctx,
+    const std::vector<apfsaccess::rw::TransactionManager::AcceptedTransaction>& transactions,
+    std::size_t index,
+    const AcceptedReplayProvenUnlinks& proven_unlinks)
+{
+    AcceptedReplayLatestMutations applied;
+    // Walk backwards to prove each link-count transition against the next one
+    // and, ultimately, the committed namespace. Recompute after publication.
+    for (std::size_t i = transactions.size(); i > index + 1; --i)
+    {
+        for (auto it = transactions[i - 1].mutations.rbegin(); it != transactions[i - 1].mutations.rend(); ++it)
+        {
+            if (it->operation != apfsaccess::rw::WriteAheadLog::OperationKind::Delete) continue;
+            if (VerifyAcceptedReplayUnlinkApplied(ctx, *it, applied, proven_unlinks)) applied[it->object_id] = &*it;
+            else applied.erase(it->object_id);
+        }
+    }
+    return applied;
+}
+
+bool AcceptedDirectoryRestoreTransactionIsConsistent(
+    const apfsaccess::rw::TransactionManager::AcceptedTransaction& transaction)
+{
+    using Operation = apfsaccess::rw::WriteAheadLog::OperationKind;
+    for (std::size_t i = 0; i < transaction.mutations.size(); ++i)
+    {
+        const auto& restore = transaction.mutations[i];
+        if (restore.operation != Operation::RestoreDirectoryFromSymbolicLink) continue;
+        if (i != 0 || transaction.mutations.size() != 2 ||
+            transaction.preimage_checkpoint_xid == 0 || transaction.preimage_checkpoint_xid == UINT64_MAX ||
+            restore.parent_object_id != transaction.preimage_checkpoint_xid + 1) return false;
+        const auto& hint = transaction.mutations[i + 1];
+        apfsaccess::rw::MetadataStore::MutationRequest decoded;
+        // Host restoration always accepts the kind change and hint removal together.
+        if (restore.object_id == 0 || !BuildAcceptedReplayMutationRequest(restore, decoded) ||
+            hint.operation != Operation::RemoveExtendedAttribute || hint.object_id != restore.object_id ||
+            hint.parent_object_id != restore.parent_object_id || hint.path_utf8 != restore.path_utf8 ||
+            hint.secondary_path_utf8 != kWindowsSymlinkKindName ||
+            !BuildAcceptedReplayMutationRequest(hint, decoded)) return false;
+    }
+    return true;
+}
+
+bool VerifyAcceptedCreatedNamespaceAfterOrderedRenames(MountContext& ctx,
+    const apfsaccess::rw::TransactionManager::AcceptedTransaction& transaction,
+    const apfsaccess::rw::WriteAheadLog::Record& requested)
+{
+    using Operation = apfsaccess::rw::WriteAheadLog::OperationKind;
+    using Store = apfsaccess::rw::MetadataStore;
+    const auto* creation = &requested;
+    if (requested.operation == Operation::Rename)
+    {
+        creation = nullptr;
+        for (const auto& record : transaction.mutations)
+        {
+            if (record.sequence >= requested.sequence || record.object_id != requested.object_id ||
+                (record.operation != Operation::CreateFile && record.operation != Operation::CreateDirectory)) continue;
+            if (creation) return false;
+            creation = &record;
+        }
+        if (!creation) return false;
+    }
+    const auto& created = *creation;
+    if ((created.operation != Operation::CreateFile && created.operation != Operation::CreateDirectory) ||
+        created.transaction_id == 0 || created.flags != 0) return false;
+    Store::MutationRequest request;
+    if (!BuildAcceptedReplayMutationRequest(created, request)) return false;
+    auto path = NormalizePath(request.path);
+    std::vector<std::wstring> abandoned_paths;
+    bool saw_creation = false;
+    bool saw_requested = false;
+    auto previous_sequence = created.sequence;
+    bool renamed = false;
+    for (const auto& record : transaction.mutations)
+    {
+        if (&record == &created) { saw_creation = true; saw_requested = &record == &requested; continue; }
+        if (!saw_creation || record.object_id != created.object_id) continue;
+        if (record.sequence <= previous_sequence) return false;
+        previous_sequence = record.sequence;
+        if (record.transaction_id != created.transaction_id || record.parent_object_id != created.parent_object_id) return false;
+        if (record.operation == Operation::Delete || record.operation == Operation::CreateFile ||
+            record.operation == Operation::CreateDirectory) return false;
+        if (record.operation != Operation::Rename) continue;
+        if (!BuildAcceptedReplayMutationRequest(record, request) || request.replace_if_exists ||
+            !IsSameNormalizedPath(&ctx, path, NormalizePath(request.path))) return false;
+        if (&record == &requested) saw_requested = true;
+        abandoned_paths.push_back(path);
+        path = NormalizePath(request.secondary_path);
+        renamed = true;
+    }
+    if (!saw_creation || !saw_requested || !renamed || !ctx.metadata_store) return false;
+    // Each superseded DREC must be absent, except when a later rename returns
+    // to that exact name. A final inode alone cannot prove a coherent chain.
+    for (const auto& old_path : abandoned_paths)
+        if (!IsSameNormalizedPath(&ctx, old_path, path) &&
+            ctx.metadata_store->LookupCommittedInodeByPath(old_path)) return false;
+    const auto inode = ctx.metadata_store->LookupCommittedInodeByPath(path);
+    const auto link = ctx.metadata_store->LookupCommittedDirectoryLinkByPath(path);
+    const auto old = ctx.metadata_store->LookupCommittedInodeByPath(Utf8ToWide(created.path_utf8));
+    return inode && link && inode->object_id == created.object_id && inode->xid == created.parent_object_id &&
+        inode->is_directory == (created.operation == Operation::CreateDirectory) &&
+        link->child_object_id == created.object_id && link->xid == created.parent_object_id &&
+        link->entry_name == LeafNameOfNormalizedPath(path) &&
+        (!old || (IsSameNormalizedPath(&ctx, path, NormalizePath(Utf8ToWide(created.path_utf8))) &&
+            old->object_id == created.object_id));
+}
+
 bool VerifyAcceptedReplayTransactionApplied(
     MountContext& ctx,
     const apfsaccess::rw::TransactionManager::AcceptedTransaction& transaction,
-    const std::unordered_set<std::uint64_t>* later_terminal_deletes)
+    const AcceptedReplayLatestMutations* later_unlinks,
+    const AcceptedReplayLatestMutations& later_mutations,
+    const AcceptedReplayProvenUnlinks* proven_unlinks = nullptr,
+    const AcceptedReplayProvenDataMutations* proven_data = nullptr)
 {
-    std::unordered_set<std::uint64_t> deleted_in_batch;
-    if (later_terminal_deletes != nullptr)
+    using Operation = apfsaccess::rw::WriteAheadLog::OperationKind;
+    if (!apfsaccess::fshost::NativeCompressionRewrite::AcceptedBatchIsConsistent(
+            transaction, ctx.metadata_store ? ctx.metadata_store->Context().volume_object_id : 0)) return false;
+    if (apfsaccess::fshost::NativeCompressionReplay::ContainsRewrite(transaction))
+        return ctx.metadata_store && ctx.tx_manager &&
+            apfsaccess::fshost::NativeCompressionReplay::Verify(*ctx.metadata_store, *ctx.tx_manager,
+                transaction.accepted_sequence, ctx.payload_spool.get(), ctx.payload_spool_volume_identity) ==
+                apfsaccess::fshost::NativeCompressionReplay::Result::Verified;
+    if (!AcceptedDirectoryRestoreTransactionIsConsistent(transaction)) return false;
+    const auto is_link_change = [](Operation operation)
     {
-        deleted_in_batch = *later_terminal_deletes;
+        return operation == Operation::SetSymbolicLinkTarget ||
+               operation == Operation::RemoveSymbolicLinkTarget ||
+               operation == Operation::RestoreDirectoryFromSymbolicLink;
+    };
+    const bool has_link_changes = std::any_of(transaction.mutations.begin(), transaction.mutations.end(),
+        [&](const auto& record) { return is_link_change(record.operation); });
+    AcceptedReplayProvenUnlinks local_proof;
+    AcceptedReplayProvenDataMutations local_data;
+    if (!proven_unlinks || !proven_data)
+    {
+        std::vector<const apfsaccess::rw::WriteAheadLog::Record*> records;
+        for (const auto& record : transaction.mutations) records.push_back(&record);
+        if (!proven_unlinks)
+        {
+            local_proof = ProveAcceptedUnlinks(ctx, records);
+            proven_unlinks = &local_proof;
+        }
+        if (!proven_data)
+        {
+            local_data = ProveAcceptedDataMutations(ctx, records);
+            proven_data = &local_data;
+        }
     }
+    auto latest_mutations = later_mutations;
+    auto applied_unlinks = later_unlinks ? *later_unlinks : AcceptedReplayLatestMutations{};
     for (auto it = transaction.mutations.rbegin(); it != transaction.mutations.rend(); ++it)
     {
         const auto& record = *it;
-        if (record.operation == apfsaccess::rw::WriteAheadLog::OperationKind::Delete)
+        apfsaccess::rw::MetadataStore::MutationRequest decoded;
+        if (!BuildAcceptedReplayMutationRequest(record, decoded) ||
+            (AcceptedReplayMutationRequiresIdentity(decoded.operation) &&
+                (record.object_id == 0 || record.parent_object_id == 0))) return false;
+        if (record.operation == Operation::Delete)
         {
-            deleted_in_batch.insert(record.object_id);
+            if (!VerifyAcceptedReplayUnlinkApplied(ctx, record, applied_unlinks, *proven_unlinks)) return false;
+            applied_unlinks[record.object_id] = &record;
+            continue;
         }
-        else if (deleted_in_batch.find(record.object_id) != deleted_in_batch.end())
+        const auto deleted = applied_unlinks.find(record.object_id);
+        if (deleted != applied_unlinks.end() &&
+            !ctx.metadata_store->LookupCommittedInodeByObjectId(record.object_id))
         {
+            if (ctx.metadata_store->AuthoritativeAppleCheckpointView() &&
+                std::none_of(proven_unlinks->begin(), proven_unlinks->end(), [&](const auto* unlink) {
+                    return unlink->object_id == record.object_id && unlink->unlink_outcome->links_after == 0;
+                })) return false;
+            const auto& unlink = *deleted->second;
+            const bool same_generation = unlink.unlink_outcome
+                ? record.parent_object_id == unlink.unlink_outcome->generation_before ||
+                    record.parent_object_id == unlink.unlink_outcome->generation_after
+                : record.parent_object_id == unlink.parent_object_id;
+            if (!same_generation) return false;
             continue;
         }
 
-        if (!VerifyAcceptedReplayMutationApplied(ctx, record))
+        const auto later = latest_mutations.find(record.object_id);
+        if (is_link_change(record.operation) && later != latest_mutations.end())
+        {
+            const auto& final = *later->second;
+            apfsaccess::rw::MetadataStore::MutationRequest request;
+            // Only the same checkpoint's final target/kind can supersede this
+            // field. Identity, path and the final on-disk value remain proven.
+            if (is_link_change(final.operation) &&
+                (record.operation != Operation::RestoreDirectoryFromSymbolicLink || proven_data->contains(&record)) &&
+                record.parent_object_id == final.parent_object_id &&
+                record.path_utf8 == final.path_utf8 &&
+                BuildAcceptedReplayMutationRequest(record, request) &&
+                VerifyAcceptedReplayMutationApplied(ctx, final))
+            {
+                continue;
+            }
+        }
+        if (!proven_data->contains(&record) && !VerifyAcceptedReplayMutationApplied(ctx, record) &&
+            !VerifyAcceptedCreatedNamespaceAfterOrderedRenames(ctx, transaction, record))
         {
             return false;
+        }
+        if (has_link_changes)
+        {
+            latest_mutations.try_emplace(record.object_id, &record);
         }
     }
     return true;
@@ -12979,6 +15516,17 @@ bool RebuildPayloadSpoolIndexFromAcceptedWalBestEffort(MountContext& ctx)
             transaction.accepted_sequence <= apfs_durable_sequence;
         for (const auto& record : transaction.mutations)
         {
+            if (record.operation == apfsaccess::rw::WriteAheadLog::OperationKind::SetExtendedAttribute ||
+                record.operation == apfsaccess::rw::WriteAheadLog::OperationKind::RemoveExtendedAttribute ||
+                record.operation == apfsaccess::rw::WriteAheadLog::OperationKind::SetInodeMetadata ||
+                record.operation == apfsaccess::rw::WriteAheadLog::OperationKind::RewriteCompressedContent)
+            {
+                // Inline metadata/proof envelopes are validated by their
+                // production decoder; only Write records reference the spool.
+                apfsaccess::rw::MetadataStore::MutationRequest request;
+                if (!BuildAcceptedReplayMutationRequest(record, request)) return false;
+                continue;
+            }
             if (record.operation != apfsaccess::rw::WriteAheadLog::OperationKind::Write)
             {
                 if (record.payload_length != 0 || record.payload_spool_id != 0)
@@ -13051,6 +15599,199 @@ bool RebuildPayloadSpoolIndexFromAcceptedWalBestEffort(MountContext& ctx)
     return true;
 }
 
+bool RefreshManifestCheckpointPinsAfterCleanup(MountContext& ctx)
+{
+    if (!IsManifestSession(&ctx) || !ctx.tx_manager || !ctx.metadata_store)
+    {
+        return true;
+    }
+    // Manifest acceptance owns this lock before the coordinator's commit lock.
+    // Keep a cleanup snapshot from overwriting a newer accepted transaction.
+    std::lock_guard<std::mutex> commit_lock(ctx.commit_mutex);
+    {
+        std::lock_guard<std::mutex> metadata_lock(ctx.metadata_mutex);
+        if (!ctx.metadata_store->AuthoritativeAppleCheckpointView()) return true;
+    }
+    std::vector<std::uint64_t> pins;
+    std::string error;
+    bool census_loaded = false;
+    bool unapplied_accepted_work = false;
+    {
+        std::lock_guard<std::mutex> tx_lock(ctx.tx_mutex);
+        census_loaded = ctx.tx_manager->LoadRequiredCheckpointXidsSinceCleanup(pins, &error);
+        unapplied_accepted_work = ctx.tx_manager->HasUnappliedAcceptedWork();
+    }
+    if (!census_loaded)
+    {
+        SetRuntimeRecoveryReason(ctx, L"CheckpointPinCleanupCensusFailed");
+        return false;
+    }
+    if (!ctx.container_coordinator->UpdateRequiredCheckpointXids(
+            ctx.container_volume_oid, pins, error, unapplied_accepted_work))
+    {
+        SetRuntimeRecoveryReason(ctx, L"CheckpointPinCleanupUpdateFailed");
+        return false;
+    }
+    return true;
+}
+
+// Callers hold metadata_mutex; direct mode cannot certify sibling journals.
+bool GetDirectApplePreimageLocked(
+    const apfsaccess::rw::MetadataStore& store,
+    std::uint64_t& preimage,
+    std::string& error)
+{
+    preimage = 0;
+    const auto* view = store.AuthoritativeAppleCheckpointView();
+    if (!view) return true;
+    if (view->volumes.size() != 1 ||
+        view->volumes.front().superblock.object_id != store.Context().volume_object_id)
+    {
+        error = "DirectAppleVolumeRequiresContainerCoordinator";
+        return false;
+    }
+    preimage = view->container.superblock.xid;
+    if (preimage == 0 || store.CheckpointXid() != preimage)
+    {
+        error = "DirectAppleCheckpointIdentityMismatch";
+        return false;
+    }
+    return true;
+}
+
+bool LoadDirectCheckpointPinsLocked(
+    MountContext& ctx, std::vector<std::uint64_t>& pins, std::string& error)
+{
+    pins.clear();
+    std::uint64_t preimage = 0;
+    if (!GetDirectApplePreimageLocked(*ctx.metadata_store, preimage, error)) return false;
+    if (preimage == 0) return true;
+    std::lock_guard<std::mutex> tx_lock(ctx.tx_mutex);
+    if (!ctx.tx_manager || !ctx.tx_manager->RecoveryStateValid() ||
+        ctx.tx_manager->CurrentState() != apfsaccess::rw::TransactionManager::State::Idle)
+    {
+        error = "DirectAppleJournalNotAccepted";
+        return false;
+    }
+    const auto target = ctx.tx_manager->Watermarks().accepted_sequence;
+    if (!ctx.tx_manager->FlushDeferredAcceptanceDurabilityNow(target) ||
+        !ctx.tx_manager->LoadRequiredCheckpointXidsSinceCleanup(pins, &error))
+    {
+        if (error.empty()) error = "DirectAppleJournalDurabilityFailed";
+        return false;
+    }
+    if ((!pins.empty() && pins.back() > preimage) ||
+        (pins.empty() && ctx.metadata_store->PendingMutationCount() != 0))
+    {
+        error = "DirectAppleJournalCheckpointCoverageMissing";
+        return false;
+    }
+    return true;
+}
+
+// Only an APFS-durable prefix may be retired here. This never finalizes newer
+// accepted work or clears the mount's dirty/recovery marker.
+bool CleanupDurableJournalPrefixWithoutPinRefresh(
+    MountContext& ctx, bool& cleaned, std::wstring& failure)
+{
+    cleaned = false;
+    failure.clear();
+    if (ctx.compression_verification_pending.load(std::memory_order_acquire))
+    {
+        failure = L"CompressedPublicationVerificationPending";
+        return false;
+    }
+    if (!ctx.tx_manager) return true;
+    std::uint64_t durable_sequence = 0;
+    {
+        std::lock_guard<std::mutex> tx_lock(ctx.tx_mutex);
+        if (!ctx.tx_manager->RecoveryStateValid())
+        {
+            failure = L"AcceptedPrefixRecoveryStateInvalid";
+            return false;
+        }
+        const auto watermarks = ctx.tx_manager->Watermarks();
+        if (watermarks.cleanup_sequence >= watermarks.apfs_durable_sequence) return true;
+        durable_sequence = watermarks.apfs_durable_sequence;
+    }
+    if (ctx.payload_spool && !ctx.payload_spool->CleanupThroughSequence(durable_sequence))
+    {
+        failure = L"AcceptedPrefixPayloadCleanupFailed";
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> tx_lock(ctx.tx_mutex);
+        if (!ctx.tx_manager->MarkCleanedThrough(durable_sequence))
+        {
+            failure = L"AcceptedPrefixCleanupWatermarkFailed";
+            return false;
+        }
+    }
+    cleaned = true;
+    return true;
+}
+
+bool CleanupDurableJournalPrefixBestEffort(MountContext& ctx, bool& cleaned)
+{
+    std::wstring failure;
+    if (!CleanupDurableJournalPrefixWithoutPinRefresh(ctx, cleaned, failure))
+    {
+        SetRuntimeRecoveryReason(ctx, std::move(failure));
+        return false;
+    }
+    return !cleaned || RefreshManifestCheckpointPinsAfterCleanup(ctx);
+}
+
+bool BindAcceptedReplayToRetainedVolumeHistory(MountContext& ctx,
+    const std::vector<apfsaccess::rw::TransactionManager::AcceptedTransaction>& originals,
+    std::vector<apfsaccess::rw::TransactionManager::AcceptedTransaction>& projected)
+{
+    using Operation = apfsaccess::rw::WriteAheadLog::OperationKind;
+    const auto current = ctx.metadata_store->CheckpointXid();
+    if (!current || *current == UINT64_MAX || originals.size() != projected.size()) return false;
+    for (std::size_t i = 0; i < projected.size(); ++i)
+    {
+        auto& transaction = projected[i];
+        const auto source = originals[i].preimage_checkpoint_xid;
+        if (source == *current) continue;
+        apfsaccess::rw::AppleVolumeReplayBoundary boundary;
+        std::string error;
+        if (!ctx.metadata_store->FindAcceptedReplayBoundary(source, boundary, error)) return false;
+        if (boundary.preimage_checkpoint_xid == source) continue;
+        // CRW1 authenticates source bytes at one checkpoint; it cannot be rebased.
+        if (std::any_of(transaction.mutations.begin(), transaction.mutations.end(), [](const auto& record) {
+                return record.operation == Operation::RewriteCompressedContent;
+            })) return false;
+        if (source == 0 || source == UINT64_MAX || boundary.preimage_checkpoint_xid == UINT64_MAX ||
+            transaction.mutations.size() != originals[i].mutations.size()) return false;
+        const auto original_generation = source + 1;
+        const auto projected_generation = boundary.preimage_checkpoint_xid + 1;
+        for (std::size_t j = 0; j < transaction.mutations.size(); ++j)
+        {
+            auto& record = transaction.mutations[j];
+            apfsaccess::rw::MetadataStore::MutationRequest request;
+            // Validate the original envelope before translating only its XIDs.
+            // Namespace OIDs, ranges, paths, values, hashes and sequences remain exact.
+            if (!BuildAcceptedReplayMutationRequest(record, request) || record.object_id == 0 ||
+                record.parent_object_id == 0 || record.parent_object_id > original_generation ||
+                ((record.operation != Operation::Delete && record.operation != Operation::Rename) &&
+                    record.parent_object_id != original_generation)) return false;
+            if (record.parent_object_id == original_generation) record.parent_object_id = projected_generation;
+            if (record.unlink_outcome)
+            {
+                if (record.unlink_outcome->generation_after != original_generation ||
+                    record.unlink_outcome->generation_before > original_generation) return false;
+                if (record.unlink_outcome->generation_before == original_generation)
+                    record.unlink_outcome->generation_before = projected_generation;
+                record.unlink_outcome->generation_after = projected_generation;
+            }
+            ctx.accepted_replay_original_records.emplace(&record, &originals[i].mutations[j]);
+        }
+        transaction.preimage_checkpoint_xid = boundary.preimage_checkpoint_xid;
+    }
+    return true;
+}
+
 bool ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(MountContext& ctx)
 {
     if (HasBlockedRecoveryEvidence(ctx))
@@ -13062,6 +15803,46 @@ bool ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(MountContext& ctx)
     {
         SetRuntimeRecoveryReason(ctx, L"AcceptedWriteReplayValidationFailed");
         return false;
+    }
+
+    std::vector<std::uint64_t> direct_checkpoint_pins;
+    if (!IsManifestSession(&ctx))
+    {
+        std::string error;
+        std::lock_guard<std::mutex> metadata_lock(ctx.metadata_mutex);
+        if (!LoadDirectCheckpointPinsLocked(ctx, direct_checkpoint_pins, error))
+        {
+            SetRuntimeRecoveryReason(ctx, L"AcceptedReplayCheckpointCensusFailed");
+            return false;
+        }
+    }
+    if (IsManifestSession(&ctx) && ctx.container_coordinator->CheckpointCensusRequired())
+    {
+        std::vector<std::uint64_t> pins;
+        std::string error;
+        if (!ctx.tx_manager->LoadRequiredCheckpointXidsSinceCleanup(pins, &error) ||
+            !ctx.container_coordinator->UpdateRequiredCheckpointXids(ctx.container_volume_oid, pins, error,
+                ctx.tx_manager->HasUnappliedAcceptedWork()))
+        {
+            SetRuntimeRecoveryReason(ctx, L"AcceptedReplayCheckpointCensusFailed");
+            return false;
+        }
+    }
+
+    if (IsManifestSession(&ctx) && ctx.tx_manager->HasUnappliedAcceptedWork())
+    {
+        std::string error;
+        bool refreshed;
+        {
+            std::lock_guard<std::mutex> metadata_lock(ctx.metadata_mutex);
+            refreshed = ctx.metadata_store->CheckpointXid() == ctx.container_coordinator->CheckpointXid() ||
+                ctx.container_coordinator->RefreshSessionForRecovery(ctx.container_volume_oid, error);
+        }
+        if (!refreshed)
+        {
+            SetRuntimeRecoveryReason(ctx, L"AcceptedReplaySessionRefreshFailed");
+            return false;
+        }
     }
 
     if (!RebuildPayloadSpoolIndexFromAcceptedWalBestEffort(ctx))
@@ -13081,6 +15862,23 @@ bool ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(MountContext& ctx)
         return false;
     }
 
+    std::vector<apfsaccess::rw::TransactionManager::AcceptedTransaction> original_transactions;
+    ScopeExit clear_original_records{[&]() { ctx.accepted_replay_original_records.clear(); }};
+    if (IsManifestSession(&ctx) && ctx.metadata_store->AuthoritativeAppleCheckpointView() && !transactions.empty())
+    {
+        original_transactions = transactions;
+        bool bound;
+        {
+            std::lock_guard<std::mutex> metadata_lock(ctx.metadata_mutex);
+            bound = BindAcceptedReplayToRetainedVolumeHistory(ctx, original_transactions, transactions);
+        }
+        if (!bound)
+        {
+            SetRuntimeRecoveryReason(ctx, L"AcceptedReplayVolumeHistoryUnproven");
+            return false;
+        }
+    }
+
     struct ReplayMutationPlan
     {
         const apfsaccess::rw::WriteAheadLog::Record* record = nullptr;
@@ -13091,7 +15889,8 @@ bool ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(MountContext& ctx)
         const apfsaccess::rw::TransactionManager::AcceptedTransaction* transaction = nullptr;
         std::vector<ReplayMutationPlan> mutations;
         bool already_applied = false;
-        std::unordered_set<std::uint64_t> later_terminal_deletes;
+        std::size_t transaction_index = 0;
+        AcceptedReplayLatestMutations later_mutations;
     };
 
     // Validate every accepted transaction before changing the working
@@ -13100,12 +15899,37 @@ bool ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(MountContext& ctx)
     std::vector<ReplayTransactionPlan> replay_plans;
     replay_plans.reserve(transactions.size());
     std::vector<std::byte> replay_payload;
+    std::vector<const apfsaccess::rw::WriteAheadLog::Record*> accepted_records;
+    for (const auto& transaction : transactions)
+        for (const auto& record : transaction.mutations) accepted_records.push_back(&record);
+    AcceptedReplayProvenUnlinks proven_unlinks;
+    AcceptedReplayProvenDataMutations proven_data;
+    auto verified_prefix_sequence = ctx.tx_manager->Watermarks().apfs_durable_sequence;
+    bool prefix_has_gap = false;
+    {
+        std::lock_guard<std::mutex> metadata_lock(ctx.metadata_mutex);
+        proven_unlinks = ProveAcceptedUnlinks(ctx, accepted_records);
+        proven_data = ProveAcceptedDataMutations(ctx, accepted_records);
+    }
     for (std::size_t index = 0; index < transactions.size(); ++index)
     {
         const auto& transaction = transactions[index];
+        if (!apfsaccess::fshost::NativeCompressionRewrite::AcceptedBatchIsConsistent(
+                transaction, ctx.metadata_store->Context().volume_object_id))
+        {
+            SetRuntimeRecoveryReason(ctx, L"AcceptedCompressionRewriteBatchInvalid");
+            return false;
+        }
+        if (!AcceptedDirectoryRestoreTransactionIsConsistent(transaction))
+        {
+            SetRuntimeRecoveryReason(ctx, L"AcceptedDirectoryRestoreBatchInvalid");
+            return false;
+        }
         ReplayTransactionPlan plan{};
         plan.transaction = &transaction;
+        plan.transaction_index = index;
         plan.mutations.reserve(transaction.mutations.size());
+        std::unordered_set<std::uint64_t> link_change_objects;
         for (const auto& record : transaction.mutations)
         {
             ReplayMutationPlan mutation{};
@@ -13136,41 +15960,82 @@ bool ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(MountContext& ctx)
                 SetRuntimeRecoveryReason(ctx, L"AcceptedWriteReplayPayloadMismatch");
                 return false;
             }
+            if (mutation.request.operation == apfsaccess::rw::MetadataStore::MutationOperation::SetSymbolicLinkTarget ||
+                mutation.request.operation == apfsaccess::rw::MetadataStore::MutationOperation::RemoveSymbolicLinkTarget ||
+                mutation.request.operation == apfsaccess::rw::MetadataStore::MutationOperation::RestoreDirectoryFromSymbolicLink)
+            {
+                link_change_objects.insert(record.object_id);
+            }
             plan.mutations.push_back(std::move(mutation));
         }
 
         {
             std::lock_guard<std::mutex> metadata_lock(ctx.metadata_mutex);
-            // Collect terminal deletes from later accepted transactions so an
-            // earlier mutation of an object deleted later in the batch is
-            // treated as applied (the later delete dominates it). The
-            // per-transaction view cannot see a delete in a later transaction;
-            // deletes inside the current transaction are discovered while
-            // iterating its records in reverse.
-            std::unordered_set<std::uint64_t> later_terminal_deletes_by_index;
+            const auto later_unlinks = CollectAppliedLaterUnlinks(ctx, transactions, index, proven_unlinks);
             for (std::size_t later_index = index + 1; later_index < transactions.size(); ++later_index)
             {
                 const auto& later_transaction = transactions[later_index];
-                for (auto it = later_transaction.mutations.rbegin();
-                     it != later_transaction.mutations.rend();
-                     ++it)
+                for (const auto& later_record : later_transaction.mutations)
                 {
-                    if (it->operation == apfsaccess::rw::WriteAheadLog::OperationKind::Delete)
+                    if (link_change_objects.contains(later_record.object_id))
                     {
-                        later_terminal_deletes_by_index.insert(it->object_id);
+                        plan.later_mutations[later_record.object_id] = &later_record;
                     }
                 }
             }
-            plan.later_terminal_deletes = std::move(later_terminal_deletes_by_index);
             const auto already_applied = VerifyAcceptedReplayTransactionApplied(
-                ctx, transaction, &plan.later_terminal_deletes);
+                ctx, transaction, &later_unlinks, plan.later_mutations, &proven_unlinks, &proven_data);
             plan.already_applied = already_applied;
             if (already_applied)
             {
+                if (!prefix_has_gap) verified_prefix_sequence = transaction.accepted_sequence;
                 continue;
+            }
+            prefix_has_gap = true;
+            if (ctx.metadata_store->AuthoritativeAppleCheckpointView() &&
+                transaction.preimage_checkpoint_xid != ctx.metadata_store->CheckpointXid())
+            {
+                SetRuntimeRecoveryReason(ctx, L"AcceptedReplayPreimageCheckpointMismatch");
+                return false;
+            }
+            for (const auto& mutation : plan.mutations)
+            {
+                if (mutation.request.operation !=
+                    apfsaccess::rw::MetadataStore::MutationOperation::RestoreDirectoryFromSymbolicLink) continue;
+                const auto inode = ctx.metadata_store->LookupCommittedInodeByPath(mutation.request.path);
+                bool hint = false;
+                if (!inode || inode->object_id != mutation.record->object_id ||
+                    inode->node_type != apfsaccess::rw::MetadataStore::NodeType::SymbolicLink ||
+                    !ReadWindowsDirectorySymlink(ctx.metadata_store->LookupCommittedExtendedAttribute(
+                        inode->object_id, kWindowsSymlinkKindName), hint) || !hint)
+                {
+                    SetRuntimeRecoveryReason(ctx, L"AcceptedDirectoryRestorePreimageInvalid");
+                    return false;
+                }
             }
         }
         replay_plans.push_back(std::move(plan));
+    }
+
+    // Validate the entire suffix before retiring anything, then release only
+    // the contiguous prefix independently proven in committed APFS metadata.
+    if (verified_prefix_sequence > ctx.tx_manager->Watermarks().apfs_durable_sequence &&
+        !ctx.tx_manager->MarkApfsDurableThrough(verified_prefix_sequence))
+    {
+        SetRuntimeRecoveryReason(ctx, L"AcceptedPrefixDurabilityWatermarkFailed");
+        return false;
+    }
+    bool prefix_cleaned = false;
+    if (!CleanupDurableJournalPrefixBestEffort(ctx, prefix_cleaned)) return false;
+    if (prefix_cleaned && !IsManifestSession(&ctx))
+    {
+        std::string error;
+        std::lock_guard<std::mutex> metadata_lock(ctx.metadata_mutex);
+        if (!LoadDirectCheckpointPinsLocked(ctx, direct_checkpoint_pins, error))
+        {
+            SetRuntimeRecoveryReason(ctx, L"AcceptedReplayCheckpointCensusFailed");
+            return false;
+        }
     }
 
     const auto has_unapplied_transactions = std::any_of(
@@ -13180,6 +16045,8 @@ bool ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(MountContext& ctx)
     if (has_unapplied_transactions)
     {
         std::wstring replay_failure;
+        std::vector<apfsaccess::rw::MetadataStore::MutationRequest> manifest_replay_requests;
+        std::vector<const apfsaccess::rw::WriteAheadLog::Record*> manifest_replay_records;
         replay_payload.clear();
         for (const auto& plan : replay_plans)
         {
@@ -13197,8 +16064,29 @@ bool ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(MountContext& ctx)
                     break;
                 }
 
+                // Inline WAL is durable authority even when its advisory spool
+                // entry was discarded. Restore the commit reader's range first.
+                if (mutation.request.operation == apfsaccess::rw::MetadataStore::MutationOperation::Write &&
+                    !mutation.record->inline_payload.empty() && ctx.payload_spool)
+                {
+                    const auto& record = AcceptedReplayPayloadAuthority(ctx, *mutation.record);
+                    if (!ctx.payload_spool->RestoreInlineRange({ctx.payload_spool_volume_identity,
+                        record.object_id, record.parent_object_id, record.logical_offset, record.payload_length,
+                        record.payload_offset, record.payload_spool_id, record.payload_sha256}, replay_payload))
+                    {
+                        replay_failure = L"AcceptedWriteReplayPayloadRestoreFailed";
+                        break;
+                    }
+                }
+
                 {
                     std::lock_guard<std::mutex> metadata_lock(ctx.metadata_mutex);
+                    if (IsManifestSession(&ctx))
+                    {
+                        manifest_replay_requests.push_back(mutation.request);
+                        manifest_replay_records.push_back(mutation.record);
+                        continue;
+                    }
                     apfsaccess::rw::MetadataStore::PayloadIdentity replay_identity{};
                     const auto replay_status = ctx.metadata_store->StageMutation(
                         mutation.request,
@@ -13225,12 +16113,12 @@ bool ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(MountContext& ctx)
                     if (mutation.request.operation == apfsaccess::rw::MetadataStore::MutationOperation::Write &&
                         (replay_identity.object_id != mutation.record->object_id ||
                          replay_identity.generation != mutation.record->parent_object_id ||
-                         !ctx.metadata_store->WritePreparedFileRange(
+                         (!ctx.metadata_store->AuthoritativeAppleCheckpointView() && !ctx.metadata_store->WritePreparedFileRange(
                              mutation.request.path,
                              mutation.request.offset,
                              std::span<const std::byte>(
                                  replay_payload.data(),
-                                 replay_payload.size()))))
+                                 replay_payload.size())))))
                     {
                         replay_failure = L"AcceptedWriteReplayIdentityMismatch";
                     }
@@ -13255,10 +16143,53 @@ bool ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(MountContext& ctx)
         std::optional<std::uint64_t> replay_commit_xid;
         {
             std::lock_guard<std::mutex> metadata_lock(ctx.metadata_mutex);
-            commit_status = RequiresCanonicalMutationGate(ctx.args)
-                ? ctx.metadata_store->CommitCanonicalTransaction()
-                : ctx.metadata_store->CommitTransaction();
-            replay_commit_xid = ctx.metadata_store->LastCommittedXid();
+            std::vector<const apfsaccess::rw::WriteAheadLog::Record*> replay_data_records;
+            for (const auto& plan : replay_plans)
+                for (const auto& mutation : plan.mutations) replay_data_records.push_back(mutation.record);
+            if (ctx.metadata_store->AuthoritativeAppleCheckpointView())
+            {
+                ctx.accepted_replay_payload_reader = [&](auto identity, auto offset, auto destination)
+                    { return ReadAppleReplayPayloadRange(ctx, replay_data_records, identity, offset, destination); };
+            }
+            ScopeExit reset_replay_reader{[&]() { ctx.accepted_replay_payload_reader = {}; }};
+            if (IsManifestSession(&ctx))
+            {
+                // Startup has no FsHost namespace yet. Restore WAL bytes after
+                // their own stage, before a later rename/delete changes the path.
+                const apfsaccess::catalog::ContainerMutationStagingHook restore_payload =
+                    [&](std::size_t index, const auto& request, const auto& identity, std::string& error)
+                {
+                    if (index >= manifest_replay_records.size())
+                    {
+                        error = "ManifestReplayPayloadCardinalityMismatch";
+                        return false;
+                    }
+                    if (request.operation != apfsaccess::rw::MetadataStore::MutationOperation::Write) return true;
+                    const auto& record = *manifest_replay_records[index];
+                    if (identity.object_id != record.object_id ||
+                        identity.generation != record.parent_object_id ||
+                        !ReadAcceptedReplayPayload(ctx, record, replay_payload) ||
+                        (!ctx.metadata_store->AuthoritativeAppleCheckpointView() &&
+                         !ctx.metadata_store->WritePreparedFileRange(request.path, request.offset, replay_payload)))
+                    {
+                        error = "ManifestReplayPayloadIdentityMismatch";
+                        return false;
+                    }
+                    return true;
+                };
+                const auto outcome = CommitManifestMutations(
+                    &ctx, std::move(manifest_replay_requests), {}, restore_payload, true,
+                    ctx.metadata_store->CheckpointXid());
+                commit_status = outcome.status;
+                replay_commit_xid = outcome.committed_xid;
+            }
+            else
+            {
+                commit_status = RequiresCanonicalMutationGate(ctx.args)
+                    ? ctx.metadata_store->CommitCanonicalTransaction(direct_checkpoint_pins)
+                    : ctx.metadata_store->CommitTransaction(direct_checkpoint_pins);
+                replay_commit_xid = ctx.metadata_store->LastCommittedXid();
+            }
         }
         {
             std::lock_guard<std::recursive_mutex> runtime_lock(ctx.runtime_state_mutex);
@@ -13284,10 +16215,13 @@ bool ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(MountContext& ctx)
     // verification remains intentionally strict on recovery paths.
     {
         std::lock_guard<std::mutex> metadata_lock(ctx.metadata_mutex);
+        proven_unlinks = ProveAcceptedUnlinks(ctx, accepted_records);
+        proven_data = ProveAcceptedDataMutations(ctx, accepted_records);
         for (const auto& plan : replay_plans)
         {
+            const auto later_unlinks = CollectAppliedLaterUnlinks(ctx, transactions, plan.transaction_index, proven_unlinks);
             if (!VerifyAcceptedReplayTransactionApplied(
-                    ctx, *plan.transaction, &plan.later_terminal_deletes))
+                    ctx, *plan.transaction, &later_unlinks, plan.later_mutations, &proven_unlinks, &proven_data))
             {
                 SetRuntimeRecoveryReason(ctx, L"AcceptedWriteReplayVerificationFailed");
                 return false;
@@ -13315,6 +16249,11 @@ bool ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(MountContext& ctx)
     if (!ctx.tx_manager->MarkCleanedThrough(durable_sequence))
     {
         SetRuntimeRecoveryReason(ctx, L"AcceptedWriteReplayCleanupWatermarkFailed");
+        return false;
+    }
+
+    if (!RefreshManifestCheckpointPinsAfterCleanup(ctx))
+    {
         return false;
     }
 
@@ -13365,13 +16304,14 @@ void ReconcileWriteAheadLogRecoveryAfterMetadataBootstrap(
             ctx.runtime_recovery_reason = L"AcceptedWriteReplayRequired";
             ctx.runtime_last_recovery_action = L"DowngradedUntilAcceptedWriteReplay";
         }
-        if (ctx.native_write_enabled &&
-            IsRecoveryPolicyFailClosed(ctx.args.write_recovery_policy))
-        {
-            ctx.write_degraded = true;
-            ctx.native_write_enabled = false;
-            ctx.overlay_write_enabled = false;
-        }
+        // A fresh context has no foreground publication-proof guard. Until
+        // bootstrap replay succeeds, neither policy may let an ordinary drain
+        // treat NothingToCommit as proof and finalize unproven accepted work.
+        // Successful replay clears the caller's recovery-pending flag before
+        // reconciliation, so verified recovery keeps its writable backend.
+        ctx.write_degraded = true;
+        ctx.native_write_enabled = false;
+        ctx.overlay_write_enabled = false;
     }
     std::wcerr << L"[FsHost] RW write-ahead log recovery is required; accepted writes are retained and RW stays blocked until replay completes."
         << std::endl;
@@ -13508,22 +16448,33 @@ bool StageNativeDeletePostorderBestEffort(
     MountContext* c,
     const std::vector<std::shared_ptr<Node>>& postorder,
     std::wstring* failed_path = nullptr,
-    apfsaccess::rw::MetadataStore::PayloadIdentity* staged_root_identity = nullptr,
-    bool* metadata_staged = nullptr)
+    bool* metadata_staged = nullptr,
+    std::vector<apfsaccess::rw::TransactionManager::MutationIntent>* journal_mutations = nullptr,
+    bool continue_callback_batch = false)
 {
+    if (journal_mutations) journal_mutations->clear();
     if (metadata_staged)
     {
         *metadata_staged = false;
-    }
-    if (staged_root_identity)
-    {
-        *staged_root_identity = {};
     }
     if (!c || !IsNativeWriteEnabled(c))
     {
         return true;
     }
 
+    // Reserve admission for this already-enumerated namespace operation. A
+    // pressure drain between children could publish unjournaled deletions.
+    // The ordinary ceiling and worker behavior resume when this call returns.
+    std::size_t atomic_batch_limit = 0;
+    if (postorder.size() > 1 || continue_callback_batch)
+    {
+        if (IsManifestSession(c)) atomic_batch_limit = ManifestQueuedRequestCount(c) + postorder.size();
+        else if (c->metadata_store)
+        {
+            std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
+            atomic_batch_limit = c->metadata_store->PendingMutationCount() + postorder.size();
+        }
+    }
     for (const auto& node : postorder)
     {
         if (!node)
@@ -13532,6 +16483,7 @@ bool StageNativeDeletePostorderBestEffort(
         }
 
         apfsaccess::rw::MetadataStore::PayloadIdentity staged_identity{};
+        std::optional<apfsaccess::rw::UnlinkOutcome> staged_unlink;
         bool current_metadata_staged = false;
         if (!RecordNativeMutationBestEffort(
                 c,
@@ -13543,7 +16495,9 @@ bool StageNativeDeletePostorderBestEffort(
                 false,
                 0,
                 &staged_identity,
-                &current_metadata_staged))
+                &current_metadata_staged,
+                &staged_unlink,
+                atomic_batch_limit))
         {
             if (metadata_staged)
             {
@@ -13560,9 +16514,15 @@ bool StageNativeDeletePostorderBestEffort(
             *metadata_staged = *metadata_staged || current_metadata_staged;
         }
 
-        if (staged_root_identity)
+        if (journal_mutations && current_metadata_staged)
         {
-            *staged_root_identity = staged_identity;
+            apfsaccess::rw::TransactionManager::MutationIntent intent;
+            intent.kind = apfsaccess::rw::TransactionManager::MutationKind::Delete;
+            intent.path = node->path;
+            intent.object_id = staged_identity.object_id;
+            intent.generation = staged_identity.generation;
+            intent.unlink_outcome = std::move(staged_unlink);
+            journal_mutations->push_back(std::move(intent));
         }
     }
 
@@ -13577,10 +16537,14 @@ bool IsBenignStaleDeletedSetBasicInfoFailure(MountContext* c, const std::shared_
     }
 
     std::wstring failure_path;
+    bool inode_metadata_failure = false;
     {
         std::lock_guard<std::recursive_mutex> runtime_lock(c->runtime_state_mutex);
-        if (_wcsicmp(c->last_native_mutation_failure_operation.c_str(), L"SetBasicInfo") ||
-            _wcsicmp(c->last_native_mutation_failure_reason.c_str(), L"SetBasicInfoTargetMissing") ||
+        inode_metadata_failure = !_wcsicmp(c->last_native_mutation_failure_operation.c_str(), L"SetInodeMetadata") &&
+            !_wcsicmp(c->last_native_mutation_failure_reason.c_str(), L"InodeMetadataIdentityMismatch");
+        if ((!inode_metadata_failure &&
+            (_wcsicmp(c->last_native_mutation_failure_operation.c_str(), L"SetBasicInfo") ||
+             _wcsicmp(c->last_native_mutation_failure_reason.c_str(), L"SetBasicInfoTargetMissing"))) ||
             !IsSameNormalizedPath(c, c->last_native_mutation_failure_path, node->path))
         {
             return false;
@@ -13595,6 +16559,10 @@ bool IsBenignStaleDeletedSetBasicInfoFailure(MountContext* c, const std::shared_
     {
         std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
         missing_from_native_metadata = !c->metadata_store->LookupCommittedInodeByPath(failure_path).has_value();
+        if (inode_metadata_failure &&
+            (!missing_from_native_metadata || c->metadata_store->LookupWorkingInodeByPath(failure_path) ||
+             (node->object_id != 0 && c->metadata_store->LookupCommittedInodeByObjectId(node->object_id))))
+            return false;
     }
 #endif
 
@@ -13689,6 +16657,28 @@ NTSTATUS BlockNativeMutationAfterStagingFailure(
         return STATUS_MEDIA_WRITE_PROTECTED;
     }
 
+    if (IsManifestSession(c) && c->manifest_preaccept_failure_status.exchange(
+            STATUS_SUCCESS, std::memory_order_acq_rel) == STATUS_DEVICE_BUSY)
+    {
+        // The callback has rolled back its local changes; neither native
+        // staging nor WAL acceptance ran, so this is retryable, not degradation.
+        if (c->tx_manager && c->metadata_store && c->payload_spool &&
+            !c->unjournaled_native_mutation.load(std::memory_order_acquire) &&
+            !HasBlockedRecoveryEvidence(*c) && !HasPendingNativeMutations(c) &&
+            CanClearNativeRecoveryStateBestEffort(c))
+        {
+            const auto spool = c->payload_spool->SnapshotCounters();
+            if (!spool.recovery_required && spool.dirty_range_count == 0 &&
+                !spool.index_dirty && spool.bytes_since_sync == 0 && spool.appends_since_sync == 0)
+            {
+                // Disarm only this rejected operation's marker. Existing own-
+                // volume accepted WAL or unresolved spool evidence must survive.
+                (void)UpdateRecoveryMarkerBestEffort(c, false);
+            }
+        }
+        return STATUS_DEVICE_BUSY;
+    }
+
     {
         std::lock_guard<std::recursive_mutex> runtime_lock(c->runtime_state_mutex);
         if (metadata_staged)
@@ -13741,7 +16731,9 @@ bool RecordMutationBestEffort(
     bool replace_if_exists = false,
     std::uint64_t wal_sequence = 0,
     std::uint64_t timestamp_utc = 0,
-    const apfsaccess::rw::MetadataStore::PayloadIdentity* identity = nullptr)
+    const apfsaccess::rw::MetadataStore::PayloadIdentity* identity = nullptr,
+    const std::optional<apfsaccess::rw::UnlinkOutcome>* unlink_outcome = nullptr,
+    std::span<const std::byte> inline_payload = {})
 {
     if (!c || !c->tx_manager)
     {
@@ -13749,6 +16741,24 @@ bool RecordMutationBestEffort(
     }
 
     ScopedPerfTimer wal_append_scope(&c->perf_wal_append);
+
+    using Kind = apfsaccess::rw::TransactionManager::MutationKind;
+    const bool attribute = kind == Kind::SetExtendedAttribute || kind == Kind::RemoveExtendedAttribute;
+    const bool inode_metadata = kind == Kind::SetInodeMetadata;
+    const bool compression_rewrite = kind == Kind::RewriteCompressedContent;
+    apfsaccess::rw::CompressionRewrite compression_source;
+    if (compression_rewrite && (offset != 0 || timestamp_utc != 0 || !secondary_path.empty() ||
+        replace_if_exists || (unlink_outcome && unlink_outcome->has_value()) || length != inline_payload.size() ||
+        !apfsaccess::rw::DecodeCompressionRewrite(inline_payload, compression_source) || !identity ||
+        identity->object_id != compression_source.object || identity->generation != compression_source.generation)) return false;
+    apfsaccess::rw::InodeMetadataPatch patch;
+    if (inode_metadata && (offset != 0 || timestamp_utc != 0 || !secondary_path.empty() ||
+        replace_if_exists || (unlink_outcome && unlink_outcome->has_value()) || length != inline_payload.size() ||
+        !apfsaccess::rw::DecodeInodeMetadataPatch(inline_payload, patch))) return false;
+    if (!inode_metadata && !compression_rewrite && (attribute ? (offset != 0 || length != inline_payload.size() || inline_payload.size() > apfsaccess::rw::WriteAheadLog::MaxExtendedAttributePayloadBytes ||
+            replace_if_exists || (unlink_outcome && unlink_outcome->has_value()) ||
+            (kind == Kind::RemoveExtendedAttribute && !inline_payload.empty())) :
+        !inline_payload.empty())) return false;
 
     if (IsManifestSession(c) &&
         IsNativeWriteEnabled(c) &&
@@ -13762,6 +16772,12 @@ bool RecordMutationBestEffort(
         expectation.length = length;
         expectation.replace_if_exists = replace_if_exists;
         expectation.timestamp_utc = timestamp_utc;
+        if (attribute || inode_metadata)
+        {
+            expectation.payload = inline_payload.data();
+            expectation.payload_bytes = static_cast<std::uint32_t>(inline_payload.size());
+            expectation.has_payload = true;
+        }
         return CommitQueuedManifestMutationWithWalBestEffort(
             c, expectation, L"ManifestMetadata");
     }
@@ -13780,10 +16796,25 @@ bool RecordMutationBestEffort(
     mutation.path = path;
     mutation.secondary_path = secondary_path;
     mutation.offset = offset;
-    mutation.length = length;
+    // Operation 12 retains its codec length; the WAL mapper clears its file range.
+    mutation.length = attribute ? 0 : length;
     mutation.wal_sequence = wal_sequence;
     mutation.replace_if_exists = replace_if_exists;
     mutation.timestamp_utc = timestamp_utc;
+    if (unlink_outcome) mutation.unlink_outcome = *unlink_outcome;
+    if (kind == Kind::SetExtendedAttribute || inode_metadata || compression_rewrite)
+    {
+        mutation.inline_payload.assign(inline_payload.begin(), inline_payload.end());
+        mutation.payload_length = inline_payload.size();
+        BCRYPT_ALG_HANDLE algorithm = nullptr;
+        if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0) return false;
+        const auto status = BCryptHash(algorithm, nullptr, 0,
+            reinterpret_cast<PUCHAR>(const_cast<std::byte*>(inline_payload.data())),
+            static_cast<ULONG>(inline_payload.size()), mutation.payload_checksum.data(),
+            static_cast<ULONG>(mutation.payload_checksum.size()));
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        if (status < 0) return false;
+    }
     if (identity && identity->object_id != 0 && identity->generation != 0)
     {
         mutation.object_id = identity->object_id;
@@ -13966,12 +16997,28 @@ ManifestJournalKindForOperation(
         return JournalKind::Write;
     case MetadataOperation::SetFileSize:
         return JournalKind::SetFileSize;
+    case MetadataOperation::SetAllocationSize:
+        return JournalKind::SetAllocationSize;
     case MetadataOperation::Rename:
         return JournalKind::Rename;
     case MetadataOperation::Delete:
         return JournalKind::Delete;
     case MetadataOperation::SetBasicInfo:
         return JournalKind::SetBasicInfo;
+    case MetadataOperation::SetInodeMetadata:
+        return JournalKind::SetInodeMetadata;
+    case MetadataOperation::SetSymbolicLinkTarget:
+        return JournalKind::SetSymbolicLinkTarget;
+    case MetadataOperation::RemoveSymbolicLinkTarget:
+        return JournalKind::RemoveSymbolicLinkTarget;
+    case MetadataOperation::RestoreDirectoryFromSymbolicLink:
+        return JournalKind::RestoreDirectoryFromSymbolicLink;
+    case MetadataOperation::SetExtendedAttribute:
+        return JournalKind::SetExtendedAttribute;
+    case MetadataOperation::RemoveExtendedAttribute:
+        return JournalKind::RemoveExtendedAttribute;
+    case MetadataOperation::RewriteCompressedContent:
+        return JournalKind::RewriteCompressedContent;
     default:
         return std::nullopt;
     }
@@ -13980,8 +17027,14 @@ ManifestJournalKindForOperation(
 bool CommitQueuedManifestMutationWithWalBestEffort(
     MountContext* c,
     const ManifestJournalExpectation& expectation,
-    const wchar_t* origin)
+    const wchar_t* origin,
+    const apfsaccess::catalog::ContainerMutationPreparationHook& preparation_hook,
+    const apfsaccess::catalog::ContainerPostpublicationVerifierHook& verification_hook,
+    bool defer_finalization,
+    ManifestCommitOutcome* manifest_result,
+    bool preserve_unaccepted_manifest_queue)
 {
+    if (manifest_result) *manifest_result = {};
     if (!IsManifestSession(c) || !c->tx_manager || !c->payload_spool)
     {
         return false;
@@ -13989,8 +17042,12 @@ bool CommitQueuedManifestMutationWithWalBestEffort(
 
     bool hook_called = false;
     bool journal_accepted = false;
+    c->manifest_preaccept_failure_status.store(STATUS_SUCCESS, std::memory_order_release);
     const apfsaccess::catalog::ContainerPrepublicationHook bind_wal =
-        [&](const auto& requests, const auto& identities, std::string& error)
+        [&](const auto& requests, const auto& identities,
+            std::uint64_t preimage_checkpoint_xid,
+            std::vector<std::uint64_t>& required_checkpoint_xids,
+            std::string& error)
         {
             hook_called = true;
             if (requests.empty() || requests.size() != identities.size())
@@ -14006,6 +17063,15 @@ bool CommitQueuedManifestMutationWithWalBestEffort(
                 {
                     const auto kind =
                         ManifestJournalKindForOperation(request.operation);
+                    using Operation = apfsaccess::rw::MetadataStore::MutationOperation;
+                    const bool attribute = request.operation == Operation::SetExtendedAttribute ||
+                        request.operation == Operation::RemoveExtendedAttribute ||
+                        request.operation == Operation::SetInodeMetadata;
+                    if (attribute && (!expectation.has_payload ||
+                            request.inline_payload.size() != expectation.payload_bytes ||
+                            (expectation.payload_bytes != 0 && expectation.payload == nullptr) ||
+                            !std::equal(request.inline_payload.begin(), request.inline_payload.end(),
+                                static_cast<const std::byte*>(expectation.payload)))) return false;
                     return kind.has_value() &&
                         kind.value() == expectation.kind &&
                         request.path == expectation.path &&
@@ -14018,6 +17084,11 @@ bool CommitQueuedManifestMutationWithWalBestEffort(
             if (!expectation_present)
             {
                 error = "ManifestCallbackQueueMismatch";
+                return false;
+            }
+            if (preparation_hook && !UpdateRecoveryMarkerBestEffort(c, true))
+            {
+                error = "ManifestPreparedRecoveryMarkerFailed";
                 return false;
             }
 
@@ -14039,6 +17110,7 @@ bool CommitQueuedManifestMutationWithWalBestEffort(
                     apfsaccess::rw::TransactionManager::MutationKind::Write)
                 {
                     const bool payload_matches = expectation.has_payload &&
+                        expectation.kind == apfsaccess::rw::TransactionManager::MutationKind::Write &&
                         !payload_consumed &&
                         request.path == expectation.path &&
                         request.offset == expectation.offset &&
@@ -14060,6 +17132,21 @@ bool CommitQueuedManifestMutationWithWalBestEffort(
                 }
                 else
                 {
+                    auto journal_identity = identity;
+                    if (kind.value() == apfsaccess::rw::TransactionManager::MutationKind::RewriteCompressedContent)
+                    {
+                        apfsaccess::rw::CompressionRewrite source;
+                        if (!apfsaccess::rw::DecodeCompressionRewrite(request.inline_payload, source) ||
+                            source.checkpoint == UINT64_MAX || source.checkpoint != preimage_checkpoint_xid ||
+                            source.volume != c->container_volume_oid || request.object_id != source.object ||
+                            request.generation != source.generation || identity.object_id != source.object ||
+                            identity.generation != source.checkpoint + 1)
+                        {
+                            error = "ManifestCompressionSourceIdentityMismatch";
+                            return false;
+                        }
+                        journal_identity = {source.object, source.generation};
+                    }
                     recorded = RecordMutationBestEffort(
                         c,
                         kind.value(),
@@ -14070,7 +17157,9 @@ bool CommitQueuedManifestMutationWithWalBestEffort(
                         request.replace_if_exists,
                         0,
                         request.timestamp_utc,
-                        &identity);
+                        &journal_identity,
+                        &request.expected_unlink_outcome,
+                        request.inline_payload);
                 }
                 if (!recorded)
                 {
@@ -14079,7 +17168,8 @@ bool CommitQueuedManifestMutationWithWalBestEffort(
                 }
             }
 
-            if (expectation.has_payload && !payload_consumed)
+            if (expectation.kind == apfsaccess::rw::TransactionManager::MutationKind::Write &&
+                expectation.has_payload && !payload_consumed)
             {
                 error = "ManifestWritePayloadNotConsumed";
                 return false;
@@ -14092,28 +17182,51 @@ bool CommitQueuedManifestMutationWithWalBestEffort(
                     &accepted_sequence,
                     nullptr,
                     nullptr,
-                    true) ||
+                    true,
+                    preimage_checkpoint_xid) ||
                 accepted_sequence == 0)
             {
                 error = "ManifestWalAcceptanceFailed";
                 return false;
             }
             journal_accepted = true;
+            if (c->metadata_store->AuthoritativeAppleCheckpointView())
+            {
+                // The coordinator owns publication here. Return the post-accept
+                // census rather than reentering its commit lock to register pins.
+                std::lock_guard<std::mutex> lock(c->tx_mutex);
+                if (!c->tx_manager->LoadRequiredCheckpointXidsSinceCleanup(
+                        required_checkpoint_xids, &error))
+                {
+                    return false;
+                }
+            }
             return true;
         };
 
+    ManifestCommitOutcome local_result;
+    auto& result = manifest_result ? *manifest_result : local_result;
     const auto status = CommitNativeMutationsBestEffort(
-        c, origin, bind_wal);
+        c, origin, bind_wal, {}, preparation_hook, verification_hook,
+        &result, preserve_unaccepted_manifest_queue);
     if (!NT_SUCCESS(status) || !hook_called || !journal_accepted)
     {
-        if (!journal_accepted)
+        if (status == STATUS_DEVICE_BUSY && result.clean_prepublication_refusal && !hook_called)
+            c->manifest_preaccept_failure_status.store(STATUS_DEVICE_BUSY, std::memory_order_release);
+        // Prepared compression and its older boundary own failure handling.
+        // Acceptance can persist even when the helper cannot return its receipt; never
+        // abort or refresh away that evidence through the ordinary queue path.
+        if (hook_called && !journal_accepted && !preparation_hook && !preserve_unaccepted_manifest_queue)
         {
             AbortMutationJournalBestEffort(c, origin);
+            // A failed hook conservatively pins possible acceptance. Only a
+            // real post-abort rescan can prove there is no unresolved work.
+            (void)RefreshManifestCheckpointPinsAfterCleanup(*c);
         }
         return false;
     }
 
-    return FinalizeMutationJournalBestEffort(c, origin);
+    return defer_finalization || FinalizeMutationJournalBestEffort(c, origin);
 }
 
 bool CommitMutationJournalBestEffort(
@@ -14121,6 +17234,7 @@ bool CommitMutationJournalBestEffort(
     std::uint64_t* committed_sequence = nullptr,
     std::uint64_t* transaction_id = nullptr)
 {
+    if (c && c->compression_verification_pending.load(std::memory_order_acquire)) return false;
     if (transaction_id)
     {
         *transaction_id = 0;
@@ -14201,7 +17315,8 @@ bool AcceptMutationJournalForDeferredCommitBestEffort(
     std::uint64_t* accepted_sequence,
     GroupedDeferredAcceptanceFailureReason* failure_reason,
     MutationCallbackScope* callback_scope,
-    bool wait_for_durability)
+    bool wait_for_durability,
+    std::uint64_t preimage_checkpoint_xid)
 {
     if (accepted_sequence)
     {
@@ -14216,13 +17331,33 @@ bool AcceptMutationJournalForDeferredCommitBestEffort(
         return true;
     }
 
+    std::unique_lock<std::mutex> direct_preimage_lock;
+    if (!IsManifestSession(c) && c->metadata_store)
+    {
+        direct_preimage_lock = std::unique_lock<std::mutex>(c->metadata_mutex);
+        std::uint64_t actual_preimage = 0;
+        std::string error;
+        if (!GetDirectApplePreimageLocked(*c->metadata_store, actual_preimage, error) ||
+            (actual_preimage != 0 && preimage_checkpoint_xid != 0 &&
+             preimage_checkpoint_xid != actual_preimage))
+        {
+            if (failure_reason) *failure_reason = GroupedDeferredAcceptanceFailureReason::WalAcceptanceFailed;
+            return false;
+        }
+        if (actual_preimage != 0) preimage_checkpoint_xid = actual_preimage;
+        else direct_preimage_lock.unlock();
+    }
+    const auto release_preimage_lock = [&]()
+    {
+        if (direct_preimage_lock.owns_lock()) direct_preimage_lock.unlock();
+    };
     const auto accept_and_wait_locked =
         [&](ObservedMutexGuard& lock,
             apfsaccess::rw::TransactionManager& tx,
             bool require_durability) -> bool
     {
         std::uint64_t deferred_sequence = 0;
-        if (!tx.AcceptForDeferredCommit(&deferred_sequence))
+        if (!tx.AcceptForDeferredCommit(&deferred_sequence, preimage_checkpoint_xid))
         {
             if (failure_reason)
             {
@@ -14231,6 +17366,9 @@ bool AcceptMutationJournalForDeferredCommitBestEffort(
             return false;
         }
 
+        // Acceptance now names the protected source. Do not keep metadata
+        // locked while a durability waiter releases/reacquires callback scope.
+        release_preimage_lock();
         if (!require_durability)
         {
             if (accepted_sequence)
@@ -14280,6 +17418,7 @@ bool AcceptMutationJournalForDeferredCommitBestEffort(
         auto& tx = *c->tx_manager;
         if (tx.CurrentState() == apfsaccess::rw::TransactionManager::State::Idle)
         {
+            release_preimage_lock();
             const auto existing_sequence = tx.Watermarks().accepted_sequence;
             if (wait_for_durability && existing_sequence != 0)
             {
@@ -14435,10 +17574,26 @@ NTSTATUS CommitNativeMutationsBestEffort(
 #ifdef APFSACCESS_HAS_RW_ENGINE
     , const apfsaccess::catalog::ContainerPrepublicationHook&
         manifest_prepublication_hook
+    , const std::function<bool(const apfsaccess::rw::MetadataStore&, std::string&)>&
+        direct_postpublication_hook
+    , const apfsaccess::catalog::ContainerMutationPreparationHook& manifest_preparation_hook
+    , const apfsaccess::catalog::ContainerPostpublicationVerifierHook& manifest_verification_hook
+    , ManifestCommitOutcome* manifest_result
+    , bool preserve_unaccepted_manifest_queue
 #endif
 )
 {
     ScopedPerfTimer perf_scope(c ? &c->perf_commit_native : nullptr);
+
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (manifest_result) *manifest_result = {};
+    if (c && c->compression_verification_pending.load(std::memory_order_acquire) &&
+        !direct_postpublication_hook && !manifest_verification_hook)
+    {
+        CompleteDeferredCommitBarrier(c, false, STATUS_MEDIA_WRITE_PROTECTED);
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    }
+#endif
 
     if (!c)
     {
@@ -14495,6 +17650,9 @@ NTSTATUS CommitNativeMutationsBestEffort(
     std::uint64_t pending_mutations_before = 0;
     std::uint64_t pending_payload_bytes_before = 0;
     const auto commit_started_tick = static_cast<std::uint64_t>(GetTickCount64());
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+    c->test_native_commit_started_tick_ms = commit_started_tick;
+#endif
     {
         auto metadata_lock = AcquireObservedMutex(c->metadata_mutex, &c->perf_metadata_mutex_wait);
         const auto pending_payload_bytes = c->metadata_store
@@ -14507,7 +17665,7 @@ NTSTATUS CommitNativeMutationsBestEffort(
         commit_timeout_budget_seconds = ComputeWriteCommitTimeoutBudgetSeconds(
             c->args.write_commit_timeout_seconds,
             pending_payload_bytes);
-        ArmCommitDeadline(c, pending_payload_bytes);
+        ArmCommitDeadline(c, pending_payload_bytes, commit_started_tick);
 #ifdef APFSACCESS_FSHOST_UNIT_TEST
         if (forced_commit_status)
         {
@@ -14522,6 +17680,17 @@ NTSTATUS CommitNativeMutationsBestEffort(
 #ifdef APFSACCESS_HAS_RW_ENGINE
             if (IsManifestSession(c))
             {
+                if (manifest_preparation_hook)
+                {
+                    // A prepared batch may never consume older queued work.
+                    // Its callback must finish that boundary before entering.
+                    std::lock_guard<std::mutex> queue_lock(c->manifest_queue_mutex);
+                    if (!c->manifest_queued_requests.empty())
+                    {
+                        ClearCommitDeadline(c);
+                        return STATUS_DEVICE_BUSY;
+                    }
+                }
                 // Manifest sessions never stage eagerly: commit the queued
                 // batch through the container funnel (canonical selection is
                 // already pinned on the session at mount).
@@ -14539,10 +17708,61 @@ NTSTATUS CommitNativeMutationsBestEffort(
                 }
                 else
                 {
+                    // The manifest funnel stages only after taking the shared
+                    // container lock. Budget its actual payload before publish,
+                    // retaining the original start time across retention retries.
+                    const auto staged_budget_hook = [&](
+                        const auto& staged_requests, const auto& identities,
+                        std::uint64_t preimage_xid, auto& pins, auto& error)
+                    {
+                        pending_payload_bytes_before =
+                            c->metadata_store->PendingPayloadByteEstimate();
+                        std::uint64_t storage_bytes = 0;
+                        std::unordered_set<std::uint64_t> payload_objects;
+                        using Operation = apfsaccess::rw::MetadataStore::MutationOperation;
+                        for (const auto& request : staged_requests)
+                        {
+                            if (request.operation != Operation::Write &&
+                                request.operation != Operation::SetFileSize &&
+                                request.operation != Operation::SetAllocationSize) continue;
+                            const auto inode = c->metadata_store->LookupWorkingInodeByPath(request.path);
+                            if (!inode || !payload_objects.insert(inode->object_id).second) continue;
+                            const auto bytes = (std::max)(inode->logical_size,
+                                inode->allocation_size.value_or(0));
+                            storage_bytes = bytes > (std::numeric_limits<std::uint64_t>::max)() - storage_bytes
+                                ? (std::numeric_limits<std::uint64_t>::max)() : storage_bytes + bytes;
+                        }
+                        pending_payload_bytes_before =
+                            (std::max)(pending_payload_bytes_before, storage_bytes);
+                        pending_mutations_before = c->metadata_store->PendingMutationCount();
+                        commit_timeout_budget_seconds = ComputeWriteCommitTimeoutBudgetSeconds(
+                            c->args.write_commit_timeout_seconds, pending_payload_bytes_before);
+                        ArmCommitDeadline(c, pending_payload_bytes_before, commit_started_tick);
+                        return !manifest_prepublication_hook || manifest_prepublication_hook(
+                            staged_requests, identities, preimage_xid, pins, error);
+                    };
                     const auto manifest_outcome = CommitManifestMutations(
                         c,
-                        std::move(queued_manifest_requests),
-                        manifest_prepublication_hook);
+                        queued_manifest_requests,
+                        staged_budget_hook, {}, false, std::nullopt,
+                        manifest_preparation_hook, manifest_verification_hook);
+                    if (preserve_unaccepted_manifest_queue && manifest_outcome.clean_prepublication_refusal)
+                    {
+                        // Retain the original full batch until its phase is
+                        // known. Prepend it before later arrivals, never restore
+                        // requests whose binder/publication may have run.
+                        RestoreManifestRequests(c, std::move(queued_manifest_requests));
+                    }
+                    if (manifest_result) *manifest_result = manifest_outcome;
+                    if ((manifest_preparation_hook || preserve_unaccepted_manifest_queue) &&
+                        manifest_outcome.clean_prepublication_refusal)
+                    {
+                        // Successful preparation alone says nothing about WAL
+                        // acceptance. Only the coordinator's clean phase proof
+                        // may bypass recovery latching after a staging refusal.
+                        ClearCommitDeadline(c);
+                        return CleanManifestRefusalStatus(manifest_outcome);
+                    }
                     commit_status = manifest_outcome.status;
                     final_commit_stage = manifest_outcome.stage;
                     committed_xid = manifest_outcome.committed_xid;
@@ -14555,15 +17775,45 @@ NTSTATUS CommitNativeMutationsBestEffort(
 #endif
             require_canonical_gate = RequiresCanonicalMutationGate(c->args);
             canonical_ready_before_commit = c->metadata_store->IsCanonicalCommitReady();
-            commit_status = require_canonical_gate
-                ? c->metadata_store->CommitCanonicalTransaction()
-                : c->metadata_store->CommitTransaction();
-            final_commit_stage = c->metadata_store->LastCommitStage();
-            committed_xid = c->metadata_store->LastCommittedXid();
-            metadata_recovery_reason = c->metadata_store->RecoveryReason();
-            metadata_commit_failure_detail =
-                c->metadata_store->LastCommitFailureDetail();
-            metadata_recovery_required = c->metadata_store->IsRecoveryRequired();
+            std::vector<std::uint64_t> required_checkpoint_xids;
+            std::string census_error;
+            if (!LoadDirectCheckpointPinsLocked(*c, required_checkpoint_xids, census_error))
+            {
+                commit_status = apfsaccess::rw::MetadataStore::CommitStatus::InvariantFailed;
+                final_commit_stage = "direct-checkpoint-census-failed";
+                metadata_recovery_reason = Utf8ToWide(census_error);
+                metadata_recovery_required = true;
+            }
+            else
+            {
+                commit_status = require_canonical_gate
+                    ? c->metadata_store->CommitCanonicalTransaction(required_checkpoint_xids)
+                    : c->metadata_store->CommitTransaction(required_checkpoint_xids);
+                final_commit_stage = c->metadata_store->LastCommitStage();
+                committed_xid = c->metadata_store->LastCommittedXid();
+                metadata_recovery_reason = c->metadata_store->RecoveryReason();
+                metadata_commit_failure_detail = c->metadata_store->LastCommitFailureDetail();
+                metadata_recovery_required = c->metadata_store->IsRecoveryRequired();
+                if (commit_status == apfsaccess::rw::MetadataStore::CommitStatus::Committed &&
+                    direct_postpublication_hook)
+                {
+                    std::string proof_error;
+                    bool verified = false;
+                    try { verified = direct_postpublication_hook(*c->metadata_store, proof_error); }
+                    catch (const std::exception&) { proof_error = "PublicationVerifierException"; }
+                    catch (...) { proof_error = "PublicationVerifierException"; }
+                    if (!verified || !proof_error.empty())
+                    {
+                        // The checkpoint already exists. Retain its identity and
+                        // recovery evidence; a failed proof is not a rollback.
+                        commit_status = apfsaccess::rw::MetadataStore::CommitStatus::InvariantFailed;
+                        final_commit_stage = "direct-postpublication-verification";
+                        metadata_recovery_reason = Utf8ToWide(proof_error.empty()
+                            ? "PublicationVerifierRefused" : proof_error);
+                        metadata_recovery_required = true;
+                    }
+                }
+            }
 #ifdef APFSACCESS_HAS_RW_ENGINE
             }
 #endif
@@ -14572,6 +17822,29 @@ NTSTATUS CommitNativeMutationsBestEffort(
         {
             metadata_commit_failure_detail =
                 c->metadata_store->LastCommitFailureDetail();
+            if (commit_status == apfsaccess::rw::MetadataStore::CommitStatus::Committed &&
+                c->metadata_store->AuthoritativeAppleCheckpointView() && c->payload_spool)
+            {
+                // Publication precedes manifest CB_Write's cache update. Retire
+                // ordinary sidecar bases now, before finalization removes the
+                // spool ranges that made those preimages usable. Shared payloads
+                // are explicitly materialized by their ordered callback writes.
+                const auto changes = c->metadata_store->SnapshotLastCommittedInodeChanges();
+                std::lock_guard<std::mutex> lock(c->mutex);
+                for (const auto& change : changes)
+                {
+                    if (!change.current || change.current->node_type !=
+                            apfsaccess::rw::MetadataStore::NodeType::RegularFile ||
+                        c->payload_spool->MaxDirtyRangeEnd(c->payload_spool_volume_identity,
+                            change.object_id, change.current->xid) == 0) continue;
+                    for (const auto& path : {change.previous_path, change.current->full_path})
+                    {
+                        const auto node = TryGetVisibleNodeLockedNormalized(c, path);
+                        if (node && node->object_id == change.object_id && !node->shared_payload)
+                            MarkHydrationStaleLocked(c, node);
+                    }
+                }
+            }
         }
         if (metadata_recovery_reason.empty() &&
             require_canonical_gate &&
@@ -14724,6 +17997,10 @@ NTSTATUS CommitNativeMutationsBestEffort(
         (void)UpdateRecoveryMarkerBestEffort(c, true);
         (void)WriteHostStatusFile(*c);
         return STATUS_DISK_FULL;
+    case apfsaccess::rw::MetadataStore::CommitStatus::RetentionBlocked:
+        // No device write occurred. Keep accepted work and mount admission;
+        // cleanup can release its historical checkpoint before a later retry.
+        return STATUS_DEVICE_BUSY;
     case apfsaccess::rw::MetadataStore::CommitStatus::InvariantFailed:
         std::wcerr << L"[FsHost] RW native-commit warning (" << origin << L"): pending mutation invariants failed preflight validation." << std::endl;
         latch_commit_failure(
@@ -15323,7 +18600,7 @@ void DiscardDeferredRenameRollbackPlans(MountContext* c)
 
     for (const auto& plan : plans)
     {
-        DiscardFileRollbackSnapshot(plan.replaced_file_snapshot);
+        DiscardFileRollbackSnapshot(plan.replaced_file_snapshot, true);
     }
 }
 
@@ -16412,10 +19689,40 @@ void DeferredCommitWorkerLoop(MountContext* c)
     std::unique_lock<std::mutex> lock(c->deferred_commit_mutex);
     for (;;)
     {
-        c->deferred_commit_cv.wait(lock, [&]()
+        if (c->deferred_commit_thread_stop) break;
+        // Automatic atime has its own bounded deadline. Do not let data-close
+        // quiescence or an open write handle indefinitely postpone this queue.
+        if (c->deferred_access_time_requested &&
+            std::chrono::steady_clock::now() >= c->deferred_access_time_deadline &&
+            !c->deferred_commit_thread_stop)
         {
-            return c->deferred_commit_thread_stop || c->deferred_commit_requested;
+            lock.unlock();
+            {
+                MutationCallbackScope mutation(c, false, true);
+                if (mutation.OwnsLock()) (void)DrainDeferredAccessTimes(c);
+            }
+            lock.lock();
+            if (c->deferred_access_time_requested)
+                c->deferred_access_time_deadline = std::chrono::steady_clock::now() +
+                    kDeferredCommitMutationMutexRetryPeriod;
+        }
+        if (c->deferred_access_time_requested)
+        {
+            const auto wake = c->deferred_commit_requested
+                ? (std::min)(c->deferred_commit_deadline, c->deferred_access_time_deadline)
+                : c->deferred_access_time_deadline;
+            c->deferred_commit_cv.wait_until(lock, wake);
+            if (!c->deferred_commit_thread_stop &&
+                (!c->deferred_commit_requested ||
+                    std::chrono::steady_clock::now() >= c->deferred_access_time_deadline)) continue;
+        }
+        else c->deferred_commit_cv.wait(lock, [&]()
+        {
+            return c->deferred_commit_thread_stop || c->deferred_commit_requested ||
+                c->deferred_access_time_requested;
         });
+        if (c->deferred_access_time_requested && !c->deferred_commit_requested &&
+            !c->deferred_commit_thread_stop) continue;
         if (c->deferred_commit_thread_stop)
         {
             break;
@@ -16427,7 +19734,9 @@ void DeferredCommitWorkerLoop(MountContext* c)
             {
                 return c->deferred_commit_thread_stop ||
                     !c->deferred_commit_requested ||
-                    c->deferred_commit_deadline != deadline;
+                    c->deferred_commit_deadline != deadline ||
+                    (c->deferred_access_time_requested &&
+                        c->deferred_access_time_deadline < deadline);
             }))
         {
             if (c->deferred_commit_thread_stop)
@@ -16969,6 +20278,11 @@ NTSTATUS DrainNativeMutationsByPolicy(
     bool has_delete_plans,
     bool namespace_boundary)
 {
+    // Caller owns mutation_callback_mutex (or has drained callbacks and stopped
+    // the worker during lifecycle teardown). Recursion is only the atime batch's
+    // own existing staging/acceptance/publication path.
+    const auto atime_status = DrainDeferredAccessTimes(c);
+    if (!NT_SUCCESS(atime_status)) return atime_status;
 #ifdef APFSACCESS_HAS_RW_ENGINE
     const bool native_write_enabled = c && IsNativeWriteEnabled(c);
     if (c &&
@@ -17063,7 +20377,13 @@ NTSTATUS DrainNativeMutationsByPolicy(
         return LatchDeferredWalAcceptanceFailureBeforeApfsCommit(c, origin);
     }
 
-    const auto status = CommitNativeMutationsBestEffort(c, origin);
+    auto status = CommitNativeMutationsBestEffort(c, origin);
+    if (status == STATUS_DEVICE_BUSY && c)
+    {
+        bool cleaned = false;
+        if (!CleanupDurableJournalPrefixBestEffort(*c, cleaned)) status = STATUS_UNSUCCESSFUL;
+        else if (cleaned) status = CommitNativeMutationsBestEffort(c, origin);
+    }
     if (!NT_SUCCESS(status) && c && !from_deferred_worker)
     {
         CompleteDeferredCommitBarrier(c, false, status);
@@ -17122,6 +20442,120 @@ NTSTATUS DrainDeferredNativeMutationsBeforePayloadOpen(MountContext* c, const Op
     }
 #endif
     return STATUS_SUCCESS;
+}
+
+// DEFAULT data mutation refusal is per inode, independent of read capability,
+// cached payloads and paths. Compression read candidates never authorize writes.
+// Call without either host mutex held; the store owns compression interpretation.
+bool HasUnsupportedDefaultContentTransform(MountContext* c, const std::shared_ptr<Node>& node, bool named_stream)
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (!c || !c->metadata_store || !node || named_stream || node->node_kind != NodeKind::RegularFile)
+        return false;
+    std::uint64_t object_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        object_id = node->object_id;
+    }
+    std::lock_guard<std::mutex> metadata_lock(c->metadata_mutex);
+    return c->metadata_store->HasUnsupportedContentTransform(object_id);
+#else
+    return false;
+#endif
+}
+
+NTSTATUS EnsurePayloadHandleReadyForMutation(MountContext* c, OpenContext* open_ctx, bool overwrite_authorized = false)
+{
+    if (!c || !open_ctx || !open_ctx->node)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (open_ctx->file != INVALID_HANDLE_VALUE)
+    {
+        return STATUS_SUCCESS;
+    }
+    if ((!open_ctx->metadata_read_fallback && !overwrite_authorized) ||
+        open_ctx->named_stream ||
+        open_ctx->node->node_kind != NodeKind::RegularFile)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    std::uint64_t payload_epoch = 0;
+    bool detached_payload = false;
+    bool shared_open_payload = false;
+    std::uint64_t logical_size = 0;
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        detached_payload = open_ctx->node->namespace_detached && open_ctx->node->shared_payload;
+        if ((!detached_payload && TryGetNodeLockedNormalized(c, open_ctx->node->path) != open_ctx->node) ||
+            HasUnrestoredHydrationLocked(c, open_ctx->node))
+        {
+            return STATUS_IO_DEVICE_ERROR;
+        }
+        payload_epoch = c->payload_identity_cache_epoch.load(std::memory_order_acquire);
+        shared_open_payload = open_ctx->node->shared_payload && SharedPayloadHasOpenHandles(*open_ctx->node);
+        logical_size = open_ctx->node->file_size;
+        if (shared_open_payload && IsHydrationStaleLocked(c, open_ctx->node)) return STATUS_IO_DEVICE_ERROR;
+    }
+
+    const auto hydration_path = HydrationPath(c, *open_ctx->node);
+    // Open aliases share the current cache; rebuilding it would replace their live payload.
+    if (shared_open_payload)
+    {
+        WIN32_FILE_ATTRIBUTE_DATA attributes{};
+        if (!GetFileAttributesExW(hydration_path.c_str(), GetFileExInfoStandard, &attributes) ||
+            (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+            ((static_cast<std::uint64_t>(attributes.nFileSizeHigh) << 32) | attributes.nFileSizeLow) != logical_size)
+            return STATUS_IO_DEVICE_ERROR;
+    }
+
+    // An unlinked handle can only reopen the cache retained before namespace removal.
+    if (!detached_payload && !shared_open_payload &&
+        !TryHydrateFromCurrentPayloadOverlay(c, open_ctx->node, payload_epoch))
+    {
+        return STATUS_IO_DEVICE_ERROR;
+    }
+
+    HANDLE payload_file = CreateFileW(
+        hydration_path.wstring().c_str(),
+        ResolveHydrationDesiredAccess(IsMutationWriteEnabled(c), open_ctx->granted_access, true),
+        ResolveHydrationShareMode(IsMutationWriteEnabled(c), open_ctx->granted_access, open_ctx->write_open),
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (payload_file == INVALID_HANDLE_VALUE)
+    {
+        return STATUS_IO_DEVICE_ERROR;
+    }
+
+    bool payload_still_current = false;
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        payload_still_current =
+            (detached_payload ? open_ctx->node->namespace_detached && open_ctx->node->shared_payload != nullptr :
+                TryGetNodeLockedNormalized(c, open_ctx->node->path) == open_ctx->node) &&
+            !HasUnrestoredHydrationLocked(c, open_ctx->node) &&
+            !IsHydrationStaleLocked(c, open_ctx->node) &&
+            c->payload_identity_cache_epoch.load(std::memory_order_acquire) == payload_epoch;
+    }
+    if (!payload_still_current)
+    {
+        CloseHandle(payload_file);
+        return STATUS_IO_DEVICE_ERROR;
+    }
+
+    open_ctx->file.store(payload_file, std::memory_order_release);
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+    if (g_lazy_payload_handle_published_hook) g_lazy_payload_handle_published_hook();
+#endif
+    open_ctx->metadata_read_fallback.store(false, std::memory_order_release);
+    return STATUS_SUCCESS;
+#else
+    return STATUS_IO_DEVICE_ERROR;
+#endif
 }
 
 NTSTATUS DrainDeferredDeleteRollbackBeforePathReuse(MountContext* c, const std::wstring& normalized_path, const wchar_t* origin)
@@ -17232,7 +20666,8 @@ bool FinalizeMutationJournalBestEffort(MountContext* c, const wchar_t* origin)
 {
     ScopedPerfTimer cleanup_stage_scope(c ? &c->perf_cleanup_stage : nullptr);
     if (c && c->args.readwrite &&
-        (c->unjournaled_native_mutation.load(std::memory_order_acquire) ||
+        (c->compression_verification_pending.load(std::memory_order_acquire) ||
+         c->unjournaled_native_mutation.load(std::memory_order_acquire) ||
          (!IsNativeWriteEnabled(c) && RequiresNativeApfsCheckpoint(c))))
     {
         // No APFS checkpoint has been proven for this accepted boundary. Keep
@@ -17303,6 +20738,10 @@ bool FinalizeMutationJournalBestEffort(MountContext* c, const wchar_t* origin)
                 cleanup_marked = c->tx_manager->MarkCleanedThrough(committed_sequence);
             }
         }
+        if (cleaned && cleanup_marked && c)
+        {
+            cleanup_marked = RefreshManifestCheckpointPinsAfterCleanup(*c);
+        }
         if (cleaned && cleanup_marked)
         {
             RemoveStaleHydrationFilesAfterCheckpointBestEffort(c);
@@ -17340,6 +20779,7 @@ bool FinalizeMutationJournalBestEffort(MountContext* c, const wchar_t* origin)
         &barrier_effective_success);
     const auto finalization_success = success &&
         (!completed_deferred_barrier || barrier_effective_success);
+    if (finalization_success) RetireUnlinkedPayloadCandidatesBestEffort(c);
     if (completed_deferred_barrier && success && !barrier_effective_success && c)
     {
         {
@@ -17700,7 +21140,7 @@ bool RemoveNodeRecursiveValidatedLocked(MountContext* c, const std::shared_ptr<N
             }
         }
     }
-    if (!node->is_directory)
+    if (!node->is_directory && !node->shared_payload)
     {
         InvalidateHydrationReadHandle(c);
         std::error_code ec;
@@ -17709,6 +21149,9 @@ bool RemoveNodeRecursiveValidatedLocked(MountContext* c, const std::shared_ptr<N
         ClearHydrationStaleLockedNormalized(c, node->path);
     }
     const auto removed_path = node->path;
+    node->namespace_detached = true;
+    if (node->shared_payload)
+        c->unlinked_payload_candidates[node->shared_payload->key] = node->shared_payload;
     EraseIndexedNodeLocked(c, node);
     MarkAncestorChildDeleteLockedNormalized(c, removed_path);
     return true;
@@ -17731,7 +21174,7 @@ bool RemoveNodePostorderValidatedLocked(
         {
             return false;
         }
-        if (!node->is_directory)
+        if (!node->is_directory && !node->shared_payload)
         {
             const auto preserve_file_hydration =
                 node == preserved_hydration_node ||
@@ -17746,6 +21189,9 @@ bool RemoveNodePostorderValidatedLocked(
             ForgetNamedStreamsLocked(c, node->path);
             ClearHydrationStaleLockedNormalized(c, node->path);
         }
+        node->namespace_detached = true;
+        if (node->shared_payload)
+            c->unlinked_payload_candidates[node->shared_payload->key] = node->shared_payload;
         EraseIndexedNodeLocked(c, node);
     }
 
@@ -17847,12 +21293,11 @@ std::shared_ptr<Node> FindRemovableDeferredDirectoryDeletePostorderLocked(
     return {};
 }
 
-bool TryFastCloseNonMutatingContext(MountContext* c, OpenContext* o)
+bool TryFastCloseNonMutatingContext(MountContext* c, OpenContext* o, bool retire_lifetime = false)
 {
     if (!c ||
         !o ||
         !o->node ||
-        !IsMutationWriteEnabled(c) ||
         o->named_stream ||
         o->mutation_observed.load(std::memory_order_acquire) ||
         o->delete_on_cleanup ||
@@ -17876,6 +21321,7 @@ bool TryFastCloseNonMutatingContext(MountContext* c, OpenContext* o)
     }
 
     ReleaseOpenContextAccountingLocked(c, o);
+    if (retire_lifetime) RetireOpenContextLifetimeLocked(o);
     return true;
 }
 
@@ -17924,6 +21370,21 @@ bool ReindexNodePathsLocked(MountContext* c, const std::shared_ptr<Node>& node, 
 
     const auto old_key = LowerPathKey(c, old_path);
     const auto new_key = LowerPathKey(c, new_path);
+    const auto old_prefix = old_key == L"\\" ? old_key : old_key + L"\\";
+    const auto new_prefix = new_key == L"\\" ? new_key : new_key + L"\\";
+    const auto affected_path = [&](const std::wstring& path_key) {
+        return path_key == old_key || path_key == new_key ||
+            path_key.starts_with(old_prefix) || path_key.starts_with(new_prefix);
+    };
+    for (const auto& [state_key, backup] : c->unrestored_hydration_backups)
+    {
+        if (affected_path(state_key)) return false;
+        const auto owner = c->shared_payload_owners.find(state_key);
+        if (owner == c->shared_payload_owners.end()) continue;
+        for (const auto& weak : owner->second->aliases)
+            if (const auto alias = weak.lock(); alias && alias->shared_payload == owner->second &&
+                affected_path(NodePathKey(c, *alias))) return false;
+    }
     const auto old_hydration_key = node->hydration_key;
     const auto target_hydration_key =
         (node->hydration_key.empty() || node->hydration_key == old_key)
@@ -18027,6 +21488,8 @@ void RollbackRenameLocalStateLocked(MountContext* c, const RenameLocalSnapshot& 
     snapshot.node->hydration_key = snapshot.old_hydration_key;
     snapshot.node->committed_read_path = snapshot.old_committed_read_path;
     snapshot.node->timestamp = snapshot.old_timestamp;
+    snapshot.node->inode_times = snapshot.old_inode_times;
+    snapshot.node->times_generation = snapshot.old_times_generation;
     for (const auto& entry : snapshot.descendant_committed_read_paths)
     {
         if (entry.node)
@@ -18097,9 +21560,9 @@ NTSTATUS CB_GetVolumeInfo(FSP_FILE_SYSTEM* fs, FSP_FSCTL_VOLUME_INFO* v)
     {
         free_size = total_size;
     }
-    if (total_size.has_value() && (!free_size.has_value() || free_size.value() == 0))
+    if (total_size.has_value() && !free_size.has_value())
     {
-        // Prefer a usable Explorer capacity bar over reporting an unknown/zero
+        // Prefer a usable Explorer capacity bar over reporting an unknown
         // free space while the richer APFS spaceman state is still unavailable.
         free_size = total_size;
     }
@@ -18120,6 +21583,8 @@ NTSTATUS CB_SetVolumeLabel(FSP_FILE_SYSTEM* fs, PWSTR, FSP_FSCTL_VOLUME_INFO*)
     return STATUS_MEDIA_WRITE_PROTECTED;
 }
 
+#include "NativeXattrStreams.h"
+
 NTSTATUS CB_GetStreamInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buffer, ULONG length, PULONG transferred)
 {
     auto* c = Ctx(fs);
@@ -18137,10 +21602,58 @@ NTSTATUS CB_GetStreamInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buffer, ULONG le
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (o->node->is_directory)
+    if (IsSpecialNode(o->node->node_kind))
     {
         return STATUS_SUCCESS;
     }
+
+    MutationCallbackScope mutation(c);
+    std::vector<std::pair<std::wstring, std::uint64_t>> native_streams;
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (c->metadata_store && o->node->object_id)
+    {
+        if (NativeXattrVisibilityUnresolved(c)) return STATUS_IO_DEVICE_ERROR;
+        std::vector<apfsaccess::rw::AppleXattrRecord> attributes;
+        bool compressed = false;
+        {
+            std::shared_lock<std::shared_mutex> gate(c->committed_read_gate);
+            std::lock_guard<std::mutex> metadata(c->metadata_mutex);
+            if (c->metadata_store->IsRecoveryRequired()) return STATUS_IO_DEVICE_ERROR;
+            if (c->metadata_store->AuthoritativeAppleCheckpointView())
+            {
+                attributes = c->metadata_store->SnapshotWorkingExtendedAttributes(o->node->object_id);
+                const auto inode = c->metadata_store->LookupCommittedInodeByObjectId(o->node->object_id);
+                compressed = (inode && (inode->bsd_flags & apfsaccess::rw::kAppleBsdCompressedFlag)) ||
+                    c->metadata_store->LookupWorkingExtendedAttribute(o->node->object_id, "com.apple.decmpfs").has_value();
+            }
+        }
+        const bool inspect_all = o->native_xattr && o->native_xattr->protocol;
+        for (const auto& attribute : attributes)
+        {
+            // CopyFile consumes ordinary stream enumeration. Expose a single
+            // writable representation; the explicit protocol handle is for
+            // inspecting original protected metadata, including Mac ACLs.
+            if (!inspect_all && (attribute.name_utf8.starts_with("com.apfsaccess.windows.") ||
+                attribute.name_utf8 == "com.apple.system.Security" || attribute.name_utf8 == "com.apple.decmpfs" ||
+                attribute.name_utf8.starts_with("com.apple.fs.") ||
+                (attribute.flags & apfsaccess::rw::kAppleXattrFileSystemOwned) ||
+                (compressed && attribute.name_utf8 == "com.apple.ResourceFork"))) continue;
+            OpenContext probe;
+            probe.node = o->node; probe.native_xattr_name = attribute.name_utf8;
+            probe.native_xattr = std::make_shared<NativeXattrStreamState>();
+            const auto name = NativeXattrStreamName(attribute.name_utf8);
+            std::string decoded;
+            if (DecodeNativeXattrStream(name, decoded) != 1) return STATUS_NOT_SUPPORTED;
+            std::vector<std::byte> ignored;
+            std::uint64_t size = 0;
+            const auto status = NativeXattrValue(c, &probe, 0, 0, ignored, size);
+            if (!NT_SUCCESS(status)) return status;
+            native_streams.emplace_back(name, size);
+        }
+    }
+#endif
+    std::lock_guard<std::mutex> stream_lock(c->mutex);
+    if (HasUnrestoredHydrationLocked(c, o->node)) return STATUS_IO_DEVICE_ERROR;
 
     const auto add_stream_info = [&](FSP_FSCTL_STREAM_INFO* stream_info) -> bool
     {
@@ -18172,7 +21685,10 @@ NTSTATUS CB_GetStreamInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buffer, ULONG le
 
     const auto add_named_stream = [&](const std::wstring& stream_name, std::uint64_t stream_size) -> bool
     {
-        const auto name_bytes = stream_name.size() * sizeof(WCHAR);
+        // WinFsp adds the leading colon and :$DATA when constructing the
+        // Windows FILE_STREAM_INFORMATION result from this callback buffer.
+        const auto bare_name = StreamNameForWin32Path(stream_name);
+        const auto name_bytes = bare_name.size() * sizeof(WCHAR);
         const auto entry_size = sizeof(FSP_FSCTL_STREAM_INFO) + name_bytes;
         if (entry_size > static_cast<std::size_t>(std::numeric_limits<UINT16>::max()))
         {
@@ -18186,26 +21702,28 @@ NTSTATUS CB_GetStreamInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buffer, ULONG le
         stream_info->StreamAllocationSize = ((stream_size + 4095ull) / 4096ull) * 4096ull;
         if (name_bytes > 0)
         {
-            std::memcpy(stream_info->StreamNameBuf, stream_name.data(), name_bytes);
+            std::memcpy(stream_info->StreamNameBuf, bare_name.data(), name_bytes);
         }
 
         return add_stream_info(stream_info);
     };
 
-    if (!add_named_stream(L"::$DATA", o->node->file_size))
+    if (!o->node->is_directory && !add_named_stream(L"::$DATA", o->node->file_size))
     {
         return STATUS_BUFFER_OVERFLOW;
     }
 
-    std::vector<std::pair<std::wstring, std::uint64_t>> streams;
+    std::vector<std::pair<std::wstring, std::uint64_t>> streams = std::move(native_streams);
     {
-        std::lock_guard<std::mutex> lock(c->mutex);
-        const auto stream_bucket = c->named_stream_sizes.find(NodePathKey(c, *o->node));
+        const auto stream_bucket = c->named_stream_sizes.find(HydrationStateKey(c, *o->node));
         if (stream_bucket != c->named_stream_sizes.end())
         {
             for (const auto& [stream_name, stream_size] : stream_bucket->second)
             {
-                streams.emplace_back(CanonicalStreamName(stream_name), stream_size);
+                std::string reserved;
+                const auto canonical = CanonicalStreamName(stream_name);
+                if (DecodeNativeXattrStream(canonical, reserved) == 0)
+                    streams.emplace_back(canonical, stream_size);
             }
         }
     }
@@ -18246,14 +21764,24 @@ void ConfigureVolumeParamsForExplorer(MountContext& ctx, const FILETIME& now, FS
     vp.SecurityTimeoutValid = 1;
     vp.SecurityTimeout = 2000;
     vp.StreamInfoTimeoutValid = 1;
-    vp.StreamInfoTimeout = 2000;
+    // Native protocol inspection and ordinary CopyFile lists differ by handle.
+    // WinFsp shares this cache with the base file, so these lists cannot cache.
+    vp.StreamInfoTimeout = 0;
     const auto name_policy = apfsaccess::rw::ApfsNamePolicy::FromIncompatibleFeatures(
         ctx.args.incompatible_features);
     vp.CaseSensitiveSearch =
         name_policy.case_mode == apfsaccess::rw::ApfsCaseMode::Sensitive ? 1 : 0;
     vp.CasePreservedNames = 1;
     vp.UnicodeOnDisk = 1;
+    vp.ReparsePoints = 1;
     vp.PersistentAcls = 0;
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    {
+        std::lock_guard<std::mutex> lock(ctx.metadata_mutex);
+        vp.PersistentAcls = !ctx.overlay_write_enabled && ctx.metadata_store &&
+            ctx.metadata_store->AuthoritativeAppleCheckpointView() != nullptr;
+    }
+#endif
     vp.NamedStreams = 1;
     vp.SupportsPosixUnlinkRename = 1;
     vp.ReadOnlyVolume = IsMutationWriteEnabled(&ctx) ? 0 : 1;
@@ -18264,7 +21792,307 @@ void ConfigureVolumeParamsForExplorer(MountContext& ctx, const FILETIME& now, FS
     wcscpy_s(vp.FileSystemName, sizeof(vp.FileSystemName) / sizeof(WCHAR), L"APFS");
 }
 
-NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UINT32 granted_access, UINT32, PSECURITY_DESCRIPTOR, UINT64, PVOID* out_ctx, FSP_FSCTL_FILE_INFO* info)
+NTSTATUS PrepareWindowsAttributeUpdate(MountContext* c, const std::shared_ptr<Node>& node,
+    UINT32 requested, bool replace, UINT32& value, bool& changed)
+{
+    constexpr UINT32 accepted = kPersistedWindowsAttributeMask | FILE_ATTRIBUTE_NORMAL |
+        FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT;
+    if ((requested & ~accepted) != 0) return STATUS_NOT_SUPPORTED;
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        const auto current = VisibleWindowsAttributes(*node);
+        value = requested & kPersistedWindowsAttributeMask;
+        if (!replace) value |= current;
+        changed = current != value;
+    }
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (changed && IsNativeWriteEnabled(c) && c->metadata_store && node->object_id != 0)
+    {
+        std::lock_guard<std::mutex> lock(c->metadata_mutex);
+        std::optional<UINT32> previous;
+        if (!ReadWindowsAttributes(c->metadata_store->LookupWorkingExtendedAttribute(
+                node->object_id, kWindowsAttributesName), previous)) return STATUS_NOT_SUPPORTED;
+    }
+#endif
+    return STATUS_SUCCESS;
+}
+
+#ifdef APFSACCESS_HAS_RW_ENGINE
+std::array<std::byte, 8> EncodeWindowsAttributes(UINT32 value)
+{
+    std::array<std::byte, 8> bytes{std::byte{'D'}, std::byte{'O'}, std::byte{'S'}, std::byte{1}};
+    for (unsigned i = 0; i != 4; ++i) bytes[4 + i] = static_cast<std::byte>((value >> (8 * i)) & 0xff);
+    return bytes;
+}
+
+std::size_t WindowsAttributeBatchLimit(MountContext* c, std::size_t added)
+{
+    if (IsManifestSession(c)) return ManifestQueuedRequestCount(c) + added;
+    std::lock_guard<std::mutex> lock(c->metadata_mutex);
+    return (c->metadata_store ? c->metadata_store->PendingMutationCount() : 0) + added;
+}
+
+bool StageWindowsAttributes(MountContext* c, const std::wstring& path, UINT32 value,
+    std::size_t batch_limit, apfsaccess::rw::MetadataStore::PayloadIdentity& identity, bool& staged,
+    bool start_batch = true)
+{
+    const auto payload = EncodeWindowsAttributes(value);
+    return RecordNativeMutationBestEffort(c,
+        apfsaccess::rw::MetadataStore::MutationOperation::SetExtendedAttribute,
+        path, kWindowsAttributesNameWide, 0, payload.size(), false, 0,
+        &identity, &staged, nullptr, batch_limit, payload, start_batch);
+}
+
+bool JournalWindowsAttributes(MountContext* c, const std::wstring& path, UINT32 value,
+    const apfsaccess::rw::MetadataStore::PayloadIdentity& identity)
+{
+    const auto payload = EncodeWindowsAttributes(value);
+    return RecordMutationBestEffort(c,
+        apfsaccess::rw::TransactionManager::MutationKind::SetExtendedAttribute,
+        path, kWindowsAttributesNameWide, 0, payload.size(), false, 0, 0, &identity, nullptr, payload);
+}
+
+std::vector<std::byte> EncodeContentTimes(FILETIME timestamp)
+{
+    apfsaccess::rw::InodeMetadataPatch patch;
+    patch.mask = apfsaccess::rw::InodeMetadataPatch::ModificationTime | apfsaccess::rw::InodeMetadataPatch::ChangeTime;
+    patch.modification_time_utc = patch.change_time_utc = ToFileTimeValue(timestamp);
+    std::vector<std::byte> payload;
+    (void)apfsaccess::rw::EncodeInodeMetadataPatch(patch, payload);
+    return payload;
+}
+
+bool ShouldCaptureNativeContentTimes(MountContext* c)
+{
+    if (!IsNativeWriteEnabled(c) || !c->metadata_store) return false;
+    std::lock_guard<std::mutex> lock(c->metadata_mutex);
+    return c->metadata_store->AuthoritativeAppleCheckpointView() != nullptr;
+}
+
+bool StageContentTimes(MountContext* c, const std::wstring& path, FILETIME timestamp,
+    std::size_t batch_limit, apfsaccess::rw::MetadataStore::PayloadIdentity& identity, bool& staged, bool start_batch)
+{
+    const auto payload = EncodeContentTimes(timestamp);
+    return RecordNativeMutationBestEffort(c,
+        apfsaccess::rw::MetadataStore::MutationOperation::SetInodeMetadata,
+        path, L"", 0, payload.size(), false, 0, &identity, &staged, nullptr, batch_limit, payload, start_batch);
+}
+
+bool JournalContentTimes(MountContext* c, const std::wstring& path, FILETIME timestamp,
+    const apfsaccess::rw::MetadataStore::PayloadIdentity& identity)
+{
+    const auto payload = EncodeContentTimes(timestamp);
+    return RecordMutationBestEffort(c,
+        apfsaccess::rw::TransactionManager::MutationKind::SetInodeMetadata,
+        path, L"", 0, payload.size(), false, 0, 0, &identity, nullptr, payload);
+}
+#endif
+
+bool ValidRequestedInodeTimes(const InodeTimes& times)
+{
+    constexpr std::uint64_t epoch = 116444736000000000ULL;
+    constexpr std::uint64_t maximum = epoch + (std::numeric_limits<std::uint64_t>::max)() / 100;
+    const auto valid = [](std::uint64_t value) { return value == 0 || (value >= epoch && value <= maximum); };
+    return valid(times.create_time_utc) && valid(times.modification_time_utc) &&
+        valid(times.change_time_utc) && valid(times.access_time_utc);
+}
+
+#include "DeferredAccessTimes.h"
+
+NTSTATUS UpdateWindowsBasicMetadata(MountContext* c, OpenContext* o, UINT32 attributes,
+    bool replace_attributes, const InodeTimes& requested, FSP_FSCTL_FILE_INFO* info)
+{
+    if (!ValidRequestedInodeTimes(requested)) return STATUS_INVALID_PARAMETER;
+    auto changes = requested;
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        const auto current = VisibleInodeTimes(*o->node);
+        if (changes.create_time_utc == current.create_time_utc) changes.create_time_utc = 0;
+        if (changes.modification_time_utc == current.modification_time_utc) changes.modification_time_utc = 0;
+        if (changes.change_time_utc == current.change_time_utc) changes.change_time_utc = 0;
+        if (changes.access_time_utc == current.access_time_utc) changes.access_time_utc = 0;
+    }
+    const auto fill_info = [&]
+    {
+        if (!info) return;
+        FillInfo(*o->node, ReportsReadOnly(c), info);
+        if (o->named_stream)
+        {
+            info->FileSize = o->stream_size;
+            info->AllocationSize = ((o->stream_size + 4095ull) / 4096ull) * 4096ull;
+        }
+    };
+    const bool has_times = changes != InodeTimes{};
+    UINT32 windows_attributes = 0;
+    bool attributes_changed = false;
+    if (attributes != INVALID_FILE_ATTRIBUTES)
+    {
+        const auto status = PrepareWindowsAttributeUpdate(c, o->node,
+            attributes, replace_attributes, windows_attributes, attributes_changed);
+        if (!NT_SUCCESS(status)) return status;
+    }
+    if (!has_times && !attributes_changed)
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        fill_info();
+        return STATUS_SUCCESS;
+    }
+    const auto path = SnapshotMutationPathForNode(c, *o->node);
+    const bool detached = path.empty() && IsDetachedPayloadNode(c, *o->node);
+    if (path.empty() && !detached) return STATUS_FILE_DELETED;
+    std::uint64_t generation = 0;
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    using Patch = apfsaccess::rw::InodeMetadataPatch;
+    Patch patch;
+    patch.create_time_utc = changes.create_time_utc;
+    patch.modification_time_utc = changes.modification_time_utc;
+    patch.change_time_utc = changes.change_time_utc;
+    patch.access_time_utc = changes.access_time_utc;
+    if (patch.create_time_utc) patch.mask |= Patch::CreateTime;
+    if (patch.modification_time_utc) patch.mask |= Patch::ModificationTime;
+    if (patch.change_time_utc) patch.mask |= Patch::ChangeTime;
+    if (patch.access_time_utc) patch.mask |= Patch::AccessTime;
+    std::vector<std::byte> payload;
+    if (has_times && !apfsaccess::rw::EncodeInodeMetadataPatch(patch, payload)) return STATUS_INVALID_PARAMETER;
+    apfsaccess::rw::MetadataStore::PayloadIdentity time_identity{}, attribute_identity{};
+    if (!detached && IsNativeWriteEnabled(c))
+    {
+        bool legacy_modification_time = false;
+        if (has_times && c->metadata_store && !ShouldCaptureNativeContentTimes(c))
+        {
+            bool absent_clean_target = false;
+            {
+                std::lock_guard<std::mutex> lock(c->metadata_mutex);
+                absent_clean_target = !attributes_changed && c->metadata_store->PendingMutationCount() == 0 &&
+                    !c->metadata_store->LookupWorkingInodeByPath(path) &&
+                    !c->metadata_store->LookupCommittedInodeByPath(path) &&
+                    (o->node->object_id == 0 || !c->metadata_store->LookupCommittedInodeByObjectId(o->node->object_id));
+            }
+            if (absent_clean_target)
+            {
+                std::lock_guard<std::mutex> lock(c->mutex);
+                fill_info();
+                return STATUS_SUCCESS;
+            }
+            legacy_modification_time = !attributes_changed && patch.mask == Patch::ModificationTime &&
+                c->metadata_store->IsFixtureCompatibilityPathActive();
+            if (!legacy_modification_time) return STATUS_NOT_SUPPORTED;
+        }
+        const auto time_length = legacy_modification_time ? 0 : payload.size();
+        const auto scalar_time = legacy_modification_time ? changes.modification_time_utc : 0;
+        if (legacy_modification_time) payload.clear();
+        const auto batch_limit = WindowsAttributeBatchLimit(c, (attributes_changed ? 1 : 0) + (has_times ? 1 : 0));
+        bool attribute_staged = false, time_staged = false;
+        bool recorded = !attributes_changed || StageWindowsAttributes(c, path, windows_attributes,
+            batch_limit, attribute_identity, attribute_staged);
+        if (has_times)
+            recorded = recorded && RecordNativeMutationBestEffort(c,
+                legacy_modification_time ? apfsaccess::rw::MetadataStore::MutationOperation::SetBasicInfo :
+                    apfsaccess::rw::MetadataStore::MutationOperation::SetInodeMetadata,
+                path, L"", 0, time_length, false, scalar_time, &time_identity, &time_staged,
+                nullptr, batch_limit, payload, !attributes_changed);
+        if (recorded && attributes_changed && (!has_times || !IsManifestSession(c)))
+            recorded = JournalWindowsAttributes(c, path, windows_attributes, attribute_identity);
+        if (recorded && has_times)
+            recorded = RecordMutationBestEffort(c,
+                legacy_modification_time ? apfsaccess::rw::TransactionManager::MutationKind::SetBasicInfo :
+                    apfsaccess::rw::TransactionManager::MutationKind::SetInodeMetadata,
+                path, L"", 0, time_length, false, 0, scalar_time, &time_identity, nullptr, payload);
+        if (!recorded && (attribute_staged || time_staged || attributes_changed ||
+                !IsBenignStaleDeletedSetBasicInfoFailure(c, o->node)))
+            return BlockNativeMutationAfterStagingFailure(c, L"SetInodeMetadata", attribute_staged || time_staged);
+        generation = (std::max)(time_identity.generation, attribute_identity.generation);
+    }
+#endif
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        generation = (std::max)(generation, c->namespace_checkpoint_xid);
+#endif
+        if (has_times)
+        {
+            auto times = VisibleInodeTimes(*o->node);
+            if (changes.create_time_utc) times.create_time_utc = changes.create_time_utc;
+            if (changes.modification_time_utc) times.modification_time_utc = changes.modification_time_utc;
+            if (changes.change_time_utc) times.change_time_utc = changes.change_time_utc;
+            if (changes.access_time_utc) times.access_time_utc = changes.access_time_utc;
+            o->node->times_generation = (std::max)(o->node->times_generation, generation);
+            SetVisiblePayloadMetadataLocked(o->node, o->node->file_size, times);
+            if (o->node->shared_payload)
+                o->node->shared_payload->visible_generation = (std::max)(
+                    o->node->shared_payload->visible_generation.value_or(0), generation);
+        }
+        if (attributes_changed)
+            SetVisibleWindowsAttributesLocked(o->node, windows_attributes,
+                (std::max)(generation, o->node->attributes_generation));
+        fill_info();
+    }
+    MarkOpenContextMutation(o);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS UpdateNamedStreamContentTimes(MountContext* c, OpenContext* o, FSP_FSCTL_FILE_INFO* info)
+{
+    const auto timestamp = UtcNow();
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (IsNativeWriteEnabled(c) && !ShouldCaptureNativeContentTimes(c))
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        SetVisiblePayloadMetadataLocked(o->node, o->node->file_size, timestamp);
+        if (info)
+        {
+            FillInfo(*o->node, ReportsReadOnly(c), info);
+            info->FileSize = o->stream_size;
+            info->AllocationSize = ((o->stream_size + 4095ull) / 4096ull) * 4096ull;
+        }
+        MarkOpenContextMutation(o);
+        return STATUS_SUCCESS;
+    }
+#endif
+    const auto now = ToFileTimeValue(timestamp);
+    const auto status = UpdateWindowsBasicMetadata(c, o, INVALID_FILE_ATTRIBUTES, false, {0, now, now, 0}, info);
+    if (NT_SUCCESS(status)) MarkOpenContextMutation(o);
+    return status;
+}
+
+NTSTATUS NormalizeFileAllocationRequest(MountContext* c, std::uint64_t requested, std::uint64_t& aligned)
+{
+    std::uint64_t unit = 4096;
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (IsNativeWriteEnabled(c))
+    {
+        std::lock_guard<std::mutex> lock(c->metadata_mutex);
+        if (!c->metadata_store || !c->metadata_store->SupportsFileAllocationSize()) return STATUS_NOT_SUPPORTED;
+        unit = c->metadata_store->BlockSizeBytes().value_or(0);
+    }
+#endif
+    const auto maximum = static_cast<std::uint64_t>(INT64_MAX);
+    if (unit == 0 || requested > maximum || requested > maximum - (unit - 1)) return STATUS_INVALID_PARAMETER;
+    aligned = ((requested + unit - 1) / unit) * unit;
+    return STATUS_SUCCESS;
+}
+
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+bool g_cached_allocation_fail_for_test = false;
+unsigned g_cached_allocation_failure_count_for_test = 0;
+#endif
+
+bool SetCachedAllocationSize(HANDLE file, std::uint64_t size)
+{
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+    if (g_cached_allocation_fail_for_test)
+    {
+        ++g_cached_allocation_failure_count_for_test;
+        SetLastError(ERROR_DISK_FULL);
+        return false;
+    }
+#endif
+    FILE_ALLOCATION_INFO allocation{};
+    allocation.AllocationSize.QuadPart = static_cast<LONGLONG>(size);
+    return SetFileInformationByHandle(file, FileAllocationInfo, &allocation, sizeof(allocation)) != FALSE;
+}
+
+NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UINT32 granted_access, UINT32 attributes, PSECURITY_DESCRIPTOR security_descriptor, UINT64 allocation_size, PVOID* out_ctx, FSP_FSCTL_FILE_INFO* info)
 {
     auto* c = Ctx(fs);
     ScopedCallbackActivity callback_scope(c, "Create");
@@ -18280,6 +22108,8 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
         return STATUS_VOLUME_DISMOUNTED;
     }
     MutationCallbackScope mutation_scope(c);
+    const auto atime_status = DrainDeferredAccessTimes(c);
+    if (!NT_SUCCESS(atime_status)) return atime_status;
     if (!IsMutationWriteEnabled(c))
     {
         return HandleMutationWriteDisabled(c, L"Create");
@@ -18291,8 +22121,15 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
 
     auto path = NormalizePath(file_name ? std::wstring(file_name) : L"\\");
     auto stream_path = SplitNamedStreamPathNormalized(path);
+    std::string native_name;
+    if (DecodeNativeXattrStream(stream_path.stream_name, native_name) != 0)
+    {
+        if (security_descriptor) return STATUS_INVALID_PARAMETER;
+        return OpenNativeXattr(c, stream_path, create_options, granted_access, true, allocation_size, out_ctx, info);
+    }
     if (stream_path.is_named_stream)
     {
+        if (security_descriptor) return STATUS_INVALID_PARAMETER;
         if (!IsValidNormalizedWin32PathForMutation(stream_path.base_path))
         {
             return STATUS_OBJECT_NAME_INVALID;
@@ -18315,7 +22152,12 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
         {
             return STATUS_FILE_IS_A_DIRECTORY;
         }
-        if (!EnsureHydrationSidecarExistsForNamedStream(c, base_node))
+        if (base_node->node_kind != NodeKind::RegularFile)
+        {
+            return STATUS_INVALID_DEVICE_REQUEST;
+        }
+        std::lock_guard<std::mutex> stream_lock(c->mutex);
+        if (!EnsureHydrationSidecarExistsForNamedStreamLocked(c, base_node))
         {
             return STATUS_UNSUCCESSFUL;
         }
@@ -18330,11 +22172,18 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
         o->named_stream = true;
         o->stream_name = stream_path.stream_name;
         InitializeOpenAccess(o, granted_access);
+        if ((create_options & FILE_DELETE_ON_CLOSE) &&
+            (!o->allow_delete || (VisibleWindowsAttributes(*base_node) & FILE_ATTRIBUTE_READONLY)))
+        {
+            const auto status = o->allow_delete ? STATUS_CANNOT_DELETE : STATUS_ACCESS_DENIED;
+            delete o;
+            return status;
+        }
         o->write_open = true;
         const auto desired_access = ResolveHydrationDesiredAccess(
             IsMutationWriteEnabled(c),
             granted_access,
-            true);
+            true) | FILE_READ_ATTRIBUTES | (o->allow_delete ? DELETE : 0);
         const auto stream_storage_path = HydrationStreamPath(c, *base_node, stream_path.stream_name);
         o->file = CreateFileW(
             stream_storage_path.c_str(),
@@ -18346,15 +22195,26 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
             nullptr);
         if (o->file == INVALID_HANDLE_VALUE)
         {
+            const auto status = LocalNamedStreamError(GetLastError());
             delete o;
-            return STATUS_UNSUCCESSFUL;
+            return status;
+        }
+
+        if (create_options & FILE_DELETE_ON_CLOSE)
+        {
+            const auto status = SetLocalNamedStreamDeleteLocked(c, o, true);
+            if (!NT_SUCCESS(status))
+            {
+                CloseHandle(o->file);
+                delete o;
+                return status;
+            }
         }
 
         {
-            std::lock_guard<std::mutex> lock(c->mutex);
             AcquireOpenContextAccountingLocked(c, base_node, o);
             o->stream_size = RememberNamedStreamSizeFromHandleLocked(c, base_node, stream_path.stream_name, o->file);
-            FillInfo(*base_node, !IsMutationWriteEnabled(c), info);
+            FillInfo(*base_node, ReportsReadOnly(c), info);
         }
 
         *out_ctx = o;
@@ -18369,6 +22229,14 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
     if (!IsValidNormalizedWin32PathForMutation(path))
     {
         return STATUS_OBJECT_NAME_INVALID;
+    }
+
+    std::vector<std::byte> creation_security;
+    if (IsNativeWriteEnabled(c) && security_descriptor)
+    {
+        // WinFsp has already computed the inherited, self-relative descriptor.
+        const auto status = EncodeWindowsSecurity(security_descriptor, creation_security);
+        if (!NT_SUCCESS(status)) return status;
     }
 
     // A new namespace entry has no deferred-create rollback plan. Drain any
@@ -18414,6 +22282,31 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
 
     const bool request_directory = (create_options & FILE_DIRECTORY_FILE) != 0;
     const bool request_non_directory = (create_options & FILE_NON_DIRECTORY_FILE) != 0;
+    const bool reserve_allocation = !request_directory && allocation_size != 0;
+    if (reserve_allocation)
+    {
+        const auto status = NormalizeFileAllocationRequest(c, allocation_size, allocation_size);
+        if (!NT_SUCCESS(status)) return status;
+    }
+    if ((attributes & ~(kPersistedWindowsAttributeMask | FILE_ATTRIBUTE_NORMAL |
+            FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) return STATUS_NOT_SUPPORTED;
+    const UINT32 windows_attributes = (attributes & kPersistedWindowsAttributeMask) |
+        (request_directory ? 0u : FILE_ATTRIBUTE_ARCHIVE);
+    const bool attributes_changed = windows_attributes != (request_directory ? 0u : FILE_ATTRIBUTE_ARCHIVE);
+    const auto creation_timestamp = UtcNow();
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    const bool capture_creation_times = ShouldCaptureNativeContentTimes(c);
+    std::vector<std::byte> creation_times_payload;
+    if (capture_creation_times)
+    {
+        using Patch = apfsaccess::rw::InodeMetadataPatch;
+        Patch patch;
+        patch.mask = Patch::CreateTime | Patch::ModificationTime | Patch::ChangeTime | Patch::AccessTime;
+        patch.create_time_utc = patch.modification_time_utc = patch.change_time_utc = patch.access_time_utc =
+            ToFileTimeValue(creation_timestamp);
+        if (!apfsaccess::rw::EncodeInodeMetadataPatch(patch, creation_times_payload)) return STATUS_INVALID_PARAMETER;
+    }
+#endif
 
     std::shared_ptr<Node> node;
     {
@@ -18442,11 +22335,11 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
             {
                 return STATUS_DELETE_PENDING;
             }
-            if (request_directory && !existing->is_directory)
+            if (request_directory && !IsWindowsDirectory(*existing))
             {
                 return STATUS_NOT_A_DIRECTORY;
             }
-            if (request_non_directory && existing->is_directory)
+            if (request_non_directory && IsWindowsDirectory(*existing))
             {
                 return STATUS_FILE_IS_A_DIRECTORY;
             }
@@ -18456,11 +22349,21 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
         node = std::make_shared<Node>();
         SetNodePathNormalized(c, *node, path);
         node->apfs_path.clear();
+        const auto reported_unit = CaptureReportedVolumeInfo(*c).allocation_unit_bytes;
+        node->allocation_unit_bytes = reported_unit != 0 ? reported_unit : 4096;
         node->hydration_key = node->path_key;
         node->is_directory = request_directory;
+        node->node_kind = request_directory ? NodeKind::Directory : NodeKind::RegularFile;
         node->file_size = 0;
-        node->timestamp = UtcNow();
+        node->timestamp = creation_timestamp;
         node->loaded = request_directory;
+        if (!creation_security.empty())
+        {
+            auto security = std::make_shared<NativeInodeSecurity>();
+            security->windows_security_flags = 2;
+            security->windows_security = creation_security;
+            node->native_security = std::move(security);
+        }
         EmplaceNodeLocked(c, node);
         AddChildName(*parent_node, name);
     }
@@ -18508,11 +22411,14 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
                     nullptr);
             }
         }
-        if (o->file == INVALID_HANDLE_VALUE)
+        if (o->file == INVALID_HANDLE_VALUE || (reserve_allocation && !SetCachedAllocationSize(o->file, allocation_size)))
         {
+            if (o->file != INVALID_HANDLE_VALUE) CloseHandle(o->file);
             delete o;
             std::lock_guard<std::mutex> lock(c->mutex);
             RemoveChildName(*parent_node, name);
+            std::error_code ec;
+            std::filesystem::remove(HydrationPath(c, *node), ec);
             EraseIndexedNodeLocked(c, node);
             return STATUS_UNSUCCESSFUL;
         }
@@ -18526,8 +22432,15 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
     apfsaccess::rw::MetadataStore::PayloadIdentity staged_create_identity{};
     bool native_create_metadata_staged = false;
     bool native_create_journaled = true;
+    apfsaccess::rw::MetadataStore::PayloadIdentity attribute_identity{};
+    apfsaccess::rw::MetadataStore::PayloadIdentity creation_times_identity{};
+    apfsaccess::rw::MetadataStore::PayloadIdentity allocation_identity{};
+    apfsaccess::rw::MetadataStore::PayloadIdentity security_identity{};
     if (IsNativeWriteEnabled(c))
     {
+        const auto batch_limit = attributes_changed || capture_creation_times || reserve_allocation || !creation_security.empty()
+            ? WindowsAttributeBatchLimit(c, 1 + (attributes_changed ? 1 : 0) + (capture_creation_times ? 1 : 0) +
+                (reserve_allocation ? 1 : 0) + (!creation_security.empty() ? 1 : 0)) : 0;
         const auto native_create_operation = request_directory
             ? apfsaccess::rw::MetadataStore::MutationOperation::CreateDirectory
             : apfsaccess::rw::MetadataStore::MutationOperation::CreateFile;
@@ -18541,9 +22454,48 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
             false,
             0,
             &staged_create_identity,
-            &native_create_metadata_staged);
+            &native_create_metadata_staged, nullptr, batch_limit, {},
+            attributes_changed || capture_creation_times || reserve_allocation || !creation_security.empty());
+        if (native_create_journaled && !creation_security.empty())
+        {
+            bool security_staged = false;
+            native_create_journaled = RecordNativeMutationBestEffort(c,
+                apfsaccess::rw::MetadataStore::MutationOperation::SetExtendedAttribute,
+                path, kWindowsSecurityNameWide, 0, creation_security.size(), false, 0, &security_identity,
+                &security_staged, nullptr, batch_limit, creation_security, false);
+            native_create_metadata_staged = native_create_metadata_staged || security_staged;
+        }
+        if (native_create_journaled && attributes_changed)
+        {
+            bool attribute_staged = false;
+            native_create_journaled = StageWindowsAttributes(c, path, windows_attributes,
+                batch_limit, attribute_identity, attribute_staged, false);
+            native_create_metadata_staged = native_create_metadata_staged || attribute_staged;
+        }
+        if (native_create_journaled && capture_creation_times)
+        {
+            bool times_staged = false;
+            native_create_journaled = RecordNativeMutationBestEffort(c,
+                apfsaccess::rw::MetadataStore::MutationOperation::SetInodeMetadata,
+                path, L"", 0, creation_times_payload.size(), false, 0, &creation_times_identity,
+                &times_staged, nullptr, batch_limit, creation_times_payload);
+            native_create_metadata_staged = native_create_metadata_staged || times_staged;
+        }
+        if (native_create_journaled && reserve_allocation)
+        {
+            bool allocation_staged = false;
+            native_create_journaled = RecordNativeMutationBestEffort(c,
+                apfsaccess::rw::MetadataStore::MutationOperation::SetAllocationSize,
+                path, L"", 0, allocation_size, false, 0, &allocation_identity, &allocation_staged, nullptr, batch_limit);
+            native_create_metadata_staged = native_create_metadata_staged || allocation_staged;
+        }
         if (native_create_journaled)
         {
+            if (staged_create_identity.object_id != 0)
+            {
+                std::lock_guard<std::mutex> lock(c->mutex);
+                node->object_id = staged_create_identity.object_id;
+            }
             native_create_journaled = RecordMutationBestEffort(
                 c,
                 request_directory
@@ -18557,6 +22509,25 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
                 0,
                 0,
                 &staged_create_identity);
+            if (native_create_journaled && attributes_changed && !IsManifestSession(c))
+                native_create_journaled = JournalWindowsAttributes(c, path, windows_attributes, attribute_identity);
+            if (native_create_journaled && capture_creation_times && !IsManifestSession(c))
+                native_create_journaled = RecordMutationBestEffort(c,
+                    apfsaccess::rw::TransactionManager::MutationKind::SetInodeMetadata,
+                    path, L"", 0, creation_times_payload.size(), false, 0, 0,
+                    &creation_times_identity, nullptr, creation_times_payload);
+            if (native_create_journaled && reserve_allocation && !IsManifestSession(c))
+                native_create_journaled = RecordMutationBestEffort(c,
+                    apfsaccess::rw::TransactionManager::MutationKind::SetAllocationSize,
+                    path, L"", 0, allocation_size, false, 0, 0, &allocation_identity);
+            if (native_create_journaled && !creation_security.empty() && !IsManifestSession(c))
+                native_create_journaled = RecordMutationBestEffort(c,
+                    apfsaccess::rw::TransactionManager::MutationKind::SetExtendedAttribute,
+                    path, kWindowsSecurityNameWide, 0, creation_security.size(), false, 0, 0,
+                    &security_identity, nullptr, creation_security);
+            if (native_create_journaled && !creation_security.empty())
+                native_create_journaled = NT_SUCCESS(DrainNativeMutationsByPolicy(c, L"CreateSecurity", false, true)) &&
+                    FinalizeMutationJournalBestEffort(c, L"CreateSecurity");
         }
     }
     if (!native_create_journaled)
@@ -18582,9 +22553,35 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
     {
         std::lock_guard<std::mutex> lock(c->mutex);
         AcquireOpenContextAccountingLocked(c, node, o);
+        if (reserve_allocation) SetVisibleAllocationSizeLocked(node, allocation_size);
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        if (!creation_security.empty())
+        {
+            const auto current = VisibleNativeSecurity(*node);
+            auto security = std::make_shared<NativeInodeSecurity>(current ? *current : NativeInodeSecurity{});
+            security->windows_security_flags = apfsaccess::rw::kAppleXattrDataEmbedded;
+            security->windows_security = std::move(creation_security);
+            SetVisibleNativeSecurityLocked(node, security,
+                (std::max)({node->security_generation, security_identity.generation, c->namespace_checkpoint_xid}), true);
+        }
+        if (capture_creation_times)
+        {
+            const auto time = ToFileTimeValue(creation_timestamp);
+            node->times_generation = (std::max)({node->times_generation,
+                creation_times_identity.generation, c->namespace_checkpoint_xid});
+            SetVisiblePayloadMetadataLocked(node, node->file_size, InodeTimes{time, time, time, time});
+        }
+#endif
+        if (attributes_changed)
+            SetVisibleWindowsAttributesLocked(node, windows_attributes,
+#ifdef APFSACCESS_HAS_RW_ENGINE
+                (std::max)(attribute_identity.generation, c->namespace_checkpoint_xid));
+#else
+                node->attributes_generation);
+#endif
     }
 
-    FillInfo(*node, !IsMutationWriteEnabled(c), info);
+    FillInfo(*node, ReportsReadOnly(c), info);
     *out_ctx = o;
     MarkOpenContextMutation(o);
 #ifdef APFSACCESS_HAS_RW_ENGINE
@@ -18608,7 +22605,9 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
     return STATUS_SUCCESS;
 }
 
-NTSTATUS CB_Overwrite(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, BOOLEAN, UINT64 allocation_size, FSP_FSCTL_FILE_INFO* info)
+#include "NativeSparseWrite.h"
+
+NTSTATUS CB_Overwrite(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32 attributes, BOOLEAN replace_attributes, UINT64 allocation_size, FSP_FSCTL_FILE_INFO* info)
 {
     auto* c = Ctx(fs);
     ScopedCallbackActivity callback_scope(c, "Overwrite");
@@ -18617,6 +22616,10 @@ NTSTATUS CB_Overwrite(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, BOOLEAN, UINT64 al
     if (!c || !o || !o->node || !info)
     {
         return STATUS_INVALID_PARAMETER;
+    }
+    if (!o->node->is_directory && o->node->node_kind != NodeKind::RegularFile)
+    {
+        return STATUS_INVALID_DEVICE_REQUEST;
     }
     ExternalMutationRequestScope mutation_request_scope(c);
     if (!mutation_request_scope.Acquired())
@@ -18628,64 +22631,194 @@ NTSTATUS CB_Overwrite(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, BOOLEAN, UINT64 al
     {
         return HandleMutationWriteDisabled(c, L"Overwrite");
     }
-    if (o->node->is_directory || o->file == INVALID_HANDLE_VALUE)
+    if (o->node->is_directory && !o->native_xattr)
     {
         return STATUS_FILE_IS_A_DIRECTORY;
     }
-    if (!o->allow_set_file_size)
+    const bool disposition_authorized = o->pending_overwrite_supersede &&
+        *o->pending_overwrite_supersede == (replace_attributes != FALSE);
+    if (!o->allow_set_file_size && !disposition_authorized)
     {
         return STATUS_ACCESS_DENIED;
     }
+    if (HasUnsupportedDefaultContentTransform(c, o->node, o->named_stream)) return STATUS_NOT_SUPPORTED;
+    o->pending_overwrite_supersede.reset();
+    if (o->native_xattr)
+    {
+        const auto atime_status = DrainDeferredAccessTimes(c);
+        if (!NT_SUCCESS(atime_status)) return atime_status;
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        if (allocation_size > apfsaccess::rw::WriteAheadLog::MaxExtendedAttributePayloadBytes) return STATUS_NOT_SUPPORTED;
+#endif
+        return WriteNativeXattr(c, o, nullptr, 0, 0, FALSE, FALSE, nullptr, info, true);
+    }
+    UINT32 windows_attributes = 0;
+    bool attributes_changed = false;
+    const auto attribute_status = PrepareWindowsAttributeUpdate(c, o->node,
+        attributes | FILE_ATTRIBUTE_ARCHIVE, replace_attributes != FALSE, windows_attributes, attributes_changed);
+    if (!NT_SUCCESS(attribute_status)) return attribute_status;
+    const auto mutation_path = SnapshotMutationPathForNode(c, *o->node);
+    const bool detached_payload = mutation_path.empty() && IsDetachedPayloadNode(c, *o->node);
+    if (mutation_path.empty() && !detached_payload) return STATUS_FILE_DELETED;
+    const bool reserve_allocation = !o->named_stream && (allocation_size != 0 ||
+        (o->node->file_size == 0 && o->node->allocation_size.value_or(0) != 0));
+    if (reserve_allocation)
+    {
+        const auto status = NormalizeFileAllocationRequest(c, allocation_size, allocation_size);
+        if (!NT_SUCCESS(status)) return status;
+    }
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    const auto sparse_status = PreflightNativePayloadMutation(c, o, mutation_path,
+        reserve_allocation ? apfsaccess::rw::MetadataStore::MutationOperation::SetAllocationSize :
+            apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize, 0, allocation_size);
+    if (!NT_SUCCESS(sparse_status)) return sparse_status;
+#endif
+    const auto atime_status = DrainDeferredAccessTimes(c);
+    if (!NT_SUCCESS(atime_status)) return atime_status;
+    if (o->file == INVALID_HANDLE_VALUE)
+    {
+        if (!o->metadata_read_fallback && !disposition_authorized)
+        {
+            return STATUS_FILE_IS_A_DIRECTORY;
+        }
+        const auto handle_status = EnsurePayloadHandleReadyForMutation(c, o, disposition_authorized);
+        if (!NT_SUCCESS(handle_status))
+        {
+            return handle_status;
+        }
+    }
 
+    HANDLE overwrite_file = o->file;
+    HANDLE writable_overwrite_file = INVALID_HANDLE_VALUE;
+    ScopeExit close_overwrite_file{[&]() {
+        if (writable_overwrite_file != INVALID_HANDLE_VALUE) CloseHandle(writable_overwrite_file);
+    }};
+    if (disposition_authorized && !o->allow_set_file_size)
+    {
+        writable_overwrite_file = ReOpenFile(o->file, GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0);
+        if (writable_overwrite_file == INVALID_HANDLE_VALUE) return STATUS_IO_DEVICE_ERROR;
+        overwrite_file = writable_overwrite_file;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        if (HasUnrestoredHydrationLocked(c, o->node)) return STATUS_IO_DEVICE_ERROR;
+    }
     if (o->named_stream)
     {
+        std::unique_lock<std::mutex> stream_lock(c->mutex);
+        if (HasUnrestoredHydrationLocked(c, o->node)) return STATUS_IO_DEVICE_ERROR;
+        // WinFsp supplies an allocation request, not the resulting EOF.
         LARGE_INTEGER target{};
-        target.QuadPart = allocation_size;
-        if (!SetFilePointerEx(o->file, target, nullptr, FILE_BEGIN) || !SetEndOfFile(o->file))
+        if (!SetFilePointerEx(overwrite_file, target, nullptr, FILE_BEGIN) || !SetEndOfFile(overwrite_file))
         {
             return STATUS_UNSUCCESSFUL;
         }
 
         {
-            std::lock_guard<std::mutex> lock(c->mutex);
-            o->stream_size = allocation_size;
-            RememberNamedStreamSizeLocked(c, o->node->path, o->stream_name, allocation_size);
-            FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
+            o->stream_size = 0;
+            RememberNamedStreamSizeFromHandleLocked(c, o->node, o->stream_name, o->file);
+            FillInfo(*o->node, ReportsReadOnly(c), info);
+            info->FileSize = 0;
+            info->AllocationSize = 0;
         }
-        MarkOpenContextMutation(o);
-        return STATUS_SUCCESS;
+        stream_lock.unlock();
+        return UpdateNamedStreamContentTimes(c, o, info);
     }
 
+    // Cache-only payloads have no accepted journal to recover a failed compound overwrite.
+    bool cache_only = true;
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    cache_only = detached_payload || !IsNativeWriteEnabled(c);
+#endif
+    SetFileSizeRollbackSnapshot overwrite_snapshot{};
+    bool retain_overwrite_snapshot = false;
+    ScopeExit discard_overwrite_snapshot{[&]() {
+        if (!retain_overwrite_snapshot) DiscardSetFileSizeRollbackTail(overwrite_snapshot);
+    }};
+    if (cache_only && reserve_allocation)
+    {
+        const HANDLE backup_source = ReOpenFile(o->file, GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_OVERLAPPED);
+        if (backup_source == INVALID_HANDLE_VALUE) return STATUS_UNSUCCESSFUL;
+        ScopeExit close_backup_source{[&]() { CloseHandle(backup_source); }};
+        LARGE_INTEGER old_eof{};
+        if (!GetFileSizeEx(backup_source, &old_eof) || old_eof.QuadPart < 0 ||
+            !CaptureSetFileSizeRollbackTail(backup_source, HydrationPath(c, *o->node),
+                static_cast<std::uint64_t>(old_eof.QuadPart), 0, overwrite_snapshot))
+            return STATUS_UNSUCCESSFUL;
+    }
+
+    const auto content_timestamp = UtcNow();
 #ifdef APFSACCESS_HAS_RW_ENGINE
     apfsaccess::rw::MetadataStore::PayloadIdentity staged_overwrite_identity{};
+    const bool capture_content_times = !detached_payload && ShouldCaptureNativeContentTimes(c);
     bool native_overwrite_metadata_staged = false;
     bool native_overwrite_journaled = true;
-    if (IsNativeWriteEnabled(c))
+    if (!detached_payload && IsNativeWriteEnabled(c))
     {
-        native_overwrite_journaled = RecordNativeMutationBestEffort(
+        const auto batch_limit = attributes_changed || capture_content_times || reserve_allocation
+            ? WindowsAttributeBatchLimit(c, 1 + (attributes_changed ? 1 : 0) + (capture_content_times ? 1 : 0) +
+                (reserve_allocation ? 1 : 0)) : 0;
+        apfsaccess::rw::MetadataStore::PayloadIdentity attribute_identity{};
+        bool attribute_staged = false;
+        if (attributes_changed)
+            native_overwrite_journaled = StageWindowsAttributes(c, mutation_path, windows_attributes,
+                batch_limit, attribute_identity, attribute_staged);
+        native_overwrite_metadata_staged = attribute_staged;
+        apfsaccess::rw::MetadataStore::PayloadIdentity time_identity{};
+        bool time_staged = false;
+        if (capture_content_times)
+            native_overwrite_journaled = native_overwrite_journaled && StageContentTimes(c,
+                mutation_path, content_timestamp, batch_limit, time_identity, time_staged, !attributes_changed);
+        native_overwrite_metadata_staged = native_overwrite_metadata_staged || time_staged;
+        bool size_staged = false;
+        native_overwrite_journaled = native_overwrite_journaled && RecordNativeMutationBestEffort(
             c,
             apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize,
-            o->node->path,
+            mutation_path,
             L"",
             0,
-            allocation_size,
+            0,
             false,
             0,
             &staged_overwrite_identity,
-            &native_overwrite_metadata_staged);
+            &size_staged,
+            nullptr,
+            batch_limit, {}, reserve_allocation && !attributes_changed && !capture_content_times);
+        native_overwrite_metadata_staged = native_overwrite_metadata_staged || size_staged;
+        apfsaccess::rw::MetadataStore::PayloadIdentity allocation_identity{};
+        if (native_overwrite_journaled && reserve_allocation)
+        {
+            bool allocation_staged = false;
+            native_overwrite_journaled = RecordNativeMutationBestEffort(c,
+                apfsaccess::rw::MetadataStore::MutationOperation::SetAllocationSize,
+                mutation_path, L"", 0, allocation_size, false, 0, &allocation_identity,
+                &allocation_staged, nullptr, batch_limit);
+            native_overwrite_metadata_staged = native_overwrite_metadata_staged || allocation_staged;
+        }
+        if (native_overwrite_journaled && attributes_changed && !IsManifestSession(c))
+            native_overwrite_journaled = JournalWindowsAttributes(c, mutation_path, windows_attributes, attribute_identity);
+        if (native_overwrite_journaled && capture_content_times && !IsManifestSession(c))
+            native_overwrite_journaled = JournalContentTimes(c, mutation_path, content_timestamp, time_identity);
         if (native_overwrite_journaled)
         {
             native_overwrite_journaled = RecordMutationBestEffort(
                 c,
                 apfsaccess::rw::TransactionManager::MutationKind::SetFileSize,
-                o->node->path,
+                mutation_path,
                 L"",
                 0,
-                allocation_size,
+                0,
                 false,
                 0,
                 0,
                 &staged_overwrite_identity);
+            if (native_overwrite_journaled && reserve_allocation && !IsManifestSession(c))
+                native_overwrite_journaled = RecordMutationBestEffort(c,
+                    apfsaccess::rw::TransactionManager::MutationKind::SetAllocationSize,
+                    mutation_path, L"", 0, allocation_size, false, 0, 0, &allocation_identity);
         }
     }
     if (!native_overwrite_journaled)
@@ -18698,12 +22831,25 @@ NTSTATUS CB_Overwrite(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, BOOLEAN, UINT64 al
 #endif
 
     LARGE_INTEGER target{};
-    target.QuadPart = allocation_size;
-    if (!SetFilePointerEx(o->file, target, nullptr, FILE_BEGIN) || !SetEndOfFile(o->file))
+    if (!SetFilePointerEx(overwrite_file, target, nullptr, FILE_BEGIN) || !SetEndOfFile(overwrite_file) ||
+        (reserve_allocation && !SetCachedAllocationSize(overwrite_file, allocation_size)))
     {
-#ifdef APFSACCESS_HAS_RW_ENGINE
-        if (IsNativeWriteEnabled(c))
+        if (cache_only && reserve_allocation && !RestoreSetFileSizeRollbackTail(overwrite_file, overwrite_snapshot))
         {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            retain_overwrite_snapshot = true;
+            MarkHydrationStaleLocked(c, o->node);
+            c->unrestored_hydration_backups[HydrationStateKey(c, *o->node)] = overwrite_snapshot.tail_backup_path;
+            return STATUS_IO_DEVICE_ERROR;
+        }
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        if (!detached_payload && IsNativeWriteEnabled(c))
+        {
+            InvalidateHydrationReadHandle(c);
+            {
+                std::lock_guard<std::mutex> lock(c->mutex);
+                MarkHydrationStaleLocked(c, o->node);
+            }
             (void)BlockNativeMutationAfterStagingFailure(
                 c,
                 L"Overwrite",
@@ -18717,9 +22863,31 @@ NTSTATUS CB_Overwrite(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, BOOLEAN, UINT64 al
 
     {
         std::lock_guard<std::mutex> lock(c->mutex);
-        o->node->file_size = allocation_size;
-        o->node->timestamp = UtcNow();
-        FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
+        o->node->times_generation = (std::max)(o->node->times_generation,
+#ifdef APFSACCESS_HAS_RW_ENGINE
+            (std::max)(staged_overwrite_identity.generation, c->namespace_checkpoint_xid));
+#else
+            std::uint64_t{0});
+#endif
+        SetVisiblePayloadMetadataLocked(o->node, 0, content_timestamp);
+        if (o->node->allocation_size || reserve_allocation)
+            SetVisibleAllocationSizeLocked(o->node, allocation_size);
+        if (attributes_changed)
+            SetVisibleWindowsAttributesLocked(o->node, windows_attributes,
+#ifdef APFSACCESS_HAS_RW_ENGINE
+                (std::max)(staged_overwrite_identity.generation, c->namespace_checkpoint_xid));
+#else
+                o->node->attributes_generation);
+#endif
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        if (!detached_payload && o->node->shared_payload)
+        {
+            o->node->shared_payload->materialized_generation = staged_overwrite_identity.generation;
+            o->node->shared_payload->visible_generation = (std::max)(
+                o->node->shared_payload->visible_generation.value_or(0), staged_overwrite_identity.generation);
+        }
+#endif
+        FillInfo(*o->node, ReportsReadOnly(c), info);
     }
 #ifdef APFSACCESS_HAS_RW_ENGINE
     if (!IsNativeWriteEnabled(c))
@@ -18727,10 +22895,10 @@ NTSTATUS CB_Overwrite(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, BOOLEAN, UINT64 al
         (void)RecordMutationBestEffort(
             c,
             apfsaccess::rw::TransactionManager::MutationKind::SetFileSize,
-            o->node->path,
+            mutation_path,
             L"",
             0,
-            allocation_size,
+            0,
             false,
             0,
             0,
@@ -18741,16 +22909,23 @@ NTSTATUS CB_Overwrite(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, BOOLEAN, UINT64 al
     return STATUS_SUCCESS;
 }
 
+#include "NativeCompressionWrite.h"
+
 NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG len, BOOLEAN write_to_end_of_file, BOOLEAN constrained_io, PULONG done, FSP_FSCTL_FILE_INFO* info)
 {
     auto* c = Ctx(fs);
     ScopedCallbackActivity callback_scope(c, "Write");
     ScopedPerfTimer perf_scope(c ? &c->perf_write : nullptr);
 
+    if (done) *done = 0;
     auto* o = (OpenContext*)ctx;
-    if (!c || !o || !o->node || o->node->is_directory || !buf || !done)
+    if (!c || !o || !o->node || (o->node->is_directory && !o->native_xattr) || !buf || !done)
     {
         return STATUS_INVALID_PARAMETER;
+    }
+    if (o->node->node_kind != NodeKind::RegularFile && !(o->native_xattr && o->node->is_directory))
+    {
+        return STATUS_INVALID_DEVICE_REQUEST;
     }
     ExternalMutationRequestScope mutation_request_scope(c);
     if (!mutation_request_scope.Acquired())
@@ -18766,32 +22941,19 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
     {
         return STATUS_ACCESS_DENIED;
     }
-    if (o->file == INVALID_HANDLE_VALUE)
+    if (o->native_xattr)
     {
-        *done = 0;
-        return o->metadata_read_fallback ? STATUS_ACCESS_DENIED : STATUS_INVALID_PARAMETER;
+        const auto atime_status = DrainDeferredAccessTimes(c);
+        if (!NT_SUCCESS(atime_status)) return atime_status;
+        return WriteNativeXattr(c, o, buf, off, len, write_to_end_of_file, constrained_io, done, info);
     }
-
+    const auto mutation_path = SnapshotMutationPathForNode(c, *o->node);
+    const bool detached_payload = mutation_path.empty() && IsDetachedPayloadNode(c, *o->node);
+    if (mutation_path.empty() && !detached_payload) return STATUS_FILE_DELETED;
     auto current_size = o->named_stream ? o->stream_size : o->node->file_size;
     if (write_to_end_of_file)
     {
         off = current_size;
-        // CopyFileEx-style copies pre-size the destination to the source size,
-        // stream every chunk with explicit offsets, then re-issue the final
-        // buffer once more as a write-to-end append. On a pre-sized file that
-        // duplicate would extend the file by one extra chunk, which forces the
-        // engine into a full re-materialization of the file at commit time.
-        // Coalesce it back onto the chunk it duplicates. Only for generic
-        // write handles whose immediately preceding write ended exactly at
-        // EOF with the same length; append-only handles are excluded so real
-        // sequential appends are never affected.
-        if (!o->named_stream && o->allow_write_data && o->has_last_write &&
-            current_size > 0 && off == current_size &&
-            o->last_write_offset + o->last_write_length == current_size &&
-            static_cast<std::uint64_t>(len) == o->last_write_length)
-        {
-            off = current_size - len;
-        }
     }
     else if (!o->allow_write_data && o->allow_append_data)
     {
@@ -18808,7 +22970,7 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
         *done = 0;
         if (info)
         {
-            FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
+            FillInfo(*o->node, ReportsReadOnly(c), info);
         }
         return STATUS_SUCCESS;
     }
@@ -18819,8 +22981,57 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
         write_len = (ULONG)(current_size - off);
     }
 
+    if (write_len == 0)
+    {
+        *done = 0;
+        std::lock_guard<std::mutex> lock(c->mutex);
+        if (info) FillInfo(*o->node, ReportsReadOnly(c), info);
+        return STATUS_SUCCESS;
+    }
+
+    if (HasUnsupportedDefaultContentTransform(c, o->node, o->named_stream))
+    {
+        const auto atime_status = DrainDeferredAccessTimes(c);
+        if (!NT_SUCCESS(atime_status)) return atime_status;
+        return WriteNativeCompressedContent(c, o, mutation_path, buf, off, write_len, done, info);
+    }
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    const auto sparse_status = PreflightNativePayloadMutation(c, o, mutation_path,
+        apfsaccess::rw::MetadataStore::MutationOperation::Write, off, write_len);
+    if (!NT_SUCCESS(sparse_status)) return sparse_status;
+#endif
+    const auto atime_status = DrainDeferredAccessTimes(c);
+    if (!NT_SUCCESS(atime_status)) return atime_status;
+    if (o->file == INVALID_HANDLE_VALUE)
+    {
+        *done = 0;
+        if (!o->metadata_read_fallback)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+        const auto handle_status = EnsurePayloadHandleReadyForMutation(c, o);
+        if (!NT_SUCCESS(handle_status))
+        {
+            return handle_status;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        if (HasUnrestoredHydrationLocked(c, o->node))
+        {
+            *done = 0;
+            return STATUS_IO_DEVICE_ERROR;
+        }
+    }
     if (o->named_stream)
     {
+        std::unique_lock<std::mutex> stream_lock(c->mutex);
+        if (HasUnrestoredHydrationLocked(c, o->node))
+        {
+            *done = 0;
+            return STATUS_IO_DEVICE_ERROR;
+        }
         OVERLAPPED ov{};
         ov.Offset = (DWORD)(off & 0xffffffffull);
         ov.OffsetHigh = (DWORD)(off >> 32);
@@ -18833,28 +23044,39 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
 
         {
             const auto write_end = off + static_cast<std::uint64_t>(written);
-            std::lock_guard<std::mutex> lock(c->mutex);
             o->stream_size = std::max<std::uint64_t>(o->stream_size, write_end);
-            o->last_write_offset = off;
-            o->last_write_length = written;
-            o->has_last_write = true;
-            RememberNamedStreamSizeLocked(c, o->node->path, o->stream_name, o->stream_size);
+            RememberNamedStreamSizeFromHandleLocked(c, o->node, o->stream_name, o->file);
             if (info)
             {
-                FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
+                FillInfo(*o->node, ReportsReadOnly(c), info);
             }
         }
         *done = written;
+        stream_lock.unlock();
         if (written != 0)
         {
-            MarkOpenContextMutation(o);
+            const auto status = UpdateNamedStreamContentTimes(c, o, info);
+            if (!NT_SUCCESS(status)) *done = 0;
+            return status;
         }
         return STATUS_SUCCESS;
     }
 
+    UINT32 archive_attributes = 0;
+    bool archive_changed = false;
+    const auto archive_status = PrepareWindowsAttributeUpdate(c, o->node,
+        FILE_ATTRIBUTE_ARCHIVE, false, archive_attributes, archive_changed);
+    if (!NT_SUCCESS(archive_status))
+    {
+        *done = 0;
+        return archive_status;
+    }
+
+    const auto content_timestamp = UtcNow();
 #ifdef APFSACCESS_HAS_RW_ENGINE
-    const bool native_write_active = IsNativeWriteEnabled(c);
-    const auto storage_plan = apfsaccess::rw::WritePipeline::PlanForegroundPayloadStorage({
+    const bool native_write_active = !detached_payload && IsNativeWriteEnabled(c);
+    const bool capture_content_times = native_write_active && ShouldCaptureNativeContentTimes(c);
+    auto storage_plan = apfsaccess::rw::WritePipeline::PlanForegroundPayloadStorage({
         native_write_active,
         c->metadata_store != nullptr,
         c->payload_spool != nullptr &&
@@ -18865,6 +23087,9 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
         write_len,
         IsExperimentalDualHydrationMirrorEnabled(),
     });
+    // Every alias shares this one live content stream. Mirror its ordered
+    // mutations without changing the spool-only path for ordinary files.
+    if (o->node->shared_payload) storage_plan.should_write_hydration_file = true;
     const auto payload_spool_capacity = storage_plan.should_stage_payload_spool
         ? EnsurePayloadSpoolCapacityBeforeNativeWriteBestEffort(c, write_len)
         : PayloadSpoolCapacityOutcome::Ready;
@@ -18880,21 +23105,40 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
 
     apfsaccess::rw::MetadataStore::PayloadIdentity staged_payload_identity{};
     bool write_metadata_staged = false;
-    if (native_write_active &&
-        !RecordNativeMutationBestEffort(
+    if (native_write_active)
+    {
+        apfsaccess::rw::MetadataStore::PayloadIdentity archive_identity{};
+        bool archive_staged = false;
+        const auto batch_limit = archive_changed || capture_content_times
+            ? WindowsAttributeBatchLimit(c, 1 + (archive_changed ? 1 : 0) + (capture_content_times ? 1 : 0)) : 0;
+        bool staged = !archive_changed || StageWindowsAttributes(c, mutation_path, archive_attributes,
+            batch_limit, archive_identity, archive_staged);
+        apfsaccess::rw::MetadataStore::PayloadIdentity time_identity{};
+        bool time_staged = false;
+        if (capture_content_times)
+            staged = staged && StageContentTimes(c, mutation_path, content_timestamp, batch_limit,
+                time_identity, time_staged, !archive_changed);
+        staged = staged && RecordNativeMutationBestEffort(
             c,
             apfsaccess::rw::MetadataStore::MutationOperation::Write,
-            o->node->path,
+            mutation_path,
             L"",
             off,
             write_len,
             false,
             0,
             &staged_payload_identity,
-            &write_metadata_staged))
-    {
-        *done = 0;
-        return BlockNativeMutationAfterStagingFailure(c, L"Write", write_metadata_staged);
+            &write_metadata_staged, nullptr, batch_limit);
+        write_metadata_staged = write_metadata_staged || archive_staged || time_staged;
+        if (staged && archive_changed && !IsManifestSession(c))
+            staged = JournalWindowsAttributes(c, mutation_path, archive_attributes, archive_identity);
+        if (staged && capture_content_times && !IsManifestSession(c))
+            staged = JournalContentTimes(c, mutation_path, content_timestamp, time_identity);
+        if (!staged)
+        {
+            *done = 0;
+            return BlockNativeMutationAfterStagingFailure(c, L"Write", write_metadata_staged);
+        }
     }
 #endif
     DWORD written = write_len;
@@ -18904,7 +23148,7 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
     {
         if (!RecordPayloadWriteMutationBestEffort(
                 c,
-                o->node->path,
+                mutation_path,
                 off,
                 buf,
                 written,
@@ -18927,7 +23171,7 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
         {
             *done = 0;
 #ifdef APFSACCESS_HAS_RW_ENGINE
-            if (IsNativeWriteEnabled(c))
+            if (!detached_payload && IsNativeWriteEnabled(c))
             {
                 (void)BlockNativeMutationAfterStagingFailure(c, L"Write", write_metadata_staged);
             }
@@ -18938,23 +23182,50 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
 
     {
         const auto write_end = off + static_cast<std::uint64_t>(written);
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        const auto native_allocation = SnapshotNativePayloadAllocation(c, o, mutation_path);
+#endif
         std::lock_guard<std::mutex> lock(c->mutex);
-        o->node->file_size = std::max<std::uint64_t>(o->node->file_size, write_end);
-        o->last_write_offset = off;
-        o->last_write_length = written;
-        o->has_last_write = true;
-        o->node->timestamp = UtcNow();
-        if (staged_payload_spool && !storage_plan.should_write_hydration_file)
+        o->node->times_generation = (std::max)(o->node->times_generation,
+#ifdef APFSACCESS_HAS_RW_ENGINE
+            (std::max)(staged_payload_identity.generation, c->namespace_checkpoint_xid));
+#else
+            std::uint64_t{0});
+#endif
+        SetVisiblePayloadMetadataLocked(o->node, std::max<std::uint64_t>(o->node->file_size, write_end), content_timestamp);
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        if (native_allocation) SetVisibleAllocationSizeLocked(o->node, *native_allocation);
+#endif
+        if (archive_changed && written != 0)
+            SetVisibleWindowsAttributesLocked(o->node, archive_attributes,
+#ifdef APFSACCESS_HAS_RW_ENGINE
+                (std::max)({staged_payload_identity.generation, c->namespace_checkpoint_xid, o->node->attributes_generation}));
+#else
+                o->node->attributes_generation);
+#endif
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        if (!detached_payload && o->node->shared_payload)
+        {
+            o->node->shared_payload->materialized_generation = staged_payload_identity.generation;
+            o->node->shared_payload->visible_generation = (std::max)(
+                o->node->shared_payload->visible_generation.value_or(0), staged_payload_identity.generation);
+        }
+#endif
+        if ((staged_payload_spool && !storage_plan.should_write_hydration_file)
+#ifdef APFSACCESS_HAS_RW_ENGINE
+            || (native_write_active && o->cleanup_seen && !o->node->shared_payload)
+#endif
+            )
         {
             MarkHydrationStaleLocked(c, o->node);
         }
         else
         {
-            ClearHydrationStaleLockedNormalized(c, o->node->path);
+            ClearHydrationStaleLockedNormalized(c, mutation_path);
         }
         if (info)
         {
-            FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
+            FillInfo(*o->node, ReportsReadOnly(c), info);
         }
     }
     *done = written;
@@ -18963,7 +23234,7 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
     {
         if (!RecordPayloadWriteMutationBestEffort(
                 c,
-                o->node->path,
+                mutation_path,
                 off,
                 buf,
                 written,
@@ -18973,12 +23244,12 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
             return BlockNativeMutationAfterStagingFailure(c, L"Write", write_metadata_staged);
         }
     }
-    else if (!native_write_active)
+    else if (!IsNativeWriteEnabled(c))
     {
         RecordMutationBestEffort(
             c,
             apfsaccess::rw::TransactionManager::MutationKind::Write,
-            o->node->path,
+            mutation_path,
             L"",
             off,
             written);
@@ -18991,194 +23262,147 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
     return STATUS_SUCCESS;
 }
 
-NTSTATUS CB_SetBasicInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32, UINT64 creation_time, UINT64 last_access_time, UINT64 last_write_time, UINT64 change_time, FSP_FSCTL_FILE_INFO* info)
+NTSTATUS CB_SetBasicInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32 attributes, UINT64 creation_time, UINT64 last_access_time, UINT64 last_write_time, UINT64 change_time, FSP_FSCTL_FILE_INFO* info)
 {
     auto* c = Ctx(fs);
     ScopedCallbackActivity callback_scope(c, "SetBasicInfo");
     ScopedPerfTimer perf_scope(c ? &c->perf_set_basic_info : nullptr);
-
     auto* o = (OpenContext*)ctx;
-    if (!c || !o || !o->node || !info)
+    if (!c || !o || !o->node || !info) return STATUS_INVALID_PARAMETER;
+    const InodeTimes requested{creation_time, last_write_time, change_time, last_access_time};
+    if (!ValidRequestedInodeTimes(requested)) return STATUS_INVALID_PARAMETER;
+    const bool no_op = requested == InodeTimes{} && attributes == INVALID_FILE_ATTRIBUTES;
+    ExternalMutationRequestScope mutation_request_scope(c, !no_op);
+    if (!mutation_request_scope.Acquired()) return STATUS_VOLUME_DISMOUNTED;
+    std::optional<MutationCallbackScope> mutation_scope;
+    if (!no_op) mutation_scope.emplace(c);
+    if (!no_op)
     {
-        return STATUS_INVALID_PARAMETER;
+        const auto atime_status = DrainDeferredAccessTimes(c);
+        if (!NT_SUCCESS(atime_status)) return atime_status;
     }
-    const bool no_timestamp_change =
-        creation_time == 0 &&
-        last_access_time == 0 &&
-        last_write_time == 0 &&
-        change_time == 0;
-    if (no_timestamp_change)
-    {
-        ExternalMutationRequestScope no_op_request_scope(c, false);
-        if (!no_op_request_scope.Acquired())
-        {
-            return STATUS_VOLUME_DISMOUNTED;
-        }
-        if (!IsMutationWriteEnabled(c))
-        {
-            return HandleMutationWriteDisabled(c, L"SetBasicInfo");
-        }
-        if (!o->allow_set_basic_info)
-        {
-            return STATUS_ACCESS_DENIED;
-        }
-
-        std::lock_guard<std::mutex> lock(c->mutex);
-        FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
-        return STATUS_SUCCESS;
-    }
-    ExternalMutationRequestScope mutation_request_scope(c);
-    if (!mutation_request_scope.Acquired())
-    {
-        return STATUS_VOLUME_DISMOUNTED;
-    }
-    MutationCallbackScope mutation_scope(c);
-    if (!IsMutationWriteEnabled(c))
-    {
-        return HandleMutationWriteDisabled(c, L"SetBasicInfo");
-    }
-    if (!o->allow_set_basic_info)
-    {
-        return STATUS_ACCESS_DENIED;
-    }
-    if (o->named_stream)
-    {
-        FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
-        return STATUS_SUCCESS;
-    }
-
-    ULARGE_INTEGER stamp{};
-    if (last_write_time != 0)
-    {
-        stamp.QuadPart = last_write_time;
-    }
-    else if (change_time != 0)
-    {
-        stamp.QuadPart = change_time;
-    }
-    else if (last_access_time != 0)
-    {
-        stamp.QuadPart = last_access_time;
-    }
-    else if (creation_time != 0)
-    {
-        stamp.QuadPart = creation_time;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(c->mutex);
-        if (o->node->timestamp.dwLowDateTime == stamp.LowPart &&
-            o->node->timestamp.dwHighDateTime == stamp.HighPart)
-        {
-            FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
-            return STATUS_SUCCESS;
-        }
-    }
-
-#ifdef APFSACCESS_HAS_RW_ENGINE
-    apfsaccess::rw::MetadataStore::PayloadIdentity staged_basic_info_identity{};
-    bool native_set_basic_info_metadata_staged = false;
-    bool native_set_basic_info_staged = true;
-    if (IsNativeWriteEnabled(c))
-    {
-        native_set_basic_info_staged = RecordNativeMutationBestEffort(
-            c,
-            apfsaccess::rw::MetadataStore::MutationOperation::SetBasicInfo,
-            o->node->path,
-            L"",
-            0,
-            0,
-            false,
-            stamp.QuadPart,
-            &staged_basic_info_identity,
-            &native_set_basic_info_metadata_staged);
-    }
-    if (!native_set_basic_info_staged)
-    {
-        if (!IsBenignStaleDeletedSetBasicInfoFailure(c, o->node))
-        {
-            return BlockNativeMutationAfterStagingFailure(
-                c,
-                L"SetBasicInfo",
-                native_set_basic_info_metadata_staged);
-        }
-    }
-    if (native_set_basic_info_staged &&
-        IsNativeWriteEnabled(c) &&
-        !RecordMutationBestEffort(
-            c,
-            apfsaccess::rw::TransactionManager::MutationKind::SetBasicInfo,
-            o->node->path,
-            L"",
-            0,
-            0,
-            false,
-            0,
-            stamp.QuadPart,
-            &staged_basic_info_identity))
-    {
-        return BlockNativeMutationAfterStagingFailure(c, L"SetBasicInfo", true);
-    }
-#endif
-
-    {
-        std::lock_guard<std::mutex> lock(c->mutex);
-        o->node->timestamp.dwLowDateTime = stamp.LowPart;
-        o->node->timestamp.dwHighDateTime = stamp.HighPart;
-        FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
-    }
-#ifdef APFSACCESS_HAS_RW_ENGINE
-    if (!IsNativeWriteEnabled(c))
-    {
-        (void)RecordMutationBestEffort(
-            c,
-            apfsaccess::rw::TransactionManager::MutationKind::SetBasicInfo,
-            o->node->path,
-            L"",
-            0,
-            0,
-            false,
-            0,
-            stamp.QuadPart,
-            &staged_basic_info_identity);
-    }
-#endif
-    MarkOpenContextMutation(o);
-    return STATUS_SUCCESS;
+    if (!IsMutationWriteEnabled(c)) return HandleMutationWriteDisabled(c, L"SetBasicInfo");
+    if (!o->allow_set_basic_info) return STATUS_ACCESS_DENIED;
+    return UpdateWindowsBasicMetadata(c, o, attributes, true, requested, info);
 }
 
-NTSTATUS CB_SetFileSize(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT64 size, BOOLEAN, FSP_FSCTL_FILE_INFO* info)
+NTSTATUS SetFileSizeUnderMutationLock(MountContext* c, OpenContext* o, UINT64 size,
+    BOOLEAN set_allocation_size, FSP_FSCTL_FILE_INFO* info, bool cleanup_allocation = false)
 {
-    auto* c = Ctx(fs);
-    ScopedCallbackActivity callback_scope(c, "SetFileSize");
-    ScopedPerfTimer perf_scope(c ? &c->perf_set_file_size : nullptr);
-
-    auto* o = (OpenContext*)ctx;
-    if (!c || !o || !o->node || o->node->is_directory || !info)
+    if (!c || !o || !o->node || (o->node->is_directory && !o->native_xattr) || !info)
     {
         return STATUS_INVALID_PARAMETER;
     }
-    ExternalMutationRequestScope mutation_request_scope(c);
-    if (!mutation_request_scope.Acquired())
+    if (o->node->node_kind != NodeKind::RegularFile && !(o->native_xattr && o->node->is_directory))
     {
-        return STATUS_VOLUME_DISMOUNTED;
+        return STATUS_INVALID_DEVICE_REQUEST;
     }
-    MutationCallbackScope mutation_scope(c);
     if (!IsMutationWriteEnabled(c))
     {
         return HandleMutationWriteDisabled(c, L"SetFileSize");
     }
-    if (!o->allow_set_file_size)
+    if (!o->allow_set_file_size && !cleanup_allocation)
     {
         return STATUS_ACCESS_DENIED;
     }
-    if (o->file == INVALID_HANDLE_VALUE)
+    if (o->native_xattr)
     {
-        return STATUS_UNSUCCESSFUL;
+        const auto atime_status = DrainDeferredAccessTimes(c);
+        if (!NT_SUCCESS(atime_status)) return atime_status;
+        return WriteNativeXattr(c, o, nullptr, size, 0, FALSE, FALSE, nullptr, info, true, set_allocation_size != FALSE);
+    }
+    if (HasUnsupportedDefaultContentTransform(c, o->node, o->named_stream)) return STATUS_NOT_SUPPORTED;
+    const auto mutation_path = SnapshotMutationPathForNode(c, *o->node);
+    const bool detached_payload = mutation_path.empty() && IsDetachedPayloadNode(c, *o->node);
+    if (mutation_path.empty() && !detached_payload) return STATUS_FILE_DELETED;
+    if (size > static_cast<std::uint64_t>(INT64_MAX)) return STATUS_INVALID_PARAMETER;
+    const bool allocation_request = set_allocation_size && !o->named_stream;
+    if (allocation_request)
+    {
+        const auto status = NormalizeFileAllocationRequest(c, size, size);
+        if (!NT_SUCCESS(status)) return status;
+    }
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    const auto sparse_status = PreflightNativePayloadMutation(c, o, mutation_path,
+        allocation_request ? apfsaccess::rw::MetadataStore::MutationOperation::SetAllocationSize :
+            apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize, 0, size);
+    if (!NT_SUCCESS(sparse_status)) return sparse_status;
+#endif
+    const auto atime_status = DrainDeferredAccessTimes(c);
+    if (!NT_SUCCESS(atime_status)) return atime_status;
+    bool same_file_eof = false;
+    bool shrinking_native_payload = false;
+    std::uint64_t target_size = size;
+    std::uint64_t target_allocation = 0;
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        const auto current_size = o->named_stream ? o->stream_size : o->node->file_size;
+        if (allocation_request) target_size = (std::min)(size, current_size);
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        shrinking_native_payload = !o->named_stream && !detached_payload && !o->node->shared_payload &&
+            IsNativeWriteEnabled(c) && c->metadata_store &&
+            c->metadata_store->AuthoritativeAppleCheckpointView() && target_size < current_size;
+#endif
+        const auto unit = o->node->allocation_unit_bytes;
+        target_allocation = allocation_request ? size : size < current_size
+            ? ((size + unit - 1) / unit) * unit
+            : (std::max)(o->node->allocation_size.value_or(0), ((size + unit - 1) / unit) * unit);
+        same_file_eof = !o->named_stream && !set_allocation_size && size == current_size;
+        if (o->named_stream && (size == current_size || (set_allocation_size && size > current_size)))
+        {
+            FillInfo(*o->node, ReportsReadOnly(c), info);
+            if (o->named_stream)
+            {
+                info->FileSize = current_size;
+                info->AllocationSize = ((current_size + 4095ull) / 4096ull) * 4096ull;
+            }
+            return STATUS_SUCCESS;
+        }
+    }
+    if (same_file_eof)
+        return UpdateWindowsBasicMetadata(c, o, FILE_ATTRIBUTE_ARCHIVE, false, {}, info);
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    const auto commit_resize_boundary = [&]() -> NTSTATUS
+    {
+        const auto status = CommitNativeMutationsOnFlushBestEffort(c);
+        if (!NT_SUCCESS(status)) return status;
+        return FinalizeMutationJournalBestEffort(c, L"SetFileSize") ? STATUS_SUCCESS :
+            c->write_degraded ? STATUS_MEDIA_WRITE_PROTECTED : STATUS_UNSUCCESSFUL;
+    };
+    if (shrinking_native_payload)
+    {
+        {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            if (HasUnrestoredHydrationLocked(c, o->node)) return STATUS_IO_DEVICE_ERROR;
+        }
+        // Spool records describe writes, not truncations. Drain the old prefix
+        // before shrinking, and publish the shorter EOF before a later write or
+        // growth can overlay records or committed bytes from the discarded tail.
+        const auto status = commit_resize_boundary();
+        if (!NT_SUCCESS(status)) return status;
+    }
+#endif
+    if (o->file == INVALID_HANDLE_VALUE && !cleanup_allocation)
+    {
+        if (!o->metadata_read_fallback)
+        {
+            return STATUS_UNSUCCESSFUL;
+        }
+        const auto handle_status = EnsurePayloadHandleReadyForMutation(c, o);
+        if (!NT_SUCCESS(handle_status))
+        {
+            return handle_status;
+        }
     }
 
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        if (HasUnrestoredHydrationLocked(c, o->node)) return STATUS_IO_DEVICE_ERROR;
+    }
     if (o->named_stream)
     {
+        std::unique_lock<std::mutex> stream_lock(c->mutex);
+        if (HasUnrestoredHydrationLocked(c, o->node)) return STATUS_IO_DEVICE_ERROR;
         LARGE_INTEGER target{};
         target.QuadPart = size;
         if (!SetFilePointerEx(o->file, target, nullptr, FILE_BEGIN) || !SetEndOfFile(o->file))
@@ -19187,50 +23411,102 @@ NTSTATUS CB_SetFileSize(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT64 size, BOOLEAN, FS
         }
 
         {
-            std::lock_guard<std::mutex> lock(c->mutex);
             o->stream_size = size;
-            RememberNamedStreamSizeLocked(c, o->node->path, o->stream_name, size);
-            FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
+            RememberNamedStreamSizeFromHandleLocked(c, o->node, o->stream_name, o->file);
+            FillInfo(*o->node, ReportsReadOnly(c), info);
         }
-        MarkOpenContextMutation(o);
-        return STATUS_SUCCESS;
+        stream_lock.unlock();
+        return UpdateNamedStreamContentTimes(c, o, info);
     }
 
+    UINT32 archive_attributes = 0;
+    bool archive_changed = false;
+    const auto archive_status = cleanup_allocation ? STATUS_SUCCESS : PrepareWindowsAttributeUpdate(c, o->node,
+        FILE_ATTRIBUTE_ARCHIVE, false, archive_attributes, archive_changed);
+    if (!NT_SUCCESS(archive_status)) return archive_status;
+
     SetFileSizeRollbackSnapshot rollback_snapshot{};
+    bool retained_native_payload = false;
+    bool stale_allocation_cache = false;
     {
         std::lock_guard<std::mutex> lock(c->mutex);
         rollback_snapshot.previous_size = o->node->file_size;
         rollback_snapshot.previous_timestamp = o->node->timestamp;
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        retained_native_payload = !detached_payload && IsNativeWriteEnabled(c) &&
+            !o->node->shared_payload && (o->cleanup_seen ||
+                (c->metadata_store && c->metadata_store->AuthoritativeAppleCheckpointView() &&
+                    IsHydrationStaleLocked(c, o->node)));
+        stale_allocation_cache = allocation_request && !detached_payload && IsNativeWriteEnabled(c) &&
+            (retained_native_payload || IsHydrationStaleLocked(c, o->node));
+#endif
     }
     const auto hydration_path = HydrationPath(c, *o->node);
-    if (!CaptureSetFileSizeRollbackTail(o->file, hydration_path, rollback_snapshot.previous_size, size, rollback_snapshot))
+    HANDLE cleanup_file = INVALID_HANDLE_VALUE;
+    ScopeExit close_cleanup_file{[&]() { if (cleanup_file != INVALID_HANDLE_VALUE) CloseHandle(cleanup_file); }};
+    if (cleanup_allocation && !stale_allocation_cache)
+    {
+        // Last cleanup can belong to a read-only alias. Use a separate cache
+        // handle without widening that caller's granted access.
+        cleanup_file = CreateFileW(hydration_path.c_str(), FILE_WRITE_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            kHydrationCacheFileAttributes, nullptr);
+        if (cleanup_file == INVALID_HANDLE_VALUE && GetLastError() != ERROR_FILE_NOT_FOUND &&
+            GetLastError() != ERROR_PATH_NOT_FOUND) return STATUS_UNSUCCESSFUL;
+    }
+    const HANDLE resize_file = stale_allocation_cache ? INVALID_HANDLE_VALUE :
+        cleanup_allocation ? cleanup_file : o->file.load();
+    // This retained handle can predate the current APFS EOF. Native rollback
+    // is journal-backed; do not require a tail from its obsolete cache file.
+    if (!retained_native_payload && !stale_allocation_cache &&
+        !CaptureSetFileSizeRollbackTail(o->file, hydration_path, rollback_snapshot.previous_size, target_size, rollback_snapshot))
     {
         return STATUS_UNSUCCESSFUL;
     }
 
+    const auto content_timestamp = UtcNow();
 #ifdef APFSACCESS_HAS_RW_ENGINE
     apfsaccess::rw::MetadataStore::PayloadIdentity staged_file_size_identity{};
+    const bool capture_content_times = !cleanup_allocation && !detached_payload && ShouldCaptureNativeContentTimes(c);
     bool native_file_size_metadata_staged = false;
     bool native_file_size_journaled = true;
-    if (IsNativeWriteEnabled(c))
+    if (!detached_payload && IsNativeWriteEnabled(c))
     {
-        native_file_size_journaled = RecordNativeMutationBestEffort(
+        apfsaccess::rw::MetadataStore::PayloadIdentity archive_identity{};
+        bool archive_staged = false;
+        const auto batch_limit = archive_changed || capture_content_times
+            ? WindowsAttributeBatchLimit(c, 1 + (archive_changed ? 1 : 0) + (capture_content_times ? 1 : 0)) : 0;
+        native_file_size_journaled = !archive_changed || StageWindowsAttributes(c, mutation_path,
+            archive_attributes, batch_limit, archive_identity, archive_staged);
+        apfsaccess::rw::MetadataStore::PayloadIdentity time_identity{};
+        bool time_staged = false;
+        if (capture_content_times)
+            native_file_size_journaled = native_file_size_journaled && StageContentTimes(c,
+                mutation_path, content_timestamp, batch_limit, time_identity, time_staged, !archive_changed);
+        native_file_size_journaled = native_file_size_journaled && RecordNativeMutationBestEffort(
             c,
-            apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize,
-            o->node->path,
+            allocation_request ? apfsaccess::rw::MetadataStore::MutationOperation::SetAllocationSize :
+                apfsaccess::rw::MetadataStore::MutationOperation::SetFileSize,
+            mutation_path,
             L"",
             0,
             size,
             false,
             0,
             &staged_file_size_identity,
-            &native_file_size_metadata_staged);
+            &native_file_size_metadata_staged, nullptr, batch_limit);
+        native_file_size_metadata_staged = native_file_size_metadata_staged || archive_staged || time_staged;
+        if (native_file_size_journaled && archive_changed && !IsManifestSession(c))
+            native_file_size_journaled = JournalWindowsAttributes(c, mutation_path, archive_attributes, archive_identity);
+        if (native_file_size_journaled && capture_content_times && !IsManifestSession(c))
+            native_file_size_journaled = JournalContentTimes(c, mutation_path, content_timestamp, time_identity);
         if (native_file_size_journaled)
         {
             native_file_size_journaled = RecordMutationBestEffort(
                 c,
-                apfsaccess::rw::TransactionManager::MutationKind::SetFileSize,
-                o->node->path,
+                allocation_request ? apfsaccess::rw::TransactionManager::MutationKind::SetAllocationSize :
+                    apfsaccess::rw::TransactionManager::MutationKind::SetFileSize,
+                mutation_path,
                 L"",
                 0,
                 size,
@@ -19251,12 +23527,21 @@ NTSTATUS CB_SetFileSize(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT64 size, BOOLEAN, FS
 #endif
 
     LARGE_INTEGER target{};
-    target.QuadPart = size;
-    if (!SetFilePointerEx(o->file, target, nullptr, FILE_BEGIN) || !SetEndOfFile(o->file))
+    target.QuadPart = target_size;
+    // FileAllocationInfo already clamps EOF on shrink and never grows it.
+    // A second EOF call could fail after the first call destroyed the tail.
+    if (resize_file != INVALID_HANDLE_VALUE &&
+        (allocation_request ? !SetCachedAllocationSize(resize_file, size) :
+            !SetFilePointerEx(resize_file, target, nullptr, FILE_BEGIN) || !SetEndOfFile(resize_file)))
     {
 #ifdef APFSACCESS_HAS_RW_ENGINE
-        if (IsNativeWriteEnabled(c))
+        if (!detached_payload && IsNativeWriteEnabled(c))
         {
+            InvalidateHydrationReadHandle(c);
+            {
+                std::lock_guard<std::mutex> lock(c->mutex);
+                MarkHydrationStaleLocked(c, o->node);
+            }
             (void)BlockNativeMutationAfterStagingFailure(
                 c,
                 L"SetFileSize",
@@ -19269,19 +23554,48 @@ NTSTATUS CB_SetFileSize(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT64 size, BOOLEAN, FS
 
     InvalidateHydrationReadHandle(c);
 
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (const auto native_allocation = SnapshotNativePayloadAllocation(c, o, mutation_path))
+        target_allocation = *native_allocation;
+#endif
     {
         std::lock_guard<std::mutex> lock(c->mutex);
-        o->node->file_size = size;
-        o->node->timestamp = UtcNow();
-        FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
+        o->node->times_generation = (std::max)(o->node->times_generation,
+#ifdef APFSACCESS_HAS_RW_ENGINE
+            (std::max)(staged_file_size_identity.generation, c->namespace_checkpoint_xid));
+#else
+            std::uint64_t{0});
+#endif
+        if (!cleanup_allocation) SetVisiblePayloadMetadataLocked(o->node, target_size, content_timestamp);
+        if (o->node->allocation_size || allocation_request)
+            SetVisibleAllocationSizeLocked(o->node, target_allocation);
+        if (retained_native_payload || stale_allocation_cache) MarkHydrationStaleLocked(c, o->node);
+        if (archive_changed)
+            SetVisibleWindowsAttributesLocked(o->node, archive_attributes,
+#ifdef APFSACCESS_HAS_RW_ENGINE
+                (std::max)({staged_file_size_identity.generation, c->namespace_checkpoint_xid, o->node->attributes_generation}));
+#else
+                o->node->attributes_generation);
+#endif
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        if (!detached_payload && o->node->shared_payload)
+        {
+            if (!stale_allocation_cache && !IsHydrationStaleLocked(c, o->node))
+                o->node->shared_payload->materialized_generation = staged_file_size_identity.generation;
+            o->node->shared_payload->visible_generation = (std::max)(
+                o->node->shared_payload->visible_generation.value_or(0), staged_file_size_identity.generation);
+        }
+#endif
+        FillInfo(*o->node, ReportsReadOnly(c), info);
     }
 #ifdef APFSACCESS_HAS_RW_ENGINE
     if (!IsNativeWriteEnabled(c))
     {
         (void)RecordMutationBestEffort(
             c,
-            apfsaccess::rw::TransactionManager::MutationKind::SetFileSize,
-            o->node->path,
+            allocation_request ? apfsaccess::rw::TransactionManager::MutationKind::SetAllocationSize :
+                apfsaccess::rw::TransactionManager::MutationKind::SetFileSize,
+            mutation_path,
             L"",
             0,
             size,
@@ -19293,7 +23607,24 @@ NTSTATUS CB_SetFileSize(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT64 size, BOOLEAN, FS
 #endif
     DiscardSetFileSizeRollbackTail(rollback_snapshot);
     MarkOpenContextMutation(o);
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (shrinking_native_payload) return commit_resize_boundary();
+#endif
     return STATUS_SUCCESS;
+}
+
+NTSTATUS CB_SetFileSize(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT64 size, BOOLEAN set_allocation_size, FSP_FSCTL_FILE_INFO* info)
+{
+    auto* c = Ctx(fs);
+    ScopedCallbackActivity callback_scope(c, "SetFileSize");
+    ScopedPerfTimer perf_scope(c ? &c->perf_set_file_size : nullptr);
+    auto* o = static_cast<OpenContext*>(ctx);
+    if (!c || !o || !o->node || (o->node->is_directory && !o->native_xattr) || !info) return STATUS_INVALID_PARAMETER;
+    if (o->node->node_kind != NodeKind::RegularFile && !(o->native_xattr && o->node->is_directory)) return STATUS_INVALID_DEVICE_REQUEST;
+    ExternalMutationRequestScope mutation_request_scope(c);
+    if (!mutation_request_scope.Acquired()) return STATUS_VOLUME_DISMOUNTED;
+    MutationCallbackScope mutation_scope(c);
+    return SetFileSizeUnderMutationLock(c, o, size, set_allocation_size, info);
 }
 
 NTSTATUS CB_CanDelete(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name)
@@ -19301,6 +23632,33 @@ NTSTATUS CB_CanDelete(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name)
     auto* c = Ctx(fs);
     ScopedCallbackActivity callback_scope(c, "CanDelete");
     ScopedPerfTimer perf_scope(c ? &c->perf_can_delete : nullptr);
+    if (auto* stream = static_cast<OpenContext*>(ctx); stream && stream->named_stream)
+    {
+        if (!c) return STATUS_INVALID_PARAMETER;
+        ExternalMutationRequestScope request(c);
+        if (!request.Acquired()) return STATUS_VOLUME_DISMOUNTED;
+        MutationCallbackScope mutation(c);
+        if (stream->native_xattr)
+        {
+            if (!stream->allow_delete) return STATUS_ACCESS_DENIED;
+            std::wstring path;
+            auto status = ValidateNativeXattrEdit(c, stream, path);
+#ifdef APFSACCESS_HAS_RW_ENGINE
+            if (NT_SUCCESS(status))
+            {
+                constexpr auto limit = apfsaccess::rw::WriteAheadLog::MaxExtendedAttributePayloadBytes;
+                std::vector<std::byte> bytes; std::uint64_t size = 0;
+                status = NativeXattrValue(c, stream, 0, limit + 1, bytes, size);
+                if (NT_SUCCESS(status) && size > limit) return STATUS_NOT_SUPPORTED;
+            }
+#endif
+            return status;
+        }
+        std::lock_guard<std::mutex> lock(c->mutex);
+        return ValidateLocalNamedStreamDeleteLocked(c, stream, true);
+    }
+    if (file_name && SplitNamedStreamPath(file_name).is_named_stream)
+        return STATUS_INVALID_HANDLE;
     const auto trace_return = [&](NTSTATUS status, const std::wstring& detail = std::wstring()) -> NTSTATUS
     {
         if (IsHostMoveTraceEnabled())
@@ -19332,6 +23690,8 @@ NTSTATUS CB_CanDelete(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name)
         return trace_return(STATUS_VOLUME_DISMOUNTED, L"shutdown-drain");
     }
     MutationCallbackScope mutation_scope(c);
+    const auto atime_status = DrainDeferredAccessTimes(c);
+    if (!NT_SUCCESS(atime_status)) return atime_status;
     if (!IsMutationWriteEnabled(c))
     {
         return trace_return(HandleMutationWriteDisabled(c, L"CanDelete"), L"write-disabled");
@@ -19403,6 +23763,35 @@ NTSTATUS CB_SetDelete(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, BOOLEAN d
     auto* c = Ctx(fs);
     ScopedCallbackActivity callback_scope(c, "SetDelete");
     ScopedPerfTimer perf_scope(c ? &c->perf_set_delete : nullptr);
+    if (auto* stream = static_cast<OpenContext*>(ctx); stream && stream->named_stream)
+    {
+        if (!c) return STATUS_INVALID_PARAMETER;
+        // Cancellation reduces an existing obligation and remains possible after
+        // write admission closes; it must not be turned into deletion by Close.
+        std::optional<ExternalMutationRequestScope> request;
+        if (delete_file)
+        {
+            request.emplace(c);
+            if (!request->Acquired())
+            {
+                std::lock_guard<std::mutex> lock(c->mutex);
+                if (!stream->stream_delete_pending) stream->stream_delete_cancelled = true;
+                return STATUS_VOLUME_DISMOUNTED;
+            }
+        }
+        MutationCallbackScope mutation(c);
+        if (stream->native_xattr) return NativeXattrSetDelete(c, stream, delete_file != FALSE);
+        std::lock_guard<std::mutex> lock(c->mutex);
+        const auto status = SetLocalNamedStreamDeleteLocked(c, stream, delete_file != FALSE);
+        // A rejected new request must not be retried by a stale Cleanup flag
+        // after permissions or filesystem conditions change. Keep any earlier
+        // successfully armed disposition intact when a later request fails.
+        if (!NT_SUCCESS(status) && delete_file && !stream->stream_delete_pending)
+            stream->stream_delete_cancelled = true;
+        return status;
+    }
+    if (file_name && SplitNamedStreamPath(file_name).is_named_stream)
+        return STATUS_INVALID_HANDLE;
 
     auto* o = (OpenContext*)ctx;
     const auto trace_return = [&](NTSTATUS status, const std::wstring& detail = std::wstring()) -> NTSTATUS
@@ -19436,6 +23825,8 @@ NTSTATUS CB_SetDelete(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, BOOLEAN d
         return trace_return(STATUS_VOLUME_DISMOUNTED, L"shutdown-drain");
     }
     MutationCallbackScope mutation_scope(c);
+    const auto atime_status = DrainDeferredAccessTimes(c);
+    if (!NT_SUCCESS(atime_status)) return atime_status;
     if (!IsMutationWriteEnabled(c))
     {
         return trace_return(HandleMutationWriteDisabled(c, L"SetDelete"), L"write-disabled");
@@ -19461,6 +23852,11 @@ NTSTATUS CB_SetDelete(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, BOOLEAN d
         return trace_return(STATUS_SUCCESS, L"clear");
     }
 
+    if (delete_file)
+    {
+        const auto retained = CaptureNativeXattrsBeforeUnlink(c, target);
+        if (!NT_SUCCESS(retained)) return trace_return(retained, L"native-stream-retention");
+    }
     if (delete_file && o && o->node && !o->node->is_directory)
     {
         std::lock_guard<std::mutex> lock(c->mutex);
@@ -19542,6 +23938,103 @@ NTSTATUS CB_SetDelete(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, BOOLEAN d
     return trace_return(STATUS_SUCCESS, delete_file ? L"set" : L"clear");
 }
 
+bool RetainOpenReplacementPayload(MountContext* c, const std::shared_ptr<Node>& node)
+{
+    if (!node || node->node_kind != NodeKind::RegularFile || node->object_id == 0) return true;
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        if (!SharedPayloadHasOpenHandles(*node)) return true;
+    }
+    // Rename has drained prior writes and owns mutation serialization, but not the namespace lock.
+    if (!EnsureHydrated(c, node)) return false;
+    std::lock_guard<std::mutex> lock(c->mutex);
+    if (TryGetNodeLockedNormalized(c, node->path) != node || HasUnrestoredHydrationLocked(c, node)) return false;
+    if (node->shared_payload) return true;
+    auto owner = std::make_shared<SharedInodePayload>();
+    owner->key = L"$inode:" + std::to_wstring(node->object_id);
+    owner->object_id = node->object_id;
+    owner->file_size = node->file_size;
+    owner->allocation_size = node->allocation_size;
+    owner->timestamp = node->timestamp;
+    owner->inode_times = node->inode_times;
+    owner->visible_generation = node->times_generation;
+    owner->windows_attributes = node->windows_attributes;
+    owner->attributes_generation = node->attributes_generation;
+    owner->native_security = node->native_security;
+    owner->security_generation = node->security_generation;
+    owner->aliases.push_back(node);
+    if (c->shared_payload_owners.contains(owner->key)) return false;
+    const auto old_path = HydrationPath(c, *node);
+    Node retained;
+    retained.shared_payload = owner;
+    const auto retained_path = HydrationPath(c, retained);
+    InvalidateHydrationReadHandle(c);
+    if (old_path != retained_path && !MoveFileExW(old_path.c_str(), retained_path.c_str(), 0)) return false;
+    const auto old_key = HydrationStateKey(c, *node);
+    if (auto streams = c->named_stream_sizes.extract(old_key); !streams.empty())
+    {
+        streams.key() = owner->key;
+        c->named_stream_sizes.insert(std::move(streams));
+    }
+    c->stale_hydration_keys.erase(old_key);
+    node->hydration_key = owner->key;
+    node->shared_payload = owner;
+    c->shared_payload_owners.emplace(owner->key, std::move(owner));
+    return true;
+}
+
+bool RetireUnlinkedPayloadBestEffort(MountContext* c, const std::shared_ptr<SharedInodePayload>& owner)
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (!c || !owner || !c->metadata_store) return false;
+    if (!IsNativeWriteEnabled(c) || c->write_degraded || c->recovery_active || HasPendingNativeMutations(c)) return false;
+    {
+        std::lock_guard<std::mutex> lock(c->metadata_mutex);
+        if (c->metadata_store->LookupCommittedInodeByObjectId(owner->object_id)) return true;
+    }
+    std::lock_guard<std::mutex> lock(c->mutex);
+    if (c->unrestored_hydration_backups.contains(owner->key) ||
+        !c->deferred_delete_rollback_plans.empty() || !c->deferred_rename_rollback_plans.empty()) return false;
+    for (const auto& weak : owner->aliases)
+        if (const auto node = weak.lock(); node && node->shared_payload == owner &&
+            (TryGetNodeLockedNormalized(c, node->path) == node || node->open_handle_count != 0 ||
+                node->live_context_count != 0 || node->closing_context_count != 0)) return true;
+    const auto found = c->shared_payload_owners.find(owner->key);
+    if (found == c->shared_payload_owners.end() || found->second != owner) return true;
+    Node retained;
+    retained.shared_payload = owner;
+    InvalidateHydrationReadHandle(c);
+    std::error_code ec;
+    std::filesystem::remove(HydrationPath(c, retained), ec);
+    if (ec) return false;
+    c->named_stream_sizes.erase(owner->key);
+    c->stale_hydration_keys.erase(owner->key);
+    c->shared_payload_owners.erase(found);
+    c->unlinked_payload_candidates.erase(owner->key);
+    return true;
+#else
+    (void)c; (void)owner;
+    return false;
+#endif
+}
+
+void RetireUnlinkedPayloadCandidatesBestEffort(MountContext* c)
+{
+    if (!c) return;
+    decltype(c->unlinked_payload_candidates) candidates;
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        candidates.swap(c->unlinked_payload_candidates);
+    }
+    // Visit only removed owners, not the entire mounted namespace or cache.
+    for (const auto& [key, owner] : candidates)
+        if (!RetireUnlinkedPayloadBestEffort(c, owner))
+        {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            c->unlinked_payload_candidates.emplace(key, owner);
+        }
+}
+
 NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_name, BOOLEAN replace_if_exists)
 {
     auto* c = Ctx(fs);
@@ -19592,12 +24085,16 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
     {
         return trace_return(STATUS_INVALID_PARAMETER, L"invalid-args");
     }
+    if (auto* stream = static_cast<OpenContext*>(ctx); stream && stream->native_xattr)
+        return STATUS_NOT_SUPPORTED;
     ExternalMutationRequestScope mutation_request_scope(c);
     if (!mutation_request_scope.Acquired())
     {
         return trace_return(STATUS_VOLUME_DISMOUNTED, L"shutdown-drain");
     }
     MutationCallbackScope mutation_scope(c);
+    const auto atime_status = DrainDeferredAccessTimes(c);
+    if (!NT_SUCCESS(atime_status)) return atime_status;
     if (!IsMutationWriteEnabled(c))
     {
         return trace_return(HandleMutationWriteDisabled(c, L"Rename"), L"write-disabled");
@@ -19660,6 +24157,17 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
         return trace_return(STATUS_SUCCESS, L"same-path");
     }
 
+    if (replace_if_exists)
+    {
+        const auto source = FindNodeNormalized(c, old_path);
+        const auto destination = FindNodeNormalized(c, new_path);
+        if (source && destination && source != destination &&
+            (source->object_id == 0 || source->object_id != destination->object_id))
+        {
+            const auto retained = CaptureNativeXattrsBeforeUnlink(c, new_path);
+            if (!NT_SUCCESS(retained)) return trace_return(retained, L"native-stream-retention");
+        }
+    }
     const auto target_reuse_status = DrainDeferredDeleteRollbackBeforePathReuse(c, new_path, L"RenamePathReuse");
     if (!NT_SUCCESS(target_reuse_status))
     {
@@ -19699,6 +24207,7 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
         experimental_namespace_writeback &&
         source_before_lock &&
         !source_before_lock->is_directory &&
+        !source_before_lock->windows_directory_symlink &&
         replace_if_exists == FALSE &&
         !existing_before_lock;
     const bool simple_directory_rename_can_start_deferred_batch =
@@ -19800,7 +24309,7 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
     }
 
     {
-        std::lock_guard<std::mutex> lock(c->mutex);
+        std::unique_lock<std::mutex> lock(c->mutex);
         auto node = TryGetNodeLockedNormalized(c, old_path);
         if (!node)
         {
@@ -19851,14 +24360,14 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
             {
                 return trace_return(STATUS_ACCESS_DENIED, L"cross-parent-parent-context");
             }
-            if (!HasDirectoryInsertPermission(current_open, node->is_directory))
+            if (!HasDirectoryInsertPermission(current_open, IsWindowsDirectory(*node)))
             {
                 return trace_return(STATUS_ACCESS_DENIED, L"old-parent-insert");
             }
         }
         else if (context_is_new_parent)
         {
-            if (!HasDirectoryInsertPermission(current_open, node->is_directory))
+            if (!HasDirectoryInsertPermission(current_open, IsWindowsDirectory(*node)))
             {
                 return trace_return(STATUS_ACCESS_DENIED, L"new-parent-insert");
             }
@@ -19898,14 +24407,21 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
         }
 
         auto existing = TryGetNodeLockedNormalized(c, new_path);
+        if (existing && existing != node && !node->is_directory && !existing->is_directory &&
+            node->object_id != 0 && existing->object_id == node->object_id &&
+            !IsDeleteBlockedStateLocked(existing))
+        {
+            return trace_return(STATUS_SUCCESS, L"same-inode-alias");
+        }
         if (existing && existing != node)
         {
             if (has_open_context)
             {
+                // WinFsp checks target DELETE access before passing the source context.
                 const bool can_replace_with_context =
-                    context_is_new_parent &&
-                    current_open->allow_delete_child &&
-                    IsDirectChildPathNormalized(c, current_open->node->path, new_path);
+                    context_is_source ||
+                    (context_is_new_parent && current_open->allow_delete_child &&
+                        IsDirectChildPathNormalized(c, current_open->node->path, new_path));
                 if (!can_replace_with_context)
                 {
                     return trace_return(STATUS_ACCESS_DENIED, L"replace-context");
@@ -19919,7 +24435,8 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
             {
                 return trace_return(STATUS_OBJECT_NAME_COLLISION, L"collision");
             }
-            if (existing->is_directory != node->is_directory)
+            if (existing->is_directory != node->is_directory ||
+                IsWindowsDirectory(*existing) != IsWindowsDirectory(*node))
             {
                 return trace_return(STATUS_ACCESS_DENIED, L"replace-type");
             }
@@ -19944,6 +24461,8 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
         rename_snapshot.old_hydration_key = node->hydration_key;
         rename_snapshot.old_committed_read_path = node->committed_read_path;
         rename_snapshot.old_timestamp = node->timestamp;
+        rename_snapshot.old_inode_times = node->inode_times;
+        rename_snapshot.old_times_generation = node->times_generation;
         rename_snapshot.old_parent = old_parent;
         rename_snapshot.new_parent = new_parent;
         rename_snapshot.old_leaf = old_leaf;
@@ -19971,6 +24490,12 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
         {
             rename_snapshot.replaced_node = existing;
             rename_snapshot.replaced_node_was_present = true;
+            lock.unlock();
+            const bool retained = RetainOpenReplacementPayload(c, existing);
+            lock.lock();
+            if (!retained || TryGetNodeLockedNormalized(c, new_path) != existing ||
+                TryGetNodeLockedNormalized(c, old_path) != node)
+                return trace_return(STATUS_IO_DEVICE_ERROR, L"retain-open-target");
             if (!MoveFileAsideForRollbackLocked(c, existing, L"rename-replaced", rename_snapshot.replaced_file_snapshot))
             {
                 return trace_return(STATUS_UNSUCCESSFUL, L"rollback-snapshot");
@@ -20036,6 +24561,7 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
         rename_snapshot.node_reindexed = true;
     }
 #ifdef APFSACCESS_HAS_RW_ENGINE
+    const bool manifest_rename_requested = IsManifestSession(c) && IsNativeWriteEnabled(c);
     const bool rename_journal_recorded = RecordMutationBestEffort(
         c,
         apfsaccess::rw::TransactionManager::MutationKind::Rename,
@@ -20050,7 +24576,9 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
     const bool rename_identity_recorded =
         staged_rename_identity.object_id != 0 &&
         staged_rename_identity.generation != 0;
-    if (rename_metadata_staged && (!rename_journal_recorded || !rename_identity_recorded))
+    const bool manifest_rename_failed = manifest_rename_requested && !rename_journal_recorded;
+    if (manifest_rename_failed ||
+        (rename_metadata_staged && (!rename_journal_recorded || !rename_identity_recorded)))
     {
         {
             std::lock_guard<std::mutex> lock(c->mutex);
@@ -20116,12 +24644,14 @@ NTSTATUS CB_Rename(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR old_name, PWSTR new_nam
         return c->write_degraded ? STATUS_MEDIA_WRITE_PROTECTED : STATUS_UNSUCCESSFUL;
     }
 #endif
-    DiscardFileRollbackSnapshot(rename_snapshot.replaced_file_snapshot);
+    DiscardFileRollbackSnapshot(rename_snapshot.replaced_file_snapshot, true);
+    if (rename_snapshot.replaced_node)
+        RetireUnlinkedPayloadBestEffort(c, rename_snapshot.replaced_node->shared_payload);
     MarkOpenContextMutation(current_open);
     return trace_return(STATUS_SUCCESS, L"renamed");
 }
 
-NTSTATUS CB_SetSecurity(FSP_FILE_SYSTEM* fs, PVOID, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR)
+NTSTATUS CB_SetSecurity(FSP_FILE_SYSTEM* fs, PVOID ctx, SECURITY_INFORMATION information, PSECURITY_DESCRIPTOR modification)
 {
     auto* c = Ctx(fs);
     ScopedCallbackActivity callback_scope(c, "SetSecurity");
@@ -20142,10 +24672,83 @@ NTSTATUS CB_SetSecurity(FSP_FILE_SYSTEM* fs, PVOID, SECURITY_INFORMATION, PSECUR
         return HandleMutationWriteDisabled(c, L"SetSecurity");
     }
 
-    // APFS Access does not persist Windows ACLs into APFS metadata. Treat ACL
-    // writes as a supported no-op so common shell/Office workflows do not fall
-    // back to read-only behavior after copying files onto the mount.
+    if (!IsNativeWriteEnabled(c)) return STATUS_SUCCESS;
+    MutationCallbackScope mutation_scope(c);
+    const auto atime_status = DrainDeferredAccessTimes(c);
+    if (!NT_SUCCESS(atime_status)) return atime_status;
+    auto* o = static_cast<OpenContext*>(ctx);
+    if (!o || !o->node || !modification) return STATUS_INVALID_PARAMETER;
+    constexpr SECURITY_INFORMATION supported = OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION;
+    if (!information || (information & ~supported)) return STATUS_NOT_SUPPORTED;
+    if ((information & (PROTECTED_DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION)) ==
+        (PROTECTED_DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION)) return STATUS_INVALID_PARAMETER;
+    if (((information & (OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION)) && !(o->granted_access & WRITE_OWNER)) ||
+        ((information & (DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION |
+            UNPROTECTED_DACL_SECURITY_INFORMATION)) && !(o->granted_access & WRITE_DAC))) return STATUS_ACCESS_DENIED;
+    if (!IsValidSecurityDescriptor(modification)) return STATUS_INVALID_SECURITY_DESCR;
+    if (!c->api.SetSecurityDescriptor || !c->api.DeleteSecurityDescriptor) return STATUS_NOT_SUPPORTED;
+    std::shared_ptr<const NativeInodeSecurity> previous;
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        previous = VisibleNativeSecurity(*o->node);
+    }
+    std::span<const std::byte> descriptor;
+    auto status = ResolveWindowsSecurity(previous.get(), c->sd, c->sd_size, descriptor);
+    if (!NT_SUCCESS(status)) return status;
+    PSECURITY_DESCRIPTOR merged = nullptr;
+    status = c->api.SetSecurityDescriptor(const_cast<std::byte*>(descriptor.data()), information, modification, &merged);
+    ScopeExit release{[&] { if (merged) c->api.DeleteSecurityDescriptor(merged,
+        reinterpret_cast<NTSTATUS (*)()>(c->api.SetSecurityDescriptor)); }};
+    if (!NT_SUCCESS(status)) return status;
+    std::vector<std::byte> payload;
+    status = EncodeWindowsSecurity(merged, payload);
+    if (!NT_SUCCESS(status)) return status;
+    if (descriptor.size() == payload.size() - 4 &&
+        std::equal(descriptor.begin(), descriptor.end(), payload.begin() + 4)) return STATUS_SUCCESS;
+    const auto path = SnapshotMutationPathForNode(c, *o->node);
+    if (path.empty()) return STATUS_FILE_DELETED;
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (!c->metadata_store || !c->tx_manager) return STATUS_NOT_SUPPORTED;
+    {
+        std::lock_guard<std::mutex> lock(c->metadata_mutex);
+        const auto inode = c->metadata_store->LookupWorkingInodeByPath(path);
+        if (!inode || inode->object_id != o->node->object_id) return STATUS_FILE_DELETED;
+        const auto committed = c->metadata_store->LookupCommittedInodeByObjectId(inode->object_id);
+        if ((inode->bsd_flags & apfsaccess::rw::kAppleBsdCompressedFlag) != 0 ||
+            (committed && (committed->bsd_flags & apfsaccess::rw::kAppleBsdCompressedFlag) != 0) ||
+            c->metadata_store->LookupCommittedExtendedAttribute(inode->object_id, "com.apple.decmpfs") ||
+            c->metadata_store->LookupWorkingExtendedAttribute(inode->object_id, "com.apple.decmpfs"))
+            return STATUS_NOT_SUPPORTED;
+        const auto attribute = c->metadata_store->LookupWorkingExtendedAttribute(inode->object_id, kWindowsSecurityName);
+        if (attribute && attribute->flags != apfsaccess::rw::kAppleXattrDataEmbedded) return STATUS_NOT_SUPPORTED;
+    }
+    apfsaccess::rw::MetadataStore::PayloadIdentity identity{};
+    bool staged = false;
+    const bool recorded = RecordNativeMutationBestEffort(c,
+        apfsaccess::rw::MetadataStore::MutationOperation::SetExtendedAttribute,
+        path, kWindowsSecurityNameWide, 0, payload.size(), false, 0, &identity, &staged,
+        nullptr, WindowsAttributeBatchLimit(c, 1), payload) &&
+        RecordMutationBestEffort(c, apfsaccess::rw::TransactionManager::MutationKind::SetExtendedAttribute,
+            path, kWindowsSecurityNameWide, 0, payload.size(), false, 0, 0, &identity, nullptr, payload);
+    if (!recorded) return BlockNativeMutationAfterStagingFailure(c, L"SetSecurity", staged);
+    status = DrainNativeMutationsByPolicy(c, L"SetSecurity", false, true);
+    if (!NT_SUCCESS(status)) return status;
+    if (!FinalizeMutationJournalBestEffort(c, L"SetSecurity")) return STATUS_UNSUCCESSFUL;
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        const auto current = VisibleNativeSecurity(*o->node);
+        auto updated = std::make_shared<NativeInodeSecurity>(current ? *current : NativeInodeSecurity{});
+        updated->windows_security_flags = apfsaccess::rw::kAppleXattrDataEmbedded;
+        updated->windows_security = std::move(payload);
+        SetVisibleNativeSecurityLocked(o->node, updated,
+            (std::max)({identity.generation, c->namespace_checkpoint_xid, o->node->security_generation}), true);
+    }
+    MarkOpenContextMutation(o);
     return STATUS_SUCCESS;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
 }
 
 VOID CB_Cleanup(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, ULONG flags)
@@ -20175,29 +24778,153 @@ VOID CB_Cleanup(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, ULONG flags)
     {
         return;
     }
-    const bool cleanup_may_delete =
-        IsMutationWriteEnabled(c) &&
-        (((flags & FspCleanupDelete) != 0) || o->delete_on_close_requested);
-    std::optional<MutationCallbackScope> mutation_scope;
-    if (cleanup_may_delete)
+    if (o->native_xattr)
     {
-        mutation_scope.emplace(c);
-    }
-
-    if (o->file != INVALID_HANDLE_VALUE)
-    {
-        if (o->named_stream)
+        ExternalMutationRequestScope request(c, false);
+        MutationCallbackScope mutation(c);
+        if (!o->cleanup_seen && (flags & FspCleanupDelete) && !o->stream_delete_pending &&
+            !o->stream_delete_cancelled && request.Acquired())
         {
-            std::lock_guard<std::mutex> lock(c->mutex);
-            o->stream_size = RememberNamedStreamSizeFromHandleLocked(c, o->node, o->stream_name, o->file);
+            const auto status = NativeXattrSetDelete(c, o, true);
+            if (!NT_SUCCESS(status)) TraceMove(c, L"Cleanup native xattr delete failed: " + FormatNtStatus(status));
         }
-        CloseHandle(o->file);
-        o->file = INVALID_HANDLE_VALUE;
+        std::lock_guard<std::mutex> lock(c->mutex);
+        ReleaseOpenContextAccountingLocked(c, o);
+        return;
     }
+    // WinFsp also requests atime on FILE_READ_ATTRIBUTES-only opens. A stat
+    // must not turn monitoring or Shell enumeration into durable data writes.
+    // Explicit SetBasicInfo and handles with data/list access retain their policy.
+    if (!o->allow_read_data && !o->allow_write_data && !o->allow_append_data)
+    {
+        flags &= ~FspCleanupSetLastAccessTime;
+    }
+    // Only an actual metadata update needs content-transform interpretation.
+    // A pure metadata handle must not wait on the commit gate during Cleanup.
+    constexpr ULONG content_metadata_flags = FspCleanupSetArchiveBit | FspCleanupSetLastAccessTime |
+        FspCleanupSetLastWriteTime | FspCleanupSetChangeTime | FspCleanupSetAllocationSize;
+    if ((flags & content_metadata_flags) && HasUnsupportedDefaultContentTransform(c, o->node, o->named_stream))
+        flags &= ~content_metadata_flags;
+    const bool cleanup_may_delete =
+        !o->named_stream &&
+        !(file_name && SplitNamedStreamPath(file_name).is_named_stream) &&
+        (((flags & FspCleanupDelete) != 0) || o->delete_on_close_requested) &&
+        IsMutationWriteEnabled(c);
+    bool cleanup_may_set_archive = false;
+    if ((flags & FspCleanupSetArchiveBit) != 0 && IsMutationWriteEnabled(c))
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        cleanup_may_set_archive = (VisibleWindowsAttributes(*o->node) & FILE_ATTRIBUTE_ARCHIVE) == 0;
+    }
+    bool cleanup_may_set_times =
+        (flags & (FspCleanupSetLastAccessTime | FspCleanupSetLastWriteTime | FspCleanupSetChangeTime)) != 0 &&
+        IsMutationWriteEnabled(c);
+    const bool cleanup_may_set_allocation = !o->cleanup_seen &&
+        !o->named_stream && o->node->node_kind == NodeKind::RegularFile &&
+        (flags & FspCleanupSetAllocationSize) != 0 && IsMutationWriteEnabled(c);
+    std::optional<ExternalMutationRequestScope> metadata_request_scope;
+    if (cleanup_may_set_archive || cleanup_may_set_times || cleanup_may_set_allocation) metadata_request_scope.emplace(c, false);
+    const bool metadata_admitted = metadata_request_scope && metadata_request_scope->Acquired();
+    std::optional<MutationCallbackScope> mutation_scope;
+    if (cleanup_may_delete || metadata_admitted) mutation_scope.emplace(c);
 
+    const bool automatic_read_atime = metadata_admitted && !o->cleanup_seen &&
+        !cleanup_may_delete && !cleanup_may_set_archive && !cleanup_may_set_allocation &&
+        (flags & content_metadata_flags) == FspCleanupSetLastAccessTime &&
+        o->allow_read_data && !o->allow_write_data && !o->allow_append_data &&
+        !o->named_stream && !o->mutation_observed.load(std::memory_order_acquire);
+    if (automatic_read_atime && TryDeferAutomaticAccessTime(c, o))
     {
         std::lock_guard<std::mutex> lock(c->mutex);
         ReleaseOpenContextAccountingLocked(c, o);
+        return;
+    }
+    if (mutation_scope && !NT_SUCCESS(DrainDeferredAccessTimes(c)))
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        ReleaseOpenContextAccountingLocked(c, o);
+        return;
+    }
+
+    if (metadata_admitted && IsMutationWriteEnabled(c) && (cleanup_may_set_archive || cleanup_may_set_times))
+    {
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        if (cleanup_may_set_times && IsNativeWriteEnabled(c) && !ShouldCaptureNativeContentTimes(c))
+            cleanup_may_set_times = false;
+#endif
+        const auto now = ToFileTimeValue(UtcNow());
+        InodeTimes requested;
+        if (cleanup_may_set_times)
+        {
+            if (flags & FspCleanupSetLastAccessTime) requested.access_time_utc = now;
+            if (flags & FspCleanupSetLastWriteTime) requested.modification_time_utc = now;
+            if (flags & FspCleanupSetChangeTime) requested.change_time_utc = now;
+        }
+        const auto status = UpdateWindowsBasicMetadata(c, o,
+            cleanup_may_set_archive ? FILE_ATTRIBUTE_ARCHIVE : INVALID_FILE_ATTRIBUTES,
+            false, requested, nullptr);
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        if (!NT_SUCCESS(status) && status != STATUS_FILE_DELETED && IsNativeWriteEnabled(c))
+            (void)BlockNativeMutationAfterStagingFailure(c, L"CleanupMetadata");
+#endif
+    }
+
+    if (o->named_stream)
+    {
+        // Never enter the base delete/latch path, including duplicate Cleanup,
+        // stale FileName, cancellation, and a caller-supplied Delete flag.
+        ExternalMutationRequestScope request(c, false);
+        if (!mutation_scope) mutation_scope.emplace(c);
+        std::lock_guard<std::mutex> lock(c->mutex);
+        if (!o->cleanup_seen && (flags & FspCleanupDelete) &&
+            !o->stream_delete_pending && !o->stream_delete_cancelled && request.Acquired())
+        {
+            const auto status = SetLocalNamedStreamDeleteLocked(c, o, true);
+            if (!NT_SUCCESS(status)) TraceMove(c, L"Cleanup stream delete failed: " + FormatNtStatus(status));
+        }
+        if (NT_SUCCESS(ValidateLocalNamedStreamHandle(o)))
+            o->stream_size = RememberNamedStreamSizeFromHandleLocked(c, o->node, o->stream_name, o->file);
+        ReleaseOpenContextAccountingLocked(c, o);
+        return;
+    }
+
+    // Cleanup releases user-handle accounting, but cached I/O may continue until
+    // Close. The fully shared payload handle must remain valid for that lifetime.
+    bool release_allocation = false;
+    std::uint64_t cleanup_eof = 0;
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        ReleaseOpenContextAccountingLocked(c, o);
+        if (TryGetNodeLockedNormalized(c, o->node->path) != o->node)
+        {
+            o->delete_on_close_requested = false;
+            return;
+        }
+        release_allocation = metadata_admitted && cleanup_may_set_allocation && !cleanup_may_delete &&
+            o->node->open_handle_count == 0;
+        if (release_allocation && o->node->shared_payload)
+            for (const auto& weak : o->node->shared_payload->aliases)
+                if (const auto alias = weak.lock(); alias && alias->shared_payload == o->node->shared_payload &&
+                    alias->open_handle_count != 0) release_allocation = false;
+        cleanup_eof = o->node->file_size;
+        const auto unit = o->node->allocation_unit_bytes;
+        release_allocation = release_allocation &&
+            o->node->allocation_size.value_or(0) > ((cleanup_eof + unit - 1) / unit) * unit;
+    }
+
+    if (release_allocation && IsMutationWriteEnabled(c))
+    {
+        std::uint64_t allocation = 0;
+        auto status = NormalizeFileAllocationRequest(c, cleanup_eof, allocation);
+        if (NT_SUCCESS(status) && allocation < o->node->allocation_size.value_or(0))
+        {
+            FSP_FSCTL_FILE_INFO ignored{};
+            status = SetFileSizeUnderMutationLock(c, o, allocation, TRUE, &ignored, true);
+        }
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        if (!NT_SUCCESS(status) && status != STATUS_FILE_DELETED && IsNativeWriteEnabled(c))
+            (void)BlockNativeMutationAfterStagingFailure(c, L"CleanupAllocation");
+#endif
     }
 
     if (cleanup_may_delete)
@@ -20213,10 +24940,14 @@ VOID CB_Cleanup(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, ULONG flags)
             : NormalizePath(file_name ? std::wstring(file_name) : L"\\");
         if (path != L"\\" && EnsureParentDirectoryLoadedNormalized(c, path))
         {
-            auto found = FindNodeNormalized(c, path);
-            if (!found)
+            std::shared_ptr<Node> found;
             {
-                return;
+                std::lock_guard<std::mutex> lock(c->mutex);
+                // SetDelete has already hidden this name from fresh lookups.
+                // Its owning Cleanup must still latch the exact retained inode
+                // so the final stream Close can complete the accepted intent.
+                found = TryGetNodeLockedNormalized(c, path);
+                if (!found || found != o->node) return;
             }
             if (found->is_directory && !EnsureDirectoryLoaded(c, found))
             {
@@ -20225,7 +24956,7 @@ VOID CB_Cleanup(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, ULONG flags)
 
             std::lock_guard<std::mutex> lock(c->mutex);
             auto node = TryGetNodeLockedNormalized(c, path);
-            if (node)
+            if (node && node == o->node)
             {
                 if (IsDeleteBlockedStateLocked(node) && !o->delete_on_cleanup)
                 {
@@ -20250,6 +24981,12 @@ VOID CB_Cleanup(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, ULONG flags)
     }
 }
 
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+// Called outside both locks, after the lifetime/fast-close decision. Tests may
+// pause one Close here while another runs to completion, without sleep races.
+std::function<void(OpenContext*)> g_close_retirement_test_hook;
+#endif
+
 VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
 {
     auto* c = Ctx(fs);
@@ -20261,11 +24998,98 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
     {
         return;
     }
-    if (TryFastCloseNonMutatingContext(c, o))
+    const bool lifetime_was_accounted = o->lifetime_accounted;
+    ScopeExit retire_payload{[c, node = o->node, accounted = lifetime_was_accounted]() {
+        if (!c || !node) return;
+        std::shared_ptr<SharedInodePayload> owner;
+        {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            if (accounted && node->closing_context_count != 0) --node->closing_context_count;
+            if (node->cancel_delete_after_closes && node->closing_context_count == 0 &&
+                node->live_context_count == 0)
+            {
+                // Every closer has finished; drain cancellation can no longer
+                // discard an admitted closer's in-flight deletion authority.
+                node->cancel_delete_after_closes = false;
+                node->delete_latched = false;
+                node->delete_requested_after_children = false;
+                node->caller_delete_retry_required = false;
+                RefreshDeletePendingStateLocked(c, node);
+            }
+            owner = node->shared_payload;
+            // Visible owners and other live/closing aliases need no mutation
+            // lock on this short path. The retirement routine rechecks identity.
+            if (!owner || SharedPayloadHasOpenHandles(*node)) return;
+            for (const auto& weak : owner->aliases)
+                if (const auto alias = weak.lock(); alias && alias->shared_payload == owner &&
+                    TryGetNodeLockedNormalized(c, alias->path) == alias) return;
+        }
+        if (!owner) return;
+        MutationCallbackScope mutation_scope(c);
+        RetireUnlinkedPayloadBestEffort(c, owner);
+    }};
+    const auto can_complete_stream_base_delete_locked = [&]()
     {
+        // A stream contributes accounting, never base delete authority. Only a
+        // retained context for this exact node may finish a base Cleanup latch.
+        // A pending (but unlatched) intent still belongs to its base context.
+        return c && lifetime_was_accounted && o->node &&
+            o->node->node_kind == NodeKind::RegularFile && !o->node->namespace_detached &&
+            o->node->delete_latched && o->node->open_handle_count == 0 &&
+            o->node->live_context_count == 0 &&
+            TryGetNodeLockedNormalized(c, o->node->path) == o->node;
+    };
+    if (o->named_stream)
+    {
+        // Closing the exact ADS handle completes its stream disposition even
+        // during drain. Base completion needs separate, already-latched authority.
+        bool complete_base_delete = false;
+        if (c)
+        {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            if (NT_SUCCESS(ValidateLocalNamedStreamHandle(o)))
+                o->stream_size = RememberNamedStreamSizeFromHandleLocked(c, o->node, o->stream_name, o->file);
+            const auto file = o->file.exchange(INVALID_HANDLE_VALUE);
+            if (file != INVALID_HANDLE_VALUE && !CloseHandle(file))
+                TraceMove(c, L"Close stream handle failed: " + FormatNtStatus(LocalNamedStreamError(GetLastError())));
+            ReleaseOpenContextAccountingLocked(c, o);
+            RetireOpenContextLifetimeLocked(o);
+            complete_base_delete = can_complete_stream_base_delete_locked();
+        }
+        else
+        {
+            const auto file = o->file.exchange(INVALID_HANDLE_VALUE);
+            if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+        }
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+        if (g_close_retirement_test_hook) g_close_retirement_test_hook(o);
+#endif
+        if (!complete_base_delete)
+        {
+            delete o;
+            return;
+        }
+    }
+    if (TryFastCloseNonMutatingContext(c, o, true))
+    {
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+        if (g_close_retirement_test_hook) g_close_retirement_test_hook(o);
+#endif
         delete o;
         return;
     }
+
+    if (!o->named_stream && c && o->node)
+    {
+        const auto file = o->file.exchange(INVALID_HANDLE_VALUE);
+        if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+        std::lock_guard<std::mutex> lock(c->mutex);
+        ReleaseOpenContextAccountingLocked(c, o);
+        RetireOpenContextLifetimeLocked(o);
+    }
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+    if (!o->named_stream && g_close_retirement_test_hook) g_close_retirement_test_hook(o);
+#endif
 
     ExternalMutationRequestScope mutation_request_scope(c);
     if (!mutation_request_scope.Acquired())
@@ -20288,9 +25112,17 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
                 o->delete_on_cleanup = false;
             }
             o->delete_on_close_requested = false;
-            o->node->delete_latched = false;
-            o->node->delete_requested_after_children = false;
-            o->node->caller_delete_retry_required = false;
+            if (o->node->live_context_count == 0 && o->node->closing_context_count <= 1)
+            {
+                o->node->cancel_delete_after_closes = false;
+                o->node->delete_latched = false;
+                o->node->delete_requested_after_children = false;
+                o->node->caller_delete_retry_required = false;
+            }
+            else if (o->node->delete_latched)
+            {
+                o->node->cancel_delete_after_closes = true;
+            }
             RefreshDeletePendingStateLocked(c, o->node);
         }
         delete o;
@@ -20298,13 +25130,24 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
     }
 
     MutationCallbackScope mutation_scope(c);
+    if (!NT_SUCCESS(DrainDeferredAccessTimes(c)))
+    {
+        delete o;
+        return;
+    }
+    if (o->named_stream)
+    {
+        // Recheck after admission and serialization; retain the existing base
+        // identity checks, rollback/WAL, drain and alias-retirement machinery.
+        std::lock_guard<std::mutex> lock(c->mutex);
+        if (!can_complete_stream_base_delete_locked())
+        {
+            delete o;
+            return;
+        }
+    }
     if (o->file != INVALID_HANDLE_VALUE)
     {
-        if (o->named_stream)
-        {
-            std::lock_guard<std::mutex> lock(c->mutex);
-            o->stream_size = RememberNamedStreamSizeFromHandleLocked(c, o->node, o->stream_name, o->file);
-        }
         CloseHandle(o->file);
         o->file = INVALID_HANDLE_VALUE;
     }
@@ -20319,8 +25162,8 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
         std::wstring leaf;
         LocalFileRollbackSnapshot file_snapshot;
         std::vector<DeleteRollbackSubtreeEntry> subtree_snapshots;
-        apfsaccess::rw::MetadataStore::PayloadIdentity staged_identity{};
         bool metadata_staged = false;
+        std::vector<apfsaccess::rw::TransactionManager::MutationIntent> journal_mutations;
         bool journal_recorded = false;
     };
     std::vector<DeleteClosePlan> delete_plans;
@@ -20328,10 +25171,10 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
     bool can_remove_on_close = false;
     std::shared_ptr<Node> delete_root;
     std::vector<std::shared_ptr<Node>> delete_postorder;
-    apfsaccess::rw::MetadataStore::PayloadIdentity delete_identity{};
+    std::vector<apfsaccess::rw::TransactionManager::MutationIntent> delete_mutations;
     std::shared_ptr<Node> deferred_delete_root;
     std::vector<std::shared_ptr<Node>> deferred_delete_postorder;
-    apfsaccess::rw::MetadataStore::PayloadIdentity deferred_delete_identity{};
+    std::vector<apfsaccess::rw::TransactionManager::MutationIntent> deferred_delete_mutations;
     const auto release_delete_on_cleanup_locked = [&]()
     {
         if (o->delete_on_cleanup)
@@ -20344,15 +25187,43 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
             RefreshDeletePendingStateLocked(c, o->node);
         }
     };
+    const auto restore_delete_plans = [&]()
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        for (auto it = delete_plans.rbegin(); it != delete_plans.rend(); ++it)
+        {
+            DeferredDeleteRollbackPlan rollback_plan{};
+            rollback_plan.emit = it->emit;
+            rollback_plan.path = std::move(it->path);
+            rollback_plan.node = std::move(it->node);
+            rollback_plan.parent = std::move(it->parent);
+            rollback_plan.leaf = std::move(it->leaf);
+            rollback_plan.file_snapshot = std::move(it->file_snapshot);
+            rollback_plan.subtree_snapshots = std::move(it->subtree_snapshots);
+            RestoreDeleteRollbackPlanLocked(c, rollback_plan);
+            DiscardDeleteRollbackPlanSnapshots(rollback_plan, false);
+        }
+    };
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    const auto reject_delete_preparation = [&](bool metadata_staged)
+    {
+        const bool unjournaled = metadata_staged || ManifestQueuedRequestCount(c) != 0 ||
+            std::any_of(delete_plans.begin(), delete_plans.end(), [](const auto& plan) { return plan.metadata_staged; });
+        if (unjournaled) (void)BlockNativeMutationAfterStagingFailure(c, L"DeleteRollbackCapture", true);
+        restore_delete_plans();
+        if (unjournaled) AbortMutationJournalBestEffort(c, L"DeleteRollbackCapture");
+    };
+#endif
     if (c && o->node)
     {
         std::lock_guard<std::mutex> lock(c->mutex);
         remove_requested_on_close =
-            o->delete_on_cleanup ||
+            TryGetNodeLockedNormalized(c, o->node->path) == o->node &&
+            (o->delete_on_cleanup ||
             o->node->delete_latched ||
             (o->node->is_directory &&
                 o->node->delete_requested_after_children &&
-                !o->node->caller_delete_retry_required);
+                !o->node->caller_delete_retry_required));
         if (o->delete_on_cleanup)
         {
             had_delete_on_cleanup = true;
@@ -20363,6 +25234,11 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
         can_remove_on_close =
             remove_requested_on_close &&
             o->node->path != L"\\" &&
+            // Cleanup accounting is not handle lifetime. A base Close also
+            // has to leave a latched unlink for any cleaned but live ADS/base
+            // contexts, just as the retained-stream branch does above.
+            !(o->node->node_kind == NodeKind::RegularFile && o->node->delete_latched &&
+                o->node->live_context_count != 0) &&
             CollectRemovableNodePostorderLocked(c, o->node, delete_postorder);
         if (remove_requested_on_close && can_remove_on_close)
         {
@@ -20387,8 +25263,8 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
                 c,
                 delete_postorder,
                 nullptr,
-                &delete_identity,
-                &native_delete_metadata_staged);
+                &native_delete_metadata_staged,
+                &delete_mutations);
         }
         if (!native_delete_staged)
         {
@@ -20411,7 +25287,7 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
 #endif
         {
             bool local_delete_completed = false;
-            std::lock_guard<std::mutex> lock(c->mutex);
+            std::unique_lock<std::mutex> lock(c->mutex);
             if (TryGetNodeLockedNormalized(c, delete_root->path) == delete_root)
             {
                 const auto plan_path = delete_root->path;
@@ -20431,11 +25307,16 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
                         preserve_hydration_in_place,
                         plan.subtree_snapshots))
                 {
+                    release_delete_on_cleanup_locked();
                     delete_root->delete_latched = false;
                     delete_root->delete_pending = false;
                     delete_root->delete_requested_after_children = false;
                     delete_root->caller_delete_retry_required = false;
                     RefreshDeletePendingStateLocked(c, delete_root);
+                    lock.unlock();
+#ifdef APFSACCESS_HAS_RW_ENGINE
+                    reject_delete_preparation(native_delete_metadata_staged);
+#endif
                     delete o;
                     return;
                 }
@@ -20471,7 +25352,7 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
                     plan.node = delete_root;
                     plan.parent = parent;
                     plan.leaf = leaf;
-                    plan.staged_identity = delete_identity;
+                    plan.journal_mutations = std::move(delete_mutations);
                     plan.metadata_staged = native_delete_metadata_staged;
                     if (plan.subtree_snapshots.size() == 1)
                     {
@@ -20525,8 +25406,9 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
                     c,
                     deferred_delete_postorder,
                     nullptr,
-                    &deferred_delete_identity,
-                    &native_delete_metadata_staged);
+                    &native_delete_metadata_staged,
+                    &deferred_delete_mutations,
+                    !delete_plans.empty());
             }
             if (!native_delete_staged)
             {
@@ -20548,7 +25430,7 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
             if (native_delete_staged || benign_stale_native_delete)
 #endif
             {
-                std::lock_guard<std::mutex> lock(c->mutex);
+                std::unique_lock<std::mutex> lock(c->mutex);
                 if (TryGetNodeLockedNormalized(c, deferred_delete_root->path) == deferred_delete_root)
                 {
                     const auto plan_path = deferred_delete_root->path;
@@ -20568,6 +25450,12 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
                         deferred_delete_root->delete_latched = false;
                         deferred_delete_root->delete_pending = false;
                         RefreshDeletePendingStateLocked(c, deferred_delete_root);
+                        lock.unlock();
+#ifdef APFSACCESS_HAS_RW_ENGINE
+                        reject_delete_preparation(native_delete_metadata_staged);
+#else
+                        restore_delete_plans();
+#endif
                         delete o;
                         return;
                     }
@@ -20603,7 +25491,7 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
                         plan.node = deferred_delete_root;
                         plan.parent = parent;
                         plan.leaf = leaf;
-                        plan.staged_identity = deferred_delete_identity;
+                        plan.journal_mutations = std::move(deferred_delete_mutations);
                         plan.metadata_staged = native_delete_metadata_staged;
                         if (plan.subtree_snapshots.size() == 1)
                         {
@@ -20636,43 +25524,34 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
                 delete_journal_failed = true;
                 continue;
             }
-            const bool has_identity =
-                plan.staged_identity.object_id != 0 &&
-                plan.staged_identity.generation != 0;
-            plan.journal_recorded = (has_identity || manifest_request_queued) &&
-                RecordMutationBestEffort(
-                c,
-                apfsaccess::rw::TransactionManager::MutationKind::Delete,
-                plan.path,
-                L"",
-                0,
-                0,
-                false,
-                0,
-                0,
-                &plan.staged_identity);
+            if (manifest_request_queued)
+            {
+                // The container hook binds every queued child; the root names
+                // the callback expectation, not the complete journal batch.
+                plan.journal_recorded = RecordMutationBestEffort(c,
+                    apfsaccess::rw::TransactionManager::MutationKind::Delete, plan.path);
+            }
+            else
+            {
+                plan.journal_recorded = !plan.journal_mutations.empty();
+                for (const auto& mutation : plan.journal_mutations)
+                {
+                    const apfsaccess::rw::MetadataStore::PayloadIdentity identity{mutation.object_id, mutation.generation};
+                    if (!RecordMutationBestEffort(c, mutation.kind, mutation.path, L"", 0, 0, false, 0, 0,
+                            &identity, &mutation.unlink_outcome))
+                    {
+                        plan.journal_recorded = false;
+                        break;
+                    }
+                }
+            }
             delete_journal_failed = delete_journal_failed || !plan.journal_recorded;
         }
     }
     if (delete_journal_failed)
     {
         (void)BlockNativeMutationAfterStagingFailure(c, L"Delete", true);
-        {
-            std::lock_guard<std::mutex> lock(c->mutex);
-            for (auto it = delete_plans.rbegin(); it != delete_plans.rend(); ++it)
-            {
-                DeferredDeleteRollbackPlan rollback_plan{};
-                rollback_plan.emit = it->emit;
-                rollback_plan.path = std::move(it->path);
-                rollback_plan.node = std::move(it->node);
-                rollback_plan.parent = std::move(it->parent);
-                rollback_plan.leaf = std::move(it->leaf);
-                rollback_plan.file_snapshot = std::move(it->file_snapshot);
-                rollback_plan.subtree_snapshots = std::move(it->subtree_snapshots);
-                RestoreDeleteRollbackPlanLocked(c, rollback_plan);
-                DiscardDeleteRollbackPlanSnapshots(rollback_plan, false);
-            }
-        }
+        restore_delete_plans();
         AbortMutationJournalBestEffort(c, L"Close");
         delete o;
         return;
@@ -20695,7 +25574,7 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
             delete_plans.end(),
             [](const DeleteClosePlan& plan)
             {
-                return plan.node && !plan.node->is_directory;
+                return plan.node && !IsWindowsDirectory(*plan.node);
             });
     if (can_defer_file_delete_close)
     {
@@ -20708,22 +25587,7 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
                 &mutation_scope))
         {
             (void)BlockNativeMutationAfterStagingFailure(c, L"Delete", true);
-            {
-                std::lock_guard<std::mutex> lock(c->mutex);
-                for (auto it = delete_plans.rbegin(); it != delete_plans.rend(); ++it)
-                {
-                    DeferredDeleteRollbackPlan rollback_plan{};
-                    rollback_plan.emit = it->emit;
-                    rollback_plan.path = std::move(it->path);
-                    rollback_plan.node = std::move(it->node);
-                    rollback_plan.parent = std::move(it->parent);
-                    rollback_plan.leaf = std::move(it->leaf);
-                    rollback_plan.file_snapshot = std::move(it->file_snapshot);
-                    rollback_plan.subtree_snapshots = std::move(it->subtree_snapshots);
-                    RestoreDeleteRollbackPlanLocked(c, rollback_plan);
-                    DiscardDeleteRollbackPlanSnapshots(rollback_plan, false);
-                }
-            }
+            restore_delete_plans();
             AbortMutationJournalBestEffort(c, L"DeleteDeferredAccept");
             delete o;
             return;
@@ -20851,7 +25715,8 @@ bool ReadCommittedFileRangeWithoutMetadataLock(
     std::size_t bytes_to_read,
     std::byte* destination,
     std::size_t destination_size,
-    std::size_t& out_bytes_read)
+    std::size_t& out_bytes_read,
+    std::uint64_t expected_object_id)
 {
     out_bytes_read = 0;
     if (!c || !c->metadata_store)
@@ -20870,8 +25735,13 @@ bool ReadCommittedFileRangeWithoutMetadataLock(
             &c->perf_metadata_mutex_wait,
             &c->perf_metadata_mutex_hold);
         plan = c->metadata_store->SnapshotCommittedFileReadPlan(canonical_path_key);
+        // A candidate only admits the native decoder, including empty/EOF
+        // requests. It never certifies bytes or relaxes mutation admission.
+        if (plan && c->metadata_store->HasUnsupportedContentTransform(plan->object_id) &&
+            !plan->HasCompressionReadCandidate())
+            return false;
     }
-    if (!plan.has_value())
+    if (!plan.has_value() || (expected_object_id != 0 && plan->object_id != expected_object_id))
     {
         return false;
     }
@@ -20900,7 +25770,14 @@ NTSTATUS CB_Read(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG le
     ScopedCallbackActivity callback_scope(c, "Read");
     ScopedPerfTimer perf_scope(c ? &c->perf_read : nullptr);
 
+    if (done) *done = 0;
     auto* o = (OpenContext*)ctx;
+    // A lazy upgrade publishes its handle before clearing fallback. Read the
+    // flag first so false always pairs with the fully published handle.
+    const bool metadata_read_fallback = o && o->metadata_read_fallback.load(std::memory_order_acquire);
+    HANDLE payload_file = o ? o->file.load(std::memory_order_acquire) : INVALID_HANDLE_VALUE;
+    HANDLE detached_read = INVALID_HANDLE_VALUE;
+    ScopeExit close_detached_read{[&]() { if (detached_read != INVALID_HANDLE_VALUE) CloseHandle(detached_read); }};
     const auto trace_return = [&](NTSTATUS status, const std::wstring& detail = std::wstring()) -> NTSTATUS
     {
         if (IsHostMoveTraceEnabled())
@@ -20914,8 +25791,8 @@ NTSTATUS CB_Read(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG le
             {
                 message << L" path='" << o->node->path << L"'"
                         << L" allowRead=" << (o->allow_read_data ? L"1" : L"0")
-                        << L" metadataFallback=" << (o->metadata_read_fallback ? L"1" : L"0")
-                        << L" fileHandle=" << (o->file != INVALID_HANDLE_VALUE ? L"1" : L"0");
+                        << L" metadataFallback=" << (metadata_read_fallback ? L"1" : L"0")
+                        << L" fileHandle=" << (payload_file != INVALID_HANDLE_VALUE ? L"1" : L"0");
             }
             if (!detail.empty())
             {
@@ -20925,18 +25802,99 @@ NTSTATUS CB_Read(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG le
         }
         return status;
     };
-    if (!o || !o->node || o->node->is_directory || !buf || !done)
+    if (!o || !o->node || (o->node->is_directory && !o->native_xattr) || !buf || !done)
     {
         return trace_return(STATUS_INVALID_PARAMETER, L"invalid-args");
+    }
+    if (o->node->node_kind != NodeKind::RegularFile && !(o->native_xattr && o->node->is_directory))
+    {
+        return trace_return(STATUS_INVALID_DEVICE_REQUEST, L"non-regular-node");
     }
     if (!o->allow_read_data)
     {
         return trace_return(STATUS_ACCESS_DENIED, L"permission");
     }
+    if (o->native_xattr)
+    {
+        MutationCallbackScope mutation(c);
+        std::vector<std::byte> bytes;
+        std::uint64_t size = 0;
+        const auto status = NativeXattrValue(c, o, off, len, bytes, size);
+        if (!NT_SUCCESS(status)) return status;
+        if (!bytes.empty()) std::memcpy(buf, bytes.data(), bytes.size());
+        *done = static_cast<ULONG>(bytes.size());
+        return STATUS_SUCCESS;
+    }
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
+    if (!o->named_stream && c && c->metadata_store &&
+        HasUnsupportedDefaultContentTransform(c, o->node, false))
+    {
+        std::wstring path;
+        std::uint64_t object_id = 0;
+        {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            path = CommittedReadPathForNodeLocked(c, *o->node);
+            object_id = o->node->object_id;
+        }
+        // Compressed DEFAULT data has no mutable overlay. Always validate the
+        // authoritative plan, even at EOF and on retained cache-backed handles;
+        // never return hydration/spool bytes or pad a short decode with zeros.
+        std::size_t bytes_read = 0;
+        if (object_id == 0 || !ReadCommittedFileRangeWithoutMetadataLock(c,
+                LowerPathKey(c, path), path, off, len,
+                reinterpret_cast<std::byte*>(buf), len, bytes_read, object_id))
+            return trace_return(STATUS_NOT_SUPPORTED, L"compressed-plan-read-failed");
+        *done = static_cast<ULONG>(bytes_read);
+        return trace_return(STATUS_SUCCESS, L"compressed-plan-read");
+    }
     if (!o->named_stream && c && c->metadata_store)
     {
+        bool empty_or_eof = false;
+        {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            empty_or_eof = len == 0 || off >= o->node->file_size;
+        }
+        if (empty_or_eof) return trace_return(STATUS_SUCCESS, L"empty-or-eof");
+    }
+#endif
+
+    std::wstring data_path, committed_read_path;
+    std::uint64_t visible_size = 0, expected_object_id = 0;
+    bool authoritative_read = metadata_read_fallback;
+    {
+        std::unique_lock<std::mutex> lock;
+        if (c) lock = std::unique_lock<std::mutex>(c->mutex);
+        data_path = CurrentDataPathForNodeLocked(c, *o->node);
+        committed_read_path = CommittedReadPathForNodeLocked(c, *o->node);
+        visible_size = o->node->file_size;
+        expected_object_id = o->node->object_id;
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        // A cleaned-up single-name context can retain an older cache handle
+        // after another open republishes hydration and clears its stale flag.
+        authoritative_read = authoritative_read || (c && c->metadata_store &&
+            o->cleanup_seen && !o->named_stream && !o->node->shared_payload);
+#endif
+        if (payload_file == INVALID_HANDLE_VALUE && o->node->namespace_detached && o->node->shared_payload &&
+            !o->named_stream && !HasUnrestoredHydrationLocked(c, o->node) && !IsHydrationStaleLocked(c, o->node))
+        {
+            detached_read = CreateFileW(HydrationPath(c, *o->node).c_str(), GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            payload_file = detached_read;
+        }
+    }
+
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (!o->named_stream && c && c->metadata_store && !data_path.empty())
+    {
+        // Pending truncation is visible before its checkpoint is published;
+        // neither an older APFS projection nor a local alias cache extends EOF.
+        if (off >= visible_size)
+        {
+            *done = 0;
+            return trace_return(STATUS_SUCCESS, L"visible-eof");
+        }
+        len = static_cast<ULONG>((std::min)(static_cast<std::uint64_t>(len), visible_size - off));
         const auto is_hydration_stale = [&]()
         {
             std::lock_guard<std::mutex> lock(c->mutex);
@@ -20944,7 +25902,7 @@ NTSTATUS CB_Read(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG le
         };
         const auto has_dirty_payload_read_state = [&]()
         {
-            return o->metadata_read_fallback ||
+            return authoritative_read ||
                 c->pending_native_writes.load(std::memory_order_acquire) ||
                 c->recovery_active.load(std::memory_order_acquire) ||
                 c->write_degraded.load(std::memory_order_acquire) ||
@@ -20955,22 +25913,24 @@ NTSTATUS CB_Read(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG le
         {
             const auto serve_stale_or_deferred_spool_read = [&]() -> std::optional<std::size_t>
             {
-                const auto committed_read_path = SnapshotCommittedReadPathForNode(c, o->node);
-                const auto visible_path_key = NodePathKey(c, *o->node);
+                const auto visible_path_key = LowerPathKey(c, data_path);
                 const auto committed_read_path_key = LowerPathKey(c, committed_read_path);
-                const auto payload_spool_identities = ResolvePayloadSpoolIdentitiesForCanonicalKeys(
+                auto payload_spool_identities = ResolvePayloadSpoolIdentitiesForCanonicalKeys(
                     c,
-                    o->node->path,
+                    data_path,
                     visible_path_key,
                     committed_read_path,
                     committed_read_path_key,
                     o);
+                for (auto* identity : {&payload_spool_identities.visible, &payload_spool_identities.committed})
+                    if (*identity && expected_object_id != 0 && (*identity)->object_id != expected_object_id)
+                        identity->reset();
                 std::size_t bytes_read = 0;
                 if (ReadPayloadSpoolRangeIfFullyCoveredForReadPathsWithIdentities(
                         c,
-                        o->node->path,
+                        data_path,
                         payload_spool_identities,
-                        o->node->file_size,
+                        visible_size,
                         off,
                         len,
                         reinterpret_cast<std::byte*>(buf),
@@ -20988,7 +25948,8 @@ NTSTATUS CB_Read(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG le
                     static_cast<std::size_t>(len),
                     reinterpret_cast<std::byte*>(buf),
                     static_cast<std::size_t>(len),
-                    bytes_read);
+                    bytes_read,
+                    expected_object_id);
                 if (!read_ok)
                 {
                     return std::nullopt;
@@ -21005,7 +25966,7 @@ NTSTATUS CB_Read(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG le
                 std::uint64_t spool_logical_end = 0;
                 if (!OverlayPayloadSpoolForReadPathsWithIdentitiesAndLogicalEnd(
                         c,
-                        o->node->path,
+                        data_path,
                         payload_spool_identities,
                         off,
                         reinterpret_cast<std::byte*>(buf),
@@ -21042,7 +26003,7 @@ NTSTATUS CB_Read(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG le
                 }
             }
 
-            if (o->metadata_read_fallback)
+            if (authoritative_read)
             {
                 const auto bytes_read = serve_stale_or_deferred_spool_read();
                 if (!bytes_read.has_value())
@@ -21058,11 +26019,22 @@ NTSTATUS CB_Read(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG le
     }
 #endif
 
-    if (o->file != INVALID_HANDLE_VALUE)
+    std::unique_lock<std::mutex> stream_lock;
+    if (c)
+    {
+        stream_lock = std::unique_lock<std::mutex>(c->mutex);
+        if (HasUnrestoredHydrationLocked(c, o->node))
+        {
+            *done = 0;
+            return trace_return(STATUS_IO_DEVICE_ERROR, L"unrestored-hydration");
+        }
+        if (!o->named_stream) stream_lock.unlock();
+    }
+    if (payload_file != INVALID_HANDLE_VALUE)
     {
         OVERLAPPED ov{}; ov.Offset = (DWORD)(off & 0xffffffffull); ov.OffsetHigh = (DWORD)(off >> 32);
         DWORD read = 0;
-        if (!ReadFile(o->file, buf, len, &read, &ov))
+        if (!ReadFile(payload_file, buf, len, &read, &ov))
         {
             auto e = GetLastError();
             *done = 0;
@@ -21072,8 +26044,8 @@ NTSTATUS CB_Read(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG le
             }
             return trace_return(STATUS_UNSUCCESSFUL, L"readfile");
         }
-        const auto needs_payload_overlay = c &&
-            (o->metadata_read_fallback ||
+        const auto needs_payload_overlay = c && !data_path.empty() && !o->node->shared_payload &&
+            (metadata_read_fallback ||
              c->pending_native_writes.load(std::memory_order_acquire) ||
              c->recovery_active.load(std::memory_order_acquire) ||
              c->write_degraded.load(std::memory_order_acquire) ||
@@ -21082,18 +26054,19 @@ NTSTATUS CB_Read(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG le
             needs_payload_overlay &&
             [&]()
             {
-                const auto visible_path_key = NodePathKey(c, *o->node);
+                const auto visible_path_key = LowerPathKey(c, data_path);
                 const auto payload_spool_identity = ResolvePayloadSpoolIdentitiesForCanonicalKeys(
                     c,
-                    o->node->path,
+                    data_path,
                     visible_path_key,
-                    o->node->path,
+                    data_path,
                     visible_path_key,
                     o).visible;
                 return payload_spool_identity.has_value() &&
+                    (expected_object_id == 0 || payload_spool_identity->object_id == expected_object_id) &&
                     !OverlayPayloadSpoolBestEffort(
                         c,
-                        o->node->path,
+                        data_path,
                         *payload_spool_identity,
                         off,
                         reinterpret_cast<std::byte*>(buf),
@@ -21118,7 +26091,12 @@ NTSTATUS CB_GetFileInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, FSP_FSCTL_FILE_INFO* inf
     ScopedPerfTimer perf_scope(c ? &c->perf_get_file_info : nullptr);
     auto* o = (OpenContext*)ctx;
     if (!c || !o || !o->node || !info) return STATUS_INVALID_PARAMETER;
-    FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
+    if (o->native_xattr)
+    {
+        MutationCallbackScope mutation(c);
+        return NativeXattrInfo(c, o, info);
+    }
+    FillInfo(*o->node, ReportsReadOnly(c), info);
     return STATUS_SUCCESS;
 }
 
@@ -21132,19 +26110,6 @@ NTSTATUS CB_Flush(FSP_FILE_SYSTEM* fs, PVOID ctx, FSP_FSCTL_FILE_INFO* info)
     const bool volume_flush = o == nullptr;
     if (!c || (!volume_flush && (!o->node || !info))) return STATUS_INVALID_PARAMETER;
     MutationCallbackScope mutation_scope(c);
-
-    if (!volume_flush && o->named_stream)
-    {
-        if (o->file != INVALID_HANDLE_VALUE)
-        {
-            FlushFileBuffers(o->file);
-            std::lock_guard<std::mutex> lock(c->mutex);
-            o->stream_size = RememberNamedStreamSizeFromHandleLocked(c, o->node, o->stream_name, o->file);
-        }
-        FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
-        return STATUS_SUCCESS;
-    }
-
     std::optional<ExternalMutationRequestScope> mutation_request_scope;
     if (IsMutationWriteEnabled(c))
     {
@@ -21153,6 +26118,30 @@ NTSTATUS CB_Flush(FSP_FILE_SYSTEM* fs, PVOID ctx, FSP_FSCTL_FILE_INFO* info)
         {
             return STATUS_VOLUME_DISMOUNTED;
         }
+    }
+
+    const auto atime_status = DrainDeferredAccessTimes(c);
+    if (!NT_SUCCESS(atime_status)) return atime_status;
+
+    if (c->unjournaled_native_mutation.load(std::memory_order_acquire))
+    {
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    }
+
+    if (!volume_flush && o->native_xattr && c->write_degraded)
+        return STATUS_MEDIA_WRITE_PROTECTED;
+
+    if (!volume_flush && o->named_stream && !o->native_xattr)
+    {
+        std::lock_guard<std::mutex> stream_lock(c->mutex);
+        if (HasUnrestoredHydrationLocked(c, o->node)) return STATUS_IO_DEVICE_ERROR;
+        if (o->file != INVALID_HANDLE_VALUE)
+        {
+            FlushFileBuffers(o->file);
+            o->stream_size = RememberNamedStreamSizeFromHandleLocked(c, o->node, o->stream_name, o->file);
+        }
+        FillInfo(*o->node, ReportsReadOnly(c), info);
+        return STATUS_SUCCESS;
     }
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
@@ -21174,9 +26163,374 @@ NTSTATUS CB_Flush(FSP_FILE_SYSTEM* fs, PVOID ctx, FSP_FSCTL_FILE_INFO* info)
 #endif
     if (!volume_flush)
     {
-        FillInfo(*o->node, !IsMutationWriteEnabled(c), info);
+        if (o->native_xattr) return NativeXattrInfo(c, o, info);
+        FillInfo(*o->node, ReportsReadOnly(c), info);
     }
     return STATUS_SUCCESS;
+}
+
+NTSTATUS CopySymbolicLinkTarget(const Node& node, PVOID buffer, PSIZE_T size)
+{
+    if (node.node_kind != NodeKind::SymbolicLink || node.symlink_target.empty())
+    {
+        return STATUS_NOT_A_REPARSE_POINT;
+    }
+    if (!size)
+    {
+        return buffer == nullptr ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
+    }
+
+    const SIZE_T header_size = FIELD_OFFSET(REPARSE_DATA_BUFFER, SymbolicLinkReparseBuffer.PathBuffer);
+    if (node.symlink_target.size() > (MAXIMUM_REPARSE_DATA_BUFFER_SIZE - header_size) / (2 * sizeof(wchar_t)) ||
+        node.symlink_target.find_first_of(L"\\:") != std::wstring::npos ||
+        node.symlink_target.find(L'\0') != std::wstring::npos)
+    {
+        return STATUS_IO_REPARSE_DATA_INVALID;
+    }
+    const auto name_bytes = node.symlink_target.size() * sizeof(wchar_t);
+    const auto required = header_size + 2 * name_bytes;
+    if (!buffer || *size < required)
+    {
+        *size = required;
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    auto substitute = node.symlink_target;
+    std::replace(substitute.begin(), substitute.end(), L'/', L'\\');
+    REPARSE_DATA_BUFFER header{};
+    header.ReparseTag = IO_REPARSE_TAG_SYMLINK;
+    header.ReparseDataLength = static_cast<USHORT>(required - REPARSE_DATA_BUFFER_HEADER_SIZE);
+    auto& symbolic = header.SymbolicLinkReparseBuffer;
+    symbolic.SubstituteNameLength = static_cast<USHORT>(name_bytes);
+    symbolic.PrintNameOffset = static_cast<USHORT>(name_bytes);
+    symbolic.PrintNameLength = static_cast<USHORT>(name_bytes);
+    // Rooted POSIX paths stay inside this filesystem; never expose them as
+    // absolute NT device paths. The stored APFS target/print name is untouched.
+    symbolic.Flags = SYMLINK_FLAG_RELATIVE;
+    std::memcpy(buffer, &header, header_size);
+    auto* names = static_cast<std::byte*>(buffer) + header_size;
+    std::memcpy(names, substitute.data(), name_bytes);
+    std::memcpy(names + name_bytes, node.symlink_target.data(), name_bytes);
+    *size = required;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS GetReparsePointByName(
+    FSP_FILE_SYSTEM* fs,
+    PVOID context,
+    PWSTR file_name,
+    BOOLEAN,
+    PVOID buffer,
+    PSIZE_T size)
+{
+    auto* c = context
+        ? static_cast<MountContext*>(context)
+        : Ctx(fs);
+    if (!c || !file_name)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    const auto node = FindNodeNormalized(c, NormalizePath(file_name));
+    std::lock_guard<std::mutex> lock(c->mutex);
+    return node
+        ? CopySymbolicLinkTarget(*node, buffer, size)
+        : STATUS_OBJECT_NAME_NOT_FOUND;
+}
+
+NTSTATUS CB_ResolveReparsePoints(
+    FSP_FILE_SYSTEM* fs,
+    PWSTR file_name,
+    UINT32 reparse_point_index,
+    BOOLEAN resolve_last_path_component,
+    PIO_STATUS_BLOCK io_status,
+    PVOID buffer,
+    PSIZE_T size)
+{
+    auto* c = Ctx(fs);
+    ScopedCallbackActivity callback_scope(c, "ResolveReparsePoints");
+    if (!c || !c->api.ResolveReparsePoints || !file_name || !io_status || !size)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    return c->api.ResolveReparsePoints(
+        fs,
+        GetReparsePointByName,
+        c,
+        file_name,
+        reparse_point_index,
+        resolve_last_path_component,
+        io_status,
+        buffer,
+        size);
+}
+
+NTSTATUS CB_GetReparsePoint(
+    FSP_FILE_SYSTEM* fs,
+    PVOID file_context,
+    PWSTR file_name,
+    PVOID buffer,
+    PSIZE_T size)
+{
+    auto* c = Ctx(fs);
+    ScopedCallbackActivity callback_scope(c, "GetReparsePoint");
+    if (!c)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (auto* open = static_cast<OpenContext*>(file_context);
+        open && open->node)
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        return CopySymbolicLinkTarget(*open->node, buffer, size);
+    }
+    return GetReparsePointByName(
+        fs, c, file_name, FALSE, buffer, size);
+}
+
+NTSTATUS DecodeSymbolicLinkMutationBuffer(
+    const Arguments& args, PVOID buffer, SIZE_T size, bool removing, std::wstring& target)
+{
+    target.clear();
+    const SIZE_T base_size = REPARSE_DATA_BUFFER_HEADER_SIZE;
+    const SIZE_T names_offset = FIELD_OFFSET(REPARSE_DATA_BUFFER, SymbolicLinkReparseBuffer.PathBuffer);
+    if (!buffer || size < base_size || size > MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
+        return STATUS_IO_REPARSE_DATA_INVALID;
+    REPARSE_DATA_BUFFER header{};
+    std::memcpy(&header, buffer, base_size);
+    if (header.ReparseTag != IO_REPARSE_TAG_SYMLINK)
+        return STATUS_IO_REPARSE_TAG_MISMATCH;
+    if (header.Reserved != 0 || header.ReparseDataLength != size - base_size)
+        return STATUS_IO_REPARSE_DATA_INVALID;
+    if (removing)
+        return size == base_size ? STATUS_SUCCESS : STATUS_IO_REPARSE_DATA_INVALID;
+    if (size < names_offset)
+        return STATUS_IO_REPARSE_DATA_INVALID;
+    std::memcpy(&header, buffer, names_offset);
+    const auto& link = header.SymbolicLinkReparseBuffer;
+    if ((link.Flags & ~SYMLINK_FLAG_RELATIVE) != 0)
+        return STATUS_IO_REPARSE_DATA_INVALID;
+    const auto read_name = [&](USHORT offset, USHORT length, std::wstring& name)
+    {
+        const auto available = size - names_offset;
+        if (offset % sizeof(wchar_t) || length % sizeof(wchar_t) ||
+            offset > available || length > available - offset)
+            return false;
+        name.resize(length / sizeof(wchar_t));
+        std::memcpy(name.data(), static_cast<const std::byte*>(buffer) + names_offset + offset, length);
+        std::wstring round_trip;
+        return name.find(L'\0') == std::wstring::npos &&
+            (name.empty() || (TryUtf8ToWideStrict(WideToUtf8(name), round_trip) && round_trip == name));
+    };
+    std::wstring substitute, print;
+    if (!read_name(link.SubstituteNameOffset, link.SubstituteNameLength, substitute) ||
+        !read_name(link.PrintNameOffset, link.PrintNameLength, print) || substitute.empty())
+        return STATUS_IO_REPARSE_DATA_INVALID;
+    if ((link.Flags & SYMLINK_FLAG_RELATIVE) == 0)
+    {
+        // Translate only this mount's absolute Windows namespace to an APFS
+        // volume-rooted target. Cross-volume/UNC targets need explicit routing.
+        auto mount = args.mount;
+        while (mount.size() > 2 && mount.back() == L'\\') mount.pop_back();
+        const auto prefix = L"\\??\\" + mount;
+        if (mount.empty() || substitute.size() <= prefix.size() ||
+            _wcsnicmp(substitute.c_str(), prefix.c_str(), prefix.size()) != 0 ||
+            substitute[prefix.size()] != L'\\')
+            return STATUS_NOT_SUPPORTED;
+        substitute.erase(0, prefix.size());
+        print.clear();
+    }
+    if (substitute.starts_with(L"\\\\") || substitute.find(L':') != std::wstring::npos)
+        return STATUS_NOT_SUPPORTED;
+    auto projected_print = print;
+    std::replace(projected_print.begin(), projected_print.end(), L'/', L'\\');
+    target = !print.empty() && print.find(L'\\') == std::wstring::npos && projected_print == substitute
+        ? print : substitute;
+    std::replace(target.begin(), target.end(), L'\\', L'/');
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS MutateSymbolicLinkReparsePoint(
+    FSP_FILE_SYSTEM* fs, PVOID file_context, PWSTR file_name, PVOID buffer, SIZE_T size, bool removing)
+{
+    auto* c = Ctx(fs);
+    auto* open = static_cast<OpenContext*>(file_context);
+    const auto* origin = removing ? L"DeleteReparsePoint" : L"SetReparsePoint";
+    ScopedCallbackActivity callback_scope(c, removing ? "DeleteReparsePoint" : "SetReparsePoint");
+    if (!c || !open || !open->node || !file_name) return STATUS_INVALID_PARAMETER;
+    ExternalMutationRequestScope request_scope(c);
+    if (!request_scope.Acquired()) return STATUS_VOLUME_DISMOUNTED;
+    MutationCallbackScope mutation_scope(c);
+    const auto atime_status = DrainDeferredAccessTimes(c);
+    if (!NT_SUCCESS(atime_status)) return atime_status;
+    if (!IsMutationWriteEnabled(c)) return HandleMutationWriteDisabled(c, origin);
+    if (!open->allow_write_data && !open->allow_append_data && !open->allow_set_basic_info)
+        return STATUS_ACCESS_DENIED;
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (!IsNativeWriteEnabled(c) || !c->metadata_store || !c->tx_manager) return STATUS_NOT_SUPPORTED;
+    std::wstring target;
+    const auto decoded = DecodeSymbolicLinkMutationBuffer(c->args, buffer, size, removing, target);
+    if (!NT_SUCCESS(decoded)) return decoded;
+    std::wstring path;
+    std::uint64_t object_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        path = open->node->path;
+        object_id = open->node->object_id;
+        if (!IsSameNormalizedPath(c, NormalizePath(file_name), path)) return STATUS_INVALID_PARAMETER;
+        if (TryGetNodeLockedNormalized(c, path) != open->node || IsDeleteBlockedStateLocked(open->node))
+            return STATUS_DELETE_PENDING;
+        if (open->named_stream) return STATUS_NOT_SUPPORTED;
+        if (path == L"\\") return STATUS_ACCESS_DENIED;
+        if (removing && open->node->node_kind != NodeKind::SymbolicLink) return STATUS_NOT_A_REPARSE_POINT;
+        if (!removing && open->node->node_kind != NodeKind::SymbolicLink &&
+            open->node->node_kind != NodeKind::Directory &&
+            (open->node->node_kind != NodeKind::RegularFile || open->node->file_size != 0))
+            return STATUS_INVALID_PARAMETER;
+        if (open->node->is_directory && !open->node->children.empty()) return STATUS_DIRECTORY_NOT_EMPTY;
+    }
+    if (object_id != 0)
+    {
+        std::lock_guard<std::mutex> lock(c->metadata_mutex);
+        const auto inode = c->metadata_store->LookupWorkingInodeByPath(path);
+        if (!inode || inode->object_id != object_id) return STATUS_OBJECT_NAME_NOT_FOUND;
+        bool directory_hint = false;
+        if (!ReadWindowsDirectorySymlink(c->metadata_store->LookupWorkingExtendedAttribute(
+                object_id, kWindowsSymlinkKindName), directory_hint)) return STATUS_NOT_SUPPORTED;
+    }
+    // Create may have returned an identity that exists only in the working tree.
+    // Finish that history before changing its kind; replay must not mistake the
+    // final symlink for proof that a CreateDirectory record is already applied.
+    if (HasPendingNativeMutations(c))
+    {
+        const auto drained = DrainNativeMutationsByPolicy(c, origin, false, true);
+        if (!NT_SUCCESS(drained)) return drained;
+        if (!FinalizeMutationJournalBestEffort(c, origin))
+            return c->write_degraded ? STATUS_MEDIA_WRITE_PROTECTED : STATUS_UNSUCCESSFUL;
+    }
+    using Store = apfsaccess::rw::MetadataStore;
+    bool stored_directory_hint = false;
+    bool directory_link = false;
+    std::uint16_t prior_mode = 0;
+    {
+        std::lock_guard<std::mutex> lock(c->metadata_mutex);
+        const auto inode = c->metadata_store->LookupCommittedInodeByPath(path);
+        if (!inode || (object_id && inode->object_id != object_id)) return STATUS_OBJECT_NAME_NOT_FOUND;
+        object_id = inode->object_id;
+        prior_mode = inode->mode;
+        if (!ReadWindowsDirectorySymlink(c->metadata_store->LookupCommittedExtendedAttribute(
+                object_id, kWindowsSymlinkKindName), stored_directory_hint)) return STATUS_NOT_SUPPORTED;
+        directory_link = inode->is_directory ||
+            (inode->node_type == Store::NodeType::SymbolicLink && stored_directory_hint);
+    }
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        if (TryGetNodeLockedNormalized(c, path) != open->node ||
+            open->node->object_id != object_id || IsDeleteBlockedStateLocked(open->node))
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+    const bool restoring_directory = removing && directory_link;
+    const auto operation = restoring_directory ? Store::MutationOperation::RestoreDirectoryFromSymbolicLink :
+        removing ? Store::MutationOperation::RemoveSymbolicLinkTarget : Store::MutationOperation::SetSymbolicLinkTarget;
+    const bool add_hint = !removing && directory_link && !stored_directory_hint;
+    const bool clear_hint = stored_directory_hint && (restoring_directory || (!removing && !directory_link));
+    const bool change_hint = add_hint || clear_hint;
+    const auto hint_operation = add_hint ? Store::MutationOperation::SetExtendedAttribute
+                                         : Store::MutationOperation::RemoveExtendedAttribute;
+    const std::span<const std::byte> hint_payload = add_hint
+        ? std::span<const std::byte>(kWindowsDirectorySymlinkHint) : std::span<const std::byte>{};
+    const auto batch_limit = change_hint ? WindowsAttributeBatchLimit(c, 2) : 0;
+    Store::PayloadIdentity identity;
+    Store::PayloadIdentity hint_identity;
+    bool staged = false;
+    if (!RecordNativeMutationBestEffort(c, operation, path, target, 0, 0, false, 0, &identity, &staged,
+            nullptr, batch_limit, {}, change_hint))
+    {
+        {
+            std::lock_guard<std::recursive_mutex> lock(c->runtime_state_mutex);
+            if (!staged && c->last_native_mutation_failure_status == L"invalid-request")
+                return STATUS_IO_REPARSE_DATA_INVALID;
+            if (!staged && c->last_native_mutation_failure_status == L"unsupported-operation")
+                return STATUS_NOT_SUPPORTED;
+        }
+        return BlockNativeMutationAfterStagingFailure(c, origin, staged);
+    }
+    if (change_hint)
+    {
+        bool hint_staged = false;
+        if (!RecordNativeMutationBestEffort(c, hint_operation, path, kWindowsSymlinkKindNameWide,
+                0, hint_payload.size(), false, 0, &hint_identity, &hint_staged, nullptr, batch_limit, hint_payload))
+            return BlockNativeMutationAfterStagingFailure(c, origin, true);
+    }
+    // In manifest mode the first journal binder accepts/publishes the entire
+    // queued batch with coordinator-issued identities, including the hint.
+    if (!RecordMutationBestEffort(c, *ManifestJournalKindForOperation(operation), path, target,
+            0, 0, false, 0, 0, &identity))
+        return BlockNativeMutationAfterStagingFailure(c, origin, true);
+    if (change_hint && !IsManifestSession(c) &&
+        !RecordMutationBestEffort(c, *ManifestJournalKindForOperation(hint_operation), path,
+            kWindowsSymlinkKindNameWide, 0, hint_payload.size(), false, 0, 0, &hint_identity, nullptr, hint_payload))
+        return BlockNativeMutationAfterStagingFailure(c, origin, true);
+    const auto committed = DrainNativeMutationsByPolicy(c, origin, false, true);
+    if (!NT_SUCCESS(committed)) return committed;
+    std::optional<Store::InodeRecord> inode;
+    std::optional<UINT32> windows_attributes;
+    bool committed_directory_hint = false;
+    bool committed_hint_valid = true;
+    bool restored_directory_valid = true;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const NativeInodeSecurity>> native_security;
+    {
+        std::lock_guard<std::mutex> lock(c->metadata_mutex);
+        inode = c->metadata_store->LookupCommittedInodeByPath(path);
+        if (inode && !ReadWindowsAttributes(c->metadata_store->LookupCommittedExtendedAttribute(
+                inode->object_id, kWindowsAttributesName), windows_attributes)) return STATUS_NOT_SUPPORTED;
+        if (inode) committed_hint_valid = ReadWindowsDirectorySymlink(c->metadata_store->LookupCommittedExtendedAttribute(
+            inode->object_id, kWindowsSymlinkKindName), committed_directory_hint);
+        if (inode) CaptureCommittedNativeSecurity(*c->metadata_store, *inode, native_security);
+        if (restoring_directory)
+        {
+            const auto children = c->metadata_store->SnapshotCommittedDirectoryChildInodes(object_id);
+            restored_directory_valid = inode && children && children->empty() && inode->link_count == 1 &&
+                inode->directory_entry_count == 0 && inode->logical_size == 0 &&
+                inode->allocation_size.value_or(0) == 0 && inode->data_physical_address == 0 &&
+                inode->mode == static_cast<std::uint16_t>((prior_mode & ~0170000) | 0040000);
+        }
+    }
+    if (!committed_hint_valid || !restored_directory_valid || !inode ||
+        inode->object_id != object_id || inode->is_directory != restoring_directory ||
+        inode->node_type != (restoring_directory ? Store::NodeType::Directory :
+            removing ? Store::NodeType::RegularFile : Store::NodeType::SymbolicLink) ||
+        inode->symlink_target_utf8 != (removing ? std::string{} : WideToUtf8(target)) ||
+        committed_directory_hint != (!removing && directory_link))
+        return BlockNativeMutationAfterStagingFailure(c, origin, true);
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        for (const auto& [key, node] : c->nodes)
+        {
+            if (node == open->node || node->object_id == inode->object_id)
+            {
+                if (!ApplyCommittedInodeMetadataToNode(c, *inode, UtcNow(), node, windows_attributes,
+                        native_security.at(inode->object_id), committed_directory_hint))
+                    return STATUS_IO_REPARSE_DATA_INVALID;
+                MarkHydrationStaleLocked(c, node);
+            }
+        }
+    }
+    if (!FinalizeMutationJournalBestEffort(c, origin))
+        return c->write_degraded ? STATUS_MEDIA_WRITE_PROTECTED : STATUS_UNSUCCESSFUL;
+    MarkOpenContextMutation(open);
+    return STATUS_SUCCESS;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
+NTSTATUS CB_SetReparsePoint(FSP_FILE_SYSTEM* fs, PVOID context, PWSTR name, PVOID buffer, SIZE_T size)
+{
+    return MutateSymbolicLinkReparsePoint(fs, context, name, buffer, size, false);
+}
+
+NTSTATUS CB_DeleteReparsePoint(FSP_FILE_SYSTEM* fs, PVOID context, PWSTR name, PVOID buffer, SIZE_T size)
+{
+    return MutateSymbolicLinkReparsePoint(fs, context, name, buffer, size, true);
 }
 
 NTSTATUS CB_GetSecurityByName(FSP_FILE_SYSTEM* fs, PWSTR file_name, PUINT32 attrs, PSECURITY_DESCRIPTOR sd, SIZE_T* sz)
@@ -21185,9 +26539,17 @@ NTSTATUS CB_GetSecurityByName(FSP_FILE_SYSTEM* fs, PWSTR file_name, PUINT32 attr
     ScopedCallbackActivity callback_scope(c, "GetSecurityByName");
     ScopedPerfTimer perf_scope(c ? &c->perf_get_security_by_name : nullptr);
     if (!c || !sz) return STATUS_INVALID_PARAMETER;
+    if (file_name && c->api.FindReparsePoint &&
+        c->api.FindReparsePoint(
+            fs, GetReparsePointByName, c, file_name, attrs))
+    {
+        return STATUS_REPARSE;
+    }
     auto p = NormalizePath(file_name ? std::wstring(file_name) : L"\\");
     auto stream_path = SplitNamedStreamPathNormalized(p);
     auto lookup_path = stream_path.is_named_stream ? stream_path.base_path : p;
+    std::string native_name;
+    if (DecodeNativeXattrStream(stream_path.stream_name, native_name) < 0) return STATUS_OBJECT_NAME_INVALID;
     auto n = FindNodeNormalized(c, lookup_path);
     if (!n)
     {
@@ -21208,23 +26570,42 @@ NTSTATUS CB_GetSecurityByName(FSP_FILE_SYSTEM* fs, PWSTR file_name, PUINT32 attr
     }
     if (attrs)
     {
-        *attrs = BuildFileAttributes(*n, !IsMutationWriteEnabled(c));
+        *attrs = BuildFileAttributes(*n, ReportsReadOnly(c));
+        if (DecodeNativeXattrStream(stream_path.stream_name, native_name) == 1)
+            *attrs &= ~FILE_ATTRIBUTE_DIRECTORY;
     }
-    if (!sd || *sz < c->sd_size) { *sz = c->sd_size; return STATUS_BUFFER_OVERFLOW; }
-    std::memcpy(sd, c->sd, c->sd_size);
-    *sz = c->sd_size;
+    std::shared_ptr<const NativeInodeSecurity> security;
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        security = VisibleNativeSecurity(*n);
+    }
+    std::span<const std::byte> descriptor;
+    const auto status = ResolveWindowsSecurity(security.get(), c->sd, c->sd_size, descriptor);
+    if (!NT_SUCCESS(status)) return status;
+    if (!sd || *sz < descriptor.size()) { *sz = descriptor.size(); return STATUS_BUFFER_OVERFLOW; }
+    std::memcpy(sd, descriptor.data(), descriptor.size());
+    *sz = descriptor.size();
     return STATUS_SUCCESS;
 }
 
-NTSTATUS CB_GetSecurity(FSP_FILE_SYSTEM* fs, PVOID, PSECURITY_DESCRIPTOR sd, SIZE_T* sz)
+NTSTATUS CB_GetSecurity(FSP_FILE_SYSTEM* fs, PVOID ctx, PSECURITY_DESCRIPTOR sd, SIZE_T* sz)
 {
     auto* c = Ctx(fs);
     ScopedCallbackActivity callback_scope(c, "GetSecurity");
     ScopedPerfTimer perf_scope(c ? &c->perf_get_security : nullptr);
-    if (!c || !sz) return STATUS_INVALID_PARAMETER;
-    if (!sd || *sz < c->sd_size) { *sz = c->sd_size; return STATUS_BUFFER_OVERFLOW; }
-    std::memcpy(sd, c->sd, c->sd_size);
-    *sz = c->sd_size;
+    auto* o = static_cast<OpenContext*>(ctx);
+    if (!c || !sz || !o || !o->node) return STATUS_INVALID_PARAMETER;
+    std::shared_ptr<const NativeInodeSecurity> security;
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        security = VisibleNativeSecurity(*o->node);
+    }
+    std::span<const std::byte> descriptor;
+    const auto status = ResolveWindowsSecurity(security.get(), c->sd, c->sd_size, descriptor);
+    if (!NT_SUCCESS(status)) return status;
+    if (!sd || *sz < descriptor.size()) { *sz = descriptor.size(); return STATUS_BUFFER_OVERFLOW; }
+    std::memcpy(sd, descriptor.data(), descriptor.size());
+    *sz = descriptor.size();
     return STATUS_SUCCESS;
 }
 
@@ -21232,6 +26613,7 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
 {
     auto* c = Ctx(fs);
     ScopedCallbackActivity callback_scope(c, "Open");
+    callback_scope.OpenRequest(granted_access, create_options, !file_name || std::wstring_view(file_name) == L"\\");
     ScopedPerfTimer perf_scope(c ? &c->perf_open : nullptr);
     const auto trace_return = [&](NTSTATUS status, const std::wstring& detail = std::wstring(), const OpenContext* open_ctx = nullptr) -> NTSTATUS
     {
@@ -21271,7 +26653,15 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
 
     auto p = NormalizePath(file_name ? std::wstring(file_name) : L"\\");
     auto stream_path = SplitNamedStreamPathNormalized(p);
-    auto lookup_path = stream_path.is_named_stream ? stream_path.base_path : p;
+    std::string native_name;
+    if (DecodeNativeXattrStream(stream_path.stream_name, native_name) != 0)
+    {
+        ExternalMutationRequestScope request(c);
+        if (!request.Acquired()) return STATUS_VOLUME_DISMOUNTED;
+        MutationCallbackScope mutation(c);
+        return OpenNativeXattr(c, stream_path, create_options, granted_access, false, 0, out_ctx, info);
+    }
+    auto lookup_path = stream_path.base_path;
     auto n = FindNodeNormalized(c, lookup_path);
     if (!n)
     {
@@ -21288,20 +26678,76 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
         return trace_return(STATUS_DELETE_PENDING, L"delete-blocked");
     }
 
-    if (n->is_directory && (create_options & FILE_NON_DIRECTORY_FILE) != 0)
+    if (IsWindowsDirectory(*n) && (create_options & FILE_NON_DIRECTORY_FILE) != 0)
     {
         return trace_return(STATUS_FILE_IS_A_DIRECTORY, L"directory-as-file");
     }
-    if (!n->is_directory && (create_options & FILE_DIRECTORY_FILE) != 0)
+    if (!IsWindowsDirectory(*n) && (create_options & FILE_DIRECTORY_FILE) != 0)
     {
         return trace_return(STATUS_NOT_A_DIRECTORY, L"file-as-directory");
     }
 
-    const auto mutation_enabled = IsMutationWriteEnabled(c);
+    const auto normalized_access = NormalizeGrantedAccess(granted_access);
+    const auto disposition = (create_options >> 24) & 0xff;
+    const bool overwriting = disposition == FILE_SUPERSEDE || disposition == FILE_OVERWRITE || disposition == FILE_OVERWRITE_IF;
+    const bool requires_content_check = overwriting ||
+        (normalized_access & (FILE_READ_DATA | FILE_EXECUTE | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+    callback_scope.Stage("content-transform-check");
+    const bool transformed_default_content =
+        requires_content_check && HasUnsupportedDefaultContentTransform(c, n, stream_path.is_named_stream);
+    // Inspect the transform first: an ordinary observation during conversion
+    // must not open its old cache before the verified replacement is ready.
+    if (requires_content_check && !stream_path.is_named_stream && n->object_id != 0 &&
+        c->compression_verification_pending.load(std::memory_order_acquire) == n->object_id)
+        return trace_return(STATUS_DEVICE_BUSY, L"compressed-payload-publication");
+    const bool compressed_write_candidate = transformed_default_content && !overwriting &&
+        (normalized_access & FILE_WRITE_DATA) != 0 && CanOpenNativeCompressionRewrite(c, n);
+    if (transformed_default_content &&
+        (overwriting || (normalized_access & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0) &&
+        !compressed_write_candidate)
+        return trace_return(STATUS_NOT_SUPPORTED, L"unsupported-content-transform");
+    const bool compressed_default_read = transformed_default_content &&
+        ((normalized_access & (FILE_READ_DATA | FILE_EXECUTE)) != 0 || compressed_write_candidate);
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (compressed_default_read)
+    {
+        std::wstring path;
+        std::uint64_t object_id = 0;
+        std::size_t probe_size = 0;
+        {
+            std::lock_guard<std::mutex> lock(c->mutex);
+            path = CommittedReadPathForNodeLocked(c, *n);
+            object_id = n->object_id;
+            probe_size = n->file_size == 0 ? 0 : 1;
+        }
+        std::byte probe{};
+        std::size_t bytes_read = 0;
+        // Probe only the bounded native range. A snapshot candidate is not
+        // proof of decodable content; empty representations need validation too.
+        if (object_id == 0 || !ReadCommittedFileRangeWithoutMetadataLock(c,
+                LowerPathKey(c, path), path, 0, probe_size, &probe, 1,
+                bytes_read, object_id) || bytes_read != probe_size)
+            return trace_return(STATUS_NOT_SUPPORTED, L"compressed-plan-open-failed");
+    }
+#endif
+    if (n->node_kind == NodeKind::SymbolicLink && stream_path.is_named_stream)
+        return trace_return(STATUS_INVALID_DEVICE_REQUEST, L"symlink-stream");
+    if (n->is_directory && stream_path.is_named_stream)
+        return trace_return(STATUS_FILE_IS_A_DIRECTORY, L"directory-stream");
+    if (IsSpecialNode(n->node_kind) && (stream_path.is_named_stream ||
+        (normalized_access & (FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_EXECUTE)) != 0))
+    {
+        return trace_return(STATUS_INVALID_DEVICE_REQUEST, L"special-node-content");
+    }
+
+    callback_scope.Stage("mutation-readiness");
     const auto mutation_access_requested = HasOpenMutationIntent(granted_access, create_options);
+    const auto mutation_enabled = mutation_access_requested || overwriting
+        ? IsMutationWriteEnabled(c) : !ReportsReadOnly(c);
     std::optional<ExternalMutationRequestScope> mutation_request_scope;
     if (mutation_access_requested)
     {
+        callback_scope.Stage("mutation-admission");
         {
             std::lock_guard<std::mutex> admission_gate(c->mutation_callback_mutex);
             mutation_request_scope.emplace(c);
@@ -21318,7 +26764,6 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
     }
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
-    const auto normalized_access = NormalizeGrantedAccess(granted_access);
     const bool read_payload_access_requested =
         (normalized_access & (FILE_READ_DATA | FILE_EXECUTE)) != 0;
 #endif
@@ -21332,7 +26777,27 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
     o->named_stream = stream_path.is_named_stream;
     o->stream_name = stream_path.stream_name;
     InitializeOpenAccess(o, granted_access);
-    o->delete_on_close_requested = (create_options & FILE_DELETE_ON_CLOSE) != 0;
+    // WinFsp checks disposition rights separately, then strips unrequested rights from GrantedAccess.
+    if (overwriting)
+        o->pending_overwrite_supersede = disposition == FILE_SUPERSEDE;
+    o->delete_on_close_requested = !o->named_stream && (create_options & FILE_DELETE_ON_CLOSE) != 0;
+    if (o->delete_on_close_requested)
+    {
+        MutationCallbackScope mutation(c);
+        const auto retained = CaptureNativeXattrsBeforeUnlink(c, lookup_path);
+        if (!NT_SUCCESS(retained))
+        {
+            delete o;
+            return trace_return(retained, L"native-stream-retention");
+        }
+    }
+    if (o->named_stream && (create_options & FILE_DELETE_ON_CLOSE) &&
+        (!o->allow_delete || (VisibleWindowsAttributes(*n) & FILE_ATTRIBUTE_READONLY)))
+    {
+        const auto status = o->allow_delete ? STATUS_CANNOT_DELETE : STATUS_ACCESS_DENIED;
+        delete o;
+        return trace_return(status, L"stream-delete-on-close-permission");
+    }
     if (n->is_directory && o->allow_delete)
     {
         std::lock_guard<std::mutex> lock(c->mutex);
@@ -21343,23 +26808,29 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
             SetDeleteIntentLocked(c, o, true);
         }
     }
-    if (!n->is_directory)
+    if (n->node_kind == NodeKind::RegularFile)
     {
-        const auto requires_hydration_handle = RequiresHydrationHandleForOpen(o);
+        // Prepare a shared cache before publishing the overwrite handle. Once it
+        // is live, alias protection must not reconstruct that cache underneath it.
+        callback_scope.Stage("payload-open");
+        const auto requires_hydration_handle = RequiresHydrationHandleForOpen(o) ||
+            (o->pending_overwrite_supersede.has_value() && n->shared_payload);
         const auto desired_access = ResolveHydrationDesiredAccess(
             mutation_enabled,
             granted_access,
-            false);
+            false) | (o->named_stream ? (FILE_READ_ATTRIBUTES | (o->allow_delete ? DELETE : 0)) : 0);
         o->write_open = mutation_enabled && mutation_access_requested;
-        bool can_read_from_metadata = false;
+        // Validated compressed reads use the native plan for both single-name
+        // and shared-payload inodes, regardless of any existing hydration file.
+        bool can_read_from_metadata = compressed_default_read;
         bool can_read_from_spool = false;
-        const auto can_use_metadata_read_fallback = CanUseMetadataReadFallbackForOpen(
+        const auto can_use_metadata_read_fallback = !n->shared_payload && CanUseMetadataReadFallbackForOpen(
             o,
             create_options,
             c->metadata_store != nullptr);
         const auto has_valid_existing_hydration = [&]()
         {
-            if (!requires_hydration_handle || o->named_stream)
+            if (!requires_hydration_handle || o->named_stream || compressed_default_read)
             {
                 return false;
             }
@@ -21436,7 +26907,7 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
             }
         };
 
-        if (can_use_metadata_read_fallback && !has_valid_existing_hydration)
+        if (!compressed_default_read && can_use_metadata_read_fallback && !has_valid_existing_hydration)
         {
             probe_metadata_or_spool();
         }
@@ -21501,13 +26972,24 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
                 }
             }
 
-            if ((o->named_stream && EnsureHydrationSidecarExistsForNamedStream(c, n)) ||
+            std::unique_lock<std::mutex> stream_lock;
+            if (o->named_stream)
+            {
+                stream_lock = std::unique_lock<std::mutex>(c->mutex);
+                if (HasUnrestoredHydrationLocked(c, n))
+                {
+                    delete o;
+                    return trace_return(STATUS_IO_DEVICE_ERROR, L"unrestored-hydration");
+                }
+            }
+            if ((o->named_stream && EnsureHydrationSidecarExistsForNamedStreamLocked(c, n)) ||
                 (!o->named_stream && EnsureHydrated(c, n, false)))
             {
                 auto pth = o->named_stream
                     ? std::filesystem::path(HydrationStreamPath(c, *n, o->stream_name))
                     : HydrationPath(c, *n);
-                const auto creation_disposition = (o->named_stream && mutation_access_requested)
+                const auto creation_disposition = (o->named_stream && mutation_access_requested &&
+                    !(create_options & FILE_DELETE_ON_CLOSE) && (o->allow_write_data || o->allow_append_data))
                     ? OPEN_ALWAYS
                     : OPEN_EXISTING;
                 o->file = CreateFileW(
@@ -21528,19 +27010,11 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
             // payload spool, so forcing hydration here makes normal copy tools
             // see a false I/O-device error while setting timestamps.
         }
-        else if (o->named_stream &&
-            o->file == INVALID_HANDLE_VALUE &&
-            !mutation_access_requested)
+        else if (o->named_stream && o->file == INVALID_HANDLE_VALUE)
         {
             const auto error = GetLastError();
             delete o;
-            if (error == ERROR_FILE_NOT_FOUND ||
-                error == ERROR_PATH_NOT_FOUND ||
-                error == ERROR_INVALID_NAME)
-            {
-                return trace_return(STATUS_OBJECT_NAME_NOT_FOUND, L"named-stream-missing");
-            }
-            return trace_return(STATUS_IO_DEVICE_ERROR, L"named-stream-open");
+            return trace_return(LocalNamedStreamError(error), L"named-stream-open");
         }
 
         if (requires_hydration_handle && o->file == INVALID_HANDLE_VALUE && !mutation_access_requested)
@@ -21576,16 +27050,28 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
         if (o->named_stream)
         {
             std::lock_guard<std::mutex> lock(c->mutex);
+            if (create_options & FILE_DELETE_ON_CLOSE)
+            {
+                const auto status = SetLocalNamedStreamDeleteLocked(c, o, true);
+                if (!NT_SUCCESS(status))
+                {
+                    CloseHandle(o->file);
+                    delete o;
+                    return trace_return(status, L"stream-delete-on-close");
+                }
+            }
             o->stream_size = RememberNamedStreamSizeFromHandleLocked(c, n, o->stream_name, o->file);
         }
     }
 
+    callback_scope.Stage("namespace-accounting");
     {
         std::lock_guard<std::mutex> lock(c->mutex);
         AcquireOpenContextAccountingLocked(c, n, o);
     }
 
-    FillInfo(*n, !IsMutationWriteEnabled(c), info);
+    callback_scope.Stage("return-file-info");
+    FillInfo(*n, ReportsReadOnly(c), info);
     *out_ctx = o;
     return trace_return(STATUS_SUCCESS, L"opened", o);
 }
@@ -21617,14 +27103,28 @@ NTSTATUS CB_ReadDirectory(FSP_FILE_SYSTEM* fs, PVOID dir_ctx, PWSTR, PWSTR marke
         std::shared_ptr<Node> node;
     };
 
-    const auto mk = marker ? std::wstring(marker) : std::wstring();
-    const auto read_only = !IsMutationWriteEnabled(c);
+    auto mk = marker ? std::wstring(marker) : std::wstring();
+    const auto read_only = ReportsReadOnly(c);
     std::vector<DirectoryEntrySnapshot> entries;
     {
         ObservedMutexGuard lock(
             c->mutex,
             &c->perf_namespace_mutex_wait,
             &c->perf_namespace_mutex_hold);
+        // WinFsp maps an initially empty listing to NO_SUCH_FILE. Non-root
+        // directories expose dot entries, as its native reference filesystem does.
+        if (o->node->path != L"\\" && (mk.empty() || mk == L"." || mk == L".."))
+        {
+            if (mk.empty()) entries.push_back({L".", o->node});
+            if (mk != L"..")
+            {
+                auto parent = TryGetNodeLockedNormalized(c, ParentOfNormalizedPath(o->node->path));
+                if (!parent || !parent->is_directory) return STATUS_OBJECT_PATH_NOT_FOUND;
+                entries.push_back({L"..", std::move(parent)});
+            }
+            // Dot markers precede every real child, including names such as !a.
+            mk.clear();
+        }
         EnsureSortedChildNamesLocked(*o->node);
         const auto& sorted_children = o->node->sorted_children;
         std::size_t first_child_index = 0;
@@ -21650,7 +27150,7 @@ NTSTATUS CB_ReadDirectory(FSP_FILE_SYSTEM* fs, PVOID dir_ctx, PWSTR, PWSTR marke
             }
         }
 
-        entries.reserve(sorted_children.size() - first_child_index);
+        entries.reserve(entries.size() + sorted_children.size() - first_child_index);
         for (std::size_t index = first_child_index; index < sorted_children.size(); ++index)
         {
             const auto& name = sorted_children[index];
@@ -21660,6 +27160,13 @@ NTSTATUS CB_ReadDirectory(FSP_FILE_SYSTEM* fs, PVOID dir_ctx, PWSTR, PWSTR marke
                 entries.push_back({ name, child });
             }
         }
+    }
+
+    // An empty root has no dot entries. Returning a successful empty buffer
+    // makes WinFsp turn the first query into NO_SUCH_FILE; return EOF directly.
+    if (entries.empty() && o->node->path == L"\\" && mk.empty())
+    {
+        return STATUS_NO_MORE_FILES;
     }
 
     std::vector<unsigned char> dir_info_scratch;
@@ -22468,6 +27975,40 @@ bool MountManifestSession(
     return true;
 }
 
+bool InitializeManifestCheckpointCensus(
+    apfsaccess::catalog::ContainerMountCoordinator& coordinator,
+    const std::vector<std::unique_ptr<MountContext>>& sessions,
+    std::string& error)
+{
+    std::vector<apfsaccess::catalog::VolumeCheckpointPins> census;
+    for (const auto& session : sessions)
+    {
+        if (!session || session->container_coordinator != &coordinator ||
+            !session->tx_manager || HasBlockedRecoveryEvidence(*session))
+        {
+            error = "ManifestCheckpointJournalUnavailable";
+            return false;
+        }
+        apfsaccess::catalog::VolumeCheckpointPins pins;
+        pins.volume_object_id = session->container_volume_oid;
+        {
+            std::lock_guard<std::mutex> lock(session->tx_mutex);
+            if (!session->tx_manager->RecoveryStateValid() ||
+                !session->tx_manager->LoadRequiredCheckpointXidsSinceCleanup(
+                    pins.required_checkpoint_xids, &error))
+            {
+                if (error.empty()) error = "ManifestCheckpointJournalInvalid";
+                return false;
+            }
+            pins.unapplied_accepted_work = session->tx_manager->HasUnappliedAcceptedWork();
+        }
+        census.push_back(std::move(pins));
+    }
+    // No publication has started; a missing catalog sibling must refuse the
+    // entire census instead of being guessed to have an empty recovery journal.
+    return coordinator.InitializeRequiredCheckpointCensus(census, error);
+}
+
 bool WriteContainerStatusContents(
     const std::wstring& status_file,
     const std::string& contents)
@@ -22530,6 +28071,29 @@ std::uint64_t CurrentProcessStartFileTimeUtc()
     return value.QuadPart;
 }
 
+void WriteContainerCommitDiagnosticsJson(std::ostream& json,
+    const apfsaccess::catalog::ContainerCommitDiagnostics& counters)
+{
+    json << "{\"commitAttempts\":" << counters.commit_attempts
+         << ",\"commitSuccesses\":" << counters.commit_successes
+         << ",\"commitNoops\":" << counters.commit_noops
+         << ",\"commitFailures\":" << counters.commit_failures
+         << ",\"lastFailureStage\":\"" << EscapeJson(counters.last_failure_stage) << "\""
+         << ",\"lastFailureDetail\":\"" << EscapeJson(counters.last_failure_detail) << "\""
+         << ",\"commitTotalUs\":" << counters.commit_total_us
+         << ",\"commitMaxUs\":" << counters.commit_max_us
+         << ",\"commitWaitTotalUs\":" << counters.commit_wait_total_us
+         << ",\"commitHoldTotalUs\":" << counters.commit_hold_total_us
+         << ",\"reloadAttempts\":" << counters.reload_attempts
+         << ",\"reloadFailures\":" << counters.reload_failures
+         << ",\"reloadReuses\":" << counters.reload_reuses
+         << ",\"reloadTotalUs\":" << counters.reload_total_us
+         << ",\"reloadMaxUs\":" << counters.reload_max_us
+         << ",\"precommitReloadAttempts\":" << counters.precommit_reload_attempts
+         << ",\"rollbackReloadAttempts\":" << counters.rollback_reload_attempts
+         << ",\"recoveryReloadAttempts\":" << counters.recovery_reload_attempts << "}";
+}
+
 // {containerUuid, ownerPid, ownerStartFileTimeUtc, leaseHeld, checkpointXid,
 //  volumes:[{objectId, canonicalId, mounted, ready, writable,
 //  recoveryIdentity}]}. canonicalId is apfs-vol:<uuid>:<oid>.
@@ -22572,7 +28136,11 @@ bool WriteContainerStatusFile(
     }
     json << ",\"recoveryReason\":\""
          << EscapeJson(container_recovery_reason) << "\""
-         << ",\"volumes\":[";
+         << ",\"commitDiagnostics\":";
+    WriteContainerCommitDiagnosticsJson(json, coordinator.DiagnosticsSnapshot());
+    if (IsPerfCountersEnabled())
+        json << ",\"devicePerformance\":" << coordinator.DevicePerformanceJson();
+    json << ",\"volumes\":[";
     bool first = true;
     for (const auto& pctx : contexts)
     {
@@ -22635,7 +28203,41 @@ bool WriteContainerStatusFile(
              << ",\"recoveryReason\":\""
              << EscapeJson(WideToUtf8(recovery_reason)) << "\""
              << ",\"recoveryIdentity\":\""
-             << EscapeJson(WideToUtf8(ctx.args.recovery_identity)) << "\"}";
+             << EscapeJson(WideToUtf8(ctx.args.recovery_identity)) << "\""
+             << ",\"commitDiagnostics\":";
+        WriteContainerCommitDiagnosticsJson(json,
+            coordinator.DiagnosticsSnapshot(ctx.container_volume_oid));
+        if (IsPerfCountersEnabled())
+        {
+            json << ",\"callbackPerformance\":{";
+            bool first_counter = true;
+            const auto append = [&](const char* name, const PerfCounter& counter)
+            {
+                if (!first_counter) json << ',';
+                first_counter = false;
+                AppendPerfCounterJson(json, name, counter);
+            };
+            append("create", ctx.perf_create);
+            append("open", ctx.perf_open);
+            append("write", ctx.perf_write);
+            append("read", ctx.perf_read);
+            append("rename", ctx.perf_rename);
+            append("setFileSize", ctx.perf_set_file_size);
+            append("setBasicInfo", ctx.perf_set_basic_info);
+            append("cleanup", ctx.perf_cleanup);
+            append("close", ctx.perf_close);
+            append("flush", ctx.perf_flush);
+            append("readDirectory", ctx.perf_read_directory);
+            append("commitNative", ctx.perf_commit_native);
+            append("walAppend", ctx.perf_wal_append);
+            append("acceptanceWait", ctx.perf_acceptance_wait);
+            append("cleanupStage", ctx.perf_cleanup_stage);
+            append("postCheckpointHydration", ctx.perf_post_checkpoint_hydration);
+            append("recoveryMarker", ctx.perf_recovery_marker);
+            append("mutationCallbackLock", ctx.perf_mutation_callback_lock);
+            json << '}';
+        }
+        json << "}";
     }
     json << "]}";
     return WriteContainerStatusContents(process_args.status_file, json.str());
@@ -22646,6 +28248,10 @@ void FillContainerServeInterface(FSP_FILE_SYSTEM_INTERFACE& iface)
     iface.GetVolumeInfo = CB_GetVolumeInfo;
     iface.SetVolumeLabel = CB_SetVolumeLabel;
     iface.GetSecurityByName = CB_GetSecurityByName;
+    iface.ResolveReparsePoints = CB_ResolveReparsePoints;
+    iface.GetReparsePoint = CB_GetReparsePoint;
+    iface.SetReparsePoint = CB_SetReparsePoint;
+    iface.DeleteReparsePoint = CB_DeleteReparsePoint;
     iface.Create = CB_Create;
     iface.Open = CB_Open;
     iface.Overwrite = CB_Overwrite;
@@ -22929,6 +28535,7 @@ ContainerControlActionResult AttachManifestMountForControl(
         WinFspLifecyclePhase::Created,
         std::memory_order_release);
     context->fs->UserContext = context;
+    InstallOperationDiagnostics(context->fs);
     auto mount = BuildWinFspMountPoint(context->args.mount);
     status = context->api.SetMount(context->fs, mount.data());
     if (!NT_SUCCESS(status))
@@ -23228,6 +28835,7 @@ int RunManifestServe(
             WinFspLifecyclePhase::Created,
             std::memory_order_release);
         ctx.fs->UserContext = &ctx;
+        InstallOperationDiagnostics(ctx.fs);
         auto m = BuildWinFspMountPoint(ctx.args.mount);
         st = ctx.api.SetMount(ctx.fs, m.data());
         if (!NT_SUCCESS(st))
@@ -23291,6 +28899,26 @@ int RunManifestServe(
             (void)WriteContainerStatusFile(process_args, coordinator, contexts);
         }
         SetConsoleCtrlHandler(CtrlHandler, TRUE);
+        std::jthread callback_watchdog;
+        if (IsPerfCountersEnabled() && !process_args.status_file.empty())
+        {
+            // Detach temporarily transfers each unique_ptr to a teardown task.
+            // The contexts themselves survive until after this thread is joined.
+            // Capture their addresses now; never race reads of those owner slots.
+            std::vector<MountContext*> diagnostic_contexts;
+            for (const auto& context : contexts) diagnostic_contexts.push_back(context.get());
+            callback_watchdog = std::jthread([&, diagnostic_contexts](std::stop_token stop)
+            {
+                while (!stop.stop_requested())
+                {
+                    for (auto* context : diagnostic_contexts)
+                        WriteCallbackWatchdogFile(*context, process_args.status_file +
+                            L".volume-" + std::to_wstring(context->container_volume_oid));
+                    for (int i = 0; i != 5 && !stop.stop_requested(); ++i)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            });
+        }
         auto last_status_tick = std::chrono::steady_clock::now();
         while (!g_exit.load())
         {
@@ -23307,6 +28935,11 @@ int RunManifestServe(
                 (void)WriteContainerStatusFile(process_args, coordinator, contexts);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        }
+        if (callback_watchdog.joinable())
+        {
+            callback_watchdog.request_stop();
+            callback_watchdog.join();
         }
     }
     // This runs for both a normal serve exit and a partial startup failure.
@@ -23429,6 +29062,7 @@ int wmain(int argc, wchar_t** argv)
             manifest.device_offset_bytes,
             open_error,
             apfsaccess::catalog::CatalogLoadPolicy::StrictApple,
+            args.readwrite,
             args.readwrite);
         if (!container_coordinator)
         {
@@ -23575,9 +29209,8 @@ int wmain(int argc, wchar_t** argv)
         (void)WriteHostStatusFile(ctx);
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
-    bool payload_spool_recovery_pending = false;
-    bool write_ahead_log_recovery_pending = false;
-    if (args.readwrite && !ctx.recovery_identity_blocked.load(std::memory_order_acquire))
+    if ((args.readwrite || (manifest_mode && container_coordinator->CheckpointCensusRequired())) &&
+        !ctx.recovery_identity_blocked.load(std::memory_order_acquire))
     {
         const auto wal_volume_identity = BuildWalVolumeIdentity(args);
         const auto spool_root = BuildPayloadSpoolSessionRoot(
@@ -23588,7 +29221,7 @@ int wmain(int argc, wchar_t** argv)
         ctx.tx_manager->SetVolumeIdentity(wal_volume_identity);
         ctx.tx_manager->SetJournalPath(ctx.tx_journal_file.wstring());
         const auto recovered_watermarks = ctx.tx_manager->Watermarks();
-        write_ahead_log_recovery_pending =
+        const bool write_ahead_log_recovery_pending =
             !ctx.tx_manager->RecoveryStateValid() ||
             ctx.tx_manager->HasUnappliedAcceptedWork() ||
             recovered_watermarks.cleanup_sequence < recovered_watermarks.apfs_durable_sequence;
@@ -23608,7 +29241,6 @@ int wmain(int argc, wchar_t** argv)
             });
         if (ctx.payload_spool->RecoveryRequired())
         {
-            payload_spool_recovery_pending = true;
             std::wcerr << L"[FsHost] RW payload spool recovery was detected; metadata bootstrap will attempt clean-checkpoint reconciliation before downgrading."
                 << std::endl;
         }
@@ -23618,7 +29250,31 @@ int wmain(int argc, wchar_t** argv)
     }
 #endif
 
+            session_contexts.push_back(std::move(session_ctx));
+        }
 #ifdef APFSACCESS_HAS_RW_ENGINE
+        if (manifest_mode && container_coordinator->CheckpointCensusRequired())
+        {
+            std::string census_error;
+            if (!InitializeManifestCheckpointCensus(*container_coordinator, session_contexts, census_error))
+            {
+                std::wcerr << L"[FsHost] Container journal census failed before replay: "
+                    << Utf8ToWide(census_error) << std::endl;
+                return 22;
+            }
+        }
+#endif
+        for (const auto& session_ctx : session_contexts)
+        {
+            MountContext& ctx = *session_ctx;
+            const auto& args = ctx.args;
+#ifdef APFSACCESS_HAS_RW_ENGINE
+            bool payload_spool_recovery_pending = ctx.payload_spool && ctx.payload_spool->RecoveryRequired();
+            const auto recovered_watermarks = ctx.tx_manager
+                ? ctx.tx_manager->Watermarks() : apfsaccess::rw::TransactionManager::DurabilityWatermarks{};
+            bool write_ahead_log_recovery_pending = ctx.tx_manager &&
+                (!ctx.tx_manager->RecoveryStateValid() || ctx.tx_manager->HasUnappliedAcceptedWork() ||
+                 recovered_watermarks.cleanup_sequence < recovered_watermarks.apfs_durable_sequence);
     {
 #ifdef APFSACCESS_HAS_RW_ENGINE
         if (manifest_mode)
@@ -23887,6 +29543,7 @@ int wmain(int argc, wchar_t** argv)
     root->hydration_key = root->path_key;
     root->apfs_path = ApfsRoot(args);
     root->is_directory = true;
+    root->node_kind = NodeKind::Directory;
     root->timestamp = now;
     EmplaceNodeLocked(&ctx, root);
 
@@ -23955,7 +29612,6 @@ int wmain(int argc, wchar_t** argv)
         }
     }
 #endif
-            session_contexts.push_back(std::move(session_ctx));
         }
 #pragma warning(pop)
         return 0;
@@ -23964,11 +29620,7 @@ int wmain(int argc, wchar_t** argv)
     {
         for (const auto& done_ctx : session_contexts)
         {
-            if (done_ctx && !done_ctx->session_root.empty())
-            {
-                std::error_code cleanup_ec;
-                std::filesystem::remove_all(done_ctx->session_root, cleanup_ec);
-            }
+            CleanupHydrationSession(done_ctx.get());
         }
 #ifdef APFSACCESS_HAS_RW_ENGINE
         if (manifest_mode && container_coordinator)
@@ -23984,13 +29636,7 @@ int wmain(int argc, wchar_t** argv)
         {
             for (const auto& done_ctx : session_contexts)
             {
-                if (!done_ctx || done_ctx->session_root.empty())
-                {
-                    continue;
-                }
-
-                std::error_code ec;
-                std::filesystem::remove_all(done_ctx->session_root, ec);
+                CleanupHydrationSession(done_ctx.get());
             }
         }
     };
@@ -24029,6 +29675,7 @@ int wmain(int argc, wchar_t** argv)
         WinFspLifecyclePhase::Created,
         std::memory_order_release);
     ctx.fs->UserContext = &ctx;
+    InstallOperationDiagnostics(ctx.fs);
     auto m = BuildWinFspMountPoint(args.mount);
     st = ctx.api.SetMount(ctx.fs, m.data());
     if (!NT_SUCCESS(st))

@@ -28,6 +28,15 @@ public:
         Rename,
         Delete,
         SetBasicInfo,
+        SetSymbolicLinkTarget,
+        RemoveSymbolicLinkTarget,
+        SetExtendedAttribute,
+        RemoveExtendedAttribute,
+        SetInodeMetadata = 12,
+        // No payload; length is allocation bytes, EOF becomes min(previous EOF, length).
+        SetAllocationSize = 13,
+        RestoreDirectoryFromSymbolicLink = 14,
+        RewriteCompressedContent = 15,
     };
 
     struct MutationIntent
@@ -46,6 +55,7 @@ public:
         std::array<std::uint8_t, WriteAheadLog::PayloadHashSize> payload_checksum{};
         std::vector<std::byte> inline_payload;
         bool replace_if_exists = false;
+        std::optional<UnlinkOutcome> unlink_outcome;
     };
 
     struct DurabilityWatermarks
@@ -60,6 +70,7 @@ public:
         std::uint64_t transaction_id = 0;
         std::uint64_t accepted_sequence = 0;
         std::vector<WriteAheadLog::Record> mutations;
+        std::uint64_t preimage_checkpoint_xid = 0;
     };
 
     enum class State
@@ -74,9 +85,10 @@ public:
 
     [[nodiscard]] State CurrentState() const noexcept;
     [[nodiscard]] bool Begin();
-    [[nodiscard]] bool Accept();
+    [[nodiscard]] bool Accept(std::uint64_t preimage_checkpoint_xid = 0);
     [[nodiscard]] bool AcceptForDeferredCommit(
-        std::uint64_t* accepted_sequence = nullptr);
+        std::uint64_t* accepted_sequence = nullptr,
+        std::uint64_t preimage_checkpoint_xid = 0);
     [[nodiscard]] bool WaitForDeferredAcceptanceDurability(
         std::uint64_t accepted_sequence);
     [[nodiscard]] bool FlushDeferredAcceptanceDurabilityNow(
@@ -86,7 +98,7 @@ public:
     [[nodiscard]] bool CanAcceptWithoutPayloadSpoolFlush() const noexcept;
     [[nodiscard]] bool CanFinalizeWithoutPayloadSpoolFlush(
         bool allow_process_local_coverage = true);
-    [[nodiscard]] bool Commit();
+    [[nodiscard]] bool Commit(std::uint64_t preimage_checkpoint_xid = 0);
     [[nodiscard]] bool Abort();
     [[nodiscard]] bool RecordMutation(const MutationIntent& mutation);
     [[nodiscard]] bool FlushPreparedRecords();
@@ -117,6 +129,10 @@ public:
         std::string* failure_reason = nullptr);
     [[nodiscard]] bool LoadAcceptedTransactionsSinceCleanup(
         std::vector<AcceptedTransaction>& transactions,
+        std::string* failure_reason = nullptr,
+        WalReadLimits limits = {});
+    [[nodiscard]] bool LoadRequiredCheckpointXidsSinceCleanup(
+        std::vector<std::uint64_t>& checkpoint_xids,
         std::string* failure_reason = nullptr);
     [[nodiscard]] std::size_t PendingMutationCount() const noexcept;
     [[nodiscard]] std::uint64_t DurableJournalAppendCount() const noexcept;
@@ -146,7 +162,8 @@ private:
 
     [[nodiscard]] bool PersistTransactionBatchLocked(
         const wchar_t* outcome,
-        bool durable_flush = true);
+        bool durable_flush = true,
+        std::uint64_t preimage_checkpoint_xid = 0);
     [[nodiscard]] bool AppendWatermarkLocked(
         WriteAheadLog::RecordState state,
         std::uint64_t target_sequence);
@@ -154,14 +171,16 @@ private:
     [[nodiscard]] bool AppendPreparedMutationLocked(MutationIntent& mutation);
     [[nodiscard]] WriteAheadLog::Record BuildTransactionMarkerLocked(
         const wchar_t* outcome,
-        const std::string& volume_identity) const;
+        const std::string& volume_identity,
+        std::uint64_t preimage_checkpoint_xid) const;
     [[nodiscard]] bool IsAcceptedBoundary(std::uint64_t sequence) const noexcept;
     [[nodiscard]] std::uint64_t SafeCompactionFloor(std::uint64_t preferred_floor) const noexcept;
     void ObserveDurableJournalAppend(std::uint64_t elapsed_microseconds) noexcept;
     [[nodiscard]] bool LoadAcceptedTransactionsAfter(
         bool include_checkpointed_transactions,
         std::vector<AcceptedTransaction>& transactions,
-        std::string* failure_reason);
+        std::string* failure_reason,
+        WalReadLimits limits = {});
     void ConfigureJournal();
     [[nodiscard]] bool SeedIdsFromExistingJournal(bool acquire_writer_lease);
     [[nodiscard]] bool SeedIdsFromJournalRecords(

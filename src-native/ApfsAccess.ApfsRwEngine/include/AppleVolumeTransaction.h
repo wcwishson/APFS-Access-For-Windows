@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AppleTransactionCommit.h"
+#include "CompressionRewrite.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -21,11 +22,14 @@ struct AppleVolumeDataWrite
 struct AppleVolumeTransactionRequest
 {
     std::uint64_t volume_object_id = 0;
+    std::vector<std::uint64_t> required_checkpoint_xids;
     // Complete replacement record set for the filesystem tree, excluding
     // extents generated for data_writes. Data-stream ID records are checked
     // and normalized against the old tree and data_writes.
     std::vector<catalog::BtreeRecord> filesystem_records;
     std::vector<AppleVolumeDataWrite> data_writes;
+    // Exact source evidence from the dedicated MetadataStore transition.
+    std::vector<CompressionRewrite> compression_rewrites;
     std::vector<AppleSpacemanReleaseRequest> released_data_blocks;
     std::int64_t file_count_delta = 0;
     std::int64_t directory_count_delta = 0;
@@ -42,6 +46,11 @@ struct AppleVolumeTransactionPlan
     std::vector<std::uint64_t> payload_blocks;
     std::vector<catalog::BtreeRecord> filesystem_records;
 };
+
+bool CheckAppleVolumeWriteFeatures(
+    const catalog::NxSuperblock& container,
+    const catalog::ApsbVolume& volume,
+    std::string& out_error);
 
 // Builds a complete single-volume Apple APFS copy-on-write transaction without
 // performing I/O. Snapshot-bearing volumes remain fail-closed until snapshot

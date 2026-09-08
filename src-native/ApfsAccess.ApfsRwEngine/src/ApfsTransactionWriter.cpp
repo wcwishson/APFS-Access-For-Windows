@@ -881,7 +881,7 @@ bool EncodeAppleInodeRecord(const AppleInodeRecord& value,
     AppendU32(out_record.value, value.owner);
     AppendU32(out_record.value, value.group);
     AppendU16(out_record.value, value.mode);
-    AppendU16(out_record.value, 0);
+    AppendU16(out_record.value, value.reserved_pad);
     AppendU64(out_record.value, value.uncompressed_size);
     std::vector<std::byte> extended;
     if (!EncodeExtendedFields(value.extended_fields, extended, out_error))
@@ -986,7 +986,7 @@ bool EncodeAppleFileExtentRecord(const AppleFileExtentRecord& value,
     if (!MakeFsKey(value.object_id, 8, out_record.key, out_error) ||
         value.block_size == 0 || !IsPowerOfTwo(value.block_size) ||
         value.length_bytes == 0 || value.length_bytes > kFileExtentLengthMask ||
-        value.physical_block == 0 || value.logical_address % value.block_size != 0 ||
+        (value.physical_block == 0 && value.crypto_id != 0) || value.logical_address % value.block_size != 0 ||
         value.length_bytes % value.block_size != 0)
     {
         if (out_error.empty())
@@ -1000,6 +1000,32 @@ bool EncodeAppleFileExtentRecord(const AppleFileExtentRecord& value,
     AppendU64(out_record.value, value.length_bytes);
     AppendU64(out_record.value, value.physical_block);
     AppendU64(out_record.value, value.crypto_id);
+    return true;
+}
+
+bool DecodeAppleFileExtentRecord(const catalog::BtreeRecord& record,
+    std::uint32_t block_size, AppleFileExtentRecord& out_value, std::string& out_error)
+{
+    out_value = {};
+    out_error.clear();
+    if (record.key.size() != 16 || record.value.size() != 24)
+        return Fail(out_error, "AppleFileExtentRecordInvalid");
+    const auto header = catalog::ReadU64LE(record.key, 0).value_or(0);
+    AppleFileExtentRecord decoded{
+        header & kFsObjectIdMask,
+        catalog::ReadU64LE(record.key, 8).value_or(0),
+        catalog::ReadU64LE(record.value, 0).value_or(0) & kFileExtentLengthMask,
+        catalog::ReadU64LE(record.value, 8).value_or(0),
+        catalog::ReadU64LE(record.value, 16).value_or(0),
+        block_size};
+    if ((header >> 60) != 8 || decoded.object_id == 0 || block_size == 0 || !IsPowerOfTwo(block_size) ||
+        decoded.length_bytes == 0 || (decoded.physical_block == 0 && decoded.crypto_id != 0) ||
+        decoded.logical_address % block_size != 0 || decoded.length_bytes % block_size != 0 ||
+        catalog::ReadU64LE(record.value, 0).value_or(0) != decoded.length_bytes ||
+        decoded.length_bytes > std::numeric_limits<std::uint64_t>::max() - decoded.logical_address ||
+        decoded.length_bytes / block_size > std::numeric_limits<std::uint64_t>::max() - decoded.physical_block)
+        return Fail(out_error, "AppleFileExtentRecordInvalid");
+    out_value = decoded;
     return true;
 }
 
@@ -1157,12 +1183,15 @@ bool EncodeAppleXattrRecord(const AppleXattrRecord& value,
     const auto storage_flags = value.flags & (kAppleXattrDataStream | kAppleXattrDataEmbedded);
     constexpr std::uint16_t kSupportedFlags =
         kAppleXattrDataStream | kAppleXattrDataEmbedded | kAppleXattrFileSystemOwned;
+    const auto stream_id = storage_flags == kAppleXattrDataStream
+        ? catalog::ReadU64LE(value.data, 0).value_or(0) : 0;
     if (!MakeFsKey(value.object_id, 4, out_record.key, out_error) ||
         !ValidateName(value.name_utf8, kMaximumFsKeyBytes - 11, out_error) ||
         (value.flags & ~kSupportedFlags) != 0 ||
         (storage_flags != kAppleXattrDataStream && storage_flags != kAppleXattrDataEmbedded) ||
         value.data.size() > std::numeric_limits<std::uint16_t>::max() ||
-        (storage_flags == kAppleXattrDataStream && value.data.size() != sizeof(std::uint64_t)) ||
+        (storage_flags == kAppleXattrDataStream &&
+            (value.data.size() != kAppleXattrDataStreamBytes || stream_id == 0 || stream_id > kFsObjectIdMask)) ||
         (storage_flags == kAppleXattrDataEmbedded &&
             value.data.size() > kMaximumEmbeddedXattrBytes))
     {

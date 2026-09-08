@@ -1615,14 +1615,14 @@ bool TestNonFixtureRejectsLegacyPrivateCheckpointOverlay(const std::filesystem::
     apfsaccess::rw::MetadataStore raw_bypass_store(raw_bypass_context);
     const auto raw_prepared = raw_bypass_store.PrepareNativeWritePath();
     if (raw_prepared ||
-        raw_bypass_store.RecoveryReason() != L"NativeAppleTransactionWriterUnavailable")
+        raw_bypass_store.RecoveryReason() != L"NativeAppleTransactionSourceNotRegularFile")
     {
         std::wcerr << L"[DETAIL] LegacyPrivateOverlay raw recovery reason: "
                    << raw_bypass_store.RecoveryReason() << std::endl;
     }
     ok &= Require(
         !raw_prepared &&
-            raw_bypass_store.RecoveryReason() == L"NativeAppleTransactionWriterUnavailable",
+            raw_bypass_store.RecoveryReason() == L"NativeAppleTransactionSourceNotRegularFile",
         "LegacyPrivateOverlay: test override must never enable a raw-device writer");
     return ok;
 }

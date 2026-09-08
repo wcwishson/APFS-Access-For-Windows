@@ -19,6 +19,23 @@ constexpr std::size_t kMaxVisitedBlocks = 4096;
 constexpr std::uint64_t kMaxGptEntries = 512;
 constexpr std::size_t kMaxFsOidSlots = 100;
 
+bool Materialize(const RandomAccessSource& source, std::uint64_t count, std::uint64_t bytes)
+{
+    const auto budget = source.ReadBudget();
+    return !budget || budget->Materialize(count, bytes);
+}
+
+struct BudgetErrorScope
+{
+    const RandomAccessSource& source;
+    std::string& error;
+    ~BudgetErrorScope()
+    {
+        const auto budget = source.ReadBudget();
+        if (budget && budget->Failed()) error = budget->Failure();
+    }
+};
+
 bool ReadInto(const RandomAccessSource& source, std::uint64_t offset, std::size_t size, std::vector<std::byte>& out)
 {
     out.clear();
@@ -235,6 +252,7 @@ std::optional<GptLayout> ParseGpt(
         {
             continue;
         }
+        if (!Materialize(source, 0, header_size)) return std::nullopt;
         std::vector<std::byte> header_copy(header.begin(), header.begin() + header_size);
         for (int index = 0; index < 4; ++index)
         {
@@ -326,6 +344,7 @@ std::optional<GptLayout> ParseGpt(
                     return std::nullopt;
                 }
             }
+            if (!Materialize(source, 1, sizeof(GptPartition) + 128)) return std::nullopt;
             accepted_ranges.emplace_back(start_bytes, range_end);
             GptPartition partition;
             partition.number = index + 1;
@@ -596,7 +615,8 @@ bool ParseCheckpointMapBlock(
     std::uint64_t expected_xid,
     std::uint64_t expected_physical_block,
     std::vector<CheckpointMapping>& out_mappings,
-    bool& out_last)
+    bool& out_last,
+    const RandomAccessSource& source)
 {
     out_mappings.clear();
     out_last = false;
@@ -620,6 +640,7 @@ bool ParseCheckpointMapBlock(
     {
         return false;
     }
+    if (!Materialize(source, count, static_cast<std::uint64_t>(count) * sizeof(CheckpointMapping))) return false;
     out_mappings.reserve(count);
     for (std::uint32_t index = 0; index < count; ++index)
     {
@@ -712,6 +733,8 @@ std::optional<ContainerCheckpointView> BuildCheckpointCandidate(
     const std::vector<std::vector<std::byte>>& descriptor_blocks,
     std::uint32_t candidate_index)
 {
+    if (!Materialize(source, 0, sizeof(NxSuperblock) + kMaxFsOidSlots * sizeof(std::uint64_t) + 64))
+        return std::nullopt;
     auto candidate = ParseNxSuperblock(descriptor_blocks[candidate_index]);
     if (!candidate.has_value() || !SameCheckpointGeometry(anchor, candidate.value()) ||
         !RingFieldsValid(candidate->xp_desc_index, candidate->xp_desc_len,
@@ -729,6 +752,7 @@ std::optional<ContainerCheckpointView> BuildCheckpointCandidate(
     view.superblock = candidate.value();
     view.superblock_physical_block =
         candidate->xp_desc_base_block + candidate_index;
+    if (!Materialize(source, 1, descriptor_blocks[candidate_index].size())) return std::nullopt;
     view.superblock_bytes = descriptor_blocks[candidate_index];
     std::unordered_set<std::uint64_t> mapped_oids;
     const auto map_block_count = candidate->xp_desc_len - 1;
@@ -742,20 +766,23 @@ std::optional<ContainerCheckpointView> BuildCheckpointCandidate(
         const auto physical_block = candidate->xp_desc_base_block + ring_index;
         if (!ParseCheckpointMapBlock(
                 descriptor_blocks[ring_index], candidate->xid, physical_block,
-                block_mappings, is_last) ||
+                block_mappings, is_last, source) ||
             is_last != (offset + 1 == map_block_count))
         {
             return std::nullopt;
         }
+        if (!Materialize(source, 0, sizeof(std::uint64_t))) return std::nullopt;
         view.checkpoint_map_blocks.push_back(candidate->xp_desc_base_block + ring_index);
         for (const auto& mapping : block_mappings)
         {
-            if (!mapped_oids.insert(mapping.object_id).second ||
+            if (!Materialize(source, 0, sizeof(std::uint64_t)) ||
+                !mapped_oids.insert(mapping.object_id).second ||
                 !ValidateMappedObject(source, store_offset, store_size_bytes,
                     candidate.value(), mapping))
             {
                 return std::nullopt;
             }
+            if (!Materialize(source, 1, sizeof(mapping))) return std::nullopt;
             view.mappings.push_back(mapping);
         }
     }
@@ -777,6 +804,8 @@ std::optional<ContainerCheckpointView> LoadLegacySyntheticCheckpoint(
     const std::vector<std::byte>& primary_bytes)
 {
     ContainerCheckpointView selected;
+    if (!Materialize(source, 0, primary_bytes.size() + kMaxFsOidSlots * sizeof(std::uint64_t) + 64))
+        return std::nullopt;
     selected.superblock = primary;
     selected.superblock_bytes = primary_bytes;
     if (store_size_bytes < static_cast<std::uint64_t>(primary.block_size) * 2)
@@ -814,9 +843,16 @@ std::optional<ContainerCheckpointView> LoadContainerCheckpointView(
     const RandomAccessSource& source,
     std::uint64_t store_offset_bytes,
     std::uint64_t store_size_bytes,
-    std::string& out_error)
+    std::string& out_error,
+    std::optional<std::uint64_t> exact_checkpoint_xid)
 {
+    BudgetErrorScope budget_error{source, out_error};
     out_error.clear();
+    if (exact_checkpoint_xid == 0)
+    {
+        out_error = "CheckpointExactXidInvalid";
+        return std::nullopt;
+    }
     std::vector<std::byte> probe;
     if (!ReadInto(source, store_offset_bytes, 4096, probe))
     {
@@ -836,9 +872,16 @@ std::optional<ContainerCheckpointView> LoadContainerCheckpointView(
         out_error = "CheckpointBlockZeroUnreadable";
         return std::nullopt;
     }
+    if (!Materialize(source, 0, sizeof(NxSuperblock) + kMaxFsOidSlots * sizeof(std::uint64_t) + 64))
+        return std::nullopt;
     auto anchor = ParseNxSuperblock(block_zero);
     if (!anchor.has_value())
     {
+        if (exact_checkpoint_xid.has_value())
+        {
+            out_error = "CheckpointBlockZeroInvalid";
+            return std::nullopt;
+        }
         // Compatibility for the pre-catalog synthetic fixtures only. A real
         // APFS mount cannot recover descriptor geometry without block zero.
         std::vector<std::byte> synthetic_second;
@@ -878,8 +921,14 @@ std::optional<ContainerCheckpointView> LoadContainerCheckpointView(
     }
     if (anchor->xp_desc_block_count == 0)
     {
+        if (exact_checkpoint_xid.has_value())
+        {
+            out_error = "CheckpointExactGenerationUnavailable";
+            return std::nullopt;
+        }
         auto legacy = LoadLegacySyntheticCheckpoint(
             source, store_offset_bytes, store_size_bytes, anchor.value(), block_zero);
+        if (source.ReadBudget() && source.ReadBudget()->Failed()) return std::nullopt;
         if (!legacy.has_value())
         {
             out_error = "CheckpointSyntheticCopiesConflict";
@@ -897,6 +946,9 @@ std::optional<ContainerCheckpointView> LoadContainerCheckpointView(
         return std::nullopt;
     }
 
+    if (!Materialize(source, anchor->xp_desc_block_count,
+            static_cast<std::uint64_t>(anchor->xp_desc_block_count) * sizeof(std::vector<std::byte>)))
+        return std::nullopt;
     std::vector<std::vector<std::byte>> descriptor_blocks(anchor->xp_desc_block_count);
     for (std::uint32_t index = 0; index < anchor->xp_desc_block_count; ++index)
     {
@@ -915,6 +967,20 @@ std::optional<ContainerCheckpointView> LoadContainerCheckpointView(
     {
         auto candidate = BuildCheckpointCandidate(source, store_offset_bytes,
             store_size_bytes, anchor.value(), descriptor_blocks, index);
+        if (source.ReadBudget() && source.ReadBudget()->Failed()) return std::nullopt;
+        if (exact_checkpoint_xid.has_value())
+        {
+            if (!candidate.has_value() || candidate->superblock.xid != *exact_checkpoint_xid ||
+                candidate->checkpoint_map_blocks.empty() || candidate->superblock.spaceman_oid == 0)
+            {
+                continue;
+            }
+            if (best.has_value())
+            {
+                out_error = "CheckpointExactGenerationAmbiguous";
+                return std::nullopt;
+            }
+        }
         if (candidate.has_value() &&
             (!best.has_value() || candidate->superblock.xid > best->superblock.xid))
         {
@@ -924,6 +990,11 @@ std::optional<ContainerCheckpointView> LoadContainerCheckpointView(
     if (best.has_value())
     {
         return best;
+    }
+    if (exact_checkpoint_xid.has_value())
+    {
+        out_error = "CheckpointExactGenerationUnavailable";
+        return std::nullopt;
     }
 
     // Old synthetic fixtures used a descriptor-area shape without a spaceman
@@ -981,6 +1052,15 @@ bool ReadBtreeLeafRecords(
     std::vector<BtreeRecord>& out_records,
     std::string& out_error)
 {
+    BudgetErrorScope budget_error{source, out_error};
+    bool complete = false;
+    struct ClearIncomplete
+    {
+        bool& complete;
+        std::vector<BtreeRecord>& records;
+        std::vector<std::uint64_t>* visited;
+        ~ClearIncomplete() { if (!complete) { records.clear(); if (visited) visited->clear(); } }
+    } clear_incomplete{complete, out_records, policy.visited_physical_blocks};
     out_records.clear();
     out_error.clear();
     if (policy.visited_physical_blocks != nullptr)
@@ -997,11 +1077,13 @@ bool ReadBtreeLeafRecords(
         std::uint64_t physical_block = 0;
         std::uint64_t object_id = 0;
         bool root = false;
+        std::optional<std::uint16_t> expected_level;
     };
     std::queue<PendingNode> pending;
-    pending.push({root_block, policy.root_object_id, true});
+    if (!Materialize(source, 0, sizeof(PendingNode))) return false;
+    pending.push({root_block, policy.root_object_id, true, std::nullopt});
     std::unordered_set<std::uint64_t> visited;
-    visited.reserve(kMaxVisitedBlocks);
+    if (!source.ReadBudget()) visited.reserve(kMaxVisitedBlocks);
     std::vector<std::byte> block;
     bool root_layout_seen = false;
     std::uint32_t tree_key_size = 0;
@@ -1011,8 +1093,14 @@ bool ReadBtreeLeafRecords(
         const PendingNode current = pending.front();
         pending.pop();
         const std::uint64_t block_index = current.physical_block;
+        if (!Materialize(source, 0, sizeof(std::uint64_t))) return false;
         if (!visited.insert(block_index).second)
         {
+            if (policy.require_complete_traversal)
+            {
+                out_error = "CatalogBtreeRepeatedNode";
+                return false;
+            }
             continue;
         }
         if (visited.size() > kMaxVisitedBlocks)
@@ -1081,6 +1169,7 @@ bool ReadBtreeLeafRecords(
         }
         if (policy.visited_physical_blocks != nullptr)
         {
+            if (!Materialize(source, 0, sizeof(std::uint64_t))) return false;
             policy.visited_physical_blocks->push_back(block_index);
         }
         const std::uint16_t flags = ReadU16LE(block, 0x20).value_or(0);
@@ -1090,6 +1179,12 @@ bool ReadBtreeLeafRecords(
         const std::uint16_t table_length = ReadU16LE(block, 0x2A).value_or(0xFFFFu);
         const std::uint16_t free_offset = ReadU16LE(block, 0x2C).value_or(0xFFFFu);
         const std::uint16_t free_length = ReadU16LE(block, 0x2E).value_or(0xFFFFu);
+        if (policy.require_complete_traversal &&
+            ((current.expected_level && level != *current.expected_level) || (level != 0 && key_count == 0)))
+        {
+            out_error = "CatalogBtreeLevelInvalid";
+            return false;
+        }
         if (level == 0xFFFFu || key_count > kMaxBtreeRecords || table_offset == 0xFFFFu ||
             table_length == 0xFFFFu || free_offset == 0xFFFFu || free_length == 0xFFFFu)
         {
@@ -1153,6 +1248,12 @@ bool ReadBtreeLeafRecords(
             out_error = "CatalogBtreeBoundsInvalid";
             return false;
         }
+        if (policy.require_complete_traversal &&
+            static_cast<std::uint64_t>(key_count) * entry_size > table_length)
+        {
+            out_error = "CatalogBtreeTableInvalid";
+            return false;
+        }
         for (std::uint32_t index = 0; index < key_count; ++index)
         {
             const std::size_t entry_offset = table_start + static_cast<std::size_t>(index) * entry_size;
@@ -1188,6 +1289,11 @@ bool ReadBtreeLeafRecords(
                 }
             }
             const bool ghost = level == 0 && value_offset == 0xFFFFu;
+            if (policy.require_complete_traversal && (key_offset == 0xFFFFu || ghost || key_length == 0))
+            {
+                out_error = "CatalogBtreeMissingEntry";
+                return false;
+            }
             if (key_offset == 0xFFFFu || (ghost && !policy.include_ghost_records))
             {
                 continue;
@@ -1206,8 +1312,17 @@ bool ReadBtreeLeafRecords(
             const std::size_t key_start = key_area_start + key_offset;
             const std::size_t value_start = ghost ? value_area_end :
                 value_area_end - value_offset;
+            if (policy.require_complete_traversal &&
+                (key_start > free_start || key_length > free_start - key_start ||
+                    value_start < value_area_start || value_length > value_area_end - value_start))
+            {
+                out_error = "CatalogBtreeEntryRegionInvalid";
+                return false;
+            }
             if (level == 0)
             {
+                if (!Materialize(source, 1, sizeof(BtreeRecord) +
+                        static_cast<std::uint64_t>(key_length) + (ghost ? 0 : value_length))) return false;
                 BtreeRecord record;
                 record.key.assign(
                     block.begin() + static_cast<std::vector<std::byte>::difference_type>(key_start),
@@ -1233,6 +1348,11 @@ bool ReadBtreeLeafRecords(
                     block[value_start + static_cast<std::size_t>(b)])) << (b * 8);
             }
             std::uint64_t child_block = child_object_id;
+            if (policy.require_complete_traversal && child_object_id == 0)
+            {
+                out_error = "CatalogBtreeChildInvalid";
+                return false;
+            }
             if (!child_addresses_are_physical)
             {
                 if (policy.ephemeral_checkpoint != nullptr &&
@@ -1267,10 +1387,12 @@ bool ReadBtreeLeafRecords(
             }
             if (child_block != 0)
             {
-                pending.push({child_block, child_object_id, false});
+                if (!Materialize(source, 0, sizeof(PendingNode))) return false;
+                pending.push({child_block, child_object_id, false, static_cast<std::uint16_t>(level - 1)});
             }
         }
     }
+    complete = true;
     return true;
 }
 
@@ -1282,6 +1404,7 @@ std::optional<OmapValue> ResolveOmapValue(
     std::uint64_t max_xid,
     std::string& out_error)
 {
+    BudgetErrorScope budget_error{source, out_error};
     out_error.clear();
     if (block_size == 0 || map_oid == 0 || oid == 0)
     {
@@ -1332,6 +1455,7 @@ std::optional<OmapValue> ResolveOmapValue(
         (tree_type & kObjectStorageTypeMask) == kObjectPhysical &&
         (tree_type & kObjectTypeMask) == kObjectTypeBtree;
     BtreeReadPolicy policy;
+    policy.require_complete_traversal = true;
     if (has_strict_identity)
     {
         if (ReadU64LE(omap, 0x08).value_or(0) != map_oid)
@@ -1351,14 +1475,22 @@ std::optional<OmapValue> ResolveOmapValue(
     }
     std::optional<OmapValue> selected;
     bool newest_is_tombstone = false;
+    std::unordered_map<std::uint64_t, std::unordered_set<std::uint64_t>> seen_xids;
     for (const auto& record : records)
     {
-        if (record.key.size() < 16 || record.value.size() < 16)
+        if (record.key.size() != 16 || record.value.size() != 16)
         {
-            continue;
+            out_error = "CatalogOmapRecordSizeInvalid";
+            return std::nullopt;
         }
         const auto candidate_oid = ReadU64LE(record.key, 0).value_or(0xFFFFFFFFFFFFFFFFull);
         const auto candidate_xid = ReadU64LE(record.key, 8).value_or(0xFFFFFFFFFFFFFFFFull);
+        if (!Materialize(source, 0, 2 * sizeof(std::uint64_t))) return std::nullopt;
+        if (!seen_xids[candidate_oid].insert(candidate_xid).second)
+        {
+            out_error = "CatalogOmapKeyDuplicate";
+            return std::nullopt;
+        }
         if (candidate_oid != oid || candidate_xid > max_xid)
         {
             continue;
@@ -1416,6 +1548,7 @@ std::optional<ApsbVolume> ParseApsb(const std::vector<std::byte>& block)
     out.fext_tree_oid = ReadU64LE(block, 0x408).value_or(0);
     out.fext_tree_type = ReadU32LE(block, 0x410).value_or(0);
     out.file_count = ReadU64LE(block, 0xB8).value_or(0);
+    out.next_object_id = ReadU64LE(block, 0xB0).value_or(0);
     out.directory_count = ReadU64LE(block, 0xC0).value_or(0);
     out.features = ReadU64LE(block, 0x28).value_or(0);
     out.readonly_features = ReadU64LE(block, 0x30).value_or(0);
@@ -1610,6 +1743,7 @@ std::optional<OmapValue> ResolveAppleOmapValue(
     policy.root_object_id = map.tree.object_id;
     policy.storage_type = kObjectPhysical;
     policy.subtype = kObjectTypeOmap;
+    policy.require_complete_traversal = true;
     std::string tree_error;
     if (!ReadBtreeLeafRecords(source, block_size, map.tree.physical_block,
             true, 0, max_xid, policy, records, tree_error))
@@ -1619,16 +1753,24 @@ std::optional<OmapValue> ResolveAppleOmapValue(
     }
     std::optional<OmapValue> selected;
     bool newest_is_tombstone = false;
+    std::unordered_map<std::uint64_t, std::unordered_set<std::uint64_t>> seen_xids;
     for (const auto& record : records)
     {
-        if (record.key.size() < 16 || record.value.size() < 16)
+        if (record.key.size() != 16 || record.value.size() != 16)
         {
-            continue;
+            out_error = error_prefix + "RecordSizeInvalid";
+            return std::nullopt;
         }
         const auto candidate_oid = ReadU64LE(record.key, 0).value_or(
             0xFFFFFFFFFFFFFFFFull);
         const auto candidate_xid = ReadU64LE(record.key, 8).value_or(
             0xFFFFFFFFFFFFFFFFull);
+        if (!Materialize(source, 0, 2 * sizeof(std::uint64_t))) return std::nullopt;
+        if (!seen_xids[candidate_oid].insert(candidate_xid).second)
+        {
+            out_error = error_prefix + "KeyDuplicate";
+            return std::nullopt;
+        }
         if (candidate_oid != oid || candidate_xid > max_xid)
         {
             continue;
@@ -1946,6 +2088,7 @@ bool LoadAppleSpacemanOwnershipViewImpl(
     std::unordered_set<std::uint16_t> active_bitmap_indices;
     for (std::uint32_t index = 0; index < pool.bitmap_size_blocks; ++index)
     {
+        if (!Materialize(source, 1, sizeof(AppleSpacemanInternalPoolBitmapView) + sizeof(std::uint16_t))) return false;
         AppleSpacemanInternalPoolBitmapView bitmap;
         bitmap.xid = ReadU64LE(out_view.bytes,
             pool.bitmap_xid_offset + static_cast<std::size_t>(index) * 8).value_or(
@@ -1969,6 +2112,8 @@ bool LoadAppleSpacemanOwnershipViewImpl(
         pool.active_bitmaps.push_back(std::move(bitmap));
     }
 
+    if (!Materialize(source, pool.bitmap_block_count,
+            static_cast<std::uint64_t>(pool.bitmap_block_count) * 2 * sizeof(std::uint16_t))) return false;
     pool.bitmap_free_next.reserve(pool.bitmap_block_count);
     for (std::uint32_t index = 0; index < pool.bitmap_block_count; ++index)
     {
@@ -2128,6 +2273,7 @@ bool LoadAppleSpacemanOwnershipViewImpl(
             queued_block_count += entry.block_count;
             previous_key = key;
             have_previous = true;
+            if (!Materialize(source, 1, sizeof(entry))) return false;
             queue.entries.push_back(entry);
         }
         if (queued_block_count != queue.block_count)
@@ -2142,15 +2288,18 @@ bool LoadAppleSpacemanOwnershipViewImpl(
             out_error = "AppleSpacemanFreeQueueOldestXidMismatch";
             return false;
         }
+        if (!Materialize(source, 1, sizeof(queue.root))) return false;
         out_view.free_queue_roots.push_back(queue.root);
     }
 
     std::unordered_set<std::uint64_t> ownership_blocks;
+    if (!Materialize(source, 0, sizeof(std::uint64_t))) return false;
     ownership_blocks.insert(out_view.object.physical_block);
     for (const auto& queue : out_view.free_queues)
     {
         for (const auto block : queue.tree_blocks)
         {
+            if (!Materialize(source, 0, sizeof(std::uint64_t))) return false;
             if (!ownership_blocks.insert(block).second)
             {
                 out_error = "AppleSpacemanOwnershipOverlap";
@@ -2160,6 +2309,8 @@ bool LoadAppleSpacemanOwnershipViewImpl(
     }
 
     std::vector<std::uint64_t> cib_blocks;
+    if (!Materialize(source, main_device.cib_count,
+            static_cast<std::uint64_t>(main_device.cib_count) * sizeof(std::uint64_t))) return false;
     if (main_device.cab_count == 0)
     {
         if (!ByteRangeFits(main_device.address_offset, main_device.cib_count,
@@ -2190,6 +2341,7 @@ bool LoadAppleSpacemanOwnershipViewImpl(
         cib_blocks.reserve(main_device.cib_count);
         for (std::uint32_t cab_index = 0; cab_index < main_device.cab_count; ++cab_index)
         {
+            if (!Materialize(source, 1, sizeof(AppleSpacemanCabView) + sizeof(std::uint64_t))) return false;
             const auto cab_block = ReadU64LE(out_view.bytes,
                 main_device.address_offset + static_cast<std::size_t>(cab_index) * 8).value_or(0);
             if (cab_block == 0 || !ownership_blocks.insert(cab_block).second)
@@ -2219,6 +2371,7 @@ bool LoadAppleSpacemanOwnershipViewImpl(
             }
             for (std::uint32_t index = 0; index < count; ++index)
             {
+                if (!Materialize(source, 0, sizeof(std::uint64_t))) return false;
                 const auto cib_block = ReadU64LE(cab.bytes,
                     0x28 + static_cast<std::size_t>(index) * 8).value_or(0);
                 cab.cib_blocks.push_back(cib_block);
@@ -2237,6 +2390,7 @@ bool LoadAppleSpacemanOwnershipViewImpl(
     std::uint64_t total_free_count = 0;
     for (std::uint32_t cib_index = 0; cib_index < main_device.cib_count; ++cib_index)
     {
+        if (!Materialize(source, 1, sizeof(AppleSpacemanCibView) + sizeof(std::uint64_t))) return false;
         const auto cib_block = cib_blocks[cib_index];
         if (cib_block == 0 || !ownership_blocks.insert(cib_block).second)
         {
@@ -2267,6 +2421,8 @@ bool LoadAppleSpacemanOwnershipViewImpl(
         }
         for (std::uint32_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index)
         {
+            if (!Materialize(source, 1, sizeof(AppleSpacemanChunkView) +
+                    sizeof(std::size_t) + sizeof(std::uint64_t))) return false;
             const std::size_t base = 0x28 + static_cast<std::size_t>(chunk_index) * 0x20;
             AppleSpacemanChunkView chunk;
             chunk.xid = ReadU64LE(cib.bytes, base).value_or(0);
@@ -2381,6 +2537,7 @@ bool LoadAppleSpacemanOwnershipViewImpl(
                     return false;
                 }
             }
+            if (!Materialize(source, 0, 2 * sizeof(std::uint64_t))) return false;
             queued_ranges.emplace_back(entry.physical_block, range_end);
         }
     }
@@ -2413,17 +2570,24 @@ bool LoadAppleSpacemanOwnershipView(
     AppleSpacemanView& out_view,
     std::string& out_error)
 {
+    BudgetErrorScope budget_error{source, out_error};
     out_error.clear();
-    return LoadAppleSpacemanOwnershipViewImpl(
-        source, checkpoint, out_view, out_error);
+    if (!LoadAppleSpacemanOwnershipViewImpl(source, checkpoint, out_view, out_error))
+    {
+        out_view = {};
+        return false;
+    }
+    return true;
 }
 
 std::optional<AppleCheckpointView> LoadAppleCheckpointView(
     const RandomAccessSource& source,
     std::uint64_t store_offset_bytes,
     std::uint64_t store_size_bytes,
-    std::string& out_error)
+    std::string& out_error,
+    std::optional<std::uint64_t> exact_checkpoint_xid)
 {
+    BudgetErrorScope budget_error{source, out_error};
     out_error.clear();
     if (store_size_bytes == 0 || store_offset_bytes > source.SizeBytes() ||
         store_size_bytes > source.SizeBytes() - store_offset_bytes)
@@ -2434,7 +2598,7 @@ std::optional<AppleCheckpointView> LoadAppleCheckpointView(
     OffsetRandomAccessSource store(&source, store_offset_bytes, store_size_bytes);
     std::string checkpoint_error;
     auto checkpoint = LoadContainerCheckpointView(
-        store, 0, store_size_bytes, checkpoint_error);
+        store, 0, store_size_bytes, checkpoint_error, exact_checkpoint_xid);
     if (!checkpoint.has_value())
     {
         out_error = "AppleCheckpointInvalid:" + checkpoint_error;
@@ -2465,6 +2629,7 @@ std::optional<AppleCheckpointView> LoadAppleCheckpointView(
     std::unordered_set<std::uint64_t> seen_volume_oids;
     for (const std::uint64_t volume_oid : nxsb.fs_oids)
     {
+        if (!Materialize(source, 0, sizeof(std::uint64_t))) return std::nullopt;
         if (volume_oid == 0 || !seen_volume_oids.insert(volume_oid).second)
         {
             out_error = "AppleVolumeOidInvalid";
@@ -2486,6 +2651,7 @@ std::optional<AppleCheckpointView> LoadAppleCheckpointView(
         {
             return std::nullopt;
         }
+        if (!Materialize(source, 0, sizeof(ApsbVolume) + 384)) return std::nullopt;
         auto apsb = ParseApsb(apsb_bytes);
         if (!apsb.has_value())
         {
@@ -2541,6 +2707,7 @@ std::optional<AppleCheckpointView> LoadAppleCheckpointView(
             }
             volume_view.file_extent_tree = location;
         }
+        if (!Materialize(source, 1, sizeof(AppleVolumeCheckpointView))) return std::nullopt;
         view.volumes.push_back(std::move(volume_view));
     }
     if (view.volumes.empty())

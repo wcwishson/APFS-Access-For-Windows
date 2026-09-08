@@ -161,6 +161,7 @@ MutationCompactor::Summary MutationCompactor::Summarize(
 {
     Summary summary{};
     summary.raw_mutation_count = mutations.size();
+    bool has_allocation_barrier = false;
 
     std::unordered_set<std::wstring> payload_paths;
     payload_paths.reserve(mutations.size());
@@ -192,19 +193,35 @@ MutationCompactor::Summary MutationCompactor::Summarize(
                 path_key,
                 CanonicalPathKey(mutation.secondary_path, name_policy));
             break;
+        case MutationKind::SetAllocationSize:
+        case MutationKind::RewriteCompressedContent:
+            // Allocation shrink may truncate EOF; a final-path summary cannot
+            // represent the ordered writes, truncations and growth around it.
+            has_allocation_barrier = true;
+            break;
+        case MutationKind::RestoreDirectoryFromSymbolicLink:
+            // Inode type restoration must retain its position in the mutation stream.
+            has_allocation_barrier = true;
+            break;
         case MutationKind::Delete:
             ErasePayloadSubtree(payload_paths, path_key);
             break;
         case MutationKind::CreateFile:
         case MutationKind::CreateDirectory:
         case MutationKind::SetBasicInfo:
+        case MutationKind::SetSymbolicLinkTarget:
+        case MutationKind::RemoveSymbolicLinkTarget:
+        case MutationKind::SetExtendedAttribute:
+        case MutationKind::RemoveExtendedAttribute:
+        case MutationKind::SetInodeMetadata:
             break;
         }
     }
 
     summary.payload_paths.assign(payload_paths.begin(), payload_paths.end());
     std::sort(summary.payload_paths.begin(), summary.payload_paths.end());
-    summary.compacted_mutation_count = summary.payload_paths.size();
+    summary.compacted_mutation_count = has_allocation_barrier
+        ? summary.raw_mutation_count : summary.payload_paths.size();
     return summary;
 }
 }

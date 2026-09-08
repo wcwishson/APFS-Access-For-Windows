@@ -44,6 +44,7 @@ public:
 
     [[nodiscard]] const std::wstring& Path() const noexcept;
     [[nodiscard]] Geometry GetGeometry() const;
+    [[nodiscard]] bool IsRegularFile() const;
     [[nodiscard]] bool IsWritable() const;
     [[nodiscard]] bool HasWriteHandle() const noexcept;
     [[nodiscard]] static DWORD WriteHandleShareMode(std::wstring_view path) noexcept;
@@ -133,6 +134,7 @@ private:
     bool read_cache_enabled_ = false;
     mutable std::atomic<HANDLE> read_handle_{ INVALID_HANDLE_VALUE };
     mutable std::atomic<HANDLE> write_handle_{ INVALID_HANDLE_VALUE };
+    mutable std::atomic<bool> regular_file_{ false };
     mutable std::atomic<bool> writable_{ false };
     mutable bool geometry_cached_ = false;
     mutable Geometry geometry_cache_{};

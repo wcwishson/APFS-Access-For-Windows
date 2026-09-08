@@ -26,9 +26,11 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <sstream>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 namespace apfsaccess::catalog
@@ -892,6 +894,37 @@ bool ValidateManifestPath(const fs::path& path, std::string& out_error)
     return false;
 }
 
+bool NormalizeRequiredCheckpointXids(
+    const std::vector<std::uint64_t>& xids,
+    std::uint64_t maximum_xid,
+    std::vector<std::uint64_t>& out_xids,
+    std::string& out_error)
+{
+    out_xids = xids;
+    for (const std::uint64_t xid : out_xids)
+    {
+        if (xid == 0)
+        {
+            out_error = "RequiredCheckpointXidZero";
+            return false;
+        }
+        if (xid > maximum_xid)
+        {
+            out_error = "RequiredCheckpointXidFuture: xid=" +
+                std::to_string(xid) + " checkpoint=" +
+                std::to_string(maximum_xid);
+            return false;
+        }
+    }
+    std::sort(out_xids.begin(), out_xids.end());
+    if (std::adjacent_find(out_xids.begin(), out_xids.end()) != out_xids.end())
+    {
+        out_error = "RequiredCheckpointXidDuplicate";
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 struct ContainerMountCoordinator::SessionState
@@ -902,6 +935,77 @@ struct ContainerMountCoordinator::SessionState
     bool requested_write = false;
     bool use_canonical_transaction = false;
     std::unique_ptr<MetadataStore> store;
+};
+
+struct ContainerMountCoordinator::ScopedCommitDiagnostics
+{
+    ContainerMountCoordinator& owner;
+    std::uint64_t volume_object_id;
+    const ContainerCommitResult& result;
+    std::chrono::steady_clock::time_point started;
+    std::chrono::steady_clock::time_point acquired;
+
+    ~ScopedCommitDiagnostics()
+    {
+        const auto finished = std::chrono::steady_clock::now();
+        const auto wait_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(acquired - started).count());
+        const auto hold_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(finished - acquired).count());
+        const auto record = [&](ContainerCommitDiagnostics& counters)
+        {
+            ++counters.commit_attempts;
+            // Read only scalar members: return-value movement may have already
+            // moved result.error before this scope is destroyed without NRVO.
+            if (result.committed && result.commit_status_code ==
+                static_cast<int>(MetadataStore::CommitStatus::Committed))
+                ++counters.commit_successes;
+            else if (result.committed && result.commit_status_code ==
+                static_cast<int>(MetadataStore::CommitStatus::NothingToCommit))
+                ++counters.commit_noops;
+            else
+                ++counters.commit_failures;
+            counters.commit_wait_total_us += wait_us;
+            counters.commit_hold_total_us += hold_us;
+            counters.commit_total_us += wait_us + hold_us;
+            counters.commit_max_us = std::max(counters.commit_max_us, wait_us + hold_us);
+        };
+        std::lock_guard<std::mutex> guard(owner.mutex_);
+        record(owner.diagnostics_);
+        if (auto* counters = owner.FindVolumeDiagnosticsNoLock(volume_object_id)) record(*counters);
+    }
+};
+
+struct ContainerMountCoordinator::ScopedReloadDiagnostics
+{
+    ContainerMountCoordinator& owner;
+    std::uint64_t volume_object_id;
+    ReloadReason reason;
+    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    bool succeeded = false;
+
+    ~ScopedReloadDiagnostics()
+    {
+        const auto elapsed_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started).count());
+        const auto record = [&](ContainerCommitDiagnostics& counters)
+        {
+            ++counters.reload_attempts;
+            if (!succeeded) ++counters.reload_failures;
+            counters.reload_total_us += elapsed_us;
+            counters.reload_max_us = std::max(counters.reload_max_us, elapsed_us);
+            switch (reason)
+            {
+            case ReloadReason::BeforeCommit: ++counters.precommit_reload_attempts; break;
+            case ReloadReason::Rollback: ++counters.rollback_reload_attempts; break;
+            case ReloadReason::Recovery: ++counters.recovery_reload_attempts; break;
+            }
+        };
+        std::lock_guard<std::mutex> guard(owner.mutex_);
+        record(owner.diagnostics_);
+        if (auto* counters = owner.FindVolumeDiagnosticsNoLock(volume_object_id)) record(*counters);
+    }
 };
 
 bool ParseContainerManifest(
@@ -1124,7 +1228,8 @@ std::unique_ptr<ContainerMountCoordinator> ContainerMountCoordinator::Open(
     std::uint64_t device_offset_bytes,
     std::string& out_error,
     CatalogLoadPolicy catalog_load_policy,
-    bool require_writable_lease)
+    bool require_writable_lease,
+    bool require_checkpoint_census)
 {
     out_error.clear();
     if (device_path.empty())
@@ -1193,6 +1298,19 @@ std::unique_ptr<ContainerMountCoordinator> ContainerMountCoordinator::Open(
         out_error = "ContainerHasNoVolumes";
         return nullptr;
     }
+    coordinator->require_checkpoint_census_ = require_checkpoint_census;
+    coordinator->checkpoint_census_initialized_ = !require_checkpoint_census;
+    coordinator->volume_checkpoint_pins_.reserve(
+        coordinator->container_volume_oids_.size());
+    coordinator->volume_diagnostics_.reserve(
+        coordinator->container_volume_oids_.size());
+    for (const std::uint64_t volume_object_id :
+         coordinator->container_volume_oids_)
+    {
+        coordinator->volume_checkpoint_pins_.push_back(
+            {volume_object_id, {}});
+        coordinator->volume_diagnostics_.push_back({volume_object_id, {}});
+    }
     coordinator->checkpoint_xid_.store(
         catalog.Containers()[0].checkpoint_xid, std::memory_order_relaxed);
 #if defined(_WIN32)
@@ -1206,6 +1324,146 @@ std::unique_ptr<ContainerMountCoordinator> ContainerMountCoordinator::Open(
 }
 
 ContainerMountCoordinator::~ContainerMountCoordinator() = default;
+
+bool ContainerMountCoordinator::CheckpointCensusRequired() const noexcept
+{
+    return require_checkpoint_census_;
+}
+
+std::vector<VolumeCheckpointPins> ContainerMountCoordinator::CheckpointCensusSnapshot() const
+{
+    std::lock_guard<std::timed_mutex> commit_guard(commit_mutex_);
+    return volume_checkpoint_pins_;
+}
+
+bool ContainerMountCoordinator::InitializeRequiredCheckpointCensus(
+    const std::vector<VolumeCheckpointPins>& volume_pins,
+    std::string& out_error)
+{
+    out_error.clear();
+    std::lock_guard<std::timed_mutex> commit_guard(commit_mutex_);
+    if (!require_checkpoint_census_)
+    {
+        out_error = "RequiredCheckpointCensusNotRequired";
+        return false;
+    }
+    if (checkpoint_census_initialized_)
+    {
+        out_error = "RequiredCheckpointCensusAlreadyInitialized";
+        return false;
+    }
+
+    std::vector<VolumeCheckpointPins> normalized;
+    normalized.reserve(volume_pins.size());
+    const std::uint64_t maximum_xid =
+        checkpoint_xid_.load(std::memory_order_relaxed);
+    for (const VolumeCheckpointPins& entry : volume_pins)
+    {
+        if (!std::binary_search(
+                container_volume_oids_.begin(),
+                container_volume_oids_.end(),
+                entry.volume_object_id))
+        {
+            out_error = "RequiredCheckpointCensusVolumeUnknown: oid=" +
+                std::to_string(entry.volume_object_id);
+            return false;
+        }
+        std::vector<std::uint64_t> normalized_xids;
+        if (!NormalizeRequiredCheckpointXids(
+                entry.required_checkpoint_xids,
+                maximum_xid,
+                normalized_xids,
+                out_error))
+        {
+            return false;
+        }
+        if (entry.unapplied_accepted_work && normalized_xids.empty())
+        {
+            out_error = "RequiredCheckpointUnappliedSourceMissing";
+            return false;
+        }
+        normalized.push_back(
+            {entry.volume_object_id, std::move(normalized_xids), entry.unapplied_accepted_work});
+    }
+    std::sort(
+        normalized.begin(),
+        normalized.end(),
+        [](const VolumeCheckpointPins& left, const VolumeCheckpointPins& right)
+        {
+            return left.volume_object_id < right.volume_object_id;
+        });
+    if (std::adjacent_find(
+            normalized.begin(),
+            normalized.end(),
+            [](const VolumeCheckpointPins& left, const VolumeCheckpointPins& right)
+            {
+                return left.volume_object_id == right.volume_object_id;
+            }) != normalized.end())
+    {
+        out_error = "RequiredCheckpointCensusVolumeDuplicate";
+        return false;
+    }
+    if (normalized.size() != container_volume_oids_.size())
+    {
+        out_error = "RequiredCheckpointCensusIncomplete: expected=" +
+            std::to_string(container_volume_oids_.size()) + " actual=" +
+            std::to_string(normalized.size());
+        return false;
+    }
+    for (std::size_t index = 0; index < normalized.size(); ++index)
+    {
+        if (normalized[index].volume_object_id != container_volume_oids_[index])
+        {
+            out_error = "RequiredCheckpointCensusIncomplete: missing oid=" +
+                std::to_string(container_volume_oids_[index]);
+            return false;
+        }
+    }
+
+    volume_checkpoint_pins_ = std::move(normalized);
+    checkpoint_census_initialized_ = true;
+    return true;
+}
+
+bool ContainerMountCoordinator::UpdateRequiredCheckpointXids(
+    std::uint64_t volume_object_id,
+    const std::vector<std::uint64_t>& required_checkpoint_xids,
+    std::string& out_error,
+    bool unapplied_accepted_work)
+{
+    out_error.clear();
+    std::lock_guard<std::timed_mutex> commit_guard(commit_mutex_);
+    if (require_checkpoint_census_ && !checkpoint_census_initialized_)
+    {
+        out_error = "RequiredCheckpointCensusIncomplete";
+        return false;
+    }
+    VolumeCheckpointPins* pins =
+        FindVolumeCheckpointPinsNoLock(volume_object_id);
+    if (pins == nullptr)
+    {
+        out_error = "RequiredCheckpointVolumeUnknown: oid=" +
+            std::to_string(volume_object_id);
+        return false;
+    }
+    std::vector<std::uint64_t> normalized_xids;
+    if (!NormalizeRequiredCheckpointXids(
+            required_checkpoint_xids,
+            checkpoint_xid_.load(std::memory_order_relaxed),
+            normalized_xids,
+            out_error))
+    {
+        return false;
+    }
+    if (unapplied_accepted_work && normalized_xids.empty())
+    {
+        out_error = "RequiredCheckpointUnappliedSourceMissing";
+        return false;
+    }
+    pins->required_checkpoint_xids = std::move(normalized_xids);
+    pins->unapplied_accepted_work = unapplied_accepted_work;
+    return true;
+}
 
 bool ContainerMountCoordinator::MountVolume(
     const ContainerVolumeSession& session, std::string& out_error)
@@ -1349,12 +1607,21 @@ bool ContainerMountCoordinator::UnmountVolume(
 ContainerCommitResult ContainerMountCoordinator::Commit(
     std::uint64_t volume_object_id,
     const std::vector<MetadataStore::MutationRequest>& mutations,
-    const ContainerPrepublicationHook& prepublication_hook)
+    const ContainerPrepublicationHook& prepublication_hook,
+    const ContainerMutationStagingHook& mutation_staging_hook,
+    const ContainerRetentionCleanupHook& retention_cleanup_hook,
+    bool accepted_replay,
+    std::optional<std::uint64_t> expected_replay_preimage,
+    const ContainerMutationPreparationHook& mutation_preparation_hook,
+    const ContainerPostpublicationVerifierHook& postpublication_verifier_hook)
 {
+    const auto commit_started = std::chrono::steady_clock::now();
     ContainerCommitResult result{};
     std::unique_lock<std::timed_mutex> commit_guard(
         commit_mutex_, std::defer_lock);
     commit_guard.lock();
+    ScopedCommitDiagnostics diagnostics_scope{*this, volume_object_id, result,
+        commit_started, std::chrono::steady_clock::now()};
     {
         std::lock_guard<std::mutex> guard(mutex_);
         if (draining_)
@@ -1387,12 +1654,48 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
         result.error = "VolumeNotMounted";
         return result;
     }
+    const auto native_staging_clean = [&]() {
+        const auto& store = *session->store;
+        return store.IsNativeWriteReady() && !store.IsRecoveryRequired() &&
+            store.PendingMutationCount() == 0 && store.PendingAllocationCount() == 0 &&
+            store.PendingDeallocationCount() == 0 && store.PendingObjectMapUpdateCount() == 0 &&
+            store.PendingBtreeRecordCount() == 0 && store.PendingPayloadByteEstimate() == 0;
+    };
     if (!session->requested_write)
     {
         result.commit_status_code = static_cast<int>(
             MetadataStore::CommitStatus::NotWritable);
         result.error = "VolumeNotWritable";
         return result;
+    }
+    if (require_checkpoint_census_ && !checkpoint_census_initialized_)
+    {
+        result.commit_status_code = static_cast<int>(
+            MetadataStore::CommitStatus::NotReady);
+        result.error = "RequiredCheckpointCensusIncomplete";
+        return result;
+    }
+    if (require_checkpoint_census_)
+    {
+        const auto* replay_target =
+            FindVolumeCheckpointPinsNoLock(volume_object_id);
+        const bool accepted_replay_authorized = accepted_replay &&
+            replay_target != nullptr &&
+            replay_target->unapplied_accepted_work;
+        for (const auto& pins : volume_checkpoint_pins_)
+        {
+            if (!pins.unapplied_accepted_work ||
+                accepted_replay_authorized) continue;
+            result.error = (pins.volume_object_id == volume_object_id
+                    ? "VolumeAcceptedRecoveryPending: oid=" : "SiblingAcceptedRecoveryPending: oid=") +
+                std::to_string(pins.volume_object_id);
+            result.commit_status_code = static_cast<int>(MetadataStore::CommitStatus::RetentionBlocked);
+            result.commit_stage = "awaiting-accepted-recovery";
+            // This attempt has not touched staging or called any hooks. Do not
+            // certify an already dirty selected store as a clean refusal.
+            result.clean_prepublication_refusal = !accepted_replay && native_staging_clean();
+            return result;
+        }
     }
     const std::uint64_t in_flight =
         in_flight_commits_.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1422,20 +1725,168 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
     // Every per-volume store must reload the latest shared container
     // checkpoint before it chooses a target XID or allocates extents. A
     // spaceman-only refresh leaves the checkpoint slot and XID stale.
+    // Do not elide this based on XID/readiness: borrowed stores have no
+    // mutation epoch, image handles share write access, and publication
+    // guards are captured during planning rather than retained from this load.
     std::string reload_error;
-    if (!ReloadSessionForCommitNoLock(*session, reload_error))
+    if (!ReloadSessionForCommitNoLock(*session, reload_error, ReloadReason::BeforeCommit))
     {
         result.error = "CommitCommitterReloadFailed: " + reload_error;
         return result;
     }
-    result.checkpoint_xid = checkpoint_xid_.load(std::memory_order_relaxed);
-    for (const MetadataStore::MutationRequest& request : mutations)
+    const std::optional<std::uint64_t> preimage_checkpoint_xid =
+        session->store->CheckpointXid();
+    if (expected_replay_preimage && (!accepted_replay ||
+        preimage_checkpoint_xid != expected_replay_preimage))
     {
+        result.commit_status_code = static_cast<int>(MetadataStore::CommitStatus::NotReady);
+        result.error = "AcceptedReplayPreimageAdvanced";
+        return result;
+    }
+    if ((prepublication_hook || mutation_preparation_hook) && !preimage_checkpoint_xid.has_value())
+    {
+        result.commit_status_code = static_cast<int>(
+            MetadataStore::CommitStatus::InvariantFailed);
+        result.error = "CommitPreimageCheckpointMissing";
+        return result;
+    }
+    result.checkpoint_xid = preimage_checkpoint_xid.value_or(
+        checkpoint_xid_.load(std::memory_order_relaxed));
+    auto staged_requests = mutations;
+    if (mutation_preparation_hook)
+    {
+        // The public surface is const. Also reject observable staging or
+        // identity changes through an improperly captured borrowed store.
+        // Copy values, never references into a view that a reload can replace.
+        const auto capture_context = [&]() {
+            const auto& context = session->store->Context();
+            return std::make_tuple(
+                context.device_path, context.device_offset_bytes, context.volume_name,
+                context.container_uuid_hex, context.volume_uuid_hex,
+                context.volume_object_id, context.shared_container_session,
+                context.container_volume_slot_index, context.container_volume_slot_count,
+                context.incompatible_features, context.allow_raw_physical_write,
+                context.integrity_check_on_mount, context.crash_replay_mode,
+                context.allow_legacy_scaffold_for_fixtures,
+                context.disallow_scaffold_commit_on_non_fixture,
+                context.reject_scaffold_replay_blob_on_non_fixture,
+                context.require_canonical_replay_candidate_on_non_fixture,
+                context.allow_legacy_private_checkpoint_writer_for_tests);
+        };
+        const auto capture = [&]() {
+            const auto& store = *session->store;
+            const auto* checkpoint = store.AuthoritativeAppleCheckpointView();
+            return std::make_tuple(
+                store.CheckpointXid(), store.LastCommittedXid(), capture_context(),
+                checkpoint != nullptr,
+                checkpoint ? checkpoint->container.superblock.xid : 0,
+                checkpoint ? checkpoint->container.superblock.uuid_hex : std::string{},
+                checkpoint ? checkpoint->container.superblock_physical_block : 0,
+                checkpoint ? checkpoint->container.superblock_bytes : std::vector<std::byte>{},
+                store.PendingMutationCount(), store.PendingAllocationCount(),
+                store.PendingDeallocationCount(), store.PendingObjectMapUpdateCount(),
+                store.PendingBtreeRecordCount(), store.PendingPayloadByteEstimate(),
+                store.DebugWorkingInodeCount(), store.DebugWorkingFreeExtentCount(),
+                store.DebugWorkingFreeExtentTotalBytes(), store.IsNativeWriteReady(),
+                store.IsRecoveryRequired(),
+                apfsaccess::rw::CheckpointDeltaCodec::Encode(store.DebugBuildPendingCheckpointDelta()));
+        };
+        std::string preparation_error;
+        bool prepared = false;
+        bool identity_changed = false;
+        try
+        {
+            const auto context_before = capture_context();
+            const auto before = capture();
+            try
+            {
+                prepared = mutation_preparation_hook(*session->store, staged_requests, preparation_error);
+            }
+            catch (...)
+            {
+                preparation_error = "MutationPreparationHookException";
+            }
+            identity_changed = capture_context() != context_before;
+            if (capture() != before || session->store->CheckpointXid() != preimage_checkpoint_xid)
+            {
+                prepared = false;
+                preparation_error = "MutationPreparationStoreChanged";
+            }
+            std::size_t inline_bytes = 0;
+            bool bounded = !staged_requests.empty() &&
+                staged_requests.size() <= ContainerPreparedMutationLimit;
+            for (const auto& request : staged_requests)
+            {
+                if (!bounded) break;
+                bounded = request.path.size() <= ContainerPreparedPathCharLimit &&
+                    request.secondary_path.size() <= ContainerPreparedPathCharLimit &&
+                    request.inline_payload.size() <= ContainerPreparedInlineByteLimit - inline_bytes;
+                if (bounded) inline_bytes += request.inline_payload.size();
+            }
+            if (prepared && preparation_error.empty() && !bounded)
+            {
+                prepared = false;
+                preparation_error = "MutationPreparationBatchOutOfBounds";
+            }
+        }
+        catch (...)
+        {
+            prepared = false;
+            preparation_error = "MutationPreparationSnapshotException";
+        }
+        if (!prepared || !preparation_error.empty())
+        {
+            result.commit_status_code = static_cast<int>(MetadataStore::CommitStatus::InvariantFailed);
+            result.commit_stage = "mutation-preparation-hook";
+            result.error = "CommitMutationPreparationHookFailed";
+            if (!preparation_error.empty()) result.error += ": " + preparation_error;
+            if (identity_changed)
+            {
+                // Reloading a store whose routing identity was tampered with
+                // could select a different source. Leave it closed for recovery.
+                std::lock_guard<std::mutex> guard(mutex_);
+                recovery_required_ = true;
+                recovery_volume_object_id_ = session->volume_object_id;
+                recovery_reason_ = "MutationPreparationIdentityChanged";
+                result.commit_recovery_required = true;
+                result.commit_recovery_reason = WidenUtf8(recovery_reason_);
+                return result;
+            }
+            // No WAL acceptance has run: preserve the existing pin census and
+            // caller-owned evidence. Discard only local scratch/illegal staging.
+            std::string rollback_error;
+            if (!ReloadSessionForCommitNoLock(*session, rollback_error))
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+                recovery_required_ = true;
+                recovery_volume_object_id_ = session->volume_object_id;
+                recovery_reason_ = "MutationPreparationRollbackFailed: " + rollback_error;
+                result.error += " | " + recovery_reason_;
+                result.commit_recovery_required = true;
+                result.commit_recovery_reason = WidenUtf8(recovery_reason_);
+            }
+            else
+            {
+                result.clean_prepublication_refusal = !accepted_replay && native_staging_clean() &&
+                    session->store->CheckpointXid() == preimage_checkpoint_xid;
+            }
+            return result;
+        }
+    }
+    for (std::size_t mutation_index = 0;
+         mutation_index < staged_requests.size();
+         ++mutation_index)
+    {
+        MetadataStore::MutationRequest& request =
+            staged_requests[mutation_index];
         MetadataStore::PayloadIdentity staged_identity{};
+        std::optional<apfsaccess::rw::UnlinkOutcome> unlink_outcome;
         const auto stage =
-            session->store->StageMutation(request, &staged_identity);
+            session->store->StageMutation(request, &staged_identity, &unlink_outcome);
         if (stage != MetadataStore::MutationStatus::Applied)
         {
+            result.mutation_staging_status = stage;
+            result.commit_stage = "mutation-staging";
             result.error = "CommitStageFailed: status=" +
                 std::to_string(static_cast<int>(stage)) + " | " +
                 NarrowLossy(session->store->RecoveryReason());
@@ -1453,22 +1904,132 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
                 result.commit_recovery_reason =
                     WidenUtf8(recovery_reason_);
             }
+            else
+            {
+                // A caller staging hook may own external evidence; certify
+                // only the native-only staging path before the WAL binder.
+                result.clean_prepublication_refusal =
+                    !accepted_replay && !mutation_staging_hook && native_staging_clean() &&
+                    session->store->CheckpointXid() == preimage_checkpoint_xid;
+            }
             return result;
         }
         result.staged_identities.push_back(staged_identity);
+        request.expected_unlink_outcome = std::move(unlink_outcome);
+        if (mutation_staging_hook)
+        {
+            std::string hook_error;
+            bool hook_succeeded = false;
+            try
+            {
+                hook_succeeded = mutation_staging_hook(
+                    mutation_index,
+                    request,
+                    result.staged_identities.back(),
+                    hook_error);
+            }
+            catch (...)
+            {
+                hook_error = "MutationStagingHookException";
+            }
+            if (!hook_succeeded)
+            {
+                result.commit_status_code = static_cast<int>(
+                    MetadataStore::CommitStatus::InvariantFailed);
+                result.commit_stage = "mutation-staging-hook";
+                result.error = "CommitMutationStagingHookFailed";
+                if (!hook_error.empty())
+                {
+                    result.error += ": " + hook_error;
+                }
+                result.staged_identities.clear();
+                std::string rollback_error;
+                if (!ReloadSessionForCommitNoLock(*session, rollback_error))
+                {
+                    std::lock_guard<std::mutex> guard(mutex_);
+                    recovery_required_ = true;
+                    recovery_volume_object_id_ = session->volume_object_id;
+                    recovery_reason_ = "MutationStagingHookRollbackFailed: " +
+                        rollback_error;
+                    result.error += " | " + recovery_reason_;
+                    result.commit_recovery_required = true;
+                    result.commit_recovery_reason =
+                        WidenUtf8(recovery_reason_);
+                }
+                return result;
+            }
+        }
     }
     if (prepublication_hook)
     {
         std::string hook_error;
         bool hook_succeeded = false;
+        VolumeCheckpointPins* volume_pins =
+            FindVolumeCheckpointPinsNoLock(session->volume_object_id);
+        std::vector<std::uint64_t> refreshed_pins = volume_pins != nullptr
+            ? volume_pins->required_checkpoint_xids
+            : std::vector<std::uint64_t>{};
         try
         {
             hook_succeeded = prepublication_hook(
-                mutations, result.staged_identities, hook_error);
+                staged_requests,
+                result.staged_identities,
+                preimage_checkpoint_xid.value(),
+                refreshed_pins,
+                hook_error);
         }
         catch (...)
         {
             hook_error = "PrepublicationHookException";
+        }
+        // In required mode a hook failure may occur after WAL acceptance but
+        // before its rescan can refresh the output. Retaining the exact source
+        // generation is safe even when the failure happened before acceptance;
+        // only the explicit post-cleanup update may release it.
+        if (require_checkpoint_census_ && !hook_succeeded &&
+            std::find(
+                refreshed_pins.begin(),
+                refreshed_pins.end(),
+                preimage_checkpoint_xid.value()) == refreshed_pins.end())
+        {
+            refreshed_pins.push_back(preimage_checkpoint_xid.value());
+        }
+        std::vector<std::uint64_t> normalized_pins;
+        std::string pins_error;
+        const bool pins_valid = volume_pins != nullptr &&
+            NormalizeRequiredCheckpointXids(
+                refreshed_pins,
+                preimage_checkpoint_xid.value(),
+                normalized_pins,
+                pins_error);
+        if (pins_valid)
+        {
+            std::vector<std::uint64_t> retained_pins;
+            retained_pins.reserve(
+                volume_pins->required_checkpoint_xids.size() +
+                normalized_pins.size());
+            std::set_union(
+                volume_pins->required_checkpoint_xids.begin(),
+                volume_pins->required_checkpoint_xids.end(),
+                normalized_pins.begin(),
+                normalized_pins.end(),
+                std::back_inserter(retained_pins));
+            volume_pins->required_checkpoint_xids = std::move(retained_pins);
+            volume_pins->unapplied_accepted_work |= !staged_requests.empty() || !hook_succeeded;
+        }
+        else
+        {
+            hook_succeeded = false;
+            hook_error = "PrepublicationPinsInvalid: " +
+                (pins_error.empty()
+                    ? std::string("RequiredCheckpointVolumeMissing")
+                    : pins_error);
+            std::lock_guard<std::mutex> guard(mutex_);
+            recovery_required_ = true;
+            recovery_volume_object_id_ = session->volume_object_id;
+            recovery_reason_ = hook_error;
+            result.commit_recovery_required = true;
+            result.commit_recovery_reason = WidenUtf8(recovery_reason_);
         }
         if (!hook_succeeded)
         {
@@ -1520,26 +2081,85 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
         }
         deallocations.push_back({extent.physical_address, extent.bytes});
     }
-    const auto status = session->use_canonical_transaction
-        ? session->store->CommitCanonicalTransaction()
-        : session->store->CommitTransaction();
+    const std::vector<std::uint64_t> required_checkpoint_xids =
+        RequiredCheckpointXidUnionNoLock();
+    // Allocate the fallback before publication: latching a thrown verifier
+    // must not depend on allocating an exception/error message.
+    std::string verifier_recovery_reason = postpublication_verifier_hook
+        ? "CommitPostpublicationVerificationFailed" : std::string{};
+    auto status = session->use_canonical_transaction
+        ? session->store->CommitCanonicalTransaction(required_checkpoint_xids)
+        : session->store->CommitTransaction(required_checkpoint_xids);
+    std::string retention_cleanup_failure;
+    if (status == MetadataStore::CommitStatus::RetentionBlocked &&
+        session->use_canonical_transaction && retention_cleanup_hook)
+    {
+        auto* volume_pins = FindVolumeCheckpointPinsNoLock(volume_object_id);
+        auto refreshed_pins = volume_pins != nullptr
+            ? volume_pins->required_checkpoint_xids : std::vector<std::uint64_t>{};
+        bool census_valid = false;
+        try { census_valid = retention_cleanup_hook(refreshed_pins, retention_cleanup_failure); }
+        catch (...) { retention_cleanup_failure = "RetentionCleanupHookException"; }
+        std::vector<std::uint64_t> normalized_pins;
+        if (!census_valid || !retention_cleanup_failure.empty() || volume_pins == nullptr ||
+            !NormalizeRequiredCheckpointXids(refreshed_pins,
+                preimage_checkpoint_xid.value_or(0), normalized_pins, retention_cleanup_failure))
+        {
+            if (retention_cleanup_failure.empty()) retention_cleanup_failure = "RetentionCleanupRefused";
+        }
+        else if (!std::includes(volume_pins->required_checkpoint_xids.begin(),
+                     volume_pins->required_checkpoint_xids.end(), normalized_pins.begin(), normalized_pins.end()) ||
+                 (!staged_requests.empty() && !std::binary_search(normalized_pins.begin(), normalized_pins.end(),
+                     preimage_checkpoint_xid.value_or(0))))
+        {
+            retention_cleanup_failure = "RetentionCleanupPinsInvalid";
+        }
+        else if (normalized_pins != volume_pins->required_checkpoint_xids)
+        {
+            // RetentionBlocked preserves staging and guarantees no device I/O.
+            // Keep identities/source and global ownership intact; do not rerun
+            // staging or the WAL acceptance hook on this single retry.
+            volume_pins->required_checkpoint_xids = std::move(normalized_pins);
+            status = session->store->CommitCanonicalTransaction(RequiredCheckpointXidUnionNoLock());
+            if (status == MetadataStore::CommitStatus::NothingToCommit && !staged_requests.empty())
+                retention_cleanup_failure = "RetentionRetryLostPendingMutation";
+        }
+        if (!retention_cleanup_failure.empty()) status = MetadataStore::CommitStatus::InvariantFailed;
+    }
     result.commit_status_code = static_cast<int>(status);
-    result.commit_stage = session->store->LastCommitStage();
+    result.commit_stage = retention_cleanup_failure.empty()
+        ? session->store->LastCommitStage() : "retention-cleanup";
     if (const auto committed_xid = session->store->LastCommittedXid();
         committed_xid.has_value())
     {
         result.committed_xid = committed_xid.value();
     }
-    result.commit_recovery_reason = session->store->RecoveryReason();
+    result.commit_recovery_reason = retention_cleanup_failure.empty()
+        ? session->store->RecoveryReason() : WidenUtf8("RetentionCleanupFailed: " + retention_cleanup_failure);
     result.commit_recovery_required = session->store->IsRecoveryRequired();
     if (status != MetadataStore::CommitStatus::Committed &&
         status != MetadataStore::CommitStatus::NothingToCommit)
     {
-        result.error = "CommitPersistFailed: status=" +
+        result.error =
+            (status == MetadataStore::CommitStatus::RetentionBlocked
+                ? "CommitRetentionBlocked: status="
+                : "CommitPersistFailed: status=") +
             std::to_string(static_cast<int>(status)) +
             " stage=" + session->store->LastCommitStage() + " | " +
             NarrowLossy(session->store->LastCommitFailureReason()) + " | " +
-            NarrowLossy(session->store->RecoveryReason());
+            NarrowLossy(session->store->RecoveryReason()) + " | " +
+            NarrowLossy(session->store->LastCommitFailureDetail());
+        if (!retention_cleanup_failure.empty()) result.error += " | " + retention_cleanup_failure;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            diagnostics_.last_failure_stage = result.commit_stage;
+            diagnostics_.last_failure_detail = result.error;
+            if (auto* counters = FindVolumeDiagnosticsNoLock(session->volume_object_id))
+            {
+                counters->last_failure_stage = result.commit_stage;
+                counters->last_failure_detail = result.error;
+            }
+        }
         if (session->store->IsRecoveryRequired())
         {
             std::lock_guard<std::mutex> guard(mutex_);
@@ -1598,8 +2218,94 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
             return result;
         }
     }
+    if (status == MetadataStore::CommitStatus::Committed && postpublication_verifier_hook)
+    {
+        // Committed means native publication and the store's reload finished.
+        // Account for the actual checkpoint/ledger above even if verification
+        // fails. Keep accepted work unresolved until verification succeeds.
+        std::string verification_error;
+        bool verified = false;
+        bool verifier_threw = false;
+        const bool published_view_matches = result.committed_xid != 0 &&
+            session->store->CheckpointXid() == result.committed_xid &&
+            !session->store->IsRecoveryRequired();
+        try
+        {
+            if (published_view_matches)
+                verified = postpublication_verifier_hook(
+                    *session->store, result.committed_xid, verification_error);
+        }
+        catch (...)
+        {
+            verifier_threw = true;
+        }
+        if (!verified || verifier_threw || !verification_error.empty())
+        {
+            // Latch before formatting diagnostics, so even an allocation
+            // exception while reporting failure cannot admit a sibling writer.
+            std::lock_guard<std::mutex> guard(mutex_);
+            recovery_required_ = true;
+            recovery_volume_object_id_ = session->volume_object_id;
+            recovery_reason_.swap(verifier_recovery_reason);
+            result.committed = true;
+            result.commit_status_code = static_cast<int>(MetadataStore::CommitStatus::InvariantFailed);
+            result.commit_recovery_required = true;
+            result.commit_stage = "postpublication-verifier";
+            result.error = recovery_reason_;
+            if (verifier_threw) result.error += ": PostpublicationVerifierException";
+            else if (!published_view_matches) result.error += ": PublishedCheckpointMismatch";
+            else if (!verification_error.empty()) result.error += ": " + verification_error;
+            else result.error += ": PostpublicationVerifierRefused";
+            result.commit_recovery_reason = WidenUtf8(result.error);
+            diagnostics_.last_failure_stage = result.commit_stage;
+            diagnostics_.last_failure_detail = result.error;
+            if (auto* counters = FindVolumeDiagnosticsNoLock(session->volume_object_id))
+            {
+                counters->last_failure_stage = result.commit_stage;
+                counters->last_failure_detail = result.error;
+            }
+            return result;
+        }
+    }
+    if (status == MetadataStore::CommitStatus::Committed && !accepted_replay)
+    {
+        // Normal publication resolves its staged acceptance. Replay may be
+        // split across commits, so only its explicit WAL cleanup census update
+        // may clear the pending flag. Retention pins remain until cleanup.
+        if (auto* pins = FindVolumeCheckpointPinsNoLock(volume_object_id))
+            pins->unapplied_accepted_work = false;
+    }
     result.committed = true;
     return result;
+}
+
+bool ContainerMountCoordinator::RefreshSessionForRecovery(
+    std::uint64_t volume_object_id, std::string& out_error)
+{
+    out_error.clear();
+    std::lock_guard<std::timed_mutex> commit_guard(commit_mutex_);
+    SessionState* selected = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (draining_ || recovery_required_)
+        {
+            out_error = "ContainerRecoveryRefreshUnavailable";
+            return false;
+        }
+        for (const auto& session : sessions_)
+            if (session->volume_object_id == volume_object_id) { selected = session.get(); break; }
+    }
+    if (selected)
+    {
+        if (selected->store->PendingMutationCount() != 0)
+        {
+            out_error = "RecoveryRefreshUnexpectedPendingState";
+            return false;
+        }
+        return ReloadSessionForCommitNoLock(*selected, out_error, ReloadReason::Recovery);
+    }
+    out_error = "VolumeNotMounted";
+    return false;
 }
 
 bool ContainerMountCoordinator::RefreshCheckpointFromSession(
@@ -1730,9 +2436,94 @@ std::uint64_t ContainerMountCoordinator::MaxObservedCommitConcurrency()
     return max_commit_concurrency_.load(std::memory_order_relaxed);
 }
 
-bool ContainerMountCoordinator::ReloadSessionForCommitNoLock(
-    SessionState& session, std::string& out_error)
+ContainerCommitDiagnostics ContainerMountCoordinator::DiagnosticsSnapshot(
+    std::optional<std::uint64_t> volume_object_id) const
 {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!volume_object_id) return diagnostics_;
+    for (const auto& volume : volume_diagnostics_)
+        if (volume.volume_object_id == *volume_object_id) return volume.counters;
+    return {};
+}
+
+std::string ContainerMountCoordinator::DevicePerformanceJson() const
+{
+    std::lock_guard<std::mutex> guard(mutex_);
+    return device_ ? device_->PerformanceJson() : "null";
+}
+
+ContainerCommitDiagnostics* ContainerMountCoordinator::FindVolumeDiagnosticsNoLock(
+    std::uint64_t volume_object_id) noexcept
+{
+    const auto found = std::lower_bound(volume_diagnostics_.begin(), volume_diagnostics_.end(),
+        volume_object_id, [](const VolumeDiagnostics& volume, std::uint64_t oid)
+        {
+            return volume.volume_object_id < oid;
+        });
+    return found != volume_diagnostics_.end() && found->volume_object_id == volume_object_id
+        ? &found->counters : nullptr;
+}
+
+VolumeCheckpointPins*
+ContainerMountCoordinator::FindVolumeCheckpointPinsNoLock(
+    std::uint64_t volume_object_id) noexcept
+{
+    const auto found = std::lower_bound(
+        volume_checkpoint_pins_.begin(),
+        volume_checkpoint_pins_.end(),
+        volume_object_id,
+        [](const VolumeCheckpointPins& pins, std::uint64_t oid)
+        {
+            return pins.volume_object_id < oid;
+        });
+    return found != volume_checkpoint_pins_.end() &&
+            found->volume_object_id == volume_object_id
+        ? &*found
+        : nullptr;
+}
+
+const VolumeCheckpointPins*
+ContainerMountCoordinator::FindVolumeCheckpointPinsNoLock(
+    std::uint64_t volume_object_id) const noexcept
+{
+    const auto found = std::lower_bound(
+        volume_checkpoint_pins_.begin(),
+        volume_checkpoint_pins_.end(),
+        volume_object_id,
+        [](const VolumeCheckpointPins& pins, std::uint64_t oid)
+        {
+            return pins.volume_object_id < oid;
+        });
+    return found != volume_checkpoint_pins_.end() &&
+            found->volume_object_id == volume_object_id
+        ? &*found
+        : nullptr;
+}
+
+std::vector<std::uint64_t>
+ContainerMountCoordinator::RequiredCheckpointXidUnionNoLock() const
+{
+    std::vector<std::uint64_t> required_checkpoint_xids;
+    for (const VolumeCheckpointPins& pins : volume_checkpoint_pins_)
+    {
+        required_checkpoint_xids.insert(
+            required_checkpoint_xids.end(),
+            pins.required_checkpoint_xids.begin(),
+            pins.required_checkpoint_xids.end());
+    }
+    std::sort(
+        required_checkpoint_xids.begin(), required_checkpoint_xids.end());
+    required_checkpoint_xids.erase(
+        std::unique(
+            required_checkpoint_xids.begin(), required_checkpoint_xids.end()),
+        required_checkpoint_xids.end());
+    return required_checkpoint_xids;
+}
+
+bool ContainerMountCoordinator::ReloadSessionForCommitNoLock(
+    SessionState& session, std::string& out_error, ReloadReason reason)
+{
+    ScopedReloadDiagnostics diagnostics_scope{*this, session.volume_object_id, reason};
     out_error.clear();
     if (!session.store->PrepareNativeWritePath())
     {
@@ -1740,6 +2531,7 @@ bool ContainerMountCoordinator::ReloadSessionForCommitNoLock(
             NarrowLossy(session.store->RecoveryReason());
         return false;
     }
+    diagnostics_scope.succeeded = true;
     return true;
 }
 

@@ -2773,11 +2773,87 @@ bool TestPayloadSpoolMutexWaitPercentileAndSaturationBoundaries(const std::files
 }
 }
 
+bool TestInlineRestoreKeepsImmutableOffsets(const std::filesystem::path& root)
+{
+    using Spool = apfsaccess::rw::PayloadSpool;
+    const auto directory = root / "inline-restore-offsets";
+    const auto external = Bytes("EXTERNAL");
+    const auto inlined = Bytes("inline!");
+    const auto quota = external.size() + inlined.size();
+    Spool::AppendResult first, second, conflicting;
+    const auto other = Bytes("foreign");
+    {
+        Spool hash_source({root / "inline-restore-conflicting-reference", kVolume, 64});
+        if (!Require(hash_source.Append({kVolume, 18, 21, 0, 2, other}, &conflicting),
+                "conflicting inline fixture has its own valid payload checksum")) return false;
+    }
+    std::filesystem::path path;
+    {
+        Spool spool({directory, kVolume, quota});
+        if (!Require(spool.Append({kVolume, 17, 21, 0, 1, external}, &first) &&
+                spool.Append({kVolume, 18, 21, 0, 2, inlined}, &second) && spool.FlushDirtyState(),
+                "inline restore seeds exact mixed-WAL offsets at quota")) return false;
+        path = spool.SpoolFilePath();
+    }
+    const Spool::PersistedRangeReference live{kVolume, 17, 21, 0, first.payload_length,
+        first.spool_offset, first.wal_sequence, first.payload_sha256};
+    const Spool::PersistedRangeReference replay{kVolume, 18, 21, 0, second.payload_length,
+        second.spool_offset, second.wal_sequence, second.payload_sha256};
+    const std::array live_refs{live};
+    const std::array inline_refs{replay};
+    for (int restart = 0; restart != 4; ++restart)
+    {
+        if (restart == 1)
+        {
+            std::fstream output(path, std::ios::binary | std::ios::in | std::ios::out);
+            output.seekp(static_cast<std::streamoff>(replay.spool_offset));
+            output.put('!');
+            if (!Require(output.good(), "inline restore corrupts only the disposable inline bytes")) return false;
+        }
+        if (restart == 2) std::filesystem::resize_file(path, external.size());
+        Spool spool({directory, kVolume, quota});
+        if (!Require(spool.RebuildIndexFromReferences(live_refs, 0, inline_refs) &&
+                spool.RestoreInlineRange(replay, inlined) && spool.RestoreInlineRange(replay, inlined),
+                "inline restore is repeatable after index discard, corruption and truncated inline tail")) return false;
+        std::vector<std::byte> actual;
+        if (!Require(spool.ReadPersistedRange(live, actual) && actual == external &&
+                spool.ReadPersistedRange(replay, actual) && actual == inlined &&
+                std::filesystem::file_size(path) == quota,
+                "inline restore preserves external bytes and the immutable WAL offset without quota growth")) return false;
+        auto invalid = replay;
+        invalid.spool_offset = 0;
+        if (!Require(!spool.RestoreInlineRange(invalid, inlined), "inline restore refuses overlap with another live range")) return false;
+        invalid = replay;
+        ++invalid.object_id;
+        if (!Require(!spool.RestoreInlineRange(invalid, inlined), "inline restore refuses foreign indexed identity")) return false;
+        invalid = replay;
+        ++invalid.generation;
+        if (!Require(!spool.RestoreInlineRange(invalid, inlined), "inline restore refuses foreign indexed generation")) return false;
+        invalid = replay;
+        invalid.payload_sha256[0] ^= 1;
+        if (!Require(!spool.RestoreInlineRange(invalid, inlined), "inline restore refuses invalid WAL checksum")) return false;
+        invalid = replay;
+        invalid.payload_sha256 = conflicting.payload_sha256;
+        if (!Require(!spool.RestoreInlineRange(invalid, other) &&
+                spool.ReadPersistedRange(replay, actual) && actual == inlined,
+                "inline restore preserves a valid indexed range when journal bytes conflict")) return false;
+        invalid = replay;
+        invalid.spool_offset = UINT64_MAX;
+        if (!Require(!spool.RestoreInlineRange(invalid, inlined) && spool.FlushDirtyState(),
+                "inline restore refuses offset overflow and persists restart state")) return false;
+        const auto counters = spool.SnapshotCounters();
+        if (!Require(counters.append_direct_count == 0 && counters.append_merged_count == 0,
+                "inline restoration is not a new physical append")) return false;
+    }
+    return true;
+}
+
 int main()
 {
     const auto root = MakeRunRoot();
     bool ok = true;
     ok &= TestAppendReturnsAcceptedPayloadReference(root);
+    ok &= TestInlineRestoreKeepsImmutableOffsets(root);
     ok &= TestPersistedRangeRequiresExactWalIdentityAndSha256(root);
     ok &= TestPayloadOnlyFlushRebuildsMissingIndex(root);
     ok &= TestIndexRebuildDiscardsInlineWalRangesAndKeepsLegacyPayload(root);

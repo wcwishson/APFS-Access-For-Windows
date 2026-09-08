@@ -45,6 +45,8 @@ struct AppleSpacemanAllocationRequest
 {
     std::uint64_t expected_checkpoint_xid = 0;
     std::uint64_t transaction_xid = 0;
+    std::uint64_t oldest_required_checkpoint_xid = 0;
+    std::vector<std::uint16_t> protected_internal_pool_bitmap_indices;
     std::size_t main_block_count = 0;
     bool search_from_end = false;
     std::uint64_t first_ephemeral_object_id = 0;
@@ -55,6 +57,9 @@ struct AppleSpacemanAllocationPlan
 {
     std::uint64_t expected_checkpoint_xid = 0;
     std::uint64_t transaction_xid = 0;
+    std::uint64_t effective_oldest_required_checkpoint_xid = 0;
+    std::vector<std::uint16_t>
+        effective_protected_internal_pool_bitmap_indices;
     std::vector<std::uint64_t> allocated_main_blocks;
     std::vector<std::uint64_t> allocated_internal_pool_blocks;
     std::vector<AppleSpacemanDeferredFree> deferred_frees;

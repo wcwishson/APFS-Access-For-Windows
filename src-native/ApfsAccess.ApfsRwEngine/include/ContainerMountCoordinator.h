@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -44,6 +45,9 @@ struct ContainerVolumeSession
 
 struct ContainerCommitResult
 {
+    // Publication occurred (or NothingToCommit). A postpublication verifier
+    // failure keeps this true, with InvariantFailed and recovery required;
+    // callers must check status/recovery before acknowledging durable work.
     bool committed = false;
     std::string error;
     std::uint64_t checkpoint_xid = 0;
@@ -52,16 +56,119 @@ struct ContainerCommitResult
     int commit_status_code = static_cast<int>(
         apfsaccess::rw::MetadataStore::CommitStatus::NotReady);
     std::string commit_stage;
+    // Latest committed XID observed by the store; NothingToCommit can report
+    // the existing checkpoint here. Only CommitStatus::Committed proves a
+    // new publication (or an explicit postpublication-verifier failure).
     std::uint64_t committed_xid = 0;
     std::wstring commit_recovery_reason;
     bool commit_recovery_required = false;
+    // Positive evidence for this attempt only: publication/binding never ran,
+    // and the selected native store was untouched and clean or successfully
+    // reloaded after refusal. False includes unknown phase and failed rollback.
+    // Never set for accepted replay or a failure after the prepublication hook,
+    // even when commit reports no device I/O. Older WAL/census debt is unchanged.
+    bool clean_prepublication_refusal = false;
+    // Preserve the staging failure separately from the legacy commit status;
+    // phase-aware callers can identify capacity refusal without parsing text.
+    std::optional<apfsaccess::rw::MetadataStore::MutationStatus> mutation_staging_status;
     std::vector<apfsaccess::rw::MetadataStore::PayloadIdentity>
-        staged_identities;
+    staged_identities;
 };
 
+// Always-on, in-memory counters for completed coordinator scopes. Successes
+// exclude NothingToCommit; failures include admission rejection and exceptions.
+// Microseconds use steady_clock. Commit total = wait + hold; reload time is
+// nested within hold (except recovery refresh), so do not add it to commit time.
+// Reloads exclude mount preparation and MetadataStore's post-publication load.
+struct ContainerCommitDiagnostics
+{
+    std::uint64_t commit_attempts = 0;
+    std::uint64_t commit_successes = 0;
+    std::uint64_t commit_noops = 0;
+    std::uint64_t commit_failures = 0;
+    std::string last_failure_stage;
+    std::string last_failure_detail;
+    std::uint64_t commit_total_us = 0;
+    std::uint64_t commit_max_us = 0;
+    std::uint64_t commit_wait_total_us = 0;
+    std::uint64_t commit_hold_total_us = 0;
+    std::uint64_t reload_attempts = 0;
+    std::uint64_t reload_failures = 0;
+    // Reserved for a proven reuse contract; currently always zero.
+    std::uint64_t reload_reuses = 0;
+    std::uint64_t reload_total_us = 0;
+    std::uint64_t reload_max_us = 0;
+    std::uint64_t precommit_reload_attempts = 0;
+    std::uint64_t rollback_reload_attempts = 0;
+    std::uint64_t recovery_reload_attempts = 0;
+};
+
+struct VolumeCheckpointPins
+{
+    std::uint64_t volume_object_id = 0;
+    std::vector<std::uint64_t> required_checkpoint_xids;
+    bool unapplied_accepted_work = false;
+};
+
+// Delete requests carry the unlink outcome captured by the selected session's
+// staging pass. The hook persists it with the matching identity before publish
+// and returns that volume's refreshed accepted-WAL checkpoint pins.
 using ContainerPrepublicationHook = std::function<bool(
     const std::vector<apfsaccess::rw::MetadataStore::MutationRequest>&,
     const std::vector<apfsaccess::rw::MetadataStore::PayloadIdentity>&,
+    std::uint64_t preimage_checkpoint_xid,
+    std::vector<std::uint64_t>& out_required_checkpoint_xids,
+    std::string& out_error)>;
+
+using ContainerMutationStagingHook = std::function<bool(
+    std::size_t mutation_index,
+    const apfsaccess::rw::MetadataStore::MutationRequest&,
+    const apfsaccess::rw::MetadataStore::PayloadIdentity&,
+    std::string& out_error)>;
+
+// Read-only request builder, invoked once while Commit owns the container,
+// after admission/census/reload and before any staging. The vector is a local
+// copy of Commit's input; replace/extend it with the exact source request and
+// ensuing same-owner mutations (e.g. CRW1, content times, write). Return true
+// with an empty error only for a complete batch. No staging, store/device
+// writes, WAL acceptance, coordinator reentry, or retained store/vector
+// references are allowed. The host must also hold its exclusive metadata/read
+// gate. This grants no independently writable session.
+// Bounds apply only when this optional builder is present; ordinary Commit
+// callers retain their existing limits. A new Commit must rebuild evidence;
+// the internal no-I/O retention retry keeps this exact staged batch.
+inline constexpr std::size_t ContainerPreparedMutationLimit = 3;
+inline constexpr std::size_t ContainerPreparedInlineByteLimit = 17u << 20;
+inline constexpr std::size_t ContainerPreparedPathCharLimit = 32768;
+using ContainerMutationPreparationHook = std::function<bool(
+    const apfsaccess::rw::MetadataStore& live_store,
+    std::vector<apfsaccess::rw::MetadataStore::MutationRequest>& requests,
+    std::string& out_error)>;
+
+// Optional read-only verification of the immediate published native image.
+// Runs at most once, only after Committed and the store's publication/reload,
+// under commit_mutex_ (which also protects session/store lifetime), after
+// checkpoint/ledger accounting and before resolving accepted work. No sibling
+// can publish until it returns. The host retains its metadata/read gate and
+// may acquire its transaction mutex here to verify accepted WAL evidence.
+// No coordinator reentry, staging, pin cleanup, WAL durability marking, or
+// retained store references. True requires an empty error. False/throw/error
+// preserves publication and accepted census, latches container recovery, and
+// returns committed=true, InvariantFailed, stage "postpublication-verifier".
+// There is no rollback reload, second publication, or retry after this hook.
+using ContainerPostpublicationVerifierHook = std::function<bool(
+    const apfsaccess::rw::MetadataStore& live_store,
+    std::uint64_t committed_xid,
+    std::string& out_error)>;
+
+// Runs at most once under the container commit lock after no-I/O retention
+// pressure. True means the returned census is authoritative (not necessarily
+// changed) and out_error is empty. May release only this volume's durably cleaned
+// WAL pins; must not reenter the coordinator or discard the pending source.
+// False can follow irreversible journal cleanup: keep conservative pins and
+// fail closed; do not roll back durable cleanup or retry publication.
+using ContainerRetentionCleanupHook = std::function<bool(
+    std::vector<std::uint64_t>& out_required_checkpoint_xids,
     std::string& out_error)>;
 
 struct ContainerShutdownResult
@@ -107,7 +214,8 @@ public:
         std::uint64_t device_offset_bytes,
         std::string& out_error,
         CatalogLoadPolicy catalog_load_policy = CatalogLoadPolicy::StrictApple,
-        bool require_writable_lease = false);
+        bool require_writable_lease = false,
+        bool require_checkpoint_census = false);
 
     ContainerMountCoordinator(const ContainerMountCoordinator&) = delete;
     ContainerMountCoordinator& operator=(const ContainerMountCoordinator&) = delete;
@@ -122,18 +230,50 @@ public:
     // Unknown OIDs fail closed.
     [[nodiscard]] bool UnmountVolume(std::uint64_t volume_object_id, std::string& out_error);
 
+    // Required mode stays closed until one atomic census represents every
+    // catalog volume, including read-only and currently unmounted volumes.
+    [[nodiscard]] bool CheckpointCensusRequired() const noexcept;
+    // Copies the exact per-volume pins and unresolved acceptance flags under
+    // commit ownership, including after recovery is latched. Do not call from
+    // a Commit hook, which already owns that lock.
+    [[nodiscard]] std::vector<VolumeCheckpointPins> CheckpointCensusSnapshot() const;
+    [[nodiscard]] bool InitializeRequiredCheckpointCensus(
+        const std::vector<VolumeCheckpointPins>& volume_pins,
+        std::string& out_error);
+    // Replaces one volume's pins only after its durable cleanup has authorized
+    // release. Pin state is catalog-owned and survives session unmount.
+    [[nodiscard]] bool UpdateRequiredCheckpointXids(
+        std::uint64_t volume_object_id,
+        const std::vector<std::uint64_t>& required_checkpoint_xids,
+        std::string& out_error,
+        bool unapplied_accepted_work = false);
+
     // Serializes one commit for the given mounted volume: stages the
     // mutations, commits the session store (canonical transaction when the
     // session requested it), records allocation ranges in the shared ledger
     // (overlap fails closed into recovery-required), and advances the
-    // container xid. An empty batch
+    // container xid. Without a preparation builder, an empty batch
     // commits whatever the session holds (usually NothingToCommit).
-    // Rejected once draining starts.
+    // Rejected once draining starts. Unresolved accepted work blocks ordinary
+    // publication. A host-validated replay may cross unresolved siblings only
+    // when the selected volume's census entry is also unresolved; every
+    // sibling pin remains retained until its own durable cleanup update.
     [[nodiscard]] ContainerCommitResult Commit(
         std::uint64_t volume_object_id,
         const std::vector<apfsaccess::rw::MetadataStore::MutationRequest>&
             mutations,
-        const ContainerPrepublicationHook& prepublication_hook = {});
+        const ContainerPrepublicationHook& prepublication_hook = {},
+        const ContainerMutationStagingHook& mutation_staging_hook = {},
+        const ContainerRetentionCleanupHook& retention_cleanup_hook = {},
+        bool accepted_replay = false,
+        std::optional<std::uint64_t> expected_replay_preimage = std::nullopt,
+        const ContainerMutationPreparationHook& mutation_preparation_hook = {},
+        const ContainerPostpublicationVerifierHook& postpublication_verifier_hook = {});
+
+    // Refreshes the borrowed store before startup recovery examines retained
+    // history. Pending mutations are refused rather than discarded.
+    [[nodiscard]] bool RefreshSessionForRecovery(std::uint64_t volume_object_id,
+        std::string& out_error);
 
     // Re-syncs the container checkpoint from a mounted session (hosts call
     // this after startup replay, which commits directly while sessions mount
@@ -161,6 +301,19 @@ public:
     [[nodiscard]] std::string RecoveryReason() const;
     [[nodiscard]] std::uint64_t MaxObservedCommitConcurrency() const noexcept;
 
+    // Cumulative over this coordinator's lifetime, including unmount/remount
+    // and drain. Nullopt selects container totals (including unknown-OID
+    // rejections); a catalog OID selects that volume, unknown OIDs return zero.
+    // Takes only the short state mutex, so status readers and commit hooks can
+    // sample without waiting for device I/O. An active scope appears on exit;
+    // use quiescent before/after samples for exact cross-counter deltas.
+    [[nodiscard]] ContainerCommitDiagnostics DiagnosticsSnapshot(
+        std::optional<std::uint64_t> volume_object_id = std::nullopt) const;
+
+    // Atomic counters only; no device I/O or commit-lock acquisition. The state
+    // lock protects the device lifetime against concurrent drain.
+    [[nodiscard]] std::string DevicePerformanceJson() const;
+
     struct ExtentRange
     {
         std::uint64_t address = 0;
@@ -181,13 +334,25 @@ private:
     ContainerMountCoordinator() = default;
 
     struct SessionState;
+    struct ScopedCommitDiagnostics;
+    struct ScopedReloadDiagnostics;
+    enum class ReloadReason { BeforeCommit, Rollback, Recovery };
 
     bool ReloadSessionForCommitNoLock(
-        SessionState& session, std::string& out_error);
+        SessionState& session, std::string& out_error,
+        ReloadReason reason = ReloadReason::Rollback);
+    [[nodiscard]] ContainerCommitDiagnostics* FindVolumeDiagnosticsNoLock(
+        std::uint64_t volume_object_id) noexcept;
     bool RecordCommitRangesNoLock(
         const std::vector<ExtentRange>& allocations,
         const std::vector<ExtentRange>& deallocations,
         std::string& out_error);
+    [[nodiscard]] VolumeCheckpointPins* FindVolumeCheckpointPinsNoLock(
+        std::uint64_t volume_object_id) noexcept;
+    [[nodiscard]] const VolumeCheckpointPins* FindVolumeCheckpointPinsNoLock(
+        std::uint64_t volume_object_id) const noexcept;
+    [[nodiscard]] std::vector<std::uint64_t>
+        RequiredCheckpointXidUnionNoLock() const;
 
     std::shared_ptr<apfsaccess::rw::BlockDevice> device_;
     bool writable_lease_required_ = false;
@@ -195,15 +360,26 @@ private:
     std::uint64_t device_offset_bytes_ = 0;
     std::string container_uuid_hex_;
     std::vector<std::uint64_t> container_volume_oids_;
+    bool require_checkpoint_census_ = false;
+    bool checkpoint_census_initialized_ = true;
+    std::vector<VolumeCheckpointPins> volume_checkpoint_pins_;
     std::atomic<std::uint64_t> checkpoint_xid_{0};
     std::uint64_t owner_process_id_ = 0;
     mutable std::mutex mutex_;
-    std::timed_mutex commit_mutex_;
+    mutable std::timed_mutex commit_mutex_;
     bool draining_ = false;
     bool recovery_required_ = false;
     std::optional<std::uint64_t> recovery_volume_object_id_;
     std::string recovery_reason_;
     std::vector<std::unique_ptr<SessionState>> sessions_;
+    // Fixed catalog-sized storage: recording a scope never allocates.
+    struct VolumeDiagnostics
+    {
+        std::uint64_t volume_object_id = 0;
+        ContainerCommitDiagnostics counters;
+    };
+    ContainerCommitDiagnostics diagnostics_;
+    std::vector<VolumeDiagnostics> volume_diagnostics_;
     std::vector<ExtentRange> committed_ranges_;
     std::atomic<std::uint64_t> in_flight_commits_{0};
     std::atomic<std::uint64_t> max_commit_concurrency_{0};

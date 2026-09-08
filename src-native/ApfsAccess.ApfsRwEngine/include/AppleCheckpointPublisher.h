@@ -44,6 +44,8 @@ struct AppleCheckpointPublicationRequest
     // Zero preserves nx_omap_oid. A replacement must be a staged physical
     // OMAP object at this allocator-owned block.
     std::uint64_t container_object_map_oid = 0;
+    // Exact unresolved-recovery generations; each is reloaded from this store.
+    std::vector<std::uint64_t> required_checkpoint_xids;
     std::vector<AppleCheckpointPhysicalWrite> allocator_owned_writes;
     // This is the complete ephemeral object set for the new checkpoint, not
     // merely the objects changed by this transaction.
@@ -98,6 +100,19 @@ public:
         std::uint64_t physical_block,
         std::uint32_t block_size,
         std::vector<std::byte>& out_bytes) = 0;
+    // Reads a nonempty whole-block prefix of at most max_blocks adjacent
+    // blocks. The default reads exactly one block, preserving legacy targets'
+    // read/compare order and stopping before the next read on a mismatch.
+    virtual bool ReadBlockRange(
+        std::uint64_t physical_block,
+        std::uint32_t block_size,
+        std::size_t max_blocks,
+        std::vector<std::byte>& out_bytes)
+    {
+        return block_size != 0 && max_blocks != 0 &&
+            ReadBlock(physical_block, block_size, out_bytes) &&
+            out_bytes.size() == block_size;
+    }
     virtual bool WriteBlock(
         std::uint64_t physical_block,
         std::span<const std::byte> bytes) = 0;

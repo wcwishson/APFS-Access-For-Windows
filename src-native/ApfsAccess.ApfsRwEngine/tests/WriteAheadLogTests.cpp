@@ -1,5 +1,7 @@
 #include "WriteAheadLog.h"
+#include "InodeMetadataPatch.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -63,6 +65,685 @@ apfsaccess::rw::WriteAheadLog::Record MakeRecord(std::uint64_t sequence)
     record.path_utf8 = "\\docs\\file.bin";
     record.secondary_path_utf8 = "\\docs\\other.bin";
     return record;
+}
+
+bool WriteBytes(
+    const std::filesystem::path& path,
+    const std::vector<std::uint8_t>& bytes,
+    std::ios::openmode mode);
+
+void RefreshRecordChecksum(std::vector<std::uint8_t>& bytes)
+{
+    for (std::size_t i = 12; i < 16; ++i) bytes[i] = 0;
+    std::uint32_t checksum = 2166136261u;
+    for (auto byte : bytes) { checksum ^= byte; checksum *= 16777619u; }
+    for (std::size_t i = 0; i < 4; ++i)
+        bytes[12 + i] = static_cast<std::uint8_t>(checksum >> (8 * i));
+}
+
+bool TestDirectoryRestoreRoundTripAndValidation(const std::filesystem::path& root)
+{
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    static_assert(static_cast<std::uint32_t>(Wal::OperationKind::RestoreDirectoryFromSymbolicLink) == 14);
+    static_assert(static_cast<std::uint32_t>(Wal::OperationKind::RemoveSymbolicLinkTarget) == 9);
+    Wal::Record record{};
+    record.volume_identity = kVolume;
+    record.transaction_id = 10;
+    record.sequence = 1;
+    record.operation = Wal::OperationKind::RestoreDirectoryFromSymbolicLink;
+    record.object_id = 42;
+    record.parent_object_id = 7;
+    record.path_utf8 = "\\directory";
+    const auto wire = Wal::EncodeForTest(record);
+    if (!Require(wire.size() > 35 && wire[4] == 1 && wire[6] == 148 && wire[32] == 14,
+            "directory restore uses opcode 14 and unchanged v1 header")) return false;
+    // Mutate wire bytes and repair the checksum to exercise decode semantics independently.
+    for (std::size_t offset : {40u, 48u, 56u, 64u, 72u, 80u, 88u, 96u, 116u, 148u})
+    {
+        auto malformed = wire;
+        malformed[offset] = offset == 40 || offset == 48 ? 0 : 0xff;
+        RefreshRecordChecksum(malformed);
+        const auto path = root / "malformed-directory-restore.wal";
+        if (!Require(WriteBytes(path, malformed, std::ios::trunc) &&
+                Wal::ReadAll(path, kVolume).status == Wal::ReadStatus::Corrupt,
+                "checksum-valid malformed restore fails decode semantics")) return false;
+    }
+    Wal wal({root / "directory-restore.wal", kVolume});
+    auto old = record;
+    old.sequence = 2;
+    old.operation = Wal::OperationKind::RemoveSymbolicLinkTarget;
+    if (!Require(wal.Append(record) && wal.Append(old), "both symlink removal operations append")) return false;
+    const auto reject = [&](auto change)
+    {
+        auto bad = record;
+        change(bad);
+        const auto size = std::filesystem::file_size(root / "directory-restore.wal");
+        return Require(!Wal::DirectoryRestoreMutationIsConsistent(bad) &&
+            Wal::EncodeForTest(bad).empty() &&
+            wal.AppendWithResult(bad) == Wal::AppendResult::RejectedBeforeWrite &&
+            wal.AppendBatchWithResult({record, bad}) == Wal::AppendResult::RejectedBeforeWrite &&
+            std::filesystem::file_size(root / "directory-restore.wal") == size,
+            "malformed restore rejects entire append batch before bytes persist");
+    };
+    if (!reject([](auto& r) { r.object_id = 0; }) ||
+        !reject([](auto& r) { r.parent_object_id = 0; }) ||
+        !reject([](auto& r) { r.path_utf8.clear(); }) ||
+        !reject([](auto& r) { r.path_utf8.push_back('\0'); }) ||
+        !reject([](auto& r) { r.path_utf8 = "\xff"; }) ||
+        !reject([](auto& r) { r.secondary_path_utf8 = "other"; }) ||
+        !reject([](auto& r) { r.logical_offset = 1; }) ||
+        !reject([](auto& r) { r.logical_length = 1; }) ||
+        !reject([](auto& r) { r.flags = 1; }) ||
+        !reject([](auto& r) { r.payload_spool_id = 1; }) ||
+        !reject([](auto& r) { r.payload_offset = 1; }) ||
+        !reject([](auto& r) { r.payload_length = 1; }) ||
+        !reject([](auto& r) { r.inline_payload = {std::byte{1}}; }) ||
+        !reject([](auto& r) { r.payload_sha256.back() = 1; }) ||
+        !reject([](auto& r) { r.unlink_outcome.emplace(); })) return false;
+    if (!wal.Compact(1)) return false;
+    const auto read = wal.ReadAll();
+    return Require(read.status == Wal::ReadStatus::Ok && read.records.size() == 3 &&
+        read.records[0].operation == record.operation && read.records[0].object_id == 42 &&
+        read.records[0].parent_object_id == 7 && read.records[0].path_utf8 == record.path_utf8 &&
+        read.records[0].transaction_id == 10 && read.records[0].sequence == 1 &&
+        Wal::DirectoryRestoreMutationIsConsistent(read.records[0]) &&
+        read.records[1].operation == Wal::OperationKind::RemoveSymbolicLinkTarget,
+        "compaction and decode preserve restore identity and old opcode 9");
+}
+
+bool TestAllocationSizeRoundTripAndValidation(const std::filesystem::path& root)
+{
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    static_assert(static_cast<std::uint32_t>(Wal::OperationKind::SetAllocationSize) == 13);
+    Wal::Record record{};
+    record.volume_identity = kVolume;
+    record.transaction_id = 10;
+    record.sequence = 1;
+    record.operation = Wal::OperationKind::SetAllocationSize;
+    record.object_id = 42;
+    record.parent_object_id = 7;
+    record.path_utf8 = "\\allocation.bin";
+    record.logical_length = 0x100001000ull;
+    const auto wire = Wal::EncodeForTest(record);
+    if (!Require(wire.size() > 35 && wire[4] == 1 && wire[32] == 13,
+            "allocation-size uses operation 13 in the existing payload-free WAL v1 envelope")) return false;
+    Wal wal({root / "allocation-size.wal", kVolume});
+    if (!Require(wal.Append(record), "allocation-size appends without payload")) return false;
+    auto zero = record;
+    zero.sequence = 2;
+    zero.logical_length = 0;
+    if (!Require(wal.Append(zero) && wal.Compact(1), "zero allocation survives WAL compaction")) return false;
+    const auto read = wal.ReadAll();
+    if (!Require(read.status == Wal::ReadStatus::Ok && read.records.size() == 3 &&
+            read.records.back().operation == Wal::OperationKind::CompactionIndex,
+            "allocation WAL round-trip returns both records and the compaction index")) return false;
+    for (std::size_t i = 0; i < 2; ++i)
+    {
+        const auto& actual = read.records[i];
+        if (!Require(actual.operation == record.operation && actual.sequence == i + 1 &&
+                actual.transaction_id == 10 && actual.object_id == 42 && actual.parent_object_id == 7 &&
+                actual.path_utf8 == record.path_utf8 && actual.logical_length == (i == 0 ? record.logical_length : 0) &&
+                Wal::AllocationSizeMutationIsConsistent(actual),
+                "allocation identity, 64-bit length and order round-trip")) return false;
+    }
+    const auto reject = [&](auto change)
+    {
+        auto bad = record;
+        change(bad);
+        return Require(!Wal::AllocationSizeMutationIsConsistent(bad) &&
+                Wal::EncodeForTest(bad).empty() &&
+                wal.AppendWithResult(bad) == Wal::AppendResult::RejectedBeforeWrite,
+            "malformed allocation-size is rejected before writing");
+    };
+    return reject([](auto& r) { r.object_id = 0; }) &&
+        reject([](auto& r) { r.parent_object_id = 0; }) &&
+        reject([](auto& r) { r.path_utf8.clear(); }) &&
+        reject([](auto& r) { r.path_utf8.push_back('\0'); }) &&
+        reject([](auto& r) { r.path_utf8 = "\xff"; }) &&
+        reject([](auto& r) { r.secondary_path_utf8 = "other"; }) &&
+        reject([](auto& r) { r.flags = 1; }) &&
+        reject([](auto& r) { r.logical_offset = 1; }) &&
+        reject([](auto& r) { r.logical_length = 0x8000000000000000ull; }) &&
+        reject([](auto& r) { r.payload_spool_id = 1; }) &&
+        reject([](auto& r) { r.payload_offset = 1; }) &&
+        reject([](auto& r) { r.payload_length = 1; }) &&
+        reject([](auto& r) { r.inline_payload = {std::byte{1}}; }) &&
+        reject([](auto& r) { r.payload_sha256[0] = 1; }) &&
+        reject([](auto& r) { r.unlink_outcome.emplace(); });
+}
+
+bool TestInodeMetadataCodec(const std::filesystem::path&)
+{
+    using namespace apfsaccess::rw;
+    using Patch = InodeMetadataPatch;
+    const std::array<unsigned char, 52> literal{
+        0x49, 0x4d, 0x44, 1, 0x7f, 0, 0, 0,
+        0x78, 0x56, 0x34, 0x12, 0xef, 0xcd, 0xab, 0x90,
+        0xff, 0x0f, 0, 0,
+        0x00, 0x80, 0x3e, 0xd5, 0xde, 0xb1, 0x9d, 0x01,
+        0x01, 0x80, 0x3e, 0xd5, 0xde, 0xb1, 0x9d, 0x01,
+        0x02, 0x80, 0x3e, 0xd5, 0xde, 0xb1, 0x9d, 0x01,
+        0x03, 0x80, 0x3e, 0xd5, 0xde, 0xb1, 0x9d, 0x01,
+    };
+    std::vector<std::byte> bytes;
+    for (auto byte : literal) bytes.push_back(static_cast<std::byte>(byte));
+    Patch patch{};
+    if (!Require(DecodeInodeMetadataPatch(bytes, patch) && patch.mask == 127 &&
+            patch.owner == 0x12345678 && patch.group == 0x90abcdef && patch.mode == 07777 &&
+            patch.create_time_utc == Patch::UnixEpochTicks &&
+            patch.modification_time_utc == Patch::UnixEpochTicks + 1 &&
+            patch.change_time_utc == Patch::UnixEpochTicks + 2 &&
+            patch.access_time_utc == Patch::UnixEpochTicks + 3,
+            "literal little-endian metadata bytes preserve all fields and the valid epoch")) return false;
+    std::vector<std::byte> encoded;
+    if (!Require(EncodeInodeMetadataPatch(patch, encoded) && encoded == bytes,
+            "metadata encoding exactly matches the literal wire")) return false;
+    const std::array<unsigned char, 56> bsd_literal{
+        0x49, 0x4d, 0x44, 2, 0x80, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0xef, 0xcd, 0xab, 0x89,
+    };
+    std::vector<std::byte> bsd_bytes;
+    for (auto byte : bsd_literal) bsd_bytes.push_back(static_cast<std::byte>(byte));
+    Patch bsd_patch{};
+    if (!Require(DecodeInodeMetadataPatch(bsd_bytes, bsd_patch) &&
+            bsd_patch.mask == Patch::BsdFlags && bsd_patch.bsd_flags == 0x89abcdef &&
+            bsd_patch.owner == 0 && bsd_patch.group == 0 && bsd_patch.mode == 0 &&
+            bsd_patch.create_time_utc == 0 && bsd_patch.modification_time_utc == 0 &&
+            bsd_patch.change_time_utc == 0 && bsd_patch.access_time_utc == 0,
+            "IMD2 decodes BSD flags from offset 52 without inventing absent fields")) return false;
+    if (!Require(EncodeInodeMetadataPatch(bsd_patch, encoded) && encoded == bsd_bytes,
+            "BSD metadata encoding exactly matches the 56-byte IMD2 wire")) return false;
+    const auto reject = [&](std::vector<std::byte> bad)
+    {
+        auto output = patch;
+        return Require(!DecodeInodeMetadataPatch(bad, output) && output.mask == 0 &&
+            output.owner == 0 && output.group == 0 && output.mode == 0 && output.bsd_flags == 0 &&
+            output.create_time_utc == 0 && output.modification_time_utc == 0 &&
+            output.change_time_utc == 0 && output.access_time_utc == 0,
+            "malformed metadata resets every decoded output field");
+    };
+    for (std::size_t size = 0; size < bytes.size(); ++size)
+        if (!reject(std::vector<std::byte>(bytes.begin(), bytes.begin() + size))) return false;
+    auto bad = bytes;
+    bad.push_back(std::byte{0});
+    if (!reject(bad)) return false;
+    for (auto offset : {0, 1, 2, 3, 18, 19})
+    {
+        bad = bytes;
+        bad[offset] ^= std::byte{1};
+        if (!reject(bad)) return false;
+    }
+    for (auto mask : {0, 128, 126, 125, 123, 119, 111, 95, 63})
+    {
+        bad = bytes;
+        bad[4] = static_cast<std::byte>(mask);
+        if (!reject(bad)) return false;
+    }
+    bad = bytes;
+    bad[17] = std::byte{0x80};
+    if (!reject(bad)) return false;
+    bad = bsd_bytes;
+    bad.resize(52);
+    bad[3] = std::byte{1};
+    if (!reject(bad)) return false;
+    for (int fault = 0; fault != 7; ++fault)
+    {
+        bad = bsd_bytes;
+        if (fault == 0) bad.resize(55);
+        if (fault == 1) bad.push_back(std::byte{0});
+        if (fault == 2) bad[3] = std::byte{1};
+        if (fault == 3) bad[3] = std::byte{3};
+        if (fault == 4) bad[4] = std::byte{0};
+        if (fault == 5) bad[5] = std::byte{1};
+        if (fault == 6) bad[18] = std::byte{1};
+        if (!reject(bad)) return false;
+    }
+    bad = bsd_bytes;
+    bad[4] = std::byte{0};
+    std::fill(bad.begin() + 52, bad.end(), std::byte{0});
+    if (!reject(bad)) return false;
+    auto invalid_bsd_patch = patch;
+    invalid_bsd_patch.bsd_flags = 1;
+    encoded = bytes;
+    if (!Require(!EncodeInodeMetadataPatch(invalid_bsd_patch, encoded) && encoded.empty(),
+            "BSD data without the BSD field mask refuses encoding and clears output")) return false;
+    const std::array<std::uint64_t Patch::*, 4> times{
+        &Patch::create_time_utc, &Patch::modification_time_utc,
+        &Patch::change_time_utc, &Patch::access_time_utc};
+    for (std::size_t time_index = 0; time_index < times.size(); ++time_index)
+    {
+        const auto field = times[time_index];
+        for (auto value : {std::uint64_t{0}, Patch::UnixEpochTicks - 1, Patch::MaxTime + 1})
+        {
+            auto invalid = patch;
+            invalid.*field = value;
+            encoded = bytes;
+            if (!Require(!EncodeInodeMetadataPatch(invalid, encoded) && encoded.empty(),
+                    "present metadata times reject zero and out-of-range values and clear output")) return false;
+            bad = bytes;
+            for (std::size_t i = 0; i < 8; ++i)
+                bad[20 + time_index * 8 + i] = static_cast<std::byte>((value >> (8 * i)) & 0xff);
+            if (!reject(bad)) return false;
+        }
+        auto boundary = patch;
+        boundary.*field = Patch::MaxTime;
+        if (!Require(EncodeInodeMetadataPatch(boundary, encoded) &&
+                DecodeInodeMetadataPatch(encoded, boundary), "maximum metadata time is inclusive")) return false;
+    }
+    Patch zero{};
+    zero.mask = Patch::Owner | Patch::Group | Patch::Mode;
+    return Require(EncodeInodeMetadataPatch(zero, encoded) && encoded.size() == 52 &&
+        encoded[3] == std::byte{1} && DecodeInodeMetadataPatch(encoded, zero),
+        "present zero owner/group/permissions stay byte-compatible IMD1 while absent fields stay zero");
+}
+
+bool TestInodeMetadataWal(const std::filesystem::path& root)
+{
+    using namespace apfsaccess::rw;
+    using Wal = WriteAheadLog;
+    static_assert(static_cast<std::uint32_t>(Wal::OperationKind::SetInodeMetadata) == 12);
+    Wal::Record record{};
+    record.volume_identity = kVolume;
+    record.transaction_id = record.sequence = 1;
+    record.operation = Wal::OperationKind::SetInodeMetadata;
+    record.object_id = 42;
+    record.parent_object_id = 7;
+    record.path_utf8 = "\\metadata";
+    InodeMetadataPatch patch{};
+    patch.mask = InodeMetadataPatch::Owner;
+    patch.owner = 0x12345678;
+    if (!EncodeInodeMetadataPatch(patch, record.inline_payload)) return false;
+    record.payload_length = 52;
+    record.payload_sha256 = {
+        0x03, 0x7b, 0x15, 0xb0, 0xff, 0xc8, 0x63, 0xec,
+        0xc3, 0x21, 0x63, 0x7d, 0x91, 0x94, 0x61, 0x2d,
+        0xa2, 0x5c, 0xc4, 0x76, 0x67, 0x96, 0x4e, 0x41,
+        0x0f, 0x23, 0xf0, 0xdc, 0x68, 0x22, 0xfc, 0xe2,
+    };
+    const auto wire = Wal::EncodeForTest(record);
+    if (!Require(!wire.empty() && wire[4] == 2 && wire[32] == 12 &&
+            Wal::EncodeForTest(record, 1).empty() && Wal::EncodeForTest(record, 3).empty(),
+            "metadata uses authenticated WAL v2 without legacy downgrade")) return false;
+    const auto path = root / "inode-metadata.wal";
+    {
+        Wal wal({path, kVolume});
+        if (!Require(wal.Append(record), "metadata record appends")) return false;
+        auto bsd_record = record;
+        bsd_record.transaction_id = bsd_record.sequence = 2;
+        patch = {};
+        patch.mask = InodeMetadataPatch::BsdFlags;
+        patch.bsd_flags = 0x89abcdef;
+        if (!EncodeInodeMetadataPatch(patch, bsd_record.inline_payload)) return false;
+        bsd_record.payload_length = bsd_record.inline_payload.size();
+        bsd_record.payload_sha256 = {
+            0xc3, 0xc1, 0x2f, 0xa1, 0x6f, 0xa5, 0xf2, 0xbc,
+            0xbe, 0xf7, 0x82, 0xb9, 0x0b, 0x9f, 0xff, 0x63,
+            0x70, 0xe7, 0x03, 0xba, 0xb2, 0x77, 0xd7, 0x8d,
+            0x1f, 0x97, 0x31, 0x55, 0x84, 0x54, 0xa3, 0xf3,
+        };
+        if (!Require(bsd_record.inline_payload.size() == 56 && wal.Append(bsd_record),
+                "BSD metadata record appends through the existing authenticated WAL v2 envelope")) return false;
+        const auto rejects = [&](auto change)
+        {
+            auto invalid = record;
+            change(invalid);
+            return Require(Wal::EncodeForTest(invalid).empty() &&
+                wal.AppendWithResult(invalid) == Wal::AppendResult::RejectedBeforeWrite,
+                "invalid metadata identity, envelope or hash refuses before writing");
+        };
+        if (!rejects([](auto& r) { r.object_id = 0; }) ||
+            !rejects([](auto& r) { r.parent_object_id = 0; }) ||
+            !rejects([](auto& r) { r.path_utf8.clear(); }) ||
+            !rejects([](auto& r) { r.path_utf8 = std::string(1, '\xff'); }) ||
+            !rejects([](auto& r) { r.path_utf8.push_back('\0'); }) ||
+            !rejects([](auto& r) { r.secondary_path_utf8 = "other"; }) ||
+            !rejects([](auto& r) { r.flags = 1; }) ||
+            !rejects([](auto& r) { r.payload_spool_id = 1; }) ||
+            !rejects([](auto& r) { r.payload_offset = 1; }) ||
+            !rejects([](auto& r) { r.logical_offset = 1; }) ||
+            !rejects([](auto& r) { r.logical_length = 52; }) ||
+            !rejects([](auto& r) { r.payload_length = 51; }) ||
+            !rejects([](auto& r) { r.inline_payload.pop_back(); }) ||
+            !rejects([](auto& r) { r.inline_payload.push_back(std::byte{0}); }) ||
+            !rejects([](auto& r) { r.payload_sha256[0] ^= 1; }) ||
+            !rejects([](auto& r) { r.unlink_outcome = UnlinkOutcome{}; })) return false;
+        if (!Require(wal.ReadAll().records.size() == 2 && wal.Compact(1),
+                "metadata survives refusals and compaction")) return false;
+    }
+    const auto reopened = Wal::ReadAll(path, kVolume);
+    if (!Require(reopened.status == Wal::ReadStatus::Ok && reopened.records.size() == 3 &&
+            reopened.records[0].inline_payload == record.inline_payload &&
+            reopened.records[0].payload_sha256 == record.payload_sha256 &&
+            reopened.records[1].inline_payload.size() == 56 &&
+            reopened.records[1].inline_payload[3] == std::byte{2},
+            "reopen retains compacted IMD1 and IMD2 metadata payloads and authentication")) return false;
+    const auto torn_path = root / "inode-metadata-torn.wal";
+    for (std::size_t size = 1; size < wire.size(); ++size)
+    {
+        auto torn = wire;
+        torn.insert(torn.end(), wire.begin(), wire.begin() + size);
+        if (!WriteBytes(torn_path, torn, std::ios::trunc)) return false;
+        const auto read = Wal::ReadAll(torn_path, kVolume);
+        if (!Require(read.status == Wal::ReadStatus::Ok && read.recovered_torn_tail &&
+                read.records.size() == 1, "every torn metadata suffix preserves the complete prefix")) return false;
+    }
+    auto corrupt = wire;
+    corrupt.back() ^= 1;
+    if (!WriteBytes(torn_path, corrupt, std::ios::trunc)) return false;
+    if (!Require(Wal::ReadAll(torn_path, kVolume).status == Wal::ReadStatus::ChecksumMismatch,
+            "metadata corruption fails the WAL checksum")) return false;
+    const auto rejects_on_read = [&](std::vector<std::uint8_t> malformed)
+    {
+        for (std::size_t i = 12; i < 16; ++i) malformed[i] = 0;
+        std::uint32_t checksum = 2166136261u;
+        for (auto byte : malformed) { checksum ^= byte; checksum *= 16777619u; }
+        for (std::size_t i = 0; i < 4; ++i)
+            malformed[12 + i] = static_cast<std::uint8_t>(checksum >> (8 * i));
+        return Require(WriteBytes(torn_path, malformed, std::ios::trunc) &&
+            Wal::ReadAll(torn_path, kVolume).status == Wal::ReadStatus::Corrupt,
+            "checksum-valid malformed metadata fails semantic or SHA validation on read");
+    };
+    for (auto offset : {40, 48, 56, 64, 72, 80, 88, 96, 120})
+    {
+        auto malformed = wire;
+        malformed[offset] ^= malformed[offset] == 0 ? 1 : malformed[offset];
+        if (!rejects_on_read(malformed)) return false;
+    }
+    if (!rejects_on_read(corrupt)) return false;
+    return true;
+}
+
+bool TestUnlinkOutcomeVersionAndRoundtrip(const std::filesystem::path& root)
+{
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    Wal::Record record;
+    record.volume_identity = kVolume;
+    record.transaction_id = 1;
+    record.sequence = 1;
+    record.operation = Wal::OperationKind::Delete;
+    record.object_id = 17;
+    record.parent_object_id = 9;
+    record.path_utf8 = "\\alias";
+    record.unlink_outcome = apfsaccess::rw::UnlinkOutcome{17, 9, 12, 2, 2, 1, "\\alias"};
+    const auto bytes = Wal::EncodeForTest(record);
+    if (!Require(bytes.size() >= 192 && bytes[4] == 3,
+            "unlink outcomes use WAL version 3, never silently downgrade to legacy records")) return false;
+    if (!Require(Wal::EncodeForTest(record, 1).empty() && Wal::EncodeForTest(record, 2).empty(),
+            "older WAL versions cannot discard an unlink outcome")) return false;
+    const auto path = root / "unlink-outcome.wal";
+    Wal wal({path, kVolume});
+    if (!Require(wal.Append(record), "unlink outcome appends durably")) return false;
+    auto legacy = record;
+    legacy.sequence = 2;
+    legacy.unlink_outcome.reset();
+    if (!Require(wal.Append(legacy), "legacy delete records remain readable alongside v3")) return false;
+    const auto result = wal.ReadAll();
+    if (!Require(result.status == Wal::ReadStatus::Ok && result.records.size() == 2 &&
+            result.records[0].unlink_outcome == record.unlink_outcome &&
+            !result.records[1].unlink_outcome,
+            "mixed-version readback preserves every unlink outcome field")) return false;
+    if (!Require(wal.Compact(1), "compaction accepts versioned outcomes")) return false;
+    const auto compacted = wal.ReadAll();
+    return Require(compacted.status == Wal::ReadStatus::Ok && compacted.records.size() == 3 &&
+        compacted.records[0].unlink_outcome == record.unlink_outcome &&
+        !compacted.records[1].unlink_outcome &&
+        compacted.records[2].operation == Wal::OperationKind::CompactionIndex,
+        "compaction preserves unlink outcome semantics");
+}
+
+bool TestUnlinkOutcomeInvalidFieldsRefuse(const std::filesystem::path& root)
+{
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    Wal::Record valid;
+    valid.volume_identity = kVolume;
+    valid.transaction_id = valid.sequence = 1;
+    valid.operation = Wal::OperationKind::Delete;
+    valid.object_id = 17;
+    valid.parent_object_id = 9;
+    valid.path_utf8 = "\\alias";
+    valid.unlink_outcome = apfsaccess::rw::UnlinkOutcome{17, 9, 12, 2, 2, 1, "\\alias"};
+    std::vector<Wal::Record> invalid;
+    auto add = [&](auto change) { auto record = valid; change(record); invalid.push_back(std::move(record)); };
+    add([](auto& r) { ++r.object_id; });
+    add([](auto& r) { ++r.parent_object_id; });
+    add([](auto& r) { r.operation = Wal::OperationKind::Rename; });
+    add([](auto& r) { r.unlink_outcome->links_before = 0; });
+    add([](auto& r) { r.unlink_outcome->links_after = 2; });
+    add([](auto& r) { r.unlink_outcome->generation_after = 8; });
+    add([](auto& r) { r.unlink_outcome->parent_object_id = 0; });
+    add([](auto& r) { r.unlink_outcome->path_utf8 = "\\different"; });
+    add([](auto& r) { r.payload_length = 1; });
+    add([](auto& r) { r.logical_length = 1; });
+    add([](auto& r) { r.flags = 4; });
+    add([](auto& r) { r.secondary_path_utf8 = "\\unexpected"; });
+    add([](auto& r) { r.inline_payload.push_back(std::byte{1}); });
+    Wal wal({root / "unlink-invalid.wal", kVolume});
+    if (!Require(wal.Append(valid), "valid outcome establishes journal control")) return false;
+    for (const auto& record : invalid)
+    {
+        if (!Require(Wal::EncodeForTest(record).empty() &&
+                wal.AppendWithResult(record) == Wal::AppendResult::RejectedBeforeWrite,
+                "inconsistent unlink identity, count, path or payload refuses before write")) return false;
+    }
+    const auto read = wal.ReadAll();
+    return Require(read.status == Wal::ReadStatus::Ok && read.records.size() == 1,
+        "invalid outcomes leave the existing journal unchanged");
+}
+
+bool TestExtendedAttributeRoundTripAndCompaction(const std::filesystem::path& root)
+{
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    const std::array<std::uint8_t, Wal::PayloadHashSize> binary_hash{
+        0xe8, 0x05, 0x90, 0x12, 0xc1, 0x4b, 0x6e, 0xda,
+        0xac, 0xa0, 0x24, 0x0f, 0x60, 0xe1, 0xe7, 0x66,
+        0xc6, 0x45, 0x20, 0xb0, 0x70, 0x49, 0x0f, 0xbd,
+        0x35, 0x07, 0x61, 0xe6, 0x54, 0xd4, 0xae, 0xb9,
+    };
+    const std::array<std::uint8_t, Wal::PayloadHashSize> empty_hash{
+        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
+        0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+        0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+        0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+    };
+
+    Wal::Record binary;
+    binary.volume_identity = kVolume;
+    binary.transaction_id = 20;
+    binary.sequence = 1;
+    binary.operation = Wal::OperationKind::SetExtendedAttribute;
+    binary.object_id = 41;
+    binary.parent_object_id = 7;
+    binary.payload_length = 4;
+    binary.payload_sha256 = binary_hash;
+    binary.inline_payload = {
+        std::byte{0x00}, std::byte{0x11}, std::byte{0x80}, std::byte{0xff}};
+    binary.path_utf8 = "\\docs\\file.bin";
+    binary.secondary_path_utf8 = "user.binary";
+
+    auto empty = binary;
+    empty.transaction_id = 21;
+    empty.sequence = 2;
+    empty.payload_length = 0;
+    empty.payload_sha256 = empty_hash;
+    empty.inline_payload.clear();
+    empty.secondary_path_utf8 = "user.empty";
+
+    Wal::Record remove;
+    remove.volume_identity = kVolume;
+    remove.transaction_id = 22;
+    remove.sequence = 3;
+    remove.operation = Wal::OperationKind::RemoveExtendedAttribute;
+    remove.object_id = 41;
+    remove.parent_object_id = 7;
+    remove.path_utf8 = "\\docs\\file.bin";
+    remove.secondary_path_utf8 = "user.empty";
+
+    const auto binary_bytes = Wal::EncodeForTest(binary);
+    const auto empty_bytes = Wal::EncodeForTest(empty);
+    const auto remove_bytes = Wal::EncodeForTest(remove);
+    if (!Require(
+            binary_bytes.size() >= 152 && binary_bytes[4] == 2 &&
+                empty_bytes.size() >= 152 && empty_bytes[4] == 2 &&
+                remove_bytes.size() >= 148 && remove_bytes[4] == 1,
+            "set xattrs use inline WAL v2 including empty values while remove remains payload-free v1") ||
+        !Require(
+            Wal::EncodeForTest(empty, 1).empty() && Wal::EncodeForTest(remove, 2).empty(),
+            "older or payload-bearing layouts cannot erase the empty-set/remove distinction"))
+    {
+        return false;
+    }
+
+    Wal wal({root / "extended-attributes.wal", kVolume});
+    if (!Require(wal.AppendBatch({binary, empty, remove}), "xattr WAL batch appends durably"))
+    {
+        return false;
+    }
+    const auto read = wal.ReadAll();
+    if (!Require(
+            read.status == Wal::ReadStatus::Ok && read.records.size() == 3 &&
+                read.records[0].operation == Wal::OperationKind::SetExtendedAttribute &&
+                read.records[0].inline_payload == binary.inline_payload &&
+                read.records[0].payload_sha256 == binary_hash &&
+                read.records[0].secondary_path_utf8 == "user.binary" &&
+                read.records[1].operation == Wal::OperationKind::SetExtendedAttribute &&
+                read.records[1].inline_payload.empty() &&
+                read.records[1].payload_sha256 == empty_hash &&
+                read.records[2].operation == Wal::OperationKind::RemoveExtendedAttribute &&
+                read.records[2].inline_payload.empty(),
+            "xattr readback preserves exact names, binary bytes, hashes, and empty-set/remove operations"))
+    {
+        return false;
+    }
+
+    if (!Require(wal.Compact(1), "xattr WAL compaction succeeds"))
+    {
+        return false;
+    }
+    const auto compacted = wal.ReadAll();
+    return Require(
+        compacted.status == Wal::ReadStatus::Ok && compacted.records.size() == 4 &&
+            compacted.records[0].inline_payload == binary.inline_payload &&
+            compacted.records[1].operation == Wal::OperationKind::SetExtendedAttribute &&
+            compacted.records[1].payload_sha256 == empty_hash &&
+            compacted.records[2].operation == Wal::OperationKind::RemoveExtendedAttribute &&
+            compacted.records[3].operation == Wal::OperationKind::CompactionIndex,
+        "compaction preserves binary and empty xattr payload identity without converting file ranges");
+}
+
+bool TestExtendedAttributeBoundaryAndMalformedRecords(const std::filesystem::path& root)
+{
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    Wal::Record valid;
+    valid.volume_identity = kVolume;
+    valid.transaction_id = 30;
+    valid.sequence = 1;
+    valid.operation = Wal::OperationKind::SetExtendedAttribute;
+    valid.object_id = 51;
+    valid.parent_object_id = 8;
+    valid.inline_payload.assign(Wal::MaxExtendedAttributePayloadBytes, std::byte{0x8a});
+    valid.payload_length = valid.inline_payload.size();
+    valid.payload_sha256 = {
+        0x88, 0x63, 0xb5, 0x7e, 0x2c, 0x86, 0x43, 0xc3,
+        0x60, 0x03, 0xd3, 0x84, 0x94, 0x5b, 0xe0, 0xac,
+        0x9d, 0x4d, 0x68, 0xb4, 0xa9, 0x14, 0x4c, 0x10,
+        0x77, 0x6a, 0x0e, 0x5d, 0x8e, 0xc4, 0x6c, 0xdf,
+    };
+    valid.path_utf8 = "\\boundary.bin";
+    valid.secondary_path_utf8 = "user.maximum";
+
+    Wal wal({root / "extended-attribute-invalid.wal", kVolume});
+    if (!Require(wal.Append(valid), "one-MiB attribute appends at the supported journal boundary"))
+    {
+        return false;
+    }
+
+    std::vector<Wal::Record> invalid;
+    auto add = [&](auto change)
+    {
+        auto record = valid;
+        change(record);
+        invalid.push_back(std::move(record));
+    };
+    add([](auto& r)
+    {
+        r.inline_payload.push_back(std::byte{0x8a});
+        r.payload_length = r.inline_payload.size();
+    });
+    add([](auto& r) { ++r.payload_length; });
+    add([](auto& r) { r.payload_sha256[0] ^= 0xff; });
+    add([](auto& r) { r.secondary_path_utf8.clear(); });
+    add([](auto& r) { r.secondary_path_utf8 = std::string("user\0bad", 8); });
+    add([](auto& r) { r.secondary_path_utf8 = std::string("\xc3\x28", 2); });
+    add([](auto& r) { r.secondary_path_utf8.assign(Wal::MaxExtendedAttributeNameBytes + 1, 'x'); });
+    add([](auto& r) { r.path_utf8 = std::string("\\bad-") + std::string("\xf0\x28\x8c\x28", 4); });
+    add([](auto& r) { r.flags = 1; });
+    add([](auto& r) { r.payload_spool_id = 1; });
+    add([](auto& r) { r.payload_offset = 1; });
+    add([](auto& r) { r.logical_offset = 1; });
+    add([](auto& r) { r.logical_length = r.inline_payload.size(); });
+
+    auto remove = valid;
+    remove.operation = Wal::OperationKind::RemoveExtendedAttribute;
+    remove.inline_payload.clear();
+    remove.payload_length = 0;
+    remove.payload_sha256.fill(0);
+    invalid.push_back([&]
+    {
+        auto record = remove;
+        record.inline_payload.push_back(std::byte{0});
+        record.payload_length = 1;
+        return record;
+    }());
+    invalid.push_back([&]
+    {
+        auto record = remove;
+        record.payload_sha256[0] = 1;
+        return record;
+    }());
+    invalid.push_back([&]
+    {
+        auto record = remove;
+        record.payload_offset = 1;
+        return record;
+    }());
+
+    for (const auto& record : invalid)
+    {
+        if (!Require(
+                Wal::EncodeForTest(record).empty() &&
+                    wal.AppendWithResult(record) == Wal::AppendResult::RejectedBeforeWrite,
+                "malformed xattr identity or payload fields reject before WAL mutation"))
+        {
+            return false;
+        }
+    }
+    const auto read = wal.ReadAll();
+    return Require(
+        read.status == Wal::ReadStatus::Ok && read.records.size() == 1 &&
+            read.records.front().inline_payload.size() == Wal::MaxExtendedAttributePayloadBytes,
+        "malformed xattr attempts leave the boundary record unchanged");
+}
+
+bool TestUnknownOperationReadFailsClosed(const std::filesystem::path& root)
+{
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    auto unknown = MakeRecord(1);
+    unknown.operation = static_cast<Wal::OperationKind>(99);
+    const auto encoded = Wal::EncodeForTest(unknown);
+    const auto path = root / "unknown-operation.wal";
+    if (!Require(!encoded.empty() && WriteBytes(path, encoded, std::ios::trunc),
+            "checksum-valid unknown operation fixture should be written"))
+    {
+        return false;
+    }
+    return Require(
+        Wal::ReadAll(path, kVolume).status == Wal::ReadStatus::Corrupt,
+        "WAL readers must fail closed on unknown operation kinds");
 }
 
 bool WriteBytes(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes, std::ios::openmode mode)
@@ -3381,6 +4062,15 @@ int main(int argc, char** argv)
         }
     };
     run("TestAppendReadbackAndVolumeBinding", TestAppendReadbackAndVolumeBinding);
+    run("TestInodeMetadataCodec", TestInodeMetadataCodec);
+    run("TestInodeMetadataWal", TestInodeMetadataWal);
+    run("TestAllocationSizeRoundTripAndValidation", TestAllocationSizeRoundTripAndValidation);
+    run("TestDirectoryRestoreRoundTripAndValidation", TestDirectoryRestoreRoundTripAndValidation);
+    run("TestUnlinkOutcomeVersionAndRoundtrip", TestUnlinkOutcomeVersionAndRoundtrip);
+    run("TestUnlinkOutcomeInvalidFieldsRefuse", TestUnlinkOutcomeInvalidFieldsRefuse);
+    run("TestExtendedAttributeRoundTripAndCompaction", TestExtendedAttributeRoundTripAndCompaction);
+    run("TestExtendedAttributeBoundaryAndMalformedRecords", TestExtendedAttributeBoundaryAndMalformedRecords);
+    run("TestUnknownOperationReadFailsClosed", TestUnknownOperationReadFailsClosed);
     run("TestAppendHandleOwnsExclusiveWriterLease", TestAppendHandleOwnsExclusiveWriterLease);
     run("TestTornTailRecovery", TestTornTailRecovery);
     run("TestExclusiveLeaseReadRepairsTornTail", TestExclusiveLeaseReadRepairsTornTail);

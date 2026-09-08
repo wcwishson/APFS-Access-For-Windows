@@ -22,6 +22,7 @@ inline constexpr std::uint32_t kAppleOmapValueDeleted = 0x00000001;
 inline constexpr std::uint16_t kAppleXattrDataStream = 0x0001;
 inline constexpr std::uint16_t kAppleXattrDataEmbedded = 0x0002;
 inline constexpr std::uint16_t kAppleXattrFileSystemOwned = 0x0004;
+inline constexpr std::size_t kAppleXattrDataStreamBytes = 48;
 
 enum class AppleBtreeKeyOrder
 {
@@ -121,6 +122,7 @@ struct AppleInodeRecord
     std::uint32_t owner = 0;
     std::uint32_t group = 0;
     std::uint16_t mode = 0;
+    std::uint16_t reserved_pad = 0;
     std::uint64_t uncompressed_size = 0;
     std::vector<AppleExtendedField> extended_fields;
 };
@@ -142,7 +144,7 @@ struct AppleFileExtentRecord
     std::uint64_t object_id = 0;
     std::uint64_t logical_address = 0;
     std::uint64_t length_bytes = 0;
-    std::uint64_t physical_block = 0;
+    std::uint64_t physical_block = 0; // Zero denotes a logical hole, never physical ownership.
     std::uint64_t crypto_id = 0;
     std::uint32_t block_size = 0;
 };
@@ -208,6 +210,11 @@ bool EncodeAppleFileExtentRecord(
     const AppleFileExtentRecord& value,
     catalog::BtreeRecord& out_record,
     std::string& out_error);
+bool DecodeAppleFileExtentRecord(
+    const catalog::BtreeRecord& record,
+    std::uint32_t block_size,
+    AppleFileExtentRecord& out_value,
+    std::string& out_error);
 bool EncodeAppleDataStreamIdRecord(
     const AppleDataStreamIdRecord& value,
     catalog::BtreeRecord& out_record,
@@ -223,6 +230,15 @@ bool EncodeApplePhysicalExtentRecord(
 bool DecodeApplePhysicalExtentRecord(
     const catalog::BtreeRecord& record,
     ApplePhysicalExtentRecord& out_value,
+    std::string& out_error);
+// Checks a complete non-snapshot filesystem/extentref pair and returns its
+// bounded physical intervals. No file payload is read or materialized.
+bool ValidateApplePayloadExtentGraph(
+    const std::vector<catalog::BtreeRecord>& filesystem_records,
+    const std::vector<catalog::BtreeRecord>& extentref_records,
+    std::uint32_t block_size,
+    std::uint64_t container_block_count,
+    std::vector<ApplePhysicalExtentRecord>& out_extents,
     std::string& out_error);
 bool EncodeAppleSiblingLinkRecord(
     const AppleSiblingLinkRecord& value,

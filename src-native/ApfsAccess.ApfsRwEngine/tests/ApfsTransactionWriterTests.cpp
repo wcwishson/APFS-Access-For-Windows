@@ -584,15 +584,17 @@ bool TestRecordEncoders()
     encoded_records.push_back(record);
 
     xattr.flags = kAppleXattrDataStream;
-    xattr.data.assign(8, std::byte{0});
+    xattr.data.assign(48, std::byte{0});
     PutU64(xattr.data, 0, 777);
+    PutU64(xattr.data, 8, 8193);
+    PutU64(xattr.data, 16, 12288);
     ok &= Require(EncodeAppleXattrRecord(xattr, record, error),
         "stream xattr encoding: " + error);
     ok &= Require(ReadU16LE(record.value, 2).value_or(1) == 0,
         "stream xattr leaves ignored embedded length zero");
     xattr.data.push_back(std::byte{0});
     ok &= Require(!EncodeAppleXattrRecord(xattr, record, error),
-        "stream xattr requires exactly one data-stream identifier");
+        "stream xattr requires one complete data-stream descriptor");
 
     AppleFileExtentRecord extent;
     extent.object_id = 117;
@@ -619,6 +621,88 @@ bool TestRecordEncoders()
     ok &= Require(SerializeAppleBtree(encoded_records, options, tree, error),
         "serialize mixed encoded records: " + error);
     ok &= RoundTripPhysical(tree, options, encoded_records);
+    return ok;
+}
+
+bool TestFileExtentDecodeIsStrict()
+{
+    AppleFileExtentRecord extent{117, 4096, 8192, 900, 4, 4096};
+    BtreeRecord encoded;
+    std::string error;
+    if (!Require(EncodeAppleFileExtentRecord(extent, encoded, error), "strict extent fixture encodes"))
+        return false;
+    AppleFileExtentRecord decoded;
+    bool ok = Require(DecodeAppleFileExtentRecord(encoded, 4096, decoded, error) &&
+            decoded.object_id == 117 && decoded.logical_address == 4096 &&
+            decoded.length_bytes == 8192 && decoded.physical_block == 900 && decoded.crypto_id == 4,
+        "file extent decodes without losing any field");
+    auto sparse = encoded;
+    PutU64(sparse.value, 8, 0);
+    PutU64(sparse.value, 16, 0);
+    ok &= Require(DecodeAppleFileExtentRecord(sparse, 4096, decoded, error) &&
+            decoded.physical_block == 0 && decoded.logical_address == 4096 && decoded.length_bytes == 8192,
+        "sparse record retains its logical range without physical ownership");
+    PutU64(sparse.value, 16, 4);
+    ok &= Require(!DecodeAppleFileExtentRecord(sparse, 4096, decoded, error),
+        "sparse record cannot carry a physical crypto identity");
+    for (int mode = 0; mode < 13; ++mode)
+    {
+        auto invalid = encoded;
+        std::uint32_t block_size = 4096;
+        if (mode < 8) PutU64(invalid.value, 0, 8192ULL | (1ULL << (56 + mode)));
+        else if (mode == 8) PutU64(invalid.key, 8, 0xfffffffffffff000ULL);
+        else if (mode == 9) PutU64(invalid.value, 8, 0xffffffffffffffffULL);
+        else if (mode == 10) invalid.key.push_back(std::byte{0});
+        else if (mode == 11) invalid.value.pop_back();
+        else block_size = 3;
+        decoded = extent;
+        ok &= Require(!DecodeAppleFileExtentRecord(invalid, block_size, decoded, error) &&
+                decoded.object_id == 0 && decoded.length_bytes == 0,
+            "flags/overflow/malformed extent must reject with empty output, mode=" + std::to_string(mode));
+    }
+    return ok;
+}
+
+bool TestPayloadExtentGraphRequiresExactCoverage()
+{
+    std::string error;
+    const auto file = [&](std::uint64_t oid, std::uint64_t logical, std::uint64_t block, std::uint64_t count) {
+        BtreeRecord record;
+        AppleFileExtentRecord extent{oid, logical, count * 4096, block, 0, 4096};
+        Require(EncodeAppleFileExtentRecord(extent, record, error), "payload graph file extent encodes");
+        return record;
+    };
+    const auto physical = [&](std::uint64_t owner, std::uint64_t block, std::uint64_t count, int references) {
+        BtreeRecord record;
+        ApplePhysicalExtentRecord extent{block, count, kApplePhysicalExtentKindNew, owner, references};
+        Require(EncodeApplePhysicalExtentRecord(extent, record, error), "payload graph physical extent encodes");
+        return record;
+    };
+    const std::vector<BtreeRecord> files{file(117, 0, 64, 16)};
+    const std::vector<BtreeRecord> physicals{physical(117, 64, 16, 1)};
+    std::vector<ApplePhysicalExtentRecord> ranges;
+    bool ok = Require(ValidateApplePayloadExtentGraph(files, physicals, 4096, 512, ranges, error) &&
+            ranges.size() == 1 && ranges.front().physical_block == 64 && ranges.front().block_count == 16,
+        "payload graph returns a bounded interval, not one entry per byte/block");
+    ok &= Require(ValidateApplePayloadExtentGraph({file(117, 0, 64, 16), file(118, 0, 64, 16)},
+            {physical(117, 64, 16, 2)}, 4096, 512, ranges, error) && ranges.size() == 1,
+        "fully represented shared payload remains one protected range");
+    for (int mode = 0; mode < 9; ++mode)
+    {
+        auto bad_files = files;
+        auto bad_physical = physicals;
+        if (mode == 0) bad_physical.clear();
+        else if (mode == 1) bad_physical = {physical(118, 64, 16, 1)};
+        else if (mode == 2) bad_physical = {physical(117, 64, 16, 2)};
+        else if (mode == 3) bad_physical.push_back(physical(118, 100, 4, 1));
+        else if (mode == 4) bad_physical = {physical(117, 64, 8, 1)};
+        else if (mode == 5) bad_files.push_back(files.front());
+        else if (mode == 6) { bad_files.push_back(file(117, 4096, 100, 4)); bad_physical.push_back(physical(117, 100, 4, 1)); }
+        else if (mode == 7) { bad_files = {file(117, 0, 510, 16)}; bad_physical = {physical(117, 510, 16, 1)}; }
+        else PutU64(bad_files.front().value, 0, (1ULL << 63) | 65536);
+        const auto refused = !ValidateApplePayloadExtentGraph(bad_files, bad_physical, 4096, 512, ranges, error);
+        ok &= Require(refused && ranges.empty(), "incomplete/ambiguous payload graph refuses, mode=" + std::to_string(mode));
+    }
     return ok;
 }
 
@@ -967,6 +1051,8 @@ int main()
     ok &= TestGhostsAndRootHistoryFields();
     ok &= TestEphemeralTreeUsesCheckpointMappedExplicitChildren();
     ok &= TestRecordEncoders();
+    ok &= TestFileExtentDecodeIsStrict();
+    ok &= TestPayloadExtentGraphRequiresExactCoverage();
     ok &= TestPhysicalExtentRecordCodecAndOrdering();
     ok &= TestDataStreamIdRecordCodec();
     ok &= TestVolumeAccountingPatch();

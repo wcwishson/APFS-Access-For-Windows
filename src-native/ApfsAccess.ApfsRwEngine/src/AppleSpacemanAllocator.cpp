@@ -22,6 +22,50 @@ bool Fail(std::string& out_error, const char* error)
     return false;
 }
 
+bool ResolveRetentionContext(const catalog::AppleSpacemanView& view,
+    const AppleSpacemanAllocationRequest& request,
+    std::uint64_t& out_oldest_required_checkpoint_xid,
+    std::vector<std::uint16_t>& out_protected_bitmap_indices,
+    std::string& out_error)
+{
+    out_oldest_required_checkpoint_xid =
+        request.oldest_required_checkpoint_xid == 0
+        ? request.expected_checkpoint_xid
+        : request.oldest_required_checkpoint_xid;
+    if (out_oldest_required_checkpoint_xid > request.expected_checkpoint_xid)
+    {
+        return Fail(out_error, "AppleSpacemanRetentionFloorInvalid");
+    }
+
+    out_protected_bitmap_indices =
+        request.protected_internal_pool_bitmap_indices;
+    const auto index_is_valid = [&view](std::uint16_t index) {
+        return index != kInvalidBitmapIndex &&
+            index < view.internal_pool.bitmap_block_count &&
+            index < view.internal_pool.bitmap_free_next.size();
+    };
+    if (!std::all_of(out_protected_bitmap_indices.begin(),
+            out_protected_bitmap_indices.end(), index_is_valid))
+    {
+        return Fail(out_error, "AppleSpacemanProtectedBitmapIndexInvalid");
+    }
+    for (const auto& bitmap : view.internal_pool.active_bitmaps)
+    {
+        if (!index_is_valid(bitmap.rotation_index))
+        {
+            return Fail(out_error, "AppleSpacemanBitmapRotationStateInvalid");
+        }
+        out_protected_bitmap_indices.push_back(bitmap.rotation_index);
+    }
+    std::sort(out_protected_bitmap_indices.begin(),
+        out_protected_bitmap_indices.end());
+    out_protected_bitmap_indices.erase(
+        std::unique(out_protected_bitmap_indices.begin(),
+            out_protected_bitmap_indices.end()),
+        out_protected_bitmap_indices.end());
+    return true;
+}
+
 void PutU16LE(std::vector<std::byte>& bytes, std::size_t offset, std::uint16_t value)
 {
     bytes[offset] = static_cast<std::byte>(value & 0xFFu);
@@ -281,7 +325,9 @@ bool ReclaimMainPoolRange(catalog::AppleSpacemanView& view,
 }
 
 bool ReclaimMatureFreeQueues(catalog::AppleSpacemanView& view,
-    std::uint64_t expected_checkpoint_xid, std::uint64_t transaction_xid,
+    std::uint64_t expected_checkpoint_xid,
+    std::uint64_t oldest_required_checkpoint_xid,
+    std::uint64_t transaction_xid,
     std::set<std::size_t>& dirty_ip_bitmaps,
     std::set<std::size_t>& touched_chunks,
     std::array<bool, 3>& rebuild_queue, std::string& out_error)
@@ -294,12 +340,20 @@ bool ReclaimMatureFreeQueues(catalog::AppleSpacemanView& view,
         {
             continue;
         }
+        std::vector<catalog::AppleSpacemanFreeQueueEntry> retained_entries;
+        retained_entries.reserve(queue.entries.size());
+        bool reclaimed_any = false;
         for (const auto& entry : queue.entries)
         {
             if (entry.xid == 0 || entry.xid > expected_checkpoint_xid ||
                 entry.xid >= transaction_xid)
             {
                 return Fail(out_error, "AppleSpacemanFreeQueueXidInvalid");
+            }
+            if (entry.xid > oldest_required_checkpoint_xid)
+            {
+                retained_entries.push_back(entry);
+                continue;
             }
             const bool reclaimed = queue_index == 0
                 ? ReclaimInternalPoolRange(view, entry.physical_block,
@@ -313,10 +367,29 @@ bool ReclaimMatureFreeQueues(catalog::AppleSpacemanView& view,
             {
                 return false;
             }
+            reclaimed_any = true;
         }
-        queue.entries.clear();
+        if (!reclaimed_any)
+        {
+            continue;
+        }
+        queue.entries = std::move(retained_entries);
         queue.block_count = 0;
-        queue.oldest_xid = 0;
+        queue.oldest_xid = std::numeric_limits<std::uint64_t>::max();
+        for (const auto& entry : queue.entries)
+        {
+            if (entry.block_count > std::numeric_limits<std::uint64_t>::max() -
+                    queue.block_count)
+            {
+                return Fail(out_error, "AppleSpacemanFreeQueueCountOverflow");
+            }
+            queue.block_count += entry.block_count;
+            queue.oldest_xid = (std::min)(queue.oldest_xid, entry.xid);
+        }
+        if (queue.entries.empty())
+        {
+            queue.oldest_xid = 0;
+        }
         rebuild_queue[queue_index] = true;
     }
     return true;
@@ -594,17 +667,36 @@ bool RotateInternalPoolBitmap(
     catalog::AppleSpacemanView& view,
     std::size_t bitmap_index,
     std::uint64_t transaction_xid,
+    const std::vector<std::uint16_t>& protected_bitmap_indices,
     AppleSpacemanPlannedWrite& out_write,
     std::string& out_error)
 {
     auto& pool = view.internal_pool;
     auto& bitmap = pool.active_bitmaps[bitmap_index];
-    const std::uint16_t new_index = pool.bitmap_free_head;
-    if (new_index == kInvalidBitmapIndex ||
-        new_index >= pool.bitmap_block_count ||
-        new_index >= pool.bitmap_free_next.size())
+    std::uint16_t previous_index = kInvalidBitmapIndex;
+    std::uint16_t new_index = pool.bitmap_free_head;
+    std::size_t visited = 0;
+    while (new_index != kInvalidBitmapIndex)
     {
-        return Fail(out_error, "AppleSpacemanBitmapRotationExhausted");
+        if (new_index >= pool.bitmap_block_count ||
+            new_index >= pool.bitmap_free_next.size() ||
+            ++visited > pool.bitmap_free_next.size())
+        {
+            return Fail(out_error, "AppleSpacemanBitmapRotationStateInvalid");
+        }
+        if (!std::binary_search(protected_bitmap_indices.begin(),
+                protected_bitmap_indices.end(), new_index))
+        {
+            break;
+        }
+        previous_index = new_index;
+        new_index = pool.bitmap_free_next[new_index];
+    }
+    if (new_index == kInvalidBitmapIndex)
+    {
+        return Fail(out_error, previous_index == kInvalidBitmapIndex
+                ? "AppleSpacemanBitmapRotationExhausted"
+                : "AppleSpacemanBitmapRetentionExhausted");
     }
     const std::uint16_t next_head = pool.bitmap_free_next[new_index];
     const std::uint16_t old_index = bitmap.rotation_index;
@@ -614,8 +706,20 @@ bool RotateInternalPoolBitmap(
     {
         return Fail(out_error, "AppleSpacemanBitmapRotationStateInvalid");
     }
+    if (previous_index == kInvalidBitmapIndex)
+    {
+        pool.bitmap_free_head = next_head;
+    }
+    else
+    {
+        pool.bitmap_free_next[previous_index] = next_head;
+    }
+    if (pool.bitmap_free_tail == new_index)
+    {
+        pool.bitmap_free_tail = previous_index;
+    }
     pool.bitmap_free_next[new_index] = kInvalidBitmapIndex;
-    if (next_head == kInvalidBitmapIndex)
+    if (pool.bitmap_free_head == kInvalidBitmapIndex)
     {
         pool.bitmap_free_head = old_index;
         pool.bitmap_free_tail = old_index;
@@ -628,7 +732,6 @@ bool RotateInternalPoolBitmap(
             return Fail(out_error, "AppleSpacemanBitmapRotationStateInvalid");
         }
         pool.bitmap_free_next[pool.bitmap_free_tail] = old_index;
-        pool.bitmap_free_head = next_head;
         pool.bitmap_free_tail = old_index;
     }
     pool.bitmap_free_next[old_index] = kInvalidBitmapIndex;
@@ -663,12 +766,19 @@ bool PlanAppleSpacemanAllocation(
     AppleSpacemanAllocationPlan plan;
     plan.expected_checkpoint_xid = request.expected_checkpoint_xid;
     plan.transaction_xid = request.transaction_xid;
+    if (!ResolveRetentionContext(view, request,
+            plan.effective_oldest_required_checkpoint_xid,
+            plan.effective_protected_internal_pool_bitmap_indices, out_error))
+    {
+        return false;
+    }
     plan.updated_spaceman = view;
     auto& updated = plan.updated_spaceman;
     std::set<std::size_t> touched_chunks;
     std::set<std::size_t> dirty_ip_bitmaps;
     std::array<bool, 3> rebuild_queue{};
     if (!ReclaimMatureFreeQueues(updated, request.expected_checkpoint_xid,
+            plan.effective_oldest_required_checkpoint_xid,
             request.transaction_xid, dirty_ip_bitmaps, touched_chunks,
             rebuild_queue, out_error))
     {
@@ -739,6 +849,23 @@ bool PlanAppleSpacemanAllocation(
         return Fail(out_error, "AppleSpacemanMainPoolExhausted");
     }
 
+    const auto fail_internal_pool_exhaustion = [&]()
+    {
+        if (plan.effective_oldest_required_checkpoint_xid < request.expected_checkpoint_xid)
+        {
+            // Diagnose retention pressure without changing the real request or
+            // publishing anything. The probe cannot recurse: its floor is current.
+            auto unpinned_request = request;
+            unpinned_request.oldest_required_checkpoint_xid = request.expected_checkpoint_xid;
+            AppleSpacemanAllocationPlan probe;
+            std::string probe_error;
+            if (PlanAppleSpacemanAllocation(view, unpinned_request, probe, probe_error))
+            {
+                return Fail(out_error, "AppleSpacemanInternalPoolRetentionExhausted");
+            }
+        }
+        return Fail(out_error, "AppleSpacemanInternalPoolExhausted");
+    };
     std::set<std::size_t> touched_cibs;
     for (const std::size_t chunk_index : touched_chunks)
     {
@@ -746,7 +873,7 @@ bool PlanAppleSpacemanAllocation(
         std::uint64_t new_bitmap_block = 0;
         if (!ReserveInternalPoolBlock(updated, new_bitmap_block, dirty_ip_bitmaps))
         {
-            return Fail(out_error, "AppleSpacemanInternalPoolExhausted");
+            return fail_internal_pool_exhaustion();
         }
         plan.allocated_internal_pool_blocks.push_back(new_bitmap_block);
         if (chunk.bitmap_block != 0)
@@ -773,7 +900,7 @@ bool PlanAppleSpacemanAllocation(
         std::uint64_t new_cib_block = 0;
         if (!ReserveInternalPoolBlock(updated, new_cib_block, dirty_ip_bitmaps))
         {
-            return Fail(out_error, "AppleSpacemanInternalPoolExhausted");
+            return fail_internal_pool_exhaustion();
         }
         plan.allocated_internal_pool_blocks.push_back(new_cib_block);
         if (!AddDeferredFree(plan, updated, cib.object.physical_block, 1,
@@ -832,7 +959,7 @@ bool PlanAppleSpacemanAllocation(
         std::uint64_t new_cab_block = 0;
         if (!ReserveInternalPoolBlock(updated, new_cab_block, dirty_ip_bitmaps))
         {
-            return Fail(out_error, "AppleSpacemanInternalPoolExhausted");
+            return fail_internal_pool_exhaustion();
         }
         plan.allocated_internal_pool_blocks.push_back(new_cab_block);
         if (!AddDeferredFree(plan, updated, cab.object.physical_block, 1,
@@ -1033,7 +1160,9 @@ bool PlanAppleSpacemanAllocation(
     {
         AppleSpacemanPlannedWrite bitmap_write;
         if (!RotateInternalPoolBitmap(updated, bitmap_index,
-                request.transaction_xid, bitmap_write, out_error))
+                request.transaction_xid,
+                plan.effective_protected_internal_pool_bitmap_indices,
+                bitmap_write, out_error))
         {
             return false;
         }

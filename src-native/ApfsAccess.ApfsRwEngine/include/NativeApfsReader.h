@@ -4,6 +4,7 @@
 #include "BtreeMutationCodec.h"
 #include "MetadataStore.h"
 #include "ApfsNameCodec.h"
+#include "RandomAccessSource.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -26,23 +27,32 @@ struct NativeApfsVolumeProjection
     std::uint64_t file_extent_tree_oid = 0;
     std::uint64_t file_extent_tree_block = 0;
     std::uint64_t root_directory_inode = 0;
+    std::uint64_t highest_file_system_object_id = 0;
     std::uint64_t total_blocks = 0;
     std::uint32_t block_size = 0;
     std::uint64_t incompatible_features = 0;
     ApfsNamePolicy name_policy{};
     std::vector<MetadataStore::InodeRecord> inodes;
+    std::vector<MetadataStore::DirectoryLink> directory_links;
     std::vector<BtreeRecord> btree_records;
+    std::unordered_map<std::uint64_t, std::map<std::string, AppleXattrRecord>> extended_attributes_by_inode;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const std::vector<MetadataStore::FileExtent>>> attribute_stream_extents;
     std::unordered_map<std::uint64_t, std::vector<MetadataStore::FileExtent>> read_extents_by_inode;
 };
 
 class NativeApfsReader
 {
 public:
+    // Optional shared cumulative parser allowance, attached before cataloging.
+    // Budgeted calls require complete namespace and attribute ownership walks.
+    // Any failure clears out_projection; no unbudgeted retry occurs.
     [[nodiscard]] static bool TryLoadVolumeProjection(
         const BlockDevice& device,
         std::uint64_t volume_object_id,
         NativeApfsVolumeProjection& out_projection,
-        std::wstring& out_error);
+        std::wstring& out_error,
+        std::optional<std::uint64_t> exact_checkpoint_xid = std::nullopt,
+        std::shared_ptr<catalog::ApfsReadBudget> budget = {});
 
 private:
     struct ObjectMapValue
@@ -53,11 +63,7 @@ private:
         std::uint64_t xid = 0;
     };
 
-    struct RawBtreeRecord
-    {
-        std::vector<std::byte> key;
-        std::vector<std::byte> value;
-    };
+    using RawBtreeRecord = catalog::BtreeRecord;
 
     struct VolumeSuperblock
     {
@@ -165,6 +171,8 @@ private:
         std::uint64_t total_blocks,
         std::uint64_t xid,
         const ApfsNamePolicy& name_policy,
-        NativeApfsVolumeProjection& projection);
+        NativeApfsVolumeProjection& projection,
+        bool require_complete_namespace,
+        const std::shared_ptr<catalog::ApfsReadBudget>& budget = {});
 };
 } // namespace apfsaccess::rw

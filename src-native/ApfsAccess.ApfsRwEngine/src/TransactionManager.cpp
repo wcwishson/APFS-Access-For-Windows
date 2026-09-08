@@ -1,6 +1,7 @@
 #include "TransactionManager.h"
 
 #include "WriteAheadLog.h"
+#include "InodeMetadataPatch.h"
 
 #include <algorithm>
 #include <chrono>
@@ -60,6 +61,22 @@ WriteAheadLog::OperationKind ToWalOperation(TransactionManager::MutationKind kin
         return WriteAheadLog::OperationKind::Delete;
     case TransactionManager::MutationKind::SetBasicInfo:
         return WriteAheadLog::OperationKind::SetBasicInfo;
+    case TransactionManager::MutationKind::SetSymbolicLinkTarget:
+        return WriteAheadLog::OperationKind::SetSymbolicLinkTarget;
+    case TransactionManager::MutationKind::RemoveSymbolicLinkTarget:
+        return WriteAheadLog::OperationKind::RemoveSymbolicLinkTarget;
+    case TransactionManager::MutationKind::SetExtendedAttribute:
+        return WriteAheadLog::OperationKind::SetExtendedAttribute;
+    case TransactionManager::MutationKind::RemoveExtendedAttribute:
+        return WriteAheadLog::OperationKind::RemoveExtendedAttribute;
+    case TransactionManager::MutationKind::SetInodeMetadata:
+        return WriteAheadLog::OperationKind::SetInodeMetadata;
+    case TransactionManager::MutationKind::SetAllocationSize:
+        return WriteAheadLog::OperationKind::SetAllocationSize;
+    case TransactionManager::MutationKind::RestoreDirectoryFromSymbolicLink:
+        return WriteAheadLog::OperationKind::RestoreDirectoryFromSymbolicLink;
+    case TransactionManager::MutationKind::RewriteCompressedContent:
+        return WriteAheadLog::OperationKind::RewriteCompressedContent;
     default:
         return WriteAheadLog::OperationKind::TransactionMarker;
     }
@@ -84,6 +101,14 @@ bool IsMutationOperation(WriteAheadLog::OperationKind operation)
     case WriteAheadLog::OperationKind::Rename:
     case WriteAheadLog::OperationKind::Delete:
     case WriteAheadLog::OperationKind::SetBasicInfo:
+    case WriteAheadLog::OperationKind::SetSymbolicLinkTarget:
+    case WriteAheadLog::OperationKind::RemoveSymbolicLinkTarget:
+    case WriteAheadLog::OperationKind::SetExtendedAttribute:
+    case WriteAheadLog::OperationKind::RemoveExtendedAttribute:
+    case WriteAheadLog::OperationKind::SetInodeMetadata:
+    case WriteAheadLog::OperationKind::SetAllocationSize:
+    case WriteAheadLog::OperationKind::RestoreDirectoryFromSymbolicLink:
+    case WriteAheadLog::OperationKind::RewriteCompressedContent:
         return true;
     default:
         return false;
@@ -271,7 +296,7 @@ bool TransactionManager::Begin()
     return true;
 }
 
-bool TransactionManager::Commit()
+bool TransactionManager::Commit(std::uint64_t preimage_checkpoint_xid)
 {
     if (!recovery_state_valid_ || state_ != State::Active)
     {
@@ -283,7 +308,7 @@ bool TransactionManager::Commit()
     NotifyStage("prepare");
     NotifyStage("write-data");
     NotifyStage("write-metadata");
-    if (!PersistTransactionBatchLocked(L"committed"))
+    if (!PersistTransactionBatchLocked(L"committed", true, preimage_checkpoint_xid))
     {
         state_ = State::Failed;
         NotifyStage("commit-failed");
@@ -301,7 +326,7 @@ bool TransactionManager::Commit()
     return true;
 }
 
-bool TransactionManager::Accept()
+bool TransactionManager::Accept(std::uint64_t preimage_checkpoint_xid)
 {
     if (!recovery_state_valid_ || state_ != State::Active || pending_mutations_.empty())
     {
@@ -310,7 +335,7 @@ bool TransactionManager::Accept()
 
     state_ = State::Committing;
     NotifyStage("accept-start");
-    if (!PersistTransactionBatchLocked(L"accepted"))
+    if (!PersistTransactionBatchLocked(L"accepted", true, preimage_checkpoint_xid))
     {
         state_ = State::Failed;
         NotifyStage("accept-failed");
@@ -326,7 +351,9 @@ bool TransactionManager::Accept()
     return true;
 }
 
-bool TransactionManager::AcceptForDeferredCommit(std::uint64_t* accepted_sequence)
+bool TransactionManager::AcceptForDeferredCommit(
+    std::uint64_t* accepted_sequence,
+    std::uint64_t preimage_checkpoint_xid)
 {
     if (accepted_sequence)
     {
@@ -339,7 +366,7 @@ bool TransactionManager::AcceptForDeferredCommit(std::uint64_t* accepted_sequenc
 
     state_ = State::Committing;
     NotifyStage("accept-start");
-    if (!PersistTransactionBatchLocked(L"accepted", false))
+    if (!PersistTransactionBatchLocked(L"accepted", false, preimage_checkpoint_xid))
     {
         state_ = State::Failed;
         NotifyStage("accept-failed");
@@ -835,18 +862,53 @@ bool TransactionManager::LoadUnappliedAcceptedTransactions(
 
 bool TransactionManager::LoadAcceptedTransactionsSinceCleanup(
     std::vector<AcceptedTransaction>& transactions,
-    std::string* failure_reason)
+    std::string* failure_reason,
+    WalReadLimits limits)
 {
     return LoadAcceptedTransactionsAfter(
         true,
         transactions,
-        failure_reason);
+        failure_reason, limits);
+}
+
+bool TransactionManager::LoadRequiredCheckpointXidsSinceCleanup(
+    std::vector<std::uint64_t>& checkpoint_xids,
+    std::string* failure_reason)
+{
+    checkpoint_xids.clear();
+    std::vector<AcceptedTransaction> transactions;
+    if (!LoadAcceptedTransactionsSinceCleanup(transactions, failure_reason))
+    {
+        return false;
+    }
+
+    checkpoint_xids.reserve(transactions.size());
+    for (const auto& transaction : transactions)
+    {
+        if (transaction.preimage_checkpoint_xid == 0)
+        {
+            checkpoint_xids.clear();
+            if (failure_reason)
+            {
+                *failure_reason = "Accepted WAL transaction has no preimage checkpoint XID";
+            }
+            return false;
+        }
+        checkpoint_xids.push_back(transaction.preimage_checkpoint_xid);
+    }
+
+    std::sort(checkpoint_xids.begin(), checkpoint_xids.end());
+    checkpoint_xids.erase(
+        std::unique(checkpoint_xids.begin(), checkpoint_xids.end()),
+        checkpoint_xids.end());
+    return true;
 }
 
 bool TransactionManager::LoadAcceptedTransactionsAfter(
     bool include_checkpointed_transactions,
     std::vector<AcceptedTransaction>& transactions,
-    std::string* failure_reason)
+    std::string* failure_reason,
+    WalReadLimits limits)
 {
     transactions.clear();
     if (failure_reason)
@@ -890,7 +952,9 @@ bool TransactionManager::LoadAcceptedTransactionsAfter(
         return fail("Active transaction lost exclusive WAL ownership");
     }
 
-    const auto existing = journal_.ReadAllWithExclusiveWriterLease();
+    const auto existing = journal_.ReadAllWithExclusiveWriterLease(limits);
+    if (existing.status == WriteAheadLog::ReadStatus::ResourceLimit)
+        return fail("WAL read resource budget exceeded");
     if (existing.status != WriteAheadLog::ReadStatus::Ok)
     {
         recovery_state_valid_ = false;
@@ -962,15 +1026,18 @@ bool TransactionManager::LoadAcceptedTransactionsAfter(
                 }
                 if (record.sequence > lower_sequence_exclusive)
                 {
-                    if (prepared == prepared_by_transaction.end() ||
-                        prepared->second.size() != record.logical_length)
+                    const bool empty_committed = prepared == prepared_by_transaction.end() &&
+                        record.logical_length == 0 && record.state == WriteAheadLog::RecordState::Checkpointed;
+                    if (!empty_committed && (prepared == prepared_by_transaction.end() ||
+                        prepared->second.size() != record.logical_length))
                     {
                         return fail("Accepted WAL transaction is incomplete");
                     }
                     transactions.push_back(AcceptedTransaction{
                         record.transaction_id,
                         record.sequence,
-                        std::move(prepared->second),
+                        empty_committed ? std::vector<WriteAheadLog::Record>{} : std::move(prepared->second),
+                        record.object_id,
                     });
                 }
             }
@@ -1306,7 +1373,8 @@ void TransactionManager::NotifyStage(const std::string& stage)
 
 bool TransactionManager::PersistTransactionBatchLocked(
     const wchar_t* outcome,
-    bool durable_flush)
+    bool durable_flush,
+    std::uint64_t preimage_checkpoint_xid)
 {
     if (next_sequence_ == 0 ||
         next_sequence_ == (std::numeric_limits<std::uint64_t>::max)())
@@ -1365,7 +1433,10 @@ bool TransactionManager::PersistTransactionBatchLocked(
         records.push_back(record);
     }
 
-    auto marker = BuildTransactionMarkerLocked(outcome, effective_volume_identity);
+    auto marker = BuildTransactionMarkerLocked(
+        outcome,
+        effective_volume_identity,
+        preimage_checkpoint_xid);
     marker.sequence = next_sequence_;
     records.push_back(marker);
 
@@ -1645,7 +1716,8 @@ void TransactionManager::ConfigureJournal()
 
 WriteAheadLog::Record TransactionManager::BuildTransactionMarkerLocked(
     const wchar_t* outcome,
-    const std::string& volume_identity) const
+    const std::string& volume_identity,
+    std::uint64_t preimage_checkpoint_xid) const
 {
     const bool committed = outcome && wcscmp(outcome, L"committed") == 0;
     const bool aborted = outcome && wcscmp(outcome, L"aborted") == 0;
@@ -1661,6 +1733,7 @@ WriteAheadLog::Record TransactionManager::BuildTransactionMarkerLocked(
     marker.flags = accepted
         ? kWalFlagAccepted
         : (committed ? kWalFlagCommitted : (aborted ? kWalFlagAborted : 0));
+    marker.object_id = (accepted || committed) ? preimage_checkpoint_xid : 0;
     marker.logical_length = static_cast<std::uint64_t>(pending_mutations_.size());
     marker.path_utf8 = WideToUtf8(safety_level_);
     return marker;
@@ -1690,6 +1763,53 @@ bool TransactionManager::AppendPreparedMutationLocked(MutationIntent& mutation)
         next_sequence_ == (std::numeric_limits<std::uint64_t>::max)())
     {
         return false;
+    }
+
+    const bool extended_attribute_mutation =
+        mutation.kind == MutationKind::SetExtendedAttribute ||
+        mutation.kind == MutationKind::RemoveExtendedAttribute;
+    const bool inode_metadata_mutation = mutation.kind == MutationKind::SetInodeMetadata ||
+        mutation.kind == MutationKind::RewriteCompressedContent;
+    const bool allocation_size_mutation = mutation.kind == MutationKind::SetAllocationSize;
+    const bool directory_restore_mutation = mutation.kind == MutationKind::RestoreDirectoryFromSymbolicLink;
+    if (directory_restore_mutation && !mutation.secondary_path.empty())
+    {
+        return false;
+    }
+    if ((allocation_size_mutation || directory_restore_mutation) && mutation.timestamp_utc != 0)
+    {
+        return false;
+    }
+    if (inode_metadata_mutation &&
+        (mutation.length != mutation.inline_payload.size() || mutation.timestamp_utc != 0 ||
+            !mutation.secondary_path.empty()))
+    {
+        return false;
+    }
+    if (extended_attribute_mutation || inode_metadata_mutation || allocation_size_mutation || directory_restore_mutation)
+    {
+        WriteAheadLog::Record validation_record{};
+        validation_record.operation = ToWalOperation(mutation.kind);
+        validation_record.object_id = mutation.object_id;
+        validation_record.parent_object_id = mutation.generation;
+        validation_record.payload_offset = mutation.payload_spool_offset;
+        validation_record.payload_length = mutation.payload_length;
+        validation_record.logical_offset = mutation.offset;
+        validation_record.logical_length = inode_metadata_mutation ? 0 : mutation.length;
+        validation_record.flags = mutation.replace_if_exists ? kWalFlagReplaceIfExists : 0;
+        validation_record.payload_sha256 = mutation.payload_checksum;
+        validation_record.inline_payload = mutation.inline_payload;
+        validation_record.path_utf8 = WideToUtf8(mutation.path);
+        validation_record.secondary_path_utf8 = WideToUtf8(mutation.secondary_path);
+        validation_record.unlink_outcome = mutation.unlink_outcome;
+        if (!WriteAheadLog::CompressionRewriteIsConsistent(validation_record) ||
+            !WriteAheadLog::ExtendedAttributeMutationIsConsistent(validation_record) ||
+            !WriteAheadLog::AllocationSizeMutationIsConsistent(validation_record) ||
+            !WriteAheadLog::DirectoryRestoreMutationIsConsistent(validation_record) ||
+            !WriteAheadLog::InodeMetadataMutationIsConsistent(validation_record))
+        {
+            return false;
+        }
     }
 
     if (journal_path_.empty())
@@ -1724,18 +1844,30 @@ bool TransactionManager::AppendPreparedMutationLocked(MutationIntent& mutation)
     record.state = WriteAheadLog::RecordState::Prepared;
     record.object_id = mutation.object_id;
     record.parent_object_id = mutation.generation;
-    record.payload_spool_id = mutation.payload_length == 0 ? 0 : mutation.wal_sequence;
+    record.payload_spool_id = extended_attribute_mutation || inode_metadata_mutation || mutation.payload_length == 0
+        ? 0
+        : mutation.wal_sequence;
     record.payload_offset = mutation.payload_spool_offset;
     record.payload_length = mutation.payload_length;
     record.logical_offset = mutation.kind == MutationKind::SetBasicInfo
         ? mutation.timestamp_utc
         : mutation.offset;
-    record.logical_length = mutation.length;
+    record.logical_length = inode_metadata_mutation ? 0 : mutation.length;
     record.flags = mutation.replace_if_exists ? kWalFlagReplaceIfExists : 0;
     record.path_utf8 = WideToUtf8(mutation.path);
     record.secondary_path_utf8 = WideToUtf8(mutation.secondary_path);
     record.payload_sha256 = mutation.payload_checksum;
     record.inline_payload = std::move(mutation.inline_payload);
+    record.unlink_outcome = std::move(mutation.unlink_outcome);
+    if (!WriteAheadLog::CompressionRewriteIsConsistent(record) ||
+        !WriteAheadLog::ExtendedAttributeMutationIsConsistent(record) ||
+        !WriteAheadLog::AllocationSizeMutationIsConsistent(record) ||
+        !WriteAheadLog::DirectoryRestoreMutationIsConsistent(record) ||
+        !WriteAheadLog::InodeMetadataMutationIsConsistent(record) ||
+        !WriteAheadLog::UnlinkOutcomeIsConsistent(record))
+    {
+        return false;
+    }
 
     if (record.operation == WriteAheadLog::OperationKind::Write &&
         (record.inline_payload.empty() ||
@@ -1754,7 +1886,13 @@ bool TransactionManager::AppendPreparedMutationLocked(MutationIntent& mutation)
         buffered_record.operation == WriteAheadLog::OperationKind::Write
             ? !buffered_record.inline_payload.empty() &&
                 WriteAheadLog::InlinePayloadIsConsistent(buffered_record)
-            : buffered_record.inline_payload.empty();
+            : buffered_record.operation == WriteAheadLog::OperationKind::RewriteCompressedContent
+                ? WriteAheadLog::CompressionRewriteIsConsistent(buffered_record)
+            : buffered_record.operation == WriteAheadLog::OperationKind::SetInodeMetadata
+                ? WriteAheadLog::InodeMetadataMutationIsConsistent(buffered_record)
+            : buffered_record.operation == WriteAheadLog::OperationKind::SetExtendedAttribute
+                ? WriteAheadLog::ExtendedAttributeMutationIsConsistent(buffered_record)
+                : buffered_record.inline_payload.empty();
     if (!complete_inline_payload)
     {
         buffered_prepared_records_have_incomplete_inline_payload_ = true;

@@ -1,21 +1,32 @@
 #pragma once
 
+#include "UnlinkOutcome.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace apfsaccess::rw
 {
+struct WalReadLimits
+{
+    std::uint64_t bytes = UINT64_MAX;
+    std::size_t records = SIZE_MAX;
+};
+
 class WriteAheadLog
 {
 public:
     static constexpr std::size_t PayloadHashSize = 32;
     static constexpr std::size_t MaxInlinePayloadBytes = 1024u * 1024u;
+    static constexpr std::size_t MaxExtendedAttributePayloadBytes = MaxInlinePayloadBytes;
+    static constexpr std::size_t MaxExtendedAttributeNameBytes = 821;
 
     enum class OperationKind : std::uint32_t
     {
@@ -26,6 +37,14 @@ public:
         Rename = 5,
         Delete = 6,
         SetBasicInfo = 7,
+        SetSymbolicLinkTarget = 8,
+        RemoveSymbolicLinkTarget = 9,
+        SetExtendedAttribute = 10,
+        RemoveExtendedAttribute = 11,
+        SetInodeMetadata = 12,
+        SetAllocationSize = 13,
+        RestoreDirectoryFromSymbolicLink = 14,
+        RewriteCompressedContent = 15,
         TransactionMarker = 100,
         CompactionIndex = 101,
         DurabilityWatermark = 102,
@@ -50,6 +69,7 @@ public:
         ChecksumMismatch,
         VersionMismatch,
         VolumeMismatch,
+        ResourceLimit,
     };
 
     enum class AppendResult
@@ -82,6 +102,7 @@ public:
         std::uint64_t sequence = 0;
         OperationKind operation = OperationKind::Write;
         RecordState state = RecordState::Prepared;
+        // Accepted transaction markers store their required preimage checkpoint XID here.
         std::uint64_t object_id = 0;
         std::uint64_t parent_object_id = 0;
         std::uint64_t payload_spool_id = 0;
@@ -94,6 +115,7 @@ public:
         std::vector<std::byte> inline_payload;
         std::string path_utf8;
         std::string secondary_path_utf8;
+        std::optional<UnlinkOutcome> unlink_outcome;
     };
 
     struct ReadResult
@@ -134,7 +156,7 @@ public:
         std::uint64_t minimum_sequence_to_keep,
         std::uint64_t expected_writer_generation = 0) const;
     [[nodiscard]] ReadResult ReadAll() const;
-    [[nodiscard]] ReadResult ReadAllWithExclusiveWriterLease() const;
+    [[nodiscard]] ReadResult ReadAllWithExclusiveWriterLease(WalReadLimits limits = {}) const;
 
     [[nodiscard]] static ReadResult ReadAll(
         const std::filesystem::path& path,
@@ -143,6 +165,12 @@ public:
         const Record& record,
         std::uint16_t version_override = 0);
     [[nodiscard]] static bool InlinePayloadIsConsistent(const Record& record);
+    [[nodiscard]] static bool InodeMetadataMutationIsConsistent(const Record& record);
+    [[nodiscard]] static bool AllocationSizeMutationIsConsistent(const Record& record);
+    [[nodiscard]] static bool DirectoryRestoreMutationIsConsistent(const Record& record);
+    [[nodiscard]] static bool CompressionRewriteIsConsistent(const Record& record);
+    [[nodiscard]] static bool ExtendedAttributeMutationIsConsistent(const Record& record);
+    [[nodiscard]] static bool UnlinkOutcomeIsConsistent(const Record& record);
     [[nodiscard]] Counters SnapshotCounters() const;
     [[nodiscard]] bool HasExclusiveWriterLease() const;
     [[nodiscard]] std::uint64_t ExclusiveWriterLeaseGeneration() const;
@@ -201,7 +229,8 @@ private:
         const std::filesystem::path& path,
         const std::string& expected_volume_identity,
         bool repair_torn_tail,
-        std::uint64_t* complete_prefix_bytes);
+        std::uint64_t* complete_prefix_bytes,
+        WalReadLimits limits = {});
 
     Options options_;
     mutable void* append_handle_ = nullptr;

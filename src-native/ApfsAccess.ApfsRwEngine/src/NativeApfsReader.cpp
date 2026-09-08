@@ -1,5 +1,8 @@
 #include "NativeApfsReader.h"
+#include "ApfsCompression.h"
 #include "ApfsContainerCatalog.h"
+#include "ApfsExtendedRecordCodec.h"
+#include "AppleTransactionCommit.h"
 #include "RandomAccessSource.h"
 
 #include <algorithm>
@@ -32,10 +35,15 @@ constexpr std::uint16_t kBtnodeFixedKvSize = 0x0004;
 constexpr std::uint64_t kApfsObjectIdMask = 0x0fffffffffffffffull;
 constexpr std::uint64_t kApfsObjectTypeShift = 60;
 constexpr std::uint64_t kApfsTypeInode = 3;
+constexpr std::uint64_t kApfsTypeXattr = 4;
+constexpr std::uint64_t kApfsTypeSiblingLink = 5;
 constexpr std::uint64_t kApfsTypeFileExtent = 8;
 constexpr std::uint64_t kApfsTypeDirectoryRecord = 9;
+constexpr std::uint64_t kApfsTypeSiblingMap = 12;
 constexpr std::uint64_t kRootDirectoryInode = 2;
 constexpr std::uint8_t kInodeExtendedFieldDataStream = 8;
+constexpr std::uint8_t kInodeExtendedFieldSparseBytes = 13;
+constexpr std::uint64_t kInodeHasSparseBytes = 0x200;
 constexpr std::size_t kInodeUncompressedSizeOffset = 0x54;
 constexpr std::size_t kInodeExtendedFieldsOffset = 0x5C;
 constexpr std::uint64_t kWindowsFileTimeUnixEpochTicks = 116444736000000000ull;
@@ -43,10 +51,12 @@ constexpr std::uint16_t kModeTypeMask = 0170000;
 constexpr std::uint16_t kModeDirectory = 0040000;
 constexpr std::uint16_t kModeRegular = 0100000;
 constexpr std::uint16_t kModeSymlink = 0120000;
+constexpr std::uint16_t kModeFifo = 0010000;
+constexpr std::uint16_t kModeSocket = 0140000;
+constexpr std::uint16_t kModeCharacterDevice = 0020000;
+constexpr std::uint16_t kModeBlockDevice = 0060000;
 constexpr std::uint16_t kDrecTypeMask = 0x000f;
 constexpr std::uint16_t kDrecTypeDirectory = 4;
-constexpr std::uint16_t kDrecTypeRegular = 8;
-constexpr std::uint16_t kDrecTypeSymlink = 10;
 constexpr std::size_t kObjectHeaderBytes = 0x20;
 constexpr std::size_t kBtreeDataOffset = 0x38;
 constexpr std::size_t kBtreeInfoBytes = 40;
@@ -56,10 +66,13 @@ constexpr std::size_t kBtreeInfoBytes = 40;
 class BlockDeviceSource final : public catalog::RandomAccessSource
 {
 public:
-    explicit BlockDeviceSource(const BlockDevice& device)
-        : device_(device)
+    explicit BlockDeviceSource(const BlockDevice& device,
+        std::shared_ptr<catalog::ApfsReadBudget> budget = {})
+        : device_(device), budget_(std::move(budget))
     {
     }
+
+    std::shared_ptr<catalog::ApfsReadBudget> ReadBudget() const override { return budget_; }
 
     [[nodiscard]] std::uint64_t SizeBytes() const override
     {
@@ -72,15 +85,22 @@ public:
         std::vector<std::byte>& out_bytes) const override
     {
         out_bytes.clear();
+        if (budget_ && !budget_->Read(size)) return false;
         if (size == 0)
         {
             return true;
         }
-        return device_.Read(offset, size, out_bytes) && out_bytes.size() == size;
+        if (!device_.Read(offset, size, out_bytes) || out_bytes.size() != size)
+        {
+            out_bytes.clear();
+            return false;
+        }
+        return true;
     }
 
 private:
     const BlockDevice& device_;
+    std::shared_ptr<catalog::ApfsReadBudget> budget_;
 };
 
 std::uint16_t ReadLe16(const std::vector<std::byte>& buffer, std::size_t offset)
@@ -180,7 +200,9 @@ std::wstring JoinPath(const std::wstring& parent, const std::wstring& name)
 bool IsSupportedFileTypeFromMode(std::uint16_t mode)
 {
     const auto type = static_cast<std::uint16_t>(mode & kModeTypeMask);
-    return type == kModeDirectory || type == kModeRegular || type == kModeSymlink;
+    return type == kModeDirectory || type == kModeRegular || type == kModeSymlink ||
+        type == kModeFifo || type == kModeSocket ||
+        type == kModeCharacterDevice || type == kModeBlockDevice;
 }
 
 bool IsDirectoryMode(std::uint16_t mode)
@@ -196,7 +218,7 @@ bool IsDirectoryDrec(std::uint16_t flags)
 bool IsSupportedDrec(std::uint16_t flags)
 {
     const auto type = static_cast<std::uint16_t>(flags & kDrecTypeMask);
-    return type == kDrecTypeDirectory || type == kDrecTypeRegular || type == kDrecTypeSymlink;
+    return IsSupportedFileTypeFromMode(static_cast<std::uint16_t>(type << 12));
 }
 
 std::uint64_t AlignUp(std::uint64_t value, std::uint64_t alignment)
@@ -298,6 +320,27 @@ std::optional<MetadataStore::FileExtent> TryResolveSingleExtentProjection(
     };
 }
 
+MetadataStore::NodeType NodeTypeFromMode(std::uint16_t mode)
+{
+    switch (static_cast<std::uint16_t>(mode & kModeTypeMask))
+    {
+    case kModeDirectory:
+        return MetadataStore::NodeType::Directory;
+    case kModeSymlink:
+        return MetadataStore::NodeType::SymbolicLink;
+    case kModeFifo:
+        return MetadataStore::NodeType::Fifo;
+    case kModeSocket:
+        return MetadataStore::NodeType::Socket;
+    case kModeCharacterDevice:
+        return MetadataStore::NodeType::CharacterDevice;
+    case kModeBlockDevice:
+        return MetadataStore::NodeType::BlockDevice;
+    default:
+        return MetadataStore::NodeType::RegularFile;
+    }
+}
+
 bool IsReadTraceEnabled()
 {
     static const bool enabled = []()
@@ -389,11 +432,6 @@ std::optional<InodeDataStreamInfo> ReadInodeDataStreamInfo(const std::vector<std
 
 std::uint64_t ApfsNanosecondsToFileTime(std::uint64_t apfs_nanoseconds)
 {
-    if (apfs_nanoseconds == 0)
-    {
-        return 0;
-    }
-
     const auto filetime_ticks = apfs_nanoseconds / 100;
     if (filetime_ticks > std::numeric_limits<std::uint64_t>::max() - kWindowsFileTimeUnixEpochTicks)
     {
@@ -401,16 +439,162 @@ std::uint64_t ApfsNanosecondsToFileTime(std::uint64_t apfs_nanoseconds)
     }
     return kWindowsFileTimeUnixEpochTicks + filetime_ticks;
 }
+void ProjectAttributeStreams(
+    const std::vector<catalog::BtreeRecord>& records,
+    const std::vector<catalog::BtreeRecord>& extentref_records,
+    const catalog::RandomAccessSource& source,
+    const catalog::AppleCheckpointView& checkpoint,
+    std::uint64_t store_offset, NativeApfsVolumeProjection& projection)
+{
+    const auto budget = source.ReadBudget();
+    bool completed = false;
+    struct ProjectionBudgetScope
+    {
+        const std::shared_ptr<catalog::ApfsReadBudget>& budget;
+        bool& completed;
+        ~ProjectionBudgetScope() { if (budget && !completed) (void)budget->Refuse("ApfsReadBudgetAttributeOwnershipUnproven"); }
+    } projection_budget_scope{budget, completed};
+    if (budget)
+    {
+        for (const auto* input : {&records, &extentref_records})
+            for (const auto& record : *input)
+            {
+                const auto bytes = record.key.size() + record.value.size();
+                if (bytes > (UINT64_MAX - 1024) / 4 || !budget->Materialize(1, 1024 + bytes * 4)) return;
+            }
+    }
+    const auto block_size = checkpoint.container.superblock.block_size;
+    const auto block_count = checkpoint.container.superblock.block_count;
+    if (block_size == 0 || block_count > (std::numeric_limits<std::uint64_t>::max)() / block_size)
+        return;
+    const auto container_bytes = block_count * block_size;
+    if (store_offset > (std::numeric_limits<std::uint64_t>::max)() - container_bytes) return;
+    std::string error;
+    std::vector<ApplePhysicalExtentRecord> physical;
+    if (!ValidateApplePayloadExtentGraph(records, extentref_records,
+            block_size, block_count, physical, error) ||
+        !ValidateAppleCheckpointPayloadOwnership(source, checkpoint, physical, error)) return;
+
+    struct Stream
+    {
+        std::vector<std::byte> descriptor;
+        std::uint64_t owners = 0;
+        bool invalid = false;
+        std::vector<MetadataStore::FileExtent> extents;
+    };
+    std::unordered_map<std::uint64_t, Stream> streams;
+    std::unordered_map<std::uint64_t, std::uint32_t> references;
+    std::unordered_set<std::uint64_t> inode_streams;
+    for (const auto& record : records)
+    {
+        if (record.key.size() < 8) return;
+        const auto key = ReadLe64(record.key, 0);
+        const auto type = key >> kApfsObjectTypeShift;
+        if (type == kApfsTypeInode)
+        {
+            AppleInodeRecord inode;
+            if (!ApfsExtendedRecordCodec::DecodeInode(record, inode, error)) return;
+            inode_streams.insert(inode.object_id);
+            inode_streams.insert(inode.private_id);
+        }
+        else if (type == 6)
+        {
+            AppleDataStreamIdRecord reference;
+            if (!DecodeAppleDataStreamIdRecord(record, reference, error) ||
+                !references.emplace(reference.object_id, reference.reference_count).second) return;
+        }
+        else if (type == kApfsTypeXattr)
+        {
+            AppleXattrRecord attribute;
+            if (!ApfsExtendedRecordCodec::DecodeXattr(record, attribute, error)) return;
+            if ((attribute.flags & kAppleXattrDataStream) == 0) continue;
+            if (attribute.data.size() != kAppleXattrDataStreamBytes) return;
+            const auto id = ReadLe64(attribute.data, 0);
+            auto& stream = streams[id];
+            if (stream.owners++ == 0) stream.descriptor = attribute.data;
+            else if (stream.descriptor != attribute.data) stream.invalid = true;
+            if (id == 0 ||
+                (attribute.flags & ~(kAppleXattrDataStream | kAppleXattrFileSystemOwned)) != 0 ||
+                ReadLe64(attribute.data, 24) != 0) stream.invalid = true;
+        }
+    }
+    for (const auto& record : records)
+    {
+        const auto key = ReadLe64(record.key, 0);
+        if ((key >> kApfsObjectTypeShift) != kApfsTypeFileExtent) continue;
+        const auto found = streams.find(key & kApfsObjectIdMask);
+        if (found == streams.end()) continue;
+        auto& stream = found->second;
+        AppleFileExtentRecord extent;
+        if (!DecodeAppleFileExtentRecord(record, block_size, extent, error) || extent.crypto_id != 0 ||
+            extent.physical_block == 0 ||
+            extent.physical_block >= block_count ||
+            extent.length_bytes / block_size > block_count - extent.physical_block)
+        {
+            stream.invalid = true;
+            continue;
+        }
+        stream.extents.push_back({extent.logical_address,
+            store_offset + extent.physical_block * block_size, extent.length_bytes});
+    }
+    for (auto& [id, stream] : streams)
+    {
+        const auto reference = references.find(id);
+        if (stream.invalid || inode_streams.contains(id) || reference == references.end() ||
+            reference->second != stream.owners) continue;
+        const auto logical_size = ReadLe64(stream.descriptor, 8);
+        const auto allocated_size = ReadLe64(stream.descriptor, 16);
+        if (logical_size > allocated_size || allocated_size > container_bytes ||
+            allocated_size % block_size != 0) continue;
+        std::sort(stream.extents.begin(), stream.extents.end(), [](const auto& left, const auto& right) {
+            return left.logical_offset < right.logical_offset;
+        });
+        std::uint64_t covered = 0;
+        for (const auto& extent : stream.extents)
+        {
+            if (extent.logical_offset != covered || extent.bytes > allocated_size - covered)
+            {
+                stream.invalid = true;
+                break;
+            }
+            covered += extent.bytes;
+        }
+        if (stream.invalid || covered != allocated_size) continue;
+        projection.attribute_stream_extents.emplace(id,
+            std::make_shared<const std::vector<MetadataStore::FileExtent>>(std::move(stream.extents)));
+    }
+    completed = true;
+}
 } // namespace
 
 bool NativeApfsReader::TryLoadVolumeProjection(
     const BlockDevice& device,
     std::uint64_t volume_object_id,
     NativeApfsVolumeProjection& out_projection,
-    std::wstring& out_error)
+    std::wstring& out_error,
+    std::optional<std::uint64_t> exact_checkpoint_xid,
+    std::shared_ptr<catalog::ApfsReadBudget> budget)
 {
     out_projection = {};
     out_error.clear();
+    bool complete = false;
+    struct ProjectionScope
+    {
+        NativeApfsVolumeProjection& projection;
+        std::wstring& error;
+        const std::shared_ptr<catalog::ApfsReadBudget>& budget;
+        bool& complete;
+        ~ProjectionScope()
+        {
+            if (!complete) projection = {};
+            if (budget && budget->Failed())
+            {
+                const std::string reason = budget->Failure();
+                error.assign(reason.begin(), reason.end());
+            }
+        }
+    } projection_scope{out_projection, out_error, budget, complete};
+    if (budget && budget->Failed()) return false;
 
     // Production volume selection is always explicit: callers resolve the
     // volume object ID through the container catalog (name or --volume-oid)
@@ -425,10 +609,29 @@ bool NativeApfsReader::TryLoadVolumeProjection(
     // A1: the container catalog is the sole location authority for cataloged
     // media. There is no block-0 guess, no proximity scan, and every object
     // traversed here is checksum- and xid-verified by the catalog walk.
-    BlockDeviceSource device_source(device);
+    BlockDeviceSource device_source(device, budget);
     catalog::ApfsContainerCatalog catalog;
     std::wstring catalog_error;
-    if (!catalog::ApfsContainerCatalog::TryLoadDevice(device, catalog, catalog_error))
+    // TryLoadDevice owns an unbudgeted adapter. Use its existing portable
+    // authority directly for opted-in callers, never a direct-device fallback.
+    std::string bounded_catalog_error;
+    std::string device_identifier, disk_slug;
+    if (budget)
+    {
+        // Preserve TryLoadDevice's catalog labels as well as its source bytes.
+        for (wchar_t ch : device.Path()) device_identifier.push_back(ch < 0x80 ? static_cast<char>(ch) : '?');
+        for (char ch : device_identifier)
+            disk_slug.push_back(((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                (ch >= '0' && ch <= '9')) ? ch : '-');
+        const auto start = disk_slug.find_first_not_of('-');
+        disk_slug = start == std::string::npos ? "device" : disk_slug.substr(start);
+    }
+    const bool catalog_loaded = budget
+        ? catalog::ApfsContainerCatalog::TryLoadImage(device_source,
+            disk_slug, device_identifier, catalog, bounded_catalog_error,
+            catalog::CatalogLoadPolicy::StrictApple)
+        : catalog::ApfsContainerCatalog::TryLoadDevice(device, catalog, catalog_error);
+    if (!catalog_loaded || (budget && budget->Failed()))
     {
         out_error = L"NativeApfsCatalogLoadFailed";
         return false;
@@ -485,6 +688,20 @@ bool NativeApfsReader::TryLoadVolumeProjection(
         out_error = L"NativeApfsAuthoritativeCheckpointMissing";
         return false;
     }
+    std::optional<catalog::AppleCheckpointView> historical_checkpoint;
+    if (exact_checkpoint_xid)
+    {
+        std::string error;
+        historical_checkpoint = catalog::LoadAppleCheckpointView(device_source,
+            matched_store->offset_bytes, matched_store->size_bytes, error, exact_checkpoint_xid);
+        if (!historical_checkpoint || historical_checkpoint->container.superblock.uuid_hex !=
+                checkpoint->container.superblock.uuid_hex)
+        {
+            out_error = L"NativeApfsHistoricalCheckpointUnavailable";
+            return false;
+        }
+        checkpoint = &*historical_checkpoint;
+    }
     const catalog::AppleVolumeCheckpointView* selected_volume = nullptr;
     for (const auto& volume : checkpoint->volumes)
     {
@@ -497,6 +714,11 @@ bool NativeApfsReader::TryLoadVolumeProjection(
     if (selected_volume == nullptr)
     {
         out_error = L"NativeApfsAuthoritativeVolumeMissing";
+        return false;
+    }
+    if (exact_checkpoint_xid && selected_volume->superblock.uuid_hex != matched_volume->volume_uuid_hex)
+    {
+        out_error = L"NativeApfsHistoricalVolumeIdentityMismatch";
         return false;
     }
     const auto block_size = checkpoint->container.superblock.block_size;
@@ -567,6 +789,7 @@ bool NativeApfsReader::TryLoadVolumeProjection(
         tree_policy.root_object_id = selected_volume->root_tree.object_id;
         tree_policy.storage_type = selected_volume->root_tree.type;
         tree_policy.subtype = catalog::kObjectTypeFsTree;
+        tree_policy.require_complete_traversal = budget || exact_checkpoint_xid.has_value();
         if (!catalog::ReadBtreeLeafRecords(
                 store_view, block_size, selected_volume->root_tree.physical_block,
                 (selected_volume->root_tree.type & catalog::kObjectStorageTypeMask) ==
@@ -577,14 +800,7 @@ bool NativeApfsReader::TryLoadVolumeProjection(
             out_error = L"NativeApfsRootTreeReadFailed";
             return false;
         }
-        fs_records.reserve(catalog_records.size());
-        for (auto& record : catalog_records)
-        {
-            RawBtreeRecord raw{};
-            raw.key = std::move(record.key);
-            raw.value = std::move(record.value);
-            fs_records.push_back(std::move(raw));
-        }
+        fs_records = std::move(catalog_records);
     }
 
     if (selected_volume->file_extent_tree.has_value())
@@ -597,6 +813,7 @@ bool NativeApfsReader::TryLoadVolumeProjection(
         tree_policy.root_object_id = file_extent_tree.object_id;
         tree_policy.storage_type = file_extent_tree.type;
         tree_policy.subtype = catalog::kObjectTypeFileExtentTree;
+        tree_policy.require_complete_traversal = static_cast<bool>(budget);
         if (catalog::ReadBtreeLeafRecords(
                 store_view, block_size, file_extent_tree.physical_block,
                 (file_extent_tree.type & catalog::kObjectStorageTypeMask) ==
@@ -608,11 +825,13 @@ bool NativeApfsReader::TryLoadVolumeProjection(
             out_projection.file_extent_tree_block = extent_device_block;
             for (auto& record : file_extent_records)
             {
-                RawBtreeRecord raw{};
-                raw.key = std::move(record.key);
-                raw.value = std::move(record.value);
-                fs_records.push_back(std::move(raw));
+                fs_records.push_back(std::move(record));
             }
+        }
+        else if (budget)
+        {
+            out_error = L"NativeApfsFileExtentTreeReadFailed";
+            return false;
         }
         else if (IsReadTraceEnabled())
         {
@@ -625,14 +844,76 @@ bool NativeApfsReader::TryLoadVolumeProjection(
         selected_volume->superblock.incompatible_features;
     out_projection.name_policy = ApfsNamePolicy::FromIncompatibleFeatures(
         selected_volume->superblock.incompatible_features);
+    // A sibling's publication advances NXSB without changing this volume.
+    // Bind projected inode/link generations to the selected APSB, preserving
+    // identities across sibling commits and fresh recovery owners.
     if (!ProjectFileSystemTree(
-            fs_records, block_size, total_blocks, checkpoint_xid,
-            out_projection.name_policy, out_projection))
+            fs_records, block_size, total_blocks, volume.xid,
+            out_projection.name_policy, out_projection, budget || exact_checkpoint_xid.has_value(), budget))
     {
+        out_projection = {};
         out_error = L"NativeApfsRootTreeProjectionFailed";
         return false;
     }
 
+    const bool has_external_attributes = std::any_of(fs_records.begin(), fs_records.end(), [](const auto& record) {
+        return record.key.size() >= 8 && (ReadLe64(record.key, 0) >> kApfsObjectTypeShift) == kApfsTypeXattr &&
+            (ReadLe16(record.value, 0) & kAppleXattrDataStream) != 0;
+    });
+    if (has_external_attributes && selected_volume->extentref_tree)
+    {
+        // Payload authority requires a complete checksum-checked ownership graph,
+        // even when the ordinary read-only namespace tolerated a partial tree.
+        auto complete_checkpoint = catalog::LoadAppleCheckpointView(
+            store_view, 0, store_view.SizeBytes(), resolve_error, checkpoint_xid);
+        if (!complete_checkpoint || complete_checkpoint->container.superblock_bytes !=
+                checkpoint->container.superblock_bytes)
+        {
+            if (budget) return budget->Refuse("ApfsReadBudgetAttributeCheckpointUnproven");
+            complete = true; return true;
+        }
+        const auto complete_volume = std::find_if(complete_checkpoint->volumes.begin(),
+            complete_checkpoint->volumes.end(), [selected_volume_oid](const auto& candidate) {
+                return candidate.superblock.object_id == selected_volume_oid;
+            });
+        if (complete_volume == complete_checkpoint->volumes.end() ||
+            complete_volume->superblock.uuid_hex != selected_volume->superblock.uuid_hex ||
+            complete_volume->superblock.xid != selected_volume->superblock.xid ||
+            complete_volume->root_tree.physical_block != selected_volume->root_tree.physical_block ||
+            !complete_volume->extentref_tree)
+        {
+            if (budget) return budget->Refuse("ApfsReadBudgetAttributeVolumeUnproven");
+            complete = true; return true;
+        }
+        const auto read_complete = [&](const catalog::AppleObjectLocation& tree, std::uint32_t subtype,
+                                       std::uint64_t omap, std::vector<catalog::BtreeRecord>& records) {
+            catalog::BtreeReadPolicy policy;
+            policy.enforce_object_identity = true;
+            policy.root_object_id = tree.object_id;
+            policy.storage_type = tree.type;
+            policy.subtype = subtype;
+            policy.require_complete_traversal = true;
+            policy.ephemeral_checkpoint = &complete_checkpoint->container;
+            return catalog::ReadBtreeLeafRecords(store_view, block_size, tree.physical_block,
+                (tree.type & catalog::kObjectStorageTypeMask) == catalog::kObjectPhysical,
+                omap, checkpoint_xid, policy, records, resolve_error);
+        };
+        std::vector<catalog::BtreeRecord> complete_records, extentref_records, fext_records;
+        if (read_complete(complete_volume->root_tree, catalog::kObjectTypeFsTree,
+                complete_volume->superblock.omap_oid, complete_records) &&
+            read_complete(*complete_volume->extentref_tree, catalog::kObjectTypeBlockRefTree, 0, extentref_records) &&
+            (!complete_volume->file_extent_tree || read_complete(*complete_volume->file_extent_tree,
+                catalog::kObjectTypeFileExtentTree, complete_volume->superblock.omap_oid, fext_records)))
+        {
+            complete_records.insert(complete_records.end(),
+                std::make_move_iterator(fext_records.begin()), std::make_move_iterator(fext_records.end()));
+            ProjectAttributeStreams(complete_records, extentref_records, store_view, *complete_checkpoint,
+                matched_store->offset_bytes, out_projection);
+        }
+        else if (budget) return budget->Refuse("ApfsReadBudgetAttributeWalkIncomplete");
+    }
+    if (budget && budget->Failed()) return false;
+    complete = true;
     return true;
 }
 
@@ -966,7 +1247,9 @@ bool NativeApfsReader::ProjectFileSystemTree(
     std::uint64_t total_blocks,
     std::uint64_t xid,
     const ApfsNamePolicy& name_policy,
-    NativeApfsVolumeProjection& projection)
+    NativeApfsVolumeProjection& projection,
+    bool require_complete_namespace,
+    const std::shared_ptr<catalog::ApfsReadBudget>& budget)
 {
     if (block_size == 0)
     {
@@ -982,11 +1265,29 @@ bool NativeApfsReader::ProjectFileSystemTree(
         std::uint64_t parent_id = 0;
         std::uint64_t private_id = 0;
         std::uint64_t logical_size = 0;
+        std::uint64_t uncompressed_size = 0;
         std::uint64_t allocated_size = std::numeric_limits<std::uint64_t>::max();
         std::uint64_t timestamp = 0;
+        std::uint64_t create_time = 0;
+        std::uint64_t modification_time = 0;
+        std::uint64_t change_time = 0;
+        std::uint64_t access_time = 0;
+        std::uint64_t internal_flags = 0;
+        std::uint32_t link_count = 1;
+        std::uint32_t directory_entry_count = 0;
+        std::uint32_t default_protection_class = 0;
+        std::uint32_t write_generation = 0;
+        std::uint32_t bsd_flags = 0;
+        std::uint32_t owner = 0;
+        std::uint32_t group = 0;
         std::uint16_t mode = 0;
+        std::uint16_t reserved_pad = 0;
         bool is_directory = false;
         bool has_data_stream_info = false;
+        bool directory_symlink_metadata_safe = false;
+        std::string primary_name_utf8;
+        MetadataStore::NodeType node_type = MetadataStore::NodeType::RegularFile;
+        std::string symlink_target_utf8;
     };
 
     struct RawDirectoryEntry
@@ -997,45 +1298,155 @@ bool NativeApfsReader::ProjectFileSystemTree(
         std::uint16_t flags = 0;
         std::wstring name;
         std::string name_utf8;
+        std::uint64_t sibling_id = 0;
     };
 
     std::unordered_map<std::uint64_t, RawInode> raw_inodes;
     std::vector<RawDirectoryEntry> directory_entries;
+    std::vector<AppleSiblingLinkRecord> sibling_links;
+    std::unordered_map<std::uint64_t, std::uint64_t> sibling_maps;
+    std::unordered_map<std::uint64_t, AppleXattrRecord> symlink_targets;
     std::unordered_map<std::uint64_t, std::vector<MetadataStore::FileExtent>> read_extents_by_private_id;
+    std::unordered_set<std::uint64_t> extent_record_ids;
+    std::unordered_set<std::uint64_t> invalid_read_extent_ids;
+    std::unordered_set<std::uint64_t> type_dependent_record_ids;
 
     for (const auto& record : records)
     {
+        // Reserve a conservative envelope before codecs copy variable fields
+        // and before the derived inode/xattr/name/extent indexes allocate.
+        // Path-dependent and shared-extent copies are charged below separately.
+        if (budget && !budget->Materialize(1, 4096 +
+                32ULL * (record.key.size() + record.value.size()))) return false;
         if (record.key.size() < sizeof(std::uint64_t))
         {
+            if (require_complete_namespace) return false;
             continue;
         }
 
         const auto obj_id_and_type = ReadLe64(record.key, 0);
         const auto object_id = obj_id_and_type & kApfsObjectIdMask;
         const auto record_type = (obj_id_and_type >> kApfsObjectTypeShift) & 0x0f;
+        if (record_type != kApfsTypeInode && record_type != kApfsTypeXattr &&
+            record_type != kApfsTypeDirectoryRecord)
+            type_dependent_record_ids.insert(object_id);
+        projection.highest_file_system_object_id = (std::max)(
+            projection.highest_file_system_object_id, object_id);
         if (object_id == 0)
         {
+            if (require_complete_namespace || record_type == kApfsTypeFileExtent) return false;
             continue;
         }
 
         if (record_type == kApfsTypeInode)
         {
-            if (record.value.size() < 0x5C)
+            catalog::BtreeRecord typed_record{record.key, record.value};
+            AppleInodeRecord apple_inode;
+            std::string record_error;
+            if (!ApfsExtendedRecordCodec::DecodeInode(
+                    typed_record, apple_inode, record_error))
             {
-                continue;
+                return false;
+            }
+            // DecodeInode already validates the xfield envelope and uniqueness.
+            // INODE_IS_SPARSE means INO_EXT_TYPE_SPARSE_BYTES is present, even
+            // when its uint64_t count is zero. Validate this on import so an
+            // absent extent map cannot turn malformed metadata into zero reads.
+            const auto sparse_field = std::find_if(apple_inode.extended_fields.begin(),
+                apple_inode.extended_fields.end(), [](const auto& field) {
+                    return field.type == kInodeExtendedFieldSparseBytes;
+                });
+            const bool has_sparse_field = sparse_field != apple_inode.extended_fields.end();
+            if (has_sparse_field != ((apple_inode.internal_flags & kInodeHasSparseBytes) != 0) ||
+                (has_sparse_field && sparse_field->data.size() != sizeof(std::uint64_t)))
+            {
+                return false;
             }
             RawInode inode{};
             inode.object_id = object_id;
-            inode.parent_id = ReadLe64(record.value, 0x00);
-            inode.private_id = ReadLe64(record.value, 0x08);
-            inode.timestamp = ApfsNanosecondsToFileTime(ReadLe64(record.value, 0x18));
-            inode.logical_size = ReadLe64(record.value, kInodeUncompressedSizeOffset);
-            inode.mode = ReadLe16(record.value, 0x50);
+            inode.parent_id = apple_inode.parent_id;
+            inode.private_id = apple_inode.private_id;
+            projection.highest_file_system_object_id = (std::max)(
+                projection.highest_file_system_object_id, apple_inode.private_id);
+            inode.create_time = ApfsNanosecondsToFileTime(apple_inode.create_time);
+            inode.modification_time = ApfsNanosecondsToFileTime(apple_inode.modification_time);
+            inode.change_time = ApfsNanosecondsToFileTime(apple_inode.change_time);
+            inode.access_time = ApfsNanosecondsToFileTime(apple_inode.access_time);
+            inode.timestamp = inode.modification_time;
+            inode.logical_size = apple_inode.uncompressed_size;
+            inode.uncompressed_size = apple_inode.uncompressed_size;
+            inode.internal_flags = apple_inode.internal_flags;
+            inode.default_protection_class = apple_inode.default_protection_class;
+            inode.write_generation = apple_inode.write_generation;
+            inode.bsd_flags = apple_inode.bsd_flags;
+            inode.owner = apple_inode.owner;
+            inode.group = apple_inode.group;
+            inode.mode = apple_inode.mode;
+            inode.reserved_pad = apple_inode.reserved_pad;
             if (!IsSupportedFileTypeFromMode(inode.mode))
             {
+                if (require_complete_namespace) return false;
                 continue;
             }
             inode.is_directory = IsDirectoryMode(inode.mode);
+            inode.node_type = NodeTypeFromMode(inode.mode);
+            // A type change may preserve neutral fields, but must not carry directory
+            // statistics, mounted-filesystem state, storage or unknown fields into a link.
+            constexpr std::uint64_t neutral_flags = 0x8 | 0x20 | 0x40 | 0x100 | 0x8000;
+            inode.directory_symlink_metadata_safe =
+                (inode.is_directory || inode.node_type == MetadataStore::NodeType::SymbolicLink) &&
+                (!inode.is_directory || apple_inode.uncompressed_size == 0) &&
+                (apple_inode.internal_flags & ~neutral_flags) == 0 &&
+                std::all_of(apple_inode.extended_fields.begin(), apple_inode.extended_fields.end(),
+                    [](const auto& field) {
+                        return (field.type == 3 && field.data.size() == 4) ||
+                            field.type == 4 || (field.type == 7 && field.data.size() == 32);
+                    });
+            const bool is_special = !inode.is_directory &&
+                inode.node_type != MetadataStore::NodeType::RegularFile &&
+                inode.node_type != MetadataStore::NodeType::SymbolicLink;
+            if (is_special && (apple_inode.uncompressed_size != 0 ||
+                std::any_of(apple_inode.extended_fields.begin(), apple_inode.extended_fields.end(),
+                    [](const auto& field) { return field.type == kInodeExtendedFieldDataStream; })))
+            {
+                return false;
+            }
+            if (inode.is_directory)
+            {
+                inode.directory_entry_count = static_cast<std::uint32_t>(
+                    apple_inode.children_or_links);
+                inode.link_count = 1;
+            }
+            else
+            {
+                inode.link_count = static_cast<std::uint32_t>(
+                    apple_inode.children_or_links);
+                if (inode.link_count == 0)
+                {
+                    return false;
+                }
+            }
+            for (const auto& field : apple_inode.extended_fields)
+            {
+                if (field.type != 4)
+                {
+                    continue;
+                }
+                if (field.data.size() <= 1 || field.data.back() != std::byte{0})
+                {
+                    return false;
+                }
+                inode.primary_name_utf8.assign(
+                    reinterpret_cast<const char*>(field.data.data()),
+                    field.data.size() - 1);
+                const auto decoded_name = ApfsNameCodec::Decode(
+                    std::span(field.data.data(), field.data.size() - 1),
+                    name_policy);
+                if (!decoded_name.ok())
+                {
+                    return false;
+                }
+            }
             if (!inode.is_directory)
             {
                 if (auto data_stream = ReadInodeDataStreamInfo(record.value); data_stream.has_value())
@@ -1044,13 +1455,46 @@ bool NativeApfsReader::ProjectFileSystemTree(
                     inode.allocated_size = data_stream->allocated_size;
                     inode.has_data_stream_info = true;
                 }
-                if (inode.logical_size > volume_bytes)
-                {
-                    inode.logical_size = 0;
-                    inode.allocated_size = 0;
-                }
             }
+            if (require_complete_namespace && raw_inodes.contains(inode.object_id)) return false;
             raw_inodes[inode.object_id] = inode;
+        }
+        else if (record_type == kApfsTypeXattr)
+        {
+            catalog::BtreeRecord typed_record{record.key, record.value};
+            AppleXattrRecord xattr;
+            std::string record_error;
+            if (!ApfsExtendedRecordCodec::DecodeXattr(
+                    typed_record, xattr, record_error))
+            {
+                return false;
+            }
+            if ((xattr.flags & kAppleXattrDataStream) != 0)
+                projection.highest_file_system_object_id = (std::max)(
+                    projection.highest_file_system_object_id, ReadLe64(xattr.data, 0));
+            if (xattr.name_utf8 == "com.apple.fs.symlink" &&
+                !symlink_targets.emplace(xattr.object_id, xattr).second)
+            {
+                return false;
+            }
+            const auto name = xattr.name_utf8;
+            if (!projection.extended_attributes_by_inode[xattr.object_id].emplace(
+                    name, std::move(xattr)).second)
+            {
+                return false;
+            }
+        }
+        else if (record_type == kApfsTypeSiblingLink)
+        {
+            catalog::BtreeRecord typed_record{record.key, record.value};
+            AppleSiblingLinkRecord link;
+            std::string record_error;
+            if (!ApfsExtendedRecordCodec::DecodeSiblingLink(
+                    typed_record, link, record_error))
+            {
+                return false;
+            }
+            sibling_links.push_back(std::move(link));
         }
         else if (record_type == kApfsTypeDirectoryRecord)
         {
@@ -1059,6 +1503,7 @@ bool NativeApfsReader::ProjectFileSystemTree(
             const std::size_t name_offset = directory_keys_are_hashed ? 12u : 10u;
             if (record.key.size() < name_offset || record.value.size() < 18)
             {
+                if (require_complete_namespace) return false;
                 continue;
             }
             const auto name_length = directory_keys_are_hashed
@@ -1093,40 +1538,56 @@ bool NativeApfsReader::ProjectFileSystemTree(
                 entry.child_id == 0 ||
                 !IsSupportedDrec(entry.flags))
             {
+                if (require_complete_namespace) return false;
                 continue;
             }
             directory_entries.push_back(std::move(entry));
         }
+        else if (record_type == kApfsTypeSiblingMap)
+        {
+            catalog::BtreeRecord typed_record{record.key, record.value};
+            AppleSiblingMapRecord map;
+            std::string record_error;
+            if (!ApfsExtendedRecordCodec::DecodeSiblingMap(
+                    typed_record, map, record_error) ||
+                !sibling_maps.emplace(map.sibling_id, map.file_id).second)
+            {
+                return false;
+            }
+        }
         else if (record_type == kApfsTypeFileExtent)
         {
-            if (record.key.size() < 16 || record.value.size() < 24)
+            extent_record_ids.insert(object_id);
+            AppleFileExtentRecord extent;
+            std::string record_error;
+            if (!DecodeAppleFileExtentRecord(record, block_size, extent, record_error))
             {
+                invalid_read_extent_ids.insert(object_id);
                 continue;
             }
-            const auto logical_offset = ReadLe64(record.key, 8);
-            const auto length = ReadLe64(record.value, 0) & 0x00ffffffffffffffull;
-            const auto physical_block = ReadLe64(record.value, 8);
-            if (length == 0)
+            // A hole has no physical allocation. Its logical length may exceed
+            // the entire device; only nonzero physical mappings consume media.
+            std::uint64_t physical_address = 0;
+            if (extent.physical_block != 0)
             {
-                continue;
-            }
-            if (logical_offset > (std::numeric_limits<std::uint64_t>::max() - length) ||
-                physical_block > (std::numeric_limits<std::uint64_t>::max() / block_size))
-            {
-                continue;
-            }
-            const auto physical_address = physical_block * block_size;
-            if (physical_address > (std::numeric_limits<std::uint64_t>::max() - length) ||
-                physical_address + length > volume_bytes)
-            {
-                continue;
+                if (extent.physical_block > volume_bytes / block_size)
+                {
+                    invalid_read_extent_ids.insert(object_id);
+                    continue;
+                }
+                physical_address = extent.physical_block * block_size;
+                if (extent.length_bytes > volume_bytes - physical_address)
+                {
+                    invalid_read_extent_ids.insert(object_id);
+                    continue;
+                }
             }
             read_extents_by_private_id[object_id].push_back(
                 MetadataStore::FileExtent
                 {
-                    logical_offset,
+                    extent.logical_address,
                     physical_address,
-                    length
+                    extent.length_bytes
                 });
         }
     }
@@ -1135,21 +1596,213 @@ bool NativeApfsReader::ProjectFileSystemTree(
     {
         return false;
     }
+    for (const auto& [object_id, attributes] : projection.extended_attributes_by_inode)
+    {
+        if (!raw_inodes.contains(object_id))
+        {
+            return false;
+        }
+    }
+
+    for (auto& [object_id, inode] : raw_inodes)
+    {
+        const auto owner_attributes = projection.extended_attributes_by_inode.find(object_id);
+        const AppleXattrRecord* decmpfs = nullptr;
+        if (owner_attributes != projection.extended_attributes_by_inode.end())
+        {
+            const auto found = owner_attributes->second.find("com.apple.decmpfs");
+            if (found != owner_attributes->second.end()) decmpfs = &found->second;
+        }
+        const bool compressed = inode.node_type == MetadataStore::NodeType::RegularFile &&
+            ((inode.bsd_flags & kAppleBsdCompressedFlag) != 0 || decmpfs != nullptr);
+        // Without a default dstream, a compressed inode carries decoded EOF,
+        // which can exceed container capacity. Classify after collecting xattrs,
+        // but retain the capacity check for native streams and ordinary files.
+        if (!inode.is_directory && (inode.has_data_stream_info || !compressed) &&
+            (inode.has_data_stream_info ? inode.allocated_size : inode.logical_size) > volume_bytes)
+        {
+            if (require_complete_namespace) return false;
+            inode.logical_size = 0;
+            inode.allocated_size = 0;
+        }
+        if (compressed)
+        {
+            // Compressed files often have a zero-byte native data stream. Its
+            // EOF must not erase the inode's uncompressed-size evidence. Where
+            // both are absent, only a validated embedded descriptor can supply
+            // size without reading the device. Other cases fail closed on read.
+            if (inode.uncompressed_size != 0) inode.logical_size = inode.uncompressed_size;
+            if (inode.logical_size == 0 && decmpfs != nullptr && decmpfs->object_id == object_id &&
+                (decmpfs->flags & ~kAppleXattrFileSystemOwned) == kAppleXattrDataEmbedded)
+            {
+                ApfsCompressionHeader header;
+                if (ApfsCompression::Inspect(decmpfs->data, {}, header))
+                    inode.logical_size = header.uncompressed_size;
+            }
+        }
+        if (inode.directory_symlink_metadata_safe)
+        {
+            inode.directory_symlink_metadata_safe =
+                !type_dependent_record_ids.contains(object_id) &&
+                !type_dependent_record_ids.contains(inode.private_id);
+            const auto attributes = projection.extended_attributes_by_inode.find(object_id);
+            if (attributes != projection.extended_attributes_by_inode.end())
+                for (const auto& [name, attribute] : attributes->second)
+                    if (attribute.flags != kAppleXattrDataEmbedded ||
+                        name == "com.apple.decmpfs" || name == "com.apple.ResourceFork")
+                        inode.directory_symlink_metadata_safe = false;
+        }
+        if (!inode.is_directory && inode.node_type != MetadataStore::NodeType::RegularFile &&
+            inode.node_type != MetadataStore::NodeType::SymbolicLink &&
+            (extent_record_ids.contains(inode.private_id) || extent_record_ids.contains(object_id)))
+        {
+            return false;
+        }
+        const auto target = symlink_targets.find(object_id);
+        if (inode.node_type != MetadataStore::NodeType::SymbolicLink)
+        {
+            if (target != symlink_targets.end())
+            {
+                return false;
+            }
+            continue;
+        }
+        if (target == symlink_targets.end() ||
+            (target->second.flags & (kAppleXattrDataStream | kAppleXattrDataEmbedded)) !=
+                kAppleXattrDataEmbedded ||
+            target->second.data.empty() ||
+            std::find(target->second.data.begin(), target->second.data.end(), std::byte{0}) !=
+                target->second.data.end())
+        {
+            return false;
+        }
+        inode.symlink_target_utf8.assign(
+            reinterpret_cast<const char*>(target->second.data.data()),
+            target->second.data.size());
+        if (inode.logical_size != inode.symlink_target_utf8.size())
+        {
+            return false;
+        }
+    }
+
+    const auto sibling_link_key = [](
+        std::uint64_t inode_id,
+        std::uint64_t parent_id,
+        const std::string& name_utf8)
+    {
+        return std::to_string(inode_id) + "\x1f" +
+            std::to_string(parent_id) + "\x1f" + name_utf8;
+    };
+    std::unordered_map<std::string, std::uint64_t> sibling_by_link;
+    std::unordered_map<std::uint64_t, std::size_t> sibling_count_by_inode;
+    for (const auto& link : sibling_links)
+    {
+        const auto mapped = sibling_maps.find(link.sibling_id);
+        if (mapped == sibling_maps.end() || mapped->second != link.inode_id ||
+            !sibling_by_link.emplace(
+                sibling_link_key(link.inode_id, link.parent_id, link.name_utf8),
+                link.sibling_id).second)
+        {
+            return false;
+        }
+        ++sibling_count_by_inode[link.inode_id];
+    }
+    if (sibling_maps.size() != sibling_links.size())
+    {
+        return false;
+    }
+
+    std::unordered_set<std::uint64_t> matched_sibling_ids;
+    for (auto& entry : directory_entries)
+    {
+        const auto inode = raw_inodes.find(entry.child_id);
+        if (inode == raw_inodes.end() || inode->second.is_directory ||
+            inode->second.link_count <= 1)
+        {
+            continue;
+        }
+        const auto sibling = sibling_by_link.find(
+            sibling_link_key(entry.child_id, entry.parent_id, entry.name_utf8));
+        if (sibling == sibling_by_link.end() ||
+            !matched_sibling_ids.insert(sibling->second).second)
+        {
+            return false;
+        }
+        entry.sibling_id = sibling->second;
+    }
+    for (const auto& [object_id, inode] : raw_inodes)
+    {
+        if (inode.is_directory)
+        {
+            continue;
+        }
+        const auto sibling_count = sibling_count_by_inode.contains(object_id)
+            ? sibling_count_by_inode.at(object_id)
+            : 0;
+        if ((inode.link_count > 1 && sibling_count != inode.link_count) ||
+            (inode.link_count <= 1 && sibling_count != 0))
+        {
+            return false;
+        }
+    }
+    if (matched_sibling_ids.size() != sibling_links.size())
+    {
+        return false;
+    }
 
     std::unordered_map<std::uint64_t, std::vector<RawDirectoryEntry>> children_by_parent;
+    std::unordered_map<std::uint64_t, std::unordered_set<std::wstring>> names_by_parent;
+    std::unordered_map<std::uint64_t, std::size_t> incoming_links;
     for (const auto& entry : directory_entries)
     {
         if (!raw_inodes.contains(entry.child_id))
         {
+            if (require_complete_namespace) return false;
             continue;
+        }
+        if (require_complete_namespace)
+        {
+            const auto parent = raw_inodes.find(entry.parent_id);
+            const auto name = ApfsNameCodec::CanonicalWindowsComponentKey(entry.name, name_policy);
+            const auto& child = raw_inodes.at(entry.child_id);
+            if (parent == raw_inodes.end() || !parent->second.is_directory ||
+                entry.parent_id == entry.child_id || !name.ok() ||
+                !names_by_parent[entry.parent_id].insert(*name.value).second ||
+                (entry.flags & 0xfu) != ((child.mode >> 12) & 0xfu)) return false;
+            ++incoming_links[entry.child_id];
         }
         children_by_parent[entry.parent_id].push_back(entry);
     }
+    if (require_complete_namespace)
+    {
+        if (!raw_inodes.at(kRootDirectoryInode).is_directory) return false;
+        for (const auto& [id, inode] : raw_inodes)
+        {
+            const auto expected_links = id == kRootDirectoryInode ? 0 : inode.is_directory ? 1 : inode.link_count;
+            if (incoming_links[id] != expected_links || (inode.is_directory &&
+                    children_by_parent[id].size() != inode.directory_entry_count)) return false;
+            if (id != kRootDirectoryInode)
+            {
+                const auto parent = raw_inodes.find(inode.parent_id);
+                const auto entries = children_by_parent.find(inode.parent_id);
+                if (parent == raw_inodes.end() || !parent->second.is_directory ||
+                    entries == children_by_parent.end() ||
+                    std::none_of(entries->second.begin(), entries->second.end(), [&](const auto& entry) {
+                        return entry.child_id == id && (inode.primary_name_utf8.empty() ||
+                            inode.primary_name_utf8 == entry.name_utf8);
+                    })) return false;
+            }
+        }
+    }
 
     projection.inodes.clear();
+    projection.directory_links.clear();
     projection.btree_records.clear();
-    projection.inodes.reserve(raw_inodes.size());
-    projection.btree_records.reserve(records.size());
+    if (!budget)
+    {
+        projection.inodes.reserve(raw_inodes.size());
+        projection.btree_records.reserve(records.size());
+    }
     struct PendingInode
     {
         std::uint64_t object_id = 0;
@@ -1175,27 +1828,62 @@ bool NativeApfsReader::ProjectFileSystemTree(
         }
         const auto& raw_inode = inode_it->second;
 
+        if (budget && !budget->Materialize(4, 4096 +
+                16ULL * (path.size() * sizeof(wchar_t) + name_utf8.size() +
+                    raw_inode.symlink_target_utf8.size()))) return false;
+
         MetadataStore::InodeRecord inode{};
         inode.object_id = raw_inode.object_id;
         inode.parent_object_id = object_id == kRootDirectoryInode ? kRootDirectoryInode : raw_inode.parent_id;
         inode.full_path = NormalizePath(path);
         inode.name = inode.full_path == L"\\" ? L"" : inode.full_path.substr(inode.full_path.find_last_of(L'\\') + 1);
         inode.is_directory = raw_inode.is_directory;
+        inode.directory_symlink_metadata_safe = raw_inode.directory_symlink_metadata_safe;
         inode.logical_size = raw_inode.is_directory ? 0 : raw_inode.logical_size;
         inode.xid = xid;
         inode.timestamp_utc = raw_inode.timestamp;
         inode.name_utf8 = std::move(name_utf8);
+        inode.private_id = raw_inode.private_id;
+        inode.create_time_utc = raw_inode.create_time;
+        inode.modification_time_utc = raw_inode.modification_time;
+        inode.change_time_utc = raw_inode.change_time;
+        inode.access_time_utc = raw_inode.access_time;
+        inode.internal_flags = raw_inode.internal_flags;
+        inode.link_count = raw_inode.link_count;
+        inode.directory_entry_count = raw_inode.directory_entry_count;
+        inode.default_protection_class = raw_inode.default_protection_class;
+        inode.write_generation = raw_inode.write_generation;
+        inode.bsd_flags = raw_inode.bsd_flags;
+        inode.owner = raw_inode.owner;
+        inode.group = raw_inode.group;
+        inode.mode = raw_inode.mode;
+        inode.reserved_pad = raw_inode.reserved_pad;
+        inode.node_type = raw_inode.node_type;
+        inode.symlink_target_utf8 = raw_inode.symlink_target_utf8;
+        if (inode.node_type == MetadataStore::NodeType::RegularFile)
+            inode.allocation_size = raw_inode.has_data_stream_info ? raw_inode.allocated_size : 0;
 
-        if (!inode.is_directory && inode.logical_size > 0)
+        // Preserve opaque external attributes for inspection, but never turn a
+        // malformed data stream owned by a regular file into implicit zeroes.
+        if (inode.node_type == MetadataStore::NodeType::RegularFile &&
+            invalid_read_extent_ids.contains(raw_inode.private_id))
+        {
+            return false;
+        }
+        if (inode.node_type == MetadataStore::NodeType::RegularFile &&
+            (inode.logical_size > 0 || inode.allocation_size.value_or(0) > 0))
         {
             if (auto read_extents_it = read_extents_by_private_id.find(raw_inode.private_id);
                 read_extents_it != read_extents_by_private_id.end())
             {
+                if (budget && !budget->Materialize(read_extents_it->second.size(),
+                        4ULL * sizeof(MetadataStore::FileExtent) * read_extents_it->second.size())) return false;
                 std::vector<MetadataStore::FileExtent> normalized_extents;
                 if (NormalizeFileExtents(read_extents_it->second, normalized_extents))
                 {
                     projection.read_extents_by_inode[inode.object_id] = normalized_extents;
-                    if (auto single_extent = TryResolveSingleExtentProjection(normalized_extents, inode.logical_size);
+                    if (auto single_extent = TryResolveSingleExtentProjection(normalized_extents,
+                            (std::max)(inode.logical_size, inode.allocation_size.value_or(0)));
                         single_extent.has_value())
                     {
                         inode.data_physical_address = single_extent->physical_address;
@@ -1209,17 +1897,26 @@ bool NativeApfsReader::ProjectFileSystemTree(
                                 false));
                     }
                 }
-                else if (IsReadTraceEnabled())
+                else
                 {
-                    std::wcerr << L"[NativeApfsReader] invalid data extent set"
-                               << L" object=" << inode.object_id
-                               << L" privateId=" << raw_inode.private_id
-                               << L" path=" << inode.full_path
-                               << std::endl;
+                    if (IsReadTraceEnabled())
+                    {
+                        std::wcerr << L"[NativeApfsReader] invalid data extent set"
+                                   << L" object=" << inode.object_id
+                                   << L" privateId=" << raw_inode.private_id
+                                   << L" path=" << inode.full_path
+                                   << std::endl;
+                    }
+                    return false;
                 }
             }
-            else if (raw_inode.has_data_stream_info && raw_inode.allocated_size == 0)
+            else if ((raw_inode.has_data_stream_info && raw_inode.allocated_size == 0) ||
+                (raw_inode.bsd_flags & kAppleBsdCompressedFlag) != 0 ||
+                (projection.extended_attributes_by_inode.contains(inode.object_id) &&
+                    projection.extended_attributes_by_inode.at(inode.object_id).contains("com.apple.decmpfs")))
             {
+                // Compressed content may live entirely in xattrs. Preserve its
+                // namespace; the committed read plan validates and decodes it.
                 projection.read_extents_by_inode[inode.object_id] = {};
                 inode.data_physical_address = 0;
             }
@@ -1259,12 +1956,33 @@ bool NativeApfsReader::ProjectFileSystemTree(
 
         if (auto child_it = children_by_parent.find(object_id); child_it != children_by_parent.end())
         {
+            std::stable_sort(
+                child_it->second.begin(), child_it->second.end(),
+                [&raw_inodes](const auto& left, const auto& right)
+                {
+                    const auto left_inode = raw_inodes.find(left.child_id);
+                    const auto right_inode = raw_inodes.find(right.child_id);
+                    const bool left_primary = left_inode != raw_inodes.end() &&
+                        left_inode->second.parent_id == left.parent_id &&
+                        left_inode->second.primary_name_utf8 == left.name_utf8;
+                    const bool right_primary = right_inode != raw_inodes.end() &&
+                        right_inode->second.parent_id == right.parent_id &&
+                        right_inode->second.primary_name_utf8 == right.name_utf8;
+                    if (left_primary != right_primary)
+                    {
+                        return left_primary;
+                    }
+                    return left.name_utf8 < right.name_utf8;
+                });
             for (const auto& child : child_it->second)
             {
                 if (child.child_id == object_id || !raw_inodes.contains(child.child_id))
                 {
                     continue;
                 }
+                if (budget && !budget->Materialize(3, 4096 +
+                        16ULL * ((inode.full_path.size() + child.name.size() + 1) * sizeof(wchar_t) +
+                            child.name_utf8.size()))) return false;
                 const auto child_path = JoinPath(inode.full_path, child.name);
                 projection.btree_records.push_back(
                     BtreeMutationCodec::EncodeDirectoryRecord(
@@ -1273,11 +1991,23 @@ bool NativeApfsReader::ProjectFileSystemTree(
                         child.child_id,
                         xid,
                         false));
+                projection.directory_links.push_back(
+                    MetadataStore::DirectoryLink{
+                        object_id,
+                        child.name,
+                        child.child_id,
+                        xid,
+                        child.name_utf8,
+                        child.sibling_id,
+                        child.timestamp,
+                        child.flags});
                 pending.push({ child.child_id, child_path, child.name_utf8 });
             }
         }
     }
 
-    return !projection.inodes.empty();
+    return !projection.inodes.empty() && (!require_complete_namespace ||
+        (projection.inodes.size() == raw_inodes.size() &&
+            projection.directory_links.size() == directory_entries.size()));
 }
 } // namespace apfsaccess::rw

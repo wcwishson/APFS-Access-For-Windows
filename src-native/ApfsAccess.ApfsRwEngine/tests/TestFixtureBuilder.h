@@ -168,6 +168,8 @@ struct BuilderStore
     std::uint64_t spaceman_oid = 0;
     std::uint64_t spaceman_block = 0;
     bool authoritative_checkpoint = false;
+    std::uint32_t authoritative_checkpoint_ring_blocks = 8;
+    std::uint64_t authoritative_internal_pool_blocks = 4;
     // Test-only pressure control for authoritative fixtures. Zero preserves
     // the naturally derived free-space bitmap; nonzero leaves at most this
     // many main-device blocks free after all fixture structures are reserved.
@@ -391,11 +393,7 @@ inline std::vector<std::byte> BuildBtreeNode(
             value[static_cast<std::size_t>(b)] =
                 static_cast<std::byte>((record.flags >> (b * 8)) & 0xffu);
         }
-        // size field (u32 @4) = 4096, matching the historical builder.
-        value[4] = std::byte{0};
-        value[5] = std::byte{0x10};
-        value[6] = std::byte{0};
-        value[7] = std::byte{0};
+        PutU32LE(value, 4, static_cast<std::uint32_t>(block_size));
         keys.push_back(std::move(key));
         values.push_back(std::move(value));
     }
@@ -728,9 +726,9 @@ inline std::vector<std::byte> BuildAuthoritativeStoreImage(const BuilderStore& i
     const std::uint64_t volume_layout_base = 4 + spec.volumes.size();
     const std::uint64_t descriptor_base =
         volume_layout_base + static_cast<std::uint64_t>(spec.volumes.size()) * 6;
-    constexpr std::uint32_t checkpoint_ring_blocks = 8;
+    const auto checkpoint_ring_blocks = spec.authoritative_checkpoint_ring_blocks;
     constexpr std::uint32_t ip_bitmap_rotation_count = 16;
-    constexpr std::uint64_t ip_block_count = 4;
+    const auto ip_block_count = spec.authoritative_internal_pool_blocks;
     const std::uint64_t data_base = descriptor_base + checkpoint_ring_blocks;
     const std::uint64_t ip_bitmap_base =
         data_base + checkpoint_ring_blocks;
@@ -852,11 +850,13 @@ inline std::vector<std::byte> BuildAuthoritativeStoreImage(const BuilderStore& i
     selected.xp_data_next = 3;
     CheckpointMappingSpec spaceman;
     spaceman.type = 0x80000005;
+    spaceman.size = spec.block_size;
     spaceman.object_id = kSpacemanOid;
     spaceman.physical_block = data_base;
     CheckpointMappingSpec free_queue;
     free_queue.type = 0x80000002;
     free_queue.subtype = 0x00000009;
+    free_queue.size = spec.block_size;
     free_queue.object_id = kFreeQueueOid;
     free_queue.physical_block = data_base + 1;
     CheckpointMappingSpec main_free_queue = free_queue;

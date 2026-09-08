@@ -21,6 +21,14 @@ public:
         Rename,
         Delete,
         SetBasicInfo,
+        SetSymbolicLinkTarget,
+        RemoveSymbolicLinkTarget,
+        SetExtendedAttribute,
+        RemoveExtendedAttribute,
+        SetInodeMetadata = 12,
+        SetAllocationSize = 13,
+        RestoreDirectoryFromSymbolicLink = 14,
+        RewriteCompressedContent = 15,
     };
 
     struct MutationView

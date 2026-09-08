@@ -352,7 +352,8 @@ bool HasLogicalExtentCoverage(
 bool ApfsVolumeTreeStore::TryProjectFromBtreeRecords(
     const std::vector<BtreeRecord>& records,
     ApfsVolumeTreeProjection& out_projection,
-    std::wstring& out_error) const
+    std::wstring& out_error,
+    const std::unordered_map<std::uint64_t, std::uint64_t>& native_allocations) const
 {
     out_projection = {};
     out_error.clear();
@@ -442,10 +443,27 @@ bool ApfsVolumeTreeStore::TryProjectFromBtreeRecords(
         }
     }
 
+    // The private projection omits dstream allocation. Only the authoritative
+    // native caller can supply that separate bound for reserved extents.
+    for (const auto& [object_id, bytes] : native_allocations)
+    {
+        const auto inode = decoded_inodes_by_object.find(object_id);
+        if (bytes == 0 || inode == decoded_inodes_by_object.end() || inode->second.is_directory)
+        {
+            out_error = L"BtreeNativeAllocationMissingFile";
+            return false;
+        }
+    }
+    const auto extent_size = [&](const DecodedBtreeInode& inode)
+    {
+        const auto allocation = native_allocations.find(inode.object_id);
+        return allocation == native_allocations.end() ? inode.logical_size :
+            (std::max)(inode.logical_size, allocation->second);
+    };
     for (const auto& [object_id, inode] : decoded_inodes_by_object)
     {
         if (!inode.is_directory &&
-            inode.logical_size > 0 &&
+            extent_size(inode) > 0 &&
             inode.data_physical_address != 0 &&
             !decoded_extents_by_object.contains(object_id))
         {
@@ -453,7 +471,7 @@ bool ApfsVolumeTreeStore::TryProjectFromBtreeRecords(
             return false;
         }
 
-        if (inode.logical_size == 0 &&
+        if (extent_size(inode) == 0 &&
             decoded_extents_by_object.contains(object_id))
         {
             out_error = L"BtreeExtentUnexpectedForZeroLengthInode";
@@ -471,7 +489,7 @@ bool ApfsVolumeTreeStore::TryProjectFromBtreeRecords(
         }
         if (!HasLogicalExtentCoverage(
                 extents,
-                inode_it->second.logical_size,
+                extent_size(inode_it->second),
                 inode_it->second.data_physical_address))
         {
             out_error = L"BtreeExtentInodeMismatch";
@@ -480,10 +498,13 @@ bool ApfsVolumeTreeStore::TryProjectFromBtreeRecords(
     }
 
     std::unordered_map<std::uint64_t, std::size_t> inbound_links;
+    std::unordered_map<std::uint64_t, std::size_t> primary_links;
     inbound_links.reserve(decoded_inodes_by_object.size());
+    primary_links.reserve(decoded_inodes_by_object.size());
     for (const auto& [object_id, _] : decoded_inodes_by_object)
     {
         inbound_links.emplace(object_id, 0);
+        primary_links.emplace(object_id, 0);
     }
 
     for (const auto& [_, entry] : decoded_directory_entries)
@@ -494,8 +515,10 @@ bool ApfsVolumeTreeStore::TryProjectFromBtreeRecords(
             out_error = L"BtreeDirectoryMissingChildInode";
             return false;
         }
-        if (child_it->second.parent_object_id != entry.parent_object_id ||
-            child_it->second.name != entry.entry_name)
+        const auto is_primary_link =
+            child_it->second.parent_object_id == entry.parent_object_id &&
+            child_it->second.name == entry.entry_name;
+        if (child_it->second.is_directory && !is_primary_link)
         {
             out_error = L"BtreeDirectoryChildMismatch";
             return false;
@@ -509,6 +532,10 @@ bool ApfsVolumeTreeStore::TryProjectFromBtreeRecords(
         }
 
         ++inbound_links[entry.child_object_id];
+        if (is_primary_link)
+        {
+            ++primary_links[entry.child_object_id];
+        }
     }
 
     for (const auto& [object_id, link_count] : inbound_links)
@@ -516,6 +543,11 @@ bool ApfsVolumeTreeStore::TryProjectFromBtreeRecords(
         if (link_count == 0)
         {
             out_error = L"BtreeInodeUnlinked";
+            return false;
+        }
+        if (primary_links[object_id] != 1)
+        {
+            out_error = L"BtreeDirectoryChildMismatch";
             return false;
         }
 

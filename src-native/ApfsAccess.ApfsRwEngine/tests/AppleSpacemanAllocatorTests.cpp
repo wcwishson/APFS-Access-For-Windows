@@ -791,7 +791,7 @@ bool TestPlansMainAllocationAndAllocatorMetadataCow()
     return ok;
 }
 
-bool TestReclaimsMaturedFreeQueuesBeforeAllocation()
+bool TestPartitionsFreeQueuesAtRetentionFloorAndReleasesThemLater()
 {
     const auto fixture = BuildDirectCibFixture();
     VectorRandomAccessSource source(fixture.image);
@@ -806,39 +806,269 @@ bool TestReclaimsMaturedFreeQueuesBeforeAllocation()
     }
 
     SetBit(view.chunks[0].allocation_bitmap, 5);
-    --view.chunks[0].free_count;
-    --view.devices[0].free_count;
-    view.free_queues[1].entries = {{kCheckpointXid - 1, 5, 1}};
-    view.free_queues[1].block_count = 1;
+    SetBit(view.chunks[0].allocation_bitmap, 6);
+    view.chunks[0].free_count -= 2;
+    view.devices[0].free_count -= 2;
+    view.free_queues[1].entries = {
+        {kCheckpointXid - 1, 5, 1},
+        {kCheckpointXid, 6, 1},
+    };
+    view.free_queues[1].block_count = 2;
     view.free_queues[1].oldest_xid = kCheckpointXid - 1;
 
     apfsaccess::rw::AppleSpacemanAllocationRequest request;
     request.expected_checkpoint_xid = kCheckpointXid;
     request.transaction_xid = kCheckpointXid + 1;
+    request.oldest_required_checkpoint_xid = kCheckpointXid - 1;
     request.main_block_count = 1;
     request.first_ephemeral_object_id = 5000;
     apfsaccess::rw::AppleSpacemanAllocationPlan plan;
     ok &= Require(apfsaccess::rw::PlanAppleSpacemanAllocation(
             view, request, plan, error),
-        "mature free queues reclaim before allocation: " + error);
+        "retention-aware free queues plan: " + error);
     if (!ok)
     {
         return false;
     }
     ok &= Require(plan.allocated_main_blocks ==
             std::vector<std::uint64_t>{5},
-        "mature main-queue block is reusable in the next transaction");
+        "entry at the retention floor is immediately reusable");
+    ok &= Require(plan.effective_oldest_required_checkpoint_xid ==
+                kCheckpointXid - 1 &&
+            plan.effective_protected_internal_pool_bitmap_indices ==
+                std::vector<std::uint16_t>{0},
+        "plan records the effective floor and original active bitmap slot");
     ok &= Require(plan.allocated_internal_pool_blocks.size() >= 2 &&
             plan.allocated_internal_pool_blocks[0] == 103 &&
             plan.allocated_internal_pool_blocks[1] == kQueuedIpBlock,
         "mature internal-pool queue blocks are reusable for allocator COW");
-    const auto old_entry_survives = [](const auto& queue) {
-        return std::any_of(queue.entries.begin(), queue.entries.end(),
-            [](const auto& entry) { return entry.xid < kCheckpointXid + 1; });
-    };
-    ok &= Require(!old_entry_survives(plan.updated_spaceman.free_queues[0]) &&
-            !old_entry_survives(plan.updated_spaceman.free_queues[1]),
-        "reclaimed records leave both free queues while current frees remain deferred");
+    ok &= Require(SameQueueEntries(plan.updated_spaceman.free_queues[1].entries,
+                std::vector<AppleSpacemanFreeQueueEntry>{
+                    {kCheckpointXid, 6, 1}}) &&
+            plan.updated_spaceman.free_queues[1].block_count == 1 &&
+            plan.updated_spaceman.free_queues[1].oldest_xid == kCheckpointXid,
+        "newer queue entry retains its original XID, range, count, and oldest XID");
+
+    apfsaccess::rw::AppleSpacemanAllocationRequest released_request;
+    released_request.expected_checkpoint_xid = request.transaction_xid;
+    released_request.transaction_xid = request.transaction_xid + 1;
+    released_request.oldest_required_checkpoint_xid = kCheckpointXid;
+    released_request.main_block_count = 1;
+    released_request.first_ephemeral_object_id = 6000;
+    apfsaccess::rw::AppleSpacemanAllocationPlan released_plan;
+    error.clear();
+    ok &= Require(apfsaccess::rw::PlanAppleSpacemanAllocation(
+            plan.updated_spaceman, released_request, released_plan, error),
+        "advanced retention floor plan succeeds: " + error);
+    ok &= Require(released_plan.allocated_main_blocks ==
+                std::vector<std::uint64_t>{6} &&
+            released_plan.updated_spaceman.free_queues[1].entries.empty() &&
+            released_plan.updated_spaceman.free_queues[1].block_count == 0 &&
+            released_plan.updated_spaceman.free_queues[1].oldest_xid == 0,
+        "advancing the floor releases the previously retained range");
+    return ok;
+}
+
+bool TestRetentionFloorUsesXidBoundaryAcrossGaps()
+{
+    const auto fixture = BuildDirectCibFixture();
+    VectorRandomAccessSource source(fixture.image);
+    AppleSpacemanView view;
+    std::string error;
+    bool ok = Require(LoadAppleSpacemanOwnershipView(
+            source, fixture.checkpoint, view, error),
+        "XID-gap retention source loads: " + error);
+    if (!ok)
+    {
+        return false;
+    }
+
+    view.object.xid = 100;
+    SetBit(view.chunks[0].allocation_bitmap, 5);
+    SetBit(view.chunks[0].allocation_bitmap, 6);
+    view.chunks[0].free_count -= 2;
+    view.devices[0].free_count -= 2;
+    view.free_queues[1].entries = {{80, 5, 1}, {90, 6, 1}};
+    view.free_queues[1].block_count = 2;
+    view.free_queues[1].oldest_xid = 80;
+
+    apfsaccess::rw::AppleSpacemanAllocationRequest request;
+    request.expected_checkpoint_xid = 100;
+    request.transaction_xid = 101;
+    request.oldest_required_checkpoint_xid = 80;
+    request.main_block_count = 1;
+    request.first_ephemeral_object_id = 5000;
+    apfsaccess::rw::AppleSpacemanAllocationPlan plan;
+    ok &= Require(apfsaccess::rw::PlanAppleSpacemanAllocation(
+            view, request, plan, error),
+        "XID-gap retention plan succeeds: " + error);
+    ok &= Require(plan.allocated_main_blocks ==
+                std::vector<std::uint64_t>{5} &&
+            SameQueueEntries(plan.updated_spaceman.free_queues[1].entries,
+                std::vector<AppleSpacemanFreeQueueEntry>{{90, 6, 1}}) &&
+            plan.updated_spaceman.free_queues[1].block_count == 1 &&
+            plan.updated_spaceman.free_queues[1].oldest_xid == 90,
+        "retention follows the explicit XID frontier rather than generation distance");
+    return ok;
+}
+
+bool TestProtectedBitmapHeadIsSkippedAndRemainsSerialized()
+{
+    const auto fixture = BuildDirectCibFixture();
+    VectorRandomAccessSource source(fixture.image);
+    AppleSpacemanView view;
+    std::string error;
+    bool ok = Require(LoadAppleSpacemanOwnershipView(
+            source, fixture.checkpoint, view, error),
+        "protected bitmap rotation source loads: " + error);
+    if (!ok)
+    {
+        return false;
+    }
+
+    apfsaccess::rw::AppleSpacemanAllocationRequest request;
+    request.expected_checkpoint_xid = kCheckpointXid;
+    request.transaction_xid = kCheckpointXid + 1;
+    request.first_ephemeral_object_id = 5000;
+    request.protected_internal_pool_bitmap_indices = {1, 1};
+    apfsaccess::rw::AppleSpacemanAllocationPlan plan;
+    ok &= Require(apfsaccess::rw::PlanAppleSpacemanAllocation(
+            view, request, plan, error),
+        "protected bitmap head plan succeeds: " + error);
+    if (!ok)
+    {
+        return false;
+    }
+    ok &= Require(plan.effective_oldest_required_checkpoint_xid ==
+                kCheckpointXid &&
+            plan.effective_protected_internal_pool_bitmap_indices ==
+                std::vector<std::uint16_t>{0, 1},
+        "default floor and deduplicated bitmap protection are recorded");
+    ok &= Require(plan.updated_spaceman.internal_pool.active_bitmaps[0]
+                    .rotation_index == 2 &&
+            plan.updated_spaceman.internal_pool.bitmap_free_head == 1 &&
+            plan.updated_spaceman.internal_pool.bitmap_free_tail == 0 &&
+            plan.updated_spaceman.internal_pool.bitmap_free_next[1] == 3 &&
+            plan.updated_spaceman.internal_pool.bitmap_free_next[15] == 0,
+        "rotation skips the protected head without unlinking it");
+
+    auto published_image = fixture.image;
+    PutBlock(published_image, kSpacemanBlock,
+        plan.updated_spaceman.bytes);
+    for (const auto& write : plan.writes)
+    {
+        if (write.physical_block != 0)
+        {
+            PutBlock(published_image, write.physical_block, write.bytes);
+        }
+    }
+    auto published_checkpoint = fixture.checkpoint;
+    published_checkpoint.superblock.xid = request.transaction_xid;
+    const auto materialized = MaterializeEphemeralQueueWrites(
+        published_image, published_checkpoint, plan, 82);
+    VectorRandomAccessSource published_source(std::move(published_image));
+    AppleSpacemanView reloaded;
+    ok &= Require(LoadAppleSpacemanOwnershipView(
+            published_source, published_checkpoint, reloaded, error),
+        "protected bitmap free list reloads: " + error);
+    ok &= Require(SameReloadedAllocatorState(reloaded, materialized),
+        "reloaded allocator preserves the skipped protected free-list slot");
+    return ok;
+}
+
+bool TestBitmapRetentionExhaustionIsAtomic()
+{
+    const auto fixture = BuildDirectCibFixture();
+    VectorRandomAccessSource source(fixture.image);
+    AppleSpacemanView view;
+    std::string error;
+    bool ok = Require(LoadAppleSpacemanOwnershipView(
+            source, fixture.checkpoint, view, error),
+        "bitmap retention exhaustion source loads: " + error);
+    if (!ok)
+    {
+        return false;
+    }
+
+    apfsaccess::rw::AppleSpacemanAllocationRequest request;
+    request.expected_checkpoint_xid = kCheckpointXid;
+    request.transaction_xid = kCheckpointXid + 1;
+    request.first_ephemeral_object_id = 5000;
+    for (std::uint16_t index = 1; index < 16; ++index)
+    {
+        request.protected_internal_pool_bitmap_indices.push_back(index);
+    }
+    apfsaccess::rw::AppleSpacemanAllocationPlan plan;
+    ok &= Require(!apfsaccess::rw::PlanAppleSpacemanAllocation(
+            view, request, plan, error) &&
+            error == "AppleSpacemanBitmapRetentionExhausted" &&
+            plan.writes.empty() && plan.allocated_main_blocks.empty() &&
+            plan.allocated_internal_pool_blocks.empty(),
+        "protecting every inactive rotation slot fails atomically: " + error);
+    return ok;
+}
+
+bool TestMultipleActiveBitmapsCannotReuseOriginalSlotDuringPlan()
+{
+    const auto fixture = BuildDirectCibFixture();
+    VectorRandomAccessSource source(fixture.image);
+    AppleSpacemanView view;
+    std::string error;
+    bool ok = Require(LoadAppleSpacemanOwnershipView(
+            source, fixture.checkpoint, view, error),
+        "multi-active bitmap source loads: " + error);
+    if (!ok)
+    {
+        return false;
+    }
+
+    auto& pool = view.internal_pool;
+    // Planner-only two-bitmap state; serialized ownership reload is covered above.
+    pool.block_count = 32769;
+    pool.bitmap_size_blocks = 2;
+    pool.bitmap_block_count = 32;
+    pool.bitmap_index_offset = 0x710;
+    pool.bitmap_free_next.assign(32, 0xFFFF);
+    for (std::uint16_t index = 2; index < 31; ++index)
+        pool.bitmap_free_next[index] = index + 1;
+    pool.bitmap_free_head = 2;
+    pool.bitmap_free_tail = 31;
+    PutU64LE(view.bytes, 0x98, pool.block_count);
+    PutU32LE(view.bytes, 0xA0, pool.bitmap_size_blocks);
+    PutU32LE(view.bytes, 0xA4, pool.bitmap_block_count);
+    PutU32LE(view.bytes, 0x148, pool.bitmap_index_offset);
+    AppleSpacemanInternalPoolBitmapView second_bitmap;
+    second_bitmap.xid = kCheckpointXid;
+    second_bitmap.physical_block = kIpBitmapBase + 1;
+    second_bitmap.rotation_index = 1;
+    second_bitmap.bytes.assign(kBlockSize, std::byte{0});
+    SetBit(second_bitmap.bytes, 0);
+    pool.active_bitmaps.push_back(std::move(second_bitmap));
+    view.free_queues[0].entries.push_back(
+        {kCheckpointXid - 1, kIpBase + 32768, 1});
+    ++view.free_queues[0].block_count;
+
+    apfsaccess::rw::AppleSpacemanAllocationRequest request;
+    request.expected_checkpoint_xid = kCheckpointXid;
+    request.transaction_xid = kCheckpointXid + 1;
+    request.first_ephemeral_object_id = 5000;
+    for (std::uint16_t index = 3; index < 32; ++index)
+        request.protected_internal_pool_bitmap_indices.push_back(index);
+    apfsaccess::rw::AppleSpacemanAllocationPlan plan;
+    const bool planned = apfsaccess::rw::PlanAppleSpacemanAllocation(
+        view, request, plan, error);
+    ok &= Require(!planned &&
+            error == "AppleSpacemanBitmapRetentionExhausted" &&
+            plan.writes.empty() && plan.allocated_main_blocks.empty() &&
+            plan.allocated_internal_pool_blocks.empty(),
+        "second rotation cannot reuse a slot active in the original view: " + error);
+    request.protected_internal_pool_bitmap_indices.erase(
+        request.protected_internal_pool_bitmap_indices.begin());
+    ok &= Require(apfsaccess::rw::PlanAppleSpacemanAllocation(view, request, plan, error) &&
+            plan.updated_spaceman.internal_pool.active_bitmaps.size() == 2 &&
+            plan.updated_spaceman.internal_pool.active_bitmaps[0].rotation_index == 2 &&
+            plan.updated_spaceman.internal_pool.active_bitmaps[1].rotation_index == 3,
+        "two available non-original slots permit both bitmap rotations: " + error);
     return ok;
 }
 
@@ -1024,6 +1254,25 @@ bool TestAllocationFailsClosedWithoutSpaceOrFreshIdentity()
         "stale checkpoint identity fails before planning: " + error);
 
     request.expected_checkpoint_xid = kCheckpointXid;
+    request.oldest_required_checkpoint_xid = kCheckpointXid + 1;
+    error.clear();
+    ok &= Require(!apfsaccess::rw::PlanAppleSpacemanAllocation(
+            view, request, plan, error) &&
+            error == "AppleSpacemanRetentionFloorInvalid" &&
+            plan.writes.empty(),
+        "retention floor newer than the current checkpoint fails atomically: " +
+            error);
+
+    request.oldest_required_checkpoint_xid = 0;
+    request.protected_internal_pool_bitmap_indices = {16};
+    error.clear();
+    ok &= Require(!apfsaccess::rw::PlanAppleSpacemanAllocation(
+            view, request, plan, error) &&
+            error == "AppleSpacemanProtectedBitmapIndexInvalid" &&
+            plan.writes.empty(),
+        "out-of-range protected bitmap slot fails atomically: " + error);
+
+    request.protected_internal_pool_bitmap_indices.clear();
     request.main_block_count = static_cast<std::size_t>(
         view.devices[0].free_count + 1);
     error.clear();
@@ -1044,6 +1293,26 @@ bool TestAllocationFailsClosedWithoutSpaceOrFreshIdentity()
             ip_full, request, plan, error) &&
             error == "AppleSpacemanInternalPoolExhausted" && plan.writes.empty(),
         "internal-pool exhaustion fails atomically: " + error);
+
+    request.oldest_required_checkpoint_xid = kCheckpointXid - 1;
+    ok &= Require(!apfsaccess::rw::PlanAppleSpacemanAllocation(ip_full, request, plan, error) &&
+            error == "AppleSpacemanInternalPoolExhausted" && plan.writes.empty(),
+        "an old pin does not relabel genuine internal-pool exhaustion as retention pressure");
+    auto retained_pool = ip_full;
+    retained_pool.free_queues[0].entries = {{kCheckpointXid, kQueuedIpBlock, kQueuedIpBlockCount}};
+    retained_pool.free_queues[0].block_count = kQueuedIpBlockCount;
+    retained_pool.free_queues[0].oldest_xid = kCheckpointXid;
+    request.first_ephemeral_object_id = 5000;
+    const auto retained_bitmap = retained_pool.internal_pool.active_bitmaps[0].bytes;
+    ok &= Require(!apfsaccess::rw::PlanAppleSpacemanAllocation(retained_pool, request, plan, error) &&
+            error == "AppleSpacemanInternalPoolRetentionExhausted" && plan.writes.empty() &&
+            retained_pool.internal_pool.active_bitmaps[0].bytes == retained_bitmap &&
+            request.oldest_required_checkpoint_xid == kCheckpointXid - 1,
+        "retention diagnosis leaves the source bitmap, required floor and output plan unchanged: " + error);
+    request.oldest_required_checkpoint_xid = kCheckpointXid;
+    ok &= Require(apfsaccess::rw::PlanAppleSpacemanAllocation(retained_pool, request, plan, error),
+        "explicit release of the old checkpoint makes the same internal-pool request feasible: " + error);
+    request.oldest_required_checkpoint_xid = 0;
 
     request.main_block_count = 0;
     request.released_blocks = {{5, 1}};
@@ -1075,7 +1344,11 @@ int main()
     ok &= TestPlansCabHierarchyCow();
     ok &= TestRejectsMalformedOwnershipState();
     ok &= TestPlansMainAllocationAndAllocatorMetadataCow();
-    ok &= TestReclaimsMaturedFreeQueuesBeforeAllocation();
+    ok &= TestPartitionsFreeQueuesAtRetentionFloorAndReleasesThemLater();
+    ok &= TestRetentionFloorUsesXidBoundaryAcrossGaps();
+    ok &= TestProtectedBitmapHeadIsSkippedAndRemainsSerialized();
+    ok &= TestBitmapRetentionExhaustionIsAtomic();
+    ok &= TestMultipleActiveBitmapsCannotReuseOriginalSlotDuringPlan();
     ok &= TestAllocationFailsClosedWithoutSpaceOrFreshIdentity();
     ok &= TestDetectsConcurrentOwnershipDriftBeforeWrite();
     ok &= TestPlansMultiNodeFreeQueueWithExplicitMappings();

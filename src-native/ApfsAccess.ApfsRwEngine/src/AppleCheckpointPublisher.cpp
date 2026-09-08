@@ -14,6 +14,7 @@ namespace
 {
 
 constexpr std::size_t kCheckpointMappingBytes = 0x28;
+constexpr std::size_t kCheckpointReadbackBytes = 1024 * 1024;
 
 bool Fail(std::string& out_error, const char* error)
 {
@@ -141,6 +142,40 @@ bool AreaContains(std::uint64_t base, std::uint32_t count,
     return block >= base && block - base < count;
 }
 
+bool AddCheckpointGuards(const catalog::RandomAccessSource& source,
+    const catalog::ContainerCheckpointView& checkpoint,
+    std::vector<AppleCheckpointGuardBlock>& guards)
+{
+    const auto& nxsb = checkpoint.superblock;
+    if (!AddGuard(source, checkpoint.superblock_physical_block,
+            nxsb.block_size, guards))
+    {
+        return false;
+    }
+    for (const auto block : checkpoint.checkpoint_map_blocks)
+    {
+        if (!AddGuard(source, block, nxsb.block_size, guards))
+        {
+            return false;
+        }
+    }
+    for (const auto& mapping : checkpoint.mappings)
+    {
+        const auto first = mapping.physical_block - nxsb.xp_data_base_block;
+        for (std::uint32_t ordinal = 0;
+             ordinal < mapping.size_bytes / nxsb.block_size; ++ordinal)
+        {
+            const auto block = nxsb.xp_data_base_block +
+                (first + ordinal) % nxsb.xp_data_block_count;
+            if (!AddGuard(source, block, nxsb.block_size, guards))
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool ValidateEphemeralObject(
     const AppleCheckpointEphemeralObject& object,
     std::uint32_t block_size,
@@ -199,14 +234,42 @@ bool WriteAndVerifyBatch(AppleCheckpointWriteTarget& target,
     {
         return Fail(out_error, "AppleCheckpointWriteFailed");
     }
-    for (const auto& write : writes)
+    std::vector<std::byte> readback;
+    const auto blocks_per_read = (std::max<std::size_t>)(
+        1, kCheckpointReadbackBytes / block_size);
+    for (std::size_t first = 0; first < writes.size();)
     {
-        std::vector<std::byte> readback;
-        if (!target.ReadBlock(write.physical_block, block_size, readback) ||
-            readback != write.bytes)
+        std::size_t count = 1;
+        while (count < blocks_per_read && count < writes.size() - first &&
+            writes[first + count - 1].physical_block !=
+                std::numeric_limits<std::uint64_t>::max() &&
+            writes[first + count].physical_block ==
+                writes[first + count - 1].physical_block + 1)
+        {
+            ++count;
+        }
+        // Planner block sizes are at most 64 KiB. Keep the old single-block
+        // behavior for larger caller-supplied blocks without enlarging ranges.
+        const bool read = block_size > kCheckpointReadbackBytes
+            ? target.ReadBlock(writes[first].physical_block, block_size, readback)
+            : target.ReadBlockRange(writes[first].physical_block, block_size,
+                count, readback);
+        if (!read || readback.empty() || readback.size() % block_size != 0 ||
+            readback.size() / block_size > count)
         {
             return Fail(out_error, "AppleCheckpointReadbackFailed");
         }
+        const auto blocks_read = readback.size() / block_size;
+        for (std::size_t index = 0; index < blocks_read; ++index)
+        {
+            if (!std::equal(writes[first + index].bytes.begin(),
+                    writes[first + index].bytes.end(), readback.begin() +
+                        static_cast<std::ptrdiff_t>(index * block_size)))
+            {
+                return Fail(out_error, "AppleCheckpointReadbackFailed");
+            }
+        }
+        first += blocks_read;
     }
     return true;
 }
@@ -241,6 +304,22 @@ public:
                 std::numeric_limits<std::uint64_t>::max() / block_size &&
             device_.Read(physical_block * static_cast<std::uint64_t>(block_size),
                 block_size, out_bytes);
+    }
+
+    bool ReadBlockRange(std::uint64_t physical_block, std::uint32_t block_size,
+        std::size_t max_blocks, std::vector<std::byte>& out_bytes) override
+    {
+        if (block_size == 0 || max_blocks == 0 ||
+            max_blocks > kCheckpointReadbackBytes / block_size ||
+            physical_block >
+                std::numeric_limits<std::uint64_t>::max() / block_size)
+        {
+            return false;
+        }
+        const auto offset = physical_block * static_cast<std::uint64_t>(block_size);
+        const auto size = max_blocks * block_size;
+        return size <= std::numeric_limits<std::uint64_t>::max() - offset &&
+            device_.Read(offset, size, out_bytes) && out_bytes.size() == size;
     }
 
     bool WriteBlock(std::uint64_t physical_block,
@@ -321,6 +400,40 @@ bool PlanAppleCheckpointPublication(
         request.transaction_xid == std::numeric_limits<std::uint64_t>::max())
     {
         return Fail(out_error, "AppleCheckpointTransactionXidInvalid");
+    }
+    std::vector<catalog::ContainerCheckpointView> retained;
+    std::unordered_set<std::uint64_t> required;
+    for (const auto xid : request.required_checkpoint_xids)
+    {
+        if (xid == 0 || xid > nxsb.xid)
+        {
+            return Fail(out_error, "AppleCheckpointRetentionInvalid");
+        }
+        if (xid == nxsb.xid || !required.insert(xid).second)
+        {
+            continue;
+        }
+        auto historical = catalog::LoadContainerCheckpointView(
+            source, 0, source.SizeBytes(), current_error, xid);
+        if (!historical.has_value())
+        {
+            return Fail(out_error, "AppleCheckpointRetentionUnavailable");
+        }
+        const auto& old = historical->superblock;
+        if (old.uuid_hex != nxsb.uuid_hex || old.block_size != nxsb.block_size ||
+            old.block_count != nxsb.block_count ||
+            old.xp_desc_base_block != nxsb.xp_desc_base_block ||
+            old.xp_desc_block_count != nxsb.xp_desc_block_count ||
+            old.xp_data_base_block != nxsb.xp_data_base_block ||
+            old.xp_data_block_count != nxsb.xp_data_block_count ||
+            !RingFieldsValid(old.xp_desc_index, old.xp_desc_len,
+                old.xp_desc_next, old.xp_desc_block_count) ||
+            !RingFieldsValid(old.xp_data_index, old.xp_data_len,
+                old.xp_data_next, old.xp_data_block_count))
+        {
+            return Fail(out_error, "AppleCheckpointRetentionIdentityMismatch");
+        }
+        retained.push_back(std::move(*historical));
     }
     if (nxsb.next_oid == 0 || request.next_object_id < nxsb.next_oid ||
         request.next_object_id == 0)
@@ -466,6 +579,15 @@ bool PlanAppleCheckpointPublication(
     {
         return Fail(out_error, "AppleCheckpointDataRingOverlap");
     }
+    for (const auto& historical : retained)
+    {
+        const auto& old = historical.superblock;
+        if (RingRangesOverlap(data_index, data_blocks, old.xp_data_index,
+                old.xp_data_len, nxsb.xp_data_block_count))
+        {
+            return Fail(out_error, "AppleCheckpointDataRetentionExhausted");
+        }
+    }
 
     const auto mappings_per_block = static_cast<std::uint32_t>(
         (nxsb.block_size - 0x28) / kCheckpointMappingBytes);
@@ -488,6 +610,15 @@ bool PlanAppleCheckpointPublication(
     {
         return Fail(out_error, "AppleCheckpointDescriptorRingOverlap");
     }
+    for (const auto& historical : retained)
+    {
+        const auto& old = historical.superblock;
+        if (RingRangesOverlap(descriptor_index, descriptor_length,
+                old.xp_desc_index, old.xp_desc_len, nxsb.xp_desc_block_count))
+        {
+            return Fail(out_error, "AppleCheckpointDescriptorRetentionExhausted");
+        }
+    }
 
     AppleCheckpointPublicationPlan plan;
     plan.block_size = nxsb.block_size;
@@ -495,32 +626,15 @@ bool PlanAppleCheckpointPublication(
     plan.transaction_xid = request.transaction_xid;
     plan.next_object_id = request.next_object_id;
     if (!AddGuard(source, 0, nxsb.block_size, plan.guard_blocks) ||
-        !AddGuard(source, checkpoint.superblock_physical_block,
-            nxsb.block_size, plan.guard_blocks))
+        !AddCheckpointGuards(source, checkpoint, plan.guard_blocks))
     {
         return Fail(out_error, "AppleCheckpointGuardUnreadable");
     }
-    for (const auto block : checkpoint.checkpoint_map_blocks)
+    for (const auto& historical : retained)
     {
-        if (!AddGuard(source, block, nxsb.block_size, plan.guard_blocks))
+        if (!AddCheckpointGuards(source, historical, plan.guard_blocks))
         {
             return Fail(out_error, "AppleCheckpointGuardUnreadable");
-        }
-    }
-    for (const auto& mapping : checkpoint.mappings)
-    {
-        const auto first_relative =
-            mapping.physical_block - nxsb.xp_data_base_block;
-        const auto blocks = mapping.size_bytes / nxsb.block_size;
-        for (std::uint32_t ordinal = 0; ordinal < blocks; ++ordinal)
-        {
-            const auto relative = static_cast<std::uint32_t>(
-                (first_relative + ordinal) % nxsb.xp_data_block_count);
-            if (!AddGuard(source, nxsb.xp_data_base_block + relative,
-                    nxsb.block_size, plan.guard_blocks))
-            {
-                return Fail(out_error, "AppleCheckpointGuardUnreadable");
-            }
         }
     }
 

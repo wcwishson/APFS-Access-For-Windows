@@ -1,11 +1,14 @@
 #pragma once
 
 #include "ApfsFormat.h"
+#include "ApfsTransactionWriter.h"
 #include "BtreeMutationCodec.h"
 #include "BlockDevice.h"
 #include "CheckpointDelta.h"
 #include "ExtentAllocator.h"
 #include "MutationCompactor.h"
+#include "UnlinkOutcome.h"
+#include "WriteAheadLog.h"
 
 #include <atomic>
 #include <cstdint>
@@ -27,9 +30,23 @@
 
 namespace apfsaccess::rw
 {
+struct AppleVolumeReplayBoundary;
 class MetadataStore
 {
+    struct RawAttributeReadPlan;
+    struct CompressionReadSnapshot;
 public:
+    enum class NodeType : std::uint8_t
+    {
+        RegularFile,
+        Directory,
+        SymbolicLink,
+        Fifo,
+        Socket,
+        CharacterDevice,
+        BlockDevice,
+    };
+
     enum class MutationStatus
     {
         Applied,
@@ -49,6 +66,7 @@ public:
         InvariantFailed,
         PersistFailed,
         FlushFailed,
+        RetentionBlocked,
     };
 
     enum class MutationOperation
@@ -60,6 +78,14 @@ public:
         Rename,
         Delete,
         SetBasicInfo,
+        SetSymbolicLinkTarget,
+        RemoveSymbolicLinkTarget,
+        SetExtendedAttribute,
+        RemoveExtendedAttribute,
+        SetInodeMetadata = 12,
+        SetAllocationSize = 13,
+        RestoreDirectoryFromSymbolicLink = 14,
+        RewriteCompressedContent = 15,
     };
 
     enum class NativeWriteCommitModel
@@ -92,6 +118,8 @@ public:
         // existing path-based staging behavior.
         std::uint64_t object_id = 0;
         std::uint64_t generation = 0;
+        std::optional<UnlinkOutcome> expected_unlink_outcome;
+        std::vector<std::byte> inline_payload;
     };
 
     struct ObjectMapUpdate
@@ -115,6 +143,27 @@ public:
         std::uint64_t timestamp_utc = 0;
         // Original APFS bytes. Empty only for legacy/private fixtures and root.
         std::string name_utf8;
+        std::uint64_t private_id = 0;
+        std::uint64_t create_time_utc = 0;
+        std::uint64_t modification_time_utc = 0;
+        std::uint64_t change_time_utc = 0;
+        std::uint64_t access_time_utc = 0;
+        std::uint64_t internal_flags = 0;
+        std::uint32_t link_count = 1;
+        std::uint32_t directory_entry_count = 0;
+        std::uint32_t default_protection_class = 0;
+        std::uint32_t write_generation = 0;
+        std::uint32_t bsd_flags = 0;
+        std::uint32_t owner = 0;
+        std::uint32_t group = 0;
+        std::uint16_t mode = 0;
+        std::uint16_t reserved_pad = 0;
+        NodeType node_type = NodeType::RegularFile;
+        std::string symlink_target_utf8;
+        // Native data-stream allocation; absent only in legacy/private fixtures.
+        std::optional<std::uint64_t> allocation_size;
+        // Native proof for directory/symlink kind changes; recheck live children.
+        bool directory_symlink_metadata_safe = false;
     };
 
     struct CommittedInodeChange
@@ -137,6 +186,9 @@ public:
         std::uint64_t child_object_id = 0;
         std::uint64_t xid = 0;
         std::string entry_name_utf8;
+        std::uint64_t sibling_id = 0;
+        std::uint64_t date_added = 0;
+        std::uint16_t flags = 0;
     };
 
     using SpacemanAllocation = ExtentAllocator::Extent;
@@ -160,6 +212,14 @@ public:
         FileExtent single_extent{};
         bool has_single_extent = false;
         std::shared_ptr<const std::vector<FileExtent>> extents_snapshot;
+        // Compression evidence, NOT a read capability or a mutation authorization.
+        // Kept true even when the bounded decoder can serve this representation.
+        bool unsupported_content_transform = false;
+        std::shared_ptr<const CompressionReadSnapshot> compression_snapshot;
+        // No I/O: means a stable candidate is captured, not that its bytes have
+        // passed decoding. Call ReadCommittedFileRangeFromPlan even at EOF.
+        [[nodiscard]] bool HasCompressionReadCandidate() const noexcept
+        { return compression_snapshot != nullptr; }
     };
 
     struct FileMutationExtents
@@ -224,23 +284,38 @@ public:
     [[nodiscard]] std::optional<std::uint64_t> FreeSizeBytes() const noexcept;
     [[nodiscard]] std::optional<std::uint64_t> CheckpointXid() const noexcept;
     [[nodiscard]] const catalog::AppleCheckpointView* AuthoritativeAppleCheckpointView() const noexcept;
+    [[nodiscard]] bool ValidateRequiredRecoveryCheckpoints(
+        const std::vector<std::uint64_t>& checkpoint_xids, std::string& error) const;
+    [[nodiscard]] bool FindAcceptedReplayBoundary(std::uint64_t accepted_preimage_xid,
+        AppleVolumeReplayBoundary& boundary, std::string& error) const;
     [[nodiscard]] bool PrepareNativeWritePath();
     [[nodiscard]] bool IsNativeWriteReady() const noexcept;
+    [[nodiscard]] bool SupportsFileAllocationSize() const;
     [[nodiscard]] bool IsCommitPathReady() const noexcept;
     [[nodiscard]] bool IsRecoveryRequired() const noexcept;
     [[nodiscard]] std::wstring RecoveryReason() const;
     [[nodiscard]] std::wstring LastIntegrityFailureReason() const;
     [[nodiscard]] std::optional<std::uint64_t> LastIntegrityFailureObjectId() const noexcept;
     [[nodiscard]] std::wstring LastMutationFailureReason() const;
+    // Call before staging callback companion metadata; performs no mutation or WAL acceptance.
+    [[nodiscard]] MutationStatus PreflightNativeSparseMutation(
+        const MutationRequest& request, std::uint64_t* allocation = nullptr) const;
     [[nodiscard]] MutationStatus StageMutation(
         const MutationRequest& request,
-        PayloadIdentity* out_staged_payload_identity = nullptr);
+        PayloadIdentity* out_staged_payload_identity = nullptr,
+        std::optional<UnlinkOutcome>* out_unlink_outcome = nullptr);
     [[nodiscard]] MutationStatus ApplyMutation(
         const MutationRequest& request,
-        PayloadIdentity* out_staged_payload_identity = nullptr);
-    [[nodiscard]] CommitStatus CommitTransaction();
-    [[nodiscard]] CommitStatus CommitCanonicalTransaction();
-    [[nodiscard]] CommitStatus CommitPendingMutations();
+        PayloadIdentity* out_staged_payload_identity = nullptr,
+        std::optional<UnlinkOutcome>* out_unlink_outcome = nullptr);
+    [[nodiscard]] CommitStatus CommitTransaction(
+        const std::vector<std::uint64_t>& required_checkpoint_xids = {});
+    // RetentionBlocked performs no device I/O and preserves pending mutations,
+    // identities, working state and payload bindings for an exact pinned retry.
+    [[nodiscard]] CommitStatus CommitCanonicalTransaction(
+        const std::vector<std::uint64_t>& required_checkpoint_xids = {});
+    [[nodiscard]] CommitStatus CommitPendingMutations(
+        const std::vector<std::uint64_t>& required_checkpoint_xids = {});
     [[nodiscard]] bool ReplayOrRecover();
     [[nodiscard]] bool ReplayCanonicalCheckpoint();
     [[nodiscard]] bool VerifyIntegrity() const;
@@ -305,6 +380,16 @@ public:
     [[nodiscard]] std::size_t CommittedInodeCount() const noexcept;
     [[nodiscard]] std::optional<InodeRecord> LookupCommittedInodeByPath(const std::wstring& path) const;
     [[nodiscard]] std::optional<InodeRecord> LookupCommittedInodeByObjectId(std::uint64_t object_id) const;
+    [[nodiscard]] std::optional<AppleXattrRecord> LookupCommittedExtendedAttribute(
+        std::uint64_t object_id, const std::string& name_utf8) const;
+    [[nodiscard]] std::optional<AppleXattrRecord> LookupWorkingExtendedAttribute(
+        std::uint64_t object_id, const std::string& name_utf8) const;
+    [[nodiscard]] std::vector<AppleXattrRecord> SnapshotWorkingExtendedAttributes(
+        std::uint64_t object_id) const;
+    [[nodiscard]] bool ReadCommittedExtendedAttributeRange(
+        std::uint64_t object_id, const std::string& name_utf8, std::uint64_t offset,
+        std::span<std::byte> destination, std::size_t& out_bytes_read) const;
+    [[nodiscard]] std::optional<DirectoryLink> LookupCommittedDirectoryLinkByPath(const std::wstring& path) const;
     [[nodiscard]] std::optional<std::vector<InodeRecord>> SnapshotCommittedDirectoryChildInodes(std::uint64_t parent_object_id) const;
     [[nodiscard]] std::vector<InodeRecord> SnapshotCommittedInodes() const;
     [[nodiscard]] std::vector<CommittedInodeChange> SnapshotLastCommittedInodeChanges() const;
@@ -315,6 +400,12 @@ public:
     [[nodiscard]] std::size_t DebugWorkingDirectoryDescendantCount(std::uint64_t parent_object_id) const;
     [[nodiscard]] std::uint64_t DebugWorkingDirectoryChildLinearScanCount() const noexcept;
     [[nodiscard]] std::size_t DebugWorkingInodeCount() const noexcept;
+    [[nodiscard]] std::optional<InodeRecord> LookupWorkingInodeByPath(const std::wstring& path) const;
+    [[nodiscard]] std::optional<std::uint64_t> LookupWorkingAllocationByObjectId(std::uint64_t object_id) const noexcept
+    {
+        const auto found = working_inodes_.find(object_id);
+        return found == working_inodes_.end() ? std::nullopt : found->second.allocation_size;
+    }
     [[nodiscard]] std::optional<InodeRecord> DebugLookupWorkingInodeByPath(const std::wstring& path) const;
     [[nodiscard]] CheckpointDelta DebugBuildPendingCheckpointDelta() const;
     [[nodiscard]] std::optional<PayloadIdentity> LookupWorkingPayloadIdentityByPath(const std::wstring& path) const;
@@ -348,6 +439,19 @@ public:
         std::size_t& out_bytes_read) const;
     [[nodiscard]] std::optional<CommittedFileReadPlan> SnapshotCommittedFileReadPlan(
         const std::wstring& canonical_path_key) const;
+    // Mutation guard only, including compression formats supported for reads.
+    // Call under the same metadata serialization as lookup/staging.
+    [[nodiscard]] bool HasUnsupportedContentTransform(std::uint64_t object_id) const;
+    // Read-only preparation. Journal this exact request before staging/acceptance.
+    // All calls and the ensuing transaction require the host's exclusive read gate.
+    // A bounded Open admission check; source identity and all data are revalidated at mutation.
+    [[nodiscard]] bool HasSupportedCompressionRewriteHeader(std::uint64_t object_id, std::uint64_t logical_size) const;
+    [[nodiscard]] bool PrepareCompressionRewrite(const std::wstring& path, MutationRequest& out) const;
+    [[nodiscard]] static bool CompressionRewriteFromWal(const WriteAheadLog::Record& record, MutationRequest& out);
+    // Use with the originating, still-open store. Compressed plans validate
+    // before EOF, preserve the destination on failure, and report zero bytes.
+    // A candidate can still fail for unsupported/corrupt input or policy limits;
+    // never fall back to default extents or a host payload after such failure.
     [[nodiscard]] bool ReadCommittedFileRangeFromPlan(
         const CommittedFileReadPlan& plan,
         const std::wstring& trace_path,
@@ -363,6 +467,18 @@ public:
     void SetCommitStageHook(
         std::function<bool(std::string_view stage)> hook,
         bool require_strict_verification = true);
+    void SetAfterUnlinkHookForTests(std::function<bool()> hook)
+    {
+        after_unlink_hook_for_tests_ = std::move(hook);
+    }
+    void SetSparsePreflightHookForTests(std::function<void()> hook)
+    {
+        sparse_preflight_hook_for_tests_ = std::move(hook);
+    }
+    void SetSparseResizePublicationHookForTests(std::function<void()> hook)
+    {
+        sparse_resize_publication_hook_for_tests_ = std::move(hook);
+    }
     void SetFilePayloadProvider(
         std::function<std::optional<std::vector<std::byte>>(const std::wstring& path, std::uint64_t logical_size)> provider);
     void SetFilePayloadRangeProvider(
@@ -381,6 +497,16 @@ public:
         ExtentAllocator::AddFreeExtentUndo* undo);
 
 private:
+    [[nodiscard]] std::shared_ptr<const RawAttributeReadPlan> SnapshotRawAttributeReadPlan(
+        std::uint64_t object_id, const std::string& name_utf8) const;
+    [[nodiscard]] bool ReadRawAttributeRange(const RawAttributeReadPlan& plan,
+        std::uint64_t offset, std::span<std::byte> destination, std::size_t& out_bytes_read) const;
+    [[nodiscard]] bool DecodeCommittedCompressionRange(const CommittedFileReadPlan& plan,
+        std::uint64_t offset, std::size_t bytes_to_read, std::vector<std::byte>& output) const;
+    [[nodiscard]] bool IsResourceForkOwnerSupported(
+        std::uint64_t object_id, bool allow_deleted = false) const;
+    [[nodiscard]] bool IsContentIndependentAttributeForOwner(
+        const AppleXattrRecord& attribute, bool allow_deleted = false) const;
     struct PerfCounter
     {
         std::atomic<std::uint64_t> count{0};
@@ -441,7 +567,8 @@ private:
     [[nodiscard]] bool IsLegacyFixtureFallbackAllowedForCurrentContext() const noexcept;
     [[nodiscard]] bool RequiresCanonicalNonFixtureCommitPath() const noexcept;
     [[nodiscard]] bool CanUseAppleTransactionWriter(std::wstring* out_reason = nullptr) const;
-    [[nodiscard]] CommitStatus CommitApplePendingMutations();
+    [[nodiscard]] CommitStatus CommitApplePendingMutations(
+        const std::vector<std::uint64_t>& required_checkpoint_xids);
     [[nodiscard]] bool CanLoadNativeCheckpointXid(std::uint64_t persisted_xid) const noexcept;
     [[nodiscard]] std::optional<std::uint64_t> ResolveObjectBlockIndex(std::uint64_t object_or_block) const;
     [[nodiscard]] bool ReadMetadataBlock(std::uint64_t block_index, std::vector<std::byte>& out_block) const;
@@ -576,7 +703,10 @@ private:
         const std::wstring& entry_name,
         std::uint64_t child_object_id,
         std::uint64_t xid,
-        std::string entry_name_utf8 = {});
+        std::string entry_name_utf8 = {},
+        std::uint64_t sibling_id = 0,
+        std::uint64_t date_added = 0,
+        std::uint16_t flags = 0);
     void RemoveWorkingDirectoryLink(std::uint64_t parent_object_id, const std::wstring& entry_name);
     void ClearCommittedDirectoryLinkIndexes();
     void RebuildCommittedDirectoryLinkIndex();
@@ -596,6 +726,12 @@ private:
     [[nodiscard]] std::uint64_t StreamingGrowthReservationBytes(
         std::uint64_t current_aligned_bytes,
         std::uint64_t required_aligned_bytes) const noexcept;
+    [[nodiscard]] bool IsCommittedNativeSparseFile(std::uint64_t object_id) const;
+    [[nodiscard]] std::optional<std::uint64_t> NativeSparseWriteAllocation(
+        std::uint64_t object_id, std::uint64_t offset, std::uint64_t length,
+        std::optional<std::uint64_t> resized = std::nullopt) const;
+    [[nodiscard]] bool NativeSparseOwnershipEligible(std::uint64_t object_id) const;
+    [[nodiscard]] std::uint64_t NativeSparseRetainedSize(std::uint64_t object_id) const;
     [[nodiscard]] std::optional<FileMutationExtents> CommittedFileExtentsForMutation(const InodeRecord& inode) const;
     [[nodiscard]] bool PendingReadExtentsCoverLogicalRange(
         std::uint64_t object_id,
@@ -643,7 +779,6 @@ private:
         std::uint64_t bytes,
         ExtentAllocator::ContiguousAllocationUndo* undo);
     [[nodiscard]] const std::vector<FileExtent>* LookupSortedReadExtents(std::uint64_t object_id) const;
-    void TrackPendingPayloadSummaryMutation(const MutationRequest& request);
     void TrackPendingPayloadSummaryMutation(
         const MutationRequest& request,
         const std::wstring& normalized_path,
@@ -843,6 +978,7 @@ private:
     std::uint64_t next_ephemeral_extent_ = 0;
     std::uint64_t working_next_ephemeral_extent_ = 0;
     std::uint64_t next_generated_object_id_ = 1;
+    std::uint64_t highest_committed_apple_file_system_object_id_ = 0;
     bool native_write_ready_ = false;
     bool commit_path_ready_ = false;
     bool canonical_state_loaded_ = false;
@@ -900,6 +1036,8 @@ private:
     mutable std::uint64_t committed_object_map_order_cache_generation_ = 0;
     mutable std::uint64_t committed_object_map_order_generation_ = 0;
     std::unordered_map<std::uint64_t, InodeRecord> committed_inodes_;
+    std::unordered_map<std::uint64_t, std::map<std::string, AppleXattrRecord>> committed_extended_attributes_;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const std::vector<FileExtent>>> committed_attribute_stream_extents_;
     mutable std::vector<CommittedInodeOrderEntry> committed_inode_order_cache_;
     mutable bool committed_inode_order_cache_valid_ = false;
     mutable std::uint64_t committed_inode_order_cache_generation_ = 0;
@@ -910,6 +1048,8 @@ private:
     std::vector<DirectoryLink> committed_directory_links_;
     std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> committed_child_object_ids_by_parent_;
     std::unordered_map<WorkingDirectoryChildKey, std::size_t, WorkingDirectoryChildKeyHash> committed_child_index_by_parent_child_;
+    std::unordered_map<WorkingDirectoryChildKey, std::size_t, WorkingDirectoryChildKeyHash> committed_link_count_by_parent_child_;
+    std::unordered_map<std::uint64_t, std::unordered_set<std::size_t>> committed_directory_link_indices_by_parent_;
     std::unordered_map<DirectoryLinkIndexKey, std::size_t, DirectoryLinkIndexKeyHash> committed_directory_link_index_;
     std::vector<BtreeRecord> committed_btree_records_;
     std::unordered_map<std::string, std::size_t> committed_btree_index_by_key_;
@@ -1050,6 +1190,7 @@ private:
     std::unordered_map<std::uint64_t, std::size_t> working_child_count_by_parent_;
     std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> working_child_object_ids_by_parent_;
     std::unordered_map<WorkingDirectoryChildKey, std::size_t, WorkingDirectoryChildKeyHash> working_child_index_by_parent_child_;
+    std::unordered_map<WorkingDirectoryChildKey, std::size_t, WorkingDirectoryChildKeyHash> working_link_count_by_parent_child_;
     std::unordered_map<DirectoryLinkIndexKey, std::size_t, DirectoryLinkIndexKeyHash> working_directory_link_index_;
     mutable std::atomic<std::uint64_t> working_directory_child_linear_scan_count_{0};
     std::vector<SpacemanAllocation> committed_spaceman_allocations_;
@@ -1076,6 +1217,9 @@ private:
     std::unordered_map<std::uint64_t, std::vector<PreparedPayloadRange>> prepared_payload_ranges_;
     std::unordered_map<std::uint64_t, std::vector<PreparedPayloadRange>> pending_written_ranges_;
     std::function<bool(std::string_view stage)> commit_stage_hook_;
+    std::function<bool()> after_unlink_hook_for_tests_;
+    std::function<void()> sparse_preflight_hook_for_tests_;
+    std::function<void()> sparse_resize_publication_hook_for_tests_;
     bool commit_stage_hook_requires_strict_verification_ = false;
     std::function<std::optional<std::vector<std::byte>>(const std::wstring&, std::uint64_t)> file_payload_provider_;
     std::function<bool(const std::wstring&, PayloadIdentity, std::uint64_t, std::span<std::byte>)> file_payload_range_provider_;

@@ -145,6 +145,10 @@ public:
     PayloadSpool& operator=(const PayloadSpool&) = delete;
 
     [[nodiscard]] bool Append(const WriteRequest& request, AppendResult* result = nullptr);
+    // Reconstitutes checksum-validated inline WAL data at its immutable spool
+    // offset after a complete WAL index rebuild; never relocates another range.
+    [[nodiscard]] bool RestoreInlineRange(
+        const PersistedRangeReference& reference, std::span<const std::byte> payload);
     [[nodiscard]] AppendStatus AppendWithStatus(const WriteRequest& request, AppendResult* result = nullptr);
     [[nodiscard]] AppendStatus CheckAppendCapacity(std::uint64_t payload_bytes) const;
     // Makes appended payload bytes durable while leaving the advisory range index dirty.

@@ -397,6 +397,28 @@ bool TestVolumeTreeProjectionRejectsExtentInodeMismatch()
            Require(error == L"BtreeExtentInodeMismatch", "VolumeTree extent mismatch should report BtreeExtentInodeMismatch");
 }
 
+bool TestVolumeTreeNativeEmptyReservation()
+{
+    using namespace apfsaccess::rw;
+    const std::vector<BtreeRecord> records{
+        BtreeMutationCodec::EncodeInodeRecord(30, 1, L"reserved", false, 0, 12288, 0, 111),
+        BtreeMutationCodec::EncodeDirectoryRecord(1, L"reserved", 30, 111),
+        BtreeMutationCodec::EncodeExtentRecord(30, 0, 12288, 32768, 111)};
+    ApfsVolumeTreeStore store;
+    ApfsVolumeTreeProjection projection;
+    std::wstring error;
+    bool ok = Require(!store.TryProjectFromBtreeRecords(records, projection, error),
+        "Legacy projection still rejects extents for an empty file without native allocation authority");
+    ok &= Require(store.TryProjectFromBtreeRecords(records, projection, error, {{30, 32768}}) &&
+        projection.inode_record_count == 1 && projection.extent_record_count == 1,
+        "Native allocation provides the separate bound for reserved extents");
+    ok &= Require(!store.TryProjectFromBtreeRecords(records, projection, error, {{30, 65536}}),
+        "Native reservation cannot exceed its backing extent coverage");
+    ok &= Require(!store.TryProjectFromBtreeRecords(records, projection, error, {{31, 32768}}),
+        "Native allocation cannot refer to a missing inode");
+    return ok;
+}
+
 } // namespace
 
 int main()
@@ -412,6 +434,7 @@ int main()
     ok &= TestVolumeTreeProjectionRoundTrip();
     ok &= TestVolumeTreeProjectionRejectsDirectoryChildMismatch();
     ok &= TestVolumeTreeProjectionRejectsExtentInodeMismatch();
+    ok &= TestVolumeTreeNativeEmptyReservation();
 
     if (!ok)
     {

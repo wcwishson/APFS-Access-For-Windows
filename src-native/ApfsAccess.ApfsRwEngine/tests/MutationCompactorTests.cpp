@@ -56,6 +56,52 @@ std::wstring CanonicalPath(
     return result.ok() ? *result.value : std::wstring{};
 }
 
+bool TestDirectoryRestoreBarrierSummary()
+{
+    using Kind = MutationCompactor::MutationKind;
+    static_assert(static_cast<int>(Kind::RestoreDirectoryFromSymbolicLink) == 14);
+    const auto restore = Mutation(Kind::RestoreDirectoryFromSymbolicLink, L"\\directory");
+    const auto alone = MutationCompactor::Summarize({restore});
+    const auto mixed = MutationCompactor::Summarize({
+        Mutation(Kind::SetSymbolicLinkTarget, L"\\directory", L"target"), restore,
+        Mutation(Kind::Write, L"\\file", L"", 4),
+        Mutation(Kind::Write, L"\\file", L"", 8)});
+    const auto old = MutationCompactor::Summarize({Mutation(Kind::RemoveSymbolicLinkTarget, L"\\file")});
+    return Require(alone.compacted_mutation_count == 1 && alone.payload_paths.empty(),
+               "directory restore is a payload-free barrier") &&
+        Require(mixed.compacted_mutation_count == 4 && mixed.payload_paths.size() == 1 &&
+                HasPayloadPath(mixed, CanonicalPath(L"\\file")),
+               "restore prevents coalescing without inventing a directory payload") &&
+        Require(old.compacted_mutation_count == 0 && old.payload_paths.empty(),
+               "old symlink removal summary is unchanged");
+}
+
+bool TestAllocationSizeBarrierSummary()
+{
+    using Kind = MutationCompactor::MutationKind;
+    static_assert(static_cast<int>(Kind::SetAllocationSize) == 13);
+    const std::vector<MutationCompactor::MutationView> mutations{
+        Mutation(Kind::Write, L"\\file.bin", L"", 8192),
+        Mutation(Kind::SetFileSize, L"\\file.bin", L"", 2048),
+        Mutation(Kind::SetAllocationSize, L"\\file.bin", L"", 0),
+        Mutation(Kind::SetFileSize, L"\\file.bin", L"", 16384),
+        Mutation(Kind::Write, L"\\file.bin", L"", 4),
+        Mutation(Kind::SetAllocationSize, L"\\file.bin", L"", 0),
+    };
+    const auto summary = MutationCompactor::Summarize(mutations);
+    const auto only_allocation = MutationCompactor::Summarize({mutations[2]});
+    const auto truncate_after = MutationCompactor::Summarize({mutations[0], mutations[2],
+        Mutation(Kind::SetFileSize, L"\\file.bin", L"", 0)});
+    return Require(summary.compacted_mutation_count == mutations.size(),
+               "allocation barriers prohibit reporting writes and size changes as coalesced") &&
+        Require(HasPayloadPath(summary, CanonicalPath(L"\\file.bin")),
+               "allocation barrier does not discard preceding payload or later growth") &&
+        Require(only_allocation.compacted_mutation_count == 1 && only_allocation.payload_paths.empty(),
+               "zero allocation remains an operation without inventing payload") &&
+        Require(truncate_after.compacted_mutation_count == 3 && truncate_after.payload_paths.empty(),
+               "later EOF zero cannot erase the allocation barrier from the count");
+}
+
 bool TestWritesCollapseToFinalPayloadPath()
 {
     const std::vector<MutationCompactor::MutationView> mutations{
@@ -168,7 +214,8 @@ bool TestCompactionHonorsApfsNamePolicy()
 
 int main()
 {
-    if (!TestWritesCollapseToFinalPayloadPath() ||
+    if (!TestDirectoryRestoreBarrierSummary() || !TestAllocationSizeBarrierSummary() ||
+        !TestWritesCollapseToFinalPayloadPath() ||
         !TestTruncateDropsPayloadPastEof() ||
         !TestSetFileSizeGrowthRequiresPayload() ||
         !TestRenameChainsRemapPayloadPaths() ||

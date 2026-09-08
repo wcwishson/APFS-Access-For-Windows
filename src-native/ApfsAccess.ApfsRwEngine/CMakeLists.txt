@@ -19,6 +19,8 @@ add_library(ApfsAccess.ApfsRwEngine STATIC
     src/AppleTransactionCommit.cpp
     src/AppleVolumeTransaction.cpp
     src/ApfsContainerCatalog.cpp
+    src/ApfsCompression.cpp
+    src/ApfsExtendedRecordCodec.cpp
     src/ApfsFormat.cpp
     src/ApfsNameCodec.cpp
     src/ApfsObjectMapStore.cpp
@@ -37,16 +39,30 @@ add_library(ApfsAccess.ApfsRwEngine STATIC
     src/TransactionManager.cpp
     src/WriteAheadLog.cpp
     src/WritePipeline.cpp
+    ../../third_party/zlib/adler32.c
+    ../../third_party/zlib/crc32.c
+    ../../third_party/zlib/inflate.c
+    ../../third_party/zlib/inffast.c
+    ../../third_party/zlib/inftrees.c
+    ../../third_party/zlib/zutil.c
+    ../../third_party/lzfse/lzvn_decode_base.c
+    ../../third_party/lzfse/apfsaccess_lzvn.c
+    ../../third_party/lzfse/lzfse_decode_base.c
+    ../../third_party/lzfse/lzfse_fse.c
+    ../../third_party/lzfse/apfsaccess_lzfse.c
 )
 
 target_include_directories(ApfsAccess.ApfsRwEngine
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/zlib
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/lzfse
 )
 
 target_compile_features(ApfsAccess.ApfsRwEngine PUBLIC cxx_std_20)
 
-target_compile_definitions(ApfsAccess.ApfsRwEngine PRIVATE UTF8PROC_EXPORTS)
+target_compile_definitions(ApfsAccess.ApfsRwEngine PRIVATE UTF8PROC_EXPORTS Z_PREFIX)
 
 target_link_libraries(ApfsAccess.ApfsRwEngine
     PRIVATE
@@ -91,6 +107,11 @@ if(MSVC)
 endif()
 
 if(BUILD_TESTING)
+    add_executable(ApfsAccess.ApfsRwEngine.CompressionTests tests/ApfsCompressionTests.cpp)
+    target_include_directories(ApfsAccess.ApfsRwEngine.CompressionTests PRIVATE ../../third_party/lzfse)
+    target_link_libraries(ApfsAccess.ApfsRwEngine.CompressionTests PRIVATE ApfsAccess.ApfsRwEngine)
+    target_compile_features(ApfsAccess.ApfsRwEngine.CompressionTests PRIVATE cxx_std_20)
+    add_test(NAME ApfsAccess.ApfsRwEngine.CompressionTests COMMAND ApfsAccess.ApfsRwEngine.CompressionTests)
     add_executable(ApfsAccess.ApfsRwEngine.Tests
         tests/MetadataStorePersistenceTests.cpp
     )
@@ -148,6 +169,9 @@ if(BUILD_TESTING)
     add_executable(ApfsAccess.ApfsRwEngine.NameCodecTests
         tests/ApfsNameCodecTests.cpp
     )
+    add_executable(ApfsAccess.ApfsRwEngine.ExtendedRecordCodecTests
+        tests/ApfsExtendedRecordCodecTests.cpp
+    )
 
     target_link_libraries(ApfsAccess.ApfsRwEngine.AppleTransactionWriterTests
         PRIVATE
@@ -162,6 +186,10 @@ if(BUILD_TESTING)
             ApfsAccess.ApfsRwEngine
     )
     target_link_libraries(ApfsAccess.ApfsRwEngine.NameCodecTests
+        PRIVATE
+            ApfsAccess.ApfsRwEngine
+    )
+    target_link_libraries(ApfsAccess.ApfsRwEngine.ExtendedRecordCodecTests
         PRIVATE
             ApfsAccess.ApfsRwEngine
     )
@@ -298,6 +326,10 @@ if(BUILD_TESTING)
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
+    target_include_directories(ApfsAccess.ApfsRwEngine.ExtendedRecordCodecTests
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
 
     target_compile_features(ApfsAccess.ApfsRwEngine.CompatibilityTests PRIVATE cxx_std_20)
     target_compile_features(ApfsAccess.ApfsRwEngine.Tests PRIVATE cxx_std_20)
@@ -317,6 +349,7 @@ if(BUILD_TESTING)
     target_compile_features(ApfsAccess.ApfsRwEngine.AppleSpacemanAllocatorTests PRIVATE cxx_std_20)
     target_compile_features(ApfsAccess.ApfsRwEngine.AppleCheckpointPublisherTests PRIVATE cxx_std_20)
     target_compile_features(ApfsAccess.ApfsRwEngine.NameCodecTests PRIVATE cxx_std_20)
+    target_compile_features(ApfsAccess.ApfsRwEngine.ExtendedRecordCodecTests PRIVATE cxx_std_20)
 
     if(MSVC)
         target_compile_options(ApfsAccess.ApfsRwEngine.CompatibilityTests PRIVATE /W4 /permissive-)
@@ -337,6 +370,7 @@ if(BUILD_TESTING)
         target_compile_options(ApfsAccess.ApfsRwEngine.AppleSpacemanAllocatorTests PRIVATE /W4 /permissive-)
         target_compile_options(ApfsAccess.ApfsRwEngine.AppleCheckpointPublisherTests PRIVATE /W4 /permissive-)
         target_compile_options(ApfsAccess.ApfsRwEngine.NameCodecTests PRIVATE /W4 /permissive-)
+        target_compile_options(ApfsAccess.ApfsRwEngine.ExtendedRecordCodecTests PRIVATE /W4 /permissive-)
 
         foreach(_apfsaccess_rw_test_target
             ApfsAccess.ApfsRwEngine.CompatibilityTests
@@ -357,6 +391,7 @@ if(BUILD_TESTING)
             ApfsAccess.ApfsRwEngine.AppleSpacemanAllocatorTests
             ApfsAccess.ApfsRwEngine.AppleCheckpointPublisherTests
             ApfsAccess.ApfsRwEngine.NameCodecTests
+            ApfsAccess.ApfsRwEngine.ExtendedRecordCodecTests
         )
             set_property(TARGET ${_apfsaccess_rw_test_target} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
         endforeach()
@@ -433,5 +468,9 @@ if(BUILD_TESTING)
     add_test(
         NAME ApfsAccess.ApfsRwEngine.NameCodec
         COMMAND ApfsAccess.ApfsRwEngine.NameCodecTests
+    )
+    add_test(
+        NAME ApfsAccess.ApfsRwEngine.ExtendedRecordCodec
+        COMMAND ApfsAccess.ApfsRwEngine.ExtendedRecordCodecTests
     )
 endif()

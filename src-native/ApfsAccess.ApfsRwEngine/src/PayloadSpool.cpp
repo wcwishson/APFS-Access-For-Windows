@@ -1127,6 +1127,83 @@ bool PayloadSpool::FlushDirtyState()
     return FlushDirtyStateLocked();
 }
 
+bool PayloadSpool::RestoreInlineRange(
+    const PersistedRangeReference& reference, std::span<const std::byte> payload)
+{
+    std::array<std::uint8_t, 32> sha256{};
+    if (!IsVolumeMatch(reference.volume_identity) || reference.object_id == 0 ||
+        reference.generation == 0 || reference.wal_sequence == 0 || payload.empty() ||
+        reference.payload_length != payload.size() ||
+        reference.logical_offset > UINT64_MAX - payload.size() ||
+        reference.spool_offset > static_cast<std::uint64_t>(INT64_MAX) - payload.size() ||
+        !HashPayloadSha256(payload, sha256) || sha256 != reference.payload_sha256) return false;
+    auto lock = AcquireMutex();
+    if (recovery_required_) return false;
+    const auto end = reference.spool_offset + reference.payload_length;
+    std::optional<std::size_t> existing;
+    for (std::size_t i = 0; i < ranges_.size(); ++i)
+    {
+        const auto& range = ranges_[i];
+        const bool overlaps = range.spool_offset < end &&
+            reference.spool_offset < RangeEnd(range.spool_offset, range.bytes);
+        if (!overlaps && range.wal_sequence != reference.wal_sequence) continue;
+        if (existing || range.object_id != reference.object_id || range.generation != reference.generation ||
+            range.wal_sequence != reference.wal_sequence || range.logical_offset != reference.logical_offset ||
+            range.bytes != reference.payload_length || range.spool_offset != reference.spool_offset) return false;
+        existing = i;
+    }
+    DirtyRange restored{};
+    restored.object_id = reference.object_id; restored.generation = reference.generation;
+    restored.logical_offset = reference.logical_offset; restored.bytes = reference.payload_length;
+    restored.spool_offset = reference.spool_offset; restored.wal_sequence = reference.wal_sequence;
+    restored.checksum = HashPayload(payload); restored.created_at = std::chrono::steady_clock::now();
+    std::vector<std::byte> physical;
+    if (existing && ReadRangePayloadFromHandleLocked(ranges_[*existing], physical))
+        return physical.size() == payload.size() && std::equal(physical.begin(), physical.end(), payload.begin());
+    const bool present = ReadRangePayloadFromHandleLocked(restored, physical) &&
+        physical.size() == payload.size() && std::equal(physical.begin(), physical.end(), payload.begin());
+    if (!present)
+    {
+        if (options_.max_bytes != 0 && end > options_.max_bytes) return false;
+        if (!CloseAppendStreamLocked()) return false;
+        ClearValidatedPayloadCacheLocked();
+        std::unique_lock<std::shared_mutex> io_lock(payload_io_mutex_);
+        std::error_code ec;
+        std::filesystem::create_directories(options_.root, ec);
+        if (ec) return false;
+        root_ready_ = true;
+        FileHandle file{CreateFileW(spool_file_.c_str(), GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL, nullptr)};
+        LARGE_INTEGER position{};
+        position.QuadPart = static_cast<LONGLONG>(reference.spool_offset);
+        if (file.value == INVALID_HANDLE_VALUE || !SetFilePointerEx(file.value, position, nullptr, FILE_BEGIN)) return false;
+        std::size_t cursor = 0;
+        while (cursor != payload.size())
+        {
+            const auto count = static_cast<DWORD>((std::min)(payload.size() - cursor,
+                static_cast<std::size_t>((std::numeric_limits<DWORD>::max)())));
+            DWORD written = 0;
+            if (!WriteFile(file.value, payload.data() + cursor, count, &written, nullptr) || written != count)
+            { recovery_required_ = true; return false; }
+            cursor += written;
+        }
+        if (!FlushFileBuffers(file.value)) { recovery_required_ = true; return false; }
+    }
+    if (existing && present) return true;
+    if (existing) ranges_[*existing] = restored;
+    else ranges_.push_back(restored);
+    next_spool_offset_ = (std::max)(next_spool_offset_, end);
+    PublishNextSpoolOffsetHintLocked();
+    RebuildRangeSequenceIndex();
+    RebuildRangeLookup();
+    RecomputeOldestDirtyRangeLocked();
+    index_dirty_ = true;
+    index_requires_snapshot_ = true;
+    pending_index_additions_.clear();
+    return true;
+}
+
 bool PayloadSpool::FlushPayloadBytes()
 {
     auto lock = AcquireMutex();

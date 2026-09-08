@@ -199,11 +199,15 @@ struct ContainerCheckpointView
 // validate. Malformed newer generations are skipped in favor of an older
 // complete generation. Noncontiguous descriptor/data trees currently fail
 // closed with an explicit error.
+// A supplied exact XID must be nonzero and identify one complete descriptor-ring
+// generation. Missing, corrupt, ambiguous, and legacy synthetic targets fail
+// closed without selecting any other generation.
 [[nodiscard]] std::optional<ContainerCheckpointView> LoadContainerCheckpointView(
     const RandomAccessSource& source,
     std::uint64_t store_offset_bytes,
     std::uint64_t store_size_bytes,
-    std::string& out_error);
+    std::string& out_error,
+    std::optional<std::uint64_t> exact_checkpoint_xid = std::nullopt);
 
 // Compatibility wrapper returning only the selected NXSB. New code that needs
 // transactional state must use LoadContainerCheckpointView.
@@ -222,6 +226,8 @@ struct BtreeRecord
 
 struct BtreeReadPolicy
 {
+    // Resource policy comes from source.ReadBudget(), shared across all trees
+    // and recursive object-map resolution. Failure clears records/visited IDs.
     bool enforce_object_identity = false;
     std::uint64_t root_object_id = 0;
     std::uint32_t storage_type = 0;
@@ -229,6 +235,7 @@ struct BtreeReadPolicy
     bool include_ghost_records = false;
     const ContainerCheckpointView* ephemeral_checkpoint = nullptr;
     std::vector<std::uint64_t>* visited_physical_blocks = nullptr;
+    bool require_complete_traversal = false;
 };
 
 // Reads all leaf records under `root_block`, mirroring
@@ -301,6 +308,7 @@ struct ApsbVolume
     std::uint64_t fs_flags = 0;
     std::uint16_t role_raw = 0;
     std::string group_hex; // 32 lowercase hex digits, "" when zero
+    std::uint64_t next_object_id = 0;
 };
 
 // Parses one block_size-sized APSB block using the Apple File System Reference
@@ -479,11 +487,14 @@ struct AppleCheckpointView
 // Loads all transaction roots needed by the native reader and writer from one
 // complete descriptor-ring generation. This API is strict: legacy two-copy
 // synthetic superblocks and descriptor-less fixtures are never accepted.
+// Exact selection uses the same contract as LoadContainerCheckpointView; all
+// transaction roots are resolved from that selected generation.
 [[nodiscard]] std::optional<AppleCheckpointView> LoadAppleCheckpointView(
     const RandomAccessSource& source,
     std::uint64_t store_offset_bytes,
     std::uint64_t store_size_bytes,
-    std::string& out_error);
+    std::string& out_error,
+    std::optional<std::uint64_t> exact_checkpoint_xid = std::nullopt);
 
 // ---- single-authority interpretation (known-bit table v1) ---------------------
 

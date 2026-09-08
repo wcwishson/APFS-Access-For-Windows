@@ -1,5 +1,7 @@
 #include "BlockDevice.h"
+#include "ApfsFormat.h"
 #include "MetadataStore.h"
+#include "TestFixtureBuilder.h"
 
 #include <algorithm>
 #include <array>
@@ -434,6 +436,79 @@ bool TestBlockDeviceOffsetIo(const std::filesystem::path& run_root)
             *flush_p95_us <= *flush_max_us,
             "BlockDevice offset I/O flush p95 latency should not exceed max latency");
     }
+    return ok;
+}
+
+bool TestBlockDeviceWriteStaysBoundToReadObject(const std::filesystem::path& run_root)
+{
+    const auto path = run_root / "block-source.img";
+    const auto moved_path = run_root / "block-source-moved.img";
+    const auto original = BuildPatternPayload(8192, 0x31);
+    const auto replacement = BuildPatternPayload(8192, 0x79);
+    const auto payload = BuildPatternPayload(4096, 0xA7);
+    {
+        std::ofstream seed(path, std::ios::binary);
+        seed.write(reinterpret_cast<const char*>(original.data()), original.size());
+    }
+    bool ok = true;
+    {
+        apfsaccess::rw::BlockDevice device(path.wstring());
+        std::vector<std::byte> readback;
+        if (!Require(device.Read(0, original.size(), readback) && readback == original,
+                "Source binding should read the original image before substitution"))
+        {
+            return false;
+        }
+        ok &= Require(!device.HasWriteHandle(), "Read must not acquire write access");
+        if (!Require(MoveFileExW(path.c_str(), moved_path.c_str(), 0) != FALSE,
+                "Source binding test must actually move the opened image"))
+        {
+            return false;
+        }
+        {
+            std::ofstream substitute(path, std::ios::binary);
+            substitute.write(reinterpret_cast<const char*>(replacement.data()), replacement.size());
+        }
+        ok &= Require(device.Write(0, payload) && device.Flush(),
+            "Lazy write should reopen the original file object, not its replaced pathname");
+        ok &= Require(device.Read(0, payload.size(), readback) && readback == payload,
+            "Reads and writes must still address the same original file");
+    }
+    apfsaccess::rw::BlockDevice substituted(path.wstring());
+    apfsaccess::rw::BlockDevice moved(moved_path.wstring());
+    std::vector<std::byte> bytes;
+    ok &= Require(substituted.Read(0, replacement.size(), bytes) && bytes == replacement,
+        "A file substituted at the original path must remain byte-identical");
+    ok &= Require(moved.Read(0, original.size(), bytes), "Moved original should remain readable");
+    auto expected = original;
+    std::copy(payload.begin(), payload.end(), expected.begin());
+    ok &= Require(bytes == expected, "Only the originally opened image should receive the write");
+    return ok;
+}
+
+bool TestBlockDeviceRejectsNonFileWrites(const std::filesystem::path& run_root)
+{
+    bool ok = true;
+    // These real device aliases are harmless character devices, not physical media.
+    for (const auto* path : { L"NUL", LR"(\\?\GLOBALROOT\Device\Null)" })
+    {
+        const auto probe = CreateFileW(path, GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+        if (!Require(probe != INVALID_HANDLE_VALUE, "Non-file probe must exist, not pass by missing path"))
+        {
+            return false;
+        }
+        ok &= Require(GetFileType(probe) != FILE_TYPE_DISK, "Probe must be a non-file device");
+        CloseHandle(probe);
+        apfsaccess::rw::BlockDevice device(path);
+        ok &= Require(!device.IsWritable(), "Non-file device aliases must not be admitted as writable images");
+        ok &= Require(!device.HasWriteHandle(), "Refused device must never obtain a write handle");
+    }
+    apfsaccess::rw::BlockDevice directory(run_root.wstring());
+    apfsaccess::rw::BlockDevice missing((run_root / "missing-source.img").wstring());
+    ok &= Require(!directory.IsWritable() && !missing.IsWritable(),
+        "Directory and unknown sources must fail closed");
     return ok;
 }
 
@@ -3382,6 +3457,8 @@ const char* CommitStatusToString(apfsaccess::rw::MetadataStore::CommitStatus sta
         return "NotWritable";
     case CommitStatus::AllocationFailed:
         return "AllocationFailed";
+    case CommitStatus::RetentionBlocked:
+        return "RetentionBlocked";
     case CommitStatus::InvariantFailed:
         return "InvariantFailed";
     case CommitStatus::PersistFailed:
@@ -3391,6 +3468,437 @@ const char* CommitStatusToString(apfsaccess::rw::MetadataStore::CommitStatus sta
     default:
         return "Unknown";
     }
+}
+
+bool TestCommitStatusNumericStability()
+{
+    using CommitStatus = apfsaccess::rw::MetadataStore::CommitStatus;
+    return Require(
+        static_cast<int>(CommitStatus::Committed) == 0 &&
+            static_cast<int>(CommitStatus::NothingToCommit) == 1 &&
+            static_cast<int>(CommitStatus::NotReady) == 2 &&
+            static_cast<int>(CommitStatus::NotWritable) == 3 &&
+            static_cast<int>(CommitStatus::AllocationFailed) == 4 &&
+            static_cast<int>(CommitStatus::InvariantFailed) == 5 &&
+            static_cast<int>(CommitStatus::PersistFailed) == 6 &&
+            static_cast<int>(CommitStatus::FlushFailed) == 7 &&
+            static_cast<int>(CommitStatus::RetentionBlocked) == 8,
+        "Task4CommitStatus: legacy numeric identities remain stable");
+}
+
+enum class Task4RetentionPressure
+{
+    Data,
+    Descriptor,
+    Bitmap,
+};
+
+bool WriteTask4AppleMetadataFixture(
+    const std::filesystem::path& image_path,
+    std::uint32_t checkpoint_ring_blocks,
+    std::vector<std::byte>& out_bytes,
+    std::optional<Task4RetentionPressure> pressure = std::nullopt)
+{
+    apfsaccess::testfixture::BuilderStore fixture;
+    fixture.authoritative_checkpoint = true;
+    fixture.dual_checkpoint = false;
+    fixture.xid = 40;
+    fixture.block_count = 192;
+    fixture.authoritative_checkpoint_ring_blocks = checkpoint_ring_blocks;
+    fixture.authoritative_internal_pool_blocks = 16;
+    fixture.volumes.front().incompat =
+        apfsaccess::catalog::kIncompatCaseInsensitive;
+    out_bytes = apfsaccess::testfixture::BuildStoreImage(fixture);
+
+    const auto patch_block = [&out_bytes](
+        std::uint64_t block_index, const auto& patch)
+    {
+        const auto offset = static_cast<std::size_t>(block_index * kBlockSize);
+        if (offset > out_bytes.size() ||
+            out_bytes.size() - offset < kBlockSize)
+        {
+            return false;
+        }
+        std::vector<std::byte> block(
+            out_bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+            out_bytes.begin() + static_cast<std::ptrdiff_t>(offset + kBlockSize));
+        patch(block);
+        apfsaccess::testfixture::FletcherForBlock(block, block.size());
+        std::copy(block.begin(), block.end(),
+            out_bytes.begin() + static_cast<std::ptrdiff_t>(offset));
+        return true;
+    };
+    const auto volume_count = static_cast<std::uint64_t>(fixture.volumes.size());
+    const auto descriptor_base = 4 + volume_count + volume_count * 6;
+    if (pressure == Task4RetentionPressure::Descriptor)
+    {
+        const auto patch_descriptor_count = [](std::vector<std::byte>& block)
+        {
+            apfsaccess::testfixture::PutU32LE(block, 0x68, 4);
+        };
+        if (!patch_block(0, patch_descriptor_count) ||
+            !patch_block(descriptor_base + 1, patch_descriptor_count))
+        {
+            return false;
+        }
+    }
+    else if (pressure == Task4RetentionPressure::Bitmap)
+    {
+        const auto data_base = descriptor_base + checkpoint_ring_blocks;
+        if (!patch_block(data_base, [](std::vector<std::byte>& block)
+            {
+                apfsaccess::testfixture::PutU32LE(block, 0x94, 3);
+                apfsaccess::testfixture::PutU32LE(block, 0xA4, 3);
+                apfsaccess::testfixture::PutU16LE(block, 0x142, 2);
+                apfsaccess::testfixture::PutU16LE(block, 0x724, 0xFFFF);
+            }))
+        {
+            return false;
+        }
+    }
+
+    std::ofstream output(image_path, std::ios::binary | std::ios::trunc);
+    output.write(
+        reinterpret_cast<const char*>(out_bytes.data()),
+        static_cast<std::streamsize>(out_bytes.size()));
+    return static_cast<bool>(output);
+}
+
+bool PrepareTask4AppleMetadataStore(
+    apfsaccess::rw::MetadataStore& store,
+    const std::string& label)
+{
+    if (!store.PrepareNativeWritePath())
+    {
+        std::wcerr << L"[DETAIL] " << std::wstring(label.begin(), label.end())
+                   << L": " << store.RecoveryReason() << std::endl;
+        return Require(false, label + ": strict Apple metadata store prepares");
+    }
+    return Require(
+        store.CheckpointXid().value_or(0) == 40,
+        label + ": strict Apple metadata store selects xid 40");
+}
+
+bool TestRequiredCheckpointXidsReachEveryCommitEntryPoint(
+    const std::filesystem::path& run_root)
+{
+    using Store = apfsaccess::rw::MetadataStore;
+    enum class EntryPoint
+    {
+        Transaction,
+        CanonicalTransaction,
+        PendingMutations,
+    };
+    const std::pair<EntryPoint, const char*> cases[] = {
+        {EntryPoint::Transaction, "CommitTransaction"},
+        {EntryPoint::CanonicalTransaction, "CommitCanonicalTransaction"},
+        {EntryPoint::PendingMutations, "CommitPendingMutations"},
+    };
+
+    bool ok = true;
+    for (const auto& [entry_point, name] : cases)
+    {
+        const auto image_path = run_root /
+            (std::string("task4-invalid-pin-") + name + ".raw");
+        std::vector<std::byte> original_bytes;
+        if (!Require(
+                WriteTask4AppleMetadataFixture(image_path, 16, original_bytes),
+                std::string(name) + ": authoritative fixture writes"))
+        {
+            return false;
+        }
+
+        Store::VolumeContext context;
+        context.device_path = image_path.wstring();
+        context.volume_name = L"Task4InvalidPin";
+        context.volume_object_id = 101;
+        context.integrity_check_on_mount = false;
+        context.allow_legacy_scaffold_for_fixtures = false;
+        Store store(context);
+        if (!PrepareTask4AppleMetadataStore(store, name))
+        {
+            return false;
+        }
+
+        Store::MutationRequest create_directory;
+        create_directory.operation = Store::MutationOperation::CreateDirectory;
+        create_directory.path = L"\\invalid-pin";
+        ok &= Require(
+            store.ApplyMutation(create_directory) == Store::MutationStatus::Applied,
+            std::string(name) + ": metadata-only mutation stages");
+
+        const std::vector<std::uint64_t> required_checkpoint_xids{0};
+        Store::CommitStatus status = Store::CommitStatus::NotReady;
+        switch (entry_point)
+        {
+        case EntryPoint::Transaction:
+            status = store.CommitTransaction(required_checkpoint_xids);
+            break;
+        case EntryPoint::CanonicalTransaction:
+            status = store.CommitCanonicalTransaction(required_checkpoint_xids);
+            break;
+        case EntryPoint::PendingMutations:
+            status = store.CommitPendingMutations(required_checkpoint_xids);
+            break;
+        }
+
+        std::vector<std::byte> actual_bytes;
+        ok &= Require(
+            status == Store::CommitStatus::InvariantFailed,
+            std::string(name) + ": invalid required XID is not hidden");
+        ok &= Require(
+            store.LastCommitStage() == "apple-plan-failed" &&
+                store.LastCommitFailureReason() == L"AppleCommitPlanFailed" &&
+                store.LastCommitFailureDetail() == L"AppleCheckpointRetentionInvalid",
+            std::string(name) + ": planner error is exposed through commit diagnostics");
+        ok &= Require(
+            !store.IsRecoveryRequired() && store.PendingMutationCount() == 1,
+            std::string(name) + ": invalid no-I/O refusal preserves pending work without poisoning recovery");
+        ok &= Require(
+            required_checkpoint_xids == std::vector<std::uint64_t>{0},
+            std::string(name) + ": immutable required-XID input is unchanged");
+        ok &= Require(
+            ReadBytesFromImage(image_path, 0, original_bytes.size(), actual_bytes) &&
+                actual_bytes == original_bytes,
+            std::string(name) + ": invalid pin refusal leaves the whole image byte-identical");
+    }
+    return ok;
+}
+
+bool TestRetentionCapacityIsRetryableWithoutPretendingCommit(
+    const std::filesystem::path& run_root)
+{
+    using Store = apfsaccess::rw::MetadataStore;
+    struct CapacityCase
+    {
+        const char* name;
+        Task4RetentionPressure pressure;
+        std::uint32_t checkpoint_ring_blocks;
+        std::size_t successful_pinned_commits;
+        const wchar_t* expected_detail;
+    };
+    const CapacityCase cases[] = {
+        {"data", Task4RetentionPressure::Data, 8, 1,
+            L"AppleCheckpointDataRetentionExhausted"},
+        {"descriptor", Task4RetentionPressure::Descriptor, 16, 1,
+            L"AppleCheckpointDescriptorRetentionExhausted"},
+        {"bitmap", Task4RetentionPressure::Bitmap, 32, 2,
+            L"AppleSpacemanBitmapRetentionExhausted"},
+    };
+
+    bool ok = true;
+    for (const auto& test_case : cases)
+    {
+        const std::string label =
+            std::string("Task4RetentionCapacity/") + test_case.name;
+        const auto image_path = run_root /
+            (std::string("task4-retention-capacity-") + test_case.name + ".raw");
+        std::vector<std::byte> fixture_bytes;
+        if (!Require(
+                WriteTask4AppleMetadataFixture(
+                    image_path,
+                    test_case.checkpoint_ring_blocks,
+                    fixture_bytes,
+                    test_case.pressure),
+                label + ": authoritative fixture writes"))
+        {
+            return false;
+        }
+
+        apfsaccess::catalog::VectorRandomAccessSource source(fixture_bytes);
+        std::string parser_error;
+        const auto parsed = apfsaccess::catalog::LoadAppleCheckpointView(
+            source, 0, source.SizeBytes(), parser_error);
+        if (!Require(
+                parsed.has_value(),
+                label + ": authoritative parser accepts source: " + parser_error))
+        {
+            return false;
+        }
+        const auto& parsed_nxsb = parsed->container.superblock;
+        const bool expected_geometry =
+            parsed_nxsb.xp_data_block_count == test_case.checkpoint_ring_blocks &&
+            parsed_nxsb.xp_desc_block_count ==
+                (test_case.pressure == Task4RetentionPressure::Descriptor
+                    ? 4u
+                    : test_case.checkpoint_ring_blocks) &&
+            (test_case.pressure != Task4RetentionPressure::Bitmap ||
+                parsed->spaceman.internal_pool.bitmap_block_count == 3);
+        if (!Require(
+                expected_geometry,
+                label + ": authoritative parser sees patched capacity geometry"))
+        {
+            return false;
+        }
+
+        Store::VolumeContext context;
+        context.device_path = image_path.wstring();
+        context.volume_name = L"Task4RetentionCapacity";
+        context.volume_object_id = 101;
+        context.integrity_check_on_mount = false;
+        context.allow_legacy_scaffold_for_fixtures = false;
+        Store store(context);
+        if (!PrepareTask4AppleMetadataStore(store, label))
+        {
+            return false;
+        }
+
+        std::vector<std::uint64_t> required_checkpoint_xids;
+        for (std::size_t generation = 0;
+             generation < test_case.successful_pinned_commits;
+             ++generation)
+        {
+            const auto xid = 40 + static_cast<std::uint64_t>(generation);
+            Store::MutationRequest retained_directory;
+            retained_directory.operation = Store::MutationOperation::CreateDirectory;
+            retained_directory.path = L"\\retained-" + std::to_wstring(xid);
+            ok &= Require(
+                store.ApplyMutation(retained_directory) ==
+                    Store::MutationStatus::Applied,
+                label + ": pinned metadata-only mutation stages");
+            required_checkpoint_xids.push_back(xid);
+            const auto committed =
+                store.CommitPendingMutations(required_checkpoint_xids);
+            if (!Require(
+                    committed == Store::CommitStatus::Committed,
+                    label + ": pinned publication commits, status=" +
+                        CommitStatusToString(committed)))
+            {
+                return false;
+            }
+            ok &= Require(
+                store.CheckpointXid().value_or(0) == xid + 1,
+                label + ": pinned publication advances checkpoint XID");
+        }
+
+        const auto blocked_xid =
+            40 + static_cast<std::uint64_t>(test_case.successful_pinned_commits);
+        const std::wstring blocked_path =
+            L"\\retained-" + std::to_wstring(blocked_xid);
+        Store::MutationRequest blocked_directory;
+        blocked_directory.operation = Store::MutationOperation::CreateDirectory;
+        blocked_directory.path = blocked_path;
+        ok &= Require(
+            store.ApplyMutation(blocked_directory) == Store::MutationStatus::Applied,
+            label + ": blocked metadata-only mutation stages");
+
+        std::vector<std::byte> before_refusal;
+        ok &= Require(
+            ReadBytesFromImage(
+                image_path, 0, fixture_bytes.size(), before_refusal),
+            label + ": image snapshot before refusal is readable");
+        required_checkpoint_xids.push_back(blocked_xid);
+        const auto immutable_required_xids = required_checkpoint_xids;
+        const auto blocked =
+            store.CommitCanonicalTransaction(required_checkpoint_xids);
+
+        std::vector<std::byte> after_refusal;
+        ok &= Require(
+            blocked == Store::CommitStatus::RetentionBlocked,
+            label + ": retention exhaustion is distinct retryable backpressure");
+        ok &= Require(
+            store.LastCommitStage() == "apple-plan-retention-blocked" &&
+                store.LastCommitFailureReason() == L"CheckpointRetentionExhausted" &&
+                store.LastCommitFailureDetail() == test_case.expected_detail,
+            label + ": exact retention-capacity diagnostics are exposed");
+        ok &= Require(
+            !store.IsRecoveryRequired() && store.IsCommitPathReady() &&
+                store.IsCanonicalCommitReady() && store.PendingMutationCount() == 1,
+            label + ": refusal preserves retry readiness and pending work");
+        ok &= Require(
+            required_checkpoint_xids == immutable_required_xids,
+            label + ": immutable pin snapshot is unchanged");
+        ok &= Require(
+            ReadBytesFromImage(
+                image_path, 0, fixture_bytes.size(), after_refusal) &&
+                after_refusal == before_refusal,
+            label + ": no-I/O backpressure leaves the image byte-identical");
+        ok &= Require(
+            store.CommitCanonicalTransaction({}) == Store::CommitStatus::Committed,
+            label + ": retry commits after pins are released");
+        ok &= Require(
+            store.LookupCommittedInodeByPath(blocked_path).has_value(),
+            label + ": successful retry commits the preserved mutation");
+    }
+    return ok;
+}
+
+bool TestLegacyWriterRefusesRequiredCheckpointXids(
+    const std::filesystem::path& run_root)
+{
+    using Store = apfsaccess::rw::MetadataStore;
+    const auto image_path = run_root / "task4-legacy-pin-refusal.apfs.img";
+    if (!Require(
+            CreateSyntheticContainer(image_path),
+            "Task4LegacyPins: synthetic legacy fixture writes"))
+    {
+        return false;
+    }
+
+    Store::VolumeContext context{image_path.wstring(), L"Task4LegacyPins"};
+    context.integrity_check_on_mount = false;
+    Store store(context);
+    bool ok = true;
+    ok &= Require(
+        store.LoadContainerSuperblocks() && store.LoadObjectMap() &&
+            store.LoadSpacemanState() && store.PrepareNativeWritePath(),
+        "Task4LegacyPins: legacy metadata store prepares");
+    ok &= Require(
+        store.IsCommitPathReady() && !store.IsCanonicalCommitReady(),
+        "Task4LegacyPins: legacy fixture uses only the noncanonical commit path");
+
+    Store::MutationRequest create_directory;
+    create_directory.operation = Store::MutationOperation::CreateDirectory;
+    create_directory.path = L"\\legacy-pin";
+    ok &= Require(
+        store.ApplyMutation(create_directory) == Store::MutationStatus::Applied,
+        "Task4LegacyPins: metadata-only mutation stages");
+
+    std::vector<std::byte> before_refusal;
+    ok &= Require(
+        ReadBytesFromImage(image_path, 0, kContainerBytes, before_refusal),
+        "Task4LegacyPins: image snapshot before refusal is readable");
+    const std::vector<std::uint64_t> required_checkpoint_xids{40};
+    const auto refused =
+        store.CommitTransaction(required_checkpoint_xids);
+
+    std::vector<std::byte> after_refusal;
+    ok &= Require(
+        refused == Store::CommitStatus::InvariantFailed,
+        "Task4LegacyPins: legacy writer refuses nonempty checkpoint pins");
+    ok &= Require(
+        store.LastCommitStage() == "checkpoint-retention-unsupported" &&
+            store.LastCommitFailureReason() == L"CheckpointRetentionUnsupported" &&
+            store.LastCommitFailureDetail() ==
+                L"NativeAppleTransactionWriterUnavailable",
+        "Task4LegacyPins: fail-closed diagnostics identify unsupported retention");
+    ok &= Require(
+        !store.IsRecoveryRequired() && store.IsCommitPathReady() &&
+            store.PendingMutationCount() == 1,
+        "Task4LegacyPins: no-I/O refusal retains pending work without poisoning recovery");
+    ok &= Require(
+        required_checkpoint_xids == std::vector<std::uint64_t>{40},
+        "Task4LegacyPins: immutable required-XID input is unchanged");
+    ok &= Require(
+        ReadBytesFromImage(image_path, 0, kContainerBytes, after_refusal) &&
+            after_refusal == before_refusal,
+        "Task4LegacyPins: refusal leaves the whole image byte-identical");
+    ok &= Require(
+        store.CommitTransaction({}) == Store::CommitStatus::Committed,
+        "Task4LegacyPins: default no-pin legacy retry still commits");
+    ok &= Require(
+        store.LookupCommittedInodeByPath(L"\\legacy-pin").has_value(),
+        "Task4LegacyPins: no-pin retry commits the preserved mutation");
+    return ok;
+}
+
+bool TestTask4RetentionPlumbing(const std::filesystem::path& run_root)
+{
+    bool ok = TestCommitStatusNumericStability();
+    ok &= TestRequiredCheckpointXidsReachEveryCommitEntryPoint(run_root);
+    ok &= TestRetentionCapacityIsRetryableWithoutPretendingCommit(run_root);
+    ok &= TestLegacyWriterRefusesRequiredCheckpointXids(run_root);
+    return ok;
 }
 
 bool TestLargeSpacemanCheckpointUsesExtension(const std::filesystem::path& run_root)
@@ -3619,9 +4127,28 @@ int main(int argc, char** argv)
         return RunBlockDeviceReadCacheBenchmark(run_root, mode == "enabled") ? 0 : 1;
     }
 
+    if (argc == 2 && std::string_view(argv[1]) == "--test-block-source-admission")
+    {
+        bool ok = TestBlockDeviceWriteStaysBoundToReadObject(run_root);
+        ok &= TestBlockDeviceRejectsNonFileWrites(run_root);
+        std::filesystem::remove_all(run_root, ec);
+        return ok ? 0 : 1;
+    }
+
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--test-task4-retention-plumbing")
+    {
+        const bool ok = TestTask4RetentionPlumbing(run_root);
+        std::filesystem::remove_all(run_root, ec);
+        return ok ? 0 : 1;
+    }
+
     bool ok = true;
+    ok &= TestBlockDeviceWriteStaysBoundToReadObject(run_root);
+    ok &= TestBlockDeviceRejectsNonFileWrites(run_root);
     ok &= TestSingleExtentPreparedWriteUsesDirectFastPath(run_root);
     ok &= TestLargeSpacemanCheckpointUsesExtension(run_root);
+    ok &= TestTask4RetentionPlumbing(run_root);
 
     const auto image_path = run_root / "container.apfs.img";
     if (!CreateSyntheticContainer(image_path))
@@ -4946,7 +5473,9 @@ int main(int argc, char** argv)
     {
         apfsaccess::rw::MetadataStore remounted_btree_rebuild(btree_rebuild_context);
         ok &= Require(remounted_btree_rebuild.LoadContainerSuperblocks(), "Btree-rebuild remount LoadContainerSuperblocks should succeed");
-        ok &= Require(remounted_btree_rebuild.PrepareNativeWritePath(), "Btree-rebuild remount PrepareNativeWritePath should succeed");
+        const auto prepared = remounted_btree_rebuild.PrepareNativeWritePath();
+        if (!prepared) std::wcerr << L"[DETAIL] Btree-rebuild: " << remounted_btree_rebuild.RecoveryReason() << std::endl;
+        ok &= Require(prepared, "Btree-rebuild remount PrepareNativeWritePath should succeed");
         ok &= Require(!remounted_btree_rebuild.IsRecoveryRequired(), "Btree-rebuild remount should remain clean (no recovery)");
         ok &= Require(remounted_btree_rebuild.IsCommitPathReady(), "Btree-rebuild remount should keep commit path ready");
         ok &= Require(
@@ -5081,7 +5610,9 @@ int main(int argc, char** argv)
     {
         apfsaccess::rw::MetadataStore remounted_btree_rebuild(btree_rebuild_partial_inode_context);
         ok &= Require(remounted_btree_rebuild.LoadContainerSuperblocks(), "Partial-inode btree-rebuild remount LoadContainerSuperblocks should succeed");
-        ok &= Require(remounted_btree_rebuild.PrepareNativeWritePath(), "Partial-inode btree-rebuild remount PrepareNativeWritePath should succeed");
+        const auto prepared = remounted_btree_rebuild.PrepareNativeWritePath();
+        if (!prepared) std::wcerr << L"[DETAIL] Partial-inode rebuild: " << remounted_btree_rebuild.RecoveryReason() << std::endl;
+        ok &= Require(prepared, "Partial-inode btree-rebuild remount PrepareNativeWritePath should succeed");
         ok &= Require(!remounted_btree_rebuild.IsRecoveryRequired(), "Partial-inode btree-rebuild remount should remain clean (no recovery)");
         ok &= Require(remounted_btree_rebuild.IsCommitPathReady(), "Partial-inode btree-rebuild remount should keep commit path ready");
         ok &= Require(
@@ -5239,7 +5770,9 @@ int main(int argc, char** argv)
     {
         apfsaccess::rw::MetadataStore remounted(non_fixture_partial_inode_context);
         ok &= Require(remounted.LoadContainerSuperblocks(), "Non-fixture partial-inode remount LoadContainerSuperblocks should succeed");
-        ok &= Require(remounted.PrepareNativeWritePath(), "Non-fixture partial-inode remount PrepareNativeWritePath should succeed via btree reconstruction");
+        const auto prepared = remounted.PrepareNativeWritePath();
+        if (!prepared) std::wcerr << L"[DETAIL] Non-fixture rebuild: " << remounted.RecoveryReason() << std::endl;
+        ok &= Require(prepared, "Non-fixture partial-inode remount PrepareNativeWritePath should succeed via btree reconstruction");
         ok &= Require(!remounted.IsRecoveryRequired(), "Non-fixture partial-inode remount should remain clean after btree reconstruction");
         ok &= Require(remounted.IsCommitPathReady(), "Non-fixture partial-inode remount should keep commit path ready");
         ok &= Require(

@@ -1,4 +1,5 @@
 #include "TransactionManager.h"
+#include "InodeMetadataPatch.h"
 #include "WriteAheadLog.h"
 #include "PayloadSpool.h"
 
@@ -69,6 +70,473 @@ std::uint64_t EnvironmentUnsigned(const char* name, std::uint64_t fallback)
     {
         return fallback;
     }
+}
+
+bool TestDirectoryRestoreAcceptance(const std::filesystem::path& run_root)
+{
+    using namespace apfsaccess::rw;
+    using Tx = TransactionManager;
+    static_assert(static_cast<int>(Tx::MutationKind::RestoreDirectoryFromSymbolicLink) == 14);
+    Tx::MutationIntent restore{};
+    restore.kind = Tx::MutationKind::RestoreDirectoryFromSymbolicLink;
+    restore.path = L"\\directory";
+    restore.object_id = 42;
+    restore.generation = 7;
+    for (bool journal : {false, true})
+    {
+        Tx tx(L"DeferredContent");
+        if (journal) tx.SetJournalPath((run_root / "invalid-directory-restore.wal").wstring());
+        if (!tx.Begin()) return false;
+        const auto sequence = tx.NextMutationSequence();
+        const auto reject = [&](auto change)
+        {
+            auto bad = restore;
+            change(bad);
+            return Require(!tx.RecordMutation(bad) && tx.NextMutationSequence() == sequence &&
+                tx.PendingMutationCount() == 0, "invalid restore does not consume sequence or queue intent");
+        };
+        if (!reject([](auto& m) { m.object_id = 0; }) ||
+            !reject([](auto& m) { m.generation = 0; }) ||
+            !reject([](auto& m) { m.path.clear(); }) ||
+            !reject([](auto& m) { m.path.push_back(L'\0'); }) ||
+            !reject([](auto& m) { m.path = std::wstring(1, wchar_t{0xd800}); }) ||
+            !reject([](auto& m) { m.secondary_path = L"other"; }) ||
+            !reject([](auto& m) { m.secondary_path = std::wstring(1, wchar_t{0xd800}); }) ||
+            !reject([](auto& m) { m.offset = 1; }) ||
+            !reject([](auto& m) { m.length = 1; }) ||
+            !reject([](auto& m) { m.timestamp_utc = 1; }) ||
+            !reject([](auto& m) { m.replace_if_exists = true; }) ||
+            !reject([](auto& m) { m.payload_spool_offset = 1; }) ||
+            !reject([](auto& m) { m.payload_length = 1; }) ||
+            !reject([](auto& m) { m.payload_checksum.back() = 1; }) ||
+            !reject([](auto& m) { m.inline_payload = {std::byte{1}}; }) ||
+            !reject([](auto& m) { m.unlink_outcome.emplace(); })) return false;
+        if (!tx.Abort()) return false;
+    }
+    const auto path = run_root / "directory-restore-accept.wal";
+    std::uint64_t transaction_id = 0;
+    {
+        Tx tx(L"DeferredContent");
+        tx.SetVolumeIdentity(L"directory-restore-volume");
+        tx.SetJournalPath(path.wstring());
+        if (!tx.Begin()) return false;
+        transaction_id = tx.CurrentTransactionId();
+        auto old = restore;
+        old.kind = Tx::MutationKind::RemoveSymbolicLinkTarget;
+        if (!Require(tx.RecordMutation(restore) && tx.RecordMutation(old) &&
+                tx.CanAcceptWithoutPayloadSpoolFlush() && tx.Accept(123),
+                "restore and old removal accept without a payload spool")) return false;
+    }
+    Tx reopened(L"DeferredContent");
+    reopened.SetVolumeIdentity(L"directory-restore-volume");
+    reopened.SetJournalPath(path.wstring());
+    std::vector<Tx::AcceptedTransaction> accepted;
+    if (!Require(reopened.RecoveryStateValid() && reopened.LoadUnappliedAcceptedTransactions(accepted) &&
+            accepted.size() == 1 && accepted[0].mutations.size() == 2 &&
+            accepted[0].transaction_id == transaction_id && accepted[0].preimage_checkpoint_xid == 123 &&
+            reopened.CanFinalizeWithoutPayloadSpoolFlush(false),
+            "reload preserves accepted restore without recovery payload")) return false;
+    const auto& record = accepted[0].mutations[0];
+    return Require(record.operation == WriteAheadLog::OperationKind::RestoreDirectoryFromSymbolicLink &&
+        record.object_id == 42 && record.parent_object_id == 7 && record.path_utf8 == "\\directory" &&
+        record.sequence == 1 && record.transaction_id == transaction_id &&
+        WriteAheadLog::DirectoryRestoreMutationIsConsistent(record) &&
+        accepted[0].mutations[1].operation == WriteAheadLog::OperationKind::RemoveSymbolicLinkTarget &&
+        accepted[0].mutations[1].sequence == 2,
+        "reloaded op14 identity and old symlink removal remain distinct");
+}
+
+bool TestAllocationSizeAcceptanceOrder(const std::filesystem::path& run_root)
+{
+    using namespace apfsaccess::rw;
+    using Tx = TransactionManager;
+    static_assert(static_cast<int>(Tx::MutationKind::SetAllocationSize) == 13);
+    Tx::MutationIntent allocation{};
+    allocation.kind = Tx::MutationKind::SetAllocationSize;
+    allocation.path = L"\\allocation.bin";
+    allocation.object_id = 42;
+    allocation.generation = 7;
+    allocation.length = 4096;
+    for (bool journal : {false, true})
+    {
+        Tx tx(L"DeferredContent");
+        if (journal) tx.SetJournalPath((run_root / "invalid-allocation.wal").wstring());
+        if (!tx.Begin()) return false;
+        const auto sequence = tx.NextMutationSequence();
+        const auto reject = [&](auto change)
+        {
+            auto bad = allocation;
+            change(bad);
+            return Require(!tx.RecordMutation(bad) && tx.NextMutationSequence() == sequence &&
+                    tx.PendingMutationCount() == 0, "invalid allocation does not consume sequence or queue intent");
+        };
+        if (!reject([](auto& m) { m.object_id = 0; }) ||
+            !reject([](auto& m) { m.generation = 0; }) ||
+            !reject([](auto& m) { m.path.clear(); }) ||
+            !reject([](auto& m) { m.offset = 1; }) ||
+            !reject([](auto& m) { m.length = 0x8000000000000000ull; }) ||
+            !reject([](auto& m) { m.timestamp_utc = 1; }) ||
+            !reject([](auto& m) { m.secondary_path = L"other"; }) ||
+            !reject([](auto& m) { m.replace_if_exists = true; }) ||
+            !reject([](auto& m) { m.payload_length = 1; }) ||
+            !reject([](auto& m) { m.payload_spool_offset = 1; }) ||
+            !reject([](auto& m) { m.inline_payload = {std::byte{1}}; }) ||
+            !reject([](auto& m) { m.payload_checksum[0] = 1; }) ||
+            !reject([](auto& m) { m.unlink_outcome.emplace(); })) return false;
+        if (!tx.Abort()) return false;
+    }
+    const auto path = run_root / "allocation-order.wal";
+    const std::vector<Tx::MutationKind> kinds{
+        Tx::MutationKind::Write, Tx::MutationKind::SetFileSize,
+        Tx::MutationKind::SetAllocationSize, Tx::MutationKind::SetFileSize,
+        Tx::MutationKind::Write, Tx::MutationKind::SetAllocationSize};
+    const std::vector<std::uint64_t> lengths{8192, 2048, 0, 16384, 4, 0};
+    {
+        Tx tx(L"DeferredContent");
+        tx.SetJournalPath(path.wstring());
+        if (!tx.Begin()) return false;
+        for (std::size_t i = 0; i < kinds.size(); ++i)
+        {
+            auto mutation = allocation;
+            mutation.kind = kinds[i];
+            mutation.length = lengths[i];
+            if (!Require(tx.RecordMutation(mutation), "ordered mutation admitted")) return false;
+        }
+        if (!Require(tx.Accept(), "ordered transaction accepted")) return false;
+    }
+    {
+        WriteAheadLog wal({path, "default"});
+        if (!Require(wal.Compact(1), "WAL retains entire accepted ordering")) return false;
+    }
+    Tx reopened(L"DeferredContent");
+    reopened.SetJournalPath(path.wstring());
+    std::vector<Tx::AcceptedTransaction> accepted;
+    if (!Require(reopened.RecoveryStateValid() && reopened.LoadUnappliedAcceptedTransactions(accepted) &&
+            accepted.size() == 1 && accepted[0].mutations.size() == kinds.size(),
+            "recovery retains writes, truncate, repeated allocation barriers and later growth")) return false;
+    const std::vector<WriteAheadLog::OperationKind> operations{
+        WriteAheadLog::OperationKind::Write, WriteAheadLog::OperationKind::SetFileSize,
+        WriteAheadLog::OperationKind::SetAllocationSize, WriteAheadLog::OperationKind::SetFileSize,
+        WriteAheadLog::OperationKind::Write, WriteAheadLog::OperationKind::SetAllocationSize};
+    for (std::size_t i = 0; i < operations.size(); ++i)
+    {
+        const auto& record = accepted[0].mutations[i];
+        if (!Require(record.operation == operations[i] && record.logical_length == lengths[i] &&
+                record.sequence == i + 1 && record.object_id == 42 && record.parent_object_id == 7 &&
+                record.path_utf8 == "\\allocation.bin",
+                "replay preserves exact mutation order, lengths and identity")) return false;
+    }
+    return true;
+}
+
+bool TestInodeMetadataAcceptance(const std::filesystem::path& run_root)
+{
+    using namespace apfsaccess::rw;
+    using Tx = TransactionManager;
+    static_assert(static_cast<int>(Tx::MutationKind::SetInodeMetadata) == 12);
+    Tx::MutationIntent mutation{};
+    mutation.kind = Tx::MutationKind::SetInodeMetadata;
+    mutation.path = L"\\metadata";
+    mutation.object_id = 42;
+    mutation.generation = 7;
+    mutation.length = mutation.payload_length = 52;
+    InodeMetadataPatch patch{};
+    patch.mask = InodeMetadataPatch::Owner;
+    patch.owner = 0x12345678;
+    if (!EncodeInodeMetadataPatch(patch, mutation.inline_payload)) return false;
+    mutation.payload_checksum = {
+        0x03, 0x7b, 0x15, 0xb0, 0xff, 0xc8, 0x63, 0xec,
+        0xc3, 0x21, 0x63, 0x7d, 0x91, 0x94, 0x61, 0x2d,
+        0xa2, 0x5c, 0xc4, 0x76, 0x67, 0x96, 0x4e, 0x41,
+        0x0f, 0x23, 0xf0, 0xdc, 0x68, 0x22, 0xfc, 0xe2,
+    };
+    const auto path = run_root / "inode-metadata.wal";
+    {
+        Tx tx(L"DeferredContent");
+        tx.SetVolumeIdentity(L"inode-metadata-volume");
+        tx.SetJournalPath(path.wstring());
+        if (!Require(tx.Begin() && tx.RecordMutation(mutation) && tx.Accept(),
+                "metadata is durably accepted through the existing inline envelope")) return false;
+        std::vector<Tx::AcceptedTransaction> accepted;
+        std::string error;
+        if (!Require(tx.LoadAcceptedTransactionsSinceCleanup(accepted, &error) &&
+                accepted.size() == 1 && accepted[0].mutations.size() == 1 &&
+                accepted[0].mutations[0].operation == WriteAheadLog::OperationKind::SetInodeMetadata &&
+                accepted[0].mutations[0].inline_payload == mutation.inline_payload &&
+                accepted[0].mutations[0].logical_length == 0 &&
+                accepted[0].mutations[0].payload_length == 52 &&
+                accepted[0].mutations[0].payload_spool_id == 0 &&
+                tx.CanFinalizeWithoutPayloadSpoolFlush(false),
+                "accepted metadata has complete inline recovery coverage: " + error)) return false;
+    }
+    {
+        WriteAheadLog wal({path, "inode-metadata-volume"});
+        if (!Require(wal.Compact(1), "accepted metadata transaction compacts")) return false;
+    }
+    {
+        Tx reopened(L"DeferredContent");
+        reopened.SetVolumeIdentity(L"inode-metadata-volume");
+        reopened.SetJournalPath(path.wstring());
+        std::vector<Tx::AcceptedTransaction> accepted;
+        std::string error;
+        if (!Require(reopened.RecoveryStateValid() &&
+                reopened.LoadUnappliedAcceptedTransactions(accepted, &error) &&
+                accepted.size() == 1 && accepted[0].mutations.size() == 1 &&
+                accepted[0].mutations[0].inline_payload == mutation.inline_payload &&
+                reopened.CanFinalizeWithoutPayloadSpoolFlush(false),
+                "reopen recovers accepted metadata without spool data: " + error)) return false;
+    }
+    for (bool journal : {false, true})
+    {
+        Tx invalid(L"DeferredContent");
+        if (journal)
+        {
+            invalid.SetVolumeIdentity(L"invalid-metadata-volume");
+            invalid.SetJournalPath((run_root / "invalid-inode-metadata.wal").wstring());
+        }
+        if (!invalid.Begin()) return false;
+        const auto sequence = invalid.NextMutationSequence();
+        const auto reject = [&](auto change)
+        {
+            auto bad = mutation;
+            change(bad);
+            return Require(!invalid.RecordMutation(bad) && invalid.NextMutationSequence() == sequence,
+                "malformed metadata requests reject before consuming a WAL sequence");
+        };
+        if (!reject([](auto& m) { m.length = 0; }) ||
+            !reject([](auto& m) { m.length = 51; }) ||
+            !reject([](auto& m) { m.length = 53; }) ||
+            !reject([](auto& m) { m.payload_length = 0; }) ||
+            !reject([](auto& m) { m.object_id = 0; }) ||
+            !reject([](auto& m) { m.generation = 0; }) ||
+            !reject([](auto& m) { m.offset = 1; }) ||
+            !reject([](auto& m) { m.timestamp_utc = 1; }) ||
+            !reject([](auto& m) { m.payload_spool_offset = 1; }) ||
+            !reject([](auto& m) { m.replace_if_exists = true; }) ||
+            !reject([](auto& m) { m.secondary_path = L"other"; }) ||
+            !reject([](auto& m) { m.secondary_path.assign(1, static_cast<wchar_t>(0xd800)); }) ||
+            !reject([](auto& m) { m.path.clear(); }) ||
+            !reject([](auto& m) { m.payload_checksum[0] ^= 1; }) ||
+            !reject([](auto& m) { m.inline_payload[4] = std::byte{128}; }) ||
+            !reject([](auto& m) { m.unlink_outcome = UnlinkOutcome{}; })) return false;
+        if (!Require(invalid.RecordMutation(mutation) && invalid.Abort(),
+                "rejections leave room for a subsequent valid metadata request")) return false;
+    }
+    return true;
+}
+
+bool TestUnlinkOutcomeAcceptance(const std::filesystem::path& run_root)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    Tx tx(L"Conservative");
+    tx.SetVolumeIdentity(L"unlink-outcome-volume");
+    tx.SetJournalPath((run_root / "unlink-outcome.wal").wstring());
+    Tx::MutationIntent mutation;
+    mutation.kind = Tx::MutationKind::Delete;
+    mutation.path = L"\\alias";
+    mutation.object_id = 17;
+    mutation.generation = 9;
+    mutation.unlink_outcome = apfsaccess::rw::UnlinkOutcome{17, 9, 12, 2, 2, 1, "\\alias"};
+    if (!Require(tx.Begin() && tx.RecordMutation(mutation) && tx.Accept(),
+            "versioned unlink outcome can be accepted durably")) return false;
+    std::vector<Tx::AcceptedTransaction> accepted;
+    std::string error;
+    if (!Require(tx.LoadAcceptedTransactionsSinceCleanup(accepted, &error) &&
+            accepted.size() == 1 && accepted[0].mutations.size() == 1 &&
+            accepted[0].mutations[0].unlink_outcome == mutation.unlink_outcome,
+            "accepted transaction preserves the native unlink outcome: " + error)) return false;
+    if (!Require(tx.Begin(), "next unlink transaction begins")) return false;
+    const auto sequence = tx.NextMutationSequence();
+    ++mutation.object_id;
+    if (!Require(!tx.RecordMutation(mutation) && tx.NextMutationSequence() == sequence,
+            "mismatched outcome identity is rejected before buffering or advancing the sequence")) return false;
+    return Require(tx.Abort(), "invalid unlink transaction aborts cleanly");
+}
+
+bool TestExtendedAttributeAcceptanceAndValidation(const std::filesystem::path& run_root)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    const std::array<std::uint8_t, Wal::PayloadHashSize> binary_hash{
+        0xe8, 0x05, 0x90, 0x12, 0xc1, 0x4b, 0x6e, 0xda,
+        0xac, 0xa0, 0x24, 0x0f, 0x60, 0xe1, 0xe7, 0x66,
+        0xc6, 0x45, 0x20, 0xb0, 0x70, 0x49, 0x0f, 0xbd,
+        0x35, 0x07, 0x61, 0xe6, 0x54, 0xd4, 0xae, 0xb9,
+    };
+    const std::array<std::uint8_t, Wal::PayloadHashSize> empty_hash{
+        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
+        0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+        0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+        0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+    };
+
+    Tx::MutationIntent binary;
+    binary.kind = Tx::MutationKind::SetExtendedAttribute;
+    binary.path = L"\\docs\\file.bin";
+    binary.secondary_path = L"user.binary";
+    binary.object_id = 41;
+    binary.generation = 7;
+    binary.payload_length = 4;
+    binary.payload_checksum = binary_hash;
+    binary.inline_payload = {
+        std::byte{0x00}, std::byte{0x11}, std::byte{0x80}, std::byte{0xff}};
+
+    auto empty = binary;
+    empty.secondary_path = L"user.empty";
+    empty.payload_length = 0;
+    empty.payload_checksum = empty_hash;
+    empty.inline_payload.clear();
+
+    Tx::MutationIntent remove;
+    remove.kind = Tx::MutationKind::RemoveExtendedAttribute;
+    remove.path = binary.path;
+    remove.secondary_path = empty.secondary_path;
+    remove.object_id = binary.object_id;
+    remove.generation = binary.generation;
+
+    const auto path = run_root / "transaction-xattrs.wal";
+    Tx tx(L"DeferredContent");
+    tx.SetVolumeIdentity(L"transaction-xattrs-volume");
+    tx.SetJournalPath(path.wstring());
+    if (!Require(tx.Begin(), "xattr transaction begins") ||
+        !Require(
+            tx.RecordMutation(binary) && tx.RecordMutation(empty) && tx.RecordMutation(remove),
+            "set binary, set empty, and remove xattr mutations are recorded") ||
+        !Require(
+            tx.CanAcceptWithoutPayloadSpoolFlush(),
+            "embedded xattrs are fully covered by WAL bytes without payload-spool durability") ||
+        !Require(tx.Accept(), "xattr transaction reaches an accepted WAL boundary"))
+    {
+        return false;
+    }
+
+    const auto raw = Wal::ReadAll(path, "transaction-xattrs-volume");
+    if (!Require(
+            raw.status == Wal::ReadStatus::Ok && raw.records.size() == 4 &&
+                raw.records[0].operation == Wal::OperationKind::SetExtendedAttribute &&
+                raw.records[0].inline_payload == binary.inline_payload &&
+                raw.records[0].payload_spool_id == 0 &&
+                raw.records[0].payload_offset == 0 &&
+                raw.records[0].logical_offset == 0 &&
+                raw.records[0].logical_length == 0 &&
+                raw.records[1].operation == Wal::OperationKind::SetExtendedAttribute &&
+                raw.records[1].payload_sha256 == empty_hash &&
+                raw.records[2].operation == Wal::OperationKind::RemoveExtendedAttribute &&
+                raw.records[2].payload_length == 0 &&
+                raw.records[2].inline_payload.empty(),
+            "accepted WAL preserves xattrs without representing them as file ranges or spool references"))
+    {
+        return false;
+    }
+
+    std::vector<Tx::AcceptedTransaction> accepted;
+    std::string failure_reason;
+    if (!Require(
+            tx.LoadAcceptedTransactionsSinceCleanup(accepted, &failure_reason) &&
+                accepted.size() == 1 && accepted.front().mutations.size() == 3 &&
+                accepted.front().mutations[0].secondary_path_utf8 == "user.binary" &&
+                accepted.front().mutations[0].inline_payload == binary.inline_payload &&
+                accepted.front().mutations[1].operation == Wal::OperationKind::SetExtendedAttribute &&
+                accepted.front().mutations[1].inline_payload.empty() &&
+                accepted.front().mutations[2].operation == Wal::OperationKind::RemoveExtendedAttribute,
+            "accepted transaction reload retains exact xattr operations and bytes: " + failure_reason) ||
+        !Require(
+            tx.CanFinalizeWithoutPayloadSpoolFlush(false),
+            "strict WAL-scanned finalization accepts complete embedded xattr coverage"))
+    {
+        return false;
+    }
+
+    Tx restarted(L"DeferredContent");
+    restarted.SetVolumeIdentity(L"transaction-xattrs-volume");
+    restarted.SetJournalPath(path.wstring());
+    accepted.clear();
+    if (!Require(
+            restarted.RecoveryStateValid() &&
+                restarted.LoadUnappliedAcceptedTransactions(accepted, &failure_reason) &&
+                accepted.size() == 1 && accepted.front().mutations.size() == 3 &&
+                accepted.front().mutations[0].inline_payload == binary.inline_payload &&
+                accepted.front().mutations[1].payload_sha256 == empty_hash &&
+                accepted.front().mutations[2].operation == Wal::OperationKind::RemoveExtendedAttribute,
+            "restart reconstructs the accepted xattr transaction: " + failure_reason))
+    {
+        return false;
+    }
+
+    Tx invalid(L"DeferredContent");
+    invalid.SetVolumeIdentity(L"transaction-xattrs-invalid-volume");
+    invalid.SetJournalPath((run_root / "transaction-xattrs-invalid.wal").wstring());
+    if (!Require(invalid.Begin(), "invalid xattr fixture begins"))
+    {
+        return false;
+    }
+    const auto require_rejected = [&](const Tx::MutationIntent& mutation, const std::string& message)
+    {
+        const auto sequence = invalid.NextMutationSequence();
+        return Require(
+            !invalid.RecordMutation(mutation) && invalid.NextMutationSequence() == sequence &&
+                invalid.PendingMutationCount() == 0,
+            message);
+    };
+
+    auto malformed = binary;
+    malformed.payload_checksum[0] ^= 0xff;
+    if (!require_rejected(malformed, "xattr set with an incorrect hash rejects before sequence advance"))
+    {
+        return false;
+    }
+    malformed = binary;
+    ++malformed.payload_length;
+    if (!require_rejected(malformed, "xattr set with an incorrect payload length rejects"))
+    {
+        return false;
+    }
+    malformed = binary;
+    malformed.secondary_path.clear();
+    if (!require_rejected(malformed, "xattr set with an empty exact attribute name rejects"))
+    {
+        return false;
+    }
+    malformed = binary;
+    malformed.secondary_path.assign(1, static_cast<wchar_t>(0xd800));
+    if (!require_rejected(malformed, "xattr set rejects an attribute name that cannot encode as strict UTF-8"))
+    {
+        return false;
+    }
+    malformed = binary;
+    malformed.inline_payload.assign(Wal::MaxExtendedAttributePayloadBytes + 1, std::byte{0x8a});
+    malformed.payload_length = malformed.inline_payload.size();
+    if (!require_rejected(malformed, "xattr set above 3804 bytes rejects"))
+    {
+        return false;
+    }
+    malformed = binary;
+    malformed.payload_spool_offset = 1;
+    if (!require_rejected(malformed, "xattr set cannot carry a payload-spool offset"))
+    {
+        return false;
+    }
+    malformed = binary;
+    malformed.offset = 1;
+    if (!require_rejected(malformed, "xattr set cannot masquerade as a file range"))
+    {
+        return false;
+    }
+    malformed = binary;
+    malformed.replace_if_exists = true;
+    if (!require_rejected(malformed, "xattr set rejects foreign mutation flags"))
+    {
+        return false;
+    }
+    auto malformed_remove = remove;
+    malformed_remove.inline_payload = binary.inline_payload;
+    malformed_remove.payload_length = binary.payload_length;
+    malformed_remove.payload_checksum = binary_hash;
+    if (!require_rejected(malformed_remove, "xattr remove cannot carry payload bytes"))
+    {
+        return false;
+    }
+    return Require(invalid.Abort(), "invalid xattr fixture aborts without buffered mutations");
 }
 
 bool RunAcceptanceBenchmark(const std::filesystem::path& run_root)
@@ -698,6 +1166,530 @@ bool TestRecoveryClearingRequiresCurrentWriterGeneration(const std::filesystem::
                "a manager that lost its writer generation must not clear recovery state");
 }
 
+bool TestCommittedPreimageCensusDirect(const std::filesystem::path& run_root)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    const auto path = run_root / "committed-preimage-direct.wal";
+    Tx tx(L"Conservative");
+    tx.SetVolumeIdentity(L"committed-preimage-direct-volume");
+    tx.SetJournalPath(path.wstring());
+    auto mutation = MakeMetadataMutation(L"\\committed.txt");
+    mutation.object_id = 900001;
+    if (!Require(tx.Begin() && tx.RecordMutation(mutation) && tx.Commit(7007),
+            "direct Commit should persist its explicit preimage checkpoint"))
+    {
+        return false;
+    }
+    const auto committed_sequence = tx.LastCommittedSequence();
+    std::vector<std::uint64_t> xids{123};
+    std::string error;
+    const bool loaded = tx.LoadRequiredCheckpointXidsSinceCleanup(xids, &error);
+    bool ok = Require(loaded && error.empty() && xids == std::vector<std::uint64_t>{7007},
+        "direct Commit census should retain exact XID 7007 until cleanup: " + error);
+    const auto read = Wal::ReadAll(path, "committed-preimage-direct-volume");
+    ok &= Require(read.status == Wal::ReadStatus::Ok && read.records.size() == 2 &&
+            read.records[0].object_id == 900001 &&
+            read.records[1].operation == Wal::OperationKind::TransactionMarker &&
+            read.records[1].state == Wal::RecordState::Checkpointed &&
+            read.records[1].object_id == 7007,
+        "committed terminal marker should store the preimage XID independently of its mutation inode");
+    const auto watermarks = tx.Watermarks();
+    ok &= Require(watermarks.accepted_sequence == committed_sequence &&
+            watermarks.apfs_durable_sequence == committed_sequence && watermarks.cleanup_sequence == 0,
+        "census should recognize committed work as APFS-durable but uncleaned");
+    if (!Require(tx.MarkCleanedThrough(committed_sequence),
+            "direct committed boundary should be eligible for durable cleanup"))
+    {
+        return false;
+    }
+    ok &= Require(tx.LoadRequiredCheckpointXidsSinceCleanup(xids, &error) &&
+            xids.empty() && error.empty(),
+        "durable cleanup should release a committed preimage checkpoint");
+    return ok;
+}
+
+bool TestCommittedPreimageCensusAfterRestart(
+    const std::filesystem::path& run_root,
+    bool compact_before_restart)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    const std::string scenario = compact_before_restart ? "compacted-restart" : "restart";
+    const std::string identity = "committed-preimage-" + scenario + "-volume";
+    const std::wstring wide_identity(identity.begin(), identity.end());
+    const auto path = run_root / ("committed-preimage-" + scenario + ".wal");
+    std::uint64_t cleanup_sequence = 0;
+    std::uint64_t committed_sequence = 0;
+    {
+        Tx tx(L"Conservative");
+        tx.SetVolumeIdentity(wide_identity);
+        tx.SetJournalPath(path.wstring());
+        auto prefix = MakeMetadataMutation(L"\\cleaned-prefix.txt");
+        if (!Require(tx.Begin() && tx.RecordMutation(prefix) && tx.Accept(111),
+                scenario + ": accepted prefix should persist"))
+        {
+            return false;
+        }
+        cleanup_sequence = tx.Watermarks().accepted_sequence;
+        if (!Require(tx.MarkApfsDurableThrough(cleanup_sequence) && tx.MarkCleanedThrough(cleanup_sequence),
+                scenario + ": prefix should be durably cleaned"))
+        {
+            return false;
+        }
+        auto mutation = MakeMetadataMutation(L"\\retained-committed.txt");
+        mutation.object_id = 900001;
+        if (!Require(tx.Begin() && tx.RecordMutation(mutation) && tx.Commit(7007),
+                scenario + ": unresolved committed transaction should persist"))
+        {
+            return false;
+        }
+        committed_sequence = tx.LastCommittedSequence();
+    }
+    if (compact_before_restart)
+    {
+        Wal wal({path, identity, 1024 * 1024});
+        if (!Require(wal.Compact(cleanup_sequence),
+                "committed marker must already exist when WAL compaction runs"))
+        {
+            return false;
+        }
+        const auto read = wal.ReadAll();
+        if (!Require(read.status == Wal::ReadStatus::Ok &&
+                std::any_of(read.records.begin(), read.records.end(), [&](const auto& record)
+                {
+                    return record.operation == Wal::OperationKind::CompactionIndex &&
+                        record.sequence == cleanup_sequence;
+                }) &&
+                std::none_of(read.records.begin(), read.records.end(), [&](const auto& record)
+                {
+                    return record.sequence < cleanup_sequence;
+                }),
+                "compaction should remove the cleaned prefix while preserving its cleanup boundary"))
+        {
+            return false;
+        }
+    }
+    Tx recovered(L"Conservative");
+    recovered.SetVolumeIdentity(wide_identity);
+    recovered.SetJournalPath(path.wstring());
+    std::vector<std::uint64_t> xids{123};
+    std::string error;
+    const bool loaded = recovered.LoadRequiredCheckpointXidsSinceCleanup(xids, &error);
+    bool ok = Require(loaded && error.empty() && xids == std::vector<std::uint64_t>{7007},
+        scenario + ": Commit census should recover exact XID 7007 and exclude the cleaned prefix: " + error);
+    std::vector<Tx::AcceptedTransaction> transactions;
+    const bool replay_loaded = recovered.LoadAcceptedTransactionsSinceCleanup(transactions, &error);
+    ok &= Require(replay_loaded && transactions.size() == 1 &&
+            transactions[0].accepted_sequence == committed_sequence &&
+            transactions[0].preimage_checkpoint_xid == 7007 &&
+            transactions[0].mutations.size() == 1 && transactions[0].mutations[0].object_id == 900001,
+        scenario + ": recovered committed boundary must retain the marker XID and complete mutation group");
+    return ok;
+}
+
+bool TestLegacyCommittedPreimageCensus(const std::filesystem::path& run_root)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    const auto path = run_root / "committed-preimage-legacy.wal";
+    {
+        Tx tx(L"Conservative");
+        tx.SetVolumeIdentity(L"committed-preimage-legacy-volume");
+        tx.SetJournalPath(path.wstring());
+        auto mutation = MakeMetadataMutation(L"\\legacy-committed.txt");
+        mutation.object_id = 900001;
+        if (!Require(tx.Begin() && tx.RecordMutation(mutation) && tx.Commit(),
+                "legacy default Commit should remain supported"))
+        {
+            return false;
+        }
+    }
+    Tx recovered(L"Conservative");
+    recovered.SetVolumeIdentity(L"committed-preimage-legacy-volume");
+    recovered.SetJournalPath(path.wstring());
+    std::vector<Tx::AcceptedTransaction> transactions;
+    std::string error;
+    if (!Require(recovered.LoadAcceptedTransactionsSinceCleanup(transactions, &error) &&
+            transactions.size() == 1 && transactions[0].preimage_checkpoint_xid == 0,
+            "legacy committed zero marker should remain replayable after restart"))
+    {
+        return false;
+    }
+    std::vector<std::uint64_t> xids{123};
+    bool ok = Require(!recovered.LoadRequiredCheckpointXidsSinceCleanup(xids, &error) &&
+            xids.empty() && !error.empty() && recovered.RecoveryStateValid(),
+        "only pin census should reject an unresolved legacy committed zero marker");
+    if (!Require(recovered.MarkCleanedThrough(transactions[0].accepted_sequence),
+            "legacy committed zero marker should still support durable cleanup"))
+    {
+        return false;
+    }
+    ok &= Require(recovered.LoadRequiredCheckpointXidsSinceCleanup(xids, &error) &&
+            xids.empty() && error.empty(),
+        "a cleaned legacy committed zero marker must not block pin census");
+    return ok;
+}
+
+bool TestEmptyCommittedPreimageCensus(const std::filesystem::path& run_root)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    bool ok = true;
+    for (const bool compact : {false, true})
+    for (const bool legacy : {false, true})
+    {
+        const std::string identity = std::string("empty-commit-") +
+            (compact ? "compact-" : "plain-") + (legacy ? "legacy" : "identified");
+        const std::wstring wide_identity(identity.begin(), identity.end());
+        const auto path = run_root / (identity + ".wal");
+        std::uint64_t cleanup_sequence = 0;
+        std::uint64_t committed_sequence = 0;
+        const auto check = [&](Tx& manager) {
+            std::vector<Tx::AcceptedTransaction> transactions;
+            std::string error;
+            bool valid = Require(manager.LoadAcceptedTransactionsSinceCleanup(transactions, &error) &&
+                    transactions.size() == 1 && transactions.front().mutations.empty() &&
+                    transactions.front().preimage_checkpoint_xid == (legacy ? 0 : 7007),
+                identity + ": empty committed boundary is complete: " + error);
+            std::vector<std::uint64_t> xids{999};
+            const bool loaded = manager.LoadRequiredCheckpointXidsSinceCleanup(xids, &error);
+            valid &= Require(legacy ? (!loaded && xids.empty() &&
+                    error == "Accepted WAL transaction has no preimage checkpoint XID") :
+                (loaded && xids == std::vector<std::uint64_t>{7007}),
+                identity + ": empty committed census preserves exact preimage semantics: " + error);
+            return valid;
+        };
+        {
+            Tx tx(L"Conservative");
+            tx.SetVolumeIdentity(wide_identity);
+            tx.SetJournalPath(path.wstring());
+            if (!Require(tx.Begin() && tx.RecordMutation(MakeMetadataMutation(L"\\prefix.txt")) &&
+                    tx.Accept(111), identity + ": cleanup prefix accepts")) return false;
+            cleanup_sequence = tx.Watermarks().accepted_sequence;
+            if (!Require(tx.MarkApfsDurableThrough(cleanup_sequence) &&
+                    tx.MarkCleanedThrough(cleanup_sequence) && tx.Begin() &&
+                    tx.Commit(legacy ? 0 : 7007), identity + ": empty Commit succeeds")) return false;
+            committed_sequence = tx.LastCommittedSequence();
+            ok &= check(tx);
+        }
+        if (compact)
+        {
+            Wal wal({path, identity, 1024 * 1024});
+            if (!Require(wal.Compact(cleanup_sequence), identity + ": compaction succeeds")) return false;
+        }
+        Tx recovered(L"Conservative");
+        recovered.SetVolumeIdentity(wide_identity);
+        recovered.SetJournalPath(path.wstring());
+        ok &= check(recovered);
+        std::vector<std::uint64_t> xids{999};
+        std::string error;
+        ok &= Require(recovered.MarkCleanedThrough(committed_sequence) &&
+                recovered.LoadRequiredCheckpointXidsSinceCleanup(xids, &error) && xids.empty(),
+            identity + ": durable cleanup releases empty committed boundary");
+    }
+    return ok;
+}
+
+bool TestWalPreimageCheckpointContract(const std::filesystem::path& run_root)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    using Wal = apfsaccess::rw::WriteAheadLog;
+
+    const auto lifecycle_path = run_root / "preimage-checkpoint-lifecycle.wal";
+    Tx lifecycle(L"DeferredContent");
+    lifecycle.SetVolumeIdentity(L"preimage-checkpoint-lifecycle-volume");
+    lifecycle.SetJournalPath(lifecycle_path.wstring());
+
+    auto first_mutation = MakeMetadataMutation(L"\\first-preimage.txt");
+    first_mutation.object_id = 900001;
+    auto first_extra_mutation = MakeMetadataMutation(L"\\first-preimage-extra.txt");
+    first_extra_mutation.object_id = 900002;
+    if (!Require(
+            lifecycle.Begin() &&
+                lifecycle.RecordMutation(first_mutation) &&
+                lifecycle.RecordMutation(first_extra_mutation) &&
+                lifecycle.Accept(900),
+            "accepted transaction should persist its explicit preimage checkpoint XID"))
+    {
+        return false;
+    }
+    const auto first_accepted_sequence = lifecycle.Watermarks().accepted_sequence;
+
+    auto second_mutation = MakeMetadataMutation(L"\\second-preimage.txt");
+    second_mutation.object_id = 700001;
+    std::uint64_t second_accepted_sequence = 0;
+    if (!Require(
+            lifecycle.Begin() &&
+                lifecycle.RecordMutation(second_mutation) &&
+                lifecycle.AcceptForDeferredCommit(&second_accepted_sequence, 700),
+            "deferred acceptance should preserve the legacy sequence output and explicit preimage XID"))
+    {
+        return false;
+    }
+    auto duplicate_preimage_mutation = MakeMetadataMutation(L"\\duplicate-preimage.txt");
+    if (!Require(
+            lifecycle.Begin() &&
+                lifecycle.RecordMutation(duplicate_preimage_mutation) &&
+                lifecycle.Accept(700),
+            "a later accepted transaction may require the same preimage checkpoint XID"))
+    {
+        return false;
+    }
+    const auto final_accepted_sequence = lifecycle.Watermarks().accepted_sequence;
+
+    const auto lifecycle_read = Wal::ReadAll(
+        lifecycle_path,
+        "preimage-checkpoint-lifecycle-volume");
+    std::vector<std::uint64_t> marker_preimage_xids;
+    for (const auto& record : lifecycle_read.records)
+    {
+        if (record.operation == Wal::OperationKind::TransactionMarker &&
+            record.state == Wal::RecordState::Accepted)
+        {
+            marker_preimage_xids.push_back(record.object_id);
+        }
+    }
+    if (!Require(
+            lifecycle_read.status == Wal::ReadStatus::Ok &&
+                marker_preimage_xids == std::vector<std::uint64_t>({900, 700, 700}),
+            "accepted terminal markers should own immutable preimage identities independent of mutation object IDs"))
+    {
+        return false;
+    }
+
+    std::vector<Tx::AcceptedTransaction> accepted;
+    std::string failure_reason;
+    if (!Require(
+            lifecycle.LoadAcceptedTransactionsSinceCleanup(accepted, &failure_reason) &&
+                accepted.size() == 3 &&
+                accepted[0].preimage_checkpoint_xid == 900 &&
+                accepted[1].preimage_checkpoint_xid == 700 &&
+                accepted[2].preimage_checkpoint_xid == 700,
+            "accepted transaction reconstruction should expose each terminal marker preimage XID: " +
+                failure_reason))
+    {
+        return false;
+    }
+
+    std::vector<std::uint64_t> required_checkpoint_xids;
+    if (!Require(
+            lifecycle.LoadRequiredCheckpointXidsSinceCleanup(
+                required_checkpoint_xids,
+                &failure_reason) &&
+                required_checkpoint_xids == std::vector<std::uint64_t>({700, 900}),
+            "required preimage census should be sorted and unique across accepted-sequence gaps: " +
+                failure_reason) ||
+        !Require(
+            !lifecycle.MarkCleanedThrough(first_accepted_sequence),
+            "cleanup must fail before its accepted boundary is APFS-durable") ||
+        !Require(
+            lifecycle.LoadRequiredCheckpointXidsSinceCleanup(
+                required_checkpoint_xids,
+                &failure_reason) &&
+                required_checkpoint_xids == std::vector<std::uint64_t>({700, 900}),
+            "failed cleanup must retain all unresolved preimage checkpoint XIDs: " + failure_reason) ||
+        !Require(
+            lifecycle.MarkApfsDurableThrough(first_accepted_sequence) &&
+                lifecycle.MarkCleanedThrough(first_accepted_sequence),
+            "the first accepted boundary should become durably cleaned") ||
+        !Require(
+            lifecycle.LoadRequiredCheckpointXidsSinceCleanup(
+                required_checkpoint_xids,
+                &failure_reason) &&
+                required_checkpoint_xids == std::vector<std::uint64_t>({700}),
+            "durable cleanup should release only preimages at or below its exact accepted boundary: " +
+                failure_reason) ||
+        !Require(
+            lifecycle.MarkApfsDurableThrough(second_accepted_sequence),
+            "the second accepted boundary should become APFS-durable") ||
+        !Require(
+            lifecycle.LoadRequiredCheckpointXidsSinceCleanup(
+                required_checkpoint_xids,
+                &failure_reason) &&
+                required_checkpoint_xids == std::vector<std::uint64_t>({700}),
+            "APFS-durable and later accepted work must retain their shared preimage XID: " + failure_reason))
+    {
+        return false;
+    }
+
+    Tx restarted(L"DeferredContent");
+    restarted.SetVolumeIdentity(L"preimage-checkpoint-lifecycle-volume");
+    restarted.SetJournalPath(lifecycle_path.wstring());
+    if (!Require(
+            restarted.LoadRequiredCheckpointXidsSinceCleanup(
+                required_checkpoint_xids,
+                &failure_reason) &&
+                required_checkpoint_xids == std::vector<std::uint64_t>({700}),
+            "restart should reconstruct the unresolved preimage marker identity: " + failure_reason) ||
+        !Require(
+            restarted.MarkApfsDurableThrough(final_accepted_sequence) &&
+                restarted.MarkCleanedThrough(final_accepted_sequence),
+            "durable cleanup should advance through the remaining accepted boundary") ||
+        !Require(
+            restarted.LoadRequiredCheckpointXidsSinceCleanup(
+                required_checkpoint_xids,
+                &failure_reason) &&
+                required_checkpoint_xids.empty(),
+            "cleanup should release the final preimage XID: " + failure_reason))
+    {
+        return false;
+    }
+
+    const auto compaction_path = run_root / "preimage-checkpoint-compaction.wal";
+    Tx compacting(L"DeferredContent");
+    compacting.SetJournalMaxBytesForTest(900);
+    compacting.SetVolumeIdentity(L"preimage-checkpoint-compaction-volume");
+    compacting.SetJournalPath(compaction_path.wstring());
+    auto cleaned_mutation = MakeMetadataMutation(L"\\cleaned-before-preimage-compaction.txt");
+    if (!Require(
+            compacting.Begin() && compacting.RecordMutation(cleaned_mutation) && compacting.Accept(111),
+            "compaction fixture should accept its cleaned transaction"))
+    {
+        return false;
+    }
+    const auto cleaned_sequence = compacting.Watermarks().accepted_sequence;
+    if (!Require(
+            compacting.MarkApfsDurableThrough(cleaned_sequence) &&
+                compacting.MarkCleanedThrough(cleaned_sequence),
+            "compaction fixture should clean its first transaction"))
+    {
+        return false;
+    }
+    auto retained_mutation = MakeMetadataMutation(L"\\retained-after-preimage-compaction.txt");
+    if (!Require(
+            compacting.Begin() && compacting.RecordMutation(retained_mutation) && compacting.Accept(222),
+            "size retry should compact and retain the new marker preimage identity"))
+    {
+        return false;
+    }
+    const auto compacted_read = Wal::ReadAll(
+        compaction_path,
+        "preimage-checkpoint-compaction-volume");
+    const auto compacted_marker = std::find_if(
+        compacted_read.records.begin(),
+        compacted_read.records.end(),
+        [](const auto& record)
+        {
+            return record.operation == Wal::OperationKind::TransactionMarker &&
+                record.state == Wal::RecordState::Accepted;
+        });
+    if (!Require(
+            compacted_read.status == Wal::ReadStatus::Ok &&
+                std::any_of(
+                    compacted_read.records.begin(),
+                    compacted_read.records.end(),
+                    [](const auto& record)
+                    {
+                        return record.operation == Wal::OperationKind::CompactionIndex;
+                    }) &&
+                compacted_marker != compacted_read.records.end() &&
+                compacted_marker->object_id == 222,
+            "compaction should preserve the accepted marker preimage XID"))
+    {
+        return false;
+    }
+    Tx compacted_restart(L"DeferredContent");
+    compacted_restart.SetVolumeIdentity(L"preimage-checkpoint-compaction-volume");
+    compacted_restart.SetJournalPath(compaction_path.wstring());
+    if (!Require(
+            compacted_restart.LoadRequiredCheckpointXidsSinceCleanup(
+                required_checkpoint_xids,
+                &failure_reason) &&
+                required_checkpoint_xids == std::vector<std::uint64_t>({222}),
+            "restart after compaction should preserve the unresolved preimage XID: " + failure_reason))
+    {
+        return false;
+    }
+
+    constexpr std::uint64_t wal_flag_accepted = 0x8;
+    const auto make_prepared = [](const std::string& identity, std::uint64_t transaction_id)
+    {
+        Wal::Record record{};
+        record.volume_identity = identity;
+        record.transaction_id = transaction_id;
+        record.sequence = 1;
+        record.operation = Wal::OperationKind::SetBasicInfo;
+        record.state = Wal::RecordState::Prepared;
+        record.object_id = 123456;
+        record.path_utf8 = "\\legacy.txt";
+        return record;
+    };
+    const auto make_accepted_marker = [](
+        const std::string& identity,
+        std::uint64_t transaction_id,
+        std::uint64_t sequence,
+        std::uint64_t preimage_checkpoint_xid)
+    {
+        Wal::Record record{};
+        record.volume_identity = identity;
+        record.transaction_id = transaction_id;
+        record.sequence = sequence;
+        record.operation = Wal::OperationKind::TransactionMarker;
+        record.state = Wal::RecordState::Accepted;
+        record.flags = wal_flag_accepted;
+        record.logical_length = 1;
+        record.object_id = preimage_checkpoint_xid;
+        return record;
+    };
+
+    const auto legacy_path = run_root / "preimage-checkpoint-legacy-zero.wal";
+    const std::string legacy_identity = "preimage-checkpoint-legacy-zero-volume";
+    Wal legacy_wal({legacy_path, legacy_identity, 1024 * 1024});
+    if (!Require(
+            legacy_wal.AppendBatch({
+                make_prepared(legacy_identity, 1),
+                make_accepted_marker(legacy_identity, 1, 2, 0),
+            }),
+            "legacy zero-preimage fixture should persist"))
+    {
+        return false;
+    }
+    Tx legacy(L"DeferredContent");
+    legacy.SetVolumeIdentity(L"preimage-checkpoint-legacy-zero-volume");
+    legacy.SetJournalPath(legacy_path.wstring());
+    accepted.clear();
+    if (!Require(
+            legacy.LoadAcceptedTransactionsSinceCleanup(accepted, &failure_reason) &&
+                accepted.size() == 1 && accepted.front().preimage_checkpoint_xid == 0,
+            "legacy replay should continue exposing a zero preimage marker: " + failure_reason) ||
+        !Require(
+            !legacy.LoadRequiredCheckpointXidsSinceCleanup(
+                required_checkpoint_xids,
+                &failure_reason) &&
+                required_checkpoint_xids.empty() &&
+                !failure_reason.empty() &&
+                legacy.RecoveryStateValid(),
+            "only the new required-preimage census should reject a legacy zero marker"))
+    {
+        return false;
+    }
+
+    const auto conflicting_path = run_root / "preimage-checkpoint-conflicting-terminal.wal";
+    const std::string conflicting_identity = "preimage-checkpoint-conflicting-terminal-volume";
+    Wal conflicting_wal({conflicting_path, conflicting_identity, 1024 * 1024});
+    if (!Require(
+            conflicting_wal.AppendBatch({
+                make_prepared(conflicting_identity, 1),
+                make_accepted_marker(conflicting_identity, 1, 2, 333),
+                make_accepted_marker(conflicting_identity, 1, 3, 444),
+            }),
+            "conflicting terminal identity fixture should persist checksum-valid evidence"))
+    {
+        return false;
+    }
+    Tx conflicting(L"DeferredContent");
+    conflicting.SetVolumeIdentity(L"preimage-checkpoint-conflicting-terminal-volume");
+    conflicting.SetJournalPath(conflicting_path.wstring());
+    return Require(
+               !conflicting.RecoveryStateValid(),
+               "duplicate accepted terminals with conflicting preimage identities must be rejected") &&
+        Require(
+               !conflicting.LoadRequiredCheckpointXidsSinceCleanup(
+                   required_checkpoint_xids,
+                   &failure_reason),
+               "the required-preimage census must not replace a conflicting terminal identity");
+}
+
 } // namespace
 
 int main()
@@ -755,12 +1747,23 @@ int main()
     });
 
     bool ok = true;
+    ok &= TestUnlinkOutcomeAcceptance(run_root);
+    ok &= TestExtendedAttributeAcceptanceAndValidation(run_root);
+    ok &= TestInodeMetadataAcceptance(run_root);
+    ok &= TestAllocationSizeAcceptanceOrder(run_root);
+    ok &= TestDirectoryRestoreAcceptance(run_root);
     ok &= TestPoisonedManagerRejectsFurtherMutationAndReuse(run_root);
     ok &= TestPoisonedManagerRejectsDurabilityWatermarks(run_root);
     ok &= TestRecoveryClearingRequiresCurrentWriterGeneration(run_root);
     ok &= TestConfigurationOrderAndLeaseTransfer(run_root);
     ok &= TestCompactionRetryRetainsCoverageTrust(run_root);
     ok &= TestObserverReadsAndActiveLeaseLoss(run_root);
+    ok &= TestWalPreimageCheckpointContract(run_root);
+    ok &= TestCommittedPreimageCensusDirect(run_root);
+    ok &= TestCommittedPreimageCensusAfterRestart(run_root, false);
+    ok &= TestCommittedPreimageCensusAfterRestart(run_root, true);
+    ok &= TestLegacyCommittedPreimageCensus(run_root);
+    ok &= TestEmptyCommittedPreimageCensus(run_root);
     ok &= Require(tx.CurrentState() == apfsaccess::rw::TransactionManager::State::Idle, "Initial state should be idle");
     ok &= Require(tx.Begin(), "Begin should succeed from idle state");
     ok &= Require(tx.CurrentState() == apfsaccess::rw::TransactionManager::State::Active, "State should be active after begin");
