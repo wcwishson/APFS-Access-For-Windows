@@ -28,7 +28,9 @@ builder.Services.Configure<HostOptions>(options =>
     options.ShutdownTimeout = TimeSpan.FromSeconds((nativeStopSeconds * 2) + 10);
 });
 
-builder.Services.AddSingleton<IMountPolicy>(_ => new FirstFreeMountPolicy(configuredOptions.MountLetterPool));
+builder.Services.AddSingleton(_ => new VolumeDriveLetterAssignments(Path.Combine(runtimeRoot, "volume-drive-letters.json")));
+builder.Services.AddSingleton<IMountPolicy>(sp => new FirstFreeMountPolicy(
+    configuredOptions.MountLetterPool, sp.GetRequiredService<VolumeDriveLetterAssignments>()));
 
 if (string.Equals(configuredOptions.BackendMode, "Native", StringComparison.OrdinalIgnoreCase))
 {
@@ -68,6 +70,7 @@ static string ConfigurePortableRuntimeEnvironment()
     var tempRoot = Path.Combine(runtimeRoot, "temp");
     var spoolRoot = Path.Combine(runtimeRoot, "payload-spool");
 
+    Directory.CreateDirectory(runtimeRoot);
     Directory.CreateDirectory(tempRoot);
     Directory.CreateDirectory(spoolRoot);
 

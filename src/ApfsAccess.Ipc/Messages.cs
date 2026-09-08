@@ -223,5 +223,6 @@ public sealed record MountedVolumeDisplay(
     ulong? CatalogVolumeObjectId = null,
     ApfsCapabilityDecision? CatalogDecision = null,
     IReadOnlyList<string>? CatalogReasons = null,
-    bool? CatalogAutoMountAllowed = null
+    bool? CatalogAutoMountAllowed = null,
+    DriveLetterPreference? DriveLetterPreference = null
 );

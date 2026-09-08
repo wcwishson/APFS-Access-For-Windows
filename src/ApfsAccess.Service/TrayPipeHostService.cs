@@ -324,6 +324,27 @@ public sealed class TrayPipeHostService : BackgroundService
                         await peer.SendAsync(ack, cancellationToken).ConfigureAwait(false);
                         break;
                     }
+                    case ApfsMessageTypes.DriveLetterPreferenceRequested:
+                    {
+                        AckPayload result;
+                        if (!PipeMessageCodec.TryGetPayload<DriveLetterPreferenceRequestPayload>(message, out var preference) || preference is null)
+                            result = new(false, "The drive-letter preference request is malformed.", ApfsOperationCodes.InvalidArguments);
+                        else
+                        {
+                            try
+                            {
+                                using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                                // Cooperative deadline, including owned observer cleanup. Synchronous
+                                // Windows storage calls can finish later; a saved commit still replies success.
+                                deadline.CancelAfter(TimeSpan.FromSeconds(10));
+                                result = await _mountWorker.SetDriveLetterPreferenceAsync(preference, deadline.Token).ConfigureAwait(false);
+                            }
+                            catch (OperationCanceledException) { result = new(false, "Preference processing was cancelled; refresh to confirm the saved setting before retrying.", ApfsOperationCodes.Timeout); }
+                            catch (Exception ex) { result = new(false, ex.Message, ApfsOperationCodes.OperationFailed); }
+                        }
+                        await TrySendAckBestEffortAsync(peer, PipeMessageCodec.Create(ApfsMessageTypes.Ack, result, message.RequestId), cancellationToken).ConfigureAwait(false);
+                        break;
+                    }
                     case ApfsMessageTypes.InventoryRequested:
                     {
                         var inventory = await _mountWorker

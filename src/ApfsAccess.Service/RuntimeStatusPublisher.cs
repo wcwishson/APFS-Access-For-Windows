@@ -67,6 +67,24 @@ public sealed class RuntimeStatusPublisher
         handlers?.Invoke(payload);
     }
 
+    // Installation is atomic with respect to every publisher. Defer notification so
+    // callers can also release their admission lock before invoking arbitrary subscribers.
+    public bool TryPublish(StatusChangedPayload expected, StatusChangedPayload payload, out Action? notification)
+    {
+        ArgumentNullException.ThrowIfNull(expected);
+        ArgumentNullException.ThrowIfNull(payload);
+        notification = null;
+        lock (_sync)
+        {
+            if (!ReferenceEquals(_latest, expected)) return false;
+            var changed = !PayloadSemanticallyEquals(_latest, payload);
+            _latest = payload;
+            var handlers = StatusChanged;
+            if (changed && handlers is not null) notification = () => handlers(payload);
+            return true;
+        }
+    }
+
     private static bool PayloadSemanticallyEquals(StatusChangedPayload left, StatusChangedPayload right)
         => left.State == right.State &&
            SequenceEqualOrdinal(left.MountPoints, right.MountPoints) &&

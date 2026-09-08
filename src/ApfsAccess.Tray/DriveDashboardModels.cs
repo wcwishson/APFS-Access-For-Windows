@@ -37,5 +37,7 @@ public sealed record DriveDashboardRow(
     IReadOnlyList<string> FixGuidance,
     string? CatalogVolumeId = null,
     string? CatalogContainerUuid = null,
-    ulong? CatalogVolumeObjectId = null
+    ulong? CatalogVolumeObjectId = null,
+    string? DeviceId = null,
+    ApfsAccess.Core.DriveLetterPreference? DriveLetterPreference = null
 );

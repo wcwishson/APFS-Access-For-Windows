@@ -120,7 +120,10 @@ public sealed record VolumeInfo(
     ulong? CatalogVolumeObjectId = null,
     ApfsCapabilityDecision? CatalogDecision = null,
     IReadOnlyList<string>? CatalogReasons = null,
-    bool? CatalogAutoMountAllowed = null
+    bool? CatalogAutoMountAllowed = null,
+    string? NativeWriteAdmissionBlockReason = null,
+    string? CatalogVolumeUuid = null,
+    DriveLetterPreference? DriveLetterPreference = null
 );
 
 public sealed record MountRequest(string VolumeId, char DriveLetter, MountAccessMode AccessMode);

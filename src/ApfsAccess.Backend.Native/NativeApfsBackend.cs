@@ -75,6 +75,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
     private readonly IObserverRunner _observerRunner;
     private readonly IReadOnlyList<string> _deviceCandidates;
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly SemaphoreSlim _discoveryGate = new(1, 1);
     private readonly ConcurrentDictionary<string, MountedVolumeState> _mounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, HostProcessState> _hosts = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, HostProcessState> _retainedStartupHosts = new(StringComparer.OrdinalIgnoreCase);
@@ -148,56 +149,59 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
         LoadValidationEvidenceFromDisk();
     }
 
-    public Task<IReadOnlyList<DeviceInfo>> ProbeDevicesAsync(CancellationToken cancellationToken)
+    // Keep a complete observation and its cache publication ordered independently
+    // of mount operations. Synchronous Windows calls run on an owned, awaited task;
+    // cancellation never detaches that task or holds the service mount lock.
+    private async Task<T> ProbeAsync<T>(Func<CancellationToken, T> probe, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         using var operationLease = AcquireLifecycleOperationLease();
-
-        var devices = new List<DeviceInfo>();
-        foreach (var candidate in _deviceCandidates)
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
+        await _discoveryGate.WaitAsync(linked.Token).ConfigureAwait(false);
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            var discovered = DiscoverDevice(candidate);
-            if (discovered is not null)
-            {
-                _deviceDisplayNameById[discovered.DeviceId] = discovered.DisplayName;
-                devices.Add(new DeviceInfo(discovered.DeviceId, discovered.DisplayName, true));
-            }
-            else
-            {
-                _deviceDiscoveryCache.TryRemove(candidate, out _);
-                _deviceDisplayNameById.TryRemove(candidate, out _);
-            }
+            return await Task.Run(() => probe(linked.Token), linked.Token).ConfigureAwait(false);
         }
-
-        return Task.FromResult<IReadOnlyList<DeviceInfo>>(devices);
+        finally { _discoveryGate.Release(); }
     }
+
+    public async Task<IReadOnlyList<DeviceInfo>> ProbeDevicesAsync(CancellationToken cancellationToken)
+        => (await ProbeInventoryAsync(false, cancellationToken).ConfigureAwait(false)).Select(d => d.Device).ToArray();
+
+    public Task<IReadOnlyList<DeviceInventory>> ProbeInventoryAsync(bool authoritative, CancellationToken cancellationToken)
+        => ProbeAsync<IReadOnlyList<DeviceInventory>>(probeToken =>
+        {
+            var inventory = new List<DeviceInventory>();
+            foreach (var candidate in _deviceCandidates)
+            {
+                probeToken.ThrowIfCancellationRequested();
+                var discovered = DiscoverDevice(candidate, authoritative, probeToken);
+                if (discovered is not null)
+                {
+                    _deviceDisplayNameById[candidate] = discovered.DisplayName;
+                    inventory.Add(new(new(candidate, discovered.DisplayName, true),
+                        discovered.Volumes.Select(v => CreateDiscoveredVolumeInfo(candidate, v)).ToArray()));
+                }
+                else
+                {
+                    _deviceDiscoveryCache.TryRemove(candidate, out _);
+                    _deviceDisplayNameById.TryRemove(candidate, out _);
+                }
+            }
+            probeToken.ThrowIfCancellationRequested();
+            return inventory;
+        }, cancellationToken);
 
     public Task<IReadOnlyList<VolumeInfo>> ProbeVolumesAsync(string deviceId, CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
         ArgumentException.ThrowIfNullOrWhiteSpace(deviceId);
-        using var operationLease = AcquireLifecycleOperationLease();
-
-        var discovered = DiscoverDevice(deviceId);
-        if (discovered is null)
+        return ProbeAsync<IReadOnlyList<VolumeInfo>>(probeToken =>
         {
-            return Task.FromResult<IReadOnlyList<VolumeInfo>>(Array.Empty<VolumeInfo>());
-        }
-
-        _deviceDisplayNameById[discovered.DeviceId] = discovered.DisplayName;
-
-        var volumes = discovered.Volumes
-            .Select(discoveredVolume => CreateDiscoveredVolumeInfo(deviceId, discoveredVolume))
-            .ToArray();
-
-        foreach (var volume in volumes)
-        {
-            _volumeCache[volume.VolumeId] = volume;
-        }
-
-        return Task.FromResult<IReadOnlyList<VolumeInfo>>(volumes);
+            var discovered = DiscoverDevice(deviceId, false, probeToken);
+            if (discovered is null) return Array.Empty<VolumeInfo>();
+            _deviceDisplayNameById[deviceId] = discovered.DisplayName;
+            return discovered.Volumes.Select(v => CreateDiscoveredVolumeInfo(deviceId, v)).ToArray();
+        }, cancellationToken);
     }
 
     public async Task<MountResult> MountAsync(MountRequest request, CancellationToken cancellationToken)
@@ -4077,7 +4081,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
             : new[] { writeBlockReason };
         var writeUnsupportedFeatures = Array.Empty<string>();
 
-        volume = new VolumeInfo(
+        volume = ApplyNativeSourceAdmission(new VolumeInfo(
             VolumeId: volumeId,
             DeviceId: deviceId,
             VolumeName: volumeName,
@@ -4090,8 +4094,25 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
             WriteIncompatibilities: writeIncompatibilities,
             WriteUnsupportedFeatures: writeUnsupportedFeatures,
             NativeWriteReadiness: nativeWriteReadiness
-        );
+        ));
         return true;
+    }
+
+    private VolumeInfo ApplyNativeSourceAdmission(VolumeInfo volume)
+    {
+        if (!IsWriteBackendMode(_options.WriteBackendMode, "Native"))
+        {
+            return volume;
+        }
+        var reason = NativeWriteSourceAdmission.GetBlockReason(volume.DeviceId);
+        return reason is null ? volume : volume with
+        {
+            SupportsReadWrite = false,
+            SupportsNativeWrite = false,
+            NativeWriteReadiness = NativeWriteReadiness.Unavailable,
+            WriteBlockReason = reason,
+            NativeWriteAdmissionBlockReason = reason,
+        };
     }
 
     // A3 identity grammar (spec deviation note: the legacy TryParseVolumeId
@@ -4190,7 +4211,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
         // A4 single capability enforcement: with a catalog attachment,
-        // writability derives SOLELY from the capability decision. A
+        // format eligibility derives from the capability decision. A
         // non-Writable decision clamps SupportsReadWrite/SupportsNativeWrite
         // to false and no config or override below may re-enable them (the
         // write-gate policy carries the same catalog check).
@@ -4220,7 +4241,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
 
         _mountTargetsByVolumeId[volumeId] = discoveredVolume.MountTarget;
 
-        return new VolumeInfo(
+        return ApplyNativeSourceAdmission(new VolumeInfo(
             VolumeId: volumeId,
             DeviceId: deviceId,
             VolumeName: discoveredVolume.VolumeName,
@@ -4248,8 +4269,9 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
             CatalogVolumeObjectId: discoveredVolume.Catalog?.VolumeObjectId,
             CatalogDecision: discoveredVolume.Catalog?.Decision,
             CatalogReasons: discoveredVolume.Catalog?.Reasons,
-            CatalogAutoMountAllowed: discoveredVolume.Catalog?.AutoMountAllowed
-        );
+            CatalogAutoMountAllowed: discoveredVolume.Catalog?.AutoMountAllowed,
+            CatalogVolumeUuid: discoveredVolume.CatalogVolumeUuid
+        ));
     }
 
     private async Task<VolumeInfo?> ResolveVolumeAsync(string volumeId, CancellationToken cancellationToken)
@@ -4374,8 +4396,9 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
             $"No authoritative mount target was discovered for volume '{volume.VolumeId}'.");
     }
 
-    private DiscoveredDevice? DiscoverDevice(string deviceId)
+    private DiscoveredDevice? DiscoverDevice(string deviceId, bool authoritative, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (string.IsNullOrWhiteSpace(deviceId))
         {
             return null;
@@ -4383,17 +4406,19 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
 
         if (!TryGetDiscoveryFingerprint(deviceId, out var discoveryFingerprint))
         {
-            return DiscoverDeviceWithoutCache(deviceId);
+            return DiscoverDeviceWithoutCache(deviceId, cancellationToken);
         }
 
-        if (_deviceDiscoveryCache.TryGetValue(deviceId, out var cachedDiscovery) &&
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!authoritative && _deviceDiscoveryCache.TryGetValue(deviceId, out var cachedDiscovery) &&
             cachedDiscovery.Fingerprint.Equals(discoveryFingerprint))
         {
             return cachedDiscovery.Device;
         }
 
         System.Threading.Interlocked.Increment(ref _deviceDiscoveryScanCount);
-        var discoveredVolumes = DiscoverVolumes(deviceId);
+        var discoveredVolumes = DiscoverVolumes(deviceId, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
         if (discoveredVolumes.Count == 0)
         {
             _deviceDiscoveryCache.TryRemove(deviceId, out _);
@@ -4411,10 +4436,11 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
         return discovered;
     }
 
-    private DiscoveredDevice? DiscoverDeviceWithoutCache(string deviceId)
+    private DiscoveredDevice? DiscoverDeviceWithoutCache(string deviceId, CancellationToken cancellationToken)
     {
         System.Threading.Interlocked.Increment(ref _deviceDiscoveryScanCount);
-        var discoveredVolumes = DiscoverVolumes(deviceId);
+        var discoveredVolumes = DiscoverVolumes(deviceId, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
         if (discoveredVolumes.Count == 0)
         {
             _deviceDiscoveryCache.TryRemove(deviceId, out _);
@@ -4426,6 +4452,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
             ? BuildDeviceDisplayName(deviceId)
             : $"APFS Image ({Path.GetFileName(deviceId)})";
 
+        CacheDiscoveredVolumes(discoveredVolumes, deviceId);
         return new DiscoveredDevice(deviceId, displayName, discoveredVolumes);
     }
 
@@ -4458,7 +4485,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
             : storageDescriptorName;
     }
 
-    private IReadOnlyList<DiscoveredVolume> DiscoverVolumes(string deviceId)
+    private IReadOnlyList<DiscoveredVolume> DiscoverVolumes(string deviceId, CancellationToken cancellationToken)
     {
         // A2 observer-primary discovery.
         // - Observer binary missing: byte-identical legacy behavior.
@@ -4473,7 +4500,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
             return BuildLegacyDiscoveredVolumes(deviceId, snapshot: null);
         }
 
-        var snapshot = TryDiscoverTopologySnapshot(deviceId, NativeApfsObserver.DiscoveryProfile, out var observerError);
+        var snapshot = TryDiscoverTopologySnapshot(deviceId, NativeApfsObserver.DiscoveryProfile, out var observerError, cancellationToken);
         if (snapshot is not null)
         {
             _discoveryDiagnostics.TryRemove(deviceId, out _);
@@ -4662,7 +4689,8 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
                         container.Uuid,
                         storeId,
                         partitionId),
-                    Catalog: catalog));
+                    Catalog: catalog,
+                    CatalogVolumeUuid: volume.Uuid));
             }
         }
 
@@ -5625,15 +5653,17 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
         => TryDiscoverTopologySnapshot(devicePath, profile, out _);
 
     internal ApfsTopologySnapshot? TryDiscoverTopologySnapshot(
-        string devicePath, string profile, out string? observerError)
+        string devicePath, string profile, out string? observerError, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(devicePath);
         ArgumentException.ThrowIfNullOrWhiteSpace(profile);
         observerError = null;
         try
         {
-            return RunObserverEvidenceOrThrow(devicePath, profile).Topology;
+            return RunObserverEvidenceOrThrow(devicePath, profile, cancellationToken).Topology;
         }
+        catch (OperationCanceledException) { throw; }
+        catch (ObserverCleanupException) { throw; }
         catch (Exception ex)
         {
             observerError = ex.Message;
@@ -5641,7 +5671,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
         }
     }
 
-    internal ApfsObserverEvidence RunObserverEvidenceOrThrow(string devicePath, string profile)
+    internal ApfsObserverEvidence RunObserverEvidenceOrThrow(string devicePath, string profile, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(devicePath);
         ArgumentException.ThrowIfNullOrWhiteSpace(profile);
@@ -5654,7 +5684,8 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
 
         var slug = NativeApfsObserver.BuildDeviceSlug(devicePath);
         var arguments = NativeApfsObserver.BuildObserverArguments(devicePath, profile, slug);
-        var result = _observerRunner.Run(observerPath, arguments);
+        var result = _observerRunner.Run(observerPath, arguments, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
         if (result.ExitCode != 0)
         {
             throw new InvalidOperationException(
@@ -5731,7 +5762,7 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
 
     private WriteGateDecision EvaluateWriteGateDecision(VolumeInfo volume)
     {
-        return WriteGatePolicy.EvaluateForVolume(_options, volume);
+        return WriteGatePolicy.EvaluateForVolume(_options, ApplyNativeSourceAdmission(volume));
     }
 
     private bool TryResolveVolumeForPolicy(string volumeId, out VolumeInfo volume)
@@ -9335,7 +9366,8 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
         IReadOnlyList<string> WriteUnsupportedFeatures,
         string NativeVolumePath,
         VolumeMountTarget MountTarget,
-        CatalogAttachment? Catalog = null
+        CatalogAttachment? Catalog = null,
+        string? CatalogVolumeUuid = null
     );
 
     // Legacy discovery entry with the identity components needed to rebuild

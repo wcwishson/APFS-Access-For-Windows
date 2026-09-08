@@ -39,8 +39,14 @@ public static class WriteGatePolicy
             return requestDecision;
         }
 
+        if (!string.IsNullOrWhiteSpace(volume.NativeWriteAdmissionBlockReason))
+        {
+            return new WriteGateDecision(false, "NativeSourceAdmissionBlocked",
+                volume.NativeWriteAdmissionBlockReason);
+        }
+
         // A4 single capability enforcement: with a catalog attachment,
-        // writability derives SOLELY from the capability decision. Any
+        // format eligibility derives from the capability decision. Any
         // non-Writable decision blocks here, before (and regardless of) the
         // pilot allow-lists, incompatibility flags, and the testing override
         // below. No flag, config, or override path may re-enable it.

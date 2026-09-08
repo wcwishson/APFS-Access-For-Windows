@@ -7,6 +7,32 @@ namespace ApfsAccess.Service.Tests;
 public sealed class RuntimeStatusPublisherTests
 {
     [Fact]
+    public async Task ConditionalPublicationNotifiesOnlyAfterCallerReleasesLocks()
+    {
+        var publisher = new RuntimeStatusPublisher();
+        var expected = NewPayload();
+        publisher.Publish(expected);
+        var delivered = 0;
+        publisher.StatusChanged += payload =>
+        {
+            // Another thread must be able to acquire the publisher lock during delivery.
+            Assert.True(Task.Run(() => publisher.Latest).Wait(TimeSpan.FromSeconds(2)));
+            Interlocked.Increment(ref delivered);
+        };
+        var projected = expected with { MountedVolumes = expected.MountedVolumes!.Select(m => m with
+            { DriveLetterPreference = new(null, "T", "E", "next-mount", "Saved", "ET", true) }).ToArray() };
+        Assert.True(publisher.TryPublish(expected, projected, out var notification));
+        Assert.Equal(0, delivered);
+        Assert.Same(projected, publisher.Latest);
+        Assert.Equal(expected, projected with { MountedVolumes = expected.MountedVolumes });
+        Assert.NotNull(notification);
+        await Task.Run(notification);
+        Assert.Equal(1, delivered);
+        Assert.True(publisher.TryPublish(projected, projected with { TimestampUtc = projected.TimestampUtc.AddSeconds(1) }, out notification));
+        Assert.Null(notification);
+    }
+
+    [Fact]
     public void Publish_SkipsStatusChangedEvent_WhenOnlyTimestampChanges()
     {
         var publisher = new RuntimeStatusPublisher();

@@ -33,7 +33,7 @@ internal static class Program
     private static readonly string[] ReportedCommands =
     [
         "status", "list", "mount", "fix", "eject", "quit", "query", "cancel",
-        "version", "capabilities", "supervise-fshost",
+        "version", "capabilities", "supervise-fshost", "xattr", "drive-letter",
     ];
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -127,6 +127,12 @@ internal static class Program
         DateTimeOffset? operationDeadlineUtc,
         bool allowInProcessTestPipeMutations)
     {
+        if (args.Length > 0 && string.Equals(args[0], "drive-letter", StringComparison.OrdinalIgnoreCase))
+            return await DriveLetterCommand.RunAsync(args[1..]).ConfigureAwait(false);
+
+        if (args.Length > 0 && string.Equals(args[0], "xattr", StringComparison.OrdinalIgnoreCase))
+            return XattrCommand.Run(args[1..]);
+
         if (args.Length > 0 &&
             string.Equals(args[0], "supervise-fshost", StringComparison.OrdinalIgnoreCase))
         {
@@ -1855,7 +1861,9 @@ internal static class Program
         Console.WriteLine("APFS Access CLI");
         Console.WriteLine("Usage: ApfsAccess.Cli.exe <command> [options]");
         Console.WriteLine();
-        Console.WriteLine("Commands: status, list, mount, fix, eject, quit, query, cancel, version, capabilities");
+        Console.WriteLine("Commands: status, list, mount, fix, eject, quit, query, cancel, version, capabilities, xattr");
+        Console.WriteLine("Use drive-letter --help to save a preferred letter for the next clean mount.");
+        Console.WriteLine("Use xattr help for Mac file attributes and resource forks on a mounted APFS volume.");
         Console.WriteLine("Target options: --device-id ID --volume-id ID");
         Console.WriteLine("Operation options: --operation-id GUID --mode read-write|read-only --recovery-identity VALUE");
         Console.WriteLine("General options: --timeout-ms N --pipe-name NAME --dry-run --no-start-service --require-admin --elevate --human");

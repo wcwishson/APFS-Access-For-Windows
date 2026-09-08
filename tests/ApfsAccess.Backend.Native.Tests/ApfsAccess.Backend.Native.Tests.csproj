@@ -21,6 +21,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\ApfsAccess.Backend.Native\ApfsAccess.Backend.Native.csproj" />
     <ProjectReference Include="..\..\src\ApfsAccess.Core\ApfsAccess.Core.csproj" />
+    <ProjectReference Include="..\..\src\ApfsAccess.Service\ApfsAccess.Service.csproj" />
   </ItemGroup>
 
 </Project>

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using ApfsAccess.Core;
 using ApfsAccess.Ipc;
 using Microsoft.Extensions.Options;
@@ -20,7 +21,15 @@ public sealed class ApfsMountWorker : BackgroundService
     private readonly object _shutdownSync = new();
     private Task<ShutdownPreparationResult>? _shutdownPreparation;
     private long _mountCommandGeneration;
+    private long _mountOperationGeneration;
+    private readonly object _discoveryAdmissionSync = new();
+    private long _discoveryGeneration;
+    private long _admittedDiscoveryGeneration;
+    private DiscoverySnapshot? _admittedDiscovery;
+    private readonly SemaphoreSlim _preferenceOperationLock = new(1, 1);
     private int _shutdownRequested;
+    private readonly ConcurrentDictionary<(string Device, string Volume, string? Catalog, char Letter), string?> _selectedVolumeUuids = new();
+    private IReadOnlyList<VolumeInfo> _preferenceVolumes = Array.Empty<VolumeInfo>();
     private const int MissingVolumeUnmountThreshold = 2;
     public ApfsMountWorker(
         ILogger<ApfsMountWorker> logger,
@@ -119,6 +128,7 @@ public sealed class ApfsMountWorker : BackgroundService
         await _mountOperationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            ++_mountOperationGeneration;
             if (Volatile.Read(ref _shutdownRequested) != 0 ||
                 commandGeneration != Volatile.Read(ref _mountCommandGeneration))
             {
@@ -127,6 +137,7 @@ public sealed class ApfsMountWorker : BackgroundService
 
             await RunCycleCoreAsync(discovery, cancellationToken).ConfigureAwait(false);
         }
+        catch (SelectionSupersededException) { }
         finally
         {
             _mountOperationLock.Release();
@@ -135,18 +146,23 @@ public sealed class ApfsMountWorker : BackgroundService
 
     private async Task<DiscoverySnapshot> DiscoverVolumesAsync(CancellationToken cancellationToken)
     {
+        var generation = Interlocked.Increment(ref _discoveryGeneration);
         var options = _optionsMonitor.CurrentValue;
         var warnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var compatibilityWarnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        var devices = await _backend.ProbeDevicesAsync(cancellationToken).ConfigureAwait(false);
-        var connectedDevices = devices.Where(x => x.IsConnected).ToArray();
+        // Every selection/inventory admission re-observes APFS identities. Partition
+        // layout and image timestamps are insufficient to retain UUID associations.
+        var inventory = (await _backend.ProbeInventoryAsync(authoritative: true, cancellationToken).ConfigureAwait(false))
+            .Select(d => d with { Volumes = d.Volumes.ToArray() }).ToArray();
+        cancellationToken.ThrowIfCancellationRequested();
+        var connectedDevices = inventory.Select(d => d.Device).ToArray();
 
         var discoveredVolumeById = new Dictionary<string, VolumeInfo>(StringComparer.OrdinalIgnoreCase);
         var discoveredVolumes = new List<VolumeInfo>();
-        foreach (var device in connectedDevices)
+        foreach (var item in inventory)
         {
-            var volumes = await _backend.ProbeVolumesAsync(device.DeviceId, cancellationToken).ConfigureAwait(false);
+            var volumes = item.Volumes;
             foreach (var volume in volumes)
             {
                 discoveredVolumes.Add(volume);
@@ -173,8 +189,10 @@ public sealed class ApfsMountWorker : BackgroundService
         }
 
         return new DiscoverySnapshot(
+            generation,
             options,
             connectedDevices,
+            inventory,
             discoveredVolumeById,
             discoveredVolumes,
             warnings.ToArray(),
@@ -193,6 +211,9 @@ public sealed class ApfsMountWorker : BackgroundService
         var options = discovery.Options;
         var connectedDevices = discovery.ConnectedDevices;
         var discoveredVolumeById = discovery.VolumeById;
+        // Keep duplicate rows across devices: deduplicating by routing ID would hide
+        // ambiguous identities. All selection paths run here under the mount lock.
+        if (!TryAdmitDiscovery(discovery)) return;
         var warnings = new HashSet<string>(discovery.Warnings, StringComparer.OrdinalIgnoreCase);
         var compatibilityWarnings = new HashSet<string>(
             discovery.CompatibilityWarnings,
@@ -339,7 +360,8 @@ public sealed class ApfsMountWorker : BackgroundService
                 usedLetters,
                 cancellationToken,
                 deviceDisplayNames,
-                requestedAccessMode).ConfigureAwait(false));
+                requestedAccessMode,
+                discovery.Generation).ConfigureAwait(false));
         }
         else
         {
@@ -351,7 +373,8 @@ public sealed class ApfsMountWorker : BackgroundService
                     usedLetters,
                     cancellationToken,
                     deviceDisplayNames.GetValueOrDefault(volume.DeviceId),
-                    requestedAccessMode).ConfigureAwait(false);
+                    requestedAccessMode,
+                    discovery.Generation).ConfigureAwait(false);
                 mountOutcomes.Add((volume, new MountAttemptOutcome(
                     outcome.Success,
                     outcome.Error,
@@ -412,17 +435,183 @@ public sealed class ApfsMountWorker : BackgroundService
     public async Task<(bool Success, string Message)> EjectAllAsync(CancellationToken cancellationToken)
         => await EjectAsync(null, cancellationToken).ConfigureAwait(false);
 
+    private void UpdatePreferenceDiscovery(IReadOnlyList<VolumeInfo> volumes)
+    {
+        _preferenceVolumes = volumes.ToArray();
+        _mountPolicy.UpdateDiscovery(volumes);
+    }
+
+    // Admission uses a short, I/O-free lock independent of mount operations.
+    // Generation is allocated before discovery starts, so an old slow observation
+    // cannot reinstall identity or clear new ambiguity, even during an eject.
+    private bool TryAdmitDiscovery(DiscoverySnapshot discovery)
+    {
+        lock (_discoveryAdmissionSync)
+        {
+            if (discovery.Generation < _admittedDiscoveryGeneration) return false;
+            if (discovery.Generation == _admittedDiscoveryGeneration) return true;
+            _admittedDiscoveryGeneration = discovery.Generation;
+            _admittedDiscovery = discovery;
+            UpdatePreferenceDiscovery(discovery.Volumes);
+            return true;
+        }
+    }
+
     public async Task<IReadOnlyList<DeviceInventory>> GetInventoryAsync(CancellationToken cancellationToken)
     {
-        var devices = await _backend.ProbeDevicesAsync(cancellationToken).ConfigureAwait(false);
-        var inventory = new List<DeviceInventory>();
-        foreach (var device in devices.Where(static item => item.IsConnected))
+        var discovery = await DiscoverVolumesAsync(cancellationToken).ConfigureAwait(false);
+        var mounts = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+        List<(DeviceInfo Device, (VolumeInfo Volume, Func<DriveLetterPreference?> Preference)[] Volumes)> captured;
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_discoveryAdmissionSync)
         {
-            var volumes = await _backend.ProbeVolumesAsync(device.DeviceId, cancellationToken).ConfigureAwait(false);
-            inventory.Add(new DeviceInventory(device, volumes));
+            if (!TryAdmitDiscovery(discovery)) discovery = _admittedDiscovery!;
+            // Preserve the device bucket returned by discovery, including invalid
+            // cross-device rows that exact-target validation must reject explicitly.
+            captured = discovery.Inventory.Select(d => (d.Device,
+                d.Volumes.Select(v => (v, CaptureInventoryPreference(v, mounts))).ToArray())).ToList();
         }
+        // Preference storage reads may block in Windows; never perform them under
+        // the mount lock, and await their actual completion rather than detach them.
+        return await Task.Run<IReadOnlyList<DeviceInventory>>(() => captured.Select(d => new DeviceInventory(d.Device,
+            d.Volumes.Select(v => v.Volume with { DriveLetterPreference = v.Preference() }).ToArray())).ToArray(), cancellationToken).ConfigureAwait(false);
+    }
 
-        return inventory;
+    public async Task<AckPayload> SetDriveLetterPreferenceAsync(DriveLetterPreferenceRequestPayload request, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(request.DeviceId) || string.IsNullOrWhiteSpace(request.VolumeId) ||
+            !(Guid.TryParseExact(request.VolumeUuid, "D", out var uuid) || Guid.TryParseExact(request.VolumeUuid, "N", out uuid)) ||
+            uuid == Guid.Empty || request.Letter is not { Length: 1 } || char.ToUpperInvariant(request.Letter[0]) is < 'A' or > 'Z')
+            return new(false, "Supply exact device, volume and actual volume UUID, and one letter A-Z.", ApfsOperationCodes.InvalidArguments);
+        await _preferenceOperationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        DriveLetterPreferenceResult result;
+        try
+        {
+            var discovery = await DiscoverVolumesAsync(cancellationToken).ConfigureAwait(false);
+            Func<CancellationToken, DriveLetterPreferenceResult> commit;
+            lock (_discoveryAdmissionSync)
+            {
+                if (Volatile.Read(ref _shutdownRequested) != 0)
+                    return new(false, "Service is stopping. Try again after restart.", ApfsOperationCodes.ServiceUnavailable);
+                if (!TryAdmitDiscovery(discovery))
+                    return new(false, "A newer inventory superseded this validation. Refresh and try again.", ApfsOperationCodes.AmbiguousTarget);
+                var matches = _preferenceVolumes.Where(v => v.DeviceId == request.DeviceId && v.VolumeId == request.VolumeId).ToArray();
+                if (matches.Length != 1)
+                    return new(false, "Volume identity is stale or ambiguous. Refresh and try again.",
+                        matches.Length == 0 ? ApfsOperationCodes.MissingVolume : ApfsOperationCodes.AmbiguousTarget);
+                cancellationToken.ThrowIfCancellationRequested();
+                // Admission captures the exact validated UUID. Subsequent inventory
+                // changes do not retarget an admitted edit to a replacement volume.
+                commit = _mountPolicy.PrepareDriveLetterPreference(matches[0], uuid, request.Letter[0]);
+            }
+
+            result = await Task.Run(() => commit(cancellationToken), cancellationToken).ConfigureAwait(false);
+        }
+        finally { _preferenceOperationLock.Release(); }
+        // Commit owns cancellation semantics: no token checks after a saved result.
+        // Release the edit gate too before display notification can reenter the worker.
+        try { await PublishPreferenceDisplayAsync().ConfigureAwait(false); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Preference result retained; display refresh failed."); }
+        return new(result.Success, result.Message, result.Code, _statusPublisher.Latest);
+    }
+
+    private async Task PublishPreferenceDisplayAsync()
+    {
+        StatusChangedPayload latest;
+        long generation;
+        (MountedVolumeDisplay Display, Func<DriveLetterPreference?> Preference)[] captured;
+        lock (_discoveryAdmissionSync)
+        {
+            latest = _statusPublisher.Latest;
+            generation = _admittedDiscoveryGeneration;
+            captured = (latest.MountedVolumes ?? []).Select(m => (m,
+                CapturePreferenceForDisplay(m.DeviceId, m.VolumeId, m.CatalogVolumeId, m.MountPoint))).ToArray();
+        }
+        var projected = await Task.Run(() => captured.Select(m => m.Display with { DriveLetterPreference = m.Preference() }).ToArray()).ConfigureAwait(false);
+        var payload = latest with { MountedVolumes = projected };
+        Action? notification = null;
+        lock (_discoveryAdmissionSync)
+        {
+            if (generation == _admittedDiscoveryGeneration)
+                _statusPublisher.TryPublish(latest, payload, out notification);
+        }
+        notification?.Invoke();
+    }
+
+    private Func<DriveLetterPreference?> CaptureInventoryPreference(VolumeInfo volume, IReadOnlyList<MountedVolumeState> mounts)
+    {
+        var matches = mounts.Where(m => m.DeviceId == volume.DeviceId && m.VolumeId == volume.VolumeId && m.CatalogVolumeId == volume.CatalogVolumeId).ToArray();
+        var mounted = matches.Length == 1
+            ? CapturePreferenceForDisplay(volume.DeviceId, volume.VolumeId, volume.CatalogVolumeId, matches[0].MountPoint)
+            : null;
+        return () =>
+        {
+            var preference = mounted?.Invoke();
+            return preference?.CanEdit == true ? preference : _mountPolicy.GetDriveLetterPreference(volume, null);
+        };
+    }
+
+    private sealed class SelectionSupersededException : OperationCanceledException;
+
+    private async Task<char> SelectDriveLetterForVolumeAsync(VolumeInfo volume, IReadOnlySet<char> occupied,
+        long discoveryGeneration, CancellationToken cancellationToken)
+    {
+        if (!_mountPolicy.RequiresDriveLetterStorage)
+        {
+            // Preserve ordinary in-memory/legacy policies' mount-command ordering.
+            var immediate = _mountPolicy.SelectDriveLetter(volume, occupied);
+            _selectedVolumeUuids[(volume.DeviceId, volume.VolumeId, volume.CatalogVolumeId, immediate)] = volume.CatalogVolumeUuid;
+            return immediate;
+        }
+        Func<CancellationToken, char> select;
+        var commandGeneration = Volatile.Read(ref _mountCommandGeneration);
+        var operationGeneration = _mountOperationGeneration;
+        lock (_discoveryAdmissionSync)
+        {
+            if (discoveryGeneration != _admittedDiscoveryGeneration || Volatile.Read(ref _shutdownRequested) != 0)
+                throw new SelectionSupersededException();
+            select = _mountPolicy.PrepareDriveLetterSelection(volume, occupied);
+        }
+        char letter;
+        _mountOperationLock.Release();
+        try { letter = await Task.Run(() => select(cancellationToken), cancellationToken).ConfigureAwait(false); }
+        finally
+        {
+            // Restore ownership even on cancellation/failure; the outer operation owns
+            // the matching release. No detached storage work may retain this lock.
+            await _mountOperationLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        ValidateDriveLetterSelection(discoveryGeneration, commandGeneration, operationGeneration, cancellationToken);
+        _selectedVolumeUuids[(volume.DeviceId, volume.VolumeId, volume.CatalogVolumeId, letter)] = volume.CatalogVolumeUuid;
+        return letter;
+    }
+
+    private void ValidateDriveLetterSelection(long discoveryGeneration, long commandGeneration,
+        long operationGeneration, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_discoveryAdmissionSync)
+        {
+            if (discoveryGeneration != _admittedDiscoveryGeneration ||
+                commandGeneration != Volatile.Read(ref _mountCommandGeneration) ||
+                operationGeneration != _mountOperationGeneration || Volatile.Read(ref _shutdownRequested) != 0)
+                throw new SelectionSupersededException();
+        }
+    }
+
+    private DriveLetterPreference? PreferenceForDisplay(string deviceId, string volumeId, string? catalogId, string mountPoint)
+        => CapturePreferenceForDisplay(deviceId, volumeId, catalogId, mountPoint, cached: true)();
+
+    private Func<DriveLetterPreference?> CapturePreferenceForDisplay(string deviceId, string volumeId, string? catalogId, string mountPoint, bool cached = false)
+    {
+        var matches = _preferenceVolumes.Where(v => v.DeviceId == deviceId && v.VolumeId == volumeId && v.CatalogVolumeId == catalogId).ToArray();
+        var letter = mountPoint.Length >= 2 && mountPoint[1] == ':' ? (char?)char.ToUpperInvariant(mountPoint[0]) : null;
+        if (matches.Length != 1 || !letter.HasValue ||
+            !_selectedVolumeUuids.TryGetValue((deviceId, volumeId, catalogId, letter.Value), out var selectedUuid) ||
+            !Guid.TryParse(selectedUuid, out var boundUuid) || !Guid.TryParse(matches[0].CatalogVolumeUuid, out var liveUuid) || boundUuid != liveUuid)
+            return () => new(null, null, letter?.ToString(), "identity-unavailable",
+                "Mounted volume identity is unavailable. Use refreshed inventory or remount before choosing a letter.", "", false);
+        return () => cached ? _mountPolicy.GetCachedDriveLetterPreference(matches[0], letter) : _mountPolicy.GetDriveLetterPreference(matches[0], letter);
     }
 
     public async Task<(bool Success, string Message)> RefreshAsync(
@@ -498,8 +687,19 @@ public sealed class ApfsMountWorker : BackgroundService
         var discovery = await DiscoverVolumesAsync(cancellationToken).ConfigureAwait(false);
 
         await _mountOperationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (!string.IsNullOrWhiteSpace(requestedDeviceId) && !string.IsNullOrWhiteSpace(volumeId) &&
+            Volatile.Read(ref _shutdownRequested) == 0 && commandGeneration == Volatile.Read(ref _mountCommandGeneration))
+        {
+            // Preserve queued exact-target revalidation, but release the mount lock
+            // during the expensive observer/Windows work. Command and discovery
+            // generations below reject observations superseded before re-admission.
+            _mountOperationLock.Release();
+            discovery = await DiscoverVolumesAsync(cancellationToken).ConfigureAwait(false);
+            await _mountOperationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
         try
         {
+            ++_mountOperationGeneration;
             if (Volatile.Read(ref _shutdownRequested) != 0)
             {
                 return (false, "Refresh was rejected because APFS shutdown cleanup has started.");
@@ -510,23 +710,12 @@ public sealed class ApfsMountWorker : BackgroundService
                 return (false, "Refresh was superseded by a newer drive command.");
             }
 
+            if (!TryAdmitDiscovery(discovery))
+                return (false, "Refresh was superseded by a newer inventory observation.");
+
             if (!string.IsNullOrWhiteSpace(requestedDeviceId) &&
                 !string.IsNullOrWhiteSpace(volumeId))
             {
-                // The first discovery happened before waiting for the mutation lock.
-                // Re-probe while holding the lock so a reconnect cannot replace the
-                // requested recovery identity between admission and mutation.
-                discovery = await DiscoverVolumesAsync(cancellationToken).ConfigureAwait(false);
-                if (Volatile.Read(ref _shutdownRequested) != 0)
-                {
-                    return (false, "Refresh was rejected because APFS shutdown cleanup has started.");
-                }
-
-                if (commandGeneration != Volatile.Read(ref _mountCommandGeneration))
-                {
-                    return (false, "Refresh was superseded by a newer drive command.");
-                }
-
                 var exactMatches = discovery.Volumes
                     .Where(volume =>
                         string.Equals(volume.DeviceId, requestedDeviceId, StringComparison.OrdinalIgnoreCase) &&
@@ -548,6 +737,7 @@ public sealed class ApfsMountWorker : BackgroundService
                 return (false, $"Requested APFS volume '{volumeId}' was not found.");
             }
 
+            // The admitted snapshot also covers upgrade-remount letter selection.
             IReadOnlyList<MountedVolumeState>? refreshedMounted = null;
             var remountWarnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (clearUserEjectedVolumes)
@@ -608,6 +798,10 @@ public sealed class ApfsMountWorker : BackgroundService
 
             return (true, "APFS drives refreshed.");
         }
+        catch (SelectionSupersededException)
+        {
+            return (false, "Refresh was superseded while preparing drive-letter settings. Refresh and try again.");
+        }
         finally
         {
             _mountOperationLock.Release();
@@ -658,6 +852,10 @@ public sealed class ApfsMountWorker : BackgroundService
         );
         var stateChanged = false;
         var requiresAuthoritativeRefresh = false;
+        var preparationCommand = Volatile.Read(ref _mountCommandGeneration);
+        var preparationOperation = _mountOperationGeneration;
+        var plannedLetters = new HashSet<char>(usedLetters);
+        var prepared = new List<(MountedVolumeState Mount, VolumeInfo Volume, char? Letter)>();
 
         foreach (var mount in remountCandidates)
         {
@@ -702,12 +900,57 @@ public sealed class ApfsMountWorker : BackgroundService
                 continue;
             }
 
+            char? preparedLetter = null;
+            if (_mountPolicy.RequiresDriveLetterStorage)
+            {
+                // Prepare every upgrade before removing any mount. A later settings
+                // wait may be superseded too; all original mounts must remain usable
+                // by eject and consistent with the published status until then.
+                var occupied = new HashSet<char>(plannedLetters);
+                occupied.Remove(driveLetter.Value);
+                try
+                {
+                    preparedLetter = await SelectDriveLetterForVolumeAsync(
+                        volume, occupied, discovery.Generation, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogWarning(ex, "Could not allocate drive letter for {VolumeId}", volume.VolumeId);
+                    continue;
+                }
+                plannedLetters.Remove(driveLetter.Value);
+                plannedLetters.Add(preparedLetter.Value);
+            }
+            prepared.Add((mount, volume, preparedLetter));
+        }
+
+        if (_mountPolicy.RequiresDriveLetterStorage && prepared.Count > 0)
+        {
+            var current = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+            ValidateDriveLetterSelection(discovery.Generation, preparationCommand, preparationOperation, cancellationToken);
+            // Generation checks cover worker commands. Recheck the backend snapshot
+            // as well: external removal/replacement must not inherit an old plan.
+            // Runtime diagnostics and WAL counters can refresh on the same owner.
+            var ownership = (MountedVolumeState state) => (state.VolumeId, state.DeviceId, state.MountPoint,
+                state.CatalogVolumeId, state.RecoveryIdentity, state.HostProcessId, state.AccessMode);
+            if (current.Count != mounted.Count || !current.Select(ownership).ToHashSet().SetEquals(mounted.Select(ownership)))
+                return current;
+        }
+
+        foreach (var (mount, volume, preparedLetter) in prepared)
+        {
+            var driveLetter = TryGetDriveLetter(mount)!.Value;
+            // An earlier unmount can fail and leave its old letter occupied, even
+            // though preparation anticipated releasing it. Keep this mount intact.
+            if (preparedLetter.HasValue && preparedLetter.Value != driveLetter && usedLetters.Contains(preparedLetter.Value))
+                continue;
+
             var unmount = await UnmountAsync([mount], cancellationToken, warnings).ConfigureAwait(false);
             if (unmount.Removed.Count > 0)
             {
                 stateChanged = true;
                 mountedVolumeIds.Remove(mount.VolumeId);
-                usedLetters.Remove(driveLetter.Value);
+                usedLetters.Remove(driveLetter);
                 mounted.RemoveAll(candidate => string.Equals(
                     candidate.VolumeId,
                     mount.VolumeId,
@@ -729,7 +972,9 @@ public sealed class ApfsMountWorker : BackgroundService
                 usedLetters,
                 cancellationToken,
                 deviceDisplayNames.GetValueOrDefault(volume.DeviceId),
-                requestedAccessMode
+                requestedAccessMode,
+                discovery.Generation,
+                preparedLetter
             ).ConfigureAwait(false);
             if (!success)
             {
@@ -809,6 +1054,7 @@ public sealed class ApfsMountWorker : BackgroundService
         await _mountOperationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            ++_mountOperationGeneration;
             var warnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var mountedBeforeEject = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
             var selectedMounts = SelectMountsForEject(mountedBeforeEject, volumeId, deviceId, recoveryIdentity);
@@ -1010,7 +1256,8 @@ public sealed class ApfsMountWorker : BackgroundService
         HashSet<char> usedLetters,
         CancellationToken cancellationToken,
         IReadOnlyDictionary<string, string> deviceDisplayNames,
-        MountAccessMode? requestedAccessMode)
+        MountAccessMode? requestedAccessMode,
+        long discoveryGeneration)
     {
         var completed = new List<(VolumeInfo, MountAttemptOutcome)>(volumes.Count);
         var prepared = new List<PreparedContainerMount>(volumes.Count);
@@ -1019,10 +1266,10 @@ public sealed class ApfsMountWorker : BackgroundService
             char letter;
             try
             {
-                letter = _mountPolicy.SelectDriveLetter(volume, usedLetters);
+                letter = await SelectDriveLetterForVolumeAsync(volume, usedLetters, discoveryGeneration, cancellationToken).ConfigureAwait(false);
                 usedLetters.Add(letter);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger.LogWarning(ex, "Could not allocate drive letter for {VolumeId}", volume.VolumeId);
                 completed.Add((volume, new MountAttemptOutcome(false, ex.Message, null, null, null)));
@@ -1156,15 +1403,18 @@ public sealed class ApfsMountWorker : BackgroundService
         HashSet<char> usedLetters,
         CancellationToken cancellationToken,
         string? deviceDisplayName = null,
-        MountAccessMode? requestedAccessMode = null
+        MountAccessMode? requestedAccessMode = null,
+        long discoveryGeneration = 0,
+        char? preparedLetter = null
     )
     {
         char letter;
         try
         {
-            letter = _mountPolicy.SelectDriveLetter(volume, usedLetters);
+            if (preparedLetter.HasValue) cancellationToken.ThrowIfCancellationRequested();
+            letter = preparedLetter ?? await SelectDriveLetterForVolumeAsync(volume, usedLetters, discoveryGeneration, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogWarning(ex, "Could not allocate drive letter for {VolumeId}", volume.VolumeId);
             return (false, ex.Message, null, null, null);
@@ -1716,8 +1966,10 @@ public sealed class ApfsMountWorker : BackgroundService
     );
 
     private sealed record DiscoverySnapshot(
+        long Generation,
         ServiceHostOptions Options,
         IReadOnlyList<DeviceInfo> ConnectedDevices,
+        IReadOnlyList<DeviceInventory> Inventory,
         IReadOnlyDictionary<string, VolumeInfo> VolumeById,
         IReadOnlyList<VolumeInfo> Volumes,
         IReadOnlyList<string> Warnings,
@@ -2248,7 +2500,9 @@ public sealed class ApfsMountWorker : BackgroundService
                     .Select(static mount => mount.MountPoint)
                     .OrderBy(static mountPoint => mountPoint, StringComparer.OrdinalIgnoreCase)
                     .ToArray(),
-                MountedVolumes: BuildMountedVolumeDisplays(mounts),
+                MountedVolumes: BuildMountedVolumeDisplays(mounts).Select(m => m with {
+                    DriveLetterPreference = PreferenceForDisplay(m.DeviceId, m.VolumeId, m.CatalogVolumeId, m.MountPoint)
+                }).ToArray(),
                 LastError: lastError,
                 TimestampUtc: DateTime.UtcNow,
                 Warnings: warnings,

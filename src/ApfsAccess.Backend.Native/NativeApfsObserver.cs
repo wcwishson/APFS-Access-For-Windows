@@ -13,25 +13,39 @@ internal sealed record ObserverRunResult(int ExitCode, string StandardOutput, st
 internal interface IObserverRunner
 {
     ObserverRunResult Run(string observerPath, IReadOnlyList<string> arguments);
+
+    // Legacy runners remain source compatible. Production overrides this boundary
+    // and stops the owned observer, rather than timing out only the caller.
+    ObserverRunResult Run(string observerPath, IReadOnlyList<string> arguments, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var result = Run(observerPath, arguments);
+        cancellationToken.ThrowIfCancellationRequested();
+        return result;
+    }
 }
+
+internal sealed class ObserverCleanupException(string message, Exception inner) : IOException(message, inner) { }
 
 internal sealed class ProcessObserverRunner : IObserverRunner
 {
     public TimeSpan Timeout { get; init; } = TimeSpan.FromSeconds(60);
-
     public long MaxOutputBytes { get; init; } = 64L * 1024 * 1024;
-
-    public TimeSpan KillGracePeriod { get; init; } = TimeSpan.FromSeconds(5);
+    public TimeSpan KillGracePeriod { get; init; } = TimeSpan.FromSeconds(2);
 
     public ObserverRunResult Run(string observerPath, IReadOnlyList<string> arguments)
+        => Run(observerPath, arguments, CancellationToken.None);
+
+    public ObserverRunResult Run(string observerPath, IReadOnlyList<string> arguments, CancellationToken cancellationToken)
+        => RunAsync(observerPath, arguments, cancellationToken).GetAwaiter().GetResult();
+
+    private async Task<ObserverRunResult> RunAsync(string observerPath, IReadOnlyList<string> arguments, CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(observerPath);
         ArgumentNullException.ThrowIfNull(arguments);
-        if (MaxOutputBytes < 1)
-        {
-            throw new ArgumentOutOfRangeException(nameof(MaxOutputBytes), "MaxOutputBytes must be positive.");
-        }
-
+        if (MaxOutputBytes < 1) throw new ArgumentOutOfRangeException(nameof(MaxOutputBytes));
+        if (KillGracePeriod <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(KillGracePeriod));
+        cancellationToken.ThrowIfCancellationRequested();
         var psi = new ProcessStartInfo
         {
             FileName = observerPath,
@@ -41,195 +55,77 @@ internal sealed class ProcessObserverRunner : IObserverRunner
             RedirectStandardError = true,
             WorkingDirectory = Path.GetDirectoryName(observerPath) ?? AppContext.BaseDirectory,
         };
-        foreach (var argument in arguments)
-        {
-            psi.ArgumentList.Add(argument);
-        }
+        foreach (var argument in arguments) psi.ArgumentList.Add(argument);
 
-        // A10: both pipes drain concurrently on pool threads so a chatty
-        // child can never wedge the parent in a synchronous ReadToEnd
-        // deadlock (stdout full while we block on stderr or vice versa).
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(Timeout);
         using var process = new Process { StartInfo = psi };
         process.Start();
-        var pid = TryGetProcessId(process);
+        var pid = process.Id;
         var stdoutEncoding = process.StandardOutput.CurrentEncoding;
         var stderrEncoding = process.StandardError.CurrentEncoding;
-        var overrun = new OutputOverrunFlag();
-        var stdoutDrain = Task.Run(() => DrainPipe(process.StandardOutput.BaseStream, process, overrun));
-        var stderrDrain = Task.Run(() => DrainPipe(process.StandardError.BaseStream, process, overrun));
-
-        var exited = process.WaitForExit((int)Math.Min(Timeout.TotalMilliseconds, int.MaxValue));
-        if (!exited || overrun.IsSet)
-        {
-            if (!exited)
-            {
-                KillProcessTree(process);
-                exited = process.WaitForExit((int)Math.Min(KillGracePeriod.TotalMilliseconds, int.MaxValue));
-            }
-
-            if (overrun.IsSet)
-            {
-                throw new InvalidOperationException(
-                    $"ApfsObserver.exe (pid {pid}) exceeded MaxOutputBytes ({MaxOutputBytes} bytes); output truncated and process tree killed.");
-            }
-
-            if (!exited || IsProcessAlive(process, pid))
-            {
-                throw new TimeoutException(
-                    $"ApfsObserver.exe (pid {pid}) did not exit within {Timeout.TotalSeconds} seconds " +
-                    $"and remained alive after the kill grace period.");
-            }
-
-            throw new TimeoutException(
-                $"ApfsObserver.exe (pid {pid}) did not exit within {Timeout.TotalSeconds} seconds.");
-        }
-
-        try
-        {
-            Task.WaitAll([stdoutDrain, stderrDrain], KillGracePeriod);
-        }
-        catch
-        {
-            throw new TimeoutException(
-                $"ApfsObserver.exe (pid {pid}) exited but its output pipes did not drain within {KillGracePeriod.TotalSeconds} seconds.");
-        }
-
-        if (overrun.IsSet)
-        {
-            throw new InvalidOperationException(
-                $"ApfsObserver.exe (pid {pid}) exceeded MaxOutputBytes ({MaxOutputBytes} bytes); output truncated and process tree killed.");
-        }
-
-        return new ObserverRunResult(
-            process.ExitCode,
-            stdoutEncoding.GetString(stdoutDrain.Result),
-            stderrEncoding.GetString(stderrDrain.Result));
-    }
-
-    // Reads one redirected pipe to end, enforcing the per-stream byte cap.
-    // On overrun the whole tree is killed once (idempotent) and the flag is
-    // set; the reader returns its prefix so the sibling drain can finish.
-    private byte[] DrainPipe(Stream pipe, Process process, OutputOverrunFlag overrun)
-    {
-        try
+        var overrun = 0;
+        async Task<byte[]> DrainAsync(Stream pipe)
         {
             using var buffer = new MemoryStream();
             var chunk = new byte[16 * 1024];
             while (true)
             {
-                int read;
-                try
+                var read = await pipe.ReadAsync(chunk, deadline.Token).ConfigureAwait(false);
+                if (read == 0) return buffer.ToArray();
+                if (buffer.Length + read > MaxOutputBytes)
                 {
-                    read = pipe.Read(chunk, 0, chunk.Length);
+                    Interlocked.Exchange(ref overrun, 1);
+                    deadline.Cancel();
+                    throw new InvalidOperationException("Observer output exceeded its byte limit.");
                 }
-                catch (IOException)
-                {
-                    break;
-                }
-                catch (ObjectDisposedException)
-                {
-                    break;
-                }
-
-                if (read <= 0)
-                {
-                    break;
-                }
-
                 buffer.Write(chunk, 0, read);
-                if (buffer.Length > MaxOutputBytes)
-                {
-                    overrun.Set();
-                    KillProcessTree(process);
-                    break;
-                }
             }
+        }
 
-            return buffer.ToArray();
-        }
-        catch (IOException)
-        {
-            return Array.Empty<byte>();
-        }
-        catch (ObjectDisposedException)
-        {
-            return Array.Empty<byte>();
-        }
-    }
-
-    private static void KillProcessTree(Process process)
-    {
+        var stdout = DrainAsync(process.StandardOutput.BaseStream);
+        var stderr = DrainAsync(process.StandardError.BaseStream);
+        var drains = Task.WhenAll(stdout, stderr);
         try
         {
-            if (!process.HasExited)
+            await process.WaitForExitAsync(deadline.Token).ConfigureAwait(false);
+            // Include pipe draining in the execution deadline, including inherited handles.
+            await drains.WaitAsync(deadline.Token).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            return new(process.ExitCode, stdoutEncoding.GetString(stdout.Result), stderrEncoding.GetString(stderr.Result));
+        }
+        catch (Exception failure)
+        {
+            deadline.Cancel();
+            // Only this Process handle and its descendants are owned. Never reacquire
+            // a PID (which might have been recycled) or stop an unrelated host.
+            Exception? cleanupError = null;
+            try
             {
-                process.Kill(entireProcessTree: true);
+                if (!process.HasExited) process.Kill(entireProcessTree: true);
+                using var cleanup = new CancellationTokenSource(KillGracePeriod);
+                await process.WaitForExitAsync(cleanup.Token).ConfigureAwait(false);
+                try { await drains.WaitAsync(cleanup.Token).ConfigureAwait(false); }
+                catch when (drains.IsCompleted) { /* Observe cancellation/output failures. */ }
             }
-        }
-        catch (InvalidOperationException)
-        {
-        }
-        catch (NotSupportedException)
-        {
-        }
-        catch (System.ComponentModel.Win32Exception)
-        {
-        }
-    }
-
-    private static bool IsProcessAlive(Process process, int pid)
-    {
-        try
-        {
-            if (!process.HasExited)
+            catch (Exception ex) { cleanupError = ex; }
+            finally
             {
-                return true;
+                process.StandardOutput.Dispose();
+                process.StandardError.Dispose();
+                // Observe any late pipe fault if Windows could not cancel a read.
+                _ = drains.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
             }
+            if (cleanupError is not null)
+                throw new ObserverCleanupException($"ApfsObserver.exe (pid {pid}) cleanup was not confirmed within {KillGracePeriod.TotalSeconds} seconds.", cleanupError);
+            if (Volatile.Read(ref overrun) != 0)
+                throw new InvalidOperationException($"ApfsObserver.exe (pid {pid}) exceeded MaxOutputBytes ({MaxOutputBytes} bytes); owned process stopped.", failure);
+            if (cancellationToken.IsCancellationRequested)
+                throw new OperationCanceledException($"ApfsObserver.exe (pid {pid}) cancelled; owned process exit confirmed.", failure, cancellationToken);
+            if (failure is OperationCanceledException)
+                throw new TimeoutException($"ApfsObserver.exe (pid {pid}) did not complete within {Timeout.TotalSeconds} seconds; owned process exit confirmed.", failure);
+            throw;
         }
-        catch (InvalidOperationException)
-        {
-            return false;
-        }
-
-        if (pid <= 0)
-        {
-            return false;
-        }
-
-        try
-        {
-            using var probe = Process.GetProcessById(pid);
-            return !probe.HasExited;
-        }
-        catch (ArgumentException)
-        {
-            return false;
-        }
-        catch (InvalidOperationException)
-        {
-            return false;
-        }
-    }
-
-    private static int TryGetProcessId(Process process)
-    {
-        try
-        {
-            return process.Id;
-        }
-        catch
-        {
-            return 0;
-        }
-    }
-
-    private sealed class OutputOverrunFlag
-    {
-        private int _set;
-
-        public bool IsSet => Volatile.Read(ref _set) != 0;
-
-        public void Set() => Interlocked.Exchange(ref _set, 1);
     }
 }
 

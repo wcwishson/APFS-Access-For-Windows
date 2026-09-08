@@ -92,7 +92,7 @@ public static class DriveDashboardPresenter
             State: state,
             Palette: palette,
             StateText: ToStateText(state),
-            Summary: BuildRowSummary(payload, volume, state),
+            Summary: BuildRowSummary(payload, volume, state) + (volume.DriveLetterPreference is { } preference ? " " + preference.Text + "." : string.Empty),
             CanOpen: !string.IsNullOrWhiteSpace(mountPoint),
             CanEject: !string.IsNullOrWhiteSpace(volume.VolumeId) || !string.IsNullOrWhiteSpace(mountPoint),
             CanFix: state is DriveDashboardState.ReadOnly or DriveDashboardState.Attention or DriveDashboardState.Problem,
@@ -100,7 +100,9 @@ public static class DriveDashboardPresenter
             FixGuidance: BuildFixGuidance(state, payload),
             CatalogVolumeId: volume.CatalogVolumeId,
             CatalogContainerUuid: volume.CatalogContainerUuid,
-            CatalogVolumeObjectId: volume.CatalogVolumeObjectId);
+            CatalogVolumeObjectId: volume.CatalogVolumeObjectId,
+            DeviceId: volume.DeviceId,
+            DriveLetterPreference: volume.DriveLetterPreference);
     }
 
     private static DriveDashboardState Classify(StatusChangedPayload payload, MountedVolumeDisplay volume)

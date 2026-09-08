@@ -27,6 +27,14 @@ public sealed class FirstFreeMountPolicyTests
     }
 
     [Fact]
+    public void SelectDriveLetter_NormalizesOccupiedLettersWithoutPersistence()
+    {
+        var policy = new FirstFreeMountPolicy(["p", "Q"]);
+        Assert.Equal('Q', policy.SelectDriveLetter(SampleVolume, new HashSet<char> { 'p' }));
+        Assert.Throws<InvalidOperationException>(() => policy.SelectDriveLetter(SampleVolume, new HashSet<char> { 'p', 'q' }));
+    }
+
+    [Fact]
     public void ShouldAutoMount_ReturnsTrueForAnyVolume()
     {
         var policy = new FirstFreeMountPolicy();

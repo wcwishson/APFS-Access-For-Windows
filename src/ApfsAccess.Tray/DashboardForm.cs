@@ -10,6 +10,7 @@ public sealed class DashboardForm : Form
     private readonly Func<bool, Task>? _setStartWithWindowsAsync;
     private readonly Func<bool, Task>? _setStartMinimizedAsync;
     private readonly Func<Task>? _checkForUpdatesAsync;
+    private readonly Func<DriveDashboardRow, string, Task>? _setDriveLetterAsync;
     private readonly Label _summaryLabel;
     private readonly FlowLayoutPanel _rowsPanel;
     private readonly List<Button> _actionButtons = [];
@@ -33,7 +34,8 @@ public sealed class DashboardForm : Form
         StartupPreferences? startupPreferences = null,
         Func<bool, Task>? setStartWithWindowsAsync = null,
         Func<bool, Task>? setStartMinimizedAsync = null,
-        Func<Task>? checkForUpdatesAsync = null)
+        Func<Task>? checkForUpdatesAsync = null,
+        Func<DriveDashboardRow, string, Task>? setDriveLetterAsync = null)
     {
         _openAsync = openAsync ?? throw new ArgumentNullException(nameof(openAsync));
         _ejectAsync = ejectAsync ?? throw new ArgumentNullException(nameof(ejectAsync));
@@ -41,6 +43,7 @@ public sealed class DashboardForm : Form
         _setStartWithWindowsAsync = setStartWithWindowsAsync;
         _setStartMinimizedAsync = setStartMinimizedAsync;
         _checkForUpdatesAsync = checkForUpdatesAsync;
+        _setDriveLetterAsync = setDriveLetterAsync;
         startupPreferences ??= new StartupPreferences(StartWithWindows: false, StartMinimized: false);
 
         Text = "APFS Access";
@@ -311,6 +314,7 @@ public sealed class DashboardForm : Form
 
     private void UpdateRow(Control root, DriveDashboardRow row)
     {
+        root.Tag = row;
         if (root.Controls.Count == 0 ||
             root.Controls[0] is not TableLayoutPanel layout ||
             layout.Controls.Count < 3)
@@ -349,6 +353,12 @@ public sealed class DashboardForm : Form
                 buttons[2].Enabled = _actionsEnabled && row.CanFix;
                 buttons[3].Tag = true;
                 buttons[3].Enabled = _actionsEnabled;
+                if (buttons.Length >= 5)
+                {
+                    var canEdit = _setDriveLetterAsync is not null && row.DriveLetterPreference?.CanEdit == true;
+                    buttons[4].Tag = canEdit;
+                    buttons[4].Enabled = _actionsEnabled && canEdit;
+                }
             }
         }
 
@@ -460,7 +470,39 @@ public sealed class DashboardForm : Form
             return Task.CompletedTask;
         }));
 
+        container.Tag = row;
+        buttonsPanel.Controls.Add(BuildActionButton(actionButtons, "Drive letter…",
+            _setDriveLetterAsync is not null && row.DriveLetterPreference?.CanEdit == true,
+            () => ChooseDriveLetterAsync((DriveDashboardRow)container.Tag!)));
         return container;
+    }
+
+    private async Task ChooseDriveLetterAsync(DriveDashboardRow row)
+    {
+        if (_setDriveLetterAsync is null || row.DriveLetterPreference is not { CanEdit: true } preference) return;
+        using var dialog = new Form {
+            Text = "Preferred drive letter", StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog, MinimizeBox = false, MaximizeBox = false,
+            AutoScaleMode = AutoScaleMode.Dpi, ClientSize = new Size(440, 200), Font = Font
+        };
+        var panel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown,
+            WrapContents = false, Padding = new Padding(16), AutoScroll = true };
+        panel.Controls.Add(new Label { Text = $"{row.VolumeName} — {preference.VolumeUuid}", AutoSize = true });
+        panel.Controls.Add(new Label { Text = preference.Text + ".", AutoSize = true });
+        panel.Controls.Add(new Label { Text = "Applies on the next clean mount. Current work continues.", AutoSize = true });
+        var chooser = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList,
+            AccessibleName = "Preferred drive letter", Width = 110 };
+        chooser.Items.AddRange(preference.AllowedLetters.Select(c => (object)$"{c}:").ToArray());
+        chooser.SelectedItem = (preference.PreferredLetter ?? preference.ActualLetter) + ":";
+        if (chooser.SelectedIndex < 0 && chooser.Items.Count > 0) chooser.SelectedIndex = 0;
+        panel.Controls.Add(chooser);
+        var actions = new FlowLayoutPanel { AutoSize = true };
+        var save = new Button { Text = "Save", DialogResult = DialogResult.OK, Enabled = chooser.Items.Count > 0 };
+        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel };
+        actions.Controls.Add(save); actions.Controls.Add(cancel); panel.Controls.Add(actions);
+        dialog.Controls.Add(panel); dialog.AcceptButton = save; dialog.CancelButton = cancel;
+        if (dialog.ShowDialog(this) == DialogResult.OK && chooser.SelectedItem is string selected)
+            await RunActionAsync("Saving preferred letter…", () => _setDriveLetterAsync(row, selected[..1])).ConfigureAwait(true);
     }
 
     private Control BuildStartupPreferencesPanel(StartupPreferences startupPreferences)

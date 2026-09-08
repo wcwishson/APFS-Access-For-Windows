@@ -85,7 +85,8 @@ private PipePeer? _statusPeer;
             startupPreferences,
             SetStartWithWindowsAsync,
             SetStartMinimizedAsync,
-            HandleUpdateButtonAsync);
+            HandleUpdateButtonAsync,
+            SetDriveLetterPreferenceAsync);
 if (!startupPreferences.StartMinimized)
         {
             _dashboard.Show();
@@ -965,6 +966,16 @@ private void HandleServiceStopping()
             $"volumeId='{volumeId ?? "<all>"}'",
             "Timed out waiting for APFS Access to fix drives.")
             .ConfigureAwait(false);
+
+    private async Task SetDriveLetterPreferenceAsync(DriveDashboardRow row, string letter)
+    {
+        if (row.DeviceId is null || row.DriveLetterPreference is not { CanEdit: true, VolumeUuid: not null } preference)
+            throw new InvalidOperationException("Volume identity is unavailable. Refresh and try again.");
+        var result = await TrySendRequestAsync(ApfsMessageTypes.DriveLetterPreferenceRequested,
+            new DriveLetterPreferenceRequestPayload(row.DeviceId, row.VolumeId, preference.VolumeUuid, letter),
+            TimeSpan.FromSeconds(15), "Save preferred drive letter", "Preference request timed out; refresh before retrying.").ConfigureAwait(false);
+        if (!result.Success) throw new InvalidOperationException(result.Message ?? "Could not save the preferred letter.");
+    }
 
     private async Task<(bool Success, string? Message)> TrySendRequestAsync(
         string messageType,

@@ -837,6 +837,7 @@ public static class PipeMessageCodec
             ApfsMessageTypes.ServiceStopping or
             ApfsMessageTypes.EjectRequested or
             ApfsMessageTypes.RefreshRequested or
+            ApfsMessageTypes.DriveLetterPreferenceRequested or
             ApfsMessageTypes.InventoryRequested or
             ApfsMessageTypes.MountRequested or
             ApfsMessageTypes.FixRequested or

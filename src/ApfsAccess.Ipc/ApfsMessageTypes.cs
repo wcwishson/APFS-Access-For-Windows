@@ -16,6 +16,7 @@ public static class ApfsMessageTypes
     public const string CancellationRequest = "CancellationRequest";
     public const string OperationResult = "OperationResult";
     public const string Ack = "Ack";
+    public const string DriveLetterPreferenceRequested = "DriveLetterPreferenceRequested";
     public const string Ping = "Ping";
     public const string Pong = "Pong";
 }
