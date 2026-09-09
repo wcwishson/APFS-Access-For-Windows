@@ -21,6 +21,7 @@
 
 #include "ApfsContainerCatalog.h"
 #include "ApfsFormat.h"
+#include "ApfsSnapshotStore.h"
 #ifdef _WIN32
 #include "BlockDevice.h"
 #endif
@@ -29,6 +30,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -53,6 +55,8 @@ int Usage()
                  "--mode fusion [--device-id <slug>] [--out <file>]\n"
               << "  ApfsObserver --device <path> --profile <name> --mode collect "
                  "[--device-id <slug>] [--out <file>]\n"
+              << "  ApfsObserver --image <file> --mode snapshots --container-uuid <hex32> "
+                 "--volume-oid <decimal> [--out <file>]\n"
               << "  ApfsObserver --help\n";
     return 2;
 }
@@ -905,6 +909,8 @@ struct ObserverOptions
     std::string mode;
     std::string device_id;
     std::string out_path;
+    std::string container_uuid;
+    std::string volume_oid;
 };
 
 ObserverOptions ParseOptions(int argc, char** argv)
@@ -952,6 +958,14 @@ ObserverOptions ParseOptions(int argc, char** argv)
         {
             options.out_path = need_value("--out");
         }
+        else if (arg == "--container-uuid")
+        {
+            options.container_uuid = need_value("--container-uuid");
+        }
+        else if (arg == "--volume-oid")
+        {
+            options.volume_oid = need_value("--volume-oid");
+        }
         else if (arg == "--help" || arg == "-h" || arg == "/?")
         {
             std::exit(Usage());
@@ -978,19 +992,19 @@ void ValidateOptions(const ObserverOptions& options)
     {
         Fail("fusion mode requires both --store-a and --store-b");
     }
-    if (options.profile.empty())
+    if (options.profile.empty() && options.mode != "snapshots")
     {
         Fail("--profile is required");
     }
-    if (options.mode != "collect" && options.mode != "fusion")
+    if (options.mode != "collect" && options.mode != "fusion" && options.mode != "snapshots")
     {
-        Fail("--mode must be collect or fusion");
+        Fail("--mode must be collect, fusion, or snapshots");
     }
     if (has_fusion && options.mode != "fusion")
     {
         Fail("two-store inputs require --mode fusion");
     }
-    if ((has_image || has_device) && options.mode != "collect")
+    if ((has_image || has_device) && options.mode != "collect" && options.mode != "snapshots")
     {
         Fail("single inputs require --mode collect");
     }
@@ -998,6 +1012,107 @@ void ValidateOptions(const ObserverOptions& options)
     {
         Fail("--device-id must match [A-Za-z0-9_.-]{1,128}");
     }
+    if (options.mode == "snapshots")
+    {
+        if (!has_image || has_fusion || has_device)
+            Fail("snapshot inventory requires one regular --image input");
+        if (options.container_uuid.size() != 32 ||
+            options.container_uuid.find_first_not_of("0123456789abcdef") != std::string::npos ||
+            options.container_uuid == std::string(32, '0'))
+            Fail("--container-uuid must be a nonzero lowercase 32-digit hex UUID");
+        std::uint64_t oid = 0;
+        const auto parsed = std::from_chars(options.volume_oid.data(),
+            options.volume_oid.data() + options.volume_oid.size(), oid);
+        if (parsed.ec != std::errc{} || parsed.ptr != options.volume_oid.data() + options.volume_oid.size() ||
+            oid == 0 || options.volume_oid != std::to_string(oid))
+            Fail("--volume-oid must be a nonzero canonical decimal object ID");
+    }
+    else if (!options.container_uuid.empty() || !options.volume_oid.empty())
+        Fail("snapshot selectors require --mode snapshots");
+}
+
+int ObserveSnapshots(const ObserverOptions& options)
+{
+    using namespace apfsaccess::catalog;
+    RequireRegularInputFile(options.image, "snapshot input");
+    HeldFileSource source(options.image);
+    if (!source.IsOpen()) Fail("cannot open snapshot input");
+    const auto digest = HashHeldSource(source, options.image);
+    auto budget = std::make_shared<ApfsReadBudget>(65536, 256ull * 1024 * 1024,
+        1024 * 1024, 256ull * 1024 * 1024);
+    BudgetedRandomAccessSource bounded(source, budget);
+    ApfsContainerCatalog catalog;
+    std::string error;
+    if (!ApfsContainerCatalog::TryLoadImage(bounded, "snapshot-inventory", options.image,
+            catalog, error, CatalogLoadPolicy::StrictApple))
+        Fail("snapshot catalog failed: " + error);
+    std::uint64_t oid = 0;
+    std::from_chars(options.volume_oid.data(), options.volume_oid.data() + options.volume_oid.size(), oid);
+    ResolvedMountVolume volume;
+    if (!catalog.TryResolveVolume(options.container_uuid, oid, volume, error))
+        Fail("snapshot volume selection failed: " + error);
+    const ApfsContainerDescriptor* container = nullptr;
+    const ApfsPhysicalStoreDescriptor* store = nullptr;
+    for (const auto& item : catalog.Containers())
+    {
+        if (item.container_uuid_hex != options.container_uuid) continue;
+        if (container) Fail("ambiguous snapshot container");
+        container = &item;
+    }
+    if (!container || container->fusion || container->member_store_ids.size() != 1)
+        Fail("snapshot inventory requires an exact single-store container");
+    for (const auto& item : catalog.Stores())
+    {
+        if (item.stable_store_id != container->member_store_ids.front()) continue;
+        if (store || item.container_uuid_hex != options.container_uuid)
+            Fail("ambiguous snapshot store");
+        store = &item;
+    }
+    if (!store) Fail("snapshot store is absent");
+    const ApfsSnapshotScope scope{store->offset_bytes, store->size_bytes,
+        options.container_uuid, volume.volume_uuid_hex, oid, container->checkpoint_xid};
+    std::vector<ApfsSnapshotInfo> snapshots;
+    if (!ApfsSnapshotStore::Enumerate(bounded, scope, snapshots, error))
+        Fail("snapshot enumeration failed: " + error);
+    if (!source.VerifyUnchanged(error)) Fail("snapshot input changed: " + error);
+
+    JsonWriter json;
+    json.BeginObject();
+    json.Key("format"); json.String("apfs-access-snapshot-inventory");
+    json.Key("version"); json.Integer(1);
+    json.Key("readOnly"); json.Bool(true);
+    json.Key("source"); WriteSource(json, "image", options.image, digest.size_bytes, "full", digest.hex);
+    json.Key("containerUuid"); json.String(scope.container_uuid_hex);
+    json.Key("volumeUuid"); json.String(scope.volume_uuid_hex);
+    json.Key("volumeId"); json.String("apfs-vol:" + scope.container_uuid_hex + ":" + options.volume_oid);
+    // Identities and nanosecond counters stay exact in JavaScript JSON consumers.
+    json.Key("volumeOid"); json.String(options.volume_oid);
+    json.Key("checkpointXid"); json.String(std::to_string(scope.checkpoint_xid));
+    json.Key("storeOffsetBytes"); json.String(std::to_string(scope.store_offset_bytes));
+    json.Key("storeSizeBytes"); json.String(std::to_string(scope.store_size_bytes));
+    json.Key("snapshots"); json.BeginArray();
+    for (const auto& snapshot : snapshots)
+    {
+        const auto& id = snapshot.identity;
+        json.BeginObject();
+        json.Key("xid"); json.String(std::to_string(id.snapshot_xid));
+        json.Key("name"); json.String(id.name_utf8);
+        json.Key("uuid");
+        if (snapshot.snapshot_uuid_hex) json.String(*snapshot.snapshot_uuid_hex);
+        else json.Null();
+        json.Key("createTimeNs"); json.String(std::to_string(snapshot.metadata.create_time_ns));
+        json.Key("superblockPhysicalBlock"); json.String(std::to_string(id.superblock_physical_block));
+        json.Key("omapPhysicalBlock"); json.String(std::to_string(id.omap_physical_block));
+        json.Key("omapTreePhysicalBlock"); json.String(std::to_string(id.omap_tree_physical_block));
+        json.Key("rootOid"); json.String(std::to_string(id.root_oid));
+        json.Key("rootPhysicalBlock"); json.String(std::to_string(id.root_physical_block));
+        json.Key("extentrefPhysicalBlock"); json.String(std::to_string(id.extentref_physical_block));
+        json.EndObject();
+    }
+    json.EndArray(); json.EndObject();
+    if (options.out_path.empty()) std::cout << json.Text() << "\n";
+    else PublishEvidence(json.Text(), options.out_path, {options.image});
+    return 0;
 }
 
 std::string DefaultDeviceId(const std::string& path, const std::string& fallback)
@@ -1030,6 +1145,7 @@ int main(int argc, char** argv)
     }
     const ObserverOptions options = ParseOptions(argc, argv);
     ValidateOptions(options);
+    if (options.mode == "snapshots") return ObserveSnapshots(options);
 
     using apfsaccess::catalog::ApfsContainerCatalog;
     using apfsaccess::catalog::HeldFileSource;

@@ -15,6 +15,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -224,6 +225,12 @@ struct BtreeRecord
     std::vector<std::byte> value;
 };
 
+struct BtreeVirtualChildMapping
+{
+    std::uint64_t physical_block = 0;
+    std::uint64_t xid = 0;
+};
+
 struct BtreeReadPolicy
 {
     // Resource policy comes from source.ReadBudget(), shared across all trees
@@ -236,6 +243,14 @@ struct BtreeReadPolicy
     const ContainerCheckpointView* ephemeral_checkpoint = nullptr;
     std::vector<std::uint64_t>* visited_physical_blocks = nullptr;
     bool require_complete_traversal = false;
+    // Snapshot walks accept only understood, header-bearing node layouts.
+    bool reject_unsupported_flags = false;
+    // Resolve historical virtual children through a checkpoint-bound OMAP.
+    // Retain the selected mapping XID: the referenced header must not be newer
+    // than either that version or the walk's XID limit. OMAP generation is
+    // bounded independently by the resolver. Empty preserves legacy lookup.
+    std::function<std::optional<BtreeVirtualChildMapping>(std::uint64_t, std::string&)>
+        virtual_child_resolver;
 };
 
 // Reads all leaf records under `root_block`, mirroring
@@ -493,6 +508,26 @@ struct AppleCheckpointView
     AppleSpacemanView spaceman;
     std::vector<AppleVolumeCheckpointView> volumes;
 };
+
+// Raw snapshot metadata, decoded only by ApfsFormat. Base snapshot records
+// carry XID/name, not UUID. Extended UUID metadata is explicitly unsupported.
+struct AppleSnapshotRecord
+{
+    std::uint64_t xid = 0;
+    std::string name_utf8;
+    std::uint64_t create_time_ns = 0;
+    std::uint64_t change_time_ns = 0;
+    std::uint64_t inum = 0; // opaque Apple field, preserved without interpretation
+    std::uint32_t flags = 0;
+    AppleVolumeCheckpointView volume;
+};
+
+// The source is store-relative and bounded to the NXSB geometry. The supplied
+// checkpoint must come from LoadAppleCheckpointView on this same stable source.
+// On any failure no partial inventory escapes. This grants no write authority.
+bool LoadAppleSnapshotRecords(const RandomAccessSource& source,
+    const AppleCheckpointView& checkpoint, std::uint64_t volume_oid,
+    std::vector<AppleSnapshotRecord>& out_records, std::string& out_error);
 
 // Loads all transaction roots needed by the native reader and writer from one
 // complete descriptor-ring generation. This API is strict: legacy two-copy

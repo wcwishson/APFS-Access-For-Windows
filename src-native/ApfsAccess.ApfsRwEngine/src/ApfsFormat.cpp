@@ -1078,16 +1078,19 @@ bool ReadBtreeLeafRecords(
         std::uint64_t object_id = 0;
         bool root = false;
         std::optional<std::uint16_t> expected_level;
+        std::optional<std::uint64_t> mapping_xid;
     };
     std::queue<PendingNode> pending;
     if (!Materialize(source, 0, sizeof(PendingNode))) return false;
-    pending.push({root_block, policy.root_object_id, true, std::nullopt});
+    pending.push({root_block, policy.root_object_id, true, std::nullopt, std::nullopt});
     std::unordered_set<std::uint64_t> visited;
     if (!source.ReadBudget()) visited.reserve(kMaxVisitedBlocks);
     std::vector<std::byte> block;
     bool root_layout_seen = false;
     std::uint32_t tree_key_size = 0;
     std::uint32_t tree_value_size = 0;
+    std::uint64_t declared_key_count = 0;
+    std::uint64_t declared_node_count = 0;
     while (!pending.empty())
     {
         const PendingNode current = pending.front();
@@ -1123,10 +1126,11 @@ bool ReadBtreeLeafRecords(
             out_error = "CatalogBtreeChecksumInvalid";
             return false;
         }
-        if (max_xid_hint != 0)
+        if (max_xid_hint != 0 || current.mapping_xid)
         {
             const std::uint64_t node_xid = ReadU64LE(block, 0x10).value_or(0xFFFFFFFFFFFFFFFFull);
-            if (node_xid > max_xid_hint)
+            if ((max_xid_hint != 0 && node_xid > max_xid_hint) ||
+                (current.mapping_xid && node_xid > *current.mapping_xid))
             {
                 out_error = "CatalogBtreeFutureXid";
                 return false;
@@ -1173,6 +1177,13 @@ bool ReadBtreeLeafRecords(
             policy.visited_physical_blocks->push_back(block_index);
         }
         const std::uint16_t flags = ReadU16LE(block, 0x20).value_or(0);
+        if (policy.reject_unsupported_flags &&
+            ((full_object_type & ~(kObjectStorageTypeMask | kObjectTypeMask)) != 0 ||
+             (flags & ~0x0007u) != 0 || ReadU64LE(block, 0x10).value_or(0) == 0))
+        {
+            out_error = "CatalogBtreeUnsupportedFlagsOrZeroXid";
+            return false;
+        }
         const std::uint16_t level = ReadU16LE(block, 0x22).value_or(0xFFFFu);
         const std::uint32_t key_count = ReadU32LE(block, 0x24).value_or(kMaxBtreeRecords + 1);
         const std::uint16_t table_offset = ReadU16LE(block, 0x28).value_or(0xFFFFu);
@@ -1212,6 +1223,23 @@ bool ReadBtreeLeafRecords(
         const std::size_t info_start = is_root ? (block.size() - 40) : block.size();
         if (is_root)
         {
+            if (policy.reject_unsupported_flags)
+            {
+                const auto tree_flags = ReadU32LE(block, info_start).value_or(~0u);
+                const auto storage = full_object_type & kObjectStorageTypeMask;
+                // Accept the understood persistent layouts and hints.
+                // NONPERSISTENT, hashes, no-header, and actual ghost records
+                // are not supported by this strict on-disk traversal.
+                if ((tree_flags & ~0x7Fu) != 0 || (tree_flags & 0x20u) != 0 ||
+                    ((tree_flags & 0x10u) != 0) != (storage == kObjectPhysical) ||
+                    ((tree_flags & 0x08u) != 0) != (storage == kObjectEphemeral))
+                {
+                    out_error = "CatalogBtreeUnsupportedTreeFlags";
+                    return false;
+                }
+                declared_key_count = ReadU64LE(block, info_start + 24).value_or(~0ull);
+                declared_node_count = ReadU64LE(block, info_start + 32).value_or(0);
+            }
             const auto node_size = ReadU32LE(block, info_start + 4).value_or(0);
             tree_key_size = ReadU32LE(block, info_start + 8).value_or(0);
             tree_value_size = ReadU32LE(block, info_start + 12).value_or(0);
@@ -1341,6 +1369,11 @@ bool ReadBtreeLeafRecords(
                 out_error = "CatalogBtreeChildInvalid";
                 return false;
             }
+            if (policy.reject_unsupported_flags && value_length != sizeof(std::uint64_t))
+            {
+                out_error = "CatalogBtreeUnsupportedChildValue";
+                return false;
+            }
             std::uint64_t child_object_id = 0;
             for (int b = 0; b < 8; ++b)
             {
@@ -1348,6 +1381,7 @@ bool ReadBtreeLeafRecords(
                     block[value_start + static_cast<std::size_t>(b)])) << (b * 8);
             }
             std::uint64_t child_block = child_object_id;
+            std::optional<std::uint64_t> child_mapping_xid;
             if (policy.require_complete_traversal && child_object_id == 0)
             {
                 out_error = "CatalogBtreeChildInvalid";
@@ -1355,7 +1389,14 @@ bool ReadBtreeLeafRecords(
             }
             if (!child_addresses_are_physical)
             {
-                if (policy.ephemeral_checkpoint != nullptr &&
+                if (policy.virtual_child_resolver)
+                {
+                    const auto mapped = policy.virtual_child_resolver(child_object_id, out_error);
+                    if (!mapped || mapped->physical_block == 0) return false;
+                    child_block = mapped->physical_block;
+                    child_mapping_xid = mapped->xid;
+                }
+                else if (policy.ephemeral_checkpoint != nullptr &&
                     (policy.storage_type & kObjectStorageTypeMask) == kObjectEphemeral)
                 {
                     const auto& mappings = policy.ephemeral_checkpoint->mappings;
@@ -1388,9 +1429,16 @@ bool ReadBtreeLeafRecords(
             if (child_block != 0)
             {
                 if (!Materialize(source, 0, sizeof(PendingNode))) return false;
-                pending.push({child_block, child_object_id, false, static_cast<std::uint16_t>(level - 1)});
+                pending.push({child_block, child_object_id, false,
+                    static_cast<std::uint16_t>(level - 1), child_mapping_xid});
             }
         }
+    }
+    if (policy.reject_unsupported_flags &&
+        (declared_key_count != out_records.size() || declared_node_count != visited.size()))
+    {
+        out_error = "CatalogBtreeDeclaredCountsMismatch";
+        return false;
     }
     complete = true;
     return true;
@@ -1740,7 +1788,9 @@ std::optional<OmapValue> ResolveAppleOmapValue(
     std::uint64_t oid,
     std::uint64_t max_xid,
     const std::string& error_prefix,
-    std::string& out_error)
+    std::string& out_error,
+    std::uint64_t tree_max_xid = 0,
+    bool strict_snapshot = false)
 {
     std::vector<BtreeRecord> records;
     BtreeReadPolicy policy;
@@ -1749,9 +1799,10 @@ std::optional<OmapValue> ResolveAppleOmapValue(
     policy.storage_type = kObjectPhysical;
     policy.subtype = kObjectTypeOmap;
     policy.require_complete_traversal = true;
+    policy.reject_unsupported_flags = strict_snapshot;
     std::string tree_error;
     if (!ReadBtreeLeafRecords(source, block_size, map.tree.physical_block,
-            true, 0, max_xid, policy, records, tree_error))
+            true, 0, tree_max_xid == 0 ? max_xid : tree_max_xid, policy, records, tree_error))
     {
         out_error = error_prefix + "TreeInvalid:" + tree_error;
         return std::nullopt;
@@ -1770,6 +1821,13 @@ std::optional<OmapValue> ResolveAppleOmapValue(
             0xFFFFFFFFFFFFFFFFull);
         const auto candidate_xid = ReadU64LE(record.key, 8).value_or(
             0xFFFFFFFFFFFFFFFFull);
+        if (strict_snapshot && (candidate_oid == 0 || candidate_xid == 0 ||
+            candidate_xid > tree_max_xid ||
+            (ReadU32LE(record.value, 0).value() & ~0x3u) != 0))
+        {
+            out_error = error_prefix + "UnsupportedRecordFlagsOrXid";
+            return std::nullopt;
+        }
         if (!Materialize(source, 0, 2 * sizeof(std::uint64_t))) return std::nullopt;
         if (!seen_xids[candidate_oid].insert(candidate_xid).second)
         {
@@ -2721,6 +2779,359 @@ std::optional<AppleCheckpointView> LoadAppleCheckpointView(
         return std::nullopt;
     }
     return view;
+}
+
+namespace
+{
+bool SnapshotVolumeSupported(const std::vector<std::byte>& bytes,
+    const ApsbVolume& volume, std::string& error)
+{
+    if (volume.uuid_hex.empty() || !volume.name_valid || volume.xid == 0)
+    {
+        error = "SnapshotVolumeIdentityInvalid";
+        return false;
+    }
+    if (volume.fs_flags != kFsFlagUnencrypted ||
+        (volume.features & ~kVolumeKnownOptionalFeaturesMask) != 0 ||
+        volume.readonly_features != 0 ||
+        (volume.incompatible_features & ~kVolumeSupportedIncompatibleFeaturesMask) != 0)
+    {
+        error = "SnapshotVolumeFeaturesUnsupported";
+        return false;
+    }
+    // [APPLE] apfs_superblock_t: revert, encryption state, extended snapshot
+    // metadata, sealed integrity/fext, and reserved tail fields. These need
+    // their own semantics; an unsupported layout must never look empty.
+    if (ReadU64LE(bytes, 0x3E8).value_or(~0ull) != 0)
+    {
+        error = "SnapshotExtendedMetadataUnsupported";
+        return false;
+    }
+    if (ReadU64LE(bytes, 0xA0).value_or(~0ull) != 0 ||
+        ReadU64LE(bytes, 0xA8).value_or(~0ull) != 0 ||
+        ReadU16LE(bytes, 0x3C6).value_or(~0u) != 0 ||
+        ReadU64LE(bytes, 0x3C8).value_or(~0ull) != 0 ||
+        ReadU64LE(bytes, 0x3D0).value_or(~0ull) != 0 ||
+        ReadU64LE(bytes, 0x400).value_or(~0ull) != 0 ||
+        volume.fext_tree_oid != 0 || volume.fext_tree_type != 0 ||
+        ReadU32LE(bytes, 0x414).value_or(~0u) != 0 ||
+        ReadU64LE(bytes, 0x418).value_or(~0ull) != 0)
+    {
+        error = "SnapshotVolumeStateOrReservedFieldsUnsupported";
+        return false;
+    }
+    return true;
+}
+
+bool SnapshotName(const std::vector<std::byte>& bytes, std::size_t offset,
+    std::uint16_t length, std::string& name)
+{
+    if (length < 2 || offset > bytes.size() || length != bytes.size() - offset ||
+        bytes.back() != std::byte{0} ||
+        std::find(bytes.begin() + offset, bytes.end() - 1, std::byte{0}) != bytes.end() - 1 ||
+        !IsValidUtf8(bytes.data() + offset, length - 1)) return false;
+    name.assign(reinterpret_cast<const char*>(bytes.data() + offset), length - 1);
+    return true;
+}
+
+// Reuse the authoritative tree reader, including its cycle, region, checksum,
+// identity, and shared resource-budget checks. Virtual child lookup is pinned
+// to the snapshot XID while the OMAP itself belongs to the selected checkpoint.
+bool ReadSnapshotTree(const RandomAccessSource& source, std::uint32_t block_size,
+    const AppleObjectLocation& tree, const AppleOmapView& omap,
+    std::uint64_t tree_xid, std::uint64_t checkpoint_xid,
+    std::vector<BtreeRecord>& records, std::string& error)
+{
+    const auto storage = tree.type & kObjectStorageTypeMask;
+    if (storage != 0 && storage != kObjectPhysical)
+    {
+        error = "SnapshotEphemeralTreeUnsupported";
+        return false;
+    }
+    BtreeReadPolicy policy;
+    policy.enforce_object_identity = true;
+    policy.require_complete_traversal = true;
+    policy.reject_unsupported_flags = true;
+    policy.root_object_id = tree.object_id;
+    policy.storage_type = storage;
+    policy.subtype = tree.subtype;
+    policy.virtual_child_resolver = [&](std::uint64_t oid, std::string& child_error)
+        -> std::optional<BtreeVirtualChildMapping> {
+        const auto value = ResolveAppleOmapValue(source, block_size, omap, oid,
+            tree_xid, "SnapshotChildOmap", child_error, checkpoint_xid, true);
+        if (!value) return std::nullopt;
+        if (value->size != block_size)
+        {
+            child_error = "SnapshotMultiBlockNodeUnsupported";
+            return std::nullopt;
+        }
+        return BtreeVirtualChildMapping{value->physical_block, value->xid};
+    };
+    return ReadBtreeLeafRecords(source, block_size, tree.physical_block,
+        storage == kObjectPhysical, omap.object.object_id, tree_xid,
+        policy, records, error);
+}
+
+bool SnapshotOmapSupported(const RandomAccessSource& source, std::uint32_t block_size,
+    const AppleOmapView& map, std::uint64_t checkpoint_xid,
+    bool container, std::vector<std::uint64_t>& snapshot_xids, std::string& error)
+{
+    snapshot_xids.clear();
+    std::vector<std::byte> bytes;
+    if (!source.Read(map.object.physical_block * block_size, block_size, bytes) ||
+        !VerifyObjectChecksum(bytes, block_size))
+    {
+        error = "SnapshotOmapUnreadableOrChecksum";
+        return false;
+    }
+    if (map.object.type != (kObjectPhysical | kObjectTypeOmap) ||
+        map.object.subtype != 0 || map.object.xid == 0 ||
+        map.tree_type != (kObjectPhysical | kObjectTypeBtree) ||
+        (container ? map.flags != 1u : map.flags != 0) ||
+        ReadU64LE(bytes, 0x48).value_or(~0ull) != 0 ||
+        ReadU64LE(bytes, 0x50).value_or(~0ull) != 0)
+    {
+        error = "SnapshotOmapFlagsOrRevertUnsupported";
+        return false;
+    }
+    // Force a complete, strict scan even when the volume has zero snapshots.
+    // The existing resolver validates all record sizes, duplicate keys, flags
+    // and XIDs before returning the requested mapping (or ValueMissing).
+    std::string scan_error;
+    (void)ResolveAppleOmapValue(source, block_size, map, ~0ull, checkpoint_xid,
+        "SnapshotOmap", scan_error, checkpoint_xid, true);
+    if (!scan_error.empty() && scan_error != "SnapshotOmapValueMissing")
+    {
+        error = scan_error;
+        return false;
+    }
+    const auto count = ReadU32LE(bytes, 0x24).value();
+    const auto recent = ReadU64LE(bytes, 0x40).value();
+    if (map.snapshot_tree_oid == 0)
+    {
+        if (count != 0 || recent != 0 ||
+            (map.snapshot_tree_type != 0 && map.snapshot_tree_type != (kObjectPhysical | kObjectTypeBtree)))
+        {
+            error = "SnapshotOmapSnapshotRootMissing";
+            return false;
+        }
+        return true;
+    }
+    if (container || map.snapshot_tree_type != (kObjectPhysical | kObjectTypeBtree))
+    {
+        error = "SnapshotOmapSnapshotTreeTypeUnsupported";
+        return false;
+    }
+    AppleObjectLocation location;
+    if (!ReadAppleObject(source, block_size, map.snapshot_tree_oid, block_size,
+        map.snapshot_tree_oid, checkpoint_xid, kObjectPhysical, kObjectTypeBtree,
+        0x13u, "SnapshotOmapSnapshots", location, bytes, error)) return false;
+    std::vector<BtreeRecord> records;
+    if (!ReadSnapshotTree(source, block_size, location, map, checkpoint_xid,
+        checkpoint_xid, records, error)) return false;
+    std::unordered_set<std::uint64_t> seen;
+    for (const auto& record : records)
+    {
+        if (record.key.size() != 8 || record.value.size() != 16)
+        {
+            error = "SnapshotOmapSnapshotRecordMalformed";
+            return false;
+        }
+        const auto xid = ReadU64LE(record.key, 0).value();
+        if (ReadU32LE(record.value, 0).value() != 0 ||
+            ReadU32LE(record.value, 4).value() != 0 || ReadU64LE(record.value, 8).value() != 0)
+        {
+            error = "SnapshotOmapDeletedRevertedOrReservedUnsupported";
+            return false;
+        }
+        if (xid == 0 || xid > checkpoint_xid || !seen.insert(xid).second)
+        {
+            error = "SnapshotOmapSnapshotXidInvalid";
+            return false;
+        }
+        if (!Materialize(source, 1, 2 * sizeof(std::uint64_t))) return false;
+        snapshot_xids.push_back(xid);
+    }
+    std::sort(snapshot_xids.begin(), snapshot_xids.end());
+    if (snapshot_xids.size() != count ||
+        recent != (snapshot_xids.empty() ? 0 : snapshot_xids.back()))
+    {
+        error = "SnapshotOmapSnapshotCountOrRecentMismatch";
+        return false;
+    }
+    return true;
+}
+} // namespace
+
+bool LoadAppleSnapshotRecords(const RandomAccessSource& source,
+    const AppleCheckpointView& checkpoint, std::uint64_t volume_oid,
+    std::vector<AppleSnapshotRecord>& out_records, std::string& out_error)
+{
+    BudgetErrorScope budget_error{source, out_error};
+    out_records.clear();
+    out_error.clear();
+    const auto fail = [&](const char* reason) { out_error = reason; return false; };
+    const auto& nx = checkpoint.container.superblock;
+    if (nx.block_size == 0 || nx.block_count > source.SizeBytes() / nx.block_size ||
+        nx.xid == 0 || (nx.features & ~kNxKnownOptionalFeaturesMask) != 0 ||
+        nx.readonly_features != 0 ||
+        (nx.incompatible_features & ~kNxSupportedIncompatibleFeaturesMask) != 0)
+        return fail("SnapshotContainerGeometryOrFeaturesUnsupported");
+    if ((ReadU32LE(checkpoint.container.superblock_bytes, 0x18).value_or(~0u) &
+            ~(kObjectStorageTypeMask | kObjectTypeMask)) != 0 ||
+        ReadU32LE(checkpoint.container.superblock_bytes, 0x1C).value_or(~0u) != 0)
+        return fail("SnapshotContainerObjectFlagsUnsupported");
+    // Even if the enclosing source includes trailing bytes, references cannot
+    // escape the container's declared physical block range.
+    OffsetRandomAccessSource store(&source, 0, nx.block_count * nx.block_size);
+    const AppleVolumeCheckpointView* live = nullptr;
+    for (const auto& volume : checkpoint.volumes)
+        if (volume.superblock.object_id == volume_oid)
+        {
+            if (live) return fail("SnapshotVolumeAmbiguous");
+            live = &volume;
+        }
+    if (!live) return fail("SnapshotVolumeMissing");
+    std::vector<std::byte> bytes;
+    AppleObjectLocation live_location;
+    if (!ReadAppleObject(store, nx.block_size, live->superblock_object.physical_block,
+        nx.block_size, volume_oid, nx.xid, 0, kObjectTypeFs, 0,
+        "SnapshotLiveApsb", live_location, bytes, out_error)) return false;
+    if (live_location.type != kObjectTypeFs ||
+        !SnapshotVolumeSupported(bytes, live->superblock, out_error))
+        return out_error.empty() ? fail("SnapshotLiveApsbFlagsUnsupported") : false;
+    const auto count = ReadU64LE(bytes, 0xD8).value();
+    std::vector<std::uint64_t> ignored, live_omap_xids;
+    if (!SnapshotOmapSupported(store, nx.block_size, checkpoint.container_object_map,
+        nx.xid, true, ignored, out_error) ||
+        !SnapshotOmapSupported(store, nx.block_size, live->object_map,
+        nx.xid, false, live_omap_xids, out_error)) return false;
+    if (!live->snapshot_metadata_tree || live->superblock.snap_meta_tree_oid == 0)
+        return fail("SnapshotMetadataRootMissing");
+    if (live->superblock.snap_meta_tree_type != live->snapshot_metadata_tree->type)
+        return fail("SnapshotMetadataTreeTypeMismatch");
+    std::vector<BtreeRecord> records;
+    if (live->superblock.root_tree_type != live->root_tree.type || !live->extentref_tree ||
+        live->superblock.extentref_tree_type != live->extentref_tree->type)
+        return fail("SnapshotLiveRootMissingOrTypeMismatch");
+    if (!ReadSnapshotTree(store, nx.block_size, live->root_tree, live->object_map,
+        nx.xid, nx.xid, records, out_error) ||
+        !ReadSnapshotTree(store, nx.block_size, *live->extentref_tree, live->object_map,
+            nx.xid, nx.xid, records, out_error)) return false;
+    if (!ReadSnapshotTree(store, nx.block_size, *live->snapshot_metadata_tree,
+        live->object_map, nx.xid, nx.xid, records, out_error)) return false;
+    struct Parsed { AppleSnapshotRecord record; std::uint64_t apsb, extent; std::uint32_t extent_type; };
+    std::vector<Parsed> parsed;
+    std::unordered_map<std::string, std::uint64_t> names;
+    std::unordered_set<std::uint64_t> xids;
+    std::unordered_set<std::string> metadata_names;
+    constexpr std::uint64_t id_mask = 0x0FFFFFFFFFFFFFFFull;
+    for (const auto& raw : records)
+    {
+        if (raw.key.size() < 8) return fail("SnapshotRecordKeyMalformed");
+        const auto key = ReadU64LE(raw.key, 0).value();
+        const auto kind = key >> 60;
+        if (kind == 1)
+        {
+            if (raw.key.size() != 8 || raw.value.size() < 50)
+                return fail("SnapshotMetadataRecordMalformed");
+            Parsed item{};
+            item.record.xid = key & id_mask;
+            item.extent = ReadU64LE(raw.value, 0).value();
+            item.apsb = ReadU64LE(raw.value, 8).value();
+            item.record.create_time_ns = ReadU64LE(raw.value, 16).value();
+            item.record.change_time_ns = ReadU64LE(raw.value, 24).value();
+            item.record.inum = ReadU64LE(raw.value, 32).value();
+            item.extent_type = ReadU32LE(raw.value, 40).value();
+            item.record.flags = ReadU32LE(raw.value, 44).value();
+            if (item.record.flags != 0) return fail("SnapshotMetadataFlagsUnsupported");
+            if (!SnapshotName(raw.value, 50, ReadU16LE(raw.value, 48).value(), item.record.name_utf8))
+                return fail("SnapshotMetadataNameMalformed");
+            if (item.record.xid == 0 || item.record.xid > nx.xid ||
+                !xids.insert(item.record.xid).second) return fail("SnapshotXidInvalidOrDuplicate");
+            if (!metadata_names.insert(item.record.name_utf8).second)
+                return fail("SnapshotNameAmbiguous");
+            if (item.apsb == 0 || item.extent == 0) return fail("SnapshotReferencedRootMissing");
+            if (item.extent_type != (kObjectPhysical | kObjectTypeBtree))
+                return fail("SnapshotExtentTreeTypeUnsupported");
+            if (!Materialize(source, 1, sizeof(Parsed) + 2 * item.record.name_utf8.size())) return false;
+            parsed.push_back(std::move(item));
+        }
+        else if (kind == 11)
+        {
+            if ((key & id_mask) != id_mask || raw.key.size() < 10 || raw.value.size() != 8)
+                return fail("SnapshotNameRecordMalformed");
+            std::string name;
+            if (!SnapshotName(raw.key, 10, ReadU16LE(raw.key, 8).value(), name))
+                return fail("SnapshotNameRecordMalformed");
+            if (!Materialize(source, 1, name.size() + sizeof(std::uint64_t))) return false;
+            if (!names.emplace(name, ReadU64LE(raw.value, 0).value()).second)
+                return fail("SnapshotNameAmbiguous");
+        }
+        else return fail("SnapshotRecordTypeUnsupported");
+    }
+    if (parsed.size() != count || names.size() != parsed.size() ||
+        live_omap_xids.size() != parsed.size()) return fail("SnapshotInventoryCountMismatch");
+    std::sort(parsed.begin(), parsed.end(), [](const auto& a, const auto& b) {
+        return a.record.xid < b.record.xid;
+    });
+    std::vector<AppleSnapshotRecord> result;
+    for (auto& item : parsed)
+    {
+        auto& snapshot = item.record;
+        const auto name = names.find(snapshot.name_utf8);
+        if (name == names.end() || name->second != snapshot.xid ||
+            !std::binary_search(live_omap_xids.begin(), live_omap_xids.end(), snapshot.xid))
+            return fail("SnapshotNameOrOmapIdentityMismatch");
+        if (!ReadAppleObject(store, nx.block_size, item.apsb, nx.block_size,
+            item.apsb, nx.xid, kObjectPhysical, kObjectTypeFs, 0,
+            "SnapshotApsb", snapshot.volume.superblock_object, bytes, out_error)) return false;
+        const auto apsb = ParseApsb(bytes);
+        if (!apsb || apsb->xid != snapshot.xid || apsb->uuid_hex != live->superblock.uuid_hex ||
+            snapshot.volume.superblock_object.type != (kObjectPhysical | kObjectTypeFs))
+            return fail("SnapshotApsbIdentityMismatch");
+        if (!SnapshotVolumeSupported(bytes, *apsb, out_error)) return false;
+        snapshot.volume.superblock = *apsb;
+        if (apsb->extentref_tree_oid != item.extent || apsb->extentref_tree_type != item.extent_type)
+            return fail("SnapshotExtentRootIdentityMismatch");
+        if (!LoadAppleOmap(store, nx.block_size, apsb->omap_oid, nx.xid,
+            "SnapshotApsbOmap", snapshot.volume.object_map, out_error)) return false;
+        if (!SnapshotOmapSupported(store, nx.block_size, snapshot.volume.object_map,
+            nx.xid, false, ignored, out_error)) return false;
+        if (apsb->root_tree_type != kObjectTypeBtree &&
+            apsb->root_tree_type != (kObjectPhysical | kObjectTypeBtree))
+            return fail("SnapshotFsTreeTypeUnsupported");
+        auto root_block = apsb->root_oid;
+        auto root_max_xid = snapshot.xid;
+        if (apsb->root_tree_type == kObjectTypeBtree)
+        {
+            const auto mapping = ResolveAppleOmapValue(store, nx.block_size,
+                snapshot.volume.object_map, apsb->root_oid, snapshot.xid,
+                "SnapshotRootOmap", out_error, nx.xid, true);
+            if (!mapping) return false;
+            if (mapping->size != nx.block_size) return fail("SnapshotMultiBlockNodeUnsupported");
+            root_block = mapping->physical_block;
+            root_max_xid = mapping->xid;
+        }
+        if (!ReadAppleObject(store, nx.block_size, root_block, nx.block_size,
+            apsb->root_oid, root_max_xid, apsb->root_tree_type, kObjectTypeBtree,
+            kObjectTypeFsTree, "SnapshotFsTree", snapshot.volume.root_tree, bytes, out_error)) return false;
+        AppleObjectLocation extent;
+        if (!ReadAppleObject(store, nx.block_size, item.extent, nx.block_size,
+            item.extent, snapshot.xid, kObjectPhysical, kObjectTypeBtree,
+            kObjectTypeBlockRefTree, "SnapshotExtentTree", extent, bytes, out_error)) return false;
+        snapshot.volume.extentref_tree = extent;
+        // Validate complete referenced trees now; no validated descriptor may
+        // hide a malformed/cyclic child behind a superficially valid root.
+        if (!ReadSnapshotTree(store, nx.block_size, snapshot.volume.root_tree,
+            snapshot.volume.object_map, snapshot.xid, nx.xid, records, out_error) ||
+            !ReadSnapshotTree(store, nx.block_size, extent, snapshot.volume.object_map,
+                snapshot.xid, nx.xid, records, out_error)) return false;
+        if (!Materialize(source, 1, sizeof(AppleSnapshotRecord))) return false;
+        result.push_back(std::move(snapshot));
+    }
+    out_records = std::move(result);
+    return true;
 }
 
 std::vector<std::string> HexBits(std::uint64_t mask)

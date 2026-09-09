@@ -23,6 +23,7 @@ add_library(ApfsAccess.ApfsRwEngine STATIC
     src/ApfsExtendedRecordCodec.cpp
     src/ApfsFormat.cpp
     src/ApfsSharedSpace.cpp
+    src/ApfsSnapshotStore.cpp
     src/ApfsNameCodec.cpp
     src/ApfsObjectMapStore.cpp
     src/ApfsSpacemanStore.cpp
@@ -110,6 +111,16 @@ if(MSVC)
 endif()
 
 if(BUILD_TESTING)
+    foreach(_snapshot_test ApfsSnapshotStoreTests SnapshotParserRedTests)
+        add_executable(ApfsAccess.ApfsRwEngine.${_snapshot_test} tests/${_snapshot_test}.cpp)
+        target_link_libraries(ApfsAccess.ApfsRwEngine.${_snapshot_test} PRIVATE ApfsAccess.ApfsRwEngine)
+        target_compile_features(ApfsAccess.ApfsRwEngine.${_snapshot_test} PRIVATE cxx_std_20)
+        if(MSVC)
+            target_compile_options(ApfsAccess.ApfsRwEngine.${_snapshot_test} PRIVATE /W4 /permissive-)
+        endif()
+        add_test(NAME ApfsAccess.ApfsRwEngine.${_snapshot_test} COMMAND ApfsAccess.ApfsRwEngine.${_snapshot_test})
+    endforeach()
+    target_compile_definitions(ApfsAccess.ApfsRwEngine.SnapshotParserRedTests PRIVATE SNAPSHOT_STRICT_POLICY)
     foreach(_clone_test AppleCloneCowTests AppleCloneStoreTests AppleCloneWalTests)
         add_executable(ApfsAccess.ApfsRwEngine.${_clone_test} tests/${_clone_test}.cpp)
         target_link_libraries(ApfsAccess.ApfsRwEngine.${_clone_test} PRIVATE ApfsAccess.ApfsRwEngine)
