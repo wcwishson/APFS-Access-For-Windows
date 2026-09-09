@@ -4,6 +4,28 @@ namespace ApfsAccess.Backend.Native.Tests;
 // RED first: these fail against the synchronous ReadToEnd runner.
 public sealed class ObserverRunnerHardeningTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void StrictUtf8ProtocolPreservesLiteralReplacementAndRejectsMalformedBytes(bool stderr)
+    {
+        var root = Path.GetTempPath().StartsWith(@"D:\", StringComparison.OrdinalIgnoreCase) ? Path.GetTempPath() : @"D:\Temp";
+        var directory = Path.Combine(root, "observer-utf8-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, "wire.bin");
+        try
+        {
+            var runner = new ProcessObserverRunner();
+            string[] args = stderr ? ["/d", "/c", "type", path, "1>&2"] : ["/d", "/c", "type", path];
+            File.WriteAllBytes(path, System.Text.Encoding.UTF8.GetBytes("legal~�😀"));
+            var result = runner.Run("cmd.exe", args);
+            Assert.Equal("legal~�😀", stderr ? result.StandardError : result.StandardOutput);
+            File.WriteAllBytes(path, [0xED, 0xA0, 0x80]);
+            Assert.Throws<InvalidDataException>(() => runner.Run("cmd.exe", args));
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
     [Fact]
     public void Runner_DefaultMaxOutputBytes_Is64MB()
     {

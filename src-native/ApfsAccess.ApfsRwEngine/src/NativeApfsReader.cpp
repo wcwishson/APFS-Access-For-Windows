@@ -13,6 +13,7 @@
 #include <iterator>
 #include <limits>
 #include <queue>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <Windows.h>
@@ -439,6 +440,104 @@ std::uint64_t ApfsNanosecondsToFileTime(std::uint64_t apfs_nanoseconds)
     }
     return kWindowsFileTimeUnixEpochTicks + filetime_ticks;
 }
+bool ProjectValidatedAttributeStreams(
+    const std::vector<catalog::BtreeRecord>& records,
+    std::uint32_t block_size, std::uint64_t block_count,
+    std::uint64_t store_offset, NativeApfsVolumeProjection& projection, bool strict)
+{
+    const auto container_bytes = block_count * block_size;
+    std::string error;
+    struct Stream
+    {
+        std::vector<std::byte> descriptor;
+        std::uint64_t owners = 0;
+        bool invalid = false;
+        std::vector<MetadataStore::FileExtent> extents;
+    };
+    std::unordered_map<std::uint64_t, Stream> streams;
+    std::unordered_map<std::uint64_t, std::uint32_t> references;
+    std::unordered_set<std::uint64_t> inode_streams;
+    for (const auto& record : records)
+    {
+        if (record.key.size() < 8) return false;
+        const auto key = ReadLe64(record.key, 0);
+        const auto type = key >> kApfsObjectTypeShift;
+        if (type == kApfsTypeInode)
+        {
+            AppleInodeRecord inode;
+            if (!ApfsExtendedRecordCodec::DecodeInode(record, inode, error)) return false;
+            inode_streams.insert(inode.object_id);
+            inode_streams.insert(inode.private_id);
+        }
+        else if (type == 6)
+        {
+            AppleDataStreamIdRecord reference;
+            if (!DecodeAppleDataStreamIdRecord(record, reference, error) ||
+                !references.emplace(reference.object_id, reference.reference_count).second) return false;
+        }
+        else if (type == kApfsTypeXattr)
+        {
+            AppleXattrRecord attribute;
+            if (!ApfsExtendedRecordCodec::DecodeXattr(record, attribute, error)) return false;
+            if ((attribute.flags & kAppleXattrDataStream) == 0) continue;
+            if (attribute.data.size() != kAppleXattrDataStreamBytes) return false;
+            const auto id = ReadLe64(attribute.data, 0);
+            auto& stream = streams[id];
+            if (stream.owners++ == 0) stream.descriptor = attribute.data;
+            else if (stream.descriptor != attribute.data) stream.invalid = true;
+            if (id == 0 ||
+                (attribute.flags & ~(kAppleXattrDataStream | kAppleXattrFileSystemOwned)) != 0 ||
+                ReadLe64(attribute.data, 24) != 0) stream.invalid = true;
+        }
+    }
+    for (const auto& record : records)
+    {
+        const auto key = ReadLe64(record.key, 0);
+        if ((key >> kApfsObjectTypeShift) != kApfsTypeFileExtent) continue;
+        const auto found = streams.find(key & kApfsObjectIdMask);
+        if (found == streams.end()) continue;
+        auto& stream = found->second;
+        AppleFileExtentRecord extent;
+        if (!DecodeAppleFileExtentRecord(record, block_size, extent, error) || extent.crypto_id != 0 ||
+            extent.physical_block == 0 ||
+            extent.physical_block >= block_count ||
+            extent.length_bytes / block_size > block_count - extent.physical_block)
+        {
+            stream.invalid = true;
+            continue;
+        }
+        stream.extents.push_back({extent.logical_address,
+            store_offset + extent.physical_block * block_size, extent.length_bytes});
+    }
+    for (auto& [id, stream] : streams)
+    {
+        const auto reference = references.find(id);
+        if (stream.invalid || inode_streams.contains(id) || reference == references.end() ||
+            reference->second != stream.owners) { if (strict) return false; continue; }
+        const auto logical_size = ReadLe64(stream.descriptor, 8);
+        const auto allocated_size = ReadLe64(stream.descriptor, 16);
+        if (logical_size > allocated_size || allocated_size > container_bytes ||
+            allocated_size % block_size != 0) { if (strict) return false; continue; }
+        std::sort(stream.extents.begin(), stream.extents.end(), [](const auto& left, const auto& right) {
+            return left.logical_offset < right.logical_offset;
+        });
+        std::uint64_t covered = 0;
+        for (const auto& extent : stream.extents)
+        {
+            if (extent.logical_offset != covered || extent.bytes > allocated_size - covered)
+            {
+                stream.invalid = true;
+                break;
+            }
+            covered += extent.bytes;
+        }
+        if (stream.invalid || covered != allocated_size) { if (strict) return false; continue; }
+        projection.attribute_stream_extents.emplace(id,
+            std::make_shared<const std::vector<MetadataStore::FileExtent>>(std::move(stream.extents)));
+    }
+    return true;
+}
+
 void ProjectAttributeStreams(
     const std::vector<catalog::BtreeRecord>& records,
     const std::vector<catalog::BtreeRecord>& extentref_records,
@@ -475,97 +574,318 @@ void ProjectAttributeStreams(
             block_size, block_count, physical, error) ||
         !ValidateAppleCheckpointPayloadOwnership(source, checkpoint, physical, error)) return;
 
-    struct Stream
-    {
+    if (!ProjectValidatedAttributeStreams(records, block_size, block_count,
+        store_offset, projection, false)) return;
+    completed = true;
+}
+
+void ProjectExternalCompressionSizes(const catalog::RandomAccessSource& source,
+    NativeApfsVolumeProjection& projection)
+{
+    const auto budget = source.ReadBudget();
+    const ApfsCompressionLimits limits;
+    std::unordered_map<std::uint64_t, BtreeRecord> refreshed;
+    for (auto& inode : projection.inodes) {
+        if (inode.node_type != MetadataStore::NodeType::RegularFile ||
+            (inode.internal_flags & kAppleInodeHasUncompressedSize) != 0) continue;
+        const auto owner = projection.extended_attributes_by_inode.find(inode.object_id);
+        if (owner == projection.extended_attributes_by_inode.end()) continue;
+        const auto attribute = owner->second.find("com.apple.decmpfs");
+        if (attribute == owner->second.end()) continue;
+        const auto& raw = attribute->second;
+        if ((raw.flags & ~kAppleXattrFileSystemOwned) != kAppleXattrDataStream ||
+            raw.data.size() != kAppleXattrDataStreamBytes) continue;
+        const auto size = ReadLe64(raw.data, 8);
+        if (size < 16 || size > limits.max_decmpfs_bytes) continue;
+        const auto stream = projection.attribute_stream_extents.find(ReadLe64(raw.data, 0));
+        if (stream == projection.attribute_stream_extents.end() || !stream->second ||
+            stream->second->empty()) continue;
+        const auto& first = stream->second->front();
+        if (first.logical_offset != 0 || first.physical_address == 0 || first.bytes < size) continue;
+        if (budget && !budget->Materialize(1, size)) return;
         std::vector<std::byte> descriptor;
-        std::uint64_t owners = 0;
-        bool invalid = false;
-        std::vector<MetadataStore::FileExtent> extents;
-    };
-    std::unordered_map<std::uint64_t, Stream> streams;
-    std::unordered_map<std::uint64_t, std::uint32_t> references;
-    std::unordered_set<std::uint64_t> inode_streams;
+        if (!source.Read(first.physical_address, static_cast<std::size_t>(size), descriptor) ||
+            descriptor.size() != size) continue;
+        ApfsCompressionHeader header;
+        if (!ApfsCompression::Inspect(descriptor, limits, header) ||
+            inode.logical_size == header.uncompressed_size) continue;
+        if (budget && !budget->Materialize(1, 192 + inode.name.size() * sizeof(wchar_t))) return;
+        inode.logical_size = header.uncompressed_size;
+        refreshed.emplace(inode.object_id, BtreeMutationCodec::EncodeInodeRecord(
+            inode.object_id, inode.parent_object_id, inode.name, inode.is_directory,
+            inode.logical_size, inode.data_physical_address, inode.timestamp_utc,
+            inode.xid, false));
+    }
+    // Keep the in-memory compatibility index consistent with the native view.
+    for (auto& record : projection.btree_records) {
+        if (record.kind != BtreeRecordKind::Inode || record.key.size() != 17) continue;
+        const auto found = refreshed.find(ReadLe64(record.key, 9));
+        if (found != refreshed.end() && record.key == found->second.key)
+            record = std::move(found->second);
+    }
+}
+} // namespace
+
+namespace
+{
+// Record the metadata actually read by the authoritative resolver. This is
+// operation-local read evidence, not a retained-block allocation oracle.
+class SnapshotMetadataSource final : public catalog::RandomAccessSource
+{
+public:
+    explicit SnapshotMetadataSource(const catalog::RandomAccessSource& source) : source_(source) {}
+    std::uint64_t SizeBytes() const override { return source_.SizeBytes(); }
+    std::shared_ptr<catalog::ApfsReadBudget> ReadBudget() const override { return source_.ReadBudget(); }
+    bool Read(std::uint64_t offset, std::size_t size, std::vector<std::byte>& out) const override
+    {
+        out.clear();
+        if (!ReadBudget()->Materialize(1, 2 * sizeof(Range))) return false;
+        if (!source_.Read(offset, size, out)) return false;
+        if (size) ranges.emplace_back(offset, offset + size);
+        return true;
+    }
+    using Range = std::pair<std::uint64_t, std::uint64_t>;
+    mutable std::vector<Range> ranges;
+private:
+    const catalog::RandomAccessSource& source_;
+};
+
+bool ValidateSnapshotStreams(const std::vector<catalog::BtreeRecord>& records,
+    NativeApfsVolumeProjection& projection, std::string& error)
+{
+    const auto fail = [&](const char* reason) { error = reason; return false; };
+    std::unordered_map<std::uint64_t, std::uint32_t> owners, references;
+    std::unordered_set<std::uint64_t> file_streams;
+    std::unordered_set<std::uint64_t> projected_file_streams;
+    for (const auto& inode : projection.inodes)
+    {
+        if (inode.node_type != MetadataStore::NodeType::RegularFile) continue;
+        if (inode.private_id == 0 || inode.private_id >= kApfsObjectIdMask)
+            return fail("SnapshotFileStreamIdentityInvalid");
+        file_streams.insert(inode.private_id);
+        ++owners[inode.private_id]; // hardlinks are one inode, not extra stream owners
+        const auto attributes = projection.extended_attributes_by_inode.find(inode.object_id);
+        // Compressed read plans require a separate immutable read adapter. Do
+        // not publish apparently ordinary zero bytes for an unsupported codec.
+        if ((inode.bsd_flags & kAppleBsdCompressedFlag) ||
+            (attributes != projection.extended_attributes_by_inode.end() &&
+                attributes->second.contains("com.apple.decmpfs")))
+            return fail("SnapshotCompressedDataProjectionUnsupported");
+        const auto found = projection.read_extents_by_inode.find(inode.object_id);
+        if (found != projection.read_extents_by_inode.end() && !found->second.empty())
+            projected_file_streams.insert(inode.private_id);
+        std::uint64_t end = 0, allocated = 0;
+        if (found != projection.read_extents_by_inode.end())
+            for (const auto& extent : found->second)
+            {
+                // This bounded slice requires explicit logical coverage,
+                // including explicit hole records. Missing data is never zero.
+                if (extent.logical_offset != end) return fail("SnapshotFileExtentCoverageInvalid");
+                end += extent.bytes;
+                if (extent.physical_address) allocated += extent.bytes;
+            }
+        if (projection.block_size == 0 ||
+            inode.logical_size > UINT64_MAX - (projection.block_size - 1) ||
+            end != AlignUp(inode.logical_size, projection.block_size) ||
+            (inode.allocation_size && allocated != *inode.allocation_size))
+            return fail("SnapshotFileExtentCoverageInvalid");
+    }
+    for (const auto& [inode, attributes] : projection.extended_attributes_by_inode)
+        for (const auto& [name, attribute] : attributes)
+            if (attribute.flags & kAppleXattrDataStream) ++owners[ReadLe64(attribute.data, 0)];
     for (const auto& record : records)
     {
-        if (record.key.size() < 8) return;
-        const auto key = ReadLe64(record.key, 0);
-        const auto type = key >> kApfsObjectTypeShift;
-        if (type == kApfsTypeInode)
+        const auto header = ReadLe64(record.key, 0);
+        const auto id = header & kApfsObjectIdMask;
+        switch (header >> kApfsObjectTypeShift)
+        {
+        case kApfsTypeInode:
         {
             AppleInodeRecord inode;
-            if (!ApfsExtendedRecordCodec::DecodeInode(record, inode, error)) return;
-            inode_streams.insert(inode.object_id);
-            inode_streams.insert(inode.private_id);
+            if (!ApfsExtendedRecordCodec::DecodeInode(record, inode, error)) return false;
+            for (const auto& field : inode.extended_fields)
+            {
+                if (field.type == kInodeExtendedFieldDataStream &&
+                    (field.data.size() != 40 || ReadLe64(field.data, 16) != 0))
+                    return fail("SnapshotEncryptedOrMalformedDataStreamUnsupported");
+                if (field.type == kInodeExtendedFieldSparseBytes)
+                {
+                    std::uint64_t holes = 0;
+                    const auto extents = projection.read_extents_by_inode.find(inode.object_id);
+                    if (extents != projection.read_extents_by_inode.end())
+                        for (const auto& extent : extents->second)
+                            if (!extent.physical_address) holes += extent.bytes;
+                    if (ReadLe64(field.data, 0) != holes)
+                        return fail("SnapshotSparseByteCountMismatch");
+                }
+            }
+            break;
         }
-        else if (type == 6)
+        case 6:
         {
             AppleDataStreamIdRecord reference;
             if (!DecodeAppleDataStreamIdRecord(record, reference, error) ||
-                !references.emplace(reference.object_id, reference.reference_count).second) return;
+                !references.emplace(id, reference.reference_count).second ||
+                !owners.contains(id) || owners.at(id) != reference.reference_count)
+                return fail("SnapshotDataStreamOwnershipInvalid");
+            break;
         }
-        else if (type == kApfsTypeXattr)
+        case kApfsTypeFileExtent:
         {
-            AppleXattrRecord attribute;
-            if (!ApfsExtendedRecordCodec::DecodeXattr(record, attribute, error)) return;
-            if ((attribute.flags & kAppleXattrDataStream) == 0) continue;
-            if (attribute.data.size() != kAppleXattrDataStreamBytes) return;
-            const auto id = ReadLe64(attribute.data, 0);
-            auto& stream = streams[id];
-            if (stream.owners++ == 0) stream.descriptor = attribute.data;
-            else if (stream.descriptor != attribute.data) stream.invalid = true;
-            if (id == 0 ||
-                (attribute.flags & ~(kAppleXattrDataStream | kAppleXattrFileSystemOwned)) != 0 ||
-                ReadLe64(attribute.data, 24) != 0) stream.invalid = true;
+            AppleFileExtentRecord extent;
+            if (!DecodeAppleFileExtentRecord(record, projection.block_size, extent, error)) return false;
+            if (extent.crypto_id != 0) return fail("SnapshotEncryptedExtentUnsupported");
+            if (file_streams.contains(id) && !projected_file_streams.contains(id))
+                return fail("SnapshotHiddenFileExtent");
+            if (!file_streams.contains(id) && !projection.attribute_stream_extents.contains(id))
+                return fail("SnapshotExtentOwnerMissing");
+            break;
+        }
+        case kApfsTypeXattr: case kApfsTypeSiblingLink:
+        case kApfsTypeDirectoryRecord: case kApfsTypeSiblingMap: break;
+        default: return fail("SnapshotFilesystemRecordUnsupported");
         }
     }
-    for (const auto& record : records)
-    {
-        const auto key = ReadLe64(record.key, 0);
-        if ((key >> kApfsObjectTypeShift) != kApfsTypeFileExtent) continue;
-        const auto found = streams.find(key & kApfsObjectIdMask);
-        if (found == streams.end()) continue;
-        auto& stream = found->second;
-        AppleFileExtentRecord extent;
-        if (!DecodeAppleFileExtentRecord(record, block_size, extent, error) || extent.crypto_id != 0 ||
-            extent.physical_block == 0 ||
-            extent.physical_block >= block_count ||
-            extent.length_bytes / block_size > block_count - extent.physical_block)
-        {
-            stream.invalid = true;
-            continue;
-        }
-        stream.extents.push_back({extent.logical_address,
-            store_offset + extent.physical_block * block_size, extent.length_bytes});
-    }
-    for (auto& [id, stream] : streams)
-    {
-        const auto reference = references.find(id);
-        if (stream.invalid || inode_streams.contains(id) || reference == references.end() ||
-            reference->second != stream.owners) continue;
-        const auto logical_size = ReadLe64(stream.descriptor, 8);
-        const auto allocated_size = ReadLe64(stream.descriptor, 16);
-        if (logical_size > allocated_size || allocated_size > container_bytes ||
-            allocated_size % block_size != 0) continue;
-        std::sort(stream.extents.begin(), stream.extents.end(), [](const auto& left, const auto& right) {
-            return left.logical_offset < right.logical_offset;
-        });
-        std::uint64_t covered = 0;
-        for (const auto& extent : stream.extents)
-        {
-            if (extent.logical_offset != covered || extent.bytes > allocated_size - covered)
-            {
-                stream.invalid = true;
-                break;
-            }
-            covered += extent.bytes;
-        }
-        if (stream.invalid || covered != allocated_size) continue;
-        projection.attribute_stream_extents.emplace(id,
-            std::make_shared<const std::vector<MetadataStore::FileExtent>>(std::move(stream.extents)));
-    }
-    completed = true;
+    for (const auto& [id, count] : owners)
+        if (count > 1 && (!references.contains(id) || references.at(id) != count))
+            return fail("SnapshotSharedStreamOwnershipInvalid");
+    return true;
 }
 } // namespace
+
+bool NativeApfsReader::TryLoadSnapshotProjection(
+    const catalog::RandomAccessSource& source,
+    const catalog::ApfsSnapshotIdentity& expected,
+    std::shared_ptr<const NativeApfsSnapshotProjection>& out_projection,
+    std::string& out_error)
+{
+    // Keep the old owner alive when expected aliases its immutable identity.
+    const auto previous = std::move(out_projection);
+    out_projection.reset();
+    out_error.clear();
+    auto budget = source.ReadBudget();
+    try
+    {
+        if (!budget) budget = std::make_shared<catalog::ApfsReadBudget>(65536,
+            256ull * 1024 * 1024, 1000000, 256ull * 1024 * 1024);
+        const auto fail = [&](const char* reason) {
+            out_error = budget->Failed() ? budget->Failure() : reason;
+            return false;
+        };
+        if (!budget->Materialize(1, sizeof(NativeApfsSnapshotProjection) +
+            sizeof(catalog::ApfsSnapshotRecords) + expected.name_utf8.size() + 256))
+            return fail("SnapshotProjectionBudget");
+        const auto identity = expected;
+        catalog::BudgetedRandomAccessSource bounded(source, budget);
+        SnapshotMetadataSource metadata(bounded);
+        catalog::ApfsSnapshotRecords loaded;
+        if (!catalog::ApfsSnapshotStore::LoadExactRecords(metadata, identity, loaded, out_error))
+            return fail(out_error.c_str());
+        const auto& checkpoint = loaded.checkpoint;
+        const auto& nx = checkpoint.container.superblock;
+        const auto& volume = loaded.snapshot.metadata.volume;
+        const auto offset = identity.scope.store_offset_bytes;
+        if (nx.block_size == 0 || nx.block_count == 0 ||
+            nx.block_count > UINT64_MAX / nx.block_size ||
+            identity.scope.store_size_bytes != nx.block_count * nx.block_size)
+            return fail("SnapshotProjectionSourceWindowMismatch");
+        if (offset % nx.block_size != 0) return fail("SnapshotProjectionStoreUnaligned");
+        auto result = std::make_shared<NativeApfsSnapshotProjection>();
+        auto& view = result->view_;
+        view.checkpoint_xid = identity.scope.checkpoint_xid;
+        // Historical APSB o_oid is physical; the selected volume OID is virtual.
+        view.volume_object_id = identity.scope.volume_oid;
+        view.volume_superblock_block = offset / nx.block_size + identity.superblock_physical_block;
+        view.volume_object_map_oid = volume.superblock.omap_oid;
+        view.root_tree_oid = identity.root_oid;
+        view.root_tree_block = offset / nx.block_size + identity.root_physical_block;
+        view.root_directory_inode = kRootDirectoryInode;
+        view.block_size = nx.block_size;
+        view.total_blocks = nx.block_count;
+        view.incompatible_features = volume.superblock.incompatible_features;
+        view.name_policy = ApfsNamePolicy::FromIncompatibleFeatures(view.incompatible_features);
+        auto& records = loaded.trees.filesystem;
+        // Charge sort/graph/ownership scratch before calling source-free codecs.
+        for (const auto* input : {&records, &loaded.trees.extentref})
+            for (const auto& record : *input)
+                if (!budget->Materialize(1, 8192 + 32ULL * (record.key.size() + record.value.size())))
+                    return fail("SnapshotProjectionBudget");
+        if (!SortAppleBtreeRecords(records, view.name_policy.UsesHashedDirectoryKeys()
+            ? AppleBtreeKeyOrder::FileSystemHashedDirectory : AppleBtreeKeyOrder::FileSystemCaseSensitive,
+            out_error)) return false;
+        if (!ProjectFileSystemTree(records, nx.block_size, nx.block_count,
+            identity.snapshot_xid, view.name_policy, view, true, budget))
+            return fail("SnapshotNamespaceProjectionInvalid");
+        std::vector<ApplePhysicalExtentRecord> physical;
+        // Conservative supported extentref subset: complete KIND_NEW graph.
+        // UPDATE/retained accounting is refused by this existing validator.
+        if (!ValidateApplePayloadExtentGraph(records, loaded.trees.extentref,
+            nx.block_size, nx.block_count, physical, out_error)) return false;
+        // Exclude all metadata read in this operation, plus complete reserved
+        // checkpoint and spaceman pool ranges. Do not consult live free bits.
+        const auto reserve = [&](std::uint64_t block, std::uint64_t count) {
+            if (!count) return true;
+            if (block >= nx.block_count || count > nx.block_count - block)
+                return false;
+            if (!budget->Materialize(1, 2 * sizeof(SnapshotMetadataSource::Range))) return false;
+            metadata.ranges.emplace_back(offset + block * nx.block_size,
+                offset + (block + count) * nx.block_size);
+            return true;
+        };
+        const auto& pool = checkpoint.spaceman.internal_pool;
+        if (!reserve(nx.xp_desc_base_block, nx.xp_desc_block_count) ||
+            !reserve(nx.xp_data_base_block, nx.xp_data_block_count) ||
+            !reserve(pool.base_block, pool.block_count) ||
+            !reserve(pool.bitmap_base_block, pool.bitmap_block_count))
+            return fail("SnapshotReservedGeometryInvalid");
+        std::sort(metadata.ranges.begin(), metadata.ranges.end());
+        std::uint64_t merged = 0;
+        for (const auto& range : metadata.ranges)
+        {
+            if (merged && range.first <= metadata.ranges[merged - 1].second)
+                metadata.ranges[merged - 1].second = (std::max)(metadata.ranges[merged - 1].second, range.second);
+            else metadata.ranges[merged++] = range;
+        }
+        metadata.ranges.resize(static_cast<std::size_t>(merged));
+        for (const auto& extent : physical)
+        {
+            const auto begin = offset + extent.physical_block * nx.block_size;
+            const auto end = begin + extent.block_count * nx.block_size;
+            const auto after = std::lower_bound(metadata.ranges.begin(), metadata.ranges.end(), end,
+                [](const auto& range, std::uint64_t value) { return range.first < value; });
+            if (after != metadata.ranges.begin() && std::prev(after)->second > begin)
+                return fail("SnapshotPayloadMetadataOverlap");
+        }
+        if (!ProjectValidatedAttributeStreams(records, nx.block_size, nx.block_count,
+            offset, view, true)) return fail("SnapshotAttributeStreamInvalid");
+        if (!ValidateSnapshotStreams(records, view, out_error)) return false;
+        // Core projection uses store-relative addresses; translate once, keeping
+        // zero holes as zero. Attribute streams above already use source offsets.
+        for (auto& [inode, extents] : view.read_extents_by_inode)
+            for (auto& extent : extents)
+                if (extent.physical_address) extent.physical_address += offset;
+        for (auto& inode : view.inodes)
+            if (inode.data_physical_address) inode.data_physical_address += offset;
+        // These are legacy mutable catalog encodings, not snapshot read state.
+        view.btree_records.clear();
+        if (budget->Failed()) return fail("SnapshotProjectionBudget");
+        result->snapshot_ = std::move(loaded.snapshot);
+        out_projection = std::move(result);
+        return true;
+    }
+    catch (const std::bad_alloc&)
+    {
+        if (budget) (void)budget->Refuse("ApfsReadBudgetAllocationFailed");
+        out_error = "ApfsReadBudgetAllocationFailed";
+        return false;
+    }
+    catch (const std::length_error&)
+    {
+        if (budget) (void)budget->Refuse("ApfsReadBudgetAllocationFailed");
+        out_error = "ApfsReadBudgetAllocationFailed";
+        return false;
+    }
+}
 
 bool NativeApfsReader::TryLoadVolumeProjection(
     const BlockDevice& device,
@@ -912,6 +1232,7 @@ bool NativeApfsReader::TryLoadVolumeProjection(
         }
         else if (budget) return budget->Refuse("ApfsReadBudgetAttributeWalkIncomplete");
     }
+    ProjectExternalCompressionSizes(device_source, out_projection);
     if (budget && budget->Failed()) return false;
     complete = true;
     return true;
@@ -1373,8 +1694,10 @@ bool NativeApfsReader::ProjectFileSystemTree(
             inode.change_time = ApfsNanosecondsToFileTime(apple_inode.change_time);
             inode.access_time = ApfsNanosecondsToFileTime(apple_inode.access_time);
             inode.timestamp = inode.modification_time;
-            inode.logical_size = apple_inode.uncompressed_size;
-            inode.uncompressed_size = apple_inode.uncompressed_size;
+            inode.uncompressed_size =
+                (apple_inode.internal_flags & kAppleInodeHasUncompressedSize) != 0
+                    ? apple_inode.uncompressed_size : 0;
+            inode.logical_size = inode.uncompressed_size;
             inode.internal_flags = apple_inode.internal_flags;
             inode.default_protection_class = apple_inode.default_protection_class;
             inode.write_generation = apple_inode.write_generation;
@@ -1405,7 +1728,7 @@ bool NativeApfsReader::ProjectFileSystemTree(
             const bool is_special = !inode.is_directory &&
                 inode.node_type != MetadataStore::NodeType::RegularFile &&
                 inode.node_type != MetadataStore::NodeType::SymbolicLink;
-            if (is_special && (apple_inode.uncompressed_size != 0 ||
+            if (is_special && (inode.uncompressed_size != 0 ||
                 std::any_of(apple_inode.extended_fields.begin(), apple_inode.extended_fields.end(),
                     [](const auto& field) { return field.type == kInodeExtendedFieldDataStream; })))
             {

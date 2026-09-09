@@ -6028,6 +6028,7 @@ struct NativeCompressionFixture
     bool external_decmpfs = false;
     bool external_resource = false;
     bool compressed_flag = true;
+    bool uncompressed_size_flag = true;
     bool omit_decmpfs = false;
     bool wrong_reference_count = false;
     bool omit_default_dstream = false;
@@ -6060,6 +6061,8 @@ std::vector<std::byte> BuildNativeCompressionImage(const NativeCompressionFixtur
         inode.private_id = neighbor ? 118 : 117;
         inode.parent_id = 2; inode.children_or_links = 1; inode.mode = 0100644;
         inode.uncompressed_size = neighbor ? 4 : spec.inode_size;
+        if (!neighbor && spec.uncompressed_size_flag)
+            inode.internal_flags |= kAppleInodeHasUncompressedSize;
         inode.bsd_flags = !neighbor && spec.compressed_flag ? kAppleBsdCompressedFlag : 0;
         if (!neighbor && spec.rewrite_alias_fixture)
         { inode.children_or_links = 2; inode.owner = 501; inode.group = 20; inode.mode = 0100640; }
@@ -6750,6 +6753,31 @@ bool TestNativeCompressionMalformedReads()
     std::vector<std::byte> bytes(20, std::byte{0xba}); std::size_t read = 99;
     return Require(!metadata.ReadCommittedFileRangeInto(L"\\original", 65530, 20, bytes.data(), bytes.size(), read) &&
         read == 0 && bytes == std::vector<std::byte>(20, std::byte{0xba}), "late resource decode failure is atomic to caller");
+}
+
+bool TestNativeCompressionUnflaggedPadding()
+{
+    using namespace apfsaccess::rw;
+    for (const bool external : {false, true})
+    for (const bool omit_stream : {false, true}) {
+        NativeCompressionFixture spec;
+        spec.uncompressed_size_flag = false;
+        spec.external_decmpfs = external;
+        spec.inode_size = UINT64_MAX;
+        spec.omit_default_dstream = omit_stream;
+        spec.decmpfs = NativeCompressionAttribute(3, 5, kNativeCompressionHello);
+        TempImageFile image(BuildNativeCompressionImage(spec), "native-compression-padding");
+        MetadataStore metadata(NativeCompressionContext(image));
+        if (!Require(metadata.LoadContainerSuperblocks() && metadata.LoadObjectMap(),
+                "legacy compressed padding stays opaque")) return false;
+        const auto inode = metadata.LookupCommittedInodeByPath(L"\\original");
+        std::vector<std::byte> bytes;
+        if (!Require(inode && inode->logical_size == 5 &&
+                metadata.ReadCommittedFileRange(L"\\original", 0, 10, bytes) &&
+                bytes == NativeCompressionHex("68656c6c6f"),
+                "legacy decoded EOF comes from validated decmpfs, not padding")) return false;
+    }
+    return true;
 }
 
 bool TestNativeCompressionReadBudgets()
@@ -10208,6 +10236,7 @@ int main(int argc, char** argv)
     ok &= run("TestNativeCompressionResourceReads", TestNativeCompressionResourceReads);
     ok &= run("TestNativeCompressionMalformedReads", TestNativeCompressionMalformedReads);
     ok &= run("TestNativeCompressionReadBudgets", TestNativeCompressionReadBudgets);
+    ok &= run("TestNativeCompressionUnflaggedPadding", TestNativeCompressionUnflaggedPadding);
     ok &= run("TestNativeCompressionExactCheckpointSizes", TestNativeCompressionExactCheckpointSizes);
     ok &= run("TestNativeCompressionSnapshotIdentityAndPublication", TestNativeCompressionSnapshotIdentityAndPublication);
     ok &= run("TestCompressionPendingAndOriginalAdmission", TestCompressionPendingAndOriginalAdmission);

@@ -29,6 +29,7 @@ public:
         SetAllocationSize = 13,
         RestoreDirectoryFromSymbolicLink = 14,
         RewriteCompressedContent = 15,
+        CloneFile = 16,
     };
 
     struct MutationView

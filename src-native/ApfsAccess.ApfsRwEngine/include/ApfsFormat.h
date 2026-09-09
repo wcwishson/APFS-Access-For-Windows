@@ -529,6 +529,18 @@ bool LoadAppleSnapshotRecords(const RandomAccessSource& source,
     const AppleCheckpointView& checkpoint, std::uint64_t volume_oid,
     std::vector<AppleSnapshotRecord>& out_records, std::string& out_error);
 
+// Optional selected records are captured by the same authoritative inventory
+// walk, never by a second raw parser. Selection is exact; failure clears both.
+struct AppleSnapshotTreeRecords
+{
+    std::vector<BtreeRecord> filesystem;
+    std::vector<BtreeRecord> extentref;
+};
+bool LoadAppleSnapshotRecords(const RandomAccessSource& source,
+    const AppleCheckpointView& checkpoint, std::uint64_t volume_oid,
+    std::vector<AppleSnapshotRecord>& out_records, std::string& out_error,
+    std::uint64_t exact_snapshot_xid, AppleSnapshotTreeRecords& out_trees);
+
 // Loads all transaction roots needed by the native reader and writer from one
 // complete descriptor-ring generation. This API is strict: legacy two-copy
 // synthetic superblocks and descriptor-less fixtures are never accepted.

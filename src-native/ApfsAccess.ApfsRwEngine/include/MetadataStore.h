@@ -9,6 +9,7 @@
 #include "MutationCompactor.h"
 #include "UnlinkOutcome.h"
 #include "WriteAheadLog.h"
+#include "ApfsSnapshotStore.h"
 
 #include <atomic>
 #include <cstdint>
@@ -31,6 +32,8 @@
 namespace apfsaccess::rw
 {
 struct AppleVolumeReplayBoundary;
+class TransactionManager;
+class NativeApfsSnapshotProjection;
 class MetadataStore
 {
     struct RawAttributeReadPlan;
@@ -88,6 +91,7 @@ public:
         SetAllocationSize = 13,
         RestoreDirectoryFromSymbolicLink = 14,
         RewriteCompressedContent = 15,
+        CloneFile = 16,
     };
 
     enum class NativeWriteCommitModel
@@ -218,6 +222,8 @@ public:
         // Kept true even when the bounded decoder can serve this representation.
         bool unsupported_content_transform = false;
         std::shared_ptr<const CompressionReadSnapshot> compression_snapshot;
+        // Binds immutable plans to the exact installed view; never a writer token.
+        std::shared_ptr<const NativeApfsSnapshotProjection> native_snapshot;
         // No I/O: means a stable candidate is captured, not that its bytes have
         // passed decoding. Call ReadCommittedFileRangeFromPlan even at EOF.
         [[nodiscard]] bool HasCompressionReadCandidate() const noexcept
@@ -291,6 +297,15 @@ public:
     [[nodiscard]] bool FindAcceptedReplayBoundary(std::uint64_t accepted_preimage_xid,
         AppleVolumeReplayBoundary& boundary, std::string& error) const;
     [[nodiscard]] bool PrepareNativeWritePath();
+    // Single-use initialization on a fresh store, serialized with all queries.
+    // The context path is an absolute ordinary local image. Device offset must
+    // equal expected.scope.store_offset_bytes; all identity fields are exact.
+    // A fresh attempt selects immutable mode, including on failure. Calls on
+    // an initialized store refuse without changing its existing state or plans.
+    [[nodiscard]] bool PrepareNativeSnapshotReadPath(
+        const catalog::ApfsSnapshotIdentity& expected, std::string& error);
+    [[nodiscard]] bool IsImmutableSnapshotView() const noexcept;
+    [[nodiscard]] const catalog::ApfsSnapshotInfo* NativeSnapshot() const noexcept;
     [[nodiscard]] bool IsNativeWriteReady() const noexcept;
     [[nodiscard]] bool SupportsFileAllocationSize() const;
     [[nodiscard]] bool IsCommitPathReady() const noexcept;
@@ -459,6 +474,23 @@ public:
     // All calls and the ensuing transaction require the host's exclusive read gate.
     // A bounded Open admission check; source identity and all data are revalidated at mutation.
     [[nodiscard]] bool HasSupportedCompressionRewriteHeader(std::uint64_t object_id, std::uint64_t logical_size) const;
+    enum class CloneAcceptance { Refused, Accepted, RecoveryRequired };
+    struct CloneReceipt { std::uint64_t transaction_id=0, sequence=0, checkpoint=0, target=0; };
+    // Caller holds its exclusive store/journal mutation lock throughout this call.
+    // A returned receipt pins its WAL sequence and checkpoint until publication is
+    // independently verified and cleanup is durable. RecoveryRequired must block
+    // further mutations: an acceptance append may have persisted.
+    [[nodiscard]] CloneAcceptance AcceptNativeClone(TransactionManager& journal,
+        const std::wstring& source, const std::wstring& target, CloneReceipt& receipt);
+    // Drained source; new target only. Does not reserve an inode or expose a target.
+    [[nodiscard]] bool PrepareNativeClone(const std::wstring& source, const std::wstring& target, MutationRequest& out) const;
+    enum class CloneReplay { Refused, Staged, AlreadyPublished };
+    // Input must come from TransactionManager's validated accepted transaction.
+    // Later source states are never substituted; publication is proved against
+    // the first changed retained checkpoint, even if the source is now unlinked.
+    [[nodiscard]] CloneReplay ReplayNativeClone(const WriteAheadLog::Record& record,
+        std::uint64_t accepted_preimage_checkpoint);
+    [[nodiscard]] static bool NativeCloneFromWal(const WriteAheadLog::Record& record, MutationRequest& out);
     [[nodiscard]] bool PrepareCompressionRewrite(const std::wstring& path, MutationRequest& out) const;
     [[nodiscard]] static bool CompressionRewriteFromWal(const WriteAheadLog::Record& record, MutationRequest& out);
     // Use with the originating, still-open store. Compressed plans validate
@@ -580,6 +612,8 @@ private:
     [[nodiscard]] bool IsLegacyFixtureFallbackAllowedForCurrentContext() const noexcept;
     [[nodiscard]] bool RequiresCanonicalNonFixtureCommitPath() const noexcept;
     [[nodiscard]] bool CanUseAppleTransactionWriter(std::wstring* out_reason = nullptr) const;
+    [[nodiscard]] bool VerifyPublishedNativeClone(const MutationRequest& request) const;
+    [[nodiscard]] bool PrepareNativeCloneCore(const std::wstring&, const std::wstring&, MutationRequest&, bool publishing) const;
     [[nodiscard]] CommitStatus CommitApplePendingMutations(
         const std::vector<std::uint64_t>& required_checkpoint_xids, bool capacity_only = false);
     [[nodiscard]] MutationStatus ApplyMutationCore(const MutationRequest& request,
@@ -1265,5 +1299,8 @@ private:
     mutable PerfCounter persist_replay_checkpoint_perf_;
     mutable PerfCounter persist_superblock_checkpoint_perf_;
     mutable PerfCounter take_last_committed_inode_changes_perf_;
+    void ClearSnapshotReadState();
+    bool immutable_snapshot_view_ = false;
+    std::shared_ptr<const NativeApfsSnapshotProjection> native_snapshot_projection_;
 };
 } // namespace apfsaccess::rw

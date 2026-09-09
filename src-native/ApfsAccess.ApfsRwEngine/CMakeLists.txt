@@ -68,6 +68,11 @@ target_compile_features(ApfsAccess.ApfsRwEngine PUBLIC cxx_std_20)
 
 target_compile_definitions(ApfsAccess.ApfsRwEngine PRIVATE UTF8PROC_EXPORTS Z_PREFIX)
 
+if(WIN32)
+    target_sources(ApfsAccess.ApfsRwEngine PRIVATE src/ApfsCrypto.cpp src/ApfsKeybag.cpp)
+    target_link_libraries(ApfsAccess.ApfsRwEngine PRIVATE bcrypt)
+endif()
+
 target_link_libraries(ApfsAccess.ApfsRwEngine
     PRIVATE
         ApfsAccess.Utf8Proc
@@ -111,7 +116,19 @@ if(MSVC)
 endif()
 
 if(BUILD_TESTING)
-    foreach(_snapshot_test ApfsSnapshotStoreTests SnapshotParserRedTests)
+    if(WIN32)
+        add_executable(ApfsAccess.ApfsRwEngine.CryptoFoundationTests
+            tests/ApfsCryptoFoundationTests.cpp src/ApfsCrypto.cpp src/ApfsKeybag.cpp)
+        target_compile_definitions(ApfsAccess.ApfsRwEngine.CryptoFoundationTests PRIVATE APFSACCESS_CRYPTO_TESTING)
+        target_include_directories(ApfsAccess.ApfsRwEngine.CryptoFoundationTests PRIVATE tests)
+        target_link_libraries(ApfsAccess.ApfsRwEngine.CryptoFoundationTests PRIVATE ApfsAccess.ApfsRwEngine bcrypt)
+        target_compile_features(ApfsAccess.ApfsRwEngine.CryptoFoundationTests PRIVATE cxx_std_20)
+        if(MSVC)
+            target_compile_options(ApfsAccess.ApfsRwEngine.CryptoFoundationTests PRIVATE /W4 /permissive-)
+        endif()
+        add_test(NAME ApfsAccess.ApfsRwEngine.CryptoFoundationTests COMMAND ApfsAccess.ApfsRwEngine.CryptoFoundationTests)
+    endif()
+    foreach(_snapshot_test ApfsSnapshotStoreTests SnapshotParserRedTests SnapshotProjectionTests SnapshotReadStoreTests)
         add_executable(ApfsAccess.ApfsRwEngine.${_snapshot_test} tests/${_snapshot_test}.cpp)
         target_link_libraries(ApfsAccess.ApfsRwEngine.${_snapshot_test} PRIVATE ApfsAccess.ApfsRwEngine)
         target_compile_features(ApfsAccess.ApfsRwEngine.${_snapshot_test} PRIVATE cxx_std_20)
@@ -121,7 +138,7 @@ if(BUILD_TESTING)
         add_test(NAME ApfsAccess.ApfsRwEngine.${_snapshot_test} COMMAND ApfsAccess.ApfsRwEngine.${_snapshot_test})
     endforeach()
     target_compile_definitions(ApfsAccess.ApfsRwEngine.SnapshotParserRedTests PRIVATE SNAPSHOT_STRICT_POLICY)
-    foreach(_clone_test AppleCloneCowTests AppleCloneStoreTests AppleCloneWalTests)
+    foreach(_clone_test AppleCloneCowTests AppleCloneStoreTests AppleCloneWalTests NativeDurableCloneTests)
         add_executable(ApfsAccess.ApfsRwEngine.${_clone_test} tests/${_clone_test}.cpp)
         target_link_libraries(ApfsAccess.ApfsRwEngine.${_clone_test} PRIVATE ApfsAccess.ApfsRwEngine)
         target_compile_features(ApfsAccess.ApfsRwEngine.${_clone_test} PRIVATE cxx_std_20)

@@ -45,6 +45,7 @@ public:
         SetAllocationSize = 13,
         RestoreDirectoryFromSymbolicLink = 14,
         RewriteCompressedContent = 15,
+        CloneFile = 16,
         TransactionMarker = 100,
         CompactionIndex = 101,
         DurabilityWatermark = 102,
@@ -168,6 +169,7 @@ public:
     [[nodiscard]] static bool InodeMetadataMutationIsConsistent(const Record& record);
     [[nodiscard]] static bool AllocationSizeMutationIsConsistent(const Record& record);
     [[nodiscard]] static bool DirectoryRestoreMutationIsConsistent(const Record& record);
+    [[nodiscard]] static bool NativeCloneIsConsistent(const Record& record);
     [[nodiscard]] static bool CompressionRewriteIsConsistent(const Record& record);
     [[nodiscard]] static bool ExtendedAttributeMutationIsConsistent(const Record& record);
     [[nodiscard]] static bool UnlinkOutcomeIsConsistent(const Record& record);

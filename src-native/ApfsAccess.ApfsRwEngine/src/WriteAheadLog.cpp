@@ -1,6 +1,7 @@
 #include "WriteAheadLog.h"
 #include "InodeMetadataPatch.h"
 #include "CompressionRewrite.h"
+#include "NativeClone.h"
 
 #include <algorithm>
 #include <atomic>
@@ -161,6 +162,17 @@ bool IsStrictUtf8(std::string_view value)
 
 bool InlinePayloadIsConsistentImpl(const WriteAheadLog::Record& record)
 {
+    if (record.operation == WriteAheadLog::OperationKind::CloneFile)
+    {
+        NativeCloneProof p; std::array<std::uint8_t,32> digest{};
+        return DecodeNativeClone(record.inline_payload,p) && record.object_id==p.target &&
+            record.parent_object_id==p.checkpoint+1 && record.payload_length==record.inline_payload.size() &&
+            IsStrictUtf8(record.path_utf8) && IsStrictUtf8(record.secondary_path_utf8) &&
+            record.path_utf8.find('\0')==std::string::npos && record.secondary_path_utf8.find('\0')==std::string::npos &&
+            record.path_utf8!=record.secondary_path_utf8 && !record.flags && !record.unlink_outcome &&
+            !record.logical_offset && !record.logical_length && !record.payload_offset && !record.payload_spool_id &&
+            ComputeSha256(record.inline_payload,digest) && digest==record.payload_sha256;
+    }
     if (record.operation == WriteAheadLog::OperationKind::RewriteCompressedContent)
     {
         CompressionRewrite proof;
@@ -227,6 +239,7 @@ bool IsKnownOperation(WriteAheadLog::OperationKind operation)
     case WriteAheadLog::OperationKind::SetInodeMetadata:
     case WriteAheadLog::OperationKind::SetAllocationSize:
     case WriteAheadLog::OperationKind::RestoreDirectoryFromSymbolicLink:
+    case WriteAheadLog::OperationKind::CloneFile:
     case WriteAheadLog::OperationKind::RewriteCompressedContent:
     case WriteAheadLog::OperationKind::TransactionMarker:
     case WriteAheadLog::OperationKind::CompactionIndex:
@@ -1199,7 +1212,7 @@ bool DecodeRecord(
         (record.operation != WriteAheadLog::OperationKind::RemoveExtendedAttribute ||
             version == kLegacyVersion);
     if (!IsKnownOperation(record.operation) || !extended_attribute_version_is_valid ||
-        (record.operation == WriteAheadLog::OperationKind::RewriteCompressedContent && version != kInlinePayloadVersion) ||
+        ((record.operation == WriteAheadLog::OperationKind::RewriteCompressedContent || record.operation == WriteAheadLog::OperationKind::CloneFile) && version != kInlinePayloadVersion) ||
         (record.operation == WriteAheadLog::OperationKind::SetInodeMetadata && version != kInlinePayloadVersion) ||
         !InlinePayloadIsConsistentImpl(record) ||
         !ExtendedAttributeMutationIsConsistentImpl(record) ||
@@ -3886,7 +3899,7 @@ std::vector<std::uint8_t> WriteAheadLog::EncodeForTest(
                 : kLegacyVersion)
         : version_override;
     if ((record.operation == OperationKind::SetExtendedAttribute && version != kInlinePayloadVersion) ||
-        (record.operation == OperationKind::RewriteCompressedContent && version != kInlinePayloadVersion) ||
+        ((record.operation == OperationKind::RewriteCompressedContent || record.operation == OperationKind::CloneFile) && version != kInlinePayloadVersion) ||
         (record.operation == OperationKind::RemoveExtendedAttribute && version != kLegacyVersion) ||
         (!record.inline_payload.empty() && version != kInlinePayloadVersion) ||
         (record.unlink_outcome.has_value() != (version == kUnlinkOutcomeVersion)) ||
@@ -3990,6 +4003,9 @@ bool WriteAheadLog::InodeMetadataMutationIsConsistent(const Record& record)
 {
     return InodeMetadataMutationIsConsistentImpl(record);
 }
+
+bool WriteAheadLog::NativeCloneIsConsistent(const Record& record)
+{ return record.operation != OperationKind::CloneFile || InlinePayloadIsConsistentImpl(record); }
 
 bool WriteAheadLog::CompressionRewriteIsConsistent(const Record& record)
 {

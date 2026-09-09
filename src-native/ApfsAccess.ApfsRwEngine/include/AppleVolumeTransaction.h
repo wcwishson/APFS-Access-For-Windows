@@ -37,7 +37,8 @@ struct AppleVolumeTransactionRequest
     std::vector<catalog::BtreeRecord> filesystem_records;
     std::vector<AppleVolumeDataWrite> data_writes;
     // Native planner input only. A host must durably accept clone identity and
-    // source preimage before exposing this operation; no WAL/host opcode added.
+    // source preimage before exposing this operation. MetadataStore supplies the
+    // typed native acceptance API; this planner alone is not an acceptance API.
     std::vector<AppleVolumeCloneRequest> clones;
     // Exact source evidence from the dedicated MetadataStore transition.
     std::vector<CompressionRewrite> compression_rewrites;

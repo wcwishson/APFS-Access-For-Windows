@@ -12,6 +12,7 @@ namespace apfsaccess::rw
 
 constexpr std::uint32_t kAppleBsdCompressedFlag = 0x00000020;
 constexpr std::uint64_t kAppleInodeSparseFlag = 0x00000200;
+constexpr std::uint64_t kAppleInodeHasUncompressedSize = 0x00040000;
 constexpr std::uint8_t kAppleInodeSparseBytesField = 13;
 
 // Fork/compression mutation requires an owner-aware policy. These names

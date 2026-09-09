@@ -1,6 +1,7 @@
 #include "ApfsSnapshotStore.h"
 
 #include <algorithm>
+#include <stdexcept>
 #include <tuple>
 
 namespace apfsaccess::catalog
@@ -34,9 +35,10 @@ bool UuidValid(const std::string& uuid)
 }
 }
 
-bool ApfsSnapshotStore::Enumerate(const RandomAccessSource& source,
+static bool EnumerateRecords(const RandomAccessSource& source,
     const ApfsSnapshotScope& scope, std::vector<ApfsSnapshotInfo>& out_snapshots,
-    std::string& out_error)
+    std::string& out_error, std::uint64_t selected_xid = 0,
+    ApfsSnapshotRecords* selected_records = nullptr)
 {
     out_snapshots.clear();
     out_error.clear();
@@ -77,7 +79,9 @@ bool ApfsSnapshotStore::Enumerate(const RandomAccessSource& source,
         return false;
     }
     std::vector<AppleSnapshotRecord> raw;
-    if (!LoadAppleSnapshotRecords(store, *checkpoint, scope.volume_oid, raw, out_error)) return false;
+    AppleSnapshotTreeRecords trees;
+    if (!LoadAppleSnapshotRecords(store, *checkpoint, scope.volume_oid, raw,
+        out_error, selected_xid, trees)) return false;
     std::vector<ApfsSnapshotInfo> result;
     for (auto& snapshot : raw)
     {
@@ -101,7 +105,65 @@ bool ApfsSnapshotStore::Enumerate(const RandomAccessSource& source,
         result.push_back(std::move(item));
     }
     out_snapshots = std::move(result);
+    if (selected_records)
+    {
+        selected_records->checkpoint = std::move(*checkpoint);
+        selected_records->trees = std::move(trees);
+    }
     return true;
+}
+
+bool ApfsSnapshotStore::Enumerate(const RandomAccessSource& source,
+    const ApfsSnapshotScope& scope, std::vector<ApfsSnapshotInfo>& out_snapshots,
+    std::string& out_error)
+{
+    return EnumerateRecords(source, scope, out_snapshots, out_error);
+}
+
+bool ApfsSnapshotStore::LoadExactRecords(const RandomAccessSource& source,
+    const ApfsSnapshotIdentity& expected, ApfsSnapshotRecords& out_records,
+    std::string& out_error)
+{
+    bool complete = false;
+    struct ClearOnFailure
+    {
+        ApfsSnapshotRecords& records;
+        const bool& complete;
+        ~ClearOnFailure() { if (!complete) records = {}; }
+    } clear{out_records, complete};
+    try
+    {
+        const auto identity = expected; // supports expected aliasing the output
+        out_records = {};
+        ApfsSnapshotRecords result;
+        std::vector<ApfsSnapshotInfo> snapshots;
+        if (!EnumerateRecords(source, identity.scope, snapshots, out_error,
+            identity.snapshot_xid, &result)) return false;
+        const auto found = std::find_if(snapshots.begin(), snapshots.end(), [&](const auto& item) {
+            return item.identity == identity;
+        });
+        if (found == snapshots.end())
+        {
+            out_error = "SnapshotExactIdentityMismatchOrMissing";
+            return false;
+        }
+        result.snapshot = std::move(*found);
+        out_records = std::move(result);
+        complete = true;
+        return true;
+    }
+    catch (const std::bad_alloc&)
+    {
+        if (const auto budget = source.ReadBudget()) (void)budget->Refuse("ApfsReadBudgetAllocationFailed");
+        out_error = "ApfsReadBudgetAllocationFailed";
+        return false;
+    }
+    catch (const std::length_error&)
+    {
+        if (const auto budget = source.ReadBudget()) (void)budget->Refuse("ApfsReadBudgetAllocationFailed");
+        out_error = "ApfsReadBudgetAllocationFailed";
+        return false;
+    }
 }
 
 bool ApfsSnapshotStore::ValidateExact(const RandomAccessSource& source,

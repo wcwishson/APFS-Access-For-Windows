@@ -5,6 +5,7 @@
 #include "MetadataStore.h"
 #include "ApfsNameCodec.h"
 #include "RandomAccessSource.h"
+#include "ApfsSnapshotStore.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -40,9 +41,37 @@ struct NativeApfsVolumeProjection
     std::unordered_map<std::uint64_t, std::vector<MetadataStore::FileExtent>> read_extents_by_inode;
 };
 
+// Distinct immutable result: no implicit conversion to a writable live view.
+// Physical byte addresses/blocks in View() are relative to the supplied source;
+// identity locations remain relative to its exact store window. No writer token.
+class NativeApfsSnapshotProjection final
+{
+public:
+    const catalog::ApfsSnapshotInfo& Snapshot() const noexcept { return snapshot_; }
+    const NativeApfsVolumeProjection& View() const noexcept { return view_; }
+private:
+    friend class NativeApfsReader;
+    catalog::ApfsSnapshotInfo snapshot_;
+    NativeApfsVolumeProjection view_;
+};
+
 class NativeApfsReader
 {
 public:
+    // Requires a stable read-only source for the operation and subsequent data
+    // reads. Explicit snapshot identity only; this never loads a live fallback.
+    // Shares source.ReadBudget(), or installs one bounded operation allowance.
+    // On failure resets out_projection, including late namespace/extent errors.
+    // Bounded subset: complete KIND_NEW extentref graph, ordinary streams with
+    // explicit hole coverage and supported external xattrs. Compressed read
+    // plans and retained/UPDATE extentref accounting are explicitly refused.
+    // The store window must equal NXSB geometry and start on a block boundary.
+    [[nodiscard]] static bool TryLoadSnapshotProjection(
+        const catalog::RandomAccessSource& source,
+        const catalog::ApfsSnapshotIdentity& expected,
+        std::shared_ptr<const NativeApfsSnapshotProjection>& out_projection,
+        std::string& out_error);
+
     // Optional shared cumulative parser allowance, attached before cataloging.
     // Budgeted calls require complete namespace and attribute ownership walks.
     // Any failure clears out_projection; no unbudgeted retry occurs.

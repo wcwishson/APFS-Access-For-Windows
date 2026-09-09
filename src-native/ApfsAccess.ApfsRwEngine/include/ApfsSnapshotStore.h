@@ -41,6 +41,14 @@ struct ApfsSnapshotInfo
     AppleSnapshotRecord metadata;
 };
 
+// A read-only, exact record bundle. Addresses remain relative to scope's store.
+struct ApfsSnapshotRecords
+{
+    ApfsSnapshotInfo snapshot;
+    AppleCheckpointView checkpoint;
+    AppleSnapshotTreeRecords trees;
+};
+
 class ApfsSnapshotStore final
 {
 public:
@@ -48,6 +56,12 @@ public:
     // valid, empty metadata tree and consistent zero APSB/OMAP counts.
     static bool Enumerate(const RandomAccessSource& source, const ApfsSnapshotScope& scope,
         std::vector<ApfsSnapshotInfo>& out_snapshots, std::string& out_error);
+
+    // Revalidates all identity fields and returns the selected historical trees
+    // captured during that same walk. Preserves source.ReadBudget(); no retry.
+    static bool LoadExactRecords(const RandomAccessSource& source,
+        const ApfsSnapshotIdentity& expected, ApfsSnapshotRecords& out_records,
+        std::string& out_error);
 
     // Re-reads authoritative bytes; never treats a cached descriptor as proof.
     // Mismatched XID/name/root identity fails, without selecting another view.

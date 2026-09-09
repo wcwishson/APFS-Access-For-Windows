@@ -48,6 +48,11 @@ public:
     [[nodiscard]] bool IsWritable() const;
     [[nodiscard]] bool HasWriteHandle() const noexcept;
     [[nodiscard]] static DWORD WriteHandleShareMode(std::wstring_view path) noexcept;
+    // Explicit local-image lease. Never opens a writer; denies write/delete
+    // sharing until destruction. General BlockDevice opens are unchanged.
+    [[nodiscard]] static std::shared_ptr<BlockDevice> OpenStableReadOnlyImage(
+        std::wstring path, std::string& error);
+    [[nodiscard]] bool RevalidateStableReadOnlyImage() const;
 
     [[nodiscard]] bool Read(std::uint64_t offset_bytes, std::size_t size_bytes, std::vector<std::byte>& out_buffer) const;
     [[nodiscard]] bool ReadInto(
@@ -222,5 +227,7 @@ private:
     std::size_t merged_batch_scratch_capacity_ = 0;
     mutable std::vector<std::byte> read_scratch_;
     mutable std::vector<std::byte> write_scratch_;
+    bool stable_read_only_image_ = false;
+    FILE_ID_INFO stable_image_identity_{};
 };
 } // namespace apfsaccess::rw

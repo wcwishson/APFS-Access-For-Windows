@@ -2967,8 +2967,21 @@ bool LoadAppleSnapshotRecords(const RandomAccessSource& source,
     const AppleCheckpointView& checkpoint, std::uint64_t volume_oid,
     std::vector<AppleSnapshotRecord>& out_records, std::string& out_error)
 {
+    AppleSnapshotTreeRecords ignored;
+    return LoadAppleSnapshotRecords(source, checkpoint, volume_oid,
+        out_records, out_error, 0, ignored);
+}
+
+bool LoadAppleSnapshotRecords(const RandomAccessSource& source,
+    const AppleCheckpointView& checkpoint, std::uint64_t volume_oid,
+    std::vector<AppleSnapshotRecord>& out_records, std::string& out_error,
+    std::uint64_t exact_snapshot_xid, AppleSnapshotTreeRecords& out_trees)
+{
     BudgetErrorScope budget_error{source, out_error};
     out_records.clear();
+    out_trees = {};
+    AppleSnapshotTreeRecords selected_trees;
+    bool selected = false;
     out_error.clear();
     const auto fail = [&](const char* reason) { out_error = reason; return false; };
     const auto& nx = checkpoint.container.superblock;
@@ -3124,13 +3137,21 @@ bool LoadAppleSnapshotRecords(const RandomAccessSource& source,
         // Validate complete referenced trees now; no validated descriptor may
         // hide a malformed/cyclic child behind a superficially valid root.
         if (!ReadSnapshotTree(store, nx.block_size, snapshot.volume.root_tree,
-            snapshot.volume.object_map, snapshot.xid, nx.xid, records, out_error) ||
-            !ReadSnapshotTree(store, nx.block_size, extent, snapshot.volume.object_map,
-                snapshot.xid, nx.xid, records, out_error)) return false;
+            snapshot.volume.object_map, snapshot.xid, nx.xid, records, out_error)) return false;
+        if (snapshot.xid == exact_snapshot_xid)
+        {
+            selected = true;
+            selected_trees.filesystem = std::move(records);
+        }
+        if (!ReadSnapshotTree(store, nx.block_size, extent, snapshot.volume.object_map,
+            snapshot.xid, nx.xid, records, out_error)) return false;
+        if (snapshot.xid == exact_snapshot_xid) selected_trees.extentref = std::move(records);
         if (!Materialize(source, 1, sizeof(AppleSnapshotRecord))) return false;
         result.push_back(std::move(snapshot));
     }
+    if (exact_snapshot_xid != 0 && !selected) return fail("SnapshotExactXidMissing");
     out_records = std::move(result);
+    out_trees = std::move(selected_trees);
     return true;
 }
 

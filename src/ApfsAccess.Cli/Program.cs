@@ -33,7 +33,7 @@ internal static class Program
     private static readonly string[] ReportedCommands =
     [
         "status", "list", "mount", "fix", "eject", "quit", "query", "cancel",
-        "version", "capabilities", "supervise-fshost", "xattr", "drive-letter",
+        "version", "capabilities", "supervise-fshost", "xattr", "drive-letter", "snapshots",
     ];
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -127,6 +127,9 @@ internal static class Program
         DateTimeOffset? operationDeadlineUtc,
         bool allowInProcessTestPipeMutations)
     {
+        if (args.Length > 0 && string.Equals(args[0], "snapshots", StringComparison.OrdinalIgnoreCase))
+            return SnapshotCommand.Run(args[1..]);
+
         if (args.Length > 0 && string.Equals(args[0], "drive-letter", StringComparison.OrdinalIgnoreCase))
             return await DriveLetterCommand.RunAsync(args[1..]).ConfigureAwait(false);
 
@@ -294,6 +297,7 @@ internal static class Program
         Add(response, "elevationTreeOwnership", "token-specific-job-object");
         Add(response, "dryRunBehavior", "service-backed-inspection-only");
         Add(response, "automaticServiceStartup", "packaged-exe-only");
+        Add(response, "snapshotInventory", "read-only-local-image");
         Add(response, "pipeName", options.PipeName);
         Add(response, "exitCodes", new Dictionary<string, int>(StringComparer.Ordinal)
         {
@@ -323,6 +327,7 @@ internal static class Program
 
         var response = CreateResponse(options, success: true, Success, ApfsOperationCodes.OperationSucceeded, null);
         Add(response, "usage", "ApfsAccess.Cli.exe <command> [options]");
+        Add(response, "snapshotUsage", SnapshotCommand.Usage);
         Add(response, "commands", ReportedCommands);
         Add(response, "options", new[]
         {
@@ -1859,6 +1864,7 @@ internal static class Program
     private static void PrintHumanHelp()
     {
         Console.WriteLine("APFS Access CLI");
+        Console.WriteLine(SnapshotCommand.Usage + " (read-only image inventory)");
         Console.WriteLine("Usage: ApfsAccess.Cli.exe <command> [options]");
         Console.WriteLine();
         Console.WriteLine("Commands: status, list, mount, fix, eject, quit, query, cancel, version, capabilities, xattr");

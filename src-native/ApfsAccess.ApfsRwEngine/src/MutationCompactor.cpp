@@ -194,6 +194,7 @@ MutationCompactor::Summary MutationCompactor::Summarize(
                 CanonicalPathKey(mutation.secondary_path, name_policy));
             break;
         case MutationKind::SetAllocationSize:
+        case MutationKind::CloneFile:
         case MutationKind::RewriteCompressedContent:
             // Allocation shrink may truncate EOF; a final-path summary cannot
             // represent the ordered writes, truncations and growth around it.

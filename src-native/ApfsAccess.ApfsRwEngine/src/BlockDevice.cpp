@@ -1133,6 +1133,7 @@ bool BlockDevice::Write(std::uint64_t offset_bytes, const std::vector<std::byte>
 
 bool BlockDevice::Write(std::uint64_t offset_bytes, std::span<const std::byte> buffer)
 {
+    if (stable_read_only_image_) return false;
     ScopedPerfTimer perf_scope(write_perf_, static_cast<std::uint64_t>(buffer.size()));
     perf_scope.SetSecondary(unaligned_write_perf_);
 
@@ -1178,6 +1179,7 @@ bool BlockDevice::Write(std::uint64_t offset_bytes, std::span<const std::byte> b
 
 bool BlockDevice::WriteBatch(std::span<const WriteSpan> writes)
 {
+    if (stable_read_only_image_) return false;
     last_io_error_.store(ERROR_SUCCESS, std::memory_order_relaxed);
     std::uint64_t total_bytes = 0;
     const WriteSpan* single_non_empty_write = nullptr;
@@ -2082,6 +2084,7 @@ bool BlockDevice::WriteBatch(std::span<const WriteSpan> writes)
 
 bool BlockDevice::Flush()
 {
+    if (stable_read_only_image_) return false;
     ScopedPerfTimer perf_scope(flush_perf_);
 
     if (IsFaultSwitchEnabled(L"APFSACCESS_RW_FAULT_FLUSH"))
@@ -2325,6 +2328,47 @@ bool BlockDevice::EnsureAsyncEventPool(std::size_t count)
     return true;
 }
 
+std::shared_ptr<BlockDevice> BlockDevice::OpenStableReadOnlyImage(
+    std::wstring path, std::string& error)
+{
+    error.clear();
+    // Reject device, UNC and alternate-stream spellings before any open.
+    if (path.size() < 3 || !std::iswalpha(path[0]) || path[1] != L':' ||
+        (path[2] != L'\\' && path[2] != L'/') || path.find(L':', 2) != std::wstring::npos)
+    {
+        error = "SnapshotSourceRequiresAbsoluteLocalImage";
+        return {};
+    }
+    auto device = std::make_shared<BlockDevice>(std::move(path));
+    device->stable_read_only_image_ = true;
+    const auto handle = CreateFileW(device->path_.c_str(), GENERIC_READ,
+        FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        error = "SnapshotStableImageOpenFailed:" + std::to_string(GetLastError());
+        return {};
+    }
+    device->read_handle_.store(handle, std::memory_order_release);
+    if (!QueryRegularFileIdentity(handle, device->stable_image_identity_))
+    {
+        error = "SnapshotSourceNotRegularLocalImage";
+        return {};
+    }
+    device->regular_file_.store(true, std::memory_order_release);
+    return device;
+}
+
+bool BlockDevice::RevalidateStableReadOnlyImage() const
+{
+    FILE_ID_INFO identity{};
+    return stable_read_only_image_ && !HasWriteHandle() &&
+        QueryRegularFileIdentity(read_handle_.load(std::memory_order_acquire), identity) &&
+        identity.VolumeSerialNumber == stable_image_identity_.VolumeSerialNumber &&
+        std::memcmp(identity.FileId.Identifier, stable_image_identity_.FileId.Identifier,
+            sizeof(identity.FileId.Identifier)) == 0;
+}
+
 HANDLE BlockDevice::EnsureReadHandle() const
 {
     auto handle = read_handle_.load(std::memory_order_acquire);
@@ -2356,6 +2400,11 @@ HANDLE BlockDevice::EnsureReadHandle() const
 
 HANDLE BlockDevice::EnsureWriteHandle() const
 {
+    if (stable_read_only_image_)
+    {
+        last_io_error_.store(ERROR_WRITE_PROTECT, std::memory_order_relaxed);
+        return INVALID_HANDLE_VALUE;
+    }
     auto handle = write_handle_.load(std::memory_order_acquire);
     if (handle != INVALID_HANDLE_VALUE)
     {

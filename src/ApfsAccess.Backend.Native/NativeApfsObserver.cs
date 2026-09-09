@@ -62,8 +62,6 @@ internal sealed class ProcessObserverRunner : IObserverRunner
         using var process = new Process { StartInfo = psi };
         process.Start();
         var pid = process.Id;
-        var stdoutEncoding = process.StandardOutput.CurrentEncoding;
-        var stderrEncoding = process.StandardError.CurrentEncoding;
         var overrun = 0;
         async Task<byte[]> DrainAsync(Stream pipe)
         {
@@ -92,7 +90,13 @@ internal sealed class ProcessObserverRunner : IObserverRunner
             // Include pipe draining in the execution deadline, including inherited handles.
             await drains.WaitAsync(deadline.Token).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
-            return new(process.ExitCode, stdoutEncoding.GetString(stdout.Result), stderrEncoding.GetString(stderr.Result));
+            try
+            {
+                var utf8 = new System.Text.UTF8Encoding(false, true);
+                return new(process.ExitCode, utf8.GetString(stdout.Result), utf8.GetString(stderr.Result));
+            }
+            catch (System.Text.DecoderFallbackException ex)
+            { throw new InvalidDataException("Observer output is not valid UTF-8.", ex); }
         }
         catch (Exception failure)
         {
