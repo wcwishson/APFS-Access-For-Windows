@@ -3459,6 +3459,8 @@ const char* CommitStatusToString(apfsaccess::rw::MetadataStore::CommitStatus sta
         return "AllocationFailed";
     case CommitStatus::RetentionBlocked:
         return "RetentionBlocked";
+    case CommitStatus::CapacityBlocked:
+        return "CapacityBlocked";
     case CommitStatus::InvariantFailed:
         return "InvariantFailed";
     case CommitStatus::PersistFailed:
@@ -3482,7 +3484,8 @@ bool TestCommitStatusNumericStability()
             static_cast<int>(CommitStatus::InvariantFailed) == 5 &&
             static_cast<int>(CommitStatus::PersistFailed) == 6 &&
             static_cast<int>(CommitStatus::FlushFailed) == 7 &&
-            static_cast<int>(CommitStatus::RetentionBlocked) == 8,
+            static_cast<int>(CommitStatus::RetentionBlocked) == 8 &&
+            static_cast<int>(CommitStatus::CapacityBlocked) == 9,
         "Task4CommitStatus: legacy numeric identities remain stable");
 }
 

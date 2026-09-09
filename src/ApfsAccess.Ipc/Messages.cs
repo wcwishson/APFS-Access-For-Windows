@@ -40,7 +40,8 @@ public sealed record StatusChangedPayload(
     bool ShutdownDrainActive = false,
     int InFlightMutationCallbacks = 0,
     NativeWriteValidationEvidence? NativeWriteValidationEvidence = null,
-    IReadOnlyList<NativeWriteDiagnostic>? NativeWriteDiagnostics = null
+    IReadOnlyList<NativeWriteDiagnostic>? NativeWriteDiagnostics = null,
+    IReadOnlyList<DeviceInventory>? ConnectedInventory = null
 );
 
 public sealed record QuitRequestedPayload(string Requester, DateTime TimestampUtc);
@@ -224,5 +225,7 @@ public sealed record MountedVolumeDisplay(
     ApfsCapabilityDecision? CatalogDecision = null,
     IReadOnlyList<string>? CatalogReasons = null,
     bool? CatalogAutoMountAllowed = null,
-    DriveLetterPreference? DriveLetterPreference = null
+    DriveLetterPreference? DriveLetterPreference = null,
+    ApfsVolumeSpaceObservation? CatalogSpace = null,
+    bool HasRuntimeStatus = false
 );

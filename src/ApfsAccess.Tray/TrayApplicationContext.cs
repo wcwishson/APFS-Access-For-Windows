@@ -86,7 +86,8 @@ private PipePeer? _statusPeer;
             SetStartWithWindowsAsync,
             SetStartMinimizedAsync,
             HandleUpdateButtonAsync,
-            SetDriveLetterPreferenceAsync);
+            SetDriveLetterPreferenceAsync,
+            MountConnectedVolumeAsync);
 if (!startupPreferences.StartMinimized)
         {
             _dashboard.Show();
@@ -977,6 +978,48 @@ private void HandleServiceStopping()
         if (!result.Success) throw new InvalidOperationException(result.Message ?? "Could not save the preferred letter.");
     }
 
+    private async Task MountConnectedVolumeAsync(DriveDashboardRow row)
+    {
+        var current = _latestStatus ?? throw new InvalidOperationException("Service status is unavailable. Refresh first.");
+        var request = DriveDashboardPresenter.CreateMountRequest(current, row);
+        using var timeout = new CancellationTokenSource(FixRequestTimeout);
+        try
+        {
+            await using var peer = await NamedPipeMessageClient.ConnectAsync(
+                ApfsPipeConstants.PipeName, 1000, timeout.Token).ConfigureAwait(false);
+            await peer.SendAsync(PipeMessageCodec.Create(ApfsMessageTypes.ControlOperationRequest, request,
+                request.OperationId, PipeSchemaVersions.Schema2), timeout.Token).ConfigureAwait(false);
+            while (true)
+            {
+                var response = await peer.ReadMessageAsync(timeout.Token).ConfigureAwait(false)
+                    ?? throw new IOException("Service connection closed. Refresh to check the mount result.");
+                if (response.Type != ApfsMessageTypes.OperationResult || response.RequestId != request.OperationId) continue;
+                if (!PipeMessageCodec.Validate(response).IsValid ||
+                    !PipeMessageCodec.TryGetPayload<OperationResultPayload>(response, out var result) || result is null ||
+                    result.OperationId != request.OperationId || result.Command != request.Command ||
+                    !string.Equals(result.Target?.DeviceId, request.Target?.DeviceId, StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(result.Target?.VolumeId, request.Target?.VolumeId, StringComparison.OrdinalIgnoreCase) ||
+                    result.Target?.RecoveryIdentity != request.Target?.RecoveryIdentity ||
+                    result.RequestedMode != request.RequestedMode ||
+                    result.Fingerprint != ApfsOperationFingerprint.Compute(request))
+                    throw new IOException("Service returned an invalid mount result. Refresh before retrying.");
+                if (result.State is ApfsOperationStates.Accepted or ApfsOperationStates.InProgress)
+                {
+                    await Task.Delay(250, timeout.Token).ConfigureAwait(false);
+                    await peer.SendAsync(PipeMessageCodec.Create(ApfsMessageTypes.OperationResultQuery,
+                        new OperationResultQueryPayload(request.OperationId), request.OperationId, PipeSchemaVersions.Schema2), timeout.Token).ConfigureAwait(false);
+                    continue;
+                }
+                if (!result.Success) throw new InvalidOperationException(result.Diagnostic ?? "Mount request failed.");
+                return;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw new InvalidOperationException("Mount result timed out. Refresh to check the result before retrying.");
+        }
+    }
+
     private async Task<(bool Success, string? Message)> TrySendRequestAsync(
         string messageType,
         object payload,
@@ -1596,7 +1639,7 @@ private void HandleServiceStopping()
         if (payload.MountedVolumes is { Count: > 0 })
         {
             var mountedStates = rows
-                .Where(static row => row.State != DriveDashboardState.Idle)
+                .Where(static row => row.IsMounted)
                 .Select(static row => row.State)
                 .ToArray();
             if (mountedStates.Length > 0)
@@ -1604,6 +1647,9 @@ private void HandleServiceStopping()
                 return mountedStates.Max();
             }
         }
+
+        if (payload.ConnectedInventory is not null && !rows.Any(r => r.IsMounted) && payload.State == RuntimeState.Idle)
+            return DriveDashboardState.Idle;
 
         if (payload.NativeWriteSafetyState == NativeWriteSafetyState.RecoveryBlocked ||
             payload.RecoveryActive)

@@ -228,6 +228,10 @@ NTSTATUS MutateNativeXattr(MountContext* c, OpenContext* o, std::span<const std:
     Store::PayloadIdentity identity{};
     bool staged = false;
     const auto wide_name = Utf8ToWide(o->native_xattr_name);
+    const auto request = NativeCallbackRequest(remove ? Store::MutationOperation::RemoveExtendedAttribute :
+        Store::MutationOperation::SetExtendedAttribute, path, value.size(), 0, wide_name, value);
+    status = PreflightDirectCallback(c, std::span(&request, 1));
+    if (!NT_SUCCESS(status)) return status;
     std::size_t batch = 0;
     if (IsManifestSession(c)) batch = ManifestQueuedRequestCount(c) + 1;
     else { std::lock_guard<std::mutex> lock(c->metadata_mutex); batch = c->metadata_store->PendingMutationCount() + 1; }

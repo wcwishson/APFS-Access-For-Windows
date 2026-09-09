@@ -2,9 +2,11 @@
 
 #include "ApfsTransactionWriter.h"
 #include "ApfsExtendedRecordCodec.h"
+#include "ApfsSharedSpace.h"
 #include "WriteAheadLog.h"
 
 #include <algorithm>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <unordered_map>
@@ -221,6 +223,19 @@ bool ReplaceAllocationCount(std::uint64_t old_value,
     return true;
 }
 
+bool SumBlockCounts(std::initializer_list<std::uint64_t> counts,
+    std::uint64_t& out_count)
+{
+    out_count = 0;
+    for (const auto count : counts)
+    {
+        if (count > std::numeric_limits<std::uint64_t>::max() - out_count)
+            return false;
+        out_count += count;
+    }
+    return true;
+}
+
 bool SumReleasedBlocks(
     std::span<const AppleSpacemanReleaseRequest> releases,
     std::uint64_t& out_count)
@@ -273,7 +288,8 @@ bool CollectFileExtentChanges(
     const std::vector<catalog::BtreeRecord>& old_records,
     const std::vector<catalog::BtreeRecord>& requested_records,
     std::uint32_t block_size, std::vector<FileExtentUse>& out_old_uses,
-    std::vector<FileExtentUse>& out_removed_uses, std::string& out_error)
+    std::vector<FileExtentUse>& out_removed_uses, std::string& out_error,
+    const std::map<std::uint64_t, std::uint64_t>& clone_streams = {})
 {
     using ExtentKey = std::pair<std::uint64_t, std::uint64_t>;
     std::map<ExtentKey, std::size_t> old_by_key;
@@ -312,11 +328,11 @@ bool CollectFileExtentChanges(
         previous_owner = key.first;
         previous_end = extent.logical_address + extent.length_bytes;
     }
-    // Sparse COW may retain exact subranges of an old record. The mapping,
+    // Ordinary COW may retain exact subranges of an old record. The mapping,
     // crypto identity and owner must be unchanged; arbitrary remapping is forbidden.
-    std::unordered_set<std::uint64_t> sparse_ids;
+    std::unordered_set<std::uint64_t> splittable_streams;
     for (const auto& use : out_old_uses)
-        if (!use.extent.physical_block) sparse_ids.insert(use.extent.object_id);
+        if (!use.extent.physical_block) splittable_streams.insert(use.extent.object_id);
     std::unordered_map<std::uint64_t, std::size_t> private_owners;
     std::unordered_set<std::uint64_t> ordinary_private_ids;
     for (const auto& record : old_records)
@@ -325,13 +341,17 @@ bool CollectFileExtentChanges(
         AppleInodeRecord inode;
         if (!ApfsExtendedRecordCodec::DecodeInode(record, inode, out_error)) return false;
         ++private_owners[inode.private_id];
-        if (inode.internal_flags & kAppleInodeSparseFlag) sparse_ids.insert(inode.private_id);
+        if (inode.internal_flags & kAppleInodeSparseFlag) splittable_streams.insert(inode.private_id);
         if (inode.object_id == inode.private_id && (inode.mode & 0170000) == 0100000 &&
-            !(inode.bsd_flags & kAppleBsdCompressedFlag)) ordinary_private_ids.insert(inode.private_id);
+            !(inode.bsd_flags & kAppleBsdCompressedFlag))
+        {
+            ordinary_private_ids.insert(inode.private_id);
+            splittable_streams.insert(inode.private_id);
+        }
         for (const auto& field : inode.extended_fields)
             if (field.type == 8 && field.data.size() == 40 &&
                 catalog::ReadU64LE(field.data, 8).value_or(UINT64_MAX) < catalog::ReadU64LE(field.data, 0).value_or(0))
-                sparse_ids.insert(inode.private_id);
+                splittable_streams.insert(inode.private_id);
     }
     for (const auto& record : old_records)
     {
@@ -340,7 +360,7 @@ bool CollectFileExtentChanges(
         if (!ApfsExtendedRecordCodec::DecodeXattr(record, attribute, out_error)) return false;
         if (attribute.name_utf8 == "com.apple.decmpfs") ordinary_private_ids.erase(attribute.object_id);
     }
-    std::erase_if(sparse_ids, [&](auto id) { return private_owners[id] != 1 || !ordinary_private_ids.contains(id); });
+    std::erase_if(splittable_streams, [&](auto id) { return private_owners[id] != 1 || !ordinary_private_ids.contains(id); });
     std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> retained(out_old_uses.size());
     for (const auto& record : requested_records)
     {
@@ -348,18 +368,27 @@ bool CollectFileExtentChanges(
         FileExtentUse use;
         if (!DecodeFileExtentUse(record, block_size, use))
             return Fail(out_error, "AppleVolumeFileExtentRecordInvalid");
-        auto found = old_by_key.upper_bound({use.extent.object_id, use.extent.logical_address});
+        const auto clone = clone_streams.find(use.extent.object_id);
+        const auto source_id = clone == clone_streams.end() ? use.extent.object_id : clone->second;
+        auto found = old_by_key.upper_bound({source_id, use.extent.logical_address});
         if (found == old_by_key.begin()) return Fail(out_error, "AppleVolumeFileExtentMutationInvalid");
         --found;
         const auto& old = out_old_uses[found->second];
         const auto& before = old.extent;
         const auto& next = use.extent;
+        if (clone != clone_streams.end())
+        {
+            if (before.object_id != source_id || before.logical_address != next.logical_address ||
+                old.record->value != record.value)
+                return Fail(out_error, "AppleVolumeCloneExtentMismatch");
+            continue; // A new reference does not retain the source's own mapping.
+        }
         if (before.object_id != next.object_id || next.logical_address < before.logical_address ||
             next.logical_address - before.logical_address >= before.length_bytes ||
             next.length_bytes > before.length_bytes - (next.logical_address - before.logical_address))
             return Fail(out_error, "AppleVolumeFileExtentMutationInvalid");
         const bool exact = old.record->key == record.key && old.record->value == record.value;
-        if (!exact && (!sparse_ids.contains(before.object_id) || before.crypto_id || next.crypto_id ||
+        if (!exact && (!splittable_streams.contains(before.object_id) || before.crypto_id || next.crypto_id ||
             next.physical_block != (before.physical_block ? before.physical_block +
                 (next.logical_address - before.logical_address) / block_size : 0)))
             return Fail(out_error, "AppleVolumeFileExtentMutationInvalid");
@@ -379,7 +408,7 @@ bool CollectFileExtentChanges(
             fragment.extent.length_bytes = finish - begin;
             if (fragment.extent.physical_block)
                 fragment.extent.physical_block += (begin - old.extent.logical_address) / block_size;
-            if (!parts.empty()) fragment.record = nullptr; // Require exclusive ownership for splitting.
+            if (!parts.empty()) fragment.record = nullptr; // This is a subrange, not a removed whole record.
             out_removed_uses.push_back(fragment);
         };
         for (const auto& part : parts)
@@ -389,6 +418,167 @@ bool CollectFileExtentChanges(
             cursor = part.second;
         }
         remove(cursor, end);
+    }
+    return true;
+}
+
+// Materialize a bounded whole-stream clone from checked source records. No
+// arbitrary physical block is accepted from the caller as a clone mapping.
+bool PrepareCloneRecords(
+    const std::vector<catalog::BtreeRecord>& old_records,
+    const AppleVolumeTransactionRequest& request, std::uint64_t next_oid,
+    std::uint32_t block_size,
+    std::vector<catalog::BtreeRecord>& out_records,
+    std::map<std::uint64_t, std::uint64_t>& out_streams,
+    std::string& out_error)
+{
+    out_records = request.filesystem_records;
+    out_streams.clear();
+    if (request.clones.empty()) return true;
+    std::map<std::uint64_t, AppleInodeRecord> old_inodes, next_inodes;
+    const auto collect = [&](const auto& records, auto& inodes) {
+        for (const auto& record : records)
+        {
+            if ((catalog::ReadU64LE(record.key, 0).value_or(0) >> 60) != 3) continue;
+            AppleInodeRecord inode;
+            if (!ApfsExtendedRecordCodec::DecodeInode(record, inode, out_error)) return false;
+            if (!inodes.emplace(inode.object_id, inode).second)
+                return Fail(out_error, "AppleVolumeCloneInodeDuplicate");
+        }
+        return true;
+    };
+    if (!collect(old_records, old_inodes) || !collect(out_records, next_inodes)) return false;
+    // Inspect the complete caller-supplied attribute sets before materializing
+    // any clone. decmpfs changes read interpretation even without the inode flag;
+    // neither embedded nor external compression belongs to an ordinary clone.
+    std::unordered_set<std::uint64_t> clone_inodes;
+    for (const auto& clone : request.clones)
+    {
+        clone_inodes.insert(clone.source_inode_id);
+        clone_inodes.insert(clone.target_inode_id);
+    }
+    // Index only requested extents, once per request. Pointers refer to the
+    // immutable input, not out_records (which grows as targets are generated).
+    using ExtentKey = std::pair<std::uint64_t, std::uint64_t>;
+    std::map<ExtentKey, const catalog::BtreeRecord*> requested_extents;
+    for (const auto& record : request.filesystem_records)
+    {
+        const auto header = catalog::ReadU64LE(record.key, 0).value_or(0);
+        if ((header >> 60) == 4 && clone_inodes.contains(header & kFsObjectIdMask))
+        {
+            AppleXattrRecord attribute;
+            if (!ApfsExtendedRecordCodec::DecodeXattr(record, attribute, out_error)) return false;
+            if (attribute.name_utf8 == "com.apple.decmpfs")
+                return Fail(out_error, "AppleVolumeCloneStreamUnsupported");
+        }
+        if ((header >> 60) != kFsRecordTypeFileExtent) continue;
+        AppleFileExtentRecord extent;
+        if (!DecodeAppleFileExtentRecord(record, block_size, extent, out_error))
+            return Fail(out_error, "AppleVolumeFileExtentRecordInvalid");
+        if (!requested_extents.emplace(ExtentKey{extent.object_id, extent.logical_address}, &record).second)
+            return Fail(out_error, "AppleVolumeFileExtentRecordDuplicate");
+    }
+    std::unordered_set<std::uint64_t> marked;
+    for (const auto& clone : request.clones)
+    {
+        const auto source = old_inodes.find(clone.source_inode_id);
+        const auto target = next_inodes.find(clone.target_inode_id);
+        const auto retained_source = next_inodes.find(clone.source_inode_id);
+        if (source == old_inodes.end() || target == next_inodes.end() || retained_source == next_inodes.end() ||
+            clone.target_inode_id < next_oid || !next_oid || old_inodes.contains(clone.target_inode_id) ||
+            clone.target_inode_id == clone.source_inode_id ||
+            !out_streams.emplace(clone.target_inode_id, clone.source_inode_id).second)
+            return Fail(out_error, "AppleVolumeCloneIdentityInvalid");
+        const auto& src = source->second;
+        const auto& dst = target->second;
+        const auto ordinary = [](const auto& inode) {
+            // APFS-private, incomplete truncate, and Fusion-only pin flags.
+            return inode.private_id == inode.object_id && (inode.mode & 0170000) == 0100000 &&
+                !(inode.bsd_flags & kAppleBsdCompressedFlag) && !(inode.internal_flags & 0x3081);
+        };
+        const auto stream = [](const auto& inode) -> const AppleExtendedField* {
+            const AppleExtendedField* found = nullptr;
+            for (const auto& field : inode.extended_fields) if (field.type == 8)
+            { if (found) return nullptr; found = &field; }
+            return found;
+        };
+        const auto* src_stream = stream(src);
+        const auto* dst_stream = stream(dst);
+        const auto* retained_stream = stream(retained_source->second);
+        if (!ordinary(src) || !ordinary(dst) || !ordinary(retained_source->second) ||
+            !src_stream || !dst_stream || !retained_stream || src_stream->data.size() != 40 ||
+            dst_stream->data != src_stream->data || retained_stream->data != src_stream->data ||
+            catalog::ReadU64LE(src_stream->data, 16).value_or(1) != 0)
+            return Fail(out_error, "AppleVolumeCloneStreamUnsupported");
+        for (const auto& [id, inode] : old_inodes)
+            if (id != src.object_id && inode.private_id == src.private_id)
+                return Fail(out_error, "AppleVolumeSharedPrivateIdUnsupported");
+        for (const auto& [id, inode] : next_inodes)
+            if ((inode.private_id == src.private_id && id != src.object_id) ||
+                (inode.private_id == dst.private_id && id != dst.object_id))
+                return Fail(out_error, "AppleVolumeSharedPrivateIdUnsupported");
+        for (const auto& write : request.data_writes)
+            if (write.file_private_id == src.private_id || write.file_private_id == dst.private_id)
+                return Fail(out_error, "AppleVolumeCloneConcurrentWriteUnsupported");
+        bool source_reference = false;
+        std::uint64_t physical_bytes = 0, logical_end = 0;
+        for (const auto& record : old_records)
+        {
+            const auto header = catalog::ReadU64LE(record.key, 0).value_or(0);
+            const auto id = header & kFsObjectIdMask, type = header >> 60;
+            if (id == dst.object_id) return Fail(out_error, "AppleVolumeCloneTargetInUse");
+            if (id != src.object_id) continue;
+            if (type == 4)
+            {
+                AppleXattrRecord attribute;
+                if (!ApfsExtendedRecordCodec::DecodeXattr(record, attribute, out_error)) return false;
+                if (attribute.name_utf8 == "com.apple.decmpfs")
+                    return Fail(out_error, "AppleVolumeCloneStreamUnsupported");
+            }
+            if (type == 6)
+            {
+                AppleDataStreamIdRecord reference;
+                if (source_reference || !DecodeAppleDataStreamIdRecord(record, reference, out_error) || reference.reference_count != 1)
+                    return Fail(out_error, "AppleVolumeCloneStreamUnsupported");
+                source_reference = true;
+            }
+            if (type != 8) continue;
+            AppleFileExtentRecord extent;
+            if (!DecodeAppleFileExtentRecord(record, block_size, extent, out_error) || extent.crypto_id ||
+                extent.logical_address != logical_end)
+                return Fail(out_error, "AppleVolumeCloneExtentUnsupported");
+            logical_end += extent.length_bytes;
+            if (extent.physical_block) physical_bytes += extent.length_bytes;
+            const auto retained = requested_extents.find({extent.object_id, extent.logical_address});
+            if (retained == requested_extents.end() || retained->second->key != record.key ||
+                retained->second->value != record.value)
+                return Fail(out_error, "AppleVolumeCloneSourceChanged");
+            extent.object_id = dst.object_id;
+            catalog::BtreeRecord encoded;
+            if (!EncodeAppleFileExtentRecord(extent, encoded, out_error)) return false;
+            out_records.push_back(std::move(encoded));
+        }
+        const auto size = catalog::ReadU64LE(src_stream->data, 0).value_or(UINT64_MAX);
+        if (!source_reference || !size || size > UINT64_MAX - (block_size - 1) ||
+            logical_end != (size + block_size - 1) / block_size * block_size ||
+            physical_bytes != catalog::ReadU64LE(src_stream->data, 8).value_or(UINT64_MAX))
+            return Fail(out_error, "AppleVolumeCloneExtentCoverageInvalid");
+        for (const auto& record : request.filesystem_records)
+        {
+            const auto header = catalog::ReadU64LE(record.key, 0).value_or(0);
+            if ((header & kFsObjectIdMask) == dst.object_id && ((header >> 60) == 6 || (header >> 60) == 8))
+                return Fail(out_error, "AppleVolumeCloneTargetInUse");
+        }
+        marked.insert(src.object_id); marked.insert(dst.object_id);
+    }
+    for (auto& record : out_records)
+    {
+        const auto header = catalog::ReadU64LE(record.key, 0).value_or(0);
+        if ((header >> 60) != 3 || !marked.contains(header & kFsObjectIdMask)) continue;
+        AppleInodeRecord inode;
+        if (!ApfsExtendedRecordCodec::DecodeInode(record, inode, out_error)) return false;
+        inode.internal_flags |= 0x400; // INODE_WAS_EVER_CLONED, never used as proof of exclusivity.
+        if (!EncodeAppleInodeRecord(inode, record, out_error)) return false;
     }
     return true;
 }
@@ -472,6 +662,7 @@ bool NormalizeDataStreamRecords(
     const std::vector<CompressionRewrite>& compression_rewrites,
     const catalog::RandomAccessSource& source,
     std::uint64_t source_xid, std::uint64_t volume_id,
+    const std::map<std::uint64_t, std::uint64_t>& clone_streams,
     std::vector<catalog::BtreeRecord>& out_records,
     std::string& out_error)
 {
@@ -505,6 +696,12 @@ bool NormalizeDataStreamRecords(
         }
         touched_streams.insert(data.file_private_id);
         written_streams.insert(data.file_private_id);
+    }
+
+    for (const auto& [target, source_stream] : clone_streams)
+    {
+        touched_streams.insert(target);
+        written_streams.insert(target);
     }
 
     // Derive external-stream retirement from both trees. A caller-supplied
@@ -552,9 +749,9 @@ bool NormalizeDataStreamRecords(
         }
         return true;
     };
+    if (!collect_inodes(old_records, old_inode_ids) || !collect_inodes(requested_records, requested_inode_ids)) return false;
     if (!old_attributes.empty() || !requested_attributes.empty())
     {
-        if (!collect_inodes(old_records, old_inode_ids) || !collect_inodes(requested_records, requested_inode_ids)) return false;
         for (const auto& [id, owners] : old_owners)
             for (const auto& [key, attribute] : owners)
                 if (!old_inode_ids.contains(attribute.object_id)) return Fail(out_error, "AppleVolumeAttributeOldOwnerMissing");
@@ -576,7 +773,7 @@ bool NormalizeDataStreamRecords(
         for (const auto& [key, attribute] : old_attributes)
         {
             if (key.first != proof.object || key.second == "com.apple.decmpfs" ||
-                (proof.type == 4 && key.second == "com.apple.ResourceFork")) continue;
+                (CompressionRewrite::UsesResourceFork(proof.type) && key.second == "com.apple.ResourceFork")) continue;
             const auto retained = requested_attributes.find(key);
             if (retained == requested_attributes.end() || retained->second.flags != attribute.flags ||
                 retained->second.data != attribute.data) return Fail(out_error, "AppleCompressionRewriteUnrelatedAttributeChanged");
@@ -622,21 +819,30 @@ bool NormalizeDataStreamRecords(
             !authenticate("com.apple.ResourceFork", proof.resource_flags, proof.resource_descriptor, proof.resource))
             return Fail(out_error, "AppleCompressionRewriteSourceMismatch");
         const auto fork = requested_attributes.find({proof.object, "com.apple.ResourceFork"});
-        if (proof.type == 4 ? fork != requested_attributes.end() :
+        if (CompressionRewrite::UsesResourceFork(proof.type) ? fork != requested_attributes.end() :
             proof.resource_flags ? fork == requested_attributes.end() || fork->second.flags != proof.resource_flags ||
                 fork->second.data != proof.resource_descriptor : fork != requested_attributes.end())
             return Fail(out_error, "AppleCompressionRewriteForkMismatch");
         ApfsCompressionResourceReader resource;
-        resource.size = proof.resource.size();
-        resource.read = [&](std::uint64_t at, std::span<std::byte> out) {
-            if (at > proof.resource.size() || out.size() > proof.resource.size()-at) return std::size_t{0};
-            std::copy_n(proof.resource.begin()+static_cast<std::size_t>(at), out.size(), out.begin()); return out.size(); };
+        if (CompressionRewrite::UsesResourceFork(proof.type))
+        {
+            resource.size = proof.resource.size();
+            resource.read = [&](std::uint64_t at, std::span<std::byte> out) {
+                if (at > proof.resource.size() || out.size() > proof.resource.size()-at) return std::size_t{0};
+                std::copy_n(proof.resource.begin()+static_cast<std::size_t>(at), out.size(), out.begin()); return out.size(); };
+        }
         std::vector<std::byte> decoded;
         for (std::uint64_t at = 0;;)
         {
             const auto count = (std::min)(std::uint64_t{65536}, proof.size-at);
-            if (!ApfsCompression::DecodeRange(proof.decmpfs, resource, at, count, {}, decoded) || decoded.size() != count)
-                return Fail(out_error, "AppleCompressionRewriteDecodeFailed");
+            const auto decode = ApfsCompression::DecodeRange(proof.decmpfs, resource, at, count, {}, decoded);
+            if (!decode)
+            {
+                out_error = std::string("AppleCompressionRewriteDecodeFailed:") + decode.detail;
+                return false;
+            }
+            if (decoded.size() != count)
+                return Fail(out_error, "AppleCompressionRewriteDecodeSizeMismatch");
             at += count; if (at == proof.size) break;
         }
     }
@@ -788,6 +994,30 @@ bool NormalizeDataStreamRecords(
         if (covered != allocated || catalog::ReadU64LE(descriptor, 8).value_or(0) > allocated)
             return Fail(out_error, "AppleVolumeAttributeRetirementExtentInvalid");
         retired_attribute_streams.emplace(id, static_cast<std::uint32_t>(remaining));
+    }
+
+    for (const auto& [id, inode] : old_inode_ids)
+    {
+        const auto next = requested_inode_ids.find(id);
+        if (next != requested_inode_ids.end() && next->second.private_id != inode.private_id &&
+            ((inode.mode & 0170000) == 0100000 || old_extent_counts[inode.private_id] != 0))
+            return Fail(out_error, "AppleVolumePrivateIdTransitionUnsupported");
+    }
+    std::map<std::uint64_t, std::pair<std::size_t, std::size_t>> private_counts;
+    for (const auto& [id, inode] : old_inode_ids) ++private_counts[inode.private_id].first;
+    for (const auto& [id, inode] : requested_inode_ids) ++private_counts[inode.private_id].second;
+    for (const auto& [id, counts] : private_counts)
+        if (counts.first != counts.second && (counts.first > 1 || counts.second > 1))
+            return Fail(out_error, "AppleVolumeSharedPrivateIdUnsupported");
+    for (const auto stream : touched_streams)
+    {
+        const auto count_owners = [stream](const auto& inodes) {
+            return std::count_if(inodes.begin(), inodes.end(), [stream](const auto& item) {
+                return item.second.private_id == stream;
+            });
+        };
+        if (count_owners(old_inode_ids) > 1 || count_owners(requested_inode_ids) > 1)
+            return Fail(out_error, "AppleVolumeSharedPrivateIdUnsupported");
     }
 
     for (const auto object_id : touched_streams)
@@ -942,6 +1172,8 @@ bool DecodePhysicalExtentTree(
         {
             return Fail(out_error, "AppleVolumePhysicalExtentRecordInvalid");
         }
+        if (extent.kind != kApplePhysicalExtentKindNew)
+            return Fail(out_error, "AppleVolumePhysicalExtentKindUnsupported");
         out_extents.push_back({extent});
     }
     std::sort(out_extents.begin(), out_extents.end(),
@@ -1089,77 +1321,128 @@ bool ValidatePhysicalExtentCoverage(
     return true;
 }
 
+// The release witness describes removed file mappings, including overlapping
+// clone references. Only the interval sweep's zero-reference result reaches
+// spaceman. Existing allocator checkpoint pins still delay reuse independently.
 bool BuildRetainedPhysicalExtentRecords(
     const std::vector<PhysicalExtentState>& physical_extents,
     const std::vector<FileExtentUse>& removed_uses,
+    const std::vector<catalog::BtreeRecord>& requested_records,
+    std::uint32_t block_size,
+    const std::map<std::uint64_t, std::uint64_t>& clone_streams,
     std::vector<catalog::BtreeRecord>& out_records,
+    std::vector<AppleSpacemanReleaseRequest>& out_releases,
     std::string& out_error)
 {
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> removed;
-    removed.reserve(removed_uses.size());
+    struct Event
+    {
+        std::int64_t removed = 0;
+        std::int64_t affected = 0;
+        std::vector<std::pair<std::uint64_t, int>> owners;
+        std::vector<std::pair<std::uint64_t, int>> original_owners;
+    };
+    std::map<std::uint64_t, Event> events;
     for (const auto& use : removed_uses)
     {
-        if (use.extent.physical_block == 0) continue;
-        removed.emplace_back(use.extent.physical_block, ExtentEnd(use));
+        if (!use.extent.physical_block) continue;
+        ++events[use.extent.physical_block].removed;
+        --events[ExtentEnd(use)].removed;
+        ++events[use.extent.physical_block].affected;
+        --events[ExtentEnd(use)].affected;
+        events[use.extent.physical_block].original_owners.emplace_back(use.extent.object_id, 1);
+        events[ExtentEnd(use)].original_owners.emplace_back(use.extent.object_id, -1);
     }
-    std::sort(removed.begin(), removed.end());
-    for (std::size_t index = 1; index < removed.size(); ++index)
+    for (const auto& record : requested_records)
     {
-        if (removed[index - 1].second > removed[index].first)
+        if ((catalog::ReadU64LE(record.key, 0).value_or(0) >> 60) != kFsRecordTypeFileExtent) continue;
+        FileExtentUse use;
+        if (!DecodeFileExtentUse(record, block_size, use))
+            return Fail(out_error, "AppleVolumeFileExtentRecordInvalid");
+        if (!use.extent.physical_block) continue;
+        events[use.extent.physical_block].owners.emplace_back(use.extent.object_id, 1);
+        events[ExtentEnd(use)].owners.emplace_back(use.extent.object_id, -1);
+        if (clone_streams.contains(use.extent.object_id))
         {
-            return Fail(out_error, "AppleVolumeSharedExtentUnsupported");
+            --events[use.extent.physical_block].removed;
+            ++events[ExtentEnd(use)].removed;
+            ++events[use.extent.physical_block].affected;
+            --events[ExtentEnd(use)].affected;
+        }
+        else
+        {
+            events[use.extent.physical_block].original_owners.emplace_back(use.extent.object_id, 1);
+            events[ExtentEnd(use)].original_owners.emplace_back(use.extent.object_id, -1);
         }
     }
-
+    std::int64_t removed = 0, affected = 0, owner_count = 0;
+    std::map<std::uint64_t, std::int64_t> owners, original_owners;
+    auto event = events.begin();
+    const auto advance = [&](std::uint64_t block) {
+        while (event != events.end() && event->first <= block)
+        {
+            removed += event->second.removed;
+            affected += event->second.affected;
+            for (const auto& [owner, delta] : event->second.owners)
+            {
+                owner_count += delta;
+                auto& count = owners[owner];
+                count += delta;
+                if (!count) owners.erase(owner);
+            }
+            for (const auto& [owner, delta] : event->second.original_owners)
+            {
+                auto& count = original_owners[owner];
+                count += delta;
+                if (!count) original_owners.erase(owner);
+            }
+            ++event;
+        }
+    };
     out_records.clear();
-    std::size_t first_removed = 0;
+    out_releases.clear();
     for (const auto& state : physical_extents)
     {
-        const auto physical_start = state.extent.physical_block;
-        const auto physical_end = ExtentEnd(state.extent);
-        while (first_removed < removed.size() &&
-            removed[first_removed].second <= physical_start)
+        auto cursor = state.extent.physical_block;
+        const auto end = ExtentEnd(state.extent);
+        while (cursor < end)
         {
-            ++first_removed;
-        }
-        auto cursor = physical_start;
-        auto index = first_removed;
-        while (index < removed.size() && removed[index].first < physical_end)
-        {
-            if (state.extent.reference_count > 1)
-            {
-                return Fail(out_error, "AppleVolumeSharedExtentUnsupported");
-            }
-            const auto remove_start = (std::max)(cursor, removed[index].first);
-            const auto remove_end = (std::min)(physical_end,
-                removed[index].second);
-            if (remove_start > cursor)
-            {
-                auto fragment = state.extent;
-                fragment.physical_block = cursor;
-                fragment.block_count = remove_start - cursor;
-                catalog::BtreeRecord encoded;
-                if (!EncodeApplePhysicalExtentRecord(
-                        fragment, encoded, out_error))
-                {
-                    return false;
-                }
-                out_records.push_back(std::move(encoded));
-            }
-            cursor = (std::max)(cursor, remove_end);
-            ++index;
-        }
-        if (cursor < physical_end)
-        {
+            advance(cursor);
+            const auto finish = event == events.end() ? end : (std::min)(end, event->first);
+            const auto next_count = static_cast<std::int64_t>(state.extent.reference_count) - removed;
+            if (next_count < 0 || next_count > INT32_MAX)
+                return Fail(out_error, "AppleVolumePhysicalExtentReferenceUnderflow");
             auto fragment = state.extent;
             fragment.physical_block = cursor;
-            fragment.block_count = physical_end - cursor;
-            catalog::BtreeRecord encoded;
-            if (!EncodeApplePhysicalExtentRecord(fragment, encoded, out_error))
+            fragment.block_count = finish - cursor;
+            fragment.reference_count = static_cast<std::int32_t>(next_count);
+            if (affected != 0)
             {
-                return false;
+                if (!original_owners.contains(state.extent.owning_object_id))
+                    return Fail(out_error, "AppleVolumePhysicalExtentOwnerUnproven");
+                for (const auto& [owner, count] : original_owners)
+                    if (count != 1) return Fail(out_error, "AppleVolumePhysicalSelfReferenceUnsupported");
+                if (owner_count != fragment.reference_count)
+                    return Fail(out_error, "AppleVolumePhysicalExtentRefcountMismatch");
+                // Self-aliasing within a stream has no supported accounting
+                // contract in this slice. Every surviving reference is distinct.
+                for (const auto& [owner, count] : owners)
+                    if (count != 1) return Fail(out_error, "AppleVolumePhysicalSelfReferenceUnsupported");
+                if (fragment.reference_count != 0 && !owners.contains(fragment.owning_object_id))
+                    fragment.owning_object_id = owners.begin()->first;
             }
-            out_records.push_back(std::move(encoded));
+            if (fragment.reference_count == 0)
+            {
+                if (!out_releases.empty() && out_releases.back().physical_block + out_releases.back().block_count == cursor)
+                    out_releases.back().block_count += finish - cursor;
+                else out_releases.push_back({cursor, finish - cursor});
+            }
+            else
+            {
+                catalog::BtreeRecord encoded;
+                if (!EncodeApplePhysicalExtentRecord(fragment, encoded, out_error)) return false;
+                out_records.push_back(std::move(encoded));
+            }
+            cursor = finish;
         }
     }
     return true;
@@ -1393,6 +1676,19 @@ bool PlanAppleVolumeTransaction(
     {
         return false;
     }
+    // One verified checkpoint supplies the entire shared pool and volume set.
+    // Projection failures are structural evidence/accounting errors, never a
+    // clean quota/reserve refusal. Its available value is a reporting bound;
+    // admission below uses the actual allocator delta, including COW overhead.
+    catalog::ApfsSharedSpaceProjection shared_space;
+    if (!catalog::TryProjectAppleSharedSpace(checkpoint, shared_space, out_error))
+        return false;
+    const auto selected_space = std::find_if(shared_space.volumes.begin(),
+        shared_space.volumes.end(), [&request](const auto& space) {
+            return space.object_id == request.volume_object_id;
+        });
+    if (selected_space == shared_space.volumes.end())
+        return Fail(out_error, "AppleVolumeTransactionVolumeMissing");
     if ((volume.root_tree.type & catalog::kObjectStorageTypeMask) != 0)
     {
         return Fail(out_error, "AppleVolumeTransactionRootStorageUnsupported");
@@ -1410,6 +1706,28 @@ bool PlanAppleVolumeTransaction(
     {
         return Fail(out_error, "AppleVolumeTransactionObjectReadFailed");
     }
+    // Reuse the authoritative APSB parser to bind the typed counters to source
+    // evidence. Retain sibling evidence as publication guards as well: a plan
+    // must not publish after a sibling's reserve/identity changes in place.
+    std::vector<AppleCheckpointGuardBlock> space_guards;
+    for (const auto& peer : checkpoint.volumes)
+    {
+        const auto& expected = peer.superblock;
+        std::vector<std::byte> peer_bytes;
+        const bool selected = expected.object_id == request.volume_object_id;
+        if (!selected && !ReadObject(source, peer.superblock_object,
+                nxsb.block_size, peer_bytes))
+            return Fail(out_error, "AppleVolumeSpaceEvidenceChanged");
+        const auto parsed = catalog::ParseApsb(selected ? apsb_bytes : peer_bytes);
+        if (!parsed || parsed->object_id != expected.object_id ||
+            parsed->xid != expected.xid || parsed->uuid_hex != expected.uuid_hex ||
+            parsed->space.allocated_block_count != expected.space.allocated_block_count ||
+            parsed->space.quota_block_count != expected.space.quota_block_count ||
+            parsed->space.reserve_block_count != expected.space.reserve_block_count)
+            return Fail(out_error, "AppleVolumeSpaceEvidenceChanged");
+        if (!selected)
+            space_guards.push_back({peer.superblock_object.physical_block, std::move(peer_bytes)});
+    }
     const auto snapshot_count =
         catalog::ReadU64LE(apsb_bytes, 0xD8).value_or(
             std::numeric_limits<std::uint64_t>::max());
@@ -1423,9 +1741,20 @@ bool PlanAppleVolumeTransaction(
     {
         return Fail(out_error, "AppleVolumeSnapshotsUnsupported");
     }
-    if (snapshot_count != 0)
+    if (snapshot_count != 0 || volume.object_map.snapshot_tree_oid != 0 ||
+        checkpoint.container_object_map.snapshot_tree_oid != 0)
     {
         return Fail(out_error, "AppleVolumeSnapshotsUnsupported");
+    }
+
+    if (volume.file_extent_tree.has_value())
+    {
+        std::vector<catalog::BtreeRecord> fext_records;
+        std::vector<std::uint64_t> fext_blocks;
+        if (!ReadTreeRecords(source, *volume.file_extent_tree, nxsb.block_size,
+                volume.superblock.omap_oid, nxsb.xid, fext_records, fext_blocks, out_error) ||
+            !fext_records.empty())
+            return Fail(out_error, "AppleVolumeFileExtentTreeUnsupported");
     }
 
     TreeShape fs_shape;
@@ -1475,11 +1804,15 @@ bool PlanAppleVolumeTransaction(
         return false;
     }
 
+    std::vector<catalog::BtreeRecord> requested_filesystem_records;
+    std::map<std::uint64_t, std::uint64_t> clone_streams;
+    if (!PrepareCloneRecords(old_fs_records, request, volume.superblock.next_object_id,
+            nxsb.block_size, requested_filesystem_records, clone_streams, out_error)) return false;
     std::vector<FileExtentUse> old_file_extents;
     std::vector<FileExtentUse> removed_file_extents;
     if (!CollectFileExtentChanges(old_fs_records,
-            request.filesystem_records, nxsb.block_size, old_file_extents,
-            removed_file_extents, out_error))
+            requested_filesystem_records, nxsb.block_size, old_file_extents,
+            removed_file_extents, out_error, clone_streams))
     {
         return false;
     }
@@ -1489,48 +1822,30 @@ bool PlanAppleVolumeTransaction(
         return Fail(out_error, "AppleVolumeReleaseSetMismatch");
     }
     const bool rewrite_extentrefs =
-        !removed_file_extents.empty() || !request.data_writes.empty();
+        !removed_file_extents.empty() || !request.data_writes.empty() || !clone_streams.empty();
     if (rewrite_extentrefs && !volume.extentref_tree.has_value())
     {
         return Fail(out_error, "AppleVolumeExtentReferenceTreeMissing");
     }
     std::vector<PhysicalExtentState> physical_extents;
     std::vector<catalog::BtreeRecord> extentref_records;
+    std::vector<AppleSpacemanReleaseRequest> data_releases;
     if (rewrite_extentrefs &&
         (!DecodePhysicalExtentTree(old_extentref_records, nxsb.block_count,
              physical_extents, out_error) ||
          !ValidatePhysicalExtentCoverage(old_file_extents, physical_extents,
              nxsb.block_count, out_error) ||
          !BuildRetainedPhysicalExtentRecords(physical_extents,
-             removed_file_extents, extentref_records, out_error)))
+             removed_file_extents, requested_filesystem_records, nxsb.block_size, clone_streams,
+             extentref_records, data_releases, out_error)))
     {
         return false;
     }
-    std::unordered_set<std::uint64_t> split_owners;
-    for (const auto& use : removed_file_extents)
-        if (!use.record) split_owners.insert(use.extent.object_id);
-    for (const auto& use : old_file_extents)
-    {
-        if (!split_owners.contains(use.extent.object_id) || !use.extent.physical_block) continue;
-        auto at = std::upper_bound(physical_extents.begin(), physical_extents.end(), use.extent.physical_block,
-            [](auto block, const auto& state) { return block < state.extent.physical_block; });
-        if (at != physical_extents.begin()) --at;
-        auto cursor = use.extent.physical_block;
-        const auto end = ExtentEnd(use);
-        while (cursor < end)
-        {
-            if (at == physical_extents.end() || at->extent.physical_block > cursor || ExtentEnd(at->extent) <= cursor ||
-                at->extent.reference_count != 1 || at->extent.owning_object_id != use.extent.object_id)
-                return Fail(out_error, "AppleVolumeSparseSharedExtentUnsupported");
-            cursor = (std::min)(end, ExtentEnd(at->extent));
-            ++at;
-        }
-    }
     std::vector<catalog::BtreeRecord> normalized_filesystem_records;
     if (!NormalizeDataStreamRecords(old_fs_records,
-            request.filesystem_records, old_file_extents,
+            requested_filesystem_records, old_file_extents,
             removed_file_extents, request.data_writes, nxsb.block_size, volume.superblock.next_object_id,
-            request.compression_rewrites, source, nxsb.xid, request.volume_object_id,
+            request.compression_rewrites, source, nxsb.xid, request.volume_object_id, clone_streams,
             normalized_filesystem_records, out_error))
     {
         return false;
@@ -1695,16 +2010,6 @@ bool PlanAppleVolumeTransaction(
         return false;
     }
 
-    std::vector<AppleSpacemanReleaseRequest> data_releases;
-    data_releases.reserve(removed_file_extents.size());
-    for (const auto& use : removed_file_extents)
-    {
-        if (use.extent.physical_block == 0) continue;
-        data_releases.push_back({
-            use.extent.physical_block,
-            use.extent.length_bytes / nxsb.block_size,
-        });
-    }
     std::vector<AppleSpacemanReleaseRequest> releases = data_releases;
     AddReleaseBlocks(releases, old_fs_blocks);
     if (rewrite_extentrefs)
@@ -1733,13 +2038,26 @@ bool PlanAppleVolumeTransaction(
         estimated_volume_omap_tree.objects.size();
     const auto container_omap_node_count =
         estimated_container_omap_tree.objects.size();
-    const auto total_main_blocks = payload_block_count + fs_node_count +
-        extentref_node_count +
-        volume_omap_node_count + 2 + container_omap_node_count + 1;
+    std::uint64_t new_volume_blocks = 0;
+    std::uint64_t old_volume_blocks = 0;
+    std::uint64_t removed_volume_blocks = 0;
+    std::uint64_t total_main_blocks = 0;
+    std::uint64_t resulting_allocated_blocks = 0;
+    if (!SumBlockCounts({payload_block_count, fs_node_count, extentref_node_count,
+            volume_omap_node_count, 2}, new_volume_blocks) ||
+        !SumBlockCounts({old_fs_blocks.size(),
+            rewrite_extentrefs ? old_extentref_blocks.size() : 0,
+            old_volume_omap_blocks.size(), 2}, old_volume_blocks) ||
+        !SumBlockCounts({old_volume_blocks, released_data_block_count}, removed_volume_blocks) ||
+        !SumBlockCounts({new_volume_blocks, container_omap_node_count, 1}, total_main_blocks) ||
+        total_main_blocks > std::numeric_limits<std::size_t>::max() ||
+        !ReplaceAllocationCount(selected_space->allocated.blocks,
+            new_volume_blocks, removed_volume_blocks, resulting_allocated_blocks))
+        return Fail(out_error, "AppleVolumeTransactionAccountingInvalid");
     AppleSpacemanAllocationRequest allocation_request;
     allocation_request.expected_checkpoint_xid = nxsb.xid;
     allocation_request.transaction_xid = nxsb.next_xid;
-    allocation_request.main_block_count = total_main_blocks;
+    allocation_request.main_block_count = static_cast<std::size_t>(total_main_blocks);
     allocation_request.first_ephemeral_object_id = nxsb.next_oid;
     allocation_request.released_blocks = releases;
     std::vector<AppleRecoveryCheckpointView> retained;
@@ -1770,6 +2088,34 @@ bool PlanAppleVolumeTransaction(
     {
         return Fail(out_error, "AppleVolumeTransactionAllocationInvalid");
     }
+
+    // A clean capacity refusal must not conceal a stale checkpoint/allocator.
+    // Successful plans undergo the existing publication checkpoint checks.
+    const auto refuse_capacity = [&](const char* reason) {
+        return VerifyAppleSpacemanOwnershipUnchanged(source, 0, source.SizeBytes(),
+            checkpoint.container, checkpoint.spaceman, out_error) && Fail(out_error, reason);
+    };
+    // Charge net volume ownership to quota, not temporary COW ownership. An
+    // already-over-quota volume can still shrink or perform a non-growing update.
+    if (selected_space->quota && resulting_allocated_blocks > selected_space->quota->blocks &&
+        resulting_allocated_blocks > selected_space->allocated.blocks)
+        return refuse_capacity("AppleVolumeQuotaExceeded");
+    const auto reusable_free = allocation.updated_spaceman.devices[0].free_count;
+    if (reusable_free > shared_space.total.blocks ||
+        resulting_allocated_blocks > shared_space.total.blocks - reusable_free)
+        return Fail(out_error, "AppleVolumeTransactionAccountingInvalid");
+    // This count includes only frees actually reclaimed by the allocator after
+    // retention checks. Current releases and pinned old checkpoints stay charged.
+    // Protect all siblings' unmet reserves once against the same remaining pool.
+    if (reusable_free < selected_space->sibling_reserve_remaining.blocks)
+        return refuse_capacity("AppleVolumeSiblingReserveProtected");
+    const auto own_unmet = selected_space->reserve &&
+        selected_space->reserve->blocks > resulting_allocated_blocks
+        ? selected_space->reserve->blocks - resulting_allocated_blocks : 0;
+    // Temporary COW blocks cannot consume the remaining reserve promise and
+    // leave a checkpoint that the next authoritative projection must reject.
+    if (own_unmet > reusable_free - selected_space->sibling_reserve_remaining.blocks)
+        return refuse_capacity("AppleVolumeReserveCapacityProtected");
 
     std::size_t cursor = 0;
     std::vector<AppleCheckpointPhysicalWrite> writes;
@@ -1918,35 +2264,21 @@ bool PlanAppleVolumeTransaction(
         return Fail(out_error, "AppleVolumeTransactionAccountingInvalid");
     }
     accounting.snapshot_count = snapshot_count;
-    const auto new_volume_blocks = payload_block_count + fs_node_count +
-        extentref_node_count +
-        volume_omap_node_count + 2;
-    const auto old_volume_blocks = old_fs_blocks.size() +
-        (rewrite_extentrefs ? old_extentref_blocks.size() : 0) +
-        old_volume_omap_blocks.size() + 2;
-    if (!ReplaceAllocationCount(
-            catalog::ReadU64LE(apsb_bytes, 0x58).value_or(0),
-            new_volume_blocks,
-            old_volume_blocks + released_data_block_count,
-            accounting.file_system_allocated_blocks))
-    {
-        return Fail(out_error, "AppleVolumeTransactionAccountingInvalid");
-    }
+    accounting.file_system_allocated_blocks = resulting_allocated_blocks;
     const auto old_total_allocated =
         catalog::ReadU64LE(apsb_bytes, 0xE0).value_or(0);
     const auto old_total_freed =
         catalog::ReadU64LE(apsb_bytes, 0xE8).value_or(0);
     if (new_volume_blocks > std::numeric_limits<std::uint64_t>::max() -
             old_total_allocated ||
-        old_volume_blocks + released_data_block_count >
+        removed_volume_blocks >
             std::numeric_limits<std::uint64_t>::max() - old_total_freed)
     {
         return Fail(out_error, "AppleVolumeTransactionAccountingInvalid");
     }
     accounting.total_blocks_allocated =
         old_total_allocated + new_volume_blocks;
-    accounting.total_blocks_freed = old_total_freed + old_volume_blocks +
-        released_data_block_count;
+    accounting.total_blocks_freed = old_total_freed + removed_volume_blocks;
     accounting.last_modification_time = request.last_modification_time != 0 ?
         request.last_modification_time :
         catalog::ReadU64LE(apsb_bytes, 0x100).value_or(0);
@@ -2084,6 +2416,8 @@ bool PlanAppleVolumeTransaction(
     {
         return false;
     }
+    for (auto& guard : space_guards)
+        commit.publication.guard_blocks.push_back(std::move(guard));
     std::vector<std::uint64_t> guarded_blocks = old_fs_blocks;
     if (rewrite_extentrefs)
     {

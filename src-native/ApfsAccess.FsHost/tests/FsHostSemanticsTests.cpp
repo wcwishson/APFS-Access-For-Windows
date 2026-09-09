@@ -21299,7 +21299,17 @@ bool TestPersistentWindowsSecurity(bool manifest, bool create_fault = false, int
             return true;
         };
         if (!unlink(L"\\alias") || !unlink(L"\\renamed")) return false;
-        if (!Require(CB_Flush(&fs, opened, &info) == STATUS_SUCCESS && !store.LookupCommittedInodeByObjectId(17),
+        const auto unlink_flush = CB_Flush(&fs, opened, &info);
+        const auto unlinked_inode = store.LookupCommittedInodeByObjectId(17);
+        if (unlink_flush != STATUS_SUCCESS || unlinked_inode)
+        {
+            std::cerr << "[DIAG] security unlink status=" << std::hex << unlink_flush << std::dec
+                << " inode=" << unlinked_inode.has_value() << " pending=" << store.PendingMutationCount()
+                << " degraded=" << context.write_degraded << " stage=" << store.LastCommitStage() << "\n";
+            std::wcerr << L"[DIAG] security unlink reason=" << store.LastCommitFailureReason()
+                << L" detail=" << store.LastCommitFailureDetail() << L"\n";
+        }
+        if (!Require(unlink_flush == STATUS_SUCCESS && !unlinked_inode,
                 "final unlink commits while security handles remain alive")) return false;
         PVOID replacement = nullptr;
         ScopeExit close_replacement{[&] { if (replacement) CB_Close(&fs, replacement); }};
@@ -39999,7 +40009,7 @@ bool TestWriteAheadJournalPathIsStablePerVolume()
 #endif
 }
 
-bool TestVolumeInfoFallbackKeepsExplorerCapacityBarUsable()
+bool TestVolumeInfoReportsOnlyKnownFreeCapacity()
 {
     MountContext context{};
     context.label = BuildExplorerVolumeLabel(L"Main");
@@ -40021,7 +40031,7 @@ bool TestVolumeInfoFallbackKeepsExplorerCapacityBarUsable()
     {
         return false;
     }
-    if (!Require(volume_info.FreeSize == 128111046656ull, "GetVolumeInfo should use total size as temporary free-space fallback"))
+    if (!Require(volume_info.FreeSize == 0, "unknown free space cannot promise the whole container as writable capacity"))
     {
         return false;
     }
@@ -40084,7 +40094,7 @@ bool TestVolumeInfoUsesMetadataStoreWhenAvailable()
     {
         return false;
     }
-    if (!Require(volume_info.TotalSize == 896 && volume_info.FreeSize == 896, "GetVolumeInfo should align fallback total/free space to allocation units"))
+    if (!Require(volume_info.TotalSize == 896 && volume_info.FreeSize == 0, "GetVolumeInfo preserves aligned capacity while unavailable free space stays conservative"))
     {
         return false;
     }
@@ -40092,6 +40102,17 @@ bool TestVolumeInfoUsesMetadataStoreWhenAvailable()
     context.reported_free_size_bytes.reset();
     context.reported_allocation_unit_bytes = 4096;
 
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    context.reported_total_size_bytes = 1024 * 1024;
+    context.reported_free_size_bytes = 512 * 1024;
+    apfsaccess::rw::MetadataStore unavailable(apfsaccess::rw::MetadataStore::VolumeContext{});
+    context.metadata_store = &unavailable;
+    RefreshReportedVolumeInfoFromMetadata(context);
+    context.metadata_store = nullptr;
+    if (!Require(CB_GetVolumeInfo(&fs, &volume_info) == STATUS_SUCCESS &&
+            volume_info.TotalSize == 0 && volume_info.FreeSize == 0,
+            "unavailable current metadata clears earlier cached capacity claims")) return false;
+#endif
     return true;
 }
 
@@ -40913,6 +40934,8 @@ Arguments ManifestSessionArgs(
     return args;
 }
 } // namespace
+
+#include "NativeVolumeSpaceTests.h"
 
 bool TestManifestArgsValidation()
 {
@@ -42831,18 +42854,25 @@ bool TestDirectVolumeCheckpointPins()
 
 bool TestRetentionBackpressureDoesNotDegradeMount()
 {
-    MountContext context;
-    if (!ConfigureNativeCommitFailureForUnitTest(context)) return true;
-    context.test_forced_native_commit_status = apfsaccess::rw::MetadataStore::CommitStatus::RetentionBlocked;
-    context.test_forced_native_commit_recovery_reason.clear();
-    context.test_forced_native_commit_recovery_required = false;
-    context.test_forced_native_mutations_pending = true;
-    context.pending_native_writes = true;
-    const auto status = CommitNativeMutationsBestEffort(&context, L"RetentionBackpressureTest");
-    return Require(status == STATUS_DEVICE_BUSY, "retention capacity reports retryable device busy") &&
-        Require(context.native_write_enabled && !context.write_degraded && !context.recovery_active &&
-            context.pending_native_writes && context.test_forced_native_mutations_pending.value_or(false),
-            "no-I/O retention pressure preserves pending work and write admission");
+    for (const auto capacity : {false, true})
+    {
+        MountContext context;
+        if (!ConfigureNativeCommitFailureForUnitTest(context)) return true;
+        context.test_forced_native_commit_status = capacity
+            ? apfsaccess::rw::MetadataStore::CommitStatus::CapacityBlocked
+            : apfsaccess::rw::MetadataStore::CommitStatus::RetentionBlocked;
+        context.test_forced_native_commit_recovery_reason.clear();
+        context.test_forced_native_commit_recovery_required = false;
+        context.test_forced_native_mutations_pending = true;
+        context.pending_native_writes = true;
+        const auto status = CommitNativeMutationsBestEffort(&context, L"RetentionBackpressureTest");
+        if (!(Require(status == (capacity ? STATUS_DISK_FULL : STATUS_DEVICE_BUSY),
+            "capacity and retention pressure report distinct retryable statuses") &&
+            Require(context.native_write_enabled && !context.write_degraded && !context.recovery_active &&
+                context.pending_native_writes && context.test_forced_native_mutations_pending.value_or(false),
+                "no-I/O capacity pressure preserves pending work and write admission"))) return false;
+    }
+    return true;
 }
 
 bool TestManifestMetadataPolicyProjection()
@@ -43361,6 +43391,7 @@ struct DirectorySymlinkFixture
         if (!root.empty()) std::filesystem::remove_all(root, ec);
     }
 };
+
 
 
 bool TestCompressionHostAdmission()
@@ -45420,6 +45451,8 @@ bool TestDirectorySymlinkAcceptedRecovery(bool restoring = false, bool renamed_f
 #include "NativeCompressionRewriteTests.h"
 #include "NativeCompressionReplayTests.h"
 #include "NativeCompressionWriteTests.h"
+#include "NativeQuotaWriteTests.h"
+#include "NativeModernCompressionTests.h"
 #include "NativeCompressionRestartTests.h"
 #include "NativeCompressionManifestTests.h"
 #include "NativeCompressionManifestRefusalTests.h"
@@ -45459,6 +45492,18 @@ bool RunSelectedTest(const std::string& name)
     if (name == "compression-preserved-stream-authentication") return TestNativeCompressionPreservedStreamAuthentication();
     if (name == "compression-replay-wal-budget") return TestCompressionReplayWalBudget();
     if (name == "compression-write-callbacks") return TestNativeCompressionWriteCallbacks();
+    if (name == "compression-modern-type7") return TestNativeModernCompressionType7();
+    if (name == "compression-modern-type8") return TestNativeModernCompressionType8();
+    if (name == "compression-modern-type11") return TestNativeModernCompressionType11();
+    if (name == "compression-modern-type12") return TestNativeModernCompressionType12();
+    if (name == "compression-modern-type7-recovery") return TestNativeModernCompressionType7Recovery();
+    if (name == "compression-modern-type8-recovery") return TestNativeModernCompressionType8Recovery();
+    if (name == "compression-modern-type11-recovery") return TestNativeModernCompressionType11Recovery();
+    if (name == "compression-modern-type12-recovery") return TestNativeModernCompressionType12Recovery();
+    if (name == "compression-modern-before-publish-restart") return TestNativeModernCompressionBeforePublishRestart();
+    if (name == "compression-remaining-callbacks") return TestNativeRemainingCompressionCallbacks(false);
+    if (name == "compression-remaining-recovery") return TestNativeRemainingCompressionCallbacks(true);
+    if (name == "compression-remaining-before-publish-restart") return TestNativeModernCompressionBeforePublishRestart(true);
     if (name == "compression-write-interruption") return TestNativeCompressionWriteCallbacks(true);
     if (name == "compression-restart-refusal-256") return TestNativeCompressionRestart256(true);
     if (name == "compression-restart-success-256") return TestNativeCompressionRestart256(false);
@@ -45477,6 +45522,8 @@ bool RunSelectedTest(const std::string& name)
     if (name == "deferred-atime-overdue-311") return TestDeferredAccessTimeOverdue311(false) && TestDeferredAccessTimeOverdue311(true);
     if (name == "deferred-atime-pressure-311") return TestDeferredAccessTimePressure311();
     if (name == "native-lzvn-read-320") return TestNativeLzvnReadTask5();
+    if (name == "native-remaining-codec-reads") return TestNativeRemainingCodecReads(false);
+    if (name == "native-remaining-codec-malformed") return TestNativeRemainingCodecReads(true);
     if (name == "native-sparse-write-340") return TestNativeSparseWriteCallbacks340();
     if (name == "native-sparse-refusal-340") return TestNativeSparseRefusalCallbacks340();
     if (name == "native-sparse-committed-355") return TestNativeSparseCommittedCallbacks355();
@@ -45909,12 +45956,26 @@ bool RunSelectedTest(const std::string& name)
     }
     if (name == "volume-info-capacity")
     {
-        return TestVolumeInfoFallbackKeepsExplorerCapacityBarUsable() &&
+        return TestVolumeInfoReportsOnlyKnownFreeCapacity() &&
             TestVolumeInfoUsesMetadataStoreWhenAvailable();
     }
     if (name == "volume-info-does-not-wait-on-metadata")
     {
         return TestVolumeInfoDoesNotWaitOnMetadataMutex();
+    }
+    if (name == "manifest-shared-capacity")
+    {
+        return TestManifestVolumeInfoUsesNonblockingSharedCapacity();
+    }
+    if (name == "direct-native-startup-topology") return TestDirectNativeStartupTopology();
+    if (name == "direct-capacity-preserves-prefix") return TestDirectCapacityPreservesPrefix456();
+    if (name == "direct-capacity-compressed-quota") return TestDirectCompressedQuota456();
+    if (name == "direct-capacity-create-no-quota") return TestDirectCreateNoQuota456();
+    if (name == "direct-capacity-retained-census") return TestDirectAdmissionRetainedCensus456();
+    if (name == "direct-capacity-overwrite") return TestDirectCapacityOverwrite456();
+    if (name == "quota-callback-retry")
+    {
+        return TestQuotaCallbacksPreserveWritableRetry();
     }
     if (name == "metadata-root-does-not-wait-on-commit")
     {
@@ -47583,7 +47644,7 @@ int main(int argc, char** argv)
     ok &= TestLegacyAcceptedWalFromRenumberedDeviceIsNotIgnored();
     ok &= TestLegacyMixedWalScansAllIdentitiesForMatchingEvidence();
     ok &= TestLegacyCleanWalDoesNotBlockStableIdentity();
-    ok &= TestVolumeInfoFallbackKeepsExplorerCapacityBarUsable();
+    ok &= TestVolumeInfoReportsOnlyKnownFreeCapacity();
     ok &= TestVolumeInfoUsesMetadataStoreWhenAvailable();
     ok &= TestVolumeInfoDoesNotWaitOnMetadataMutex();
     ok &= TestMetadataOnlyRootDoesNotWaitOnCommit();
@@ -47616,6 +47677,15 @@ int main(int argc, char** argv)
     ok &= TestCompressionHostReads();
     ok &= TestNativeCompressionWriteCallbacks();
     ok &= TestNativeCompressionWriteCallbacks(true);
+    for (const unsigned type : {7u, 8u, 11u, 12u})
+    {
+        ok &= RunNativeModernCompressionTests(type, false);
+        ok &= RunNativeModernCompressionTests(type, true);
+    }
+    ok &= TestNativeModernCompressionBeforePublishRestart();
+    ok &= TestNativeRemainingCompressionCallbacks(false);
+    ok &= TestNativeRemainingCompressionCallbacks(true);
+    ok &= TestNativeModernCompressionBeforePublishRestart(true);
     ok &= TestNativeCompressionRestart256(true);
     ok &= TestNativeCompressionRestart256(false);
     ok &= TestNativeCompressionManifest266(false);
@@ -47638,6 +47708,8 @@ int main(int argc, char** argv)
     }
     ok &= TestDeferredAccessTimePressure311();
     ok &= TestNativeLzvnReadTask5();
+    ok &= TestNativeRemainingCodecReads(false);
+    ok &= TestNativeRemainingCodecReads(true);
     ok &= TestNativeSparseWriteCallbacks340();
     ok &= TestNativeSparseRefusalCallbacks340();
     ok &= TestNativeSparseCommittedCallbacks355();
@@ -47678,6 +47750,14 @@ int main(int argc, char** argv)
     ok &= TestManifestSimultaneousAcceptedRecovery(4);
     ok &= TestManifestPreacceptFailureReconcilesCensus();
     ok &= TestRetentionBackpressureDoesNotDegradeMount();
+    ok &= TestManifestVolumeInfoUsesNonblockingSharedCapacity();
+    ok &= TestQuotaCallbacksPreserveWritableRetry();
+    ok &= TestDirectNativeStartupTopology();
+    ok &= TestDirectCapacityPreservesPrefix456();
+    ok &= TestDirectCompressedQuota456();
+    ok &= TestDirectCreateNoQuota456();
+    ok &= TestDirectCapacityOverwrite456();
+    ok &= TestDirectAdmissionRetainedCensus456();
     ok &= TestDirectVolumeCheckpointPins();
     ok &= TestManifestPayloadReplayBeforeNodeBootstrap();
     ok &= TestManifestMetadataPolicyProjection();

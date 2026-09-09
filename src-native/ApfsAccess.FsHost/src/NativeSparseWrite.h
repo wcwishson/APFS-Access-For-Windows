@@ -15,8 +15,9 @@ NTSTATUS PreflightNativePayloadMutation(MountContext* c, OpenContext* o, const s
     request.path = path;
     request.offset = offset;
     request.length = length;
-    const auto status = c->metadata_store->PreflightNativeSparseMutation(request);
+    auto status = c->metadata_store->PreflightNativeSparseMutation(request);
     return status == Store::MutationStatus::Applied ? STATUS_SUCCESS :
+        status == Store::MutationStatus::CapacityBlocked ? STATUS_DISK_FULL :
         status == Store::MutationStatus::AllocationFailed ? STATUS_INSUFFICIENT_RESOURCES : STATUS_NOT_SUPPORTED;
     }
     catch (const std::bad_alloc&) { return STATUS_INSUFFICIENT_RESOURCES; }

@@ -38,7 +38,9 @@ public sealed record ApfsStoreRecord(
     [property: JsonPropertyName("partitionId")] string PartitionId,
     [property: JsonPropertyName("containerId")] string ContainerId,
     [property: JsonPropertyName("offsetBytes")] long OffsetBytes,
-    [property: JsonPropertyName("sizeBytes")] long SizeBytes);
+    [property: JsonPropertyName("sizeBytes")] long SizeBytes,
+    [property: JsonPropertyName("blockSizeBytes"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] long? BlockSizeBytes = null,
+    [property: JsonPropertyName("totalBlocks"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] ulong? TotalBlocks = null);
 
 public sealed record ApfsContainerRecord(
     [property: JsonPropertyName("id")] string Id,
@@ -51,7 +53,8 @@ public sealed record ApfsContainerRecord(
     [property: JsonPropertyName("compatibleFeatureBits")] IReadOnlyList<string> CompatibleFeatureBits,
     [property: JsonPropertyName("unknownFeatureBits")] IReadOnlyList<string> UnknownFeatureBits,
     [property: JsonPropertyName("incompatibleFeatureBits")] IReadOnlyList<string> IncompatibleFeatureBits,
-    [property: JsonPropertyName("readonlyFeatureBits")] IReadOnlyList<string>? ReadonlyFeatureBits = null);
+    [property: JsonPropertyName("readonlyFeatureBits")] IReadOnlyList<string>? ReadonlyFeatureBits = null,
+    [property: JsonPropertyName("sharedSpace")] ApfsSharedSpaceProjection? SharedSpace = null);
 
 public sealed record ApfsVolumeRecord(
     [property: JsonPropertyName("id")] string Id,
@@ -71,12 +74,64 @@ public sealed record ApfsVolumeRecord(
     [property: JsonPropertyName("incompatibleFeatureBits")] IReadOnlyList<string> IncompatibleFeatureBits,
     [property: JsonPropertyName("superblockBlock")] string SuperblockBlock,
     [property: JsonPropertyName("superblockXid")] string SuperblockXid,
-    [property: JsonPropertyName("readonlyFeatureBits")] IReadOnlyList<string>? ReadonlyFeatureBits = null);
+    [property: JsonPropertyName("readonlyFeatureBits")] IReadOnlyList<string>? ReadonlyFeatureBits = null,
+    [property: JsonPropertyName("roleName")] string? RoleName = null,
+    [property: JsonPropertyName("groupUuid")] string? GroupUuid = null,
+    [property: JsonPropertyName("groupMetadataValid")] bool? GroupMetadataValid = null,
+    [property: JsonPropertyName("groupAssociationStatus")] string? GroupAssociationStatus = null);
 
 public sealed record ApfsGroupRecord(
     [property: JsonPropertyName("id")] string Id,
     [property: JsonPropertyName("uuid")] string Uuid,
-    [property: JsonPropertyName("volumeIds")] IReadOnlyList<string> VolumeIds);
+    [property: JsonPropertyName("volumeIds")] IReadOnlyList<string> VolumeIds,
+    [property: JsonPropertyName("containerId")] string? ContainerId = null,
+    [property: JsonPropertyName("associationStatus")] string? AssociationStatus = null,
+    [property: JsonPropertyName("systemVolumeId")] string? SystemVolumeId = null,
+    [property: JsonPropertyName("dataVolumeId")] string? DataVolumeId = null);
+
+// One checkpoint observation shared by all consumers. Null projection means
+// unknown; within a known projection null reserve/quota means unset. Snapshot
+// and purgeable accounting remain unknown. Availability is not allocation admission.
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ApfsSpaceAmount(
+    [property: JsonPropertyName("blocks"), JsonRequired, JsonConverter(typeof(ApfsUInt64StringConverter))] ulong Blocks,
+    [property: JsonPropertyName("bytes"), JsonRequired, JsonConverter(typeof(ApfsUInt64StringConverter))] ulong Bytes);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ApfsVolumeSpaceProjection(
+    [property: JsonPropertyName("volumeId"), JsonRequired] string VolumeId,
+    [property: JsonPropertyName("objectId"), JsonRequired, JsonConverter(typeof(ApfsUInt64StringConverter))] ulong ObjectId,
+    [property: JsonPropertyName("allocated"), JsonRequired] ApfsSpaceAmount Allocated,
+    [property: JsonPropertyName("reserve"), JsonRequired] ApfsSpaceAmount? Reserve,
+    [property: JsonPropertyName("quota"), JsonRequired] ApfsSpaceAmount? Quota,
+    [property: JsonPropertyName("siblingReserveRemaining"), JsonRequired] ApfsSpaceAmount SiblingReserveRemaining,
+    [property: JsonPropertyName("available"), JsonRequired] ApfsSpaceAmount Available,
+    [property: JsonPropertyName("snapshot"), JsonRequired] ApfsSpaceAmount? Snapshot,
+    [property: JsonPropertyName("purgeable"), JsonRequired] ApfsSpaceAmount? Purgeable);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ApfsSharedSpaceProjection(
+    [property: JsonPropertyName("containerId"), JsonRequired] string ContainerId,
+    [property: JsonPropertyName("checkpointXid"), JsonRequired, JsonConverter(typeof(ApfsUInt64StringConverter))] ulong CheckpointXid,
+    [property: JsonPropertyName("allocationUnitBytes"), JsonRequired] uint AllocationUnitBytes,
+    [property: JsonPropertyName("total"), JsonRequired] ApfsSpaceAmount Total,
+    [property: JsonPropertyName("free"), JsonRequired] ApfsSpaceAmount Free,
+    [property: JsonPropertyName("used"), JsonRequired] ApfsSpaceAmount Used,
+    [property: JsonPropertyName("volumes"), JsonRequired] IReadOnlyList<ApfsVolumeSpaceProjection> Volumes);
+
+public sealed class ApfsUInt64StringConverter : JsonConverter<ulong>
+{
+    public override ulong Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.String && reader.GetString() is { } text &&
+            ulong.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var value) &&
+            value.ToString(CultureInfo.InvariantCulture) == text) return value;
+        throw new JsonException("Expected a canonical unsigned 64-bit decimal string.");
+    }
+
+    public override void Write(Utf8JsonWriter writer, ulong value, JsonSerializerOptions options)
+        => writer.WriteStringValue(value.ToString(CultureInfo.InvariantCulture));
+}
 
 public sealed record ApfsTopologySnapshot(
     [property: JsonPropertyName("disks")] IReadOnlyList<ApfsDiskRecord> Disks,
@@ -93,7 +148,8 @@ public sealed record ApfsEvidenceSource(
     [property: JsonPropertyName("hashScope")] string HashScope,
     [property: JsonPropertyName("sha256")] string? Sha256);
 
-public sealed record ApfsObserverEvidence(
+[JsonConverter(typeof(ApfsObserverEvidenceJsonConverter))]
+public record ApfsObserverEvidence(
     [property: JsonPropertyName("format")] string Format,
     [property: JsonPropertyName("version")] int Version,
     [property: JsonPropertyName("observerId")] string ObserverId,
@@ -103,7 +159,11 @@ public sealed record ApfsObserverEvidence(
     [property: JsonPropertyName("synthetic")] bool Synthetic,
     [property: JsonPropertyName("source")] ApfsEvidenceSource Source,
     [property: JsonPropertyName("topology")] ApfsTopologySnapshot Topology,
-    [property: JsonPropertyName("secondarySources")] IReadOnlyList<ApfsEvidenceSource>? SecondarySources = null);
+    [property: JsonPropertyName("secondarySources")] IReadOnlyList<ApfsEvidenceSource>? SecondarySources = null,
+    [property: JsonPropertyName("topologyMetadataVersion")] int? TopologyMetadataVersion = null)
+{
+    internal ApfsObserverEvidence CopyEvidenceRecord() => new(this);
+}
 
 // Canonical managed identity grammar (freeze section 3) plus the legacy
 // `device|volumeName` translation. Typed IDs are additive; legacy VolumeId
@@ -112,6 +172,7 @@ public static class ApfsTopology
 {
     public const string EvidenceFormat = "apfs-access-raw-evidence";
     public const int EvidenceVersion = 1;
+    public const int TopologyMetadataVersion = 1;
     public const string ObserverId = "apfs-access-owned-raw-observer";
 
     private static readonly JsonSerializerOptions EvidenceOptions = new()

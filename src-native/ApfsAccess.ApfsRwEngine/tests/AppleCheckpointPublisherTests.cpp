@@ -1477,14 +1477,12 @@ bool TestVolumeTransactionMaintainsPhysicalExtentReferences()
     ok &= Require(PlanAppleVolumeTransaction(source, checkpoint.value(),
             remove_owned, removal_plan, error),
         "last unshared reference can be removed: " + error);
-    ok &= Require(std::count_if(removal_plan.allocation.deferred_frees.begin(),
-            removal_plan.allocation.deferred_frees.end(),
-            [](const auto& released) {
-                return (released.physical_block == kOwnedPayloadBlock ||
-                           released.physical_block == kOwnedPayloadBlock + 1) &&
-                    released.block_count == 1;
-            }) == kOwnedPayloadBlockCount,
-        "every unshared block is queued once when its refcount reaches zero");
+    for (std::uint64_t ordinal = 0; ordinal < kOwnedPayloadBlockCount; ++ordinal)
+        ok &= Require(std::count_if(removal_plan.allocation.deferred_frees.begin(),
+                removal_plan.allocation.deferred_frees.end(), [ordinal](const auto& released) {
+                    const auto block = kOwnedPayloadBlock + ordinal;
+                    return block >= released.physical_block && block - released.physical_block < released.block_count;
+                }) == 1, "every unshared block is queued once when its refcount reaches zero");
     ok &= Require(std::none_of(removal_plan.filesystem_records.begin(),
             removal_plan.filesystem_records.end(),
             [&](const auto& candidate) {
@@ -1508,11 +1506,16 @@ bool TestVolumeTransactionMaintainsPhysicalExtentReferences()
     shared_rewrite.data_writes.push_back(std::move(shared_replacement));
     AppleVolumeTransactionPlan shared_plan;
     error.clear();
-    ok &= Require(!PlanAppleVolumeTransaction(source, checkpoint.value(),
-            shared_rewrite, shared_plan, error) &&
-            error == "AppleVolumeSharedExtentUnsupported",
-        "touched shared extent fails closed until clone accounting exists: " +
-            error);
+    const auto shared_planned = PlanAppleVolumeTransaction(source, checkpoint.value(),
+        shared_rewrite, shared_plan, error);
+    ok &= Require(shared_planned,
+        "shared extent COW uses checked live clone accounting: " + error);
+    if (shared_planned)
+        ok &= Require(std::none_of(shared_plan.allocation.deferred_frees.begin(),
+            shared_plan.allocation.deferred_frees.end(), [](const auto& released) {
+                return kSharedPayloadBlock >= released.physical_block &&
+                    kSharedPayloadBlock - released.physical_block < released.block_count;
+            }), "surviving clone prevents shared payload retirement");
 
     const auto rejects_invalid_extent_graph = [&](BuilderStore candidate,
                                                    const std::string& expected,

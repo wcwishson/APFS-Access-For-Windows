@@ -26,6 +26,7 @@ public sealed class DashboardForm : Form
     private bool _updatingStartupPreferences;
 
     private sealed record RenderedDashboardRow(string Identity, Control Control, IReadOnlyList<Button> Buttons);
+    private readonly Func<DriveDashboardRow, Task>? _mountVolumeAsync;
 
     public DashboardForm(
         Func<string?, Task> openAsync,
@@ -35,7 +36,8 @@ public sealed class DashboardForm : Form
         Func<bool, Task>? setStartWithWindowsAsync = null,
         Func<bool, Task>? setStartMinimizedAsync = null,
         Func<Task>? checkForUpdatesAsync = null,
-        Func<DriveDashboardRow, string, Task>? setDriveLetterAsync = null)
+        Func<DriveDashboardRow, string, Task>? setDriveLetterAsync = null,
+        Func<DriveDashboardRow, Task>? mountVolumeAsync = null)
     {
         _openAsync = openAsync ?? throw new ArgumentNullException(nameof(openAsync));
         _ejectAsync = ejectAsync ?? throw new ArgumentNullException(nameof(ejectAsync));
@@ -44,6 +46,7 @@ public sealed class DashboardForm : Form
         _setStartMinimizedAsync = setStartMinimizedAsync;
         _checkForUpdatesAsync = checkForUpdatesAsync;
         _setDriveLetterAsync = setDriveLetterAsync;
+        _mountVolumeAsync = mountVolumeAsync;
         startupPreferences ??= new StartupPreferences(StartWithWindows: false, StartMinimized: false);
 
         Text = "APFS Access";
@@ -310,7 +313,7 @@ public sealed class DashboardForm : Form
     }
 
     private static string BuildRowIdentity(DriveDashboardRow row)
-        => string.IsNullOrWhiteSpace(row.VolumeId) ? "idle" : row.VolumeId;
+        => DriveDashboardPresenter.RowIdentity(row);
 
     private void UpdateRow(Control root, DriveDashboardRow row)
     {
@@ -349,8 +352,10 @@ public sealed class DashboardForm : Form
                 buttons[0].Enabled = _actionsEnabled && row.CanOpen;
                 buttons[1].Tag = row.CanEject;
                 buttons[1].Enabled = _actionsEnabled && row.CanEject;
-                buttons[2].Tag = row.CanFix;
-                buttons[2].Enabled = _actionsEnabled && row.CanFix;
+                var canAct = row.IsMounted ? row.CanFix : _mountVolumeAsync is not null && (row.CanFix || row.CanInspectReadOnly);
+                buttons[2].Text = row.IsMounted ? "Fix" : row.CanInspectReadOnly ? "Inspect read-only" : "Mount";
+                buttons[2].Tag = canAct;
+                buttons[2].Enabled = _actionsEnabled && canAct;
                 buttons[3].Tag = true;
                 buttons[3].Enabled = _actionsEnabled;
                 if (buttons.Length >= 5)
@@ -457,16 +462,21 @@ public sealed class DashboardForm : Form
 
         buttonsPanel.Controls.Add(BuildActionButton(actionButtons, "Open", row.CanOpen, () => RunActionAsync(
             "Opening drive...",
-            () => _openAsync(row.MountPath))));
+            () => _openAsync(((DriveDashboardRow)container.Tag!).MountPath))));
         buttonsPanel.Controls.Add(BuildActionButton(actionButtons, "Eject", row.CanEject, () => RunActionAsync(
             "Ejecting APFS drive...",
-            () => _ejectAsync(row.VolumeId))));
-        buttonsPanel.Controls.Add(BuildActionButton(actionButtons, "Fix", row.CanFix, () => RunActionAsync(
+            () => _ejectAsync(((DriveDashboardRow)container.Tag!).VolumeId))));
+        buttonsPanel.Controls.Add(BuildActionButton(actionButtons, row.IsMounted ? "Fix" : row.CanInspectReadOnly ? "Inspect read-only" : "Mount",
+            row.IsMounted ? row.CanFix : _mountVolumeAsync is not null && (row.CanFix || row.CanInspectReadOnly), () => RunActionAsync(
             "Refreshing APFS drive...",
-            () => _fixAsync(row.VolumeId))));
+            () => {
+                var current = (DriveDashboardRow)container.Tag!;
+                return current.IsMounted ? _fixAsync(current.VolumeId) :
+                    _mountVolumeAsync?.Invoke(current) ?? Task.CompletedTask;
+            })));
         buttonsPanel.Controls.Add(BuildActionButton(actionButtons, "Details", true, () =>
         {
-            ShowDetails(row);
+            ShowDetails((DriveDashboardRow)container.Tag!);
             return Task.CompletedTask;
         }));
 

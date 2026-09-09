@@ -13,7 +13,10 @@ namespace apfsaccess::rw
 struct CompressionRewrite
 {
     static constexpr bool SupportsType(std::uint32_t type) noexcept
-    { return type == 1 || type == 3 || type == 4; }
+    { return type == 1 || type == 3 || type == 4 || type == 7 || type == 8 || type == 9 ||
+        type == 10 || type == 11 || type == 12 || type == 13 || type == 14; }
+    static constexpr bool UsesResourceFork(std::uint32_t type) noexcept
+    { return type == 4 || type == 8 || type == 10 || type == 12 || type == 14; }
     static constexpr std::uint64_t MaxLogicalBytes = 16ULL << 20;
     static constexpr std::uint64_t MaxResourceBytes = 512ULL << 10;
     std::uint64_t checkpoint = 0, object = 0, generation = 0, private_id = 0, size = 0, volume = 0;
@@ -69,6 +72,6 @@ inline bool DecodeCompressionRewrite(std::span<const std::byte> bytes, Compressi
         (df == 1 ? p.decmpfs_descriptor.size() == 48 : p.decmpfs_descriptor == p.decmpfs) &&
         (rf == 0 ? p.resource_descriptor.empty() && p.resource.empty() :
             rf == 1 ? p.resource_descriptor.size() == 48 : p.resource_descriptor == p.resource) &&
-        (type != 4 || rf != 0);
+        (!CompressionRewrite::UsesResourceFork(p.type) || rf != 0);
 }
 }

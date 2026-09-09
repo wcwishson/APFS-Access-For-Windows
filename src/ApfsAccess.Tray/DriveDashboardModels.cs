@@ -39,5 +39,8 @@ public sealed record DriveDashboardRow(
     string? CatalogContainerUuid = null,
     ulong? CatalogVolumeObjectId = null,
     string? DeviceId = null,
-    ApfsAccess.Core.DriveLetterPreference? DriveLetterPreference = null
+    ApfsAccess.Core.DriveLetterPreference? DriveLetterPreference = null,
+    bool IsMounted = true,
+    bool CanInspectReadOnly = false,
+    string? RecoveryIdentity = null
 );

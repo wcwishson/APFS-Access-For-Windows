@@ -173,22 +173,11 @@ NTSTATUS WriteNativeCompressedContentImpl(MountContext* c, OpenContext* o, const
                 // this successor against all three ACTUAL staged identities.
                 target = {plan->Request().object_id, plan->PreimageCheckpoint() + 1};
                 logical_eof = plan->LogicalEof();
-                Store::MutationRequest times;
-                times.operation = Store::MutationOperation::SetInodeMetadata;
-                times.path = path; times.object_id = target.object_id; times.generation = target.generation;
-                times.inline_payload = EncodeContentTimes(timestamp);
-                times.length = times.inline_payload.size();
-                if (times.inline_payload.empty() || times.length > apfsaccess::rw::WriteAheadLog::MaxInlinePayloadBytes -
-                        plan->Request().inline_payload.size())
+                if (!plan->BuildRequests(EncodeContentTimes(timestamp), requests))
                 {
                     error = "CompressedManifestJournalCapacity";
                     return false;
                 }
-                Store::MutationRequest write;
-                write.operation = Store::MutationOperation::Write;
-                write.path = path; write.object_id = target.object_id; write.generation = target.generation;
-                write.offset = offset; write.length = length;
-                requests = {plan->Request(), std::move(times), std::move(write)};
                 return true;
             };
         const apfsaccess::catalog::ContainerPostpublicationVerifierHook verify =
@@ -242,22 +231,43 @@ NTSTATUS WriteNativeCompressedContentImpl(MountContext* c, OpenContext* o, const
         admission.visibility_unresolved = c->write_degraded || c->unjournaled_native_mutation ||
             HasBlockedRecoveryEvidence(*c);
         admission.manifest_session = false;
+        admission.journal_begin_deferred = true;
         admission.windows_attributes_pending = archive_changed;
         admission.publication_budget_bytes = apfsaccess::rw::CompressionRewrite::MaxLogicalBytes;
         Preparation::Failure failure;
         {
             std::lock_guard<std::mutex> journal(c->tx_mutex);
             auto& tx = *c->tx_manager;
-            if (tx.CurrentState() != Tx::State::Idle || !tx.Begin()) return STATUS_DEVICE_BUSY;
+            if (tx.CurrentState() != Tx::State::Idle) return STATUS_DEVICE_BUSY;
             const auto inode = store.LookupCommittedInodeByPath(path);
             if (inode && inode->object_id == o->node->object_id)
                 prepared = Preparation::Prepare(store, tx, admission, path,
                     {inode->object_id, inode->xid}, offset, length, failure);
             if (!prepared || prepared->Revalidate(store, tx, admission) != Preparation::Failure::None)
             {
-                (void)tx.Abort();
                 return STATUS_NOT_SUPPORTED;
             }
+        }
+        std::vector<Store::MutationRequest> requests;
+        if (!prepared->BuildRequests(EncodeContentTimes(timestamp), requests)) return STATUS_NOT_SUPPORTED;
+        const auto admission_status = PreflightDirectCallbackLocked(c, requests);
+        if (!NT_SUCCESS(admission_status))
+        {
+            metadata.unlock(); gate.unlock(); commit.unlock();
+            return admission_status == STATUS_IO_DEVICE_ERROR
+                ? BlockNativeMutationAfterStagingFailure(c, L"CompressedCapacityAdmission") : admission_status;
+        }
+        {
+            std::lock_guard<std::mutex> journal(c->tx_mutex);
+            // Revalidate the idle proof after preview rollback, before the first
+            // WAL append. Begin only once the complete conversion was admitted.
+            if (prepared->Revalidate(store, *c->tx_manager, admission) != Preparation::Failure::None)
+                return STATUS_IO_DEVICE_ERROR;
+            if (!c->tx_manager->Begin()) return STATUS_DEVICE_BUSY;
+            admission.journal_begin_deferred = false;
+            prepared = Preparation::Prepare(store, *c->tx_manager, admission, path,
+                {requests.front().object_id, requests.front().generation}, offset, length, failure);
+            if (!prepared) { (void)c->tx_manager->Abort(); return STATUS_NOT_SUPPORTED; }
         }
         if (!UpdateRecoveryMarkerBestEffort(c, true))
         {
@@ -272,11 +282,7 @@ NTSTATUS WriteNativeCompressedContentImpl(MountContext* c, OpenContext* o, const
         const Store::PayloadIdentity source{conversion.object_id, conversion.generation};
         bool recorded = staged && RecordMutationBestEffort(c, Tx::MutationKind::RewriteCompressedContent,
             path, L"", 0, conversion.inline_payload.size(), false, 0, 0, &source, nullptr, conversion.inline_payload);
-        Store::MutationRequest times;
-        times.operation = Store::MutationOperation::SetInodeMetadata;
-        times.path = path; times.object_id = target.object_id; times.generation = target.generation;
-        times.inline_payload = EncodeContentTimes(timestamp);
-        times.length = times.inline_payload.size();
+        const auto& times = requests[1];
         recorded = recorded && store.StageMutation(times) == Store::MutationStatus::Applied &&
             RecordMutationBestEffort(c, Tx::MutationKind::SetInodeMetadata, path, L"", 0,
                 times.length, false, 0, 0, &target, nullptr, times.inline_payload);

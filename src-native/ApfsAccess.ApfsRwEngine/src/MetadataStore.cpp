@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include "ApfsExtendedRecordCodec.h"
 #include "ApfsFormat.h"
+#include "ApfsSharedSpace.h"
 #include "ApfsNameCodec.h"
 #include "ApfsObjectMapStore.h"
 #include "ApfsSpacemanStore.h"
@@ -6791,6 +6792,24 @@ std::optional<std::uint64_t> MetadataStore::FreeSizeBytes() const noexcept
         return std::nullopt;
     }
 
+    if (authoritative_apple_checkpoint_view_)
+    {
+        try
+        {
+            catalog::ApfsSharedSpaceProjection space;
+            std::string error;
+            if (!catalog::TryProjectAppleSharedSpace(
+                    *authoritative_apple_checkpoint_view_, space, error)) return std::nullopt;
+            for (const auto& volume : space.volumes)
+                if (volume.object_id == context_.volume_object_id) return volume.available.bytes;
+        }
+        catch (...)
+        {
+            // Keep this noexcept metadata query conservative under memory pressure.
+        }
+        return std::nullopt;
+    }
+
     if (!spaceman_loaded_ &&
         committed_spaceman_allocations_.empty() &&
         committed_spaceman_free_extents_.empty() &&
@@ -8135,6 +8154,55 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(
     PayloadIdentity* out_staged_payload_identity,
     std::optional<UnlinkOutcome>* out_unlink_outcome)
 {
+    return ApplyMutationCore(request, out_staged_payload_identity, out_unlink_outcome, false);
+}
+
+MetadataStore::CommitStatus MetadataStore::CheckPendingAppleCapacity(
+    const std::vector<std::uint64_t>& required_checkpoint_xids)
+{
+    if (!authoritative_apple_checkpoint_view_ || pending_mutations_.empty()) return CommitStatus::NothingToCommit;
+    auto pins = required_checkpoint_xids;
+    // The next WAL receipt will pin this preimage. Admission must budget its
+    // retention even though acceptance has not happened yet.
+    const auto xid = authoritative_apple_checkpoint_view_->container.superblock.xid;
+    if (std::find(pins.begin(), pins.end(), xid) == pins.end()) pins.push_back(xid);
+    return CommitApplePendingMutations(pins, true);
+}
+
+MetadataStore::MutationStatus MetadataStore::PreflightNativeCapacityMutation(const MutationRequest& request,
+    const std::vector<std::uint64_t>& required_checkpoint_xids)
+{
+    return PreflightNativeCapacityMutations(std::span(&request, 1), required_checkpoint_xids);
+}
+
+MetadataStore::MutationStatus MetadataStore::PreflightNativeCapacityMutations(
+    std::span<const MutationRequest> requests, const std::vector<std::uint64_t>& required_checkpoint_xids)
+{
+    if (!authoritative_apple_checkpoint_view_ || requests.empty()) return MutationStatus::Applied;
+    // Each nested stage retains its 24 KiB undo arena until the whole preview
+    // finishes. Keep ordinary callback batches inside the Windows stack budget.
+    if (requests.size() > MaximumCapacityPreviewRequests) return MutationStatus::UnsupportedOperation;
+    // Growth can combine allocation and free-add undos whose intermediate
+    // snapshots are not the batch preimage. Retain the allocator once for the
+    // whole preview, including later invalid requests and exception unwinding.
+    auto free_extents = working_spaceman_free_extents_;
+    const auto next_extent = working_next_ephemeral_extent_;
+    const auto sanitized = working_free_extents_sanitized_;
+    ScopeExit restore_allocator{[&]() {
+        working_spaceman_free_extents_.swap(free_extents);
+        working_next_ephemeral_extent_ = next_extent;
+        working_free_extents_sanitized_ = sanitized;
+    }};
+    return ApplyMutationCore(requests.front(), nullptr, nullptr, true, requests.subspan(1), required_checkpoint_xids);
+}
+
+MetadataStore::MutationStatus MetadataStore::ApplyMutationCore(
+    const MutationRequest& request,
+    PayloadIdentity* out_staged_payload_identity,
+    std::optional<UnlinkOutcome>* out_unlink_outcome,
+    bool capacity_preview, std::span<const MutationRequest> capacity_tail,
+    const std::vector<std::uint64_t>& capacity_pins)
+{
     ScopedPerfTimer perf_scope(apply_mutation_perf_);
 
     if (out_unlink_outcome) out_unlink_outcome->reset();
@@ -9201,6 +9269,26 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(
         remember_pending_object_map_update(object_id);
         return StageObjectMapUpdate(object_id, physical_address, logical_size);
     };
+    // Successful coalescers can overwrite or reorder existing requests. A
+    // preview must restore that exact stream, not merely truncate appends.
+    std::optional<decltype(pending_mutations_)> preview_requests;
+    std::optional<decltype(pending_mutation_path_key_cache_)> preview_path_keys;
+    const auto preview_next_object_id = next_generated_object_id_;
+    if (capacity_preview)
+    {
+        preview_requests.emplace(pending_mutations_);
+        preview_path_keys.emplace(pending_mutation_path_key_cache_);
+    }
+    const auto finish_capacity_preview = [&]() -> MutationStatus
+    {
+        if (!capacity_tail.empty())
+            return ApplyMutationCore(capacity_tail.front(), nullptr, nullptr, true,
+                capacity_tail.subspan(1), capacity_pins);
+        const auto capacity = CheckPendingAppleCapacity(capacity_pins);
+        return capacity == CommitStatus::NothingToCommit ? MutationStatus::Applied :
+            capacity == CommitStatus::CapacityBlocked ? MutationStatus::CapacityBlocked :
+            capacity == CommitStatus::RetentionBlocked ? MutationStatus::NotReady : MutationStatus::UnsupportedOperation;
+    };
     bool mutation_applied = false;
     bool pending_mutation_recorded = false;
     std::optional<UnlinkOutcome> staged_unlink_outcome;
@@ -9212,7 +9300,13 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(
                 return;
             }
 
-            if (pending_mutations_.size() > undo_log.pending_mutations_size)
+            if (preview_requests)
+            {
+                pending_mutations_.swap(*preview_requests);
+                pending_mutation_path_key_cache_.swap(*preview_path_keys);
+                next_generated_object_id_ = preview_next_object_id;
+            }
+            else if (pending_mutations_.size() > undo_log.pending_mutations_size)
             {
                 pending_mutations_.resize(undo_log.pending_mutations_size);
                 if (pending_mutation_path_key_cache_.size() > pending_mutations_.size())
@@ -10703,7 +10797,12 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(
             };
         }
         CoalescePendingBtreeFileMetadata(inode_ref.object_id);
-        mutation_applied = true;
+        if (capacity_preview)
+        {
+            const auto admission = finish_capacity_preview();
+            if (admission != MutationStatus::Applied) return admission;
+        }
+        mutation_applied = !capacity_preview;
         return MutationStatus::Applied;
         break;
     }
@@ -11549,13 +11648,18 @@ MetadataStore::MutationStatus MetadataStore::ApplyMutation(
             pending_write_mutation_index_by_object_id_.erase(*resolved_mutation_object_id);
         }
     }
-    mutation_applied = true;
+    if (capacity_preview)
+    {
+        const auto admission = finish_capacity_preview();
+        if (admission != MutationStatus::Applied) return admission;
+    }
+    mutation_applied = !capacity_preview;
     if (out_unlink_outcome) *out_unlink_outcome = std::move(staged_unlink_outcome);
     return MutationStatus::Applied;
 }
 
 MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations(
-    const std::vector<std::uint64_t>& required_checkpoint_xids)
+    const std::vector<std::uint64_t>& required_checkpoint_xids, bool capacity_only)
 {
     const auto fail = [this](
         CommitStatus status,
@@ -11582,7 +11686,7 @@ MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations(
         return fail(CommitStatus::NotReady, "apple-checkpoint-missing",
             L"NativeAppleTransactionWriterUnavailable");
     }
-    if (!AllowCommitStage("before-apple-preflight"))
+    if (!capacity_only && !AllowCommitStage("before-apple-preflight"))
     {
         return fail(CommitStatus::InvariantFailed,
             "apple-preflight-stage-blocked",
@@ -11892,7 +11996,8 @@ MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations(
             return fail(CommitStatus::InvariantFailed, "apple-compression-source-stale", L"CompressionRewriteSourceMismatch");
         compression_sources.emplace(proof.object, *SnapshotCommittedFileReadPlan(CanonicalPathKeyFromPath(mutation.path)));
         attribute_changes[{proof.object, "com.apple.decmpfs"}] = std::nullopt;
-        if (proof.type == 4) attribute_changes[{proof.object, "com.apple.ResourceFork"}] = std::nullopt;
+        if (CompressionRewrite::UsesResourceFork(proof.type))
+            attribute_changes[{proof.object, "com.apple.ResourceFork"}] = std::nullopt;
         content_changes.insert(proof.object);
         inode_changes.insert(proof.object);
     }
@@ -11900,12 +12005,12 @@ MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations(
         const auto found = compression_rewrites.find(attribute.object_id);
         return found != compression_rewrites.end() &&
             (attribute.name_utf8 == "com.apple.decmpfs" ||
-                (found->second.type == 4 && attribute.name_utf8 == "com.apple.ResourceFork"));
+                (CompressionRewrite::UsesResourceFork(found->second.type) && attribute.name_utf8 == "com.apple.ResourceFork"));
     };
     const auto independent_attribute = [&](const AppleXattrRecord& attribute, bool deleted = false) {
         if (IsContentIndependentAttributeForOwner(attribute, deleted)) return true;
         const auto found = compression_rewrites.find(attribute.object_id);
-        return found != compression_rewrites.end() && found->second.type != 4 &&
+        return found != compression_rewrites.end() && !CompressionRewrite::UsesResourceFork(found->second.type) &&
             attribute.name_utf8 == "com.apple.ResourceFork";
     };
     for (const auto& mutation : pending_mutations_)
@@ -12017,6 +12122,7 @@ MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations(
     // Index by stable private ID; paths (including aliases) are payload hints,
     // never evidence that an old extent belongs to the pending writer.
     std::unordered_map<std::uint64_t, std::vector<PreparedPayloadRange>> partial_rewrites;
+    std::unordered_set<std::uint64_t> clone_partial_rewrites;
     std::unordered_set<std::uint64_t> sparse_rewrites;
     for (const auto id : content_changes)
         if (working_inodes_.contains(id) && working_inodes_.at(id).node_type == NodeType::RegularFile &&
@@ -12255,12 +12361,15 @@ MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations(
                             reference->second.block_count == 0 ||
                             reference->first >= checkpoint.container.superblock.block_count ||
                             reference->second.block_count > checkpoint.container.superblock.block_count - reference->first ||
-                            reference->second.reference_count != 1 || reference->second.owning_object_id != private_id ||
+                            reference->second.kind != kApplePhysicalExtentKindNew ||
+                            (reference->second.reference_count == 1 && reference->second.owning_object_id != private_id) ||
                             reference->first + reference->second.block_count <= physical)
                         {
                             write_only_batch = false;
                             break;
                         }
+                        if (reference->second.reference_count > 1)
+                            clone_partial_rewrites.insert(private_id);
                         physical = (std::min)(end, reference->first + reference->second.block_count);
                         ++reference;
                     }
@@ -12272,7 +12381,28 @@ MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations(
     }
     if (!write_only_batch && !sparse_rewrites.empty())
         return fail(CommitStatus::InvariantFailed, "apple-sparse-transaction-unsupported", L"NativeSparseTransactionUnsupported");
-    if (!write_only_batch) partial_rewrites.clear();
+    if (!write_only_batch)
+    {
+        partial_rewrites.clear();
+        clone_partial_rewrites.clear();
+    }
+    // Shared ordinary extents need only the dirty blocks copied. The complete
+    // old mapping and byte identity have already passed eligibility checks;
+    // the planner independently proves every retained subrange and refcount.
+    for (const auto object_id : clone_partial_rewrites)
+    {
+        if (sparse_rewrites.contains(object_id)) continue;
+        auto& selected = partial_rewrites.at(object_id);
+        selected.clear();
+        for (const auto& range : pending_written_ranges_.at(object_id))
+        {
+            const auto begin = range.offset / block_size * block_size;
+            const auto finish = AlignExtentBytes(range.offset + range.bytes);
+            if (!selected.empty() && begin <= selected.back().offset + selected.back().bytes)
+                selected.back().bytes = (std::max)(finish, selected.back().offset + selected.back().bytes) - selected.back().offset;
+            else selected.push_back({begin, finish - begin});
+        }
+    }
 
     std::unordered_set<std::uint64_t> rewritten_private_ids;
     for (const auto object_id : deleted_objects)
@@ -12458,10 +12588,12 @@ MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations(
                     "apple-file-extent-record-invalid",
                     L"AppleCommitFileExtentRecordInvalid");
             }
-            if (sparse_rewrites.contains(object_id))
+            if (sparse_rewrites.contains(object_id) || clone_partial_rewrites.contains(object_id))
             {
                 const auto old_end = extent.logical_address + extent.length_bytes;
-                const auto retained_end = AlignExtentBytes((std::min)(NativeSparseRetainedSize(object_id), working_inodes_.at(object_id).logical_size));
+                const auto retained_end = clone_partial_rewrites.contains(object_id) && !sparse_rewrites.contains(object_id)
+                    ? working_inodes_.at(object_id).allocation_size.value_or(0)
+                    : AlignExtentBytes((std::min)(NativeSparseRetainedSize(object_id), working_inodes_.at(object_id).logical_size));
                 const auto end = (std::min)(old_end, retained_end);
                 auto cursor = (std::min)(extent.logical_address, end);
                 if (extent.physical_block && old_end > (std::max)(extent.logical_address, end))
@@ -13018,7 +13150,7 @@ MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations(
         const auto chunk_bytes = (std::max<std::uint64_t>)(1, (1024ull * 1024ull) / block_size) * block_size;
         const bool range_provider_configured = !!file_payload_range_provider_;
         std::optional<std::vector<std::byte>> legacy_payload;
-        if (size != 0 && !range_provider_configured && !compression_rewrites.contains(object_id))
+        if (!capacity_only && size != 0 && !range_provider_configured && !compression_rewrites.contains(object_id))
         {
             if (sparse_rewrites.contains(object_id) && size > 1024ull * 1024ull)
                 return fail(CommitStatus::PersistFailed, "apple-sparse-range-provider-required", L"NativeSparseRangeProviderRequired");
@@ -13054,7 +13186,7 @@ MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations(
                 data.logical_address = offset;
                 data.bytes.assign(static_cast<std::size_t>(count), std::byte{0});
                 const auto logical_count = offset < size ? (std::min)(count, size - offset) : 0;
-                if (logical_count != 0)
+                if (!capacity_only && logical_count != 0)
                 {
                     if (compression_rewrites.contains(object_id))
                     {
@@ -13129,7 +13261,7 @@ MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations(
     request.last_modification_time = latest_modification_time;
     request.filesystem_records = std::move(replacement_records);
 
-    if (!AllowCommitStage("before-apple-plan"))
+    if (!capacity_only && !AllowCommitStage("before-apple-plan"))
     {
         return fail(CommitStatus::InvariantFailed,
             "apple-plan-stage-blocked",
@@ -13139,6 +13271,14 @@ MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations(
     if (!PlanAppleVolumeTransaction(
             source, checkpoint, request, plan, apple_error))
     {
+        if (apple_error == "AppleVolumeQuotaExceeded" ||
+            apple_error == "AppleVolumeSiblingReserveProtected" ||
+            apple_error == "AppleVolumeReserveCapacityProtected" ||
+            apple_error == "AppleSpacemanMainPoolExhausted")
+        {
+            return fail(CommitStatus::CapacityBlocked,
+                "apple-plan-capacity-blocked", WidenAppleError(apple_error));
+        }
         if (IsAppleCheckpointRetentionCapacityError(apple_error))
         {
             return fail(CommitStatus::RetentionBlocked,
@@ -13150,6 +13290,9 @@ MetadataStore::CommitStatus MetadataStore::CommitApplePendingMutations(
             "apple-plan-failed", L"AppleCommitPlanFailed",
             WidenAppleError(apple_error));
     }
+    // Capacity previews use zero payload bytes solely to plan identical block
+    // geometry. They must return before any publication hook or device write.
+    if (capacity_only) return CommitStatus::NothingToCommit;
     if (!AllowCommitStage("before-apple-publish"))
     {
         return fail(CommitStatus::PersistFailed,
@@ -15959,7 +16102,7 @@ MetadataStore::CommitStatus MetadataStore::CommitCanonicalTransaction(
             recovery_required_,
             legacy_fixture_fallback_used_);
     }
-    else if (status != CommitStatus::RetentionBlocked)
+    else if (status != CommitStatus::RetentionBlocked && status != CommitStatus::CapacityBlocked)
     {
         canonical_commit_ready_ = false;
     }
@@ -18907,7 +19050,7 @@ std::optional<AppleXattrRecord> MetadataStore::LookupWorkingExtendedAttribute(
         {
             CompressionRewrite proof;
             if (DecodeCompressionRewrite(it->inline_payload, proof) &&
-                (name_utf8 == "com.apple.decmpfs" || (proof.type == 4 && name_utf8 == "com.apple.ResourceFork")))
+                (name_utf8 == "com.apple.decmpfs" || (CompressionRewrite::UsesResourceFork(proof.type) && name_utf8 == "com.apple.ResourceFork")))
                 return std::nullopt;
         }
         if (it->object_id != object_id ||
@@ -19058,7 +19201,7 @@ bool MetadataStore::DecodeCommittedCompressionRange(const CommittedFileReadPlan&
         if (!ApfsCompression::Inspect(decmpfs, limits, header) || header.uncompressed_size != plan.logical_size)
             return false;
         ApfsCompressionResourceReader resource;
-        if (header.type == 4 || header.type == 8 || header.type == 12)
+        if (header.type == 4 || header.type == 8 || header.type == 10 || header.type == 12 || header.type == 14)
         {
             if (!snapshot->resource || snapshot->resource->object_id != plan.object_id) return false;
             resource.size = snapshot->resource->logical_size;
@@ -19186,7 +19329,7 @@ bool MetadataStore::PrepareCompressionRewrite(const std::wstring& path, Mutation
     if (LookupCommittedExtendedAttribute(inode->object_id, "com.apple.ResourceFork") &&
         !read_attribute("com.apple.ResourceFork", CompressionRewrite::MaxResourceBytes,
             proof.resource_flags, proof.resource_descriptor, proof.resource)) return false;
-    if (proof.type == 4 && !proof.resource_flags) return false;
+    if (CompressionRewrite::UsesResourceFork(proof.type) && !proof.resource_flags) return false;
     std::array<std::uint8_t, 32> preserved_attributes{};
     std::vector<AppleXattrRecord> preserved_records;
     const auto preserved_owner = committed_extended_attributes_.find(inode->object_id);

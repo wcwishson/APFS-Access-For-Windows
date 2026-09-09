@@ -42,7 +42,7 @@ namespace
 constexpr char kFormat[] = "apfs-access-raw-evidence";
 constexpr int kVersion = 1;
 constexpr char kObserverId[] = "apfs-access-owned-raw-observer";
-constexpr char kObserverVersion[] = "1.0.0";
+constexpr char kObserverVersion[] = "1.1.0";
 
 int Usage()
 {
@@ -534,7 +534,51 @@ void WriteStore(JsonWriter& json, const apfsaccess::catalog::ApfsPhysicalStoreDe
     json.EndObject();
 }
 
-void WriteContainer(JsonWriter& json, const apfsaccess::catalog::ApfsContainerDescriptor& container)
+void WriteAmount(JsonWriter& json, const apfsaccess::catalog::ApfsSpaceAmount& amount)
+{
+    json.BeginObject();
+    json.Key("blocks"); json.String(std::to_string(amount.blocks));
+    json.Key("bytes"); json.String(std::to_string(amount.bytes));
+    json.EndObject();
+}
+
+void WriteOptionalAmount(JsonWriter& json,
+    const std::optional<apfsaccess::catalog::ApfsSpaceAmount>& amount)
+{
+    if (amount) WriteAmount(json, *amount);
+    else json.Null();
+}
+
+void WriteSharedSpace(JsonWriter& json, const apfsaccess::catalog::ApfsSharedSpaceProjection& space)
+{
+    json.BeginObject();
+    json.Key("containerId"); json.String("apfs-container:" + space.container_uuid_hex);
+    json.Key("checkpointXid"); json.String(std::to_string(space.checkpoint_xid));
+    json.Key("allocationUnitBytes"); json.Integer(space.allocation_unit_bytes);
+    json.Key("total"); WriteAmount(json, space.total);
+    json.Key("free"); WriteAmount(json, space.free);
+    json.Key("used"); WriteAmount(json, space.used);
+    json.Key("volumes"); json.BeginArray();
+    for (const auto& volume : space.volumes)
+    {
+        json.BeginObject();
+        json.Key("volumeId"); json.String("apfs-vol:" + space.container_uuid_hex + ":" + std::to_string(volume.object_id));
+        json.Key("objectId"); json.String(std::to_string(volume.object_id));
+        json.Key("allocated"); WriteAmount(json, volume.allocated);
+        json.Key("reserve"); WriteOptionalAmount(json, volume.reserve);
+        json.Key("quota"); WriteOptionalAmount(json, volume.quota);
+        json.Key("siblingReserveRemaining"); WriteAmount(json, volume.sibling_reserve_remaining);
+        json.Key("available"); WriteAmount(json, volume.available);
+        json.Key("snapshot"); WriteOptionalAmount(json, volume.snapshot);
+        json.Key("purgeable"); WriteOptionalAmount(json, volume.purgeable);
+        json.EndObject();
+    }
+    json.EndArray();
+    json.EndObject();
+}
+
+void WriteContainer(JsonWriter& json, const apfsaccess::catalog::ApfsContainerDescriptor& container,
+    const apfsaccess::catalog::ApfsContainerCatalog* catalog = nullptr)
 {
     json.BeginObject();
     json.Key("id");
@@ -565,6 +609,14 @@ void WriteContainer(JsonWriter& json, const apfsaccess::catalog::ApfsContainerDe
     WriteStringList(json, container.unknown_bits);
     json.Key("incompatibleFeatureBits");
     WriteStringList(json, container.incompatible_bits);
+    json.Key("sharedSpace");
+    apfsaccess::catalog::ApfsSharedSpaceProjection space;
+    std::string space_error;
+    // Failure/unsupported accounting is unknown, never a zero-capacity claim.
+    // Fusion has no single verified shared projection in this version.
+    if (catalog && !container.fusion && catalog->TryProjectSharedSpace(container.container_uuid_hex, space, space_error))
+        WriteSharedSpace(json, space);
+    else json.Null();
     json.EndObject();
 }
 
@@ -604,6 +656,12 @@ void WriteVolume(JsonWriter& json, const std::string& container_uuid,
     WriteStringList(json, volume.roles);
     json.Key("roleRaw");
     json.Integer(volume.role_raw);
+    json.Key("roleName"); json.String(volume.role_name);
+    json.Key("groupUuid");
+    if (volume.group_uuid_hex.empty()) json.Null();
+    else json.String(volume.group_uuid_hex);
+    json.Key("groupMetadataValid"); json.Bool(volume.group_metadata_valid);
+    json.Key("groupAssociationStatus"); json.String(volume.group_association_status);
     json.Key("groupId");
     if (group_id.empty())
     {
@@ -643,6 +701,14 @@ void WriteGroup(JsonWriter& json, const apfsaccess::catalog::ApfsVolumeGroupDesc
     json.String(group.group_uuid_hex);
     json.Key("volumeIds");
     WriteStringList(json, group.member_volume_ids);
+    json.Key("containerId"); json.String("apfs-container:" + group.container_uuid_hex);
+    json.Key("associationStatus"); json.String(group.association_status);
+    json.Key("systemVolumeId");
+    if (group.system_volume_id.empty()) json.Null();
+    else json.String(group.system_volume_id);
+    json.Key("dataVolumeId");
+    if (group.data_volume_id.empty()) json.Null();
+    else json.String(group.data_volume_id);
     json.EndObject();
 }
 
@@ -676,7 +742,7 @@ void WriteTopology(JsonWriter& json, const apfsaccess::catalog::ApfsContainerCat
     json.BeginArray();
     for (const auto& container : catalog.Containers())
     {
-        WriteContainer(json, container);
+        WriteContainer(json, container, &catalog);
     }
     json.EndArray();
 
@@ -714,6 +780,7 @@ apfsaccess::catalog::ApfsContainerDescriptor MergeFusionContainer(
     const apfsaccess::catalog::ApfsContainerDescriptor& secondary)
 {
     if (primary.container_uuid_hex != secondary.container_uuid_hex ||
+        primary.checkpoint_xid != secondary.checkpoint_xid ||
         primary.block_size != secondary.block_size ||
         primary.compatible_features != secondary.compatible_features ||
         primary.readonly_features != secondary.readonly_features ||
@@ -728,7 +795,12 @@ apfsaccess::catalog::ApfsContainerDescriptor MergeFusionContainer(
         for (const auto& other : secondary.volumes)
         {
             if (other.object_id == volume.object_id && other.name_utf8 == volume.name_utf8 &&
-                other.volume_uuid_hex == volume.volume_uuid_hex)
+                other.volume_uuid_hex == volume.volume_uuid_hex &&
+                other.role_raw == volume.role_raw && other.role_name == volume.role_name &&
+                other.roles == volume.roles && other.group_uuid_hex == volume.group_uuid_hex &&
+                other.group_metadata_valid == volume.group_metadata_valid &&
+                other.group_association_status == volume.group_association_status &&
+                other.superblock_xid == volume.superblock_xid)
             {
                 matched = true;
                 break;
@@ -968,6 +1040,8 @@ int main(int argc, char** argv)
     json.String(kFormat);
     json.Key("version");
     json.Integer(kVersion);
+    json.Key("topologyMetadataVersion");
+    json.Integer(1);
     json.Key("observerId");
     json.String(kObserverId);
     json.Key("observerVersion");

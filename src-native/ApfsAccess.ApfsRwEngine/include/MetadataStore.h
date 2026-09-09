@@ -54,6 +54,7 @@ public:
         InvalidRequest,
         AllocationFailed,
         UnsupportedOperation,
+        CapacityBlocked,
     };
 
     enum class CommitStatus
@@ -67,6 +68,7 @@ public:
         PersistFailed,
         FlushFailed,
         RetentionBlocked,
+        CapacityBlocked,
     };
 
     enum class MutationOperation
@@ -300,6 +302,17 @@ public:
     // Call before staging callback companion metadata; performs no mutation or WAL acceptance.
     [[nodiscard]] MutationStatus PreflightNativeSparseMutation(
         const MutationRequest& request, std::uint64_t* allocation = nullptr) const;
+    // Evaluates a proposed mutation using the normal undo log, then restores
+    // all staged state. No payload provider, WAL or device write is invoked.
+    [[nodiscard]] MutationStatus PreflightNativeCapacityMutation(const MutationRequest& request,
+        const std::vector<std::uint64_t>& required_checkpoint_xids = {});
+    static constexpr std::size_t MaximumCapacityPreviewRequests = 8;
+    [[nodiscard]] MutationStatus PreflightNativeCapacityMutations(std::span<const MutationRequest> requests,
+        const std::vector<std::uint64_t>& required_checkpoint_xids = {});
+    [[nodiscard]] std::vector<MutationRequest> DebugSnapshotPendingMutations() const
+        { return {pending_mutations_.begin(), pending_mutations_.end()}; }
+    [[nodiscard]] CommitStatus CheckPendingAppleCapacity(
+        const std::vector<std::uint64_t>& required_checkpoint_xids = {});
     [[nodiscard]] MutationStatus StageMutation(
         const MutationRequest& request,
         PayloadIdentity* out_staged_payload_identity = nullptr,
@@ -568,7 +581,11 @@ private:
     [[nodiscard]] bool RequiresCanonicalNonFixtureCommitPath() const noexcept;
     [[nodiscard]] bool CanUseAppleTransactionWriter(std::wstring* out_reason = nullptr) const;
     [[nodiscard]] CommitStatus CommitApplePendingMutations(
-        const std::vector<std::uint64_t>& required_checkpoint_xids);
+        const std::vector<std::uint64_t>& required_checkpoint_xids, bool capacity_only = false);
+    [[nodiscard]] MutationStatus ApplyMutationCore(const MutationRequest& request,
+        PayloadIdentity* out_staged_payload_identity, std::optional<UnlinkOutcome>* out_unlink_outcome,
+        bool capacity_preview, std::span<const MutationRequest> capacity_tail = {},
+        const std::vector<std::uint64_t>& capacity_pins = {});
     [[nodiscard]] bool CanLoadNativeCheckpointXid(std::uint64_t persisted_xid) const noexcept;
     [[nodiscard]] std::optional<std::uint64_t> ResolveObjectBlockIndex(std::uint64_t object_or_block) const;
     [[nodiscard]] bool ReadMetadataBlock(std::uint64_t block_index, std::vector<std::byte>& out_block) const;

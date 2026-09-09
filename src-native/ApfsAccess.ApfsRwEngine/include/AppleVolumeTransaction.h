@@ -19,6 +19,14 @@ struct AppleVolumeDataWrite
     std::vector<std::byte> bytes;
 };
 
+struct AppleVolumeCloneRequest
+{
+    // Whole uncompressed regular-file stream, into a newly allocated inode ID.
+    // Namespace/inode creation remains supplied in filesystem_records.
+    std::uint64_t source_inode_id = 0;
+    std::uint64_t target_inode_id = 0;
+};
+
 struct AppleVolumeTransactionRequest
 {
     std::uint64_t volume_object_id = 0;
@@ -28,8 +36,13 @@ struct AppleVolumeTransactionRequest
     // and normalized against the old tree and data_writes.
     std::vector<catalog::BtreeRecord> filesystem_records;
     std::vector<AppleVolumeDataWrite> data_writes;
+    // Native planner input only. A host must durably accept clone identity and
+    // source preimage before exposing this operation; no WAL/host opcode added.
+    std::vector<AppleVolumeCloneRequest> clones;
     // Exact source evidence from the dedicated MetadataStore transition.
     std::vector<CompressionRewrite> compression_rewrites;
+    // Exact multiset of relinquished file-extent mappings, not allocator frees.
+    // Clone mappings can overlap; the planner derives the zero-reference ranges.
     std::vector<AppleSpacemanReleaseRequest> released_data_blocks;
     std::int64_t file_count_delta = 0;
     std::int64_t directory_count_delta = 0;

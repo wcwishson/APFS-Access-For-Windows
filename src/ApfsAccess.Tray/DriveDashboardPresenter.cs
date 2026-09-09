@@ -9,7 +9,26 @@ public static class DriveDashboardPresenter
     {
         ArgumentNullException.ThrowIfNull(payload);
 
-        if (payload.MountedVolumes is not { Count: > 0 })
+        var rows = (payload.MountedVolumes ?? [])
+            .Where(v => !string.IsNullOrWhiteSpace(v.VolumeId) && !string.IsNullOrWhiteSpace(v.MountPoint))
+            .Select(v => BuildRow(payload, v)).ToList();
+        var inventory = (payload.ConnectedInventory ?? []).Where(d => d.Device.IsConnected)
+            .SelectMany(d => d.Volumes.Select(v => (Device: d.Device, Volume: v))).ToArray();
+        foreach (var item in inventory)
+        {
+            var v = item.Volume;
+            if (rows.Any(r => SameIdentity(r, v))) continue;
+            var unique = inventory.Count(i => SameTarget(i.Volume, v)) == 1 &&
+                string.Equals(item.Device.DeviceId, v.DeviceId, StringComparison.OrdinalIgnoreCase);
+            rows.Add(BuildConnectedRow(payload, item.Device, v, unique));
+        }
+        // A duplicate routing identity is never actionable, even when catalog IDs differ.
+        rows = rows.GroupBy(RowIdentity).Select(g => g.OrderByDescending(r => r.State).First()).Select(r =>
+            inventory.Count(i => string.Equals(i.Volume.DeviceId, r.DeviceId, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(i.Volume.VolumeId, r.VolumeId, StringComparison.OrdinalIgnoreCase)) > 1
+                ? r with { CanFix = false, CanInspectReadOnly = false, CanEject = false,
+                    Summary = "Ambiguous volume identity. Refresh after resolving duplicate identities." } : r).ToList();
+        if (rows.Count == 0)
         {
             var idleState = ClassifyIdle(payload);
             return
@@ -26,26 +45,83 @@ public static class DriveDashboardPresenter
                     Summary: BuildIdleSummary(payload),
                     CanOpen: false,
                     CanEject: false,
-                    CanFix: idleState is DriveDashboardState.Attention or DriveDashboardState.Problem,
+                    CanFix: payload.ConnectedInventory is null && idleState is (DriveDashboardState.Attention or DriveDashboardState.Problem),
                     Details: BuildIdleDetails(payload),
-                    FixGuidance: BuildFixGuidance(idleState, payload))
+                    FixGuidance: BuildFixGuidance(idleState, payload), IsMounted: false)
             ];
         }
 
-        return payload.MountedVolumes
-            .Where(static volume => !string.IsNullOrWhiteSpace(volume.VolumeId))
-            .OrderBy(static volume => NormalizeDriveLabel(volume.MountPoint), StringComparer.OrdinalIgnoreCase)
-            .Select(volume => BuildRow(payload, volume))
-            .ToArray();
+        return rows.OrderByDescending(r => r.IsMounted).ThenBy(RowIdentity, StringComparer.Ordinal).ToArray();
+    }
+
+    public static string RowIdentity(DriveDashboardRow row) => string.IsNullOrWhiteSpace(row.VolumeId) ? "idle" :
+        System.Text.Json.JsonSerializer.Serialize(new object?[] { row.DeviceId?.ToUpperInvariant(), row.VolumeId.ToUpperInvariant(),
+            row.CatalogContainerUuid?.ToUpperInvariant(), row.CatalogVolumeId?.ToUpperInvariant(), row.CatalogVolumeObjectId });
+
+    private static bool SameTarget(VolumeInfo a, VolumeInfo b) =>
+        string.Equals(a.DeviceId, b.DeviceId, StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(a.VolumeId, b.VolumeId, StringComparison.OrdinalIgnoreCase);
+
+    private static bool SameIdentity(DriveDashboardRow r, VolumeInfo v) =>
+        string.Equals(r.DeviceId, v.DeviceId, StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(r.VolumeId, v.VolumeId, StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(r.CatalogContainerUuid, v.CatalogContainerUuid, StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(r.CatalogVolumeId, v.CatalogVolumeId, StringComparison.OrdinalIgnoreCase) &&
+        r.CatalogVolumeObjectId == v.CatalogVolumeObjectId;
+
+    private static DriveDashboardRow BuildConnectedRow(StatusChangedPayload payload, DeviceInfo device, VolumeInfo v, bool unique)
+    {
+        var ordinary = CatalogMountPolicy.AllowsMount(v, false);
+        var inspect = !ordinary && CatalogMountPolicy.AllowsReadOnlyInspection(v);
+        var reason = v.IsEncrypted || v.CatalogDecision == ApfsCapabilityDecision.Locked ? "Locked; unlock support is required before mounting."
+            : !v.SupportsExplorerMount ? "Explorer mounting is unsupported for this volume."
+            : ordinary ? "Not mounted. Mount this volume using the current service policy."
+            : inspect ? "Not mounted by default. Read-only inspection is available; writes remain blocked."
+            : "Mounting is unavailable: the catalog does not prove this volume readable.";
+        if (!unique) reason = "Ambiguous or inconsistent device/volume identity. Mounting is unavailable.";
+        var display = new MountedVolumeDisplay(v.VolumeId, "", v.VolumeName, v.DeviceId, device.DisplayName,
+            MountAccessMode.ReadOnly, CatalogVolumeId: v.CatalogVolumeId, CatalogContainerUuid: v.CatalogContainerUuid,
+            CatalogVolumeObjectId: v.CatalogVolumeObjectId, CatalogSpace: v.CatalogSpace);
+        var details = BuildDetails(payload with { State = RuntimeState.Idle }, display, DriveDashboardState.Idle)
+            .Where(line => line.StartsWith("Device:") || line.StartsWith("Volume:") || line.StartsWith("Catalog ") ||
+                line.Contains("space", StringComparison.OrdinalIgnoreCase) || line.StartsWith("Shared container") ||
+                line.StartsWith("Volume ") || line.StartsWith("Reserved for") || line.StartsWith("Purgeable"))
+            .Concat(new[] { $"Device identity: {v.DeviceId}", $"Routing identity: {v.VolumeId}",
+                $"Catalog decision: {v.CatalogDecision?.ToString() ?? "Legacy / unspecified"}",
+                $"Catalog reasons: {string.Join(", ", v.CatalogReasons ?? [])}", reason }).ToArray();
+        return new(v.VolumeId, device.DisplayName, v.VolumeName, "", "", DriveDashboardState.Idle, DashboardPalette.Gray,
+            v.IsEncrypted || v.CatalogDecision == ApfsCapabilityDecision.Locked ? "Locked" : ordinary || inspect ? "Not mounted" : "Unavailable",
+            reason, false, false, unique && ordinary, details, [reason], v.CatalogVolumeId, v.CatalogContainerUuid,
+            v.CatalogVolumeObjectId, v.DeviceId, IsMounted: false, CanInspectReadOnly: unique && inspect, RecoveryIdentity: v.RecoveryIdentity);
+    }
+
+    public static ControlOperationRequestPayload CreateMountRequest(StatusChangedPayload current, DriveDashboardRow selected)
+    {
+        var matches = BuildRows(current).Where(r => RowIdentity(r) == RowIdentity(selected)).ToArray();
+        if (matches.Length != 1 || matches[0].IsMounted ||
+            !(matches[0].CanFix || matches[0].CanInspectReadOnly) ||
+            matches[0].CanInspectReadOnly != selected.CanInspectReadOnly || matches[0].CanFix != selected.CanFix ||
+            matches[0].RecoveryIdentity != selected.RecoveryIdentity)
+            throw new InvalidOperationException("Volume identity or capability changed. Refresh before mounting.");
+        var row = matches[0];
+        var request = new ControlOperationRequestPayload(Guid.NewGuid().ToString("D"), ApfsControlCommands.Mount,
+            new ApfsControlTarget(row.DeviceId!, row.VolumeId, row.RecoveryIdentity),
+            row.CanInspectReadOnly ? ApfsControlModes.ReadOnly : ApfsControlModes.ReadWrite, DateTime.UtcNow.AddSeconds(90));
+        var validation = PipeMessageCodec.Validate(PipeMessageCodec.Create(ApfsMessageTypes.ControlOperationRequest,
+            request, request.OperationId, PipeSchemaVersions.Schema2));
+        if (!validation.IsValid) throw new InvalidOperationException(validation.Diagnostic ?? "Invalid volume identity.");
+        return request;
     }
 
     public static string BuildSummary(StatusChangedPayload payload)
     {
         var rows = BuildRows(payload);
-        var mountedRows = rows.Where(static row => row.State != DriveDashboardState.Idle).ToArray();
+        var mountedRows = (payload.MountedVolumes ?? [])
+            .Where(v => !string.IsNullOrWhiteSpace(v.VolumeId) && !string.IsNullOrWhiteSpace(v.MountPoint))
+            .Select(v => BuildRow(payload, v)).ToArray();
         if (mountedRows.Length == 0)
         {
-            return rows[0].Summary;
+            return payload.ConnectedInventory is not null ? "No APFS drives mounted." : rows[0].Summary;
         }
 
         var countText = mountedRows.Length == 1 ? "1 APFS drive mounted" : $"{mountedRows.Length} APFS drives mounted";
@@ -69,7 +145,8 @@ public static class DriveDashboardPresenter
         }
 
         var trimmed = mountPoint.Trim();
-        if (trimmed.Length >= 2 && trimmed[1] == ':')
+        if ((trimmed.Length == 2 || trimmed.Length == 3 && trimmed[2] is '\\' or '/') &&
+            char.IsAsciiLetter(trimmed[0]) && trimmed[1] == ':')
         {
             return $"{char.ToUpperInvariant(trimmed[0])}:";
         }
@@ -79,10 +156,13 @@ public static class DriveDashboardPresenter
 
     private static DriveDashboardRow BuildRow(StatusChangedPayload payload, MountedVolumeDisplay volume)
     {
+        payload = StatusForVolume(payload, volume);
         var state = Classify(payload, volume);
         var palette = ToPalette(state);
         var mountPoint = NormalizeDriveLabel(volume.MountPoint);
         var details = BuildDetails(payload, volume, state);
+        var ordinaryMount = CatalogMountPolicy.AllowsOrdinaryMount(
+            volume.CatalogDecision, volume.CatalogReasons, volume.CatalogAutoMountAllowed);
         return new DriveDashboardRow(
             VolumeId: volume.VolumeId,
             DeviceName: FirstNonBlank(volume.DeviceDisplayName, volume.DeviceId, "APFS drive"),
@@ -92,12 +172,15 @@ public static class DriveDashboardPresenter
             State: state,
             Palette: palette,
             StateText: ToStateText(state),
-            Summary: BuildRowSummary(payload, volume, state) + (volume.DriveLetterPreference is { } preference ? " " + preference.Text + "." : string.Empty),
+            Summary: (ordinaryMount ? BuildRowSummary(payload, volume, state)
+                : "Catalog policy blocks writes and automatic mounting for this volume.") +
+                (volume.DriveLetterPreference is { } preference ? " " + preference.Text + "." : string.Empty),
             CanOpen: !string.IsNullOrWhiteSpace(mountPoint),
             CanEject: !string.IsNullOrWhiteSpace(volume.VolumeId) || !string.IsNullOrWhiteSpace(mountPoint),
-            CanFix: state is DriveDashboardState.ReadOnly or DriveDashboardState.Attention or DriveDashboardState.Problem,
+            CanFix: ordinaryMount && state is (DriveDashboardState.ReadOnly or DriveDashboardState.Attention or DriveDashboardState.Problem),
             Details: details,
-            FixGuidance: BuildFixGuidance(state, payload),
+            FixGuidance: ordinaryMount ? BuildFixGuidance(state, payload)
+                : ["Catalog policy prevents writable repair for this volume. Read-only inspection does not enable writes."],
             CatalogVolumeId: volume.CatalogVolumeId,
             CatalogContainerUuid: volume.CatalogContainerUuid,
             CatalogVolumeObjectId: volume.CatalogVolumeObjectId,
@@ -105,11 +188,55 @@ public static class DriveDashboardPresenter
             DriveLetterPreference: volume.DriveLetterPreference);
     }
 
+    private static StatusChangedPayload StatusForVolume(StatusChangedPayload aggregate, MountedVolumeDisplay volume)
+    {
+        // Older senders omit this marker and only supply aggregate health.
+        if (!volume.HasRuntimeStatus) return aggregate;
+        return aggregate with
+        {
+            State = volume.State,
+            LastError = null,
+            WriteEnabled = volume.WriteEnabled,
+            WriteBackend = volume.WriteBackend,
+            CommitModel = volume.CommitModel,
+            NativeWriteReadiness = volume.NativeWriteReadiness,
+            NativeWriteEngineState = volume.NativeWriteEngineState,
+            NativeWriteValidationState = volume.NativeWriteValidationState,
+            NativeWriteSafetyState = volume.NativeWriteSafetyState,
+            NativeWriteValidationEvidence = volume.NativeWriteValidationEvidence,
+            NativeWriteDiagnostics = volume.NativeWriteDiagnostics,
+            RecoveryActive = volume.RecoveryActive,
+            RecoveryReason = volume.RecoveryReason,
+            LastRecoveryAction = volume.LastRecoveryAction,
+            LastCommitXid = volume.LastCommitXid,
+            WriteIncompatibilities = volume.WriteIncompatibilities,
+            WriteUnsupportedFeatures = volume.WriteUnsupportedFeatures,
+            DirtyTransactionCount = volume.DirtyTransactionCount,
+            ShutdownDrainActive = volume.ShutdownDrainActive,
+            InFlightMutationCallbacks = volume.InFlightMutationCallbacks,
+        };
+    }
+
     private static DriveDashboardState Classify(StatusChangedPayload payload, MountedVolumeDisplay volume)
     {
         if (payload.State == RuntimeState.Error)
         {
             return DriveDashboardState.Problem;
+        }
+
+        if (volume.HasRuntimeStatus)
+        {
+            if (volume.RecoveryActive || volume.NativeWriteSafetyState == NativeWriteSafetyState.RecoveryBlocked)
+                return DriveDashboardState.Problem;
+            if (volume.PendingDurability || volume.WalAcceptedSequence > volume.WalApfsDurableSequence ||
+                volume.DirtyTransactionCount > 0 || volume.ShutdownDrainActive || volume.InFlightMutationCallbacks > 0)
+                return DriveDashboardState.FinishingWrites;
+            if (volume.AccessMode != MountAccessMode.ReadWrite || !volume.WriteEnabled ||
+                volume.NativeWriteSafetyState == NativeWriteSafetyState.ReadOnlyFallback)
+                return DriveDashboardState.ReadOnly;
+            if (volume.State != RuntimeState.MountedRw || !volume.MountReady)
+                return DriveDashboardState.Attention;
+            return DriveDashboardState.HealthyReadWrite;
         }
 
         if (volume.AccessMode == MountAccessMode.ReadWrite &&
@@ -202,7 +329,10 @@ public static class DriveDashboardPresenter
         => state switch
         {
             DriveDashboardState.HealthyReadWrite => "Full read/write access is available.",
-            DriveDashboardState.FinishingWrites => BuildAttentionSummary(payload),
+            DriveDashboardState.FinishingWrites => volume.HasRuntimeStatus &&
+                (volume.PendingDurability || volume.WalAcceptedSequence > volume.WalApfsDurableSequence)
+                    ? "Recent writes are still settling. Wait a moment before unplugging."
+                    : BuildAttentionSummary(payload),
             DriveDashboardState.ReadOnly => "The drive is mounted for reading, but writes are not currently available.",
             DriveDashboardState.Attention => BuildAttentionSummary(payload),
             DriveDashboardState.Problem => BuildProblemSummary(payload),
@@ -278,8 +408,27 @@ public static class DriveDashboardPresenter
             $"Catalog OID: {(volume.CatalogVolumeObjectId.HasValue ? volume.CatalogVolumeObjectId.Value.ToString() : "none")}",
         };
 
+        if (volume.CatalogSpace is { } space &&
+            space.Volume.VolumeId == volume.CatalogVolumeId &&
+            space.Volume.ObjectId == volume.CatalogVolumeObjectId &&
+            space.ContainerId == "apfs-container:" + volume.CatalogContainerUuid)
+        {
+            details.Add($"Space at last scan (checkpoint {space.CheckpointXid}):");
+            details.Add($"Shared container capacity: {FormatSpaceBytes(space.ContainerTotal.Bytes)}");
+            details.Add($"Shared container free: {FormatSpaceBytes(space.ContainerFree.Bytes)}");
+            details.Add($"Volume allocated: {FormatSpaceBytes(space.Volume.Allocated.Bytes)}");
+            details.Add($"Volume available at scan: {FormatSpaceBytes(space.Volume.Available.Bytes)}");
+            details.Add($"Volume quota: {(space.Volume.Quota is { } quota ? FormatSpaceBytes(quota.Bytes) : "No limit")}");
+            details.Add($"Volume reservation: {(space.Volume.Reserve is { } reserve ? FormatSpaceBytes(reserve.Bytes) : "None")}");
+            details.Add($"Reserved for other volumes: {FormatSpaceBytes(space.Volume.SiblingReserveRemaining.Bytes)}");
+            details.Add($"Snapshot space: {(space.Volume.Snapshot is { } snapshot ? FormatSpaceBytes(snapshot.Bytes) : "Unknown")}");
+            details.Add($"Purgeable space: {(space.Volume.Purgeable is { } purgeable ? FormatSpaceBytes(purgeable.Bytes) : "Unknown")}");
+        }
         return details;
     }
+
+    private static string FormatSpaceBytes(ulong bytes)
+        => bytes.ToString("N0", System.Globalization.CultureInfo.CurrentCulture) + " bytes";
 
     private static IReadOnlyList<string> BuildIdleDetails(StatusChangedPayload payload)
     {

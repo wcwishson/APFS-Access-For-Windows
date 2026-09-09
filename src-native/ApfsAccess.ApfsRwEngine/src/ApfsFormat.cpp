@@ -1536,6 +1536,11 @@ std::optional<ApsbVolume> ParseApsb(const std::vector<std::byte>& block)
         return std::nullopt;
     }
     ApsbVolume out;
+    // Apple File System Reference, apfs_superblock_t: original fields
+    // apfs_fs_reserve_block_count, apfs_fs_quota_block_count, apfs_fs_alloc_count.
+    out.space.reserve_block_count = ReadU64LE(block, 0x48).value();
+    out.space.quota_block_count = ReadU64LE(block, 0x50).value();
+    out.space.allocated_block_count = ReadU64LE(block, 0x58).value();
     out.object_id = ReadU64LE(block, 0x08).value_or(0);
     out.xid = ReadU64LE(block, 0x10).value_or(0);
     out.root_tree_type = ReadU32LE(block, 0x74).value_or(0);
@@ -2762,11 +2767,12 @@ std::string EncryptionModeFor(std::uint64_t fs_flags)
     return "none";
 }
 
-std::vector<std::string> RolesFor(std::uint16_t role_raw)
+std::string RoleNameFor(std::uint16_t role_raw)
 {
     switch (role_raw)
     {
     case 0x0000:
+        return "none";
     case 0x0040:
         return {"data"};
     case 0x0001:
@@ -2798,6 +2804,11 @@ std::vector<std::string> RolesFor(std::uint16_t role_raw)
     default:
         return {"unknown"};
     }
+}
+
+std::vector<std::string> RolesFor(std::uint16_t role_raw)
+{
+    return {role_raw == 0 ? "data" : RoleNameFor(role_raw)};
 }
 
 bool IsValidUtf8(const std::byte* data, std::size_t size)

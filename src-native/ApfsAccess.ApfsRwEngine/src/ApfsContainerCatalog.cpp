@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cwchar>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -86,7 +87,8 @@ bool LoadStoreCheckpoint(
 
 ApfsVolumeDescriptor DescribeVolume(
     const ApsbVolume& volume,
-    std::uint64_t superblock_block)
+    std::uint64_t superblock_block,
+    bool verified_apple = false)
 {
     ApfsVolumeDescriptor descriptor;
     descriptor.object_id = volume.object_id;
@@ -95,7 +97,14 @@ ApfsVolumeDescriptor DescribeVolume(
     descriptor.name_utf8 = volume.name_utf8;
     descriptor.name_valid = volume.name_valid;
     descriptor.role_raw = volume.role_raw;
+    descriptor.role_name = RoleNameFor(volume.role_raw);
     descriptor.roles = RolesFor(volume.role_raw);
+    if (verified_apple) descriptor.space = volume.space;
+    const bool group_feature = (volume.features & 0x10ULL) != 0;
+    descriptor.group_metadata_valid = group_feature == !volume.group_hex.empty() &&
+        (volume.group_hex.empty() || volume.role_raw == 0x1 || volume.role_raw == 0x40);
+    descriptor.group_association_status = !descriptor.group_metadata_valid ? "malformed" :
+        volume.group_hex.empty() ? "none" : "incomplete";
     descriptor.case_mode = CaseModeFor(volume.incompatible_features);
     descriptor.encryption_mode = EncryptionModeFor(volume.fs_flags);
     descriptor.locked = descriptor.encryption_mode != "none";
@@ -164,7 +173,7 @@ bool LoadStoreVolumes(
                 return false;
             }
             out_volumes.push_back(DescribeVolume(
-                volume.superblock, volume.superblock_object.physical_block));
+                volume.superblock, volume.superblock_object.physical_block, true));
         }
         return true;
     }
@@ -219,11 +228,12 @@ bool ApfsContainerCatalog::TryLoadImage(
     const RandomAccessSource& image,
     const std::string& disk_id,
     const std::string& device_identifier,
-    ApfsContainerCatalog& out_catalog,
+    ApfsContainerCatalog& published_catalog,
     std::string& out_error,
     CatalogLoadPolicy policy)
 {
-    out_catalog = ApfsContainerCatalog{};
+    published_catalog = ApfsContainerCatalog{};
+    ApfsContainerCatalog out_catalog;
     out_error.clear();
     if (disk_id.empty() || device_identifier.empty())
     {
@@ -445,29 +455,45 @@ bool ApfsContainerCatalog::TryLoadImage(
                 return false;
             }
         }
-        // Cross-validated volume groups: the same nonzero group UUID must be
-        // observed on at least two volumes before a group node is emitted.
-        // A lone group UUID stays on its volume record only.
-        std::unordered_map<std::string, std::vector<std::string>> grouped;
-        for (const ApfsVolumeDescriptor& volume : container.volumes)
+        // UUID equality alone is insufficient to establish a System/Data
+        // association. Retain malformed/incomplete metadata without routing it.
+        std::map<std::string, std::vector<ApfsVolumeDescriptor*>> grouped;
+        for (ApfsVolumeDescriptor& volume : container.volumes)
         {
             if (!volume.group_uuid_hex.empty())
             {
-                grouped[volume.group_uuid_hex].push_back(
-                    VolumeIdFor(container.container_uuid_hex, volume.object_id));
+                grouped[volume.group_uuid_hex].push_back(&volume);
             }
         }
         for (const auto& [group_hex, members] : grouped)
         {
-            if (members.size() >= 2)
+            ApfsVolumeGroupDescriptor group;
+            group.container_uuid_hex = container.container_uuid_hex;
+            group.group_uuid_hex = group_hex;
+            std::size_t systems = 0, data = 0;
+            bool malformed = false;
+            std::string system_id, data_id;
+            for (const auto* member : members)
             {
-                ApfsVolumeGroupDescriptor group;
-                group.group_uuid_hex = group_hex;
-                group.member_volume_ids = members;
-                container.groups.push_back(std::move(group));
+                const auto id = VolumeIdFor(container.container_uuid_hex, member->object_id);
+                group.member_volume_ids.push_back(id);
+                malformed |= !member->group_metadata_valid || member->volume_uuid_hex.empty();
+                if (member->role_raw == 0x1) { ++systems; system_id = id; }
+                if (member->role_raw == 0x40) { ++data; data_id = id; }
             }
+            group.association_status = malformed ? "malformed" :
+                (systems > 1 || data > 1) ? "ambiguous" :
+                (systems == 1 && data == 1) ? "valid-system-data" : "incomplete";
+            if (group.association_status == "valid-system-data")
+            {
+                group.system_volume_id = std::move(system_id);
+                group.data_volume_id = std::move(data_id);
+            }
+            for (auto* member : members) member->group_association_status = group.association_status;
+            if (members.size() >= 2) container.groups.push_back(std::move(group));
         }
     }
+    published_catalog = std::move(out_catalog);
     return true;
 }
 
@@ -477,6 +503,7 @@ bool ApfsContainerCatalog::TryLoadDevice(
     std::wstring& out_error,
     CatalogLoadPolicy policy)
 {
+    out_catalog = {};
     out_error.clear();
     const std::wstring path = device.Path();
     std::string narrow = ToNarrow(path);
@@ -551,6 +578,31 @@ const AppleCheckpointView* ApfsContainerCatalog::TryGetAppleCheckpointView(
             return item.stable_store_id == stable_store_id;
         });
     return found == checkpoint_views_.end() ? nullptr : &found->checkpoint;
+}
+
+bool ApfsContainerCatalog::TryProjectSharedSpace(const std::string& container_uuid_hex,
+    ApfsSharedSpaceProjection& out, std::string& error) const
+{
+    out = {};
+    error.clear();
+    for (const auto& container : containers_)
+    {
+        if (container.container_uuid_hex != container_uuid_hex) continue;
+        if (container.fusion || container.member_store_ids.size() != 1)
+        {
+            error = "SharedSpaceMultiStoreUnsupported";
+            return false;
+        }
+        const auto* checkpoint = TryGetAppleCheckpointView(container.member_store_ids.front());
+        if (!checkpoint)
+        {
+            error = "SharedSpaceUnverifiedCheckpoint";
+            return false;
+        }
+        return TryProjectAppleSharedSpace(*checkpoint, out, error);
+    }
+    error = "SharedSpaceContainerMissing";
+    return false;
 }
 
 bool ApfsContainerCatalog::TryResolveVolumeByName(

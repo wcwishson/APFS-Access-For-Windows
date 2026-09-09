@@ -50,16 +50,15 @@ public static class WriteGatePolicy
         // non-Writable decision blocks here, before (and regardless of) the
         // pilot allow-lists, incompatibility flags, and the testing override
         // below. No flag, config, or override path may re-enable it.
-        if (volume.CatalogDecision.HasValue &&
-            volume.CatalogDecision.Value != ApfsCapabilityDecision.Writable)
+        if (!CatalogMountPolicy.AllowsOrdinaryMount(volume))
         {
             var catalogDetail = volume.CatalogReasons is { Count: > 0 }
                 ? string.Join(", ", volume.CatalogReasons)
-                : volume.CatalogDecision.Value.ToString();
+                : volume.CatalogDecision?.ToString() ?? "incomplete catalog";
             return new WriteGateDecision(
                 false,
                 "CatalogCapabilityBlocked",
-                $"Observer catalog decision '{volume.CatalogDecision.Value}' disallows write ({catalogDetail})."
+                $"Observer catalog decision '{volume.CatalogDecision}' disallows write ({catalogDetail})."
             );
         }
 

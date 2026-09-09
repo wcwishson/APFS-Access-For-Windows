@@ -1592,6 +1592,39 @@ bool NativeApfsReader::ProjectFileSystemTree(
         }
     }
 
+    // The scalar payload projection feeds legacy OMAP/allocator validators
+    // that require exclusive addresses. Keep shared mappings in the existing
+    // per-inode extent path; physical sharing never grants write authority.
+    struct PhysicalReadRange { std::uint64_t begin, end, stream; };
+    std::vector<PhysicalReadRange> physical_read_ranges;
+    std::unordered_set<std::uint64_t> shared_read_streams;
+    std::unordered_map<std::uint64_t, std::size_t> private_read_owners;
+    for (const auto& [id, inode] : raw_inodes)
+        if (++private_read_owners[inode.private_id] > 1) shared_read_streams.insert(inode.private_id);
+    for (const auto& [stream, extents] : read_extents_by_private_id)
+        for (const auto& extent : extents)
+        {
+            if (!extent.physical_address) continue;
+            if (budget && !budget->Materialize(1, sizeof(PhysicalReadRange) + 64)) return false;
+            physical_read_ranges.push_back({extent.physical_address, extent.physical_address + extent.bytes, stream});
+        }
+    std::sort(physical_read_ranges.begin(), physical_read_ranges.end(), [](const auto& a, const auto& b) {
+        return a.begin < b.begin;
+    });
+    for (std::size_t begin = 0; begin < physical_read_ranges.size();)
+    {
+        auto end = begin + 1;
+        auto physical_end = physical_read_ranges[begin].end;
+        while (end < physical_read_ranges.size() && physical_read_ranges[end].begin < physical_end)
+        {
+            physical_end = (std::max)(physical_end, physical_read_ranges[end].end);
+            ++end;
+        }
+        if (end - begin > 1)
+            for (auto at = begin; at < end; ++at) shared_read_streams.insert(physical_read_ranges[at].stream);
+        begin = end;
+    }
+
     if (!raw_inodes.contains(kRootDirectoryInode))
     {
         return false;
@@ -1884,7 +1917,7 @@ bool NativeApfsReader::ProjectFileSystemTree(
                     projection.read_extents_by_inode[inode.object_id] = normalized_extents;
                     if (auto single_extent = TryResolveSingleExtentProjection(normalized_extents,
                             (std::max)(inode.logical_size, inode.allocation_size.value_or(0)));
-                        single_extent.has_value())
+                        single_extent.has_value() && !shared_read_streams.contains(raw_inode.private_id))
                     {
                         inode.data_physical_address = single_extent->physical_address;
                         projection.btree_records.push_back(

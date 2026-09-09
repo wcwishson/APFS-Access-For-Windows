@@ -123,7 +123,8 @@ public sealed record VolumeInfo(
     bool? CatalogAutoMountAllowed = null,
     string? NativeWriteAdmissionBlockReason = null,
     string? CatalogVolumeUuid = null,
-    DriveLetterPreference? DriveLetterPreference = null
+    DriveLetterPreference? DriveLetterPreference = null,
+    ApfsVolumeSpaceObservation? CatalogSpace = null
 );
 
 public sealed record MountRequest(string VolumeId, char DriveLetter, MountAccessMode AccessMode);
@@ -204,5 +205,6 @@ public sealed record MountedVolumeState(
     ulong? CatalogVolumeObjectId = null,
     ApfsCapabilityDecision? CatalogDecision = null,
     IReadOnlyList<string>? CatalogReasons = null,
-    bool? CatalogAutoMountAllowed = null
+    bool? CatalogAutoMountAllowed = null,
+    ApfsVolumeSpaceObservation? CatalogSpace = null
 );

@@ -12,6 +12,23 @@ public sealed class AgentControlCommandExecutorTests
     private const string VolumeId = "device-1|Main";
     private const string RecoveryIdentity = "apfs-recovery-v1|main";
 
+    [Theory]
+    [InlineData(ApfsControlCommands.Mount)]
+    [InlineData(ApfsControlCommands.Fix)]
+    public async Task ProtectedRoleReadWriteRefusalReportsAbsentWithoutClaimingReadOnlyMount(string command)
+    {
+        var backend = new ScenarioBackend { ProtectedCatalog = true };
+        using var worker = CreateWorker(backend);
+        var result = await CreateExecutor(worker).ExecuteAsync(CreateRequest(command,
+            new ApfsControlTarget(DeviceId, VolumeId), ApfsControlModes.ReadWrite), CancellationToken.None);
+        Assert.False(result.Success);
+        Assert.Equal("absent", result.MountProof);
+        Assert.Contains("read/write mount refused", result.Diagnostic);
+        Assert.DoesNotContain("final mount is read-only", result.Diagnostic);
+        Assert.Equal(0, backend.MountCalls);
+        Assert.Equal(0, backend.UnmountCalls);
+    }
+
     [Fact]
     public void UnmountResult_ProofFieldsDefaultToFalse()
     {
@@ -976,6 +993,7 @@ public sealed class AgentControlCommandExecutorTests
         public TaskCompletionSource MountStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource AllowMount { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool ReturnReadOnlyForReadWrite { get; init; }
+        public bool ProtectedCatalog { get; init; }
         public bool KeepDegradedAfterMount { get; init; }
         public bool ReturnMismatchedVolumeDeviceId { get; init; }
         public CancellationTokenSource? CancelAfterMount { get; init; }
@@ -1040,6 +1058,13 @@ public sealed class AgentControlCommandExecutorTests
                     : volume)
                 .ToArray();
 
+            if (ProtectedCatalog)
+                volumes = volumes.Select(volume => volume with
+                {
+                    CatalogDecision = ApfsCapabilityDecision.Readable,
+                    CatalogReasons = ["special-role:system"],
+                    CatalogAutoMountAllowed = false,
+                }).ToArray();
             return Task.FromResult(volumes);
         }
 

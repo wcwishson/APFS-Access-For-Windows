@@ -2446,6 +2446,9 @@ struct MountContext
     // the coordinator before it drains.
     apfsaccess::catalog::ContainerMountCoordinator* container_coordinator = nullptr;
     std::uint64_t container_volume_oid = 0;
+    // Bound before callbacks start and retained until all callbacks drain.
+    std::string container_space_uuid;
+    bool use_container_shared_space = false;
     // Manifest-mode always-defer queue: foreground mutations enqueue their
     // full request here; the deferred worker commits them through the
     // coordinator (stage+commit atomically under the container mutex).
@@ -2574,7 +2577,8 @@ NTSTATUS CleanManifestRefusalStatus(const ManifestCommitOutcome& outcome)
     using Staging = apfsaccess::rw::MetadataStore::MutationStatus;
     if (outcome.status == Status::RetentionBlocked || outcome.mutation_staging_status == Staging::NotReady)
         return STATUS_DEVICE_BUSY;
-    if (outcome.status == Status::AllocationFailed || outcome.mutation_staging_status == Staging::AllocationFailed)
+    if (outcome.status == Status::AllocationFailed || outcome.status == Status::CapacityBlocked ||
+        outcome.mutation_staging_status == Staging::AllocationFailed)
         return STATUS_DISK_FULL;
     return STATUS_NOT_SUPPORTED;
 }
@@ -2643,12 +2647,24 @@ ManifestCommitOutcome CommitManifestMutations(
 
 ReportedVolumeInfoSnapshot CaptureReportedVolumeInfo(const MountContext& context)
 {
-    std::lock_guard<std::mutex> lock(context.reported_volume_info_mutex);
-    return {
-        context.reported_allocation_unit_bytes,
-        context.reported_total_size_bytes,
-        context.reported_free_size_bytes,
-    };
+    ReportedVolumeInfoSnapshot result;
+    {
+        std::lock_guard<std::mutex> lock(context.reported_volume_info_mutex);
+        result = {context.reported_allocation_unit_bytes,
+            context.reported_total_size_bytes, context.reported_free_size_bytes};
+    }
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (context.use_container_shared_space)
+    {
+        const auto space = apfsaccess::catalog::LookupContainerSharedSpace(
+            context.container_coordinator, context.container_space_uuid, context.container_volume_oid);
+        // A missing shared observation cannot revive an older sibling's cache.
+        result.total_size_bytes = space ? std::optional<std::uint64_t>{space->total_bytes} : std::nullopt;
+        result.free_size_bytes = space ? std::optional<std::uint64_t>{space->available_bytes} : std::nullopt;
+        if (space) result.allocation_unit_bytes = space->allocation_unit_bytes;
+    }
+#endif
+    return result;
 }
 
 void RequestCallbackStatusPublish(MountContext* context) noexcept
@@ -14343,12 +14359,28 @@ bool ReadAppleReplayPayloadRange(
     for (const auto* record : records)
     {
         if (record->object_id != identity.object_id) continue;
-        // WAL generations are post-mutation XIDs except for unlink and a
-        // same-inode no-op rename. Match the staging contract before reading.
+        // Conversion authenticates the source incarnation; later writes use
+        // the staged generation. Other mutations retain their existing rules.
         if (record->operation != Operation::Delete && record->operation != Operation::Rename &&
+            record->operation != Operation::RewriteCompressedContent &&
             record->parent_object_id != target_generation) return false;
         switch (record->operation)
         {
+        case Operation::RewriteCompressedContent:
+        {
+            Store::MutationRequest request;
+            apfsaccess::rw::CompressionRewrite proof;
+            if (!exists || changed || node_type != NodeType::RegularFile ||
+                !BuildAcceptedReplayMutationRequest(*record, request) ||
+                !apfsaccess::rw::DecodeCompressionRewrite(request.inline_payload, proof) ||
+                proof.object != identity.object_id || proof.generation != generation ||
+                proof.checkpoint != *checkpoint || proof.size != size ||
+                proof.volume != ctx.metadata_store->Context().volume_object_id) return false;
+            generation = target_generation;
+            changed = true;
+            has_file_storage = size != 0;
+            break;
+        }
         case Operation::CreateFile:
             if (exists) return false;
             exists = true; size = 0; generation = target_generation; changed = true;
@@ -15659,8 +15691,33 @@ bool GetDirectApplePreimageLocked(
     return true;
 }
 
+bool ValidateDirectNativeStartup(MountContext& ctx)
+{
+    if (!ctx.native_write_enabled || IsManifestSession(&ctx)) return true;
+    std::uint64_t preimage = 0;
+    std::string error;
+    {
+        std::lock_guard<std::mutex> metadata_lock(ctx.metadata_mutex);
+        if (ctx.metadata_store &&
+            GetDirectApplePreimageLocked(*ctx.metadata_store, preimage, error)) return true;
+    }
+    if (error.empty()) error = "DirectNativeMetadataUnavailable";
+    {
+        std::lock_guard<std::recursive_mutex> runtime_lock(ctx.runtime_state_mutex);
+        ctx.native_write_enabled = false;
+        ctx.overlay_write_enabled = false;
+        ctx.write_degraded = true;
+        ctx.runtime_recovery_reason = Utf8ToWide(error);
+        ctx.runtime_last_recovery_action = L"DirectNativeLaunchRejectedBeforeMount";
+    }
+    std::wcerr << L"[FsHost] Direct native launch refused before mount: "
+               << Utf8ToWide(error) << L". Use the complete container manifest." << std::endl;
+    (void)WriteHostStatusFile(ctx);
+    return false;
+}
+
 bool LoadDirectCheckpointPinsLocked(
-    MountContext& ctx, std::vector<std::uint64_t>& pins, std::string& error)
+    MountContext& ctx, std::vector<std::uint64_t>& pins, std::string& error, bool admission = false)
 {
     pins.clear();
     std::uint64_t preimage = 0;
@@ -15668,20 +15725,25 @@ bool LoadDirectCheckpointPinsLocked(
     if (preimage == 0) return true;
     std::lock_guard<std::mutex> tx_lock(ctx.tx_mutex);
     if (!ctx.tx_manager || !ctx.tx_manager->RecoveryStateValid() ||
-        ctx.tx_manager->CurrentState() != apfsaccess::rw::TransactionManager::State::Idle)
+        (ctx.tx_manager->CurrentState() != apfsaccess::rw::TransactionManager::State::Idle &&
+         !(admission && ctx.tx_manager->CurrentState() == apfsaccess::rw::TransactionManager::State::Active)))
     {
         error = "DirectAppleJournalNotAccepted";
         return false;
     }
     const auto target = ctx.tx_manager->Watermarks().accepted_sequence;
-    if (!ctx.tx_manager->FlushDeferredAcceptanceDurabilityNow(target) ||
+    // Admission observes the real retained WAL census without changing durability
+    // or cleanup ownership. The actual commit still requires durable acceptance.
+    if ((!admission && !ctx.tx_manager->FlushDeferredAcceptanceDurabilityNow(target)) ||
         !ctx.tx_manager->LoadRequiredCheckpointXidsSinceCleanup(pins, &error))
     {
         if (error.empty()) error = "DirectAppleJournalDurabilityFailed";
         return false;
     }
     if ((!pins.empty() && pins.back() > preimage) ||
-        (pins.empty() && ctx.metadata_store->PendingMutationCount() != 0))
+        (pins.empty() && ctx.metadata_store->PendingMutationCount() != 0 &&
+         !(admission && ctx.tx_manager->CurrentState() == apfsaccess::rw::TransactionManager::State::Active &&
+             ctx.tx_manager->PendingMutationCount() != 0)))
     {
         error = "DirectAppleJournalCheckpointCoverageMissing";
         return false;
@@ -16657,8 +16719,9 @@ NTSTATUS BlockNativeMutationAfterStagingFailure(
         return STATUS_MEDIA_WRITE_PROTECTED;
     }
 
-    if (IsManifestSession(c) && c->manifest_preaccept_failure_status.exchange(
-            STATUS_SUCCESS, std::memory_order_acq_rel) == STATUS_DEVICE_BUSY)
+    const auto preaccept_status = IsManifestSession(c) ? c->manifest_preaccept_failure_status.exchange(
+            STATUS_SUCCESS, std::memory_order_acq_rel) : STATUS_SUCCESS;
+    if (preaccept_status == STATUS_DEVICE_BUSY || preaccept_status == STATUS_DISK_FULL)
     {
         // The callback has rolled back its local changes; neither native
         // staging nor WAL acceptance ran, so this is retryable, not degradation.
@@ -16676,7 +16739,7 @@ NTSTATUS BlockNativeMutationAfterStagingFailure(
                 (void)UpdateRecoveryMarkerBestEffort(c, false);
             }
         }
-        return STATUS_DEVICE_BUSY;
+        return preaccept_status;
     }
 
     {
@@ -17211,8 +17274,9 @@ bool CommitQueuedManifestMutationWithWalBestEffort(
         &result, preserve_unaccepted_manifest_queue);
     if (!NT_SUCCESS(status) || !hook_called || !journal_accepted)
     {
-        if (status == STATUS_DEVICE_BUSY && result.clean_prepublication_refusal && !hook_called)
-            c->manifest_preaccept_failure_status.store(STATUS_DEVICE_BUSY, std::memory_order_release);
+        if ((status == STATUS_DEVICE_BUSY || status == STATUS_DISK_FULL) &&
+            result.clean_prepublication_refusal && !hook_called)
+            c->manifest_preaccept_failure_status.store(status, std::memory_order_release);
         // Prepared compression and its older boundary own failure handling.
         // Acceptance can persist even when the helper cannot return its receipt; never
         // abort or refresh away that evidence through the ordinary queue path.
@@ -17754,8 +17818,7 @@ NTSTATUS CommitNativeMutationsBestEffort(
                         RestoreManifestRequests(c, std::move(queued_manifest_requests));
                     }
                     if (manifest_result) *manifest_result = manifest_outcome;
-                    if ((manifest_preparation_hook || preserve_unaccepted_manifest_queue) &&
-                        manifest_outcome.clean_prepublication_refusal)
+                    if (manifest_outcome.clean_prepublication_refusal)
                     {
                         // Successful preparation alone says nothing about WAL
                         // acceptance. Only the coordinator's clean phase proof
@@ -18001,6 +18064,10 @@ NTSTATUS CommitNativeMutationsBestEffort(
         // No device write occurred. Keep accepted work and mount admission;
         // cleanup can release its historical checkpoint before a later retry.
         return STATUS_DEVICE_BUSY;
+    case apfsaccess::rw::MetadataStore::CommitStatus::CapacityBlocked:
+        // No publication occurred. Retain accepted bytes and allow a later
+        // space-releasing mutation or retry without declaring filesystem damage.
+        return STATUS_DISK_FULL;
     case apfsaccess::rw::MetadataStore::CommitStatus::InvariantFailed:
         std::wcerr << L"[FsHost] RW native-commit warning (" << origin << L"): pending mutation invariants failed preflight validation." << std::endl;
         latch_commit_failure(
@@ -21560,13 +21627,6 @@ NTSTATUS CB_GetVolumeInfo(FSP_FILE_SYSTEM* fs, FSP_FSCTL_VOLUME_INFO* v)
     {
         free_size = total_size;
     }
-    if (total_size.has_value() && !free_size.has_value())
-    {
-        // Prefer a usable Explorer capacity bar over reporting an unknown
-        // free space while the richer APFS spaceman state is still unavailable.
-        free_size = total_size;
-    }
-
     v->TotalSize = total_size.value_or(0);
     v->FreeSize = free_size.value_or(0);
     auto label = c->label.substr(0, 31);
@@ -21583,6 +21643,7 @@ NTSTATUS CB_SetVolumeLabel(FSP_FILE_SYSTEM* fs, PWSTR, FSP_FSCTL_VOLUME_INFO*)
     return STATUS_MEDIA_WRITE_PROTECTED;
 }
 
+#include "NativeCapacityAdmission.h"
 #include "NativeXattrStreams.h"
 
 NTSTATUS CB_GetStreamInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buffer, ULONG length, PULONG transferred)
@@ -21878,6 +21939,26 @@ bool StageContentTimes(MountContext* c, const std::wstring& path, FILETIME times
         path, L"", 0, payload.size(), false, 0, &identity, &staged, nullptr, batch_limit, payload, start_batch);
 }
 
+std::vector<apfsaccess::rw::MetadataStore::MutationRequest> NativeContentCallbackRequests(
+    const std::wstring& path, bool attributes_changed, UINT32 attributes,
+    bool capture_times, FILETIME timestamp)
+{
+    using Op = apfsaccess::rw::MetadataStore::MutationOperation;
+    std::vector<apfsaccess::rw::MetadataStore::MutationRequest> requests;
+    if (attributes_changed)
+    {
+        const auto payload = EncodeWindowsAttributes(attributes);
+        requests.push_back(NativeCallbackRequest(Op::SetExtendedAttribute, path,
+            payload.size(), 0, kWindowsAttributesNameWide, payload));
+    }
+    if (capture_times)
+    {
+        const auto payload = EncodeContentTimes(timestamp);
+        requests.push_back(NativeCallbackRequest(Op::SetInodeMetadata, path, payload.size(), 0, L"", payload));
+    }
+    return requests;
+}
+
 bool JournalContentTimes(MountContext* c, const std::wstring& path, FILETIME timestamp,
     const apfsaccess::rw::MetadataStore::PayloadIdentity& identity)
 {
@@ -21981,6 +22062,21 @@ NTSTATUS UpdateWindowsBasicMetadata(MountContext* c, OpenContext* o, UINT32 attr
         const auto time_length = legacy_modification_time ? 0 : payload.size();
         const auto scalar_time = legacy_modification_time ? changes.modification_time_utc : 0;
         if (legacy_modification_time) payload.clear();
+        if (!IsManifestSession(c))
+        {
+            auto requests = NativeContentCallbackRequests(path, attributes_changed, windows_attributes, false, {});
+            if (has_times)
+            {
+                auto request = NativeCallbackRequest(legacy_modification_time ?
+                    apfsaccess::rw::MetadataStore::MutationOperation::SetBasicInfo :
+                    apfsaccess::rw::MetadataStore::MutationOperation::SetInodeMetadata,
+                    path, time_length, 0, L"", payload);
+                request.timestamp_utc = scalar_time;
+                requests.push_back(std::move(request));
+            }
+            const auto status = PreflightDirectCallback(c, requests);
+            if (!NT_SUCCESS(status)) return status;
+        }
         const auto batch_limit = WindowsAttributeBatchLimit(c, (attributes_changed ? 1 : 0) + (has_times ? 1 : 0));
         bool attribute_staged = false, time_staged = false;
         bool recorded = !attributes_changed || StageWindowsAttributes(c, path, windows_attributes,
@@ -22310,7 +22406,7 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
 
     std::shared_ptr<Node> node;
     {
-        std::lock_guard<std::mutex> lock(c->mutex);
+        std::unique_lock<std::mutex> lock(c->mutex);
         if (TryGetVisibleNodeLockedNormalized(c, parent_path) != parent_node || !parent_node->is_directory)
         {
             if (HasDeletePendingAncestorLockedNormalized(c, parent_path) ||
@@ -22345,6 +22441,32 @@ NTSTATUS CB_Create(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, 
             }
             return STATUS_OBJECT_NAME_COLLISION;
         }
+
+        lock.unlock();
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        if (IsNativeWriteEnabled(c) && !IsManifestSession(c))
+        {
+            using Op = apfsaccess::rw::MetadataStore::MutationOperation;
+            std::vector<apfsaccess::rw::MetadataStore::MutationRequest> requests{
+                NativeCallbackRequest(request_directory ? Op::CreateDirectory : Op::CreateFile, path)};
+            if (!creation_security.empty())
+                requests.push_back(NativeCallbackRequest(Op::SetExtendedAttribute, path,
+                    creation_security.size(), 0, kWindowsSecurityNameWide, creation_security));
+            if (attributes_changed)
+            {
+                const auto payload = EncodeWindowsAttributes(windows_attributes);
+                requests.push_back(NativeCallbackRequest(Op::SetExtendedAttribute, path,
+                    payload.size(), 0, kWindowsAttributesNameWide, payload));
+            }
+            if (capture_creation_times)
+                requests.push_back(NativeCallbackRequest(Op::SetInodeMetadata, path,
+                    creation_times_payload.size(), 0, L"", creation_times_payload));
+            if (reserve_allocation) requests.push_back(NativeCallbackRequest(Op::SetAllocationSize, path, allocation_size));
+            const auto status = PreflightDirectCallback(c, requests);
+            if (!NT_SUCCESS(status)) return status;
+        }
+#endif
+        lock.lock();
 
         node = std::make_shared<Node>();
         SetNodePathNormalized(c, *node, path);
@@ -22752,6 +22874,24 @@ NTSTATUS CB_Overwrite(FSP_FILE_SYSTEM* fs, PVOID ctx, UINT32 attributes, BOOLEAN
 
     const auto content_timestamp = UtcNow();
 #ifdef APFSACCESS_HAS_RW_ENGINE
+    if (!detached_payload && IsNativeWriteEnabled(c) && !IsManifestSession(c))
+    {
+        // Overwrite truncates too: retire the accepted prefix through the same
+        // publication/finalization boundary used by an explicit shrinking EOF.
+        if (o->node->file_size != 0)
+        {
+            const auto drain = CommitNativeMutationsOnFlushBestEffort(c);
+            if (!NT_SUCCESS(drain)) return drain;
+            if (!FinalizeMutationJournalBestEffort(c, L"OverwriteBoundary")) return STATUS_IO_DEVICE_ERROR;
+        }
+        using Op = apfsaccess::rw::MetadataStore::MutationOperation;
+        auto requests = NativeContentCallbackRequests(mutation_path, attributes_changed,
+            windows_attributes, ShouldCaptureNativeContentTimes(c), content_timestamp);
+        requests.push_back(NativeCallbackRequest(Op::SetFileSize, mutation_path, 0));
+        if (reserve_allocation) requests.push_back(NativeCallbackRequest(Op::SetAllocationSize, mutation_path, allocation_size));
+        const auto status = PreflightDirectCallback(c, requests);
+        if (!NT_SUCCESS(status)) return status;
+    }
     apfsaccess::rw::MetadataStore::PayloadIdentity staged_overwrite_identity{};
     const bool capture_content_times = !detached_payload && ShouldCaptureNativeContentTimes(c);
     bool native_overwrite_metadata_staged = false;
@@ -23101,6 +23241,16 @@ NTSTATUS CB_Write(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG l
             return STATUS_DISK_FULL;
         }
         return BlockNativeMutationAfterStagingFailure(c, L"WritePayloadSpool");
+    }
+
+    if (native_write_active && !IsManifestSession(c))
+    {
+        auto requests = NativeContentCallbackRequests(mutation_path, archive_changed,
+            archive_attributes, capture_content_times, content_timestamp);
+        requests.push_back(NativeCallbackRequest(apfsaccess::rw::MetadataStore::MutationOperation::Write,
+            mutation_path, write_len, off));
+        const auto status = PreflightDirectCallback(c, requests);
+        if (!NT_SUCCESS(status)) { *done = 0; return status; }
     }
 
     apfsaccess::rw::MetadataStore::PayloadIdentity staged_payload_identity{};
@@ -23468,6 +23618,16 @@ NTSTATUS SetFileSizeUnderMutationLock(MountContext* c, OpenContext* o, UINT64 si
 #ifdef APFSACCESS_HAS_RW_ENGINE
     apfsaccess::rw::MetadataStore::PayloadIdentity staged_file_size_identity{};
     const bool capture_content_times = !cleanup_allocation && !detached_payload && ShouldCaptureNativeContentTimes(c);
+    if (!detached_payload && IsNativeWriteEnabled(c) && !IsManifestSession(c))
+    {
+        using Op = apfsaccess::rw::MetadataStore::MutationOperation;
+        auto requests = NativeContentCallbackRequests(mutation_path, archive_changed,
+            archive_attributes, capture_content_times, content_timestamp);
+        requests.push_back(NativeCallbackRequest(allocation_request ? Op::SetAllocationSize : Op::SetFileSize,
+            mutation_path, size));
+        const auto status = PreflightDirectCallback(c, requests);
+        if (!NT_SUCCESS(status)) return status;
+    }
     bool native_file_size_metadata_staged = false;
     bool native_file_size_journaled = true;
     if (!detached_payload && IsNativeWriteEnabled(c))
@@ -24723,6 +24883,10 @@ NTSTATUS CB_SetSecurity(FSP_FILE_SYSTEM* fs, PVOID ctx, SECURITY_INFORMATION inf
         const auto attribute = c->metadata_store->LookupWorkingExtendedAttribute(inode->object_id, kWindowsSecurityName);
         if (attribute && attribute->flags != apfsaccess::rw::kAppleXattrDataEmbedded) return STATUS_NOT_SUPPORTED;
     }
+    const auto request = NativeCallbackRequest(apfsaccess::rw::MetadataStore::MutationOperation::SetExtendedAttribute,
+        path, payload.size(), 0, kWindowsSecurityNameWide, payload);
+    status = PreflightDirectCallback(c, std::span(&request, 1));
+    if (!NT_SUCCESS(status)) return status;
     apfsaccess::rw::MetadataStore::PayloadIdentity identity{};
     bool staged = false;
     const bool recorded = RecordNativeMutationBestEffort(c,
@@ -25234,11 +25398,12 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
         can_remove_on_close =
             remove_requested_on_close &&
             o->node->path != L"\\" &&
-            // Cleanup accounting is not handle lifetime. A base Close also
-            // has to leave a latched unlink for any cleaned but live ADS/base
-            // contexts, just as the retained-stream branch does above.
+            // Path-backed payloads need the name until their last context closes.
+            // Native inode-owned payloads retain data/streams/security separately;
+            // removing their name must not wait on cleaned cached-I/O contexts.
+            // SharedPayloadHasOpenHandles still pins their storage through Close.
             !(o->node->node_kind == NodeKind::RegularFile && o->node->delete_latched &&
-                o->node->live_context_count != 0) &&
+                !o->node->shared_payload && o->node->live_context_count != 0) &&
             CollectRemovableNodePostorderLocked(c, o->node, delete_postorder);
         if (remove_requested_on_close && can_remove_on_close)
         {
@@ -27738,14 +27903,9 @@ void RefreshReportedVolumeInfoFromMetadata(MountContext& ctx)
         {
             ctx.reported_allocation_unit_bytes = allocation_unit_bytes;
         }
-        if (total_size_bytes.has_value())
-        {
-            ctx.reported_total_size_bytes = total_size_bytes;
-        }
-        if (free_size_bytes.has_value())
-        {
-            ctx.reported_free_size_bytes = free_size_bytes;
-        }
+        // A failed current projection must invalidate earlier capacity claims.
+        ctx.reported_total_size_bytes = total_size_bytes;
+        ctx.reported_free_size_bytes = free_size_bytes;
     }
 }
 
@@ -27972,6 +28132,8 @@ bool MountManifestSession(
     }
     ctx.args.incompatible_features =
         ctx.metadata_store->Context().incompatible_features;
+    ctx.container_space_uuid = session.container_uuid_hex;
+    ctx.use_container_shared_space = ctx.metadata_store->AuthoritativeAppleCheckpointView() != nullptr;
     return true;
 }
 
@@ -29409,6 +29571,9 @@ int wmain(int argc, wchar_t** argv)
             else
             {
                 RefreshReportedVolumeInfoFromMetadata(ctx);
+                // The strict view is available only after native preparation.
+                // Refuse unsupported direct topology before replay or provider startup.
+                if (!ValidateDirectNativeStartup(ctx)) return 22;
                 const auto recovery_before_replay = ctx.metadata_store->IsRecoveryRequired();
                 const auto replay_result = ctx.metadata_store->ReplayOrRecover();
                 if (!replay_result)

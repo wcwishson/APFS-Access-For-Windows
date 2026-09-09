@@ -136,7 +136,8 @@ internal sealed record CatalogAttachment(
     string CatalogVolumeId,
     ApfsCapabilityDecision Decision,
     IReadOnlyList<string> Reasons,
-    bool AutoMountAllowed);
+    bool AutoMountAllowed,
+    ApfsVolumeSpaceObservation? Space = null);
 
 internal static class NativeApfsObserver
 {
@@ -299,6 +300,7 @@ internal static class NativeApfsObserver
         ApfsObserverEvidence evidence;
         try
         {
+            ObserverTopologyMetadataValidation.ValidateShape(stdout);
             evidence = ApfsTopology.ParseEvidence(stdout);
         }
         catch (Exception ex)
@@ -380,7 +382,6 @@ internal static class NativeApfsObserver
         RequireUniqueIds(topology.Stores.Select(static s => s?.Id), "store");
         RequireUniqueIds(topology.Containers.Select(static c => c?.Id), "container");
         RequireUniqueIds(topology.Volumes.Select(static v => v?.Id), "volume");
-        RequireUniqueIds(topology.Groups.Select(static g => g?.Id), "group");
 
         var diskIds = new HashSet<string>(StringComparer.Ordinal);
         foreach (var disk in topology.Disks)
@@ -719,55 +720,7 @@ internal static class NativeApfsObserver
             }
         }
 
-        // Groups: >=2 distinct volumeIds, all naming volumes.
-        var groupIds = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var group in topology.Groups)
-        {
-            if (group is null || string.IsNullOrWhiteSpace(group.Id) ||
-                string.IsNullOrWhiteSpace(group.Uuid) ||
-                group.VolumeIds is null)
-            {
-                throw new InvalidOperationException(
-                    "ApfsObserver.exe emitted evidence with invalid group record.");
-            }
-
-            if (!ApfsTopology.TryParseGroupId(group.Id, out var groupHex) ||
-                !IsHex32(group.Uuid) ||
-                !string.Equals(groupHex, group.Uuid, StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException(
-                    $"ApfsObserver.exe emitted evidence with invalid group id/uuid '{group.Id}'.");
-            }
-
-            if (group.VolumeIds.Count < 2 || !AreDistinct(group.VolumeIds))
-            {
-                throw new InvalidOperationException(
-                    $"ApfsObserver.exe emitted evidence with invalid group.volumeIds for '{group.Id}'.");
-            }
-
-            foreach (var volumeId in group.VolumeIds)
-            {
-                if (string.IsNullOrWhiteSpace(volumeId) || !volumeIds.Contains(volumeId))
-                {
-                    throw new InvalidOperationException(
-                        $"ApfsObserver.exe emitted evidence with dangling group.volumeIds '{volumeId}'.");
-                }
-            }
-
-            groupIds.Add(group.Id);
-        }
-
-        // Volume groupId, when present, must name an existing group.
-        foreach (var volume in topology.Volumes)
-        {
-            if (volume is null) continue;
-            if (volume.GroupId is not null && volume.GroupId.Length != 0 &&
-                !groupIds.Contains(volume.GroupId))
-            {
-                throw new InvalidOperationException(
-                    $"ApfsObserver.exe emitted evidence with dangling volume.groupId '{volume.GroupId}'.");
-            }
-        }
+        ObserverTopologyMetadataValidation.Validate(evidence);
     }
 
     private static void ValidateSources(ApfsObserverEvidence evidence)
@@ -1001,7 +954,21 @@ internal static class NativeApfsObserver
             CatalogVolumeId: volume.Id,
             Decision: capped.Decision,
             Reasons: capped.Reasons,
-            AutoMountAllowed: capped.AutoMountAllowed);
+            AutoMountAllowed: capped.AutoMountAllowed,
+            Space: ObserveVolumeSpace(container, volume));
+    }
+
+    internal static ApfsVolumeSpaceObservation? ObserveVolumeSpace(ApfsContainerRecord container, ApfsVolumeRecord volume)
+    {
+        var space = container.SharedSpace;
+        if (space is null || space.ContainerId != container.Id || volume.ContainerId != container.Id ||
+            !ulong.TryParse(volume.ObjectId, NumberStyles.None, CultureInfo.InvariantCulture, out var objectId) ||
+            !ulong.TryParse(container.CheckpointXid, NumberStyles.None, CultureInfo.InvariantCulture, out var xid) ||
+            space.CheckpointXid != xid) return null;
+        var matches = space.Volumes.Where(candidate => candidate.VolumeId == volume.Id && candidate.ObjectId == objectId).ToArray();
+        return matches.Length == 1
+            ? new ApfsVolumeSpaceObservation(container.Id, xid, space.Total, space.Free, matches[0])
+            : null;
     }
 
     private static string? FirstExistingPath(string? candidate)

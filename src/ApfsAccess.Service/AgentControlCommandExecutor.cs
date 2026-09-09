@@ -152,7 +152,9 @@ public sealed class AgentControlCommandExecutor
         {
             diagnostic = AppendDiagnostic(
                 diagnostic,
-                "The requested read-write mode was not reached; the final mount is read-only.");
+                mountProbe.Succeeded && mount is not null
+                    ? "The requested read-write mode was not reached; the final mount is read-only."
+                    : "The requested read-write mode was not reached; no final mount was proven.");
         }
 
         return BuildResult(

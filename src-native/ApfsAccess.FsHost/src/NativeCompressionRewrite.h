@@ -44,6 +44,8 @@ public:
         // publication verification wired. A borrowed session store is insufficient.
         bool manifest_session = true;
         bool container_commit_owned = false;
+        // Direct admission also prepares before Begin while holding commit ownership.
+        bool journal_begin_deferred = false;
         bool windows_attributes_pending = true;
         std::size_t queued_requests = 0;
         std::uint64_t publication_budget_bytes = 0;
@@ -84,7 +86,8 @@ public:
             // The manifest builder remains read-only even with respect to WAL:
             // Begin is deferred to the identity binder after staging. Aborting
             // an empty begun transaction would itself append a WAL marker.
-            const bool transaction_ready = admission.manifest_session && admission.container_commit_owned
+            const bool transaction_ready = (admission.manifest_session && admission.container_commit_owned) ||
+                admission.journal_begin_deferred
                 ? tx.CurrentState() == Tx::State::Idle && !tx.CurrentTransactionId()
                 : tx.CurrentState() == Tx::State::Active && tx.CurrentTransactionId();
             if (admission.queued_requests || store.PendingMutationCount() ||
@@ -117,7 +120,7 @@ public:
             // Idle manifest preparation has no buffered transaction. Enforce
             // the WAL's hard bound here; RecordMutation remains authoritative
             // once the binder begins the empty transaction after staging.
-            if (admission.manifest_session
+            if ((admission.manifest_session || admission.journal_begin_deferred)
                     ? prepared.request_.inline_payload.size() > Wal::MaxInlinePayloadBytes
                     : !tx.CanAddInlinePayload(prepared.request_.inline_payload.size()))
                 return refuse(Failure::JournalCapacity);
@@ -164,6 +167,30 @@ public:
         return current->checkpoint_ == checkpoint_ && current->volume_ == volume_ &&
             current->request_.inline_payload == request_.inline_payload &&
             current->publication_bytes_ == publication_bytes_ ? Failure::None : Failure::SourceChanged;
+    }
+
+    // One typed batch builder for manifest staging and direct admission. The
+    // successor is checked again against the actual staged conversion identity.
+    [[nodiscard]] bool BuildRequests(std::span<const std::byte> times,
+        std::vector<Store::MutationRequest>& requests) const
+    {
+        rw::InodeMetadataPatch patch;
+        if (!rw::DecodeInodeMetadataPatch(times, patch) || times.empty() ||
+            times.size() > Wal::MaxInlinePayloadBytes - request_.inline_payload.size()) return false;
+        const Store::PayloadIdentity successor{request_.object_id, checkpoint_ + 1};
+        Store::MutationRequest metadata;
+        metadata.operation = Store::MutationOperation::SetInodeMetadata;
+        metadata.path = request_.path;
+        metadata.object_id = successor.object_id; metadata.generation = successor.generation;
+        metadata.inline_payload.assign(times.begin(), times.end());
+        metadata.length = metadata.inline_payload.size();
+        Store::MutationRequest write;
+        write.operation = Store::MutationOperation::Write;
+        write.path = request_.path;
+        write.object_id = successor.object_id; write.generation = successor.generation;
+        write.offset = offset_; write.length = length_;
+        requests = {request_, std::move(metadata), std::move(write)};
+        return true;
     }
 
     // This is only request construction. The existing native staging guard is

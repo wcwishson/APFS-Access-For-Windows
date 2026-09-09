@@ -38,6 +38,8 @@ struct ApfsCompressionLimits
     std::uint64_t max_zlib_allocation_bytes = 256ULL << 10; // Cumulative allocations per stream.
     std::uint64_t max_lzfse_state_bytes = 256ULL << 10;
     std::uint64_t max_lzfse_work_units = 1ULL << 30; // Sum of conservative per-block decoder budgets.
+    std::uint64_t max_lzbitmap_state_bytes = 4096; // Fixed stack state; no codec heap.
+    std::uint64_t max_lzbitmap_work_units = 1ULL << 28; // Shared decrementing operation budget.
 };
 
 struct ApfsCompressionResourceReader
@@ -54,7 +56,7 @@ class ApfsCompression
 public:
     // Validate the little-endian 16-byte decmpfs header, supported type, limits,
     // and inline framing. Does not inflate a stream or read a resource fork.
-    // Supported types: 1, 3, 4, 7, 8, 11 and 12. LZVN raw blocks use a 06 escape.
+    // Supported types: 1, 3, 4, 7, 8, 9, 10, 11, 12, 13 and 14.
     // out_header is unchanged on failure.
     [[nodiscard]] static ApfsCompressionResult Inspect(
         std::span<const std::byte> decmpfs, const ApfsCompressionLimits& limits,
@@ -69,8 +71,12 @@ public:
     // encodings. Validates the whole table, but only inflates intersecting blocks.
     // Type 7: inline LZVN (canonical 8-byte EOS) or 06-prefixed raw bytes.
     // Type 8: N+1 little-endian offsets and 64 KiB LZVN/raw resource blocks.
+    // Types 9/10: CC-prefixed raw bytes, inline or in the same offset-table fork.
     // Types 11/12: complete LZFSE streams, inline or in the same offset-table fork.
     // Exact input/output sizes; no wrapper or trailing bytes. See lzfse/UPSTREAM.md.
+    // Types 13/14: LZBITMAP ZBM09 streams or FF-prefixed raw bytes; inline or
+    // offset-table fork. Strict contiguous metadata, zero reserved trailer bytes;
+    // final unused half-nibble is unspecified. See third_party/lzbitmap/UPSTREAM.md.
     // Even empty reads validate framing/table; inline streams are fully validated.
     // Unselected resource blocks and the resource map's internal records are not
     // decoded/validated. This is a range reader, not a whole-file integrity audit.
@@ -78,7 +84,8 @@ public:
     // block (<=69632) + one decoded block (<=65537), or bounded inline output + 1.
     // zlib memory is bounded separately; LZVN uses a fixed decoder state with no
     // heap allocation beyond inline output + 1. LZFSE state/work have separate
-    // limits. Caller/callback memory is excluded.
+    // limits. LZBITMAP uses a fixed stack state and a shared operation budget;
+    // raw escapes use the decoded-byte budget only. Caller/callback memory is excluded.
     [[nodiscard]] static ApfsCompressionResult DecodeRange(
         std::span<const std::byte> decmpfs,
         const ApfsCompressionResourceReader& resource,

@@ -93,6 +93,7 @@ public sealed class RuntimeStatusPublisher
            left.WriteEnabled == right.WriteEnabled &&
            SequenceEqualOrdinal(left.CompatibilityWarnings, right.CompatibilityWarnings) &&
            MountedVolumesEqual(left.MountedVolumes, right.MountedVolumes) &&
+           ConnectedInventoryEqual(left.ConnectedInventory, right.ConnectedInventory) &&
            string.Equals(left.WriteBackend, right.WriteBackend, StringComparison.Ordinal) &&
            left.CommitModel == right.CommitModel &&
            left.NativeWriteReadiness == right.NativeWriteReadiness &&
@@ -110,6 +111,49 @@ public sealed class RuntimeStatusPublisher
            left.InFlightMutationCallbacks == right.InFlightMutationCallbacks &&
            Equals(left.NativeWriteValidationEvidence, right.NativeWriteValidationEvidence) &&
            NativeWriteDiagnosticsEqual(left.NativeWriteDiagnostics, right.NativeWriteDiagnostics);
+
+    private static bool ConnectedInventoryEqual(
+        IReadOnlyList<DeviceInventory>? left, IReadOnlyList<DeviceInventory>? right)
+        => UnorderedEqual(left, right, (a, b) =>
+            a.Device == b.Device && UnorderedEqual(a.Volumes, b.Volumes, InventoryVolumeEqual));
+
+    private static bool InventoryVolumeEqual(VolumeInfo left, VolumeInfo right)
+        // Records compare list references. Compare those lists by content, then let
+        // record equality retain all scalar and nested value-record comparisons.
+        => UnorderedEqual(left.WriteIncompatibilities, right.WriteIncompatibilities, StringEqualsOrdinal) &&
+           UnorderedEqual(left.WriteUnsupportedFeatures, right.WriteUnsupportedFeatures, StringEqualsOrdinal) &&
+           UnorderedEqual(left.CatalogReasons, right.CatalogReasons, StringEqualsOrdinal) &&
+           left == right with
+           {
+               WriteIncompatibilities = left.WriteIncompatibilities,
+               WriteUnsupportedFeatures = left.WriteUnsupportedFeatures,
+               CatalogReasons = left.CatalogReasons,
+           };
+
+    private static bool StringEqualsOrdinal(string left, string right)
+        => string.Equals(left, right, StringComparison.Ordinal);
+
+    private static bool UnorderedEqual<T>(
+        IReadOnlyList<T>? left, IReadOnlyList<T>? right, Func<T, T, bool> equals)
+    {
+        left ??= Array.Empty<T>();
+        right ??= Array.Empty<T>();
+        if (left.Count != right.Count) return false;
+        // Scan order is not inventory state. Match each entry once so duplicate
+        // routing identities remain observable rather than being collapsed.
+        var matched = new bool[right.Count];
+        foreach (var item in left)
+        {
+            var index = -1;
+            for (var i = 0; i < right.Count; i++)
+            {
+                if (!matched[i] && equals(item, right[i])) { index = i; break; }
+            }
+            if (index < 0) return false;
+            matched[index] = true;
+        }
+        return true;
+    }
 
     private static bool SequenceEqualOrdinal(IReadOnlyList<string>? left, IReadOnlyList<string>? right)
     {

@@ -26,8 +26,8 @@ public static class ApfsVolumeCapabilities
 
     public static string SpecialRoleReason(string role) => "special-role:" + role;
 
-    // Freeze section 4 order, exactly:
-    // incompatible -> unknown -> readonly -> encryption/locked -> roles.
+    // Refusals and role evidence must survive coexisting readonly features:
+    // incompatible -> unknown -> encryption/locked -> roles -> readonly.
     // Only Writable allows automount. Compatible bits never gate.
     public static ApfsVolumeCapability Evaluate(ApfsVolumeRecord volume, ApfsContainerRecord container)
     {
@@ -46,13 +46,6 @@ public static class ApfsVolumeCapabilities
             // so every unknown entry is Unsupported (conservative).
             return new ApfsVolumeCapability(
                 ApfsCapabilityDecision.Unsupported, [ReasonUnknownFeatures], false);
-        }
-
-        if ((volume.ReadonlyFeatureBits?.Count ?? 0) > 0 ||
-            (container.ReadonlyFeatureBits?.Count ?? 0) > 0)
-        {
-            return new ApfsVolumeCapability(
-                ApfsCapabilityDecision.ReadOnlyFeature, [ReasonReadonlyFeatures], false);
         }
 
         if (volume.Locked ||
@@ -76,6 +69,15 @@ public static class ApfsVolumeCapabilities
                 ? new[] { SpecialRoleReason("unknown") }
                 : specialRoles.Select(SpecialRoleReason).ToArray();
             return new ApfsVolumeCapability(ApfsCapabilityDecision.Readable, reasons, false);
+        }
+
+        // Only ordinary, unlocked roles reach this verdict, so readonly features
+        // cannot hide a role that the inspection policy would otherwise refuse.
+        if ((volume.ReadonlyFeatureBits?.Count ?? 0) > 0 ||
+            (container.ReadonlyFeatureBits?.Count ?? 0) > 0)
+        {
+            return new ApfsVolumeCapability(
+                ApfsCapabilityDecision.ReadOnlyFeature, [ReasonReadonlyFeatures], false);
         }
 
         return new ApfsVolumeCapability(ApfsCapabilityDecision.Writable, [], true);

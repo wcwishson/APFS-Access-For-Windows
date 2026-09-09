@@ -3,6 +3,7 @@
 #include "zlib.h"
 #include "apfsaccess_lzvn.h"
 #include "apfsaccess_lzfse.h"
+#include "apfsaccess_lzbitmap.h"
 
 #include <algorithm>
 #include <array>
@@ -49,6 +50,25 @@ bool Within(std::uint64_t offset, std::uint64_t length, std::uint64_t size) noex
 
 bool RawMarker(std::byte first) noexcept
 { return (std::to_integer<unsigned>(first) & 0x0f) == 0x0f; }
+
+bool OffsetResourceType(std::uint32_t type) noexcept
+{ return type == 8 || type == 10 || type == 12 || type == 14; }
+
+bool ResourceType(std::uint32_t type) noexcept
+{ return type == 4 || OffsetResourceType(type); }
+
+Result DecodeStored(std::span<const std::byte> encoded, std::uint64_t expected,
+    std::byte marker, std::vector<std::byte>& decoded)
+{
+    if (encoded.empty())
+        return Fail(Status::Corrupt, "CompressionStoredFramingInvalid");
+    if (encoded.front() != marker)
+        return Fail(Status::Unsupported, "CompressionStoredMarkerUnsupported");
+    if (encoded.size() - 1 != expected)
+        return Fail(Status::Corrupt, "CompressionStoredFramingInvalid");
+    decoded.assign(encoded.begin() + 1, encoded.end());
+    return {};
+}
 
 bool FitsVector(std::uint64_t size) noexcept
 {
@@ -176,6 +196,27 @@ Result DecodeLzfse(std::span<const std::byte> encoded, std::uint64_t expected,
     return {};
 }
 
+Result DecodeLzbitmap(std::span<const std::byte> encoded, std::uint64_t expected,
+    const ApfsCompressionLimits& limits, std::uint64_t& remaining_work, std::vector<std::byte>& decoded)
+{
+    if (encoded.empty()) return Fail(Status::Corrupt, "CompressionLzbitmapPayloadMissing");
+    if (encoded.front() == std::byte{0xff})
+        return DecodeStored(encoded, expected, std::byte{0xff}, decoded);
+    if (RawMarker(encoded.front()))
+        return Fail(Status::Unsupported, "CompressionLzbitmapRawMarkerUnsupported");
+    if (!FitsVector(expected) || apfsaccess_lzbitmap_state_size() > limits.max_lzbitmap_state_bytes)
+        return Fail(Status::LimitExceeded, "CompressionLzbitmapStateOrSizeLimit");
+    decoded.resize(static_cast<std::size_t>((std::max)(expected, std::uint64_t{1})));
+    const auto rc = apfsaccess_lzbitmap_decode_exact(decoded.data(), decoded.size(),
+        encoded.data(), encoded.size(), static_cast<std::size_t>(expected), &remaining_work);
+    if (rc != 0)
+        return Fail(rc == ZBM_LIMIT ? Status::LimitExceeded :
+            rc == ZBM_NONCANONICAL ? Status::Unsupported : Status::Corrupt,
+            "CompressionLzbitmapStreamInvalid");
+    decoded.resize(static_cast<std::size_t>(expected));
+    return {};
+}
+
 class ForkReads
 {
 public:
@@ -208,7 +249,7 @@ Result DecodeOffsetResource(const ApfsCompressionHeader& header,
     std::uint64_t wanted, const ApfsCompressionLimits& limits,
     std::vector<std::byte>& result)
 {
-    // Types 8/12 use N+1 little-endian absolute offsets, with no resource-map header.
+    // Types 8/10/12/14 use N+1 little-endian absolute offsets, without a map header.
     // Format cross-checks: apfs-fuse Decmpfs.cpp and afsctool's LZVN writer.
     // Only format facts are used; no implementation code is copied.
     if (resource.size > limits.max_resource_bytes || resource.size > UINT32_MAX)
@@ -229,9 +270,17 @@ Result DecodeOffsetResource(const ApfsCompressionHeader& header,
     {
         const auto begin = U32(table, static_cast<std::size_t>(i * 4));
         const auto end = U32(table, static_cast<std::size_t>((i + 1) * 4));
-        const auto max_encoded = kBlockBytes + (header.type == 12 ? 4096 : 1);
-        if (end <= begin || end > resource.size || end - begin > max_encoded)
+        const auto max_encoded = kBlockBytes + (header.type == 12 || header.type == 14 ? 4096 : 1);
+        if (end <= begin || end > resource.size)
             return Fail(Status::Corrupt, "CompressionResourceBlockBoundsInvalid");
+        if (end - begin > max_encoded)
+            return header.type == 14 ?
+                Fail(Status::LimitExceeded, "CompressionLzbitmapEncodedBlockLimit") :
+                Fail(Status::Corrupt, "CompressionResourceBlockBoundsInvalid");
+        // Raw type 10 has a known encoded size even for unselected blocks.
+        if (header.type == 10 && end - begin !=
+            (std::min)(kBlockBytes, header.uncompressed_size - i * kBlockBytes) + 1)
+            return Fail(Status::Corrupt, "CompressionStoredResourceSizeMismatch");
     }
     if (!wanted) return {};
     const auto last = (offset + wanted - 1) / kBlockBytes;
@@ -242,6 +291,7 @@ Result DecodeOffsetResource(const ApfsCompressionHeader& header,
     result.resize(static_cast<std::size_t>(wanted));
     std::vector<std::byte> encoded, decoded;
     auto remaining_work = limits.max_lzfse_work_units;
+    auto remaining_bitmap_work = limits.max_lzbitmap_work_units;
     for (auto i = first; i <= last; ++i)
     {
         const auto begin = U32(table, static_cast<std::size_t>(i * 4));
@@ -251,7 +301,9 @@ Result DecodeOffsetResource(const ApfsCompressionHeader& header,
         if (!rc) return rc;
         const auto logical_start = i * kBlockBytes;
         const auto expected = (std::min)(kBlockBytes, header.uncompressed_size - logical_start);
-        rc = header.type == 12 ? DecodeLzfse(encoded, expected, limits, remaining_work, decoded) :
+        rc = header.type == 10 ? DecodeStored(encoded, expected, std::byte{0xcc}, decoded) :
+            header.type == 14 ? DecodeLzbitmap(encoded, expected, limits, remaining_bitmap_work, decoded) :
+            header.type == 12 ? DecodeLzfse(encoded, expected, limits, remaining_work, decoded) :
             DecodeLzvn(encoded, expected, decoded);
         if (!rc) return rc;
         const auto copy_begin = (std::max)(offset, logical_start);
@@ -360,11 +412,12 @@ ApfsCompressionResult ApfsCompression::Inspect(std::span<const std::byte> decmpf
         return Fail(Status::Corrupt, "CompressionHeaderInvalid");
     ApfsCompressionHeader header{U32(decmpfs, 4), U64(decmpfs, 8)};
     if (header.type != 1 && header.type != 3 && header.type != 4 && header.type != 7 && header.type != 8 &&
-        header.type != 11 && header.type != 12)
+        header.type != 9 && header.type != 10 && header.type != 11 && header.type != 12 &&
+        header.type != 13 && header.type != 14)
         return Fail(Status::Unsupported, "CompressionTypeUnsupported");
     if (header.type == 1 && decmpfs.size() - kHeaderBytes != header.uncompressed_size)
         return Fail(Status::Corrupt, "CompressionInlineRawSizeMismatch");
-    if ((header.type == 4 || header.type == 8 || header.type == 12) && decmpfs.size() != kHeaderBytes)
+    if (ResourceType(header.type) && decmpfs.size() != kHeaderBytes)
         return Fail(Status::Corrupt, "CompressionResourceAttributeSizeInvalid");
     if (header.type == 3)
     {
@@ -379,8 +432,20 @@ ApfsCompressionResult ApfsCompression::Inspect(std::span<const std::byte> decmpf
         if (payload.front() == std::byte{0x06} && payload.size() - 1 != header.uncompressed_size)
             return Fail(Status::Corrupt, "CompressionLzvnRawSizeMismatch");
     }
+    if (header.type == 9 || header.type == 13)
+    {
+        const auto payload = decmpfs.subspan(kHeaderBytes);
+        if (payload.empty()) return Fail(Status::Corrupt, "CompressionInlinePayloadInvalid");
+        if (header.type == 9 && payload.front() != std::byte{0xcc})
+            return Fail(Status::Unsupported, "CompressionStoredMarkerUnsupported");
+        if (header.type == 13 && payload.front() != std::byte{0xff} && RawMarker(payload.front()))
+            return Fail(Status::Unsupported, "CompressionLzbitmapRawMarkerUnsupported");
+        if ((header.type == 9 || payload.front() == std::byte{0xff}) &&
+            payload.size() - 1 != header.uncompressed_size)
+            return Fail(Status::Corrupt, "CompressionStoredSizeMismatch");
+    }
     if (decmpfs.size() > limits.max_decmpfs_bytes || header.uncompressed_size > limits.max_file_bytes ||
-        (header.type != 4 && header.type != 8 && header.type != 12 && header.uncompressed_size > limits.max_inline_decoded_bytes))
+        (!ResourceType(header.type) && header.uncompressed_size > limits.max_inline_decoded_bytes))
         return Fail(Status::LimitExceeded, "CompressionHeaderSizeLimit");
     out_header = header;
     return {};
@@ -395,14 +460,15 @@ ApfsCompressionResult ApfsCompression::DecodeRange(std::span<const std::byte> de
         ApfsCompressionHeader header;
         auto rc = Inspect(decmpfs, limits, header);
         if (!rc) return rc;
-        if ((header.type == 7 || header.type == 11) && (resource.size != 0 || resource.read))
+        if ((header.type == 7 || header.type == 9 || header.type == 11 || header.type == 13) &&
+            (resource.size != 0 || resource.read))
             return Fail(Status::Corrupt, "CompressionInlineResourceReaderUnexpected");
         const auto wanted = offset >= header.uncompressed_size ? 0 :
             (std::min)(length, header.uncompressed_size - offset);
         if (wanted > limits.max_output_bytes || !FitsVector(wanted))
             return Fail(Status::LimitExceeded, "CompressionOutputLimit");
         std::vector<std::byte> result;
-        if (header.type == 4 || header.type == 8 || header.type == 12)
+        if (ResourceType(header.type))
         {
             rc = header.type != 4 ? DecodeOffsetResource(header, resource, offset, wanted, limits, result) :
                 DecodeResource(header, resource, offset, wanted, limits, result);
@@ -411,13 +477,16 @@ ApfsCompressionResult ApfsCompression::DecodeRange(std::span<const std::byte> de
         else
         {
             auto payload = decmpfs.subspan(kHeaderBytes);
+            if (header.type == 9) payload = payload.subspan(1); // Inspect checked CC and exact size.
             std::vector<std::byte> decoded;
-            if (header.type == 3 || header.type == 7 || header.type == 11)
+            if (header.type == 3 || header.type == 7 || header.type == 11 || header.type == 13)
             {
                 if (header.uncompressed_size > limits.max_decoded_bytes)
                     return Fail(Status::LimitExceeded, "CompressionDecodedWorkLimit");
                 auto remaining_work = limits.max_lzfse_work_units;
-                rc = header.type == 11 ? DecodeLzfse(payload, header.uncompressed_size, limits, remaining_work, decoded) :
+                auto remaining_bitmap_work = limits.max_lzbitmap_work_units;
+                rc = header.type == 13 ? DecodeLzbitmap(payload, header.uncompressed_size, limits, remaining_bitmap_work, decoded) :
+                    header.type == 11 ? DecodeLzfse(payload, header.uncompressed_size, limits, remaining_work, decoded) :
                     header.type == 7 ? DecodeLzvn(payload, header.uncompressed_size, decoded) :
                         DecodeBlock(payload, header.uncompressed_size, limits, decoded);
                 if (!rc) return rc;

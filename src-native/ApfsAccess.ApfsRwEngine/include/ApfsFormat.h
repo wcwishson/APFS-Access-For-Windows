@@ -284,8 +284,18 @@ struct OmapValue
 
 // ---- volume superblock (APSB) -------------------------------------------------
 
+// Apple apfs_superblock_t counters, in container allocation blocks.
+// Zero reserve/quota means no configured reserve/limit, not unknown space.
+struct ApfsVolumeSpaceCounters
+{
+    std::uint64_t reserve_block_count = 0;
+    std::uint64_t quota_block_count = 0;
+    std::uint64_t allocated_block_count = 0;
+};
+
 struct ApsbVolume
 {
+    ApfsVolumeSpaceCounters space;
     std::uint64_t object_id = 0;
     std::uint64_t xid = 0;
     std::uint32_t root_tree_type = 0;
@@ -500,6 +510,11 @@ struct AppleCheckpointView
 
 [[nodiscard]] std::string CaseModeFor(std::uint64_t incompatible_features);
 [[nodiscard]] std::string EncryptionModeFor(std::uint64_t fs_flags);
+// Exact Apple role enum name, including "none" for zero. Unknown raw values
+// remain unknown; values such as UPDATE (3 << 6) are not decomposed as flags.
+[[nodiscard]] std::string RoleNameFor(std::uint16_t role_raw);
+// Compatibility policy categories: NONE is treated as ordinary "data".
+// Use RoleNameFor/role_raw for truthful on-disk metadata and group matching.
 [[nodiscard]] std::vector<std::string> RolesFor(std::uint16_t role_raw);
 [[nodiscard]] std::vector<std::string> HexBits(std::uint64_t mask);
 // Bits set in `value` outside `known_mask`, as sorted unique "0x..." strings.

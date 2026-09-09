@@ -1,10 +1,45 @@
 #pragma once
 
+// Define APFSACCESS_COORDINATOR_SHARED_SPACE_ONLY before including this header
+// in a C++17 read-model translation unit. It exposes an opaque coordinator and
+// the copied snapshot lookup without the engine's C++20 MetadataStore headers.
+// Use a separate translation unit for the full lifecycle/mutation interface.
+#include <cstdint>
+#include <optional>
+#include <string_view>
+
+namespace apfsaccess::catalog
+{
+class ContainerMountCoordinator;
+
+// A copied observation of one volume's share of a single durable container
+// checkpoint. Total is the container total; available includes the selected
+// volume's quota and sibling reserves. Never sum sibling available values.
+struct ContainerVolumeSpaceSnapshot
+{
+    std::uint64_t volume_object_id = 0;
+    std::uint64_t checkpoint_xid = 0;
+    std::uint64_t total_bytes = 0;
+    std::uint64_t available_bytes = 0;
+    std::uint32_t allocation_unit_bytes = 0;
+};
+
+// C++17 opaque-owner facade for LookupSharedSpace below. Null owner/unknown
+// identity returns nullopt. Caller must retain the owner's lifetime. No locks
+// on coordinator/session state, allocation, or I/O; a bounded copied result.
+[[nodiscard]] std::optional<ContainerVolumeSpaceSnapshot> LookupContainerSharedSpace(
+    const ContainerMountCoordinator* coordinator, std::string_view container_uuid_hex,
+    std::uint64_t volume_object_id) noexcept;
+} // namespace apfsaccess::catalog
+
+#if !defined(APFSACCESS_COORDINATOR_SHARED_SPACE_ONLY)
+
 // One safe RW owner per APFS container: a single raw-device lease, one
 // container identity/checkpoint, one commit serializer, and one extent ledger
 // shared by every mounted volume in the container, while each volume keeps an
 // independent MetadataStore session (namespace, WAL/status/recovery identity,
-// mount state). C++17-clean: FsHost builds at C++17.
+// mount state). Full engine policy types currently require C++20; the snapshot
+// facade above and its shared_ptr atomic publication use C++17 facilities.
 
 #include <atomic>
 #include <chrono>
@@ -15,6 +50,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "ApfsContainerCatalog.h"
@@ -289,6 +325,15 @@ public:
     [[nodiscard]] bool RawLeaseHeld() const noexcept;
     [[nodiscard]] std::size_t MountedVolumeCount() const;
     [[nodiscard]] std::uint64_t CheckpointXid() const noexcept;
+    // One immutable snapshot load and a bounded identity/volume lookup. No
+    // metadata, state or commit locks, device I/O, or allocation. UUID must be
+    // exactly 32 hex characters (either case). Nullopt means unknown, including
+    // legacy fixtures, invalid identity, invalidation and drain. Covers catalog
+    // volumes, even before mount. A concurrent commit may expose a complete
+    // prior durable observation or unknown; its completion updates all siblings.
+    // The caller must keep this coordinator alive throughout the call.
+    [[nodiscard]] std::optional<ContainerVolumeSpaceSnapshot> LookupSharedSpace(
+        std::string_view container_uuid_hex, std::uint64_t volume_object_id) const noexcept;
     [[nodiscard]] const std::string& ContainerUuidHex() const noexcept;
     [[nodiscard]] const apfsaccess::rw::BlockDevice& Device() const noexcept;
     // Non-owning session lookup for host provider wiring and read models.
@@ -338,6 +383,19 @@ private:
     struct ScopedReloadDiagnostics;
     enum class ReloadReason { BeforeCommit, Rollback, Recovery };
 
+    // Writers own commit_mutex_ (or are constructing Open). The only reader
+    // surface copies primitive values. C++17 shared_ptr atomic free functions
+    // protect pointer publication; no coordinator lock is acquired by readers.
+    void InvalidateSharedSpaceNoLock() noexcept;
+    void PublishSharedSpaceNoLock(const AppleCheckpointView* checkpoint,
+        bool freshly_loaded) noexcept;
+    std::shared_ptr<const ApfsSharedSpaceProjection> shared_space_snapshot_;
+    std::uint64_t shared_space_high_water_xid_ = 0;
+    bool shared_space_invalidated_ = true;
+    // Drain sets this before waiting for commit ownership. In-flight publishers
+    // cannot revive observations after shutdown, including a timed-out drain.
+    std::atomic<bool> shared_space_stopped_{false};
+
     bool ReloadSessionForCommitNoLock(
         SessionState& session, std::string& out_error,
         ReloadReason reason = ReloadReason::Rollback);
@@ -386,3 +444,5 @@ private:
 };
 
 } // namespace apfsaccess::catalog
+
+#endif // !APFSACCESS_COORDINATOR_SHARED_SPACE_ONLY

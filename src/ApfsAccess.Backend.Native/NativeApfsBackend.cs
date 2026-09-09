@@ -1003,7 +1003,8 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
                     CatalogVolumeObjectId: volume.CatalogVolumeObjectId,
                     CatalogDecision: volume.CatalogDecision,
                     CatalogReasons: volume.CatalogReasons,
-                    CatalogAutoMountAllowed: volume.CatalogAutoMountAllowed
+                    CatalogAutoMountAllowed: volume.CatalogAutoMountAllowed,
+                    CatalogSpace: volume.CatalogSpace
                 );
             Interlocked.Increment(ref _mountStateVersion);
 
@@ -4270,7 +4271,8 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
             CatalogDecision: discoveredVolume.Catalog?.Decision,
             CatalogReasons: discoveredVolume.Catalog?.Reasons,
             CatalogAutoMountAllowed: discoveredVolume.Catalog?.AutoMountAllowed,
-            CatalogVolumeUuid: discoveredVolume.CatalogVolumeUuid
+            CatalogVolumeUuid: discoveredVolume.CatalogVolumeUuid,
+            CatalogSpace: discoveredVolume.Catalog?.Space
         ));
     }
 
@@ -4658,7 +4660,8 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
                     CatalogVolumeId: volume.Id,
                     Decision: capped.Decision,
                     Reasons: capped.Reasons,
-                    AutoMountAllowed: capped.AutoMountAllowed);
+                    AutoMountAllowed: capped.AutoMountAllowed,
+                    Space: NativeApfsObserver.ObserveVolumeSpace(container, volume));
 
                 var recoveryIdentity = BuildRecoveryIdentityFromComponents(
                     affordance?.PartitionUniqueGuid,
@@ -11301,7 +11304,8 @@ public sealed class NativeApfsBackend : IApfsBackend, IContainerMountBackend, ID
             CatalogVolumeObjectId: volume.CatalogVolumeObjectId,
             CatalogDecision: volume.CatalogDecision,
             CatalogReasons: volume.CatalogReasons,
-            CatalogAutoMountAllowed: volume.CatalogAutoMountAllowed);
+            CatalogAutoMountAllowed: volume.CatalogAutoMountAllowed,
+            CatalogSpace: volume.CatalogSpace);
     }
 
     private MountResult BuildContainerLaunchSuccessResult(

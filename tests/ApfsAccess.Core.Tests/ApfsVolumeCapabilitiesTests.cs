@@ -199,7 +199,76 @@ public sealed class ApfsVolumeCapabilitiesTests
         Assert.False(result.AutoMountAllowed);
     }
 
-    // ---- Precedence: incompat > unknown > readonly > locked > roles ----
+    public static IEnumerable<object[]> ReadonlyRoleCases()
+    {
+        string[][] roles = [["unknown"], ["future-role"], [], ["data", "unknown"],
+            ["system", "future-role"], ["data"], ["system"], ["backup"], ["data", "recovery"]];
+        foreach (var containerBits in new[] { false, true })
+        foreach (var roleSet in roles)
+            yield return [containerBits, roleSet,
+                roleSet.Length > 0 && roleSet.All(role => role is "data" or "system" or "backup" or "recovery")];
+    }
+
+    [Theory]
+    [MemberData(nameof(ReadonlyRoleCases))]
+    public void EvaluateToPolicy_ReadonlyFeaturesPreserveRoleEligibility(
+        bool containerBits, string[] roles, bool inspectionAllowed)
+    {
+        var volume = DataVolume() with { Roles = roles,
+            ReadonlyFeatureBits = containerBits ? [] : ["0x4"] };
+        var container = CleanContainer() with { ReadonlyFeatureBits = containerBits ? ["0x4"] : [] };
+        var result = ApfsVolumeCapabilities.Evaluate(volume, container);
+        var projected = ProjectCapability(result);
+
+        Assert.Equal(inspectionAllowed, CatalogMountPolicy.AllowsMount(projected, true));
+        Assert.False(CatalogMountPolicy.AllowsMount(projected, false));
+        Assert.False(result.AutoMountAllowed);
+        Assert.Equal(roles.SequenceEqual(new[] { "data" })
+            ? ApfsCapabilityDecision.ReadOnlyFeature : ApfsCapabilityDecision.Readable, result.Decision);
+    }
+
+    [Theory]
+    [InlineData(false, "locked")]
+    [InlineData(true, "locked")]
+    [InlineData(false, "password")]
+    [InlineData(true, "password")]
+    [InlineData(false, "hardware-bound")]
+    [InlineData(true, "hardware-bound")]
+    [InlineData(false, "unknown")]
+    [InlineData(true, "unknown")]
+    [InlineData(false, "unknown-feature")]
+    [InlineData(true, "unknown-feature")]
+    [InlineData(false, "incompatible")]
+    [InlineData(true, "incompatible")]
+    public void EvaluateToPolicy_ReadonlyFeaturesCannotMaskRefusal(bool containerBits, string refusal)
+    {
+        var volume = DataVolume() with
+        {
+            ReadonlyFeatureBits = containerBits ? [] : ["0x4"],
+            Locked = refusal == "locked",
+            EncryptionMode = refusal is "password" or "hardware-bound" or "unknown" ? refusal : "none",
+            UnknownFeatureBits = !containerBits && refusal == "unknown-feature" ? ["0x20"] : [],
+            IncompatibleFeatureBits = !containerBits && refusal == "incompatible" ? ["0x10"] : [],
+        };
+        var container = CleanContainer() with
+        {
+            ReadonlyFeatureBits = containerBits ? ["0x4"] : [],
+            UnknownFeatureBits = containerBits && refusal == "unknown-feature" ? ["0x20"] : [],
+            IncompatibleFeatureBits = containerBits && refusal == "incompatible" ? ["0x10"] : [],
+        };
+        var result = ApfsVolumeCapabilities.Evaluate(volume, container);
+        Assert.Equal(refusal is "unknown-feature" or "incompatible"
+            ? ApfsCapabilityDecision.Unsupported : ApfsCapabilityDecision.Locked, result.Decision);
+        Assert.False(CatalogMountPolicy.AllowsMount(ProjectCapability(result), true));
+        Assert.False(CatalogMountPolicy.AllowsMount(ProjectCapability(result), false));
+    }
+
+    private static VolumeInfo ProjectCapability(ApfsVolumeCapability result) => new(
+        "v", "D:\\test.img", "Data", true,
+        CatalogDecision: result.Decision, CatalogReasons: result.Reasons,
+        CatalogAutoMountAllowed: result.AutoMountAllowed);
+
+    // ---- Precedence: incompat > unknown > locked > roles > readonly ----
 
     [Fact]
     public void Evaluate_Precedence_IncompatibleBeatsEverything()
@@ -238,7 +307,7 @@ public sealed class ApfsVolumeCapabilitiesTests
     }
 
     [Fact]
-    public void Evaluate_Precedence_ReadonlyBeatsLockedAndRole()
+    public void Evaluate_Precedence_LockedBeatsReadonlyAndRole()
     {
         var volume = DataVolume() with
         {
@@ -249,8 +318,8 @@ public sealed class ApfsVolumeCapabilitiesTests
 
         var result = ApfsVolumeCapabilities.Evaluate(volume, CleanContainer());
 
-        Assert.Equal(ApfsCapabilityDecision.ReadOnlyFeature, result.Decision);
-        Assert.Equal(["readonly-features"], result.Reasons);
+        Assert.Equal(ApfsCapabilityDecision.Locked, result.Decision);
+        Assert.Equal(["locked-encrypted"], result.Reasons);
     }
 
     [Fact]

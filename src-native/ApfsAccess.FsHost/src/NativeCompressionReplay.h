@@ -147,19 +147,22 @@ public:
                     proof.decmpfs_flags, proof.decmpfs_descriptor, proof.decmpfs, &retired_streams) ||
                 !AuthenticateAttribute(store, original, before, proof.object, "com.apple.ResourceFork",
                     proof.resource_flags, proof.resource_descriptor, proof.resource,
-                    proof.type == 4 ? &retired_streams : nullptr)) return Result::SourceMismatch;
+                    rw::CompressionRewrite::UsesResourceFork(proof.type) ? &retired_streams : nullptr)) return Result::SourceMismatch;
             if (!AuthenticatePreservedAttributes(store, original, proof) ||
                 !AuthenticatePreservedAttributes(store, published, proof)) return Result::MetadataMismatch;
             if (!VerifyMetadata(before, after, original, published, proof, *batch, allocated, retired_streams))
                 return Result::MetadataMismatch;
 
             rw::ApfsCompressionResourceReader resource;
-            resource.size = proof.resource.size();
-            resource.read = [&](std::uint64_t at, std::span<std::byte> out) {
-                if (at > proof.resource.size() || out.size() > proof.resource.size() - at) return std::size_t{0};
-                std::copy_n(proof.resource.begin() + static_cast<std::size_t>(at), out.size(), out.begin());
-                return out.size();
-            };
+            if (rw::CompressionRewrite::UsesResourceFork(proof.type))
+            {
+                resource.size = proof.resource.size();
+                resource.read = [&](std::uint64_t at, std::span<std::byte> out) {
+                    if (at > proof.resource.size() || out.size() > proof.resource.size() - at) return std::size_t{0};
+                    std::copy_n(proof.resource.begin() + static_cast<std::size_t>(at), out.size(), out.begin());
+                    return out.size();
+                };
+            }
             rw::ApfsCompressionLimits limits;
             limits.max_file_bytes = rw::CompressionRewrite::MaxLogicalBytes;
             limits.max_resource_bytes = rw::CompressionRewrite::MaxResourceBytes;
@@ -523,7 +526,7 @@ private:
                 if (!rw::ApfsExtendedRecordCodec::DecodeXattr(record, attr, error) ||
                     (!rw::IsOrdinaryAppleXattrName(attr.name_utf8) && attr.name_utf8 != "com.apple.decmpfs" &&
                         attr.name_utf8 != "com.apple.ResourceFork")) return false;
-                if (attr.name_utf8 == "com.apple.decmpfs" || (proof.type == 4 && attr.name_utf8 == "com.apple.ResourceFork"))
+                if (attr.name_utf8 == "com.apple.decmpfs" || (rw::CompressionRewrite::UsesResourceFork(proof.type) && attr.name_utf8 == "com.apple.ResourceFork"))
                 {
                     if (new_records.contains(record.key)) return false;
                     old_records.erase(record.key);

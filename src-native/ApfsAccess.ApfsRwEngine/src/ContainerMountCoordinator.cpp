@@ -1313,6 +1313,10 @@ std::unique_ptr<ContainerMountCoordinator> ContainerMountCoordinator::Open(
     }
     coordinator->checkpoint_xid_.store(
         catalog.Containers()[0].checkpoint_xid, std::memory_order_relaxed);
+    coordinator->PublishSharedSpaceNoLock(
+        catalog.Containers()[0].member_store_ids.size() == 1
+            ? catalog.TryGetAppleCheckpointView(catalog.Containers()[0].member_store_ids[0])
+            : nullptr, true);
 #if defined(_WIN32)
     coordinator->owner_process_id_ =
         static_cast<std::uint64_t>(::GetCurrentProcessId());
@@ -1496,12 +1500,19 @@ bool ContainerMountCoordinator::MountVolume(
     }
     ApfsContainerCatalog catalog;
     std::wstring catalog_error;
+    InvalidateSharedSpaceNoLock();
     if (!ApfsContainerCatalog::TryLoadDevice(
             *device_, catalog, catalog_error, catalog_load_policy_))
     {
+        InvalidateSharedSpaceNoLock();
         out_error = "ContainerCatalogReloadFailed";
         return false;
     }
+    const AppleCheckpointView* mounted_checkpoint = nullptr;
+    for (const auto& container : catalog.Containers())
+        if (container.container_uuid_hex == container_uuid_hex_ && container.member_store_ids.size() == 1)
+            mounted_checkpoint = catalog.TryGetAppleCheckpointView(container.member_store_ids[0]);
+    PublishSharedSpaceNoLock(mounted_checkpoint, true);
     catalog::ResolvedMountVolume resolved{};
     std::string resolve_error;
     if (!catalog.TryResolveVolume(
@@ -1537,6 +1548,7 @@ bool ContainerMountCoordinator::MountVolume(
         std::make_unique<MetadataStore>(std::move(context), device_);
     if (!store->LoadContainerState())
     {
+        InvalidateSharedSpaceNoLock();
         out_error = "VolumeStateLoadFailed: " +
             NarrowLossy(store->RecoveryReason());
         return false;
@@ -1545,6 +1557,7 @@ bool ContainerMountCoordinator::MountVolume(
     {
         if (!store->LoadCanonicalState())
         {
+            InvalidateSharedSpaceNoLock();
             out_error = "VolumeCanonicalStateLoadFailed: " +
                 NarrowLossy(store->RecoveryReason());
             return false;
@@ -1552,12 +1565,14 @@ bool ContainerMountCoordinator::MountVolume(
     }
     else if (!store->LoadVolumeState())
     {
+        InvalidateSharedSpaceNoLock();
         out_error = "VolumeStateLoadFailed: " +
             NarrowLossy(store->RecoveryReason());
         return false;
     }
     if (session.requested_write && !store->PrepareNativeWritePath())
     {
+        InvalidateSharedSpaceNoLock();
         out_error = "VolumeWritePathNotReady";
         return false;
     }
@@ -1578,6 +1593,8 @@ bool ContainerMountCoordinator::MountVolume(
     state->use_canonical_transaction = session.use_canonical_transaction;
     state->store = std::move(store);
     sessions_.push_back(std::move(state));
+    if (const auto* view = sessions_.back()->store->AuthoritativeAppleCheckpointView())
+        PublishSharedSpaceNoLock(view, true);
     return true;
 }
 
@@ -1597,6 +1614,7 @@ bool ContainerMountCoordinator::UnmountVolume(
         if ((*it)->volume_object_id == volume_object_id)
         {
             sessions_.erase(it);
+            if (sessions_.empty()) InvalidateSharedSpaceNoLock();
             return true;
         }
     }
@@ -1846,6 +1864,7 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
                 // could select a different source. Leave it closed for recovery.
                 std::lock_guard<std::mutex> guard(mutex_);
                 recovery_required_ = true;
+                InvalidateSharedSpaceNoLock();
                 recovery_volume_object_id_ = session->volume_object_id;
                 recovery_reason_ = "MutationPreparationIdentityChanged";
                 result.commit_recovery_required = true;
@@ -1859,6 +1878,7 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
             {
                 std::lock_guard<std::mutex> guard(mutex_);
                 recovery_required_ = true;
+                InvalidateSharedSpaceNoLock();
                 recovery_volume_object_id_ = session->volume_object_id;
                 recovery_reason_ = "MutationPreparationRollbackFailed: " + rollback_error;
                 result.error += " | " + recovery_reason_;
@@ -1896,6 +1916,7 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
             {
                 std::lock_guard<std::mutex> guard(mutex_);
                 recovery_required_ = true;
+                InvalidateSharedSpaceNoLock();
                 recovery_volume_object_id_ = session->volume_object_id;
                 recovery_reason_ = "PartialStageRollbackFailed: " +
                     rollback_error;
@@ -1948,6 +1969,7 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
                 {
                     std::lock_guard<std::mutex> guard(mutex_);
                     recovery_required_ = true;
+                    InvalidateSharedSpaceNoLock();
                     recovery_volume_object_id_ = session->volume_object_id;
                     recovery_reason_ = "MutationStagingHookRollbackFailed: " +
                         rollback_error;
@@ -1959,6 +1981,31 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
                 return result;
             }
         }
+    }
+    const auto capacity_status = session->store->CheckPendingAppleCapacity(RequiredCheckpointXidUnionNoLock());
+    if (capacity_status != MetadataStore::CommitStatus::NothingToCommit)
+    {
+        result.commit_status_code = static_cast<int>(capacity_status);
+        result.commit_stage = "before-wal-capacity-admission";
+        result.error = "CommitCapacityAdmissionRefused: " +
+            NarrowLossy(session->store->LastCommitFailureReason());
+        result.staged_identities.clear();
+        std::string rollback_error;
+        if (!ReloadSessionForCommitNoLock(*session, rollback_error))
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            recovery_required_ = true;
+            InvalidateSharedSpaceNoLock();
+            recovery_volume_object_id_ = session->volume_object_id;
+            recovery_reason_ = "CapacityAdmissionRollbackFailed: " + rollback_error;
+            result.error += " | " + recovery_reason_;
+            result.commit_recovery_required = true;
+            result.commit_recovery_reason = WidenUtf8(recovery_reason_);
+        }
+        else
+            result.clean_prepublication_refusal = !accepted_replay && !mutation_staging_hook &&
+                native_staging_clean() && session->store->CheckpointXid() == preimage_checkpoint_xid;
+        return result;
     }
     if (prepublication_hook)
     {
@@ -2026,6 +2073,7 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
                     : pins_error);
             std::lock_guard<std::mutex> guard(mutex_);
             recovery_required_ = true;
+            InvalidateSharedSpaceNoLock();
             recovery_volume_object_id_ = session->volume_object_id;
             recovery_reason_ = hook_error;
             result.commit_recovery_required = true;
@@ -2046,6 +2094,7 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
             {
                 std::lock_guard<std::mutex> guard(mutex_);
                 recovery_required_ = true;
+                InvalidateSharedSpaceNoLock();
                 recovery_volume_object_id_ = session->volume_object_id;
                 recovery_reason_ = "PrepublicationRollbackFailed: " +
                     rollback_error;
@@ -2087,6 +2136,10 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
     // must not depend on allocating an exception/error message.
     std::string verifier_recovery_reason = postpublication_verifier_hook
         ? "CommitPostpublicationVerificationFailed" : std::string{};
+    // From here publication can change the device, including on a thrown or
+    // uncertain outcome. Leave unknown until the entire successful path below
+    // has verified the durable view. Snapshot failures never change that path.
+    InvalidateSharedSpaceNoLock();
     auto status = session->use_canonical_transaction
         ? session->store->CommitCanonicalTransaction(required_checkpoint_xids)
         : session->store->CommitTransaction(required_checkpoint_xids);
@@ -2164,6 +2217,7 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
         {
             std::lock_guard<std::mutex> guard(mutex_);
             recovery_required_ = true;
+            InvalidateSharedSpaceNoLock();
             recovery_volume_object_id_ = session->volume_object_id;
             recovery_reason_ = "SessionCommitRecoveryRequired: " +
                 NarrowLossy(session->store->RecoveryReason());
@@ -2175,6 +2229,7 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
             {
                 std::lock_guard<std::mutex> guard(mutex_);
                 recovery_required_ = true;
+                InvalidateSharedSpaceNoLock();
                 recovery_volume_object_id_ = session->volume_object_id;
                 recovery_reason_ = "CleanCommitRollbackFailed: " +
                     rollback_error;
@@ -2184,6 +2239,9 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
                     WidenUtf8(recovery_reason_);
             }
         }
+        // A rollback reload may have projected a checkpoint. The failed
+        // publication attempt remains conservative until a fresh later load.
+        InvalidateSharedSpaceNoLock();
         return result;
     }
     if (const auto xid = session->store->CheckpointXid(); xid.has_value())
@@ -2207,6 +2265,7 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
                 ranges, deallocations, ledger_error))
         {
             recovery_required_ = true;
+            InvalidateSharedSpaceNoLock();
             recovery_volume_object_id_ = session->volume_object_id;
             recovery_reason_ = ledger_error;
             result.error = "CommitLedgerOverlap: " + ledger_error;
@@ -2245,6 +2304,7 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
             // exception while reporting failure cannot admit a sibling writer.
             std::lock_guard<std::mutex> guard(mutex_);
             recovery_required_ = true;
+            InvalidateSharedSpaceNoLock();
             recovery_volume_object_id_ = session->volume_object_id;
             recovery_reason_.swap(verifier_recovery_reason);
             result.committed = true;
@@ -2276,6 +2336,7 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
             pins->unapplied_accepted_work = false;
     }
     result.committed = true;
+    PublishSharedSpaceNoLock(session->store->AuthoritativeAppleCheckpointView(), true);
     return result;
 }
 
@@ -2331,6 +2392,9 @@ bool ContainerMountCoordinator::RefreshCheckpointFromSession(
             {
             }
         }
+        // This store may still hold the checkpoint preceding a sibling commit.
+        // It is not proof of a fresh load and cannot clear an invalidation.
+        PublishSharedSpaceNoLock(session->store->AuthoritativeAppleCheckpointView(), false);
         return true;
     }
     out_error = "VolumeNotMounted";
@@ -2346,6 +2410,7 @@ ContainerShutdownResult ContainerMountCoordinator::DrainAndStop(
     {
         std::lock_guard<std::mutex> guard(mutex_);
         draining_ = true;
+        shared_space_stopped_.store(true, std::memory_order_release);
     }
     std::unique_lock<std::timed_mutex> commit_guard(
         commit_mutex_, std::defer_lock);
@@ -2356,6 +2421,7 @@ ContainerShutdownResult ContainerMountCoordinator::DrainAndStop(
     }
     {
         std::lock_guard<std::mutex> guard(mutex_);
+        InvalidateSharedSpaceNoLock();
         sessions_.clear();
         committed_ranges_.clear();
         device_.reset();
@@ -2385,6 +2451,102 @@ std::size_t ContainerMountCoordinator::MountedVolumeCount() const
 std::uint64_t ContainerMountCoordinator::CheckpointXid() const noexcept
 {
     return checkpoint_xid_.load(std::memory_order_relaxed);
+}
+
+std::optional<ContainerVolumeSpaceSnapshot> LookupContainerSharedSpace(
+    const ContainerMountCoordinator* coordinator, std::string_view container_uuid_hex,
+    std::uint64_t volume_object_id) noexcept
+{
+    return coordinator ? coordinator->LookupSharedSpace(container_uuid_hex, volume_object_id) : std::nullopt;
+}
+
+std::optional<ContainerVolumeSpaceSnapshot> ContainerMountCoordinator::LookupSharedSpace(
+    std::string_view container_uuid_hex, std::uint64_t volume_object_id) const noexcept
+{
+    if (container_uuid_hex.size() != 32 || volume_object_id == 0 ||
+        shared_space_stopped_.load(std::memory_order_acquire)) return std::nullopt;
+    const auto snapshot = std::atomic_load_explicit(
+        &shared_space_snapshot_, std::memory_order_acquire);
+    if (!snapshot) return std::nullopt;
+    for (std::size_t i = 0; i < 32; ++i)
+    {
+        const auto ch = container_uuid_hex[i];
+        const auto normalized = ch >= 'A' && ch <= 'F' ? ch + ('a' - 'A') : ch;
+        if (normalized != snapshot->container_uuid_hex[i]) return std::nullopt;
+    }
+    const auto found = std::lower_bound(snapshot->volumes.begin(), snapshot->volumes.end(),
+        volume_object_id, [](const ApfsVolumeSpaceProjection& volume, std::uint64_t oid) {
+            return volume.object_id < oid;
+        });
+    if (found == snapshot->volumes.end() || found->object_id != volume_object_id ||
+        shared_space_stopped_.load(std::memory_order_acquire)) return std::nullopt;
+    return ContainerVolumeSpaceSnapshot{volume_object_id, snapshot->checkpoint_xid,
+        snapshot->total.bytes, found->available.bytes, snapshot->allocation_unit_bytes};
+}
+
+void ContainerMountCoordinator::InvalidateSharedSpaceNoLock() noexcept
+{
+    shared_space_high_water_xid_ = (std::max)(shared_space_high_water_xid_,
+        checkpoint_xid_.load(std::memory_order_relaxed));
+    shared_space_invalidated_ = true;
+    std::atomic_store_explicit(&shared_space_snapshot_,
+        std::shared_ptr<const ApfsSharedSpaceProjection>{}, std::memory_order_release);
+}
+
+void ContainerMountCoordinator::PublishSharedSpaceNoLock(
+    const AppleCheckpointView* checkpoint, bool freshly_loaded) noexcept
+{
+    if (shared_space_stopped_.load(std::memory_order_acquire) || recovery_required_)
+    {
+        InvalidateSharedSpaceNoLock();
+        return;
+    }
+    // A borrowed session cannot certify current device state after invalidation.
+    if (!freshly_loaded && shared_space_invalidated_) return;
+    if (!checkpoint)
+    {
+        InvalidateSharedSpaceNoLock();
+        return;
+    }
+    const auto xid = checkpoint->container.superblock.xid;
+    const auto floor = (std::max)(shared_space_high_water_xid_,
+        checkpoint_xid_.load(std::memory_order_relaxed));
+    if (xid < floor) return;
+    shared_space_high_water_xid_ = xid;
+    try
+    {
+        auto candidate = std::make_shared<ApfsSharedSpaceProjection>();
+        std::string error;
+        if (!TryProjectAppleSharedSpace(*checkpoint, *candidate, error) ||
+            candidate->container_uuid_hex != container_uuid_hex_ ||
+            candidate->volumes.size() != container_volume_oids_.size())
+        {
+            InvalidateSharedSpaceNoLock();
+            return;
+        }
+        std::sort(candidate->volumes.begin(), candidate->volumes.end(),
+            [](const ApfsVolumeSpaceProjection& a, const ApfsVolumeSpaceProjection& b) {
+                return a.object_id < b.object_id;
+            });
+        for (std::size_t i = 0; i < container_volume_oids_.size(); ++i)
+        {
+            if (candidate->volumes[i].object_id != container_volume_oids_[i])
+            {
+                InvalidateSharedSpaceNoLock();
+                return;
+            }
+        }
+        std::shared_ptr<const ApfsSharedSpaceProjection> immutable = std::move(candidate);
+        std::atomic_store_explicit(&shared_space_snapshot_, std::move(immutable),
+            std::memory_order_release);
+        shared_space_invalidated_ = false;
+    }
+    catch (...)
+    {
+        // In particular, bad_alloc must not turn a durable commit into a thrown
+        // result, or change WAL acceptance, retention, or recovery bookkeeping.
+        InvalidateSharedSpaceNoLock();
+    }
 }
 
 const std::string& ContainerMountCoordinator::ContainerUuidHex() const noexcept
@@ -2525,12 +2687,15 @@ bool ContainerMountCoordinator::ReloadSessionForCommitNoLock(
 {
     ScopedReloadDiagnostics diagnostics_scope{*this, session.volume_object_id, reason};
     out_error.clear();
+    InvalidateSharedSpaceNoLock();
     if (!session.store->PrepareNativeWritePath())
     {
+        InvalidateSharedSpaceNoLock();
         out_error = "VolumeWritePathReloadFailed: " +
             NarrowLossy(session.store->RecoveryReason());
         return false;
     }
+    PublishSharedSpaceNoLock(session.store->AuthoritativeAppleCheckpointView(), true);
     diagnostics_scope.succeeded = true;
     return true;
 }

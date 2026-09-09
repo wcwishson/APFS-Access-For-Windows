@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "ApfsFormat.h"
+#include "ApfsSharedSpace.h"
 
 namespace apfsaccess::rw
 {
@@ -58,7 +59,12 @@ struct ApfsVolumeDescriptor
     std::string name_utf8;
     bool name_valid = false;
     std::uint16_t role_raw = 0;
+    std::string role_name; // exact on-disk role; zero is "none"
     std::vector<std::string> roles;
+    // Known only when loaded through the strict Apple checkpoint reader.
+    std::optional<ApfsVolumeSpaceCounters> space;
+    bool group_metadata_valid = true;
+    std::string group_association_status; // none|incomplete|valid-system-data|ambiguous|malformed
     std::string case_mode; // sensitive|insensitive|unknown
     std::string encryption_mode; // none|password|hardware-bound|unknown
     bool locked = false;
@@ -76,8 +82,17 @@ struct ApfsVolumeDescriptor
 
 struct ApfsVolumeGroupDescriptor
 {
+    // Keep the existing apfs-group:<uuid> spelling. Relationship identity is
+    // the pair (container_uuid_hex, group_uuid_hex), never group UUID alone.
+    std::string container_uuid_hex;
     std::string group_uuid_hex;
     std::vector<std::string> member_volume_ids; // apfs-vol:<container>:<oid>
+    // valid-system-data|incomplete|ambiguous|malformed
+    std::string association_status;
+    // Filled only for one well-formed System/Data pair. These are metadata
+    // relationships, not firmlink routing or mount/write authorization.
+    std::string system_volume_id;
+    std::string data_volume_id;
 };
 
 struct ApfsContainerDescriptor
@@ -85,7 +100,7 @@ struct ApfsContainerDescriptor
     std::string container_uuid_hex;
     std::vector<std::string> member_store_ids;
     std::vector<ApfsVolumeDescriptor> volumes;
-    std::vector<ApfsVolumeGroupDescriptor> groups; // >= 2 members only
+    std::vector<ApfsVolumeGroupDescriptor> groups; // >= 2 members; singleton status stays on volume
     std::vector<std::string> orphan_volume_oids; // resolved but unlisted (info)
     std::uint32_t block_size = 0;
     std::uint64_t checkpoint_xid = 0;
@@ -170,6 +185,10 @@ public:
     [[nodiscard]] const std::vector<ApfsContainerDescriptor>& Containers() const noexcept { return containers_; }
     [[nodiscard]] const AppleCheckpointView* TryGetAppleCheckpointView(
         const std::string& stable_store_id) const noexcept;
+    // Uses the privately retained strict checkpoint; legacy/Fusion space is
+    // unknown and returns false. No observer/service/WinFsp wiring is implied.
+    [[nodiscard]] bool TryProjectSharedSpace(const std::string& container_uuid_hex,
+        ApfsSharedSpaceProjection& out, std::string& error) const;
 
 private:
     std::string disk_id_;

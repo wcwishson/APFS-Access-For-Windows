@@ -154,6 +154,7 @@ public sealed class ApfsMountWorker : BackgroundService
         // Every selection/inventory admission re-observes APFS identities. Partition
         // layout and image timestamps are insufficient to retain UUID associations.
         var inventory = (await _backend.ProbeInventoryAsync(authoritative: true, cancellationToken).ConfigureAwait(false))
+            .Where(d => d.Device.IsConnected)
             .Select(d => d with { Volumes = d.Volumes.ToArray() }).ToArray();
         cancellationToken.ThrowIfCancellationRequested();
         var connectedDevices = inventory.Select(d => d.Device).ToArray();
@@ -176,9 +177,13 @@ public sealed class ApfsMountWorker : BackgroundService
                 {
                     warnings.Add($"Volume '{volume.VolumeName}' cannot be mounted in Explorer.");
                 }
+                else if (!CatalogMountPolicy.AllowsOrdinaryMount(volume) && !CatalogMountPolicy.AllowsReadOnlyInspection(volume))
+                {
+                    warnings.Add(CatalogMountPolicy.Refusal(volume, requestedMode: null));
+                }
 
                 var writeDecision = WriteGatePolicy.EvaluateForVolume(options, volume);
-                if (options.EnableNativeWrite && !writeDecision.AllowWrite)
+                if (options.EnableNativeWrite && !writeDecision.AllowWrite && CatalogMountPolicy.AllowsOrdinaryMount(volume))
                 {
                     compatibilityWarnings.Add(
                         $"Write blocked for '{volume.VolumeName}' " +
@@ -317,7 +322,11 @@ public sealed class ApfsMountWorker : BackgroundService
                 continue;
             }
 
-            if (!_mountPolicy.ShouldAutoMount(volume) || mountedVolumeIds.Contains(volume.VolumeId))
+            var explicitInspection = !string.IsNullOrWhiteSpace(requestedVolumeId) &&
+                requestedAccessMode == MountAccessMode.ReadOnly;
+            if (!CatalogMountPolicy.AllowsMount(volume, explicitInspection) ||
+                (!explicitInspection && !_mountPolicy.ShouldAutoMount(volume)) ||
+                mountedVolumeIds.Contains(volume.VolumeId))
             {
                 continue;
             }
@@ -446,6 +455,7 @@ public sealed class ApfsMountWorker : BackgroundService
     // cannot reinstall identity or clear new ambiguity, even during an eject.
     private bool TryAdmitDiscovery(DiscoverySnapshot discovery)
     {
+        Action? notification = null;
         lock (_discoveryAdmissionSync)
         {
             if (discovery.Generation < _admittedDiscoveryGeneration) return false;
@@ -453,8 +463,14 @@ public sealed class ApfsMountWorker : BackgroundService
             _admittedDiscoveryGeneration = discovery.Generation;
             _admittedDiscovery = discovery;
             UpdatePreferenceDiscovery(discovery.Volumes);
-            return true;
+            StatusChangedPayload latest;
+            do
+            {
+                latest = _statusPublisher.Latest;
+            } while (!_statusPublisher.TryPublish(latest, latest with { ConnectedInventory = discovery.Inventory }, out notification));
         }
+        notification?.Invoke();
+        return true;
     }
 
     public async Task<IReadOnlyList<DeviceInventory>> GetInventoryAsync(CancellationToken cancellationToken)
@@ -737,6 +753,20 @@ public sealed class ApfsMountWorker : BackgroundService
                 return (false, $"Requested APFS volume '{volumeId}' was not found.");
             }
 
+            // Only a unique selected volume with an explicit RO mode is inspection.
+            // General Refresh/Fix and default-mode requests retain ordinary admission.
+            if (!string.IsNullOrWhiteSpace(volumeId))
+            {
+                var targets = discovery.Volumes.Where(volume =>
+                    string.Equals(volume.VolumeId, volumeId, StringComparison.OrdinalIgnoreCase) &&
+                    (string.IsNullOrWhiteSpace(requestedDeviceId) ||
+                     string.Equals(volume.DeviceId, requestedDeviceId, StringComparison.OrdinalIgnoreCase))).ToArray();
+                if (targets.Length != 1)
+                    return (false, $"Requested APFS volume '{volumeId}' was not uniquely found; mutation was not attempted.");
+                if (!CatalogMountPolicy.AllowsMount(targets[0], requestedAccessMode == MountAccessMode.ReadOnly))
+                    return (false, CatalogMountPolicy.Refusal(targets[0], requestedAccessMode));
+            }
+
             // The admitted snapshot also covers upgrade-remount letter selection.
             IReadOnlyList<MountedVolumeState>? refreshedMounted = null;
             var remountWarnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -881,7 +911,8 @@ public sealed class ApfsMountWorker : BackgroundService
                 continue;
             }
 
-            if (!_mountPolicy.ShouldAutoMount(volume) ||
+            if (!CatalogMountPolicy.AllowsOrdinaryMount(volume) ||
+                !_mountPolicy.ShouldAutoMount(volume) ||
                 options.SkipEncryptedVolumes && volume.IsEncrypted ||
                 !volume.SupportsExplorerMount)
             {
@@ -2493,7 +2524,7 @@ public sealed class ApfsMountWorker : BackgroundService
         int inFlightMutationCallbacks = 0
     )
     {
-        _statusPublisher.Publish(
+        PublishWithCurrentInventory(
             new StatusChangedPayload(
                 State: state,
                 MountPoints: mounts
@@ -2527,6 +2558,19 @@ public sealed class ApfsMountWorker : BackgroundService
                 NativeWriteDiagnostics: nativeWriteDiagnostics
             )
         );
+    }
+
+    private void PublishWithCurrentInventory(StatusChangedPayload payload)
+    {
+        Action? notification;
+        lock (_discoveryAdmissionSync)
+        {
+            payload = payload with { ConnectedInventory = _admittedDiscovery?.Inventory };
+            StatusChangedPayload latest;
+            do { latest = _statusPublisher.Latest; }
+            while (!_statusPublisher.TryPublish(latest, payload, out notification));
+        }
+        notification?.Invoke();
     }
 
     private static IReadOnlyList<MountedVolumeDisplay> BuildMountedVolumeDisplays(IReadOnlyList<MountedVolumeState> mounts)
@@ -2582,7 +2626,9 @@ public sealed class ApfsMountWorker : BackgroundService
                 CatalogVolumeObjectId: mount.CatalogVolumeObjectId,
                 CatalogDecision: mount.CatalogDecision,
                 CatalogReasons: mount.CatalogReasons,
-                CatalogAutoMountAllowed: mount.CatalogAutoMountAllowed))
+                CatalogAutoMountAllowed: mount.CatalogAutoMountAllowed,
+                CatalogSpace: mount.CatalogSpace,
+                HasRuntimeStatus: true))
             .OrderBy(static volume => volume.MountPoint, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 

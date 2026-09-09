@@ -1,6 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://apfsaccess.local/schemas/observer-evidence-v1.json",
+  "$comment": "Evidence v1 remains legacy-compatible only when topologyMetadataVersion and all extension fields are absent. Extension v1 is complete-or-reject; sharedSpace null means unknown. Present projections are single-store checkpoint observations, not allocation enforcement. Semantic identity and checked arithmetic validation is also mandatory.",
   "title": "APFS repo-owned observer evidence record",
   "type": "object",
   "additionalProperties": false,
@@ -19,6 +20,7 @@
   "properties": {
     "format": { "const": "apfs-access-raw-evidence" },
     "version": { "const": 1 },
+    "topologyMetadataVersion": { "const": 1 },
     "observerId": { "const": "apfs-access-owned-raw-observer" },
     "observerVersion": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+$" },
     "mode": { "enum": ["collect", "fusion"] },
@@ -31,7 +33,249 @@
     },
     "topology": { "$ref": "#/$defs/topology" }
   },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "topologyMetadataVersion"
+        ]
+      },
+      "then": {
+        "properties": {
+          "topology": {
+            "properties": {
+              "containers": {
+                "items": {
+                  "required": [
+                    "sharedSpace"
+                  ]
+                }
+              },
+              "volumes": {
+                "items": {
+                  "required": [
+                    "roleName",
+                    "groupUuid",
+                    "groupMetadataValid",
+                    "groupAssociationStatus"
+                  ]
+                }
+              },
+              "groups": {
+                "items": {
+                  "required": [
+                    "containerId",
+                    "associationStatus",
+                    "systemVolumeId",
+                    "dataVolumeId"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "topology": {
+            "properties": {
+              "containers": {
+                "items": {
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "sharedSpace"
+                        ]
+                      }
+                    ]
+                  }
+                }
+              },
+              "volumes": {
+                "items": {
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "roleName"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "groupUuid"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "groupMetadataValid"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "groupAssociationStatus"
+                        ]
+                      }
+                    ]
+                  }
+                }
+              },
+              "groups": {
+                "items": {
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "containerId"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "associationStatus"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "systemVolumeId"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "dataVolumeId"
+                        ]
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
+    "spaceAmount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "blocks",
+        "bytes"
+      ],
+      "properties": {
+        "blocks": {
+          "$ref": "#/$defs/u64"
+        },
+        "bytes": {
+          "$ref": "#/$defs/u64"
+        }
+      }
+    },
+    "volumeSpace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "volumeId",
+        "objectId",
+        "allocated",
+        "reserve",
+        "quota",
+        "siblingReserveRemaining",
+        "available",
+        "snapshot",
+        "purgeable"
+      ],
+      "properties": {
+        "volumeId": {
+          "$ref": "#/$defs/id"
+        },
+        "objectId": {
+          "$ref": "#/$defs/u64"
+        },
+        "allocated": {
+          "$ref": "#/$defs/spaceAmount"
+        },
+        "reserve": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/spaceAmount"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "quota": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/spaceAmount"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "siblingReserveRemaining": {
+          "$ref": "#/$defs/spaceAmount"
+        },
+        "available": {
+          "$ref": "#/$defs/spaceAmount"
+        },
+        "snapshot": {
+          "type": "null"
+        },
+        "purgeable": {
+          "type": "null"
+        }
+      }
+    },
+    "sharedSpace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "containerId",
+        "checkpointXid",
+        "allocationUnitBytes",
+        "total",
+        "free",
+        "used",
+        "volumes"
+      ],
+      "properties": {
+        "containerId": {
+          "$ref": "#/$defs/id"
+        },
+        "checkpointXid": {
+          "$ref": "#/$defs/u64"
+        },
+        "allocationUnitBytes": {
+          "enum": [
+            4096,
+            8192,
+            16384,
+            32768,
+            65536
+          ]
+        },
+        "total": {
+          "$ref": "#/$defs/spaceAmount"
+        },
+        "free": {
+          "$ref": "#/$defs/spaceAmount"
+        },
+        "used": {
+          "$ref": "#/$defs/spaceAmount"
+        },
+        "volumes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/volumeSpace"
+          }
+        }
+      }
+    },
+
     "id": {
       "type": "string",
       "pattern": "^[a-z-]+:[A-Za-z0-9_.:-]+$"
@@ -46,7 +290,7 @@
     },
     "u64": {
       "type": "string",
-      "pattern": "^[0-9]+$"
+      "pattern": "^(0|[1-9][0-9]{0,19})$"
     },
     "featureBits": {
       "type": "array",
@@ -117,6 +361,7 @@
       "additionalProperties": false,
       "required": ["id", "uuid", "blockSizeBytes", "storeIds", "volumeIds", "fusion", "checkpointXid", "compatibleFeatureBits", "readonlyFeatureBits", "unknownFeatureBits", "incompatibleFeatureBits"],
       "properties": {
+        "sharedSpace": {"anyOf": [{"$ref": "#/$defs/sharedSpace"}, {"type": "null"}]},
         "id": { "$ref": "#/$defs/id" },
         "uuid": { "$ref": "#/$defs/hex32" },
         "blockSizeBytes": { "type": "integer", "minimum": 512 },
@@ -145,6 +390,10 @@
       "additionalProperties": false,
       "required": ["id", "uuid", "objectId", "containerId", "name", "nameUtf8Valid", "roles", "roleRaw", "groupId", "caseMode", "encryptionMode", "locked", "compatibleFeatureBits", "readonlyFeatureBits", "unknownFeatureBits", "incompatibleFeatureBits", "superblockBlock", "superblockXid"],
       "properties": {
+        "roleName": {"enum": ["none", "system", "user", "recovery", "vm", "preboot", "installer", "data", "baseband", "update", "xart", "hardware", "backup", "enterprise", "prelogin", "unknown"]},
+        "groupUuid": {"anyOf": [{"$ref": "#/$defs/hex32"}, {"type": "null"}]},
+        "groupMetadataValid": {"type": "boolean"},
+        "groupAssociationStatus": {"enum": ["none", "incomplete", "valid-system-data", "ambiguous", "malformed"]},
         "id": { "$ref": "#/$defs/id" },
         "uuid": { "type": "string", "pattern": "^([0-9a-f]{32})?$" },
         "objectId": { "$ref": "#/$defs/u64" },
@@ -175,6 +424,10 @@
       "additionalProperties": false,
       "required": ["id", "uuid", "volumeIds"],
       "properties": {
+        "containerId": {"$ref": "#/$defs/id"},
+        "associationStatus": {"enum": ["incomplete", "valid-system-data", "ambiguous", "malformed"]},
+        "systemVolumeId": {"type": ["string", "null"]},
+        "dataVolumeId": {"type": ["string", "null"]},
         "id": { "$ref": "#/$defs/id" },
         "uuid": { "$ref": "#/$defs/hex32" },
         "volumeIds": {

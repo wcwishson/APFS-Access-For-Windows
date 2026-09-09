@@ -22,6 +22,7 @@ add_library(ApfsAccess.ApfsRwEngine STATIC
     src/ApfsCompression.cpp
     src/ApfsExtendedRecordCodec.cpp
     src/ApfsFormat.cpp
+    src/ApfsSharedSpace.cpp
     src/ApfsNameCodec.cpp
     src/ApfsObjectMapStore.cpp
     src/ApfsSpacemanStore.cpp
@@ -50,6 +51,7 @@ add_library(ApfsAccess.ApfsRwEngine STATIC
     ../../third_party/lzfse/lzfse_decode_base.c
     ../../third_party/lzfse/lzfse_fse.c
     ../../third_party/lzfse/apfsaccess_lzfse.c
+    ../../third_party/lzbitmap/apfsaccess_lzbitmap.c
 )
 
 target_include_directories(ApfsAccess.ApfsRwEngine
@@ -58,6 +60,7 @@ target_include_directories(ApfsAccess.ApfsRwEngine
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/zlib
         ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/lzfse
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/lzbitmap
 )
 
 target_compile_features(ApfsAccess.ApfsRwEngine PUBLIC cxx_std_20)
@@ -107,8 +110,28 @@ if(MSVC)
 endif()
 
 if(BUILD_TESTING)
+    foreach(_clone_test AppleCloneCowTests AppleCloneStoreTests AppleCloneWalTests)
+        add_executable(ApfsAccess.ApfsRwEngine.${_clone_test} tests/${_clone_test}.cpp)
+        target_link_libraries(ApfsAccess.ApfsRwEngine.${_clone_test} PRIVATE ApfsAccess.ApfsRwEngine)
+        target_compile_features(ApfsAccess.ApfsRwEngine.${_clone_test} PRIVATE cxx_std_20)
+        if(MSVC)
+            target_compile_options(ApfsAccess.ApfsRwEngine.${_clone_test} PRIVATE /W4 /permissive-)
+            set_property(TARGET ApfsAccess.ApfsRwEngine.${_clone_test} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+        endif()
+        add_test(NAME ApfsAccess.ApfsRwEngine.${_clone_test} COMMAND ApfsAccess.ApfsRwEngine.${_clone_test})
+    endforeach()
+    target_sources(ApfsAccess.ApfsRwEngine.AppleCloneWalTests PRIVATE tools/Sha256Portable.cpp)
+    add_executable(ApfsAccess.ApfsRwEngine.VolumeSpaceTests tests/ApfsVolumeSpaceTests.cpp)
+    target_link_libraries(ApfsAccess.ApfsRwEngine.VolumeSpaceTests PRIVATE ApfsAccess.ApfsRwEngine)
+    target_compile_features(ApfsAccess.ApfsRwEngine.VolumeSpaceTests PRIVATE cxx_std_20)
+    add_test(NAME ApfsAccess.ApfsRwEngine.VolumeSpaceTests COMMAND ApfsAccess.ApfsRwEngine.VolumeSpaceTests)
+    add_executable(ApfsAccess.ApfsRwEngine.AppleVolumeTransactionTests tests/AppleVolumeTransactionTests.cpp)
+    target_link_libraries(ApfsAccess.ApfsRwEngine.AppleVolumeTransactionTests PRIVATE ApfsAccess.ApfsRwEngine)
+    target_compile_features(ApfsAccess.ApfsRwEngine.AppleVolumeTransactionTests PRIVATE cxx_std_20)
+    add_test(NAME ApfsAccess.ApfsRwEngine.AppleVolumeTransactionTests COMMAND ApfsAccess.ApfsRwEngine.AppleVolumeTransactionTests)
     add_executable(ApfsAccess.ApfsRwEngine.CompressionTests tests/ApfsCompressionTests.cpp)
-    target_include_directories(ApfsAccess.ApfsRwEngine.CompressionTests PRIVATE ../../third_party/lzfse)
+    target_include_directories(ApfsAccess.ApfsRwEngine.CompressionTests PRIVATE
+        ../../third_party/lzfse ../../third_party/lzbitmap)
     target_link_libraries(ApfsAccess.ApfsRwEngine.CompressionTests PRIVATE ApfsAccess.ApfsRwEngine)
     target_compile_features(ApfsAccess.ApfsRwEngine.CompressionTests PRIVATE cxx_std_20)
     add_test(NAME ApfsAccess.ApfsRwEngine.CompressionTests COMMAND ApfsAccess.ApfsRwEngine.CompressionTests)

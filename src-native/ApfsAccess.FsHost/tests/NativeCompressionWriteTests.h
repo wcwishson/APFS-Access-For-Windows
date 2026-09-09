@@ -1,17 +1,126 @@
 #pragma once
 
-bool TestNativeCompressionWriteCallbacks(bool interrupted = false)
+// Reopen the actual failed callback's accepted WAL and spool using the same
+// bootstrap sequence as NativeCompressionRestartTests.h, without runtime guards
+// inherited from its original context. The caller has already closed aliases.
+bool HostCompressionWriteRecoverAccepted(HostCompressionRewrite211Fixture& fixture,
+    const std::vector<std::byte>& expected, bool already_published = true)
+{
+    using Store = apfsaccess::rw::MetadataStore;
+    using Tx = apfsaccess::rw::TransactionManager;
+    using Spool = apfsaccess::rw::PayloadSpool;
+    auto& original = *fixture.fixture.context;
+    const auto marks = original.tx_manager->Watermarks();
+    const auto image = ReadFileBytes(fixture.fixture.image.path);
+    const auto wal_path = original.session_root / "accepted.wal";
+    const auto spool_path = original.payload_spool->SpoolFilePath();
+    const auto wal_bytes = ReadFileBytes(wal_path);
+    const auto spool_bytes = ReadFileBytes(spool_path);
+    auto recovered = std::make_unique<MountContext>();
+    recovered->args = original.args;
+    recovered->args.write_crash_replay_mode = L"ReplayIfSafe";
+    recovered->session_root = original.session_root;
+    recovered->cache_root = original.cache_root;
+    recovered->recovery_marker_file = original.recovery_marker_file;
+    ResetRecoveryMarkerCache(&original);
+    fixture.fixture.context.reset();
+    fixture.fixture.context = std::move(recovered);
+    auto& c = *fixture.fixture.context;
+    c.native_write_enabled = true;
+    SeedRoot(c);
+    std::array<std::byte, 16> security{};
+    SeedSecurity(c, security);
+    const auto startup = LoadRecoveryMarkerAtStartup(c);
+    if (!Require(startup.load_status == RecoveryMarkerLoadStatus::Loaded && startup.state.dirty &&
+            startup.action == LoadedRecoveryMarkerAction::ReplayIfSafe && c.native_write_enabled &&
+            c.compression_verification_pending.load() == 0 && !HasBlockedRecoveryEvidence(c),
+            "modern callback recovery starts fresh from the persisted dirty marker")) return false;
+    c.tx_journal_file = wal_path;
+    c.tx_manager = std::make_unique<Tx>(L"Conservative");
+    c.tx_manager->SetVolumeIdentity(L"directory-symlink-volume");
+    c.tx_manager->SetJournalPath(wal_path.wstring());
+    bool wal_pending = c.tx_manager->HasUnappliedAcceptedWork();
+    if (!Require(wal_pending && ArmRecoveryMarkerForPendingWriteAheadLog(c, wal_pending),
+            "modern restart rediscovers real accepted callback WAL")) return false;
+    c.payload_spool_volume_identity = "directory-symlink-volume";
+    c.payload_spool = std::make_unique<Spool>(Spool::Options{
+        spool_path.parent_path(), c.payload_spool_volume_identity, 1024 * 1024});
+    bool spool_pending = c.payload_spool->RecoveryRequired();
+    c.owned_metadata_store = std::make_unique<Store>(fixture.fixture.volume);
+    c.metadata_store = c.owned_metadata_store.get();
+    // Match startup before replay: journal payloads are materialized into the
+    // new session's hydration store, then read through these production helpers.
+    c.metadata_store->SetFilePayloadProvider([&c](const std::wstring& path, std::uint64_t size) {
+        return LoadHydratedPayloadForPath(&c, path, size, false);
+    });
+    c.metadata_store->SetFilePayloadRangeProvider([&c](const std::wstring& path,
+        Store::PayloadIdentity identity, std::uint64_t offset, std::span<std::byte> bytes) {
+        return ReadHydratedPayloadRangeForPath(&c, path, identity, offset, bytes);
+    });
+    std::vector<Tx::AcceptedTransaction> batches;
+    if (!Require(c.metadata_store->PrepareNativeWritePath() && c.metadata_store->IsCanonicalCommitReady() &&
+            c.tx_manager->RecoveryStateValid() && spool_pending &&
+            c.tx_manager->LoadUnappliedAcceptedTransactions(batches) && batches.size() == 1 &&
+            batches.front().accepted_sequence == marks.accepted_sequence &&
+            wal_bytes == ReadFileBytes(wal_path) && spool_bytes == ReadFileBytes(spool_path) &&
+            apfsaccess::fshost::NativeCompressionReplay::Verify(*c.metadata_store, *c.tx_manager,
+                marks.accepted_sequence, c.payload_spool.get(), c.payload_spool_volume_identity) ==
+                (already_published ? apfsaccess::fshost::NativeCompressionReplay::Result::Verified :
+                    apfsaccess::fshost::NativeCompressionReplay::Result::HistoryUnsupported) &&
+            c.metadata_store->CheckpointXid() == batches.front().preimage_checkpoint_xid + (already_published ? 1 : 0),
+            "fresh recovery distinguishes the original preimage from a proven published conversion")) return false;
+    const auto expected_checkpoint = batches.front().preimage_checkpoint_xid + 1;
+    c.runtime_last_commit_xid = ResolveCleanRecoveryCheckpointXid(*c.metadata_store);
+    if (!Require(ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(c),
+            "production bootstrap recovers the real interrupted modern callback")) return false;
+    wal_pending = false;
+    spool_pending = c.payload_spool->RecoveryRequired();
+    ReconcilePayloadSpoolRecoveryAfterMetadataBootstrap(c, spool_pending);
+    ReconcileWriteAheadLogRecoveryAfterMetadataBootstrap(c, wal_pending);
+    const auto after = c.tx_manager->Watermarks();
+    const auto spool = c.payload_spool->SnapshotCounters();
+    std::vector<std::uint64_t> pins;
+    RecoveryMarkerState marker{};
+    if (!Require(after.accepted_sequence == marks.accepted_sequence &&
+            after.apfs_durable_sequence == marks.accepted_sequence && after.cleanup_sequence == marks.accepted_sequence &&
+            c.tx_manager->CanClearRecoveryState() && c.tx_manager->LoadAcceptedTransactionsSinceCleanup(batches) && batches.empty() &&
+            c.tx_manager->LoadRequiredCheckpointXidsSinceCleanup(pins) && pins.empty() &&
+            spool.spool_bytes == 0 && spool.dirty_range_count == 0 && ReadFileBytes(spool_path).empty() &&
+            !c.payload_spool->RecoveryRequired() && TryLoadRecoveryMarkerState(c.recovery_marker_file, marker) && !marker.dirty &&
+            !c.recovery_active && !c.pending_native_writes && !c.write_degraded && IsMutationWriteEnabled(&c) &&
+            c.metadata_store->CheckpointXid() == expected_checkpoint &&
+            (already_published ? image == ReadFileBytes(fixture.fixture.image.path) :
+                image != ReadFileBytes(fixture.fixture.image.path)) && MergeCommittedInodeStateIntoNodeIndex(&c),
+            "verified modern recovery publishes only when needed and cleans WAL debt, spool and pins")) return false;
+    auto fs = BuildFileSystem(&c);
+    for (const auto path : {L"\\compressed", L"\\alias"})
+    {
+        PVOID reader = nullptr;
+        FSP_FSCTL_FILE_INFO info{};
+        ScopeExit close{[&] { if (reader) CB_Close(&fs, reader); }};
+        std::vector<std::byte> actual(expected.size(), std::byte{0xa6});
+        ULONG done = 999;
+        if (!Require(CB_Open(&fs, const_cast<PWSTR>(path), FILE_OPEN << 24, GENERIC_READ, &reader, &info) == STATUS_SUCCESS &&
+                reader && CB_Read(&fs, reader, actual.data(), 0, static_cast<ULONG>(actual.size()), &done) == STATUS_SUCCESS &&
+                done == actual.size() && actual == expected && CB_Flush(&fs, reader, &info) == STATUS_SUCCESS,
+                "fresh recovered callbacks read all independently expected bytes through both aliases")) return false;
+    }
+    return true;
+}
+
+bool TestNativeCompressionWriteCallbacks(bool interrupted = false, unsigned only_type = 0)
 {
     using Store = apfsaccess::rw::MetadataStore;
     using Tx = apfsaccess::rw::TransactionManager;
     if (!CompressionReplay222ScratchReady()) return false;
     bool passed = true;
-    for (const auto type : {1u, 3u, 4u})
+    for (const auto type : only_type ? std::vector<unsigned>{only_type} : std::vector<unsigned>{1u, 3u, 4u})
     for (unsigned variant = 0; variant < (interrupted ? 4u : 2u); ++variant)
     {
         const bool archive_refusal = !interrupted && variant == 1;
         HostCompressionRewrite211Fixture fixture;
-        if (!Require(fixture.Initialize(type, false, false, false, archive_refusal),
+        const bool modern = type >= 7 && type <= 14;
+        if (!Require(fixture.Initialize(type, false, false, modern, archive_refusal),
                 "foreground rewrite fixture initializes")) return false;
         auto& c = *fixture.fixture.context;
         c.args.write_recovery_policy = interrupted && (variant & 1) ? L"BestEffort" : L"FailClosed";
@@ -19,7 +128,12 @@ bool TestNativeCompressionWriteCallbacks(bool interrupted = false)
         const auto initial = c.metadata_store->LookupCommittedInodeByPath(L"\\compressed");
         std::vector<std::byte> expected;
         if (!Require(initial && c.metadata_store->ReadCommittedFileRange(L"\\compressed", 0,
-                fixture.eof, expected), "capture complete original compressed bytes")) return false;
+                fixture.eof, expected) && expected == fixture.expected_source,
+                "complete original compressed bytes match an independent expected vector")) return false;
+        const auto finder = c.metadata_store->LookupCommittedExtendedAttribute(initial->object_id, "com.apple.FinderInfo");
+        const auto mac_security = c.metadata_store->LookupCommittedExtendedAttribute(initial->object_id, kAppleSecurityName);
+        const auto independent_fork = c.metadata_store->LookupCommittedExtendedAttribute(initial->object_id, "com.apple.ResourceFork");
+        const auto source_image = ReadFileBytes(fixture.fixture.image.path);
         FSP_FSCTL_FILE_INFO info{};
         PVOID writer = nullptr, reader = nullptr, unrelated = nullptr;
         ScopeExit close{[&] {
@@ -68,7 +182,7 @@ bool TestNativeCompressionWriteCallbacks(bool interrupted = false)
             const auto after = c.tx_manager->Watermarks();
             const auto after_spool = c.payload_spool->SnapshotCounters();
             const auto after_working = c.metadata_store->LookupWorkingInodeByPath(L"\\unrelated-pending");
-            if (!Require(refused_status == STATUS_NOT_SUPPORTED && refused_done == 0 &&
+            if (!Require(refused_status == STATUS_NOT_SUPPORTED && refused_done == 0 && refused == std::byte{'R'} &&
                     xid == c.metadata_store->CheckpointXid() && image == ReadFileBytes(fixture.fixture.image.path) &&
                     wal == ReadFileBytes(c.session_root / "accepted.wal") && marker == ReadFileBytes(c.recovery_marker_file) &&
                     marks.accepted_sequence == after.accepted_sequence &&
@@ -87,7 +201,7 @@ bool TestNativeCompressionWriteCallbacks(bool interrupted = false)
         bool transition_checked = false;
         const bool proof_refusal = interrupted && variant >= 2;
         ScopeExit clear_hook{[&] {
-            c.metadata_store->SetCommitStageHook({});
+            if (fixture.fixture.context->metadata_store) fixture.fixture.context->metadata_store->SetCommitStageHook({});
             g_compressed_after_publication_hook = {};
             g_compressed_refuse_publication_proof = false;
         }};
@@ -223,8 +337,34 @@ bool TestNativeCompressionWriteCallbacks(bool interrupted = false)
                 !fresh.LookupCommittedExtendedAttribute(initial->object_id, "com.apple.decmpfs"),
                 "native conversion preserves Mac permissions and identity")) return false;
         const auto retained_fork = fresh.LookupCommittedExtendedAttribute(initial->object_id, "com.apple.ResourceFork");
-        if (!Require(retained_fork.has_value() == (type != 4),
+        if (!Require(retained_fork.has_value() == !fixture.UsesResourceFork(type),
                 "independent resource forks survive; only compression-owned forks retire")) return false;
+        const auto same_attribute = [](const auto& before, const auto& after) {
+            return before.has_value() == after.has_value() &&
+                (!before || (before->flags == after->flags && before->data == after->data));
+        };
+        const auto published_image = ReadFileBytes(fixture.fixture.image.path);
+        if (!Require(same_attribute(finder, fresh.LookupCommittedExtendedAttribute(initial->object_id, "com.apple.FinderInfo")) &&
+                same_attribute(mac_security, fresh.LookupCommittedExtendedAttribute(initial->object_id, kAppleSecurityName)) &&
+                (fixture.UsesResourceFork(type) || same_attribute(independent_fork, retained_fork)) &&
+                (!modern || (source_image.size() >= 104 * 4096 && published_image.size() >= 104 * 4096 &&
+                    std::equal(source_image.begin() + 103 * 4096, source_image.begin() + 104 * 4096,
+                        published_image.begin() + 103 * 4096))),
+                "conversion preserves Finder/security metadata and external Finder source block 103 exactly")) return false;
+        std::array<std::byte, 32> finder_bytes{};
+        std::size_t read = 0;
+        if (!Require(fresh.ReadCommittedExtendedAttributeRange(initial->object_id, "com.apple.FinderInfo", 0, finder_bytes, read) &&
+                read == finder_bytes.size() && std::all_of(finder_bytes.begin(), finder_bytes.end(),
+                    [](auto byte) { return byte == std::byte{0x46}; }),
+                "preserved embedded or external FinderInfo remains readable byte for byte")) return false;
+        if (!fixture.UsesResourceFork(type))
+        {
+            std::array<std::byte, 3> fork_bytes{};
+            if (!Require(fresh.ReadCommittedExtendedAttributeRange(initial->object_id, "com.apple.ResourceFork", 0, fork_bytes, read) &&
+                    read == fork_bytes.size() && fork_bytes == std::array<std::byte, 3>{std::byte{0x46}, std::byte{0x00}, std::byte{0x80}},
+                    "independent opaque Mac resource bytes survive inline conversion exactly")) return false;
+        }
+        if (interrupted && modern && !HostCompressionWriteRecoverAccepted(fixture, expected)) return false;
     }
     return passed;
 }

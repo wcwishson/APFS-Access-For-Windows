@@ -54,6 +54,8 @@ public sealed class CatalogWriteGateTests
             SupportsReadWrite = true,
             SupportsNativeWrite = true,
             WriteBlockReason = null,
+            CatalogReasons = [],
+            CatalogAutoMountAllowed = true,
         };
 
         var gate = WriteGatePolicy.EvaluateForVolume(OverrideConfig(), volume);

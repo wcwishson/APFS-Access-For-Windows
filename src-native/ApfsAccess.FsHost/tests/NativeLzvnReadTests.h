@@ -3,7 +3,8 @@
 // Task5: include after the existing compression fixture helpers. Registration
 // belongs to the parent. These are synthetic Apple-format images, not an
 // Apple-made corpus or evidence of macOS acceptance. No WinFsp mount is needed.
-bool RunNativeCompressionReadTask5(bool malformed, bool resource_backed = false, bool lzfse = false)
+bool RunNativeCompressionReadTask5(bool malformed, bool resource_backed = false, bool lzfse = false,
+    unsigned remaining_type = 0)
 {
     using namespace apfsaccess::rw;
     using Store = MetadataStore;
@@ -49,10 +50,19 @@ bool RunNativeCompressionReadTask5(bool malformed, bool resource_backed = false,
         if (!add(EncodeAppleDirectoryRecord(link, encoded, error))) return false;
         // Frozen vectors from TestLzvnInlineKnownBytes/TestLzvnInlineRefusals.
         // e5 + "hello" + canonical EOS; malformed variant has a partial EOS.
-        const auto payload = HostCompressionHex(lzfse ? (malformed ?
+        auto payload = HostCompressionHex(lzfse ? (malformed ?
             "6276782d0500000068656c6c6f627678" : "6276782d0500000068656c6c6f62767824") : (malformed ?
                 "e568656c6c6f06" : "e568656c6c6f0600000000000000"));
-        const auto type = lzfse ? (resource_backed ? 12 : 11) : (resource_backed ? 8 : 7);
+        const auto type = remaining_type ? remaining_type : lzfse ? (resource_backed ? 12 : 11) : (resource_backed ? 8 : 7);
+        if (remaining_type)
+        {
+            resource_backed = type == 10 || type == 14;
+            payload = HostCompressionHex(type == 9 || type == 10 ?
+                (malformed ? "cd68656c6c6f" : "cc68656c6c6f") :
+                (malformed ? "5a424d090b000005000068656c6c6f0600000000" :
+                    "5a424d090b000005000068656c6c6f060000000000"));
+        }
+        const bool rewrite_supported = CompressionRewrite::SupportsType(type);
         const auto marker = HostCompressionAttribute(type, 5,
             resource_backed ? std::vector<std::byte>{} : payload);
         std::vector<std::byte> fork;
@@ -79,7 +89,7 @@ bool RunNativeCompressionReadTask5(bool malformed, bool resource_backed = false,
                 "Task5 canonical authority retains the compressed mutation guard")) return false;
         const auto plan = store.SnapshotCommittedFileReadPlan(NodePathKey(&c, *node));
         if (!Require(plan && plan->HasCompressionReadCandidate() && plan->unsupported_content_transform,
-                "Task5 type7 is a read candidate, not write authority")) return false;
+                "Task5 compressed read candidate retains the ordinary mutation guard")) return false;
         const auto security = node->native_security;
         const auto preserved = [&] {
             const auto current = store.LookupCommittedInodeByPath(L"\\compressed");
@@ -166,22 +176,36 @@ bool RunNativeCompressionReadTask5(bool malformed, bool resource_backed = false,
         for (const UINT32 access : std::array<UINT32, 4>{FILE_WRITE_DATA, FILE_APPEND_DATA,
                 FILE_READ_DATA | FILE_WRITE_DATA, GENERIC_ALL})
         {
-            PVOID denied = nullptr;
-            const auto result = CB_Open(&fs, const_cast<PWSTR>(L"\\compressed"), FILE_OPEN << 24, access, &denied, &info);
-            const bool refused = result == STATUS_NOT_SUPPORTED && !denied;
-            if (denied) CB_Close(&fs, denied);
-            if (!Require(refused, "Task5 type7 write/append Open stays outside rewrite allowlist 1/3/4") || !unchanged()) return false;
+            PVOID opened = nullptr;
+            const auto result = CB_Open(&fs, const_cast<PWSTR>(L"\\compressed"), FILE_OPEN << 24, access, &opened, &info);
+            // CB_Open requires FILE_WRITE_DATA for bounded conversion;
+            // append-only access still has no supported rewrite operation.
+            const bool allowed = rewrite_supported && !malformed && access != FILE_APPEND_DATA;
+            const bool matches = allowed ? result == STATUS_SUCCESS && opened && info.FileSize == 5 :
+                result == STATUS_NOT_SUPPORTED && !opened;
+            if (opened) CB_Close(&fs, opened);
+            if (!Require(matches, "Task5 valid modern sources allow safe write Open; malformed and append-only opens refuse") ||
+                !unchanged()) return false;
         }
         Store::MutationRequest rewrite;
-        if (!Require(!CanOpenNativeCompressionRewrite(&c, node) &&
-                !store.PrepareCompressionRewrite(L"\\compressed", rewrite),
-                "Task5 native rewrite preparation refuses type7") || !unchanged()) return false;
+        const bool candidate = CanOpenNativeCompressionRewrite(&c, node);
+        const bool prepared = store.PrepareCompressionRewrite(L"\\compressed", rewrite);
+        // Manifest Open deliberately checks only the header; its data probe
+        // above and full preparation here must still reject malformed streams.
+        // Type 9's unsupported marker is rejected by Inspect itself, so even
+        // the manifest's bounded header check refuses it before preparation.
+        if (!Require(candidate == (rewrite_supported && (!malformed || (manifest && type != 9))) &&
+                prepared == (rewrite_supported && !malformed) &&
+                (!prepared || (rewrite.object_id == 17 && !rewrite.inline_payload.empty())),
+                "Task5 full modern rewrite preparation validates content without mutation") || !unchanged()) return false;
         std::byte replacement{'Z'};
         for (const bool append : {false, true})
         {
+            if (rewrite_supported && !malformed && !append) continue; // Actual bounded edits live in the modern callback group.
             ULONG done = 999;
-            if (!Require(CB_Write(&fs, &retained, &replacement, 1, 1, append, FALSE, &done, &info) == STATUS_NOT_SUPPORTED && done == 0,
-                    "Task5 retained writable context cannot modify or append type7") || !unchanged()) return false;
+            if (!Require(CB_Write(&fs, &retained, &replacement, 1, 1, append, FALSE, &done, &info) == STATUS_NOT_SUPPORTED &&
+                    done == 0 && replacement == std::byte{'Z'},
+                    "Task5 malformed writes and EOF growth refuse without changing caller bytes") || !unchanged()) return false;
         }
         for (const auto size : {0ULL, 5ULL, 4096ULL})
         for (const BOOLEAN allocation : std::array<BOOLEAN, 2>{FALSE, TRUE})
@@ -210,3 +234,10 @@ bool TestNativeLzfseReadTask5() { return RunNativeCompressionReadTask5(false, fa
 bool TestNativeLzfseMalformedReadTask5() { return RunNativeCompressionReadTask5(true, false, true); }
 bool TestNativeLzfseResourceReadTask5() { return RunNativeCompressionReadTask5(false, true, true); }
 bool TestNativeLzfseResourceMalformedReadTask5() { return RunNativeCompressionReadTask5(true, true, true); }
+
+bool TestNativeRemainingCodecReads(bool malformed)
+{
+    for (const unsigned type : {9u, 10u, 13u, 14u})
+        if (!RunNativeCompressionReadTask5(malformed, type == 10 || type == 14, false, type)) return false;
+    return true;
+}

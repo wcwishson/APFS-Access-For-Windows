@@ -5026,15 +5026,29 @@ bool TestManifestRejectsOversizedInput()
 
 } // namespace
 
+#include "ContainerMountCoordinatorSharedSpaceTests.h"
+
 int main(int argc, char** argv)
 {
     bool ok = true;
     const bool diagnostics_only = argc == 2 && std::string(argv[1]) == "--test-coordinator-diagnostics";
     const bool reload_boundaries_only = argc == 2 && std::string(argv[1]) == "--test-coordinator-reload-boundaries";
-    if (argc != 1 && !diagnostics_only && !reload_boundaries_only)
+    const bool shared_space_only = argc == 2 && std::string(argv[1]) == "--test-coordinator-shared-space";
+    if (argc != 1 && !diagnostics_only && !reload_boundaries_only && !shared_space_only)
     {
         std::fprintf(stderr, "unknown coordinator test selector\n");
         return 2;
+    }
+    if (argc == 1 || shared_space_only)
+    {
+        ok &= shared_space_tests::TestIdentitiesAndLegacy();
+        ok &= shared_space_tests::TestSiblingPublicationAndStaleRefresh();
+        ok &= shared_space_tests::TestHeldCommitLookup(false);
+        ok &= shared_space_tests::TestHeldCommitLookup(true);
+        ok &= shared_space_tests::TestFailedPublicationCannotRestoreStaleSession(0);
+        ok &= shared_space_tests::TestFailedPublicationCannotRestoreStaleSession(1);
+        ok &= shared_space_tests::TestFailedPublicationCannotRestoreStaleSession(2);
+        ok &= shared_space_tests::TestSnapshotAllocationFailurePreservesDurableResult();
     }
     if (argc == 1 || diagnostics_only || reload_boundaries_only)
     {

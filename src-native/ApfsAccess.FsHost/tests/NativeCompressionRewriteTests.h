@@ -3,13 +3,30 @@
 // DirectorySymlinkFixture and HostCompression* helpers. Include the production
 // header at main.cpp's GLOBAL native-engine include block (see the handoff).
 
+// Independently expected bytes and frozen vectors shared with
+// ApfsCompressionTests.cpp:TestLzvnLargeLogicalRange and LzfseDecoderBridgeTests.h.
+std::vector<std::byte> HostCompressionModernPattern()
+{
+    constexpr std::string_view pattern = "Task5 LZFSE bounded decoder: abcdefghijklmnopqrstuvwxyz 0123456789\n";
+    std::vector<std::byte> bytes(8192);
+    for (std::size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<std::byte>(pattern[i % pattern.size()]);
+    return bytes;
+}
+
+const auto kHostCompressionLzfseV2 = HostCompressionHex(
+    "62767832002000004400e0020005000051b955f7ac110060b00000003cbc400fefc01500000000575700000000f01bbc20bf01000000fc060000000000000000000000000000dc0100000000f0370000000077777777776fc0dddddddd1d0000dcdd01700700777700dc01c01bf006bc013fc3cf7077777777f706dcddbd015fc1dddd1bf006dcbd017777777777000000000000000000000000000000000000000000000000000000000000000000000000c008aa0922b277000e233a59356a0c62b1de7d7f280564d93d6ffaff56dd4e742a2fc2762a345762e42ba5010000000000000000c06ffd7fff7ffcff6062767824");
+
 struct HostCompressionRewrite211Fixture
 {
     DirectorySymlinkFixture fixture{false};
     std::uint64_t eof = 5;
+    std::vector<std::byte> expected_source;
+    std::uint64_t resource_bytes = 0, resource_blocks = 0, resource_first_block = 100;
+
+    static bool UsesResourceFork(unsigned type) { return type == 4 || type == 8 || type == 10 || type == 12 || type == 14; }
 
     bool Initialize(unsigned type, bool corrupt = false, bool omit_name = false, bool external_finder = false,
-        bool archive_clear = false)
+        bool archive_clear = false, std::uint64_t quota_blocks = 0)
     {
         using namespace apfsaccess::rw;
         auto builder = TwoProjectableVolumeStore();
@@ -19,6 +36,7 @@ struct HostCompressionRewrite211Fixture
         builder.authoritative_internal_pool_blocks = 16;
         builder.authoritative_checkpoint_ring_blocks = 16;
         auto& volume = builder.volumes.front();
+        volume.quota_block_count = quota_blocks;
         auto& records = volume.filesystem_records;
         apfsaccess::catalog::BtreeRecord encoded;
         std::string error;
@@ -33,9 +51,113 @@ struct HostCompressionRewrite211Fixture
         eof = content.size();
         auto marker = HostCompressionAttribute(type, eof,
             type == 4 ? std::vector<std::byte>{} : type == 1 ? content : kHostCompressionHello);
+        if (type == 7 || type == 11 || type == 8 || type == 12)
+        {
+            auto payload = HostCompressionHex("e568656c6c6f0600000000000000");
+            if (type == 11) { content = HostCompressionModernPattern(); payload = kHostCompressionLzfseV2; }
+            if (type == 8 || type == 12)
+            {
+                // Both forks span multiple physical blocks and decode across
+                // 64 KiB. At least one block uses actual compression.
+                auto first = HostCompressionHex("400141");
+                for (unsigned i = 0; i < 241; ++i)
+                { first.push_back(std::byte{0xf0}); first.push_back(std::byte{0xff}); }
+                const auto ending = HostCompressionHex("f0cd0600000000000000");
+                first.insert(first.end(), ending.begin(), ending.end());
+                auto tail = HostCompressionModernPattern();
+                if (type == 8) tail.insert(tail.begin(), std::byte{0x06}); // LZVN raw block.
+                else
+                {
+                    // LZFSE raw bvx- block plus EOS, as in the bridge fixture.
+                    first = HostCompressionHex("6276782d00000100");
+                    first.insert(first.end(), 65536, std::byte{'A'});
+                    const auto eos_bytes = HostCompressionHex("62767824");
+                    first.insert(first.end(), eos_bytes.begin(), eos_bytes.end());
+                    tail = kHostCompressionLzfseV2;
+                }
+                resource.assign(12, std::byte{});
+                apfsaccess::testfixture::PutU32LE(resource, 0, 12);
+                apfsaccess::testfixture::PutU32LE(resource, 4, static_cast<std::uint32_t>(12 + first.size()));
+                apfsaccess::testfixture::PutU32LE(resource, 8, static_cast<std::uint32_t>(12 + first.size() + tail.size()));
+                resource.insert(resource.end(), first.begin(), first.end());
+                resource.insert(resource.end(), tail.begin(), tail.end());
+                content.assign(65536, std::byte{'A'});
+                const auto plain_tail = HostCompressionModernPattern();
+                content.insert(content.end(), plain_tail.begin(), plain_tail.end());
+                payload.clear();
+            }
+            eof = content.size();
+            marker = HostCompressionAttribute(type, eof, payload);
+        }
+        if (type == 9 || type == 10 || type == 13 || type == 14)
+        {
+            // One literal bitmap seeds ABCDEFGH; three back-references repeat
+            // it to 32 bytes. Frozen independently from the range codec tests.
+            const auto bitmap = HostCompressionHex(
+                "5a424d092a000020000017000017000017000041424344454647484344ff00000000000000000000000000000000060000000000");
+            std::vector<std::byte> bitmap_plain(32);
+            for (std::size_t i = 0; i < bitmap_plain.size(); ++i) bitmap_plain[i] = std::byte('A' + i % 8);
+            const auto encode = [type](const std::vector<std::byte>& plain) {
+                if (type == 9 || type == 10)
+                {
+                    std::vector<std::byte> bytes{std::byte{0xcc}};
+                    bytes.insert(bytes.end(), plain.begin(), plain.end());
+                    return bytes;
+                }
+                // ZBM's internal chunks are at most 32 KiB, independently of
+                // the enclosing APFS resource codec's 64 KiB block size.
+                auto bytes = HostCompressionHex("5a424d09");
+                for (std::size_t offset = 0; offset < plain.size();)
+                {
+                    const auto chunk = (std::min)(std::size_t{32768}, plain.size() - offset);
+                    for (const auto count : {chunk + 6, chunk})
+                        for (unsigned i = 0; i < 3; ++i) bytes.push_back(std::byte((count >> (8*i)) & 255));
+                    bytes.insert(bytes.end(), plain.begin() + offset, plain.begin() + offset + chunk);
+                    offset += chunk;
+                }
+                const auto end = HostCompressionHex("060000000000");
+                bytes.insert(bytes.end(), end.begin(), end.end());
+                return bytes;
+            };
+            if (type == 13) content = bitmap_plain;
+            auto payload = type == 13 ? bitmap : encode(content);
+            if (UsesResourceFork(type))
+            {
+                const auto first = encode(std::vector<std::byte>(65536, std::byte{'A'}));
+                const auto tail = type == 14 ? bitmap_plain : HostCompressionModernPattern();
+                const auto second = type == 14 ? bitmap : encode(tail);
+                resource.assign(12, std::byte{});
+                apfsaccess::testfixture::PutU32LE(resource, 0, 12);
+                apfsaccess::testfixture::PutU32LE(resource, 4, static_cast<std::uint32_t>(12 + first.size()));
+                apfsaccess::testfixture::PutU32LE(resource, 8, static_cast<std::uint32_t>(12 + first.size() + second.size()));
+                resource.insert(resource.end(), first.begin(), first.end());
+                resource.insert(resource.end(), second.begin(), second.end());
+                content.assign(65536, std::byte{'A'});
+                content.insert(content.end(), tail.begin(), tail.end());
+                payload.clear();
+            }
+            eof = content.size();
+            marker = HostCompressionAttribute(type, eof, payload);
+        }
+        expected_source = content;
         if (corrupt)
         {
-            if (type == 4) resource.pop_back(); // First block remains readable; complete EOF validation must refuse.
+            if (UsesResourceFork(type))
+            {
+                if (type == 10)
+                {
+                    // A wrong raw marker leaves the whole offset table valid:
+                    // the first block reads, but preparing the full tail fails.
+                    const auto tail_offset = 12 + 65537;
+                    resource.at(tail_offset) = std::byte{0xcd};
+                }
+                else resource.pop_back();
+                // Keep modern tables valid so the first block remains readable;
+                // full-source preparation must discover the truncated final block.
+                if (type == 8 || type == 10 || type == 12 || type == 14)
+                    apfsaccess::testfixture::PutU32LE(resource, 8, static_cast<std::uint32_t>(resource.size()));
+            }
+            else if (type == 7 || type == 9 || type == 11 || type == 13) marker.pop_back();
             else marker.back() ^= std::byte{1};
         }
         AppleInodeRecord inode;
@@ -69,19 +191,33 @@ struct HostCompressionRewrite211Fixture
             (!external_finder && !add(EncodeAppleXattrRecord({17, "com.apple.FinderInfo", kAppleXattrDataEmbedded,
                 std::vector<std::byte>(32, std::byte{0x46})}, encoded, error)))) return false;
         std::vector<std::byte> descriptor(kAppleXattrDataStreamBytes);
+        resource_bytes = resource.size();
+        resource_blocks = (resource_bytes + 4095) / 4096;
+        // Block 103 belongs exclusively to the external FinderInfo fixture.
+        resource_first_block = resource_blocks > 1 ? 104 : 100;
+        const auto resource_allocation = resource_blocks * 4096;
         apfsaccess::testfixture::PutU64LE(descriptor, 0, 777);
         apfsaccess::testfixture::PutU64LE(descriptor, 8, resource.size());
-        apfsaccess::testfixture::PutU64LE(descriptor, 16, 4096);
+        apfsaccess::testfixture::PutU64LE(descriptor, 16, resource_allocation);
         if (!add(EncodeAppleXattrRecord({17, "com.apple.ResourceFork", kAppleXattrDataStream, descriptor}, encoded, error)) ||
             !add(EncodeAppleDataStreamIdRecord({777, 1}, encoded, error)) ||
-            !add(EncodeAppleFileExtentRecord({777, 0, 4096, 100, 0, 4096}, encoded, error)) ||
-            !EncodeApplePhysicalExtentRecord({100, 1, kApplePhysicalExtentKindNew, 777, 1}, encoded, error)) return false;
-        volume.extentref_records.push_back(encoded); ++volume.additional_file_system_allocated_blocks;
-        resource.resize(4096); builder.authoritative_seeded_main_blocks.push_back({100, resource});
+            !add(EncodeAppleFileExtentRecord({777, 0, resource_allocation, resource_first_block, 0, 4096}, encoded, error)) ||
+            !EncodeApplePhysicalExtentRecord({resource_first_block, resource_blocks, kApplePhysicalExtentKindNew, 777, 1}, encoded, error)) return false;
+        volume.extentref_records.push_back(encoded);
+        volume.additional_file_system_allocated_blocks += resource_blocks;
+        resource.resize(static_cast<std::size_t>(resource_allocation));
+        for (std::uint64_t i = 0; i < resource_blocks; ++i)
+        {
+            const auto begin = resource.begin() + static_cast<std::size_t>(i * 4096);
+            // Seed each nonzero block so BuildStoreImage's spaceman bitmap
+            // reserves the complete fork as well as its extent/refcount graph.
+            builder.authoritative_seeded_main_blocks.push_back({resource_first_block + i, {begin, begin + 4096}});
+        }
         if (external_finder)
         {
             apfsaccess::testfixture::PutU64LE(descriptor, 0, 778);
             apfsaccess::testfixture::PutU64LE(descriptor, 8, 32);
+            apfsaccess::testfixture::PutU64LE(descriptor, 16, 4096);
             if (!add(EncodeAppleXattrRecord({17, "com.apple.FinderInfo", kAppleXattrDataStream, descriptor}, encoded, error)) ||
                 !add(EncodeAppleDataStreamIdRecord({778, 1}, encoded, error)) ||
                 !add(EncodeAppleFileExtentRecord({778, 0, 4096, 103, 0, 4096}, encoded, error)) ||
@@ -104,11 +240,13 @@ apfsaccess::fshost::NativeCompressionRewrite::Admission HostCompressionRewrite21
     return admission;
 }
 
-bool TestNativeCompressionRewritePreparation211()
+bool TestNativeCompressionRewritePreparation211(unsigned only_type = 0)
 {
     using Helper = apfsaccess::fshost::NativeCompressionRewrite;
     using Failure = Helper::Failure;
     using Store = apfsaccess::rw::MetadataStore;
+    if (!Require(ToLowerInvariant(std::filesystem::temp_directory_path().root_name().wstring()) == L"d:",
+            "compression preparation requires runner TEMP/TMP on D: before fixture construction")) return false;
     std::uint64_t bytes = 99;
     if (!Require(Helper::PublicationBytes(1, 4096, bytes) && bytes == 4096 &&
             Helper::PublicationBytes(65541, 4096, bytes) && bytes == 69632 &&
@@ -117,7 +255,7 @@ bool TestNativeCompressionRewritePreparation211()
             !Helper::PublicationBytes(UINT64_MAX, 4096, bytes) && bytes == 0 &&
             !Helper::PublicationBytes(5, 0, bytes) && !Helper::PublicationBytes(5, 4095, bytes),
             "full EOF including padding is bounded independently of dirty bytes")) return false;
-    for (const auto type : {1u, 3u, 4u})
+    for (const auto type : only_type ? std::vector<unsigned>{only_type} : std::vector<unsigned>{1u, 3u, 4u})
     {
         HostCompressionRewrite211Fixture owned;
         if (!Require(owned.Initialize(type), "host preparation canonical compressed fixture initializes")) return false;
@@ -125,6 +263,7 @@ bool TestNativeCompressionRewritePreparation211()
         const auto before_image = ReadFileBytes(owned.fixture.image.path);
         const auto inode = store.LookupCommittedInodeByPath(L"\\alias");
         if (!Require(inode.has_value() && tx.Begin(), "empty caller-owned transaction starts")) return false;
+        const auto before_wal = ReadFileBytes(c.session_root / "accepted.wal");
         const Store::PayloadIdentity identity{inode->object_id, inode->xid};
         auto admission = HostCompressionRewrite211Admission();
         Failure reason;
@@ -135,6 +274,13 @@ bool TestNativeCompressionRewritePreparation211()
                 prepared->JournalIntent().payload_length == prepared->JournalIntent().length &&
                 prepared->Revalidate(store, tx, admission) == Failure::None,
                 "native evidence becomes immutable source request and source-identity WAL intent")) return false;
+        apfsaccess::rw::CompressionRewrite proof;
+        std::vector<std::byte> source;
+        if (!Require(apfsaccess::rw::DecodeCompressionRewrite(prepared->Request().inline_payload, proof) &&
+                proof.type == type && proof.size == owned.expected_source.size() &&
+                proof.resource.size() == owned.resource_bytes &&
+                store.ReadCommittedFileRange(L"\\alias", 0, owned.eof, source) && source == owned.expected_source,
+                "prepared proof retains the entire allocated source fork and independently expected logical bytes")) return false;
         const auto denied = [&](Helper::Admission options, Store::PayloadIdentity id,
                                 std::uint64_t offset, std::uint64_t length, Failure expected) {
             return !Helper::Prepare(store, tx, options, L"\\alias", id, offset, length, reason) && reason == expected;
@@ -166,36 +312,60 @@ bool TestNativeCompressionRewritePreparation211()
         Store::MutationRequest write;
         if (!Require(!prepared->PrepareWrite(store, identity, L"\\compressed", 1, 1, write) &&
                 store.PendingMutationCount() == 0 && store.PendingAllocationCount() == 0 &&
-                tx.PendingMutationCount() == 0 && ReadFileBytes(owned.fixture.image.path) == before_image,
+                tx.PendingMutationCount() == 0 && ReadFileBytes(owned.fixture.image.path) == before_image &&
+                ReadFileBytes(c.session_root / "accepted.wal") == before_wal,
                 "preparation and all refusals preserve image, working state, allocator and WAL")) return false;
         if (!Require(tx.Abort() && tx.Begin() && prepared->Revalidate(store, tx, admission) == Failure::SourceChanged,
                 "an aborted transaction cannot reuse prepared evidence even at the same checkpoint")) return false;
         (void)tx.Abort();
     }
-    for (const auto type : {3u, 4u, 7u})
+    for (const auto type : only_type ? std::vector<unsigned>{only_type} : std::vector<unsigned>{3u, 4u, 2u})
     {
         HostCompressionRewrite211Fixture owned;
-        if (!Require(owned.Initialize(type, type != 7), "corrupt or unsupported compressed source imports for refusal")) return false;
+        if (!Require(owned.Initialize(type, type != 2), "corrupt or unsupported compressed source imports for refusal")) return false;
         auto& store = *owned.fixture.context->metadata_store; auto& tx = *owned.fixture.context->tx_manager;
         const auto inode = store.LookupCommittedInodeByPath(L"\\alias");
         if (!inode || !tx.Begin()) return false;
         const auto before = ReadFileBytes(owned.fixture.image.path);
+        const auto before_wal = ReadFileBytes(owned.fixture.context->session_root / "accepted.wal");
+        if (type == 8 || type == 10 || type == 12 || type == 14)
+        {
+            std::vector<std::byte> first;
+            if (!Require(store.ReadCommittedFileRange(L"\\alias", 0, 1, first) &&
+                    first == std::vector<std::byte>{std::byte{'A'}},
+                    "corrupt modern resource fixture has a readable first block before its malformed tail")) return false;
+            auto fs = BuildFileSystem(owned.fixture.context.get());
+            OpenContext reader{};
+            reader.node = FindNode(owned.fixture.context.get(), L"\\alias");
+            reader.metadata_read_fallback = true;
+            InitializeOpenAccess(&reader, FILE_READ_DATA);
+            std::vector<std::byte> guarded(static_cast<std::size_t>(owned.eof) + 17, std::byte{0xa6});
+            const auto sentinel = guarded;
+            ULONG done = 999;
+            if (!Require(CB_Read(&fs, &reader, guarded.data(), 0, static_cast<ULONG>(owned.eof), &done) ==
+                    STATUS_NOT_SUPPORTED && done == 0 && guarded == sentinel,
+                    "late malformed block cannot publish a decoded prefix or touch caller buffer guards")) return false;
+        }
         Failure reason;
         const auto prepared = Helper::Prepare(store, tx, HostCompressionRewrite211Admission(), L"\\alias",
             {inode->object_id, inode->xid}, 0, 1, reason);
         if (!Require(!prepared && reason == Failure::SourceUnsupported && !store.PendingMutationCount() &&
-                !store.PendingAllocationCount() && !tx.PendingMutationCount() && ReadFileBytes(owned.fixture.image.path) == before,
+                !store.PendingAllocationCount() && !store.PendingDeallocationCount() && !tx.PendingMutationCount() &&
+                ReadFileBytes(owned.fixture.image.path) == before &&
+                ReadFileBytes(owned.fixture.context->session_root / "accepted.wal") == before_wal,
                 "complete-source validation rejects corruption beyond the edit or unsupported type before mutation")) return false;
         (void)tx.Abort();
     }
     return true;
 }
 
-bool TestNativeCompressionRewriteWal211()
+bool TestNativeCompressionRewriteWal211(unsigned only_type = 0)
 {
     using namespace apfsaccess::rw;
     using Helper = apfsaccess::fshost::NativeCompressionRewrite;
-    for (const auto type : {1u, 3u, 4u})
+    if (!Require(ToLowerInvariant(std::filesystem::temp_directory_path().root_name().wstring()) == L"d:",
+            "compression WAL requires runner TEMP/TMP on D: before fixture construction")) return false;
+    for (const auto type : only_type ? std::vector<unsigned>{only_type} : std::vector<unsigned>{1u, 3u, 4u})
     {
         HostCompressionRewrite211Fixture owned;
         if (!owned.Initialize(type)) return false;
@@ -291,7 +461,7 @@ bool TestNativeCompressionRewriteWal211()
                 working->create_time_utc == inode->create_time_utc && working->access_time_utc == inode->access_time_utc &&
                 store.LookupWorkingExtendedAttribute(17, "com.apple.FinderInfo").has_value() &&
                 !store.LookupWorkingExtendedAttribute(17, "com.apple.decmpfs") &&
-                store.LookupWorkingExtendedAttribute(17, "com.apple.ResourceFork").has_value() == (type != 4) &&
+                store.LookupWorkingExtendedAttribute(17, "com.apple.ResourceFork").has_value() == !owned.UsesResourceFork(type) &&
                 tx.HasUnappliedAcceptedWork() && ReadFileBytes(owned.fixture.image.path) == before_image,
                 "acceptance alone preserves on-disk Mac metadata and source proof; pending removal is compression-owned only")) return false;
     }

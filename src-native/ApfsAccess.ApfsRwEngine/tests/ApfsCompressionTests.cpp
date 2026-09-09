@@ -19,9 +19,11 @@ using Bytes = std::vector<std::byte>;
 using Status = ApfsCompressionStatus;
 constexpr auto kMax = (std::numeric_limits<std::uint64_t>::max)();
 int failures = 0;
+std::uint64_t checks = 0;
 
 void Require(bool condition, std::string_view label)
 {
+    ++checks;
     if (!condition) { ++failures; std::cerr << "[FAIL] " << label << '\n'; }
 }
 
@@ -189,7 +191,7 @@ void TestHeaderAndRaw()
     Reject(Attribute(1, 8, data), Status::Corrupt);
     Reject(Attribute(1, 6, data), Status::Corrupt);
     Reject(Attribute(4, 7, data), Status::Corrupt);
-    for (const auto type : {0u, 2u, 5u, 6u, 9u, 10u, 13u, 14u,
+    for (const auto type : {0u, 2u, 5u, 6u,
         0x80000001u, 0x80000002u, 0xffffffffu})
     {
         Reject(Attribute(type, kMax, kHello), Status::Unsupported);
@@ -762,6 +764,7 @@ void TestLargeLogicalFileRange()
     Require(total_reads == 4 && block_reads == 1, "3 GiB range decodes only its final 64 KiB block");
 }
 #include "LzfseRangeTests.h"
+#include "RemainingCodecTests.h"
 } // namespace
 
 int main()
@@ -779,6 +782,10 @@ int main()
     TestResourceRanges();
     TestResourceCorruptionAndFailures();
     TestLargeLogicalFileRange();
+    const auto previous_checks = checks;
+    TestRemainingCodecs();
+    std::cout << "Existing range checks: " << previous_checks << "; remaining codec checks: "
+        << checks - previous_checks << "; total: " << checks << '\n';
     if (failures != 0) { std::cerr << failures << " compression checks failed\n"; return 1; }
     std::cout << "APFS compression standalone checks passed\n";
     return 0;

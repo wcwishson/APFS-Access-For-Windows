@@ -2678,6 +2678,312 @@ struct TempImageFile
     TempImageFile& operator=(const TempImageFile&) = delete;
 };
 
+bool TestMetadataStoreReportsSharedVolumeCapacity()
+{
+    BuilderStore spec;
+    spec.authoritative_checkpoint = true;
+    spec.block_count = 256;
+    spec.volumes.resize(2);
+    spec.volumes[0].oid = 101;
+    spec.volumes[1].oid = 102;
+    spec.volumes[0].quota_block_count = 10;
+    spec.volumes[1].reserve_block_count = 20;
+    bool ok = true;
+    for (const auto mode : {0, 1, 2, 3, 4})
+    {
+        auto variant = spec;
+        if (mode == 1) variant.volumes[0].quota_block_count = 5;
+        if (mode == 2) variant.volumes[0].quota_block_count = 0;
+        if (mode == 3) variant.volumes[1].reserve_block_count = 257;
+        const auto bytes = BuildStoreImage(variant);
+        TempImageFile file(bytes, "shared-capacity", ".raw");
+        apfsaccess::rw::MetadataStore::VolumeContext context;
+        context.device_path = file.path.wstring();
+        context.volume_object_id = mode == 4 ? 999 : 101;
+        context.allow_legacy_scaffold_for_fixtures = false;
+        apfsaccess::rw::MetadataStore store(context);
+        if (!Require(store.LoadContainerSuperblocks(), "capacity reads the strict shared checkpoint")) return false;
+        const auto* view = store.AuthoritativeAppleCheckpointView();
+        if (!Require(view && view->volumes.size() == 2 &&
+                view->volumes[0].superblock.space.allocated_block_count == 6 &&
+                view->volumes[1].superblock.space.allocated_block_count == 6,
+                "capacity fixture independently binds six allocated blocks per volume")) return false;
+        const auto free = store.FreeSizeBytes();
+        if (mode == 0) ok &= Require(free == 4 * 4096, "volume quota limits free space even in a larger shared pool");
+        if (mode == 1) ok &= Require(free == 0, "already exceeded quota reports zero usable free space");
+        if (mode == 2) ok &= Require(free == (view->spaceman.devices[0].free_count - 14) * 4096,
+            "unset quota preserves fourteen blocks of sibling unmet reserve");
+        if (mode >= 3) ok &= Require(!free, "invalid reserve or missing selected volume cannot reuse container free space");
+        ok &= Require(store.TotalSizeBytes() == 256 * 4096, "shared total remains the container capacity");
+        apfsaccess::rw::BlockDevice verify(file.path.wstring());
+        std::vector<std::byte> actual;
+        ok &= Require(verify.Read(0, bytes.size(), actual) && actual == bytes,
+            "capacity queries leave every image byte unchanged");
+    }
+    return ok;
+}
+
+bool TestMetadataStoreQuotaRefusalPreservesPendingRetry()
+{
+    using apfsaccess::rw::MetadataStore;
+    BuilderStore spec;
+    spec.authoritative_checkpoint = true;
+    spec.block_count = 256;
+    spec.authoritative_internal_pool_blocks = 16;
+    spec.authoritative_checkpoint_ring_blocks = 16;
+    spec.volumes[0].oid = 101;
+    spec.volumes[0].incompat = apfsaccess::catalog::kIncompatCaseInsensitive;
+    spec.volumes[0].quota_block_count = 6;
+    const auto bytes = BuildStoreImage(spec);
+    TempImageFile file(bytes, "quota-retry", ".raw");
+    MetadataStore::VolumeContext context;
+    context.device_path = file.path.wstring();
+    context.volume_object_id = 101;
+    context.allow_legacy_scaffold_for_fixtures = false;
+    context.integrity_check_on_mount = false;
+    MetadataStore store(context);
+    if (!Require(store.PrepareNativeWritePath(), "quota image prepares canonical writer")) return false;
+    const auto initial_xid = store.CheckpointXid();
+    const std::vector<std::byte> payload(16384, std::byte{0x5a});
+    unsigned payload_reads = 0;
+    store.SetFilePayloadProvider([&](const std::wstring& path, std::uint64_t length)
+        -> std::optional<std::vector<std::byte>> {
+        ++payload_reads;
+        if (path != L"\\quota.bin" || length > payload.size()) return std::nullopt;
+        return std::vector<std::byte>(payload.begin(), payload.begin() + static_cast<std::ptrdiff_t>(length));
+    });
+    MetadataStore::MutationRequest create;
+    create.operation = MetadataStore::MutationOperation::CreateFile;
+    create.path = L"\\quota.bin";
+    MetadataStore::MutationRequest write;
+    write.operation = MetadataStore::MutationOperation::Write;
+    write.path = create.path;
+    write.length = payload.size();
+    if (!Require(store.StageMutation(create) == MetadataStore::MutationStatus::Applied,
+            "quota test stages a real file")) return false;
+    const auto before_preview = store.PendingMutationCount();
+    unsigned publication_hooks = 0;
+    store.SetCommitStageHook([&](std::string_view) { ++publication_hooks; return false; });
+    for (int attempt = 0; attempt != 2; ++attempt)
+    {
+        const auto preview = store.PreflightNativeCapacityMutation(write);
+        const auto pending = store.LookupWorkingInodeByPath(create.path);
+        if (!Require(preview == MetadataStore::MutationStatus::CapacityBlocked && pending &&
+                pending->logical_size == 0 && store.PendingMutationCount() == before_preview &&
+                store.CheckpointXid() == initial_xid && payload_reads == 0 && publication_hooks == 0,
+                "capacity preview rolls back the proposed write without reading payload or invoking publication")) return false;
+    }
+    store.SetCommitStageHook({});
+    if (!Require(store.StageMutation(write) == MetadataStore::MutationStatus::Applied,
+            "engine test independently retains already accepted payload for retry")) return false;
+    const auto pending_count = store.PendingMutationCount();
+    for (int retry = 0; retry != 2; ++retry)
+    {
+        const auto result = store.CommitPendingMutations();
+        if (!Require(result == MetadataStore::CommitStatus::CapacityBlocked,
+                "quota refusal returns a distinct full-volume status: " + std::to_string(static_cast<int>(result))) ||
+            !Require(store.IsCommitPathReady() && !store.IsRecoveryRequired() &&
+                store.PendingMutationCount() == pending_count && store.CheckpointXid() == initial_xid,
+                "quota refusal retains pending mutations and write readiness")) return false;
+        const auto pending = store.LookupWorkingInodeByPath(create.path);
+        if (!Require(pending && pending->logical_size == payload.size(),
+                "refused commit retains the full staged file size")) return false;
+        apfsaccess::rw::BlockDevice verify(file.path.wstring());
+        std::vector<std::byte> actual;
+        if (!Require(verify.Read(0, bytes.size(), actual) && actual == bytes,
+                "quota refusal publishes no image bytes on repeated retries")) return false;
+    }
+    MetadataStore::MutationRequest shrink;
+    shrink.operation = MetadataStore::MutationOperation::SetFileSize;
+    shrink.path = create.path;
+    shrink.length = 0;
+    if (!Require(store.StageMutation(shrink) == MetadataStore::MutationStatus::Applied,
+            "explicit shrink is accepted under quota pressure")) return false;
+    const auto result = store.CommitPendingMutations();
+    if (!Require(result == MetadataStore::CommitStatus::Committed,
+            "explicit shrink lets retained work commit: " + std::to_string(static_cast<int>(result))) ||
+        !Require(store.PendingMutationCount() == 0 && !store.IsRecoveryRequired(),
+            "successful retry releases pending work without a recovery fault")) return false;
+    MetadataStore reopened(context);
+    if (!Require(reopened.LoadCanonicalState(), "quota retry remounts the canonical checkpoint")) return false;
+    const auto inode = reopened.LookupCommittedInodeByPath(create.path);
+    return Require(inode && inode->logical_size == 0, "reopened file contains the explicitly requested empty result");
+}
+
+bool TestNativeCapacityPreviewRollback()
+{
+    using Store = apfsaccess::rw::MetadataStore;
+    const auto same_requests = [](const auto& a, const auto& b) {
+        return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](const auto& x, const auto& y) {
+            return x.operation == y.operation && x.path == y.path && x.secondary_path == y.secondary_path &&
+                x.offset == y.offset && x.length == y.length && x.inline_payload == y.inline_payload &&
+                x.timestamp_utc == y.timestamp_utc && x.replace_if_exists == y.replace_if_exists &&
+                x.object_id == y.object_id && x.generation == y.generation &&
+                x.expected_unlink_outcome == y.expected_unlink_outcome;
+        });
+    };
+    for (const auto quota : {0ULL, 8ULL}) for (const bool interposed : {false, true})
+    {
+        BuilderStore spec;
+        spec.authoritative_checkpoint = true;
+        spec.block_count = 256;
+        spec.authoritative_internal_pool_blocks = 16;
+        spec.authoritative_checkpoint_ring_blocks = 16;
+        spec.volumes[0].oid = 101;
+        spec.volumes[0].incompat = apfsaccess::catalog::kIncompatCaseInsensitive;
+        spec.volumes[0].quota_block_count = quota;
+        const auto bytes = BuildStoreImage(spec);
+        TempImageFile file(bytes, "preview-rollback", ".raw");
+        Store::VolumeContext context;
+        context.device_path = file.path.wstring();
+        context.volume_object_id = 101;
+        context.allow_legacy_scaffold_for_fixtures = false;
+        context.integrity_check_on_mount = false;
+        Store store(context);
+        if (!Require(store.PrepareNativeWritePath(), "preview rollback fixture prepares")) return false;
+        Store::MutationRequest create;
+        create.operation = Store::MutationOperation::CreateFile;
+        create.path = L"\\quota.bin";
+        auto write = create;
+        write.operation = Store::MutationOperation::Write;
+        write.length = 4096;
+        if (!Require(store.StageMutation(create) == Store::MutationStatus::Applied &&
+                store.StageMutation(write) == Store::MutationStatus::Applied, "preview starts with earlier pending content")) return false;
+        if (interposed)
+        {
+            auto attr = create;
+            attr.operation = Store::MutationOperation::SetExtendedAttribute;
+            attr.secondary_path = L"user.preview";
+            attr.length = 1;
+            attr.inline_payload = {std::byte{0x23}};
+            if (!Require(store.StageMutation(attr) == Store::MutationStatus::Applied, "interposed metadata stages")) return false;
+        }
+        const auto before = store.DebugSnapshotPendingMutations();
+        const auto delta = apfsaccess::rw::CheckpointDeltaCodec::Encode(store.DebugBuildPendingCheckpointDelta());
+        const auto free_bytes = store.DebugWorkingFreeExtentTotalBytes();
+        const auto free_count = store.DebugWorkingFreeExtentCount();
+        const auto unchanged_allocator = [&]() {
+            return free_bytes == store.DebugWorkingFreeExtentTotalBytes() &&
+                free_count == store.DebugWorkingFreeExtentCount();
+        };
+        auto growth = write;
+        growth.offset = 4096;
+        growth.length = 16384;
+        for (int repeat = 0; repeat != 12; ++repeat)
+            if (!Require(store.PreflightNativeCapacityMutation(growth) == (quota ? Store::MutationStatus::CapacityBlocked : Store::MutationStatus::Applied) &&
+                    same_requests(before, store.DebugSnapshotPendingMutations()) &&
+                    unchanged_allocator() &&
+                    delta == apfsaccess::rw::CheckpointDeltaCodec::Encode(store.DebugBuildPendingCheckpointDelta()),
+                    "admitted/refused preview restores allocator, requests, order and checkpoint delta")) return false;
+        auto missing = write;
+        missing.path = L"\\missing.bin";
+        const std::array<Store::MutationRequest, 2> invalid_batch{growth, missing};
+        if (!Require(store.PreflightNativeCapacityMutations(invalid_batch) == Store::MutationStatus::InvalidRequest &&
+                unchanged_allocator() && same_requests(before, store.DebugSnapshotPendingMutations()),
+                "later invalid request restores preceding growth allocation")) return false;
+        auto shrink = write;
+        shrink.operation = Store::MutationOperation::SetFileSize;
+        shrink.length = 0;
+        std::array<Store::MutationRequest, 2> batch{shrink, write};
+        if (!Require(store.PreflightNativeCapacityMutations(batch) == Store::MutationStatus::Applied &&
+                unchanged_allocator() &&
+                same_requests(before, store.DebugSnapshotPendingMutations()) &&
+                delta == apfsaccess::rw::CheckpointDeltaCodec::Encode(store.DebugBuildPendingCheckpointDelta()),
+                "admitted multi-operation preview restores the complete earlier request stream")) return false;
+        std::array<Store::MutationRequest, Store::MaximumCapacityPreviewRequests> maximum_batch;
+        maximum_batch.fill(write);
+        if (!Require(store.PreflightNativeCapacityMutations(maximum_batch) == Store::MutationStatus::Applied &&
+                unchanged_allocator() &&
+                same_requests(before, store.DebugSnapshotPendingMutations()),
+                "maximum callback preview depth remains bounded and restores coalesced requests")) return false;
+        std::vector<Store::MutationRequest> excessive(Store::MaximumCapacityPreviewRequests + 1, write);
+        if (!Require(store.PreflightNativeCapacityMutations(excessive) == Store::MutationStatus::UnsupportedOperation &&
+                unchanged_allocator() &&
+                same_requests(before, store.DebugSnapshotPendingMutations()),
+                "oversized callback batch is refused before staging")) return false;
+        TempImageFile control_file(bytes, "preview-allocator-control", ".raw");
+        auto control_context = context;
+        control_context.device_path = control_file.path.wstring();
+        Store control(control_context);
+        if (!Require(control.PrepareNativeWritePath(), "preview control prepares")) return false;
+        for (const auto& request : before)
+            if (!Require(control.StageMutation(request) == Store::MutationStatus::Applied,
+                    "control stages the earlier real request stream")) return false;
+        auto rename = write;
+        rename.operation = Store::MutationOperation::Rename;
+        rename.secondary_path = L"\\renamed.bin";
+        auto changed = write;
+        changed.path = L"\\RENAMED.BIN";
+        changed.offset = 1024;
+        changed.length = 1024;
+        for (const auto& request : {shrink, write, rename, changed})
+            if (!Require(store.StageMutation(request) == Store::MutationStatus::Applied &&
+                    control.StageMutation(request) == Store::MutationStatus::Applied,
+                    "real mutations after previews match an untouched control")) return false;
+        const bool equal_free = store.DebugWorkingFreeExtentTotalBytes() == control.DebugWorkingFreeExtentTotalBytes();
+        const bool equal_requests = same_requests(store.DebugSnapshotPendingMutations(), control.DebugSnapshotPendingMutations());
+        const auto actual_delta_state = store.DebugBuildPendingCheckpointDelta();
+        auto control_delta_state = control.DebugBuildPendingCheckpointDelta();
+        // These otherwise identical fixtures have distinct backing-file identities.
+        control_delta_state.volume_identity = actual_delta_state.volume_identity;
+        const auto actual_delta = apfsaccess::rw::CheckpointDeltaCodec::Encode(actual_delta_state);
+        const auto control_delta = apfsaccess::rw::CheckpointDeltaCodec::Encode(control_delta_state);
+        if (!Require(equal_free && equal_requests && actual_delta == control_delta,
+                "previews preserve future allocation geometry and checkpoint delta"))
+        {
+            const auto mismatch = std::mismatch(actual_delta.begin(), actual_delta.end(), control_delta.begin(), control_delta.end());
+            std::cerr << "quota=" << quota << " interposed=" << interposed << " equal_free=" << equal_free
+                      << " equal_requests=" << equal_requests << " delta_sizes=" << actual_delta.size() << ',' << control_delta.size()
+                      << " first_delta_mismatch=" << (mismatch.first - actual_delta.begin()) << '\n';
+            return false;
+        }
+        apfsaccess::rw::BlockDevice source(file.path.wstring());
+        std::vector<std::byte> actual;
+        if (!Require(source.Read(0, bytes.size(), actual) && actual == bytes, "previews never change image bytes")) return false;
+    }
+
+    BuilderStore spec;
+    spec.authoritative_checkpoint = true;
+    spec.block_count = 256;
+    spec.authoritative_internal_pool_blocks = 16;
+    spec.authoritative_checkpoint_ring_blocks = 16;
+    spec.volumes[0].oid = 101;
+    spec.volumes[0].incompat = apfsaccess::catalog::kIncompatCaseInsensitive;
+    const auto bytes = BuildStoreImage(spec);
+    TempImageFile first(bytes, "preview-id", ".raw"), second(bytes, "preview-id-control", ".raw");
+    Store::VolumeContext context;
+    context.device_path = first.path.wstring();
+    context.volume_object_id = 101;
+    context.allow_legacy_scaffold_for_fixtures = false;
+    context.integrity_check_on_mount = false;
+    Store first_store(context);
+    context.device_path = second.path.wstring();
+    Store control(context);
+    if (!Require(first_store.PrepareNativeWritePath() && control.PrepareNativeWritePath(), "preview identity pair prepares")) return false;
+    Store::MutationRequest create;
+    create.operation = Store::MutationOperation::CreateFile;
+    create.path = L"\\identity.bin";
+    for (int i = 0; i != 3; ++i)
+        if (!Require(first_store.PreflightNativeCapacityMutation(create) == Store::MutationStatus::Applied,
+                "unlimited-volume create preview is admitted")) return false;
+    Store::PayloadIdentity actual_id{}, control_id{};
+    if (!Require(first_store.StageMutation(create, &actual_id) == Store::MutationStatus::Applied &&
+            control.StageMutation(create, &control_id) == Store::MutationStatus::Applied &&
+            actual_id.object_id == control_id.object_id && actual_id.generation == control_id.generation,
+            "previews do not consume future inode identities")) return false;
+
+    spec.authoritative_main_free_blocks = 5;
+    const auto tight_bytes = BuildStoreImage(spec);
+    TempImageFile tight(tight_bytes, "preview-main-full", ".raw");
+    context.device_path = tight.path.wstring();
+    Store full(context);
+    if (!Require(full.PrepareNativeWritePath() &&
+            full.PreflightNativeCapacityMutation(create) == Store::MutationStatus::CapacityBlocked &&
+            full.PendingMutationCount() == 0 && full.IsCanonicalCommitReady() && !full.IsRecoveryRequired(),
+            "ordinary main-pool exhaustion is refused before acceptance without disabling writes")) return false;
+    return true;
+}
+
 bool TestMetadataStoreUsesAuthoritativeCheckpointView()
 {
     const auto fixture = BuildAuthoritativeCheckpointFixture();
@@ -5848,20 +6154,35 @@ bool RequireNativeCompressionRange(apfsaccess::rw::MetadataStore& metadata,
         "native compression exact range and untouched tail");
 }
 
-bool TestNativeCompressionRewrite(bool faults = false, bool content_times = false)
+bool TestNativeCompressionRewrite(bool faults = false, bool content_times = false, bool modern = false,
+    bool remaining = false)
 {
     using namespace apfsaccess::rw;
-    for (const auto type : {1u, 3u, 4u}) for (const auto boundary : {0, 1, 2})
+    const auto types = remaining ? std::vector<unsigned>{9, 10, 13, 14} :
+        modern ? std::vector<unsigned>{7, 8, 11, 12} : std::vector<unsigned>{1, 3, 4};
+    for (const auto type : types) for (const auto boundary : {0, 1, 2})
     for (const bool times_first : {false, true})
     {
         if (!content_times && times_first) continue;
-        if ((!faults && boundary != 0) || (faults && (type != 4 || boundary == 0))) continue;
+        if ((!faults && boundary != 0) || (faults && ((!modern && !remaining && type != 4) || boundary == 0))) continue;
+        const bool resource_backed = type == 4 || type == 8 || type == 10 || type == 12 || type == 14;
         NativeCompressionFixture spec;
         spec.rewrite_alias_fixture = true;
-        spec.decmpfs = NativeCompressionAttribute(type, 5, type == 1 ? NativeCompressionHex("68656c6c6f") :
-            type == 3 ? kNativeCompressionHello : std::vector<std::byte>{});
-        spec.resource = type == 4 ? NativeCompressionResource({kNativeCompressionHello}) : NativeCompressionHex("007f8022");
-        spec.external_resource = true; spec.external_decmpfs = type == 4;
+        const auto payload = type == 1 ? NativeCompressionHex("68656c6c6f") :
+            type == 7 || type == 8 ? NativeCompressionHex("e568656c6c6f0600000000000000") :
+            type == 9 || type == 10 ? NativeCompressionHex("cc68656c6c6f") :
+            type == 13 || type == 14 ? NativeCompressionHex("5a424d090b000005000068656c6c6f060000000000") :
+            type == 11 || type == 12 ? NativeCompressionHex("6276782d0500000068656c6c6f62767824") : kNativeCompressionHello;
+        spec.decmpfs = NativeCompressionAttribute(type, 5, resource_backed ? std::vector<std::byte>{} : payload);
+        spec.resource = type == 4 ? NativeCompressionResource({payload}) : NativeCompressionHex("007f8022");
+        if (type == 8 || type == 10 || type == 12 || type == 14)
+        {
+            spec.resource = std::vector<std::byte>(8);
+            PutU32LE(*spec.resource, 0, 8);
+            PutU32LE(*spec.resource, 4, static_cast<std::uint32_t>(8 + payload.size()));
+            spec.resource->insert(spec.resource->end(), payload.begin(), payload.end());
+        }
+        spec.external_resource = true; spec.external_decmpfs = resource_backed;
         TempImageFile image(BuildNativeCompressionImage(spec), "native-compression-rewrite");
         const auto context = NativeCompressionContext(image);
         MetadataStore metadata(context);
@@ -5993,6 +6314,10 @@ bool TestNativeCompressionRewrite(bool faults = false, bool content_times = fals
             if (stage != target) return true; reached = true; return false;
         });
         const auto status = metadata.CommitPendingMutations();
+        if (status != MetadataStore::CommitStatus::Committed && !reached)
+            std::wcerr << L"Compression rewrite type " << type << L" boundary " << boundary
+                << L": " << metadata.LastCommitFailureReason() << L" / "
+                << metadata.LastCommitFailureDetail() << L"\n";
         if (!Require(boundary ? status != MetadataStore::CommitStatus::Committed && reached &&
                 metadata.IsRecoveryRequired() && metadata.PendingMutationCount() != 0 && transactions.HasUnappliedAcceptedWork() :
                 status == MetadataStore::CommitStatus::Committed,
@@ -6026,11 +6351,11 @@ bool TestNativeCompressionRewrite(bool faults = false, bool content_times = fals
                 after->group == before->group && after->mode == before->mode && after->link_count == 2 &&
                 ((after->bsd_flags & kAppleBsdCompressedFlag) != 0) == old &&
                 reopened.LookupCommittedExtendedAttribute(17, "com.apple.decmpfs").has_value() == old &&
-                reopened.LookupCommittedExtendedAttribute(17, "com.apple.ResourceFork").has_value() == (old || type != 4) &&
+                reopened.LookupCommittedExtendedAttribute(17, "com.apple.ResourceFork").has_value() == (old || !resource_backed) &&
                 reopened.LookupCommittedExtendedAttribute(17, "com.apple.FinderInfo")->data == std::vector<std::byte>(32, std::byte{0x35}) &&
                 security_before && reopened.LookupCommittedExtendedAttribute(17, "com.apple.system.Security")->data == security_before->data,
                 "compression ownership changes preserve unrelated Mac metadata")) return false;
-        if (type != 4)
+        if (!resource_backed)
         {
             std::array<std::byte, 4> fork{}; std::size_t read = 0;
             if (!Require(reopened.ReadCommittedExtendedAttributeRange(17, "com.apple.ResourceFork", 0, fork, read) &&
@@ -6206,6 +6531,44 @@ bool TestNativeCompressionRewriteRefusals()
         if (!Require(!metadata.PrepareCompressionRewrite(L"\\original", request) && metadata.PendingMutationCount() == 0 &&
                 metadata.PendingAllocationCount() == 0 && metadata.HasUnsupportedContentTransform(17),
                 "late corrupt block, unsupported type, or ambiguous ownership refuses before mutation")) return false;
+    }
+    return true;
+}
+
+bool TestNativeRemainingCompressionReads()
+{
+    using namespace apfsaccess::rw;
+    const auto plain = NativeCompressionHex("68656c6c6f");
+    for (const unsigned type : {9u, 10u, 13u, 14u})
+    for (const bool external : {false, true})
+    {
+        const bool resource = type == 10 || type == 14;
+        const auto payload = NativeCompressionHex(type == 9 || type == 10 ?
+            "cc68656c6c6f" : "5a424d090b000005000068656c6c6f060000000000");
+        NativeCompressionFixture spec;
+        spec.decmpfs = NativeCompressionAttribute(type, plain.size(), resource ? std::vector<std::byte>{} : payload);
+        spec.external_decmpfs = external;
+        spec.inode_size = plain.size();
+        spec.compressed_flag = true;
+        if (resource)
+        {
+            spec.resource = std::vector<std::byte>(8);
+            PutU32LE(*spec.resource, 0, 8);
+            PutU32LE(*spec.resource, 4, static_cast<std::uint32_t>(8 + payload.size()));
+            spec.resource->insert(spec.resource->end(), payload.begin(), payload.end());
+            spec.external_resource = external;
+        }
+        const auto image_before = BuildNativeCompressionImage(spec);
+        TempImageFile image(image_before, "native-remaining-compression");
+        MetadataStore store(NativeCompressionContext(image));
+        if (!Require(store.PrepareNativeWritePath(), "remaining codec native projection loads")) return false;
+        std::vector<std::byte> actual, image_after;
+        if (!Require(store.ReadCommittedFileRange(L"\\original", 0, 20, actual) && actual == plain &&
+                store.ReadCommittedFileRange(L"\\original", 1, 3, actual) && actual == NativeCompressionHex("656c6c") &&
+                store.ReadCommittedFileRange(L"\\original", UINT64_MAX, 8, actual) && actual.empty() &&
+                store.PendingMutationCount() == 0 &&
+                store.Device().Read(0, image_before.size(), image_after) && image_after == image_before,
+                "inline and external remaining codecs return exact ranges without native mutation")) return false;
     }
     return true;
 }
@@ -9742,6 +10105,9 @@ int main(int argc, char** argv)
     ok &= run("TestApsbRoundTrip", TestApsbRoundTrip);
     ok &= run("TestOmapResolve", TestOmapResolve);
     ok &= run("TestInterpretation", TestInterpretation);
+    ok &= run("TestMetadataStoreReportsSharedVolumeCapacity", TestMetadataStoreReportsSharedVolumeCapacity);
+    ok &= run("TestMetadataStoreQuotaRefusalPreservesPendingRetry", TestMetadataStoreQuotaRefusalPreservesPendingRetry);
+    ok &= run("TestNativeCapacityPreviewRollback", TestNativeCapacityPreviewRollback);
     ok &= run("TestCatalogStrictCheckpointAuthority", TestCatalogStrictCheckpointAuthority);
     ok &= run("TestCatalogSingleVolume", TestCatalogSingleVolume);
     ok &= run("TestCatalogPartitionless", TestCatalogPartitionless);
@@ -9826,12 +10192,19 @@ int main(int argc, char** argv)
     ok &= run("TestContentWritesRefuseProtectedAttributes", TestContentWritesRefuseProtectedAttributes);
     ok &= run("TestCompressionDefaultDataAdmission", TestCompressionDefaultDataAdmission);
     ok &= run("TestNativeCompressionInlineReads", TestNativeCompressionInlineReads);
+    ok &= run("TestNativeRemainingCompressionReads", TestNativeRemainingCompressionReads);
     ok &= run("TestNativeCompressionRewrite", [] { return TestNativeCompressionRewrite(); });
     ok &= run("TestNativeCompressionRewriteFaults", [] { return TestNativeCompressionRewrite(true); });
     ok &= run("TestNativeCompressionRewriteRefusals", TestNativeCompressionRewriteRefusals);
     ok &= run("TestNativeCompressionRewriteTimestamps", [] { return TestNativeCompressionRewrite(false, true); });
     ok &= run("TestNativeCompressionRewriteTimestampFaults", [] { return TestNativeCompressionRewrite(true, true); });
     ok &= run("TestNativeCompressionRewriteTimestampRefusals", TestNativeCompressionRewriteTimestampRefusals);
+    ok &= run("TestNativeModernCompressionRewrite", [] { return TestNativeCompressionRewrite(false, false, true); });
+    ok &= run("TestNativeModernCompressionRewriteFaults", [] { return TestNativeCompressionRewrite(true, false, true); });
+    ok &= run("TestNativeModernCompressionRewriteTimestamps", [] { return TestNativeCompressionRewrite(false, true, true); });
+    ok &= run("TestNativeRemainingCompressionRewrite", [] { return TestNativeCompressionRewrite(false, false, false, true); });
+    ok &= run("TestNativeRemainingCompressionRewriteFaults", [] { return TestNativeCompressionRewrite(true, false, false, true); });
+    ok &= run("TestNativeRemainingCompressionRewriteTimestamps", [] { return TestNativeCompressionRewrite(false, true, false, true); });
     ok &= run("TestNativeCompressionResourceReads", TestNativeCompressionResourceReads);
     ok &= run("TestNativeCompressionMalformedReads", TestNativeCompressionMalformedReads);
     ok &= run("TestNativeCompressionReadBudgets", TestNativeCompressionReadBudgets);

@@ -107,6 +107,8 @@ struct BuilderVolume
     std::string name = "Data";
     std::string uuid_hex; // "" = deterministic filler
     std::uint16_t role = 0x40;
+    std::uint64_t reserve_block_count = 0;
+    std::uint64_t quota_block_count = 0;
     std::uint64_t fs_flags = 0x1;
     std::uint64_t features = 0x1;
     std::uint64_t ro_features = 0;
@@ -218,6 +220,8 @@ inline std::vector<std::byte> BuildApsb(
     PutU32LE(block, 0x20, 0x42535041);
     PutU32LE(block, 0x24, 1);
     PutU64LE(block, 0x58, spec.file_system_allocated_blocks);
+    PutU64LE(block, 0x48, spec.reserve_block_count);
+    PutU64LE(block, 0x50, spec.quota_block_count);
     PutU64LE(block, 0x28, spec.features);
     PutU64LE(block, 0x30, spec.ro_features);
     PutU64LE(block, 0x38, spec.incompat);
