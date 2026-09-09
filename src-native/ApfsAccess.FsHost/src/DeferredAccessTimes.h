@@ -18,11 +18,24 @@ NTSTATUS DrainDeferredAccessTimeBatch(MountContext* c)
         c->deferred_access_time_requested = false;
         return STATUS_MEDIA_WRITE_PROTECTED;
     }
+    // Admit one bounded worker batch before staging. Stop and admission share
+    // the scheduler lock: a later stop lets this batch finish, while a stop
+    // that won first leaves the queue intact for the final shutdown drain.
+    const bool worker_batch = deferred_commit_worker_context == c;
+    ScopeExit release_admission{[&] {
+        if (worker_batch) admitted_worker_atime_context = nullptr;
+    }};
+    if (worker_batch)
+    {
+        std::lock_guard<std::mutex> schedule(c->deferred_commit_mutex);
+        if (c->deferred_commit_thread_stop) return STATUS_DEVICE_BUSY;
+        admitted_worker_atime_context = c;
+    }
     c->draining_access_times = true;
     ScopeExit finish{[&] { c->draining_access_times = false; }};
     const auto fail = [&](bool unjournaled = false) {
         const auto status = BlockNativeMutationAfterStagingFailure(c, L"DeferredAccessTime", unjournaled);
-        if (status != STATUS_DEVICE_BUSY)
+        if (status != STATUS_DEVICE_BUSY && status != STATUS_DISK_FULL)
         {
             // Keep both queue and visible values for diagnosis. Accepted WAL,
             // spool, census and checkpoint pins remain owned by existing code.
@@ -68,7 +81,17 @@ NTSTATUS DrainDeferredAccessTimeBatch(MountContext* c)
             const auto inode = c->metadata_store->LookupWorkingInodeByPath(request.path);
             same_identity = inode && inode->object_id == object;
         }
-        if (!same_identity) return fail();
+        if (!same_identity)
+        {
+            {
+                std::lock_guard<std::recursive_mutex> runtime(c->runtime_state_mutex);
+                c->last_native_mutation_failure_operation = L"DeferredAccessTime";
+                c->last_native_mutation_failure_path = request.path;
+                c->last_native_mutation_failure_reason = L"DeferredAccessTimeIdentityMismatch";
+                c->last_native_mutation_failure_status = std::to_wstring(object);
+            }
+            return fail();
+        }
         apfsaccess::rw::InodeMetadataPatch patch;
         patch.mask = apfsaccess::rw::InodeMetadataPatch::AccessTime;
         patch.access_time_utc = entry.time;
@@ -96,6 +119,9 @@ NTSTATUS DrainDeferredAccessTimeBatch(MountContext* c)
                 request.path, L"", 0, request.payload.size(), false, 0, 0, &identity, nullptr, request.payload)))
             return fail(true);
     }
+#ifdef APFSACCESS_FSHOST_UNIT_TEST
+    if (c->test_before_deferred_atime_publish) c->test_before_deferred_atime_publish();
+#endif
     if (manifest)
     {
         // The ordinary binder validates the expectation, stages EVERY queued

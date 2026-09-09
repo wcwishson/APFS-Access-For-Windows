@@ -378,6 +378,19 @@ bool ApfsExtendedRecordCodec::EncodeSecurity(
     return true;
 }
 
+bool ApfsExtendedRecordCodec::DecodeDataStream(const AppleExtendedField& field,
+    AppleDataStreamRecord& out_stream, std::string& out_error)
+{
+    out_stream = {};
+    out_error.clear();
+    if (field.type != 8 || field.data.size() != 40)
+        return Fail(out_error, "AppleDataStreamInvalid");
+    out_stream = {catalog::ReadU64LE(field.data, 0).value(),
+        catalog::ReadU64LE(field.data, 8).value(), catalog::ReadU64LE(field.data, 16).value(),
+        catalog::ReadU64LE(field.data, 24).value(), catalog::ReadU64LE(field.data, 32).value()};
+    return true;
+}
+
 bool ApfsExtendedRecordCodec::DecodeInode(
     const catalog::BtreeRecord& record,
     AppleInodeRecord& out_inode,

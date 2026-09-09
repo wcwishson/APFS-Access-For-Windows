@@ -443,8 +443,10 @@ std::uint64_t ApfsNanosecondsToFileTime(std::uint64_t apfs_nanoseconds)
 bool ProjectValidatedAttributeStreams(
     const std::vector<catalog::BtreeRecord>& records,
     std::uint32_t block_size, std::uint64_t block_count,
-    std::uint64_t store_offset, NativeApfsVolumeProjection& projection, bool strict)
+    std::uint64_t store_offset, NativeApfsVolumeProjection& projection, bool strict,
+    std::uint64_t routed_address_blocks = 0)
 {
+    const auto address_blocks = routed_address_blocks ? routed_address_blocks : block_count;
     const auto container_bytes = block_count * block_size;
     std::string error;
     struct Stream
@@ -500,8 +502,8 @@ bool ProjectValidatedAttributeStreams(
         AppleFileExtentRecord extent;
         if (!DecodeAppleFileExtentRecord(record, block_size, extent, error) || extent.crypto_id != 0 ||
             extent.physical_block == 0 ||
-            extent.physical_block >= block_count ||
-            extent.length_bytes / block_size > block_count - extent.physical_block)
+            extent.physical_block >= address_blocks ||
+            extent.length_bytes / block_size > address_blocks - extent.physical_block)
         {
             stream.invalid = true;
             continue;
@@ -752,6 +754,99 @@ bool ValidateSnapshotStreams(const std::vector<catalog::BtreeRecord>& records,
     return true;
 }
 } // namespace
+
+bool NativeApfsReader::ValidateOrdinaryFileSystemRecords(
+    const std::vector<catalog::BtreeRecord>& records,
+    const catalog::NxSuperblock& container, const catalog::ApsbVolume& volume,
+    const std::shared_ptr<catalog::ApfsReadBudget>& budget, std::string& out_error)
+{
+    NativeApfsVolumeProjection projection;
+    return ProjectReadOnlyRecords(records, container, volume, container.block_count,
+        budget, projection, out_error);
+}
+
+bool NativeApfsReader::ProjectReadOnlyRecords(
+    const std::vector<catalog::BtreeRecord>& records,
+    const catalog::NxSuperblock& container, const catalog::ApsbVolume& volume,
+    std::uint64_t routed_address_blocks,
+    const std::shared_ptr<catalog::ApfsReadBudget>& budget,
+    NativeApfsVolumeProjection& out_projection, std::string& out_error)
+{
+    out_projection = {};
+    out_error.clear();
+    const auto fail = [&](const char* reason) {
+        out_error = budget && budget->Failed() ? budget->Failure() : reason;
+        return false;
+    };
+    if (!budget) return fail("VerifierNamespaceBudgetRequired");
+    try
+    {
+        // The projection preserves some opaque metadata for ordinary readers.
+        // A verifier must instead disclose unsupported semantics. Reuse the
+        // authoritative codecs and keep this admission policy deliberately small.
+        for (const auto& record : records)
+        {
+            if (!budget->Materialize(1, 4096 + 32ull * (record.key.size() + record.value.size())))
+                return fail("VerifierNamespaceBudget");
+            const auto header = catalog::ReadU64LE(record.key, 0);
+            if (!header) return fail("VerifierFilesystemRecordInvalid");
+            switch (*header >> kApfsObjectTypeShift)
+            {
+            case kApfsTypeInode:
+            {
+                AppleInodeRecord inode;
+                if (!ApfsExtendedRecordCodec::DecodeInode(record, inode, out_error)) return false;
+                constexpr std::uint64_t neutral = 0x8 | 0x20 | 0x40 | 0x100 | 0x8000;
+                if (inode.reserved_pad || (inode.internal_flags &
+                    ~(neutral | kAppleInodeSparseFlag | kAppleInodeHasUncompressedSize)))
+                    return fail("VerifierInodeFlagsUnsupported");
+                for (const auto& field : inode.extended_fields)
+                    if (field.flags || (field.type != 4 && field.type != kInodeExtendedFieldDataStream &&
+                        field.type != kInodeExtendedFieldSparseBytes))
+                        return fail("VerifierInodeExtendedFieldUnsupported");
+                break;
+            }
+            case kApfsTypeXattr:
+            {
+                AppleXattrRecord attribute;
+                if (!ApfsExtendedRecordCodec::DecodeXattr(record, attribute, out_error)) return false;
+                if (attribute.flags & ~(kAppleXattrDataEmbedded | kAppleXattrDataStream | kAppleXattrFileSystemOwned))
+                    return fail("VerifierXattrFlagsUnsupported");
+                break;
+            }
+            case kApfsTypeDirectoryRecord:
+                // The existing namespace projector does not interpret drec
+                // xfields. Accept only its base record with understood type bits.
+                if (record.value.size() > 18 || (catalog::ReadU16LE(record.value, 16).value_or(0) & ~0xfu))
+                    return fail("VerifierDirectoryExtendedMetadataUnsupported");
+                break;
+            case 6: case kApfsTypeSiblingLink: case kApfsTypeSiblingMap: case kApfsTypeFileExtent: break;
+            default: return fail("VerifierFilesystemRecordUnsupported");
+            }
+        }
+        NativeApfsVolumeProjection view;
+        view.block_size = container.block_size;
+        view.total_blocks = container.block_count;
+        view.checkpoint_xid = container.xid;
+        view.volume_object_id = volume.object_id;
+        view.root_directory_inode = kRootDirectoryInode;
+        view.name_policy = ApfsNamePolicy::FromIncompatibleFeatures(volume.incompatible_features);
+        if (!ProjectFileSystemTree(records, container.block_size, container.block_count,
+            container.xid, view.name_policy, view, true, budget, routed_address_blocks))
+            return fail("VerifierNamespaceOrLinkInconsistent");
+        if (!ProjectValidatedAttributeStreams(records, container.block_size,
+            container.block_count, 0, view, true, routed_address_blocks)) return fail("VerifierAttributeStreamInvalid");
+        if (!ValidateSnapshotStreams(records, view, out_error)) return fail(out_error.c_str());
+        if (budget->Failed()) return fail("VerifierNamespaceBudget");
+        view.btree_records.clear();
+        out_projection = std::move(view);
+        return true;
+    }
+    catch (const std::bad_alloc&)
+    { (void)budget->Refuse("ApfsReadBudgetAllocationFailed"); return fail(budget->Failure()); }
+    catch (const std::length_error&)
+    { (void)budget->Refuse("ApfsReadBudgetAllocationFailed"); return fail(budget->Failure()); }
+}
 
 bool NativeApfsReader::TryLoadSnapshotProjection(
     const catalog::RandomAccessSource& source,
@@ -1570,7 +1665,8 @@ bool NativeApfsReader::ProjectFileSystemTree(
     const ApfsNamePolicy& name_policy,
     NativeApfsVolumeProjection& projection,
     bool require_complete_namespace,
-    const std::shared_ptr<catalog::ApfsReadBudget>& budget)
+    const std::shared_ptr<catalog::ApfsReadBudget>& budget,
+    std::uint64_t routed_address_blocks)
 {
     if (block_size == 0)
     {
@@ -1579,6 +1675,10 @@ bool NativeApfsReader::ProjectFileSystemTree(
     const auto volume_bytes = total_blocks > 0 && total_blocks <= (std::numeric_limits<std::uint64_t>::max() / block_size)
         ? total_blocks * static_cast<std::uint64_t>(block_size)
         : std::numeric_limits<std::uint64_t>::max();
+
+    const auto address_blocks = routed_address_blocks ? routed_address_blocks : total_blocks;
+    if (block_size == 0 || address_blocks > UINT64_MAX / block_size) return false;
+    const auto address_bytes = address_blocks * block_size;
 
     struct RawInode
     {
@@ -1893,13 +1993,13 @@ bool NativeApfsReader::ProjectFileSystemTree(
             std::uint64_t physical_address = 0;
             if (extent.physical_block != 0)
             {
-                if (extent.physical_block > volume_bytes / block_size)
+                if (extent.physical_block > address_bytes / block_size)
                 {
                     invalid_read_extent_ids.insert(object_id);
                     continue;
                 }
                 physical_address = extent.physical_block * block_size;
-                if (extent.length_bytes > volume_bytes - physical_address)
+                if (extent.length_bytes > address_bytes - physical_address)
                 {
                     invalid_read_extent_ids.insert(object_id);
                     continue;

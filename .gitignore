@@ -56,4 +56,5 @@ docs/native-write-roadmap.md
 docs/performance-baselines.md
 docs/read-write-optimization-plan.md
 scripts/.scratch-*
+scripts/snapshot_supervision_selftest.js
 third_party/lzfse/*PROVENANCE.md

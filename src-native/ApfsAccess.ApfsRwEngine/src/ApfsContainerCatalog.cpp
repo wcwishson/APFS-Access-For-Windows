@@ -1,6 +1,7 @@
 #include "ApfsContainerCatalog.h"
 
 #include "BlockDevice.h"
+#include "ApfsFusionStore.h"
 
 #include <algorithm>
 #include <cwchar>
@@ -45,6 +46,65 @@ bool AppendUnique(std::vector<std::string>& list, const std::string& value)
         return false;
     }
     list.push_back(value);
+    return true;
+}
+
+bool FinalizeContainer(ApfsContainerDescriptor& container, std::string& out_error)
+{
+        if (container.volumes.empty())
+        {
+            out_error = "CatalogNoVolumes:" + container.container_uuid_hex;
+            return false;
+        }
+        std::unordered_set<std::string> volume_uuids;
+        for (const ApfsVolumeDescriptor& volume : container.volumes)
+        {
+            if (!volume.volume_uuid_hex.empty() &&
+                !volume_uuids.insert(volume.volume_uuid_hex).second)
+            {
+                out_error = "CatalogDuplicateVolumeUuid:" + volume.volume_uuid_hex;
+                return false;
+            }
+        }
+        // UUID equality alone is insufficient to establish a System/Data
+        // association. Retain malformed/incomplete metadata without routing it.
+        std::map<std::string, std::vector<ApfsVolumeDescriptor*>> grouped;
+        for (ApfsVolumeDescriptor& volume : container.volumes)
+        {
+            if (!volume.group_uuid_hex.empty())
+            {
+                grouped[volume.group_uuid_hex].push_back(&volume);
+            }
+        }
+        for (const auto& [group_hex, members] : grouped)
+        {
+            ApfsVolumeGroupDescriptor group;
+            group.container_uuid_hex = container.container_uuid_hex;
+            group.group_uuid_hex = group_hex;
+            std::size_t systems = 0, data = 0;
+            bool malformed = false;
+            std::string system_id, data_id;
+            for (const auto* member : members)
+            {
+                const auto id = VolumeIdFor(container.container_uuid_hex, member->object_id);
+                group.member_volume_ids.push_back(id);
+                malformed |= !member->group_metadata_valid || member->volume_uuid_hex.empty();
+                if (member->role_raw == 0x1) { ++systems; system_id = id; }
+                if (member->role_raw == 0x40) { ++data; data_id = id; }
+            }
+            group.association_status = malformed ? "malformed" :
+                (systems > 1 || data > 1) ? "ambiguous" :
+                (systems == 1 && data == 1) ? "valid-system-data" : "incomplete";
+            if (group.association_status == "valid-system-data")
+            {
+                group.system_volume_id = std::move(system_id);
+                group.data_volume_id = std::move(data_id);
+            }
+            for (auto* member : members) member->group_association_status = group.association_status;
+            if (members.size() >= 2) container.groups.push_back(std::move(group));
+        }
+    for (auto& volume : container.volumes)
+        volume.stable_volume_id = VolumeIdFor(container.container_uuid_hex, volume.object_id);
     return true;
 }
 
@@ -440,61 +500,68 @@ bool ApfsContainerCatalog::TryLoadImage(
     for (ApfsContainerDescriptor& container : out_catalog.containers_)
     {
         container.fusion = container.member_store_ids.size() > 1;
-        if (container.volumes.empty())
-        {
-            out_error = "CatalogNoVolumes:" + container.container_uuid_hex;
-            return false;
-        }
-        std::unordered_set<std::string> volume_uuids;
-        for (const ApfsVolumeDescriptor& volume : container.volumes)
-        {
-            if (!volume.volume_uuid_hex.empty() &&
-                !volume_uuids.insert(volume.volume_uuid_hex).second)
-            {
-                out_error = "CatalogDuplicateVolumeUuid:" + volume.volume_uuid_hex;
-                return false;
-            }
-        }
-        // UUID equality alone is insufficient to establish a System/Data
-        // association. Retain malformed/incomplete metadata without routing it.
-        std::map<std::string, std::vector<ApfsVolumeDescriptor*>> grouped;
-        for (ApfsVolumeDescriptor& volume : container.volumes)
-        {
-            if (!volume.group_uuid_hex.empty())
-            {
-                grouped[volume.group_uuid_hex].push_back(&volume);
-            }
-        }
-        for (const auto& [group_hex, members] : grouped)
-        {
-            ApfsVolumeGroupDescriptor group;
-            group.container_uuid_hex = container.container_uuid_hex;
-            group.group_uuid_hex = group_hex;
-            std::size_t systems = 0, data = 0;
-            bool malformed = false;
-            std::string system_id, data_id;
-            for (const auto* member : members)
-            {
-                const auto id = VolumeIdFor(container.container_uuid_hex, member->object_id);
-                group.member_volume_ids.push_back(id);
-                malformed |= !member->group_metadata_valid || member->volume_uuid_hex.empty();
-                if (member->role_raw == 0x1) { ++systems; system_id = id; }
-                if (member->role_raw == 0x40) { ++data; data_id = id; }
-            }
-            group.association_status = malformed ? "malformed" :
-                (systems > 1 || data > 1) ? "ambiguous" :
-                (systems == 1 && data == 1) ? "valid-system-data" : "incomplete";
-            if (group.association_status == "valid-system-data")
-            {
-                group.system_volume_id = std::move(system_id);
-                group.data_volume_id = std::move(data_id);
-            }
-            for (auto* member : members) member->group_association_status = group.association_status;
-            if (members.size() >= 2) container.groups.push_back(std::move(group));
-        }
+        container.validation = policy == CatalogLoadPolicy::StrictApple ? CatalogValidation::CompleteAllocator : CatalogValidation::Legacy;
+        if (!FinalizeContainer(container, out_error)) return false;
     }
     published_catalog = std::move(out_catalog);
     return true;
+}
+
+bool ApfsContainerCatalog::CheckAvailable(std::string& error) const
+{
+    error.clear(); return !availability_ || availability_(error);
+}
+const AppleReadOnlyVolumeView* ApfsContainerCatalog::TryGetReadOnlyVolumeView() const
+{
+    std::string error;
+    return CheckAvailable(error) && readonly_view_ ? &*readonly_view_ : nullptr;
+}
+bool ApfsContainerCatalog::TryLoadFusion(const ApfsFusionStore& source,
+    const std::string& disk_id, const std::string& device_identifier,
+    ApfsContainerCatalog& out, std::string& error)
+{
+    out = {}; error.clear();
+    if (!source.CheckAvailable(error)) return false;
+    const auto budget = source.ReadBudget();
+    try
+    {
+        ApfsContainerCatalog staged;
+        staged.availability_ = source.RetainAvailabilityLease();
+        staged.disk_id_ = "apfs-disk:" + disk_id;
+        staged.device_identifier_ = device_identifier;
+        staged.disk_size_bytes_ = source.CapacityBytes();
+        staged.stores_.assign(source.Members().begin(), source.Members().end());
+        const auto fail = [&] {
+            std::string availability_error;
+            if (!source.CheckAvailable(availability_error)) error = std::move(availability_error);
+            return false;
+        };
+        auto view = LoadAppleReadOnlyVolumeView(source, source.Checkpoint(), error);
+        if (!view) return fail();
+        auto container = source.Container();
+        container.validation = CatalogValidation::ReadOnlyObjects;
+        for (const auto& volume : view->volumes)
+        {
+            if (!budget->Materialize(1, sizeof(ApfsVolumeDescriptor) + 4096))
+            { (void)source.CheckAvailable(error); return false; }
+            auto descriptor = DescribeVolume(volume.superblock, volume.superblock_object.physical_block, false);
+            if (volume.superblock.fs_flags != kFsFlagUnencrypted) descriptor.read_support = VolumeReadSupport::EncryptionUnsupported;
+            else if ((volume.superblock.features & ~kVolumeKnownOptionalFeaturesMask) || volume.superblock.readonly_features ||
+                (volume.superblock.incompatible_features & ~kVolumeSupportedIncompatibleFeaturesMask))
+                descriptor.read_support = VolumeReadSupport::FeaturesUnsupported;
+            else if (volume.superblock.fext_tree_oid || volume.superblock.fext_tree_type) descriptor.read_support = VolumeReadSupport::FileExtentTreeUnsupported;
+            container.volumes.push_back(std::move(descriptor));
+        }
+        if (!FinalizeContainer(container, error)) return fail();
+        staged.containers_.push_back(std::move(container));
+        staged.readonly_view_ = std::move(view);
+        if (!source.CheckAvailable(error)) return false;
+        out = std::move(staged);
+        return true;
+    }
+    catch (const std::bad_alloc&) { (void)budget->Refuse("ApfsReadBudgetAllocationFailed"); }
+    catch (const std::length_error&) { (void)budget->Refuse("ApfsReadBudgetAllocationFailed"); }
+    (void)source.CheckAvailable(error); return false;
 }
 
 bool ApfsContainerCatalog::TryLoadDevice(
@@ -610,6 +677,7 @@ bool ApfsContainerCatalog::TryResolveVolumeByName(
 {
     out_volume = ResolvedMountVolume{};
     out_error.clear();
+    if (!CheckAvailable(out_error)) return false;
     if (name_utf8.empty())
     {
         out_error = "CatalogVolumeNameMissing";
@@ -653,6 +721,7 @@ bool ApfsContainerCatalog::TryResolveVolumeByOid(
 {
     out_volume = ResolvedMountVolume{};
     out_error.clear();
+    if (!CheckAvailable(out_error)) return false;
     if (object_id == 0)
     {
         out_error = "CatalogVolumeOidZero";
@@ -684,6 +753,7 @@ bool ApfsContainerCatalog::TryResolveVolume(
 {
     out_volume = ResolvedMountVolume{};
     out_error.clear();
+    if (!CheckAvailable(out_error)) return false;
     if (container_uuid_hex.empty())
     {
         out_error = "CatalogContainerUuidMissing";
@@ -728,6 +798,7 @@ bool ApfsContainerCatalog::TryResolveVolumeByNameInContainer(
 {
     out_volume = ResolvedMountVolume{};
     out_error.clear();
+    if (!CheckAvailable(out_error)) return false;
     if (container_uuid_hex.empty())
     {
         out_error = "CatalogContainerUuidMissing";

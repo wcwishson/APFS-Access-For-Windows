@@ -285,7 +285,8 @@ NTSTATUS OpenNativeXattr(MountContext* c, const NamedStreamPath& stream, UINT32 
         if (!c->metadata_store) return STATUS_NOT_SUPPORTED;
         {
             std::lock_guard<std::mutex> metadata(c->metadata_mutex);
-            if (!c->metadata_store->AuthoritativeAppleCheckpointView()) return STATUS_NOT_SUPPORTED;
+            if (!c->metadata_store->AuthoritativeAppleCheckpointView() &&
+                !c->metadata_store->IsImmutableSnapshotView()) return STATUS_NOT_SUPPORTED;
         }
         if (create || ((options >> 24) & 0xff) != FILE_OPEN || HasOpenMutationIntent(access, options) ||
             (NormalizeGrantedAccess(access) & (WRITE_DAC | WRITE_OWNER | DELETE))) return STATUS_ACCESS_DENIED;

@@ -73,9 +73,17 @@ struct AppleSecurityRecord
     std::vector<AppleSecurityAce> entries;
 };
 
+struct AppleDataStreamRecord
+{
+    std::uint64_t size = 0, allocated_size = 0, default_crypto_id = 0;
+    std::uint64_t total_bytes_written = 0, total_bytes_read = 0;
+};
+
 class ApfsExtendedRecordCodec
 {
 public:
+    [[nodiscard]] static bool DecodeDataStream(const AppleExtendedField& field,
+        AppleDataStreamRecord& out_stream, std::string& out_error);
     // Bounded semantic projection only; false means unsupported, with output unchanged.
     // No SID resolution, generic-right expansion, ownership policy or ACL rewriting.
     [[nodiscard]] static bool DecodeSecurityPrincipal(

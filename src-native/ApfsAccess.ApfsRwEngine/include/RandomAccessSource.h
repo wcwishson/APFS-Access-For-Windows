@@ -29,6 +29,17 @@ public:
     ApfsReadBudget(const ApfsReadBudget&) = delete;
     ApfsReadBudget& operator=(const ApfsReadBudget&) = delete;
 
+    // Monotonically restrict a shared allowance at an operation boundary.
+    // Never replenishes consumed resources or clears a sticky failure.
+    void LimitRemainingTo(std::uint64_t reads, std::uint64_t read_bytes,
+        std::uint64_t records, std::uint64_t record_bytes) noexcept
+    {
+        if (reads < reads_left_) reads_left_ = reads;
+        if (read_bytes < read_bytes_left_) read_bytes_left_ = read_bytes;
+        if (records < records_left_) records_left_ = records;
+        if (record_bytes < record_bytes_left_) record_bytes_left_ = record_bytes;
+    }
+
     [[nodiscard]] bool Read(std::uint64_t bytes) noexcept
     {
         if (Failed()) return false;

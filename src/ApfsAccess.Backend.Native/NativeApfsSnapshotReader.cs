@@ -22,7 +22,7 @@ public sealed class NativeApfsSnapshotReader
         this.observerPath = observerPath;
     }
 
-    private static string? ResolvePackagedObserver()
+    internal static string? ResolvePackagedObserver()
         => new[] { Path.Combine(AppContext.BaseDirectory, NativeApfsObserver.ObserverExeName),
             Path.Combine(AppContext.BaseDirectory, "native", NativeApfsObserver.ObserverExeName) }
             .FirstOrDefault(path => File.Exists(path) && NativeApfsObserver.IsPackagedObserverPath(path));
@@ -36,7 +36,7 @@ public sealed class NativeApfsSnapshotReader
         ValidateLocalFile(image);
     }
 
-    private static void ValidateLocalFile(string path)
+    internal static void ValidateLocalFile(string path)
     {
         if (string.IsNullOrEmpty(path) || path.Length < 4 || !char.IsAsciiLetter(path[0]) ||
             path[1] != ':' || path[2] is not ('\\' or '/') || path[2..].Contains(':') ||
@@ -55,7 +55,7 @@ public sealed class NativeApfsSnapshotReader
         ValidateIdentity(handle, path);
     }
 
-    private static void ValidateIdentity(SafeFileHandle handle, string path)
+    internal static void ValidateIdentity(SafeFileHandle handle, string path)
     {
         var resolved = new StringBuilder(32768);
         var length = GetFinalPathNameByHandle(handle, resolved, (uint)resolved.Capacity, 0);

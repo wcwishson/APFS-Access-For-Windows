@@ -58,6 +58,18 @@ private:
 class NativeApfsReader
 {
 public:
+    // Source-free reuse of the strict namespace/link, stream and attribute
+    // validators. Records must be a complete authoritative FS-tree walk.
+    // This authenticates no checkpoint and grants no read/write capability.
+    // Requires an operation budget; publishes no partial projection on failure.
+    // Conservatively refuses inode xfields other than name/dstream/sparse bytes,
+    // nonzero xfield flags, directory xfields and unknown inode/xattr flags.
+    [[nodiscard]] static bool ValidateOrdinaryFileSystemRecords(
+        const std::vector<catalog::BtreeRecord>& records,
+        const catalog::NxSuperblock& container, const catalog::ApsbVolume& volume,
+        const std::shared_ptr<catalog::ApfsReadBudget>& budget,
+        std::string& out_error);
+
     // Requires a stable read-only source for the operation and subsequent data
     // reads. Explicit snapshot identity only; this never loads a live fallback.
     // Shares source.ReadBudget(), or installs one bounded operation allowance.
@@ -84,6 +96,12 @@ public:
         std::shared_ptr<catalog::ApfsReadBudget> budget = {});
 
 private:
+    friend class ApfsFusionReadSession;
+    static bool ProjectReadOnlyRecords(const std::vector<catalog::BtreeRecord>& records,
+        const catalog::NxSuperblock& container, const catalog::ApsbVolume& volume,
+        std::uint64_t routed_address_blocks,
+        const std::shared_ptr<catalog::ApfsReadBudget>& budget,
+        NativeApfsVolumeProjection& projection, std::string& error);
     struct ObjectMapValue
     {
         std::uint32_t flags = 0;
@@ -202,6 +220,7 @@ private:
         const ApfsNamePolicy& name_policy,
         NativeApfsVolumeProjection& projection,
         bool require_complete_namespace,
-        const std::shared_ptr<catalog::ApfsReadBudget>& budget = {});
+        const std::shared_ptr<catalog::ApfsReadBudget>& budget = {},
+        std::uint64_t routed_address_blocks = 0);
 };
 } // namespace apfsaccess::rw

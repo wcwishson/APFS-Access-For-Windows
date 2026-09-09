@@ -53,6 +53,17 @@ public:
     [[nodiscard]] static std::shared_ptr<BlockDevice> OpenStableReadOnlyImage(
         std::wstring path, std::string& error);
     [[nodiscard]] bool RevalidateStableReadOnlyImage() const;
+    struct StableImageIdentity
+    {
+        std::uint64_t volume_serial = 0;
+        std::array<std::byte, 16> file_id{};
+        std::uint64_t size_bytes = 0;
+        std::uint64_t creation_time = 0;
+        std::uint64_t write_time = 0;
+        bool operator==(const StableImageIdentity&) const = default;
+    };
+    // Identity of the already-held read-only lease; never opens another handle.
+    [[nodiscard]] bool QueryStableReadOnlyImageIdentity(StableImageIdentity& out) const;
 
     [[nodiscard]] bool Read(std::uint64_t offset_bytes, std::size_t size_bytes, std::vector<std::byte>& out_buffer) const;
     [[nodiscard]] bool ReadInto(

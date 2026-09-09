@@ -21,9 +21,12 @@ add_library(ApfsAccess.ApfsRwEngine STATIC
     src/ApfsContainerCatalog.cpp
     src/ApfsCompression.cpp
     src/ApfsExtendedRecordCodec.cpp
+    src/ApfsFusionStore.cpp
+    src/ApfsFusionReadSession.cpp
     src/ApfsFormat.cpp
     src/ApfsSharedSpace.cpp
     src/ApfsSnapshotStore.cpp
+    src/ApfsVerifier.cpp
     src/ApfsNameCodec.cpp
     src/ApfsObjectMapStore.cpp
     src/ApfsSpacemanStore.cpp
@@ -69,7 +72,8 @@ target_compile_features(ApfsAccess.ApfsRwEngine PUBLIC cxx_std_20)
 target_compile_definitions(ApfsAccess.ApfsRwEngine PRIVATE UTF8PROC_EXPORTS Z_PREFIX)
 
 if(WIN32)
-    target_sources(ApfsAccess.ApfsRwEngine PRIVATE src/ApfsCrypto.cpp src/ApfsKeybag.cpp)
+    target_sources(ApfsAccess.ApfsRwEngine PRIVATE src/ApfsCrypto.cpp src/ApfsKeybag.cpp src/ApfsKeybagUnlock.cpp
+        src/ApfsEncryptedReadSession.cpp)
     target_link_libraries(ApfsAccess.ApfsRwEngine PRIVATE bcrypt)
 endif()
 
@@ -117,6 +121,30 @@ endif()
 
 if(BUILD_TESTING)
     if(WIN32)
+        foreach(_fusion_test ApfsFusionStoreTests ApfsFusionCatalogTests)
+            add_executable(ApfsAccess.ApfsRwEngine.${_fusion_test}
+                tests/${_fusion_test}.cpp src/ApfsFusionStore.cpp)
+            target_compile_definitions(ApfsAccess.ApfsRwEngine.${_fusion_test} PRIVATE APFS_FUSION_STORE_TESTING)
+            target_link_libraries(ApfsAccess.ApfsRwEngine.${_fusion_test} PRIVATE ApfsAccess.ApfsRwEngine)
+            target_compile_features(ApfsAccess.ApfsRwEngine.${_fusion_test} PRIVATE cxx_std_20)
+            add_test(NAME ApfsAccess.ApfsRwEngine.${_fusion_test} COMMAND ApfsAccess.ApfsRwEngine.${_fusion_test})
+        endforeach()
+    endif()
+    add_executable(ApfsAccess.ApfsRwEngine.VerifierTests tests/ApfsVerifierTests.cpp)
+    target_link_libraries(ApfsAccess.ApfsRwEngine.VerifierTests PRIVATE ApfsAccess.ApfsRwEngine)
+    target_compile_features(ApfsAccess.ApfsRwEngine.VerifierTests PRIVATE cxx_std_20)
+    add_test(NAME ApfsAccess.ApfsRwEngine.Verifier COMMAND ApfsAccess.ApfsRwEngine.VerifierTests)
+    add_executable(ApfsAccess.ApfsRwEngine.BtreeRoutingTests tests/BtreeRoutingTests.cpp)
+    target_link_libraries(ApfsAccess.ApfsRwEngine.BtreeRoutingTests PRIVATE ApfsAccess.ApfsRwEngine)
+    target_compile_features(ApfsAccess.ApfsRwEngine.BtreeRoutingTests PRIVATE cxx_std_20)
+    add_test(NAME ApfsAccess.ApfsRwEngine.BtreeRouting COMMAND ApfsAccess.ApfsRwEngine.BtreeRoutingTests)
+    if(WIN32)
+        add_executable(ApfsAccess.ApfsRwEngine.VerifierObserverTests
+            tests/ApfsVerifierObserverTests.cpp tools/Sha256Win32.cpp)
+        target_link_libraries(ApfsAccess.ApfsRwEngine.VerifierObserverTests PRIVATE ApfsAccess.ApfsRwEngine bcrypt)
+        target_compile_features(ApfsAccess.ApfsRwEngine.VerifierObserverTests PRIVATE cxx_std_20)
+        add_test(NAME ApfsAccess.ApfsRwEngine.VerifierObserver COMMAND ApfsAccess.ApfsRwEngine.VerifierObserverTests
+            "${CMAKE_CURRENT_BINARY_DIR}/verifier-lease.test-image")
         add_executable(ApfsAccess.ApfsRwEngine.CryptoFoundationTests
             tests/ApfsCryptoFoundationTests.cpp src/ApfsCrypto.cpp src/ApfsKeybag.cpp)
         target_compile_definitions(ApfsAccess.ApfsRwEngine.CryptoFoundationTests PRIVATE APFSACCESS_CRYPTO_TESTING)
@@ -127,6 +155,25 @@ if(BUILD_TESTING)
             target_compile_options(ApfsAccess.ApfsRwEngine.CryptoFoundationTests PRIVATE /W4 /permissive-)
         endif()
         add_test(NAME ApfsAccess.ApfsRwEngine.CryptoFoundationTests COMMAND ApfsAccess.ApfsRwEngine.CryptoFoundationTests)
+        add_executable(ApfsAccess.ApfsRwEngine.KeybagUnlockTests
+            tests/ApfsKeybagUnlockTests.cpp src/ApfsKeybagUnlock.cpp src/ApfsCrypto.cpp)
+        target_compile_definitions(ApfsAccess.ApfsRwEngine.KeybagUnlockTests PRIVATE APFSACCESS_CRYPTO_TESTING)
+        target_link_libraries(ApfsAccess.ApfsRwEngine.KeybagUnlockTests PRIVATE ApfsAccess.ApfsRwEngine bcrypt)
+        target_compile_features(ApfsAccess.ApfsRwEngine.KeybagUnlockTests PRIVATE cxx_std_20)
+        if(MSVC)
+            target_compile_options(ApfsAccess.ApfsRwEngine.KeybagUnlockTests PRIVATE /W4 /permissive-)
+        endif()
+        add_test(NAME ApfsAccess.ApfsRwEngine.KeybagUnlockTests COMMAND ApfsAccess.ApfsRwEngine.KeybagUnlockTests)
+        add_executable(ApfsAccess.ApfsRwEngine.EncryptedReadSessionTests
+            tests/ApfsEncryptedReadSessionTests.cpp src/ApfsEncryptedReadSession.cpp
+            src/ApfsKeybagUnlock.cpp src/ApfsCrypto.cpp)
+        target_compile_definitions(ApfsAccess.ApfsRwEngine.EncryptedReadSessionTests PRIVATE APFSACCESS_CRYPTO_TESTING)
+        target_link_libraries(ApfsAccess.ApfsRwEngine.EncryptedReadSessionTests PRIVATE ApfsAccess.ApfsRwEngine bcrypt)
+        target_compile_features(ApfsAccess.ApfsRwEngine.EncryptedReadSessionTests PRIVATE cxx_std_20)
+        if(MSVC)
+            target_compile_options(ApfsAccess.ApfsRwEngine.EncryptedReadSessionTests PRIVATE /W4 /permissive-)
+        endif()
+        add_test(NAME ApfsAccess.ApfsRwEngine.EncryptedReadSessionTests COMMAND ApfsAccess.ApfsRwEngine.EncryptedReadSessionTests)
     endif()
     foreach(_snapshot_test ApfsSnapshotStoreTests SnapshotParserRedTests SnapshotProjectionTests SnapshotReadStoreTests)
         add_executable(ApfsAccess.ApfsRwEngine.${_snapshot_test} tests/${_snapshot_test}.cpp)
@@ -524,4 +571,69 @@ if(BUILD_TESTING)
         NAME ApfsAccess.ApfsRwEngine.ExtendedRecordCodec
         COMMAND ApfsAccess.ApfsRwEngine.ExtendedRecordCodecTests
     )
+endif()
+
+# Narrow clean-layout Fusion member-image reader using production file leases.
+if(WIN32)
+    add_executable(ApfsFusionReadTool tools/ApfsFusionReadTool.cpp)
+    target_link_libraries(ApfsFusionReadTool PRIVATE ApfsAccess.ApfsRwEngine)
+    target_compile_definitions(ApfsFusionReadTool PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    if(MSVC)
+        target_compile_options(ApfsFusionReadTool PRIVATE /W4 /permissive-)
+    endif()
+    if(BUILD_TESTING)
+        add_executable(FusionReadToolFixtures tests/FusionReadToolFixtures.cpp)
+        target_link_libraries(FusionReadToolFixtures PRIVATE ApfsAccess.ApfsRwEngine)
+        target_compile_definitions(FusionReadToolFixtures PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        set(APFSACCESS_FUSION_READ_INTEGRATION_ROOT "" CACHE PATH "Private D: Fusion image test artifacts")
+        if(APFSACCESS_FUSION_READ_INTEGRATION_ROOT)
+            find_package(Python3 REQUIRED COMPONENTS Interpreter)
+            add_test(NAME FusionReadToolIntegration COMMAND ${Python3_EXECUTABLE} -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/FusionReadToolIntegration.py
+                --root ${APFSACCESS_FUSION_READ_INTEGRATION_ROOT}
+                --tool $<TARGET_FILE:ApfsFusionReadTool>
+                --fixture-builder $<TARGET_FILE:FusionReadToolFixtures>)
+            set_tests_properties(FusionReadToolIntegration PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+        endif()
+    endif()
+endif()
+
+# Private one-command encrypted image inspection/read precursor; no mount admission.
+if(WIN32)
+    add_library(ApfsAccess.EncryptedReadTransport STATIC tools/EncryptedReadTransport.cpp)
+    target_include_directories(ApfsAccess.EncryptedReadTransport PUBLIC tools)
+    target_link_libraries(ApfsAccess.EncryptedReadTransport PUBLIC ApfsAccess.ApfsRwEngine PRIVATE bcrypt advapi32)
+    target_compile_features(ApfsAccess.EncryptedReadTransport PUBLIC cxx_std_20)
+    target_compile_definitions(ApfsAccess.EncryptedReadTransport PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_executable(ApfsEncryptedReadTool tools/ApfsEncryptedReadTool.cpp)
+    target_link_libraries(ApfsEncryptedReadTool PRIVATE ApfsAccess.EncryptedReadTransport)
+    target_compile_definitions(ApfsEncryptedReadTool PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    if(MSVC)
+        target_compile_options(ApfsAccess.EncryptedReadTransport PRIVATE /W4 /permissive-)
+        target_compile_options(ApfsEncryptedReadTool PRIVATE /W4 /permissive-)
+    endif()
+    if(BUILD_TESTING)
+        add_executable(EncryptedReadToolFixtures tests/EncryptedReadToolFixtures.cpp)
+        target_link_libraries(EncryptedReadToolFixtures PRIVATE ApfsAccess.ApfsRwEngine)
+        target_compile_definitions(EncryptedReadToolFixtures PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        # Caller selects a private artifact root; no fixture writes in the source tree.
+        set(APFSACCESS_ENCRYPTED_READ_INTEGRATION_ROOT "" CACHE PATH "Private encrypted read integration artifacts")
+        if(APFSACCESS_ENCRYPTED_READ_INTEGRATION_ROOT)
+            find_package(Python3 REQUIRED COMPONENTS Interpreter)
+            add_test(NAME EncryptedReadToolIntegration COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/EncryptedReadToolIntegration.py
+                --root ${APFSACCESS_ENCRYPTED_READ_INTEGRATION_ROOT}
+                --tool $<TARGET_FILE:ApfsEncryptedReadTool>
+                --fixture-builder $<TARGET_FILE:EncryptedReadToolFixtures>
+                --vectors ${CMAKE_CURRENT_SOURCE_DIR}/tests/ApfsKeybagUnlockVectors.h)
+            set_tests_properties(EncryptedReadToolIntegration PROPERTIES TIMEOUT 120 FIXTURES_SETUP EncryptedReadFixture)
+            add_test(NAME EncryptedReadToolReview COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/EncryptedReadToolReview.py
+                --root ${APFSACCESS_ENCRYPTED_READ_INTEGRATION_ROOT}
+                --tool $<TARGET_FILE:ApfsEncryptedReadTool> --label GREEN
+                --observer $<TARGET_FILE:ApfsAccess.ApfsRwEngine.VerifierObserverTests>
+                --vectors ${CMAKE_CURRENT_SOURCE_DIR}/tests/ApfsKeybagUnlockVectors.h)
+            set_tests_properties(EncryptedReadToolReview PROPERTIES TIMEOUT 60 FIXTURES_REQUIRED EncryptedReadFixture)
+        endif()
+    endif()
 endif()

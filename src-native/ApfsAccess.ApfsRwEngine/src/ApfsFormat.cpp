@@ -46,6 +46,47 @@ bool ReadInto(const RandomAccessSource& source, std::uint64_t offset, std::size_
     return source.Read(offset, size, out) && out.size() == size;
 }
 
+// Only the opt-in node context owns decrypted parser materializations.
+// Preserve the existing ordinary parser's allocation and cleanup policy.
+void WipeBtreeRecord(BtreeRecord& record) noexcept
+{
+    for (auto* bytes : {&record.key, &record.value})
+    {
+        volatile std::byte* data = bytes->data();
+        for (std::size_t i = 0; i < bytes->size(); ++i) data[i] = std::byte{};
+    }
+}
+
+// Routing retains copies beyond the provider's node lease. Own their cleanup,
+// including queue copies, reassignment and comparator/allocation exceptions.
+// Ordinary traversal retains its existing non-wiping policy.
+struct BtreeRoutingBytes : std::vector<std::byte>
+{
+    using Bytes = std::vector<std::byte>;
+    bool wipe = false;
+    explicit BtreeRoutingBytes(bool wipe = false) : wipe(wipe) {}
+    BtreeRoutingBytes(const BtreeRoutingBytes& other) : Bytes(other), wipe(other.wipe) {}
+    BtreeRoutingBytes(BtreeRoutingBytes&& other) noexcept
+        : Bytes(std::move(other)), wipe(other.wipe) {}
+    BtreeRoutingBytes& operator=(const BtreeRoutingBytes& other)
+    {
+        if (this != &other) { ClearOwned(); Bytes::operator=(other); wipe = other.wipe; }
+        return *this;
+    }
+    BtreeRoutingBytes& operator=(BtreeRoutingBytes&& other) noexcept
+    {
+        if (this != &other) { ClearOwned(); Bytes::operator=(std::move(other)); wipe = other.wipe; }
+        return *this;
+    }
+    ~BtreeRoutingBytes() { ClearOwned(); }
+    void ClearOwned() noexcept
+    {
+        if (!wipe) return;
+        volatile std::byte* bytes = data();
+        for (std::size_t i = 0; i < size(); ++i) bytes[i] = std::byte{};
+    }
+};
+
 std::string ToLowerHexByte(unsigned char value)
 {
     static constexpr char kDigits[] = "0123456789abcdef";
@@ -59,7 +100,12 @@ std::string ToLowerHexByte(unsigned char value)
 
 std::optional<std::uint16_t> ReadU16LE(const std::vector<std::byte>& buffer, std::size_t offset)
 {
-    if (offset + sizeof(std::uint16_t) > buffer.size())
+    return ReadU16LE(std::span<const std::byte>(buffer), offset);
+}
+
+std::optional<std::uint16_t> ReadU16LE(std::span<const std::byte> buffer, std::size_t offset)
+{
+    if (offset > buffer.size() || sizeof(std::uint16_t) > buffer.size() - offset)
     {
         return std::nullopt;
     }
@@ -70,7 +116,12 @@ std::optional<std::uint16_t> ReadU16LE(const std::vector<std::byte>& buffer, std
 
 std::optional<std::uint32_t> ReadU32LE(const std::vector<std::byte>& buffer, std::size_t offset)
 {
-    if (offset + sizeof(std::uint32_t) > buffer.size())
+    return ReadU32LE(std::span<const std::byte>(buffer), offset);
+}
+
+std::optional<std::uint32_t> ReadU32LE(std::span<const std::byte> buffer, std::size_t offset)
+{
+    if (offset > buffer.size() || sizeof(std::uint32_t) > buffer.size() - offset)
     {
         return std::nullopt;
     }
@@ -86,7 +137,12 @@ std::optional<std::uint32_t> ReadU32LE(const std::vector<std::byte>& buffer, std
 
 std::optional<std::uint64_t> ReadU64LE(const std::vector<std::byte>& buffer, std::size_t offset)
 {
-    if (offset + sizeof(std::uint64_t) > buffer.size())
+    return ReadU64LE(std::span<const std::byte>(buffer), offset);
+}
+
+std::optional<std::uint64_t> ReadU64LE(std::span<const std::byte> buffer, std::size_t offset)
+{
+    if (offset > buffer.size() || sizeof(std::uint64_t) > buffer.size() - offset)
     {
         return std::nullopt;
     }
@@ -125,6 +181,11 @@ std::optional<std::uint64_t> Fletcher64(const std::byte* data, std::size_t size)
 }
 
 bool VerifyObjectChecksum(const std::vector<std::byte>& block, std::size_t block_size)
+{
+    return VerifyObjectChecksum(std::span<const std::byte>(block), block_size);
+}
+
+bool VerifyObjectChecksum(std::span<const std::byte> block, std::size_t block_size)
 {
     if (block_size < 12 || block.size() < block_size || (block_size - 8) % sizeof(std::uint32_t) != 0)
     {
@@ -438,6 +499,11 @@ std::optional<NxSuperblock> ParseNxSuperblock(const std::vector<std::byte>& bloc
     out.spaceman_oid = ReadU64LE(block, 0x98).value_or(0);
     out.omap_oid = ReadU64LE(block, 0xA0).value_or(0);
     out.reaper_oid = ReadU64LE(block, 0xA8).value_or(0);
+    std::copy_n(block.begin() + 0x500, 16, out.fusion_uuid.begin());
+    out.fusion_middle_tree_oid = ReadU64LE(block, 0x548).value();
+    out.fusion_writeback_oid = ReadU64LE(block, 0x550).value();
+    out.fusion_writeback_start = ReadU64LE(block, 0x558).value();
+    out.fusion_writeback_blocks = ReadU64LE(block, 0x560).value();
     if (out.omap_oid == 0)
     {
         return std::nullopt;
@@ -1052,6 +1118,39 @@ bool ReadBtreeLeafRecords(
     std::vector<BtreeRecord>& out_records,
     std::string& out_error)
 {
+    return ReadBtreeLeafRecords(source, block_size, root_block, child_addresses_are_physical,
+        child_object_map_oid, max_xid_hint, policy, BtreeRoutingPolicy{}, out_records, out_error, nullptr);
+}
+
+bool ReadBtreeLeafRecords(
+    const RandomAccessSource& source, std::uint32_t block_size,
+    std::uint64_t root_block, bool child_addresses_are_physical,
+    std::uint64_t child_object_map_oid, std::uint64_t max_xid_hint,
+    const BtreeReadPolicy& policy, std::vector<BtreeRecord>& out_records,
+    std::string& out_error, BtreeNodeReadContext* node_context)
+{
+    return ReadBtreeLeafRecords(source, block_size, root_block, child_addresses_are_physical,
+        child_object_map_oid, max_xid_hint, policy, BtreeRoutingPolicy{}, out_records, out_error, node_context);
+}
+
+bool ReadBtreeLeafRecords(
+    const RandomAccessSource& source, std::uint32_t block_size,
+    std::uint64_t root_block, bool child_addresses_are_physical,
+    std::uint64_t child_object_map_oid, std::uint64_t max_xid_hint,
+    const BtreeReadPolicy& policy, const BtreeRoutingPolicy& routing,
+    std::vector<BtreeRecord>& out_records, std::string& out_error)
+{
+    return ReadBtreeLeafRecords(source, block_size, root_block, child_addresses_are_physical,
+        child_object_map_oid, max_xid_hint, policy, routing, out_records, out_error, nullptr);
+}
+
+bool ReadBtreeLeafRecords(
+    const RandomAccessSource& source, std::uint32_t block_size,
+    std::uint64_t root_block, bool child_addresses_are_physical,
+    std::uint64_t child_object_map_oid, std::uint64_t max_xid_hint,
+    const BtreeReadPolicy& policy, const BtreeRoutingPolicy& routing,
+    std::vector<BtreeRecord>& out_records, std::string& out_error, BtreeNodeReadContext* node_context)
+{
     BudgetErrorScope budget_error{source, out_error};
     bool complete = false;
     struct ClearIncomplete
@@ -1059,14 +1158,25 @@ bool ReadBtreeLeafRecords(
         bool& complete;
         std::vector<BtreeRecord>& records;
         std::vector<std::uint64_t>* visited;
-        ~ClearIncomplete() { if (!complete) { records.clear(); if (visited) visited->clear(); } }
-    } clear_incomplete{complete, out_records, policy.visited_physical_blocks};
+        bool wipe;
+        ~ClearIncomplete()
+        {
+            if (!complete)
+            {
+                if (wipe) for (auto& record : records) WipeBtreeRecord(record);
+                records.clear();
+                if (visited) visited->clear();
+            }
+        }
+    } clear_incomplete{complete, out_records, policy.visited_physical_blocks, node_context != nullptr};
     out_records.clear();
     out_error.clear();
     if (policy.visited_physical_blocks != nullptr)
     {
         policy.visited_physical_blocks->clear();
     }
+    if (routing.compare_keys && !policy.require_complete_traversal)
+    { out_error = "CatalogBtreeRoutingRequiresCompleteTraversal"; return false; }
     if (block_size == 0 || root_block == 0)
     {
         out_error = "CatalogBtreeRootInvalid";
@@ -1079,13 +1189,20 @@ bool ReadBtreeLeafRecords(
         bool root = false;
         std::optional<std::uint16_t> expected_level;
         std::optional<std::uint64_t> mapping_xid;
+        BtreeRoutingBytes lower, upper;
     };
+    // Preserve the legacy logical budget charge when routing is not requested.
+    // The added vectors are empty and allocate no buffers on that path.
+    const auto pending_charge = routing.compare_keys ? sizeof(PendingNode) :
+        sizeof(PendingNode) - 2 * sizeof(BtreeRoutingBytes);
     std::queue<PendingNode> pending;
-    if (!Materialize(source, 0, sizeof(PendingNode))) return false;
-    pending.push({root_block, policy.root_object_id, true, std::nullopt, std::nullopt});
+    if (!Materialize(source, 0, pending_charge)) return false;
+    pending.push({root_block, policy.root_object_id, true, std::nullopt, std::nullopt,
+        BtreeRoutingBytes(node_context != nullptr), BtreeRoutingBytes(node_context != nullptr)});
     std::unordered_set<std::uint64_t> visited;
     if (!source.ReadBudget()) visited.reserve(kMaxVisitedBlocks);
-    std::vector<std::byte> block;
+    std::vector<std::byte> ordinary_block;
+    std::span<const std::byte> block;
     bool root_layout_seen = false;
     std::uint32_t tree_key_size = 0;
     std::uint32_t tree_value_size = 0;
@@ -1093,7 +1210,12 @@ bool ReadBtreeLeafRecords(
     std::uint64_t declared_node_count = 0;
     while (!pending.empty())
     {
-        const PendingNode current = pending.front();
+        struct ReleaseNode
+        {
+            BtreeNodeReadContext* context;
+            ~ReleaseNode() { if (context) context->ReleaseNode(); }
+        } release_node{node_context};
+        const PendingNode current = std::move(pending.front());
         pending.pop();
         const std::uint64_t block_index = current.physical_block;
         if (!Materialize(source, 0, sizeof(std::uint64_t))) return false;
@@ -1116,7 +1238,11 @@ bool ReadBtreeLeafRecords(
             out_error = "CatalogBtreeBlockOverflow";
             return false;
         }
-        if (!ReadBlockAt(source, block_index * block_size, block_size, block))
+        const bool read_ok = node_context
+            ? node_context->ReadNode(current.object_id, block_index, current.root, block, out_error)
+            : ReadBlockAt(source, block_index * block_size, block_size, ordinary_block);
+        if (!node_context) block = ordinary_block;
+        if (!read_ok || block.size() != block_size)
         {
             out_error = "CatalogBtreeBlockUnreadable";
             return false;
@@ -1178,7 +1304,8 @@ bool ReadBtreeLeafRecords(
         }
         const std::uint16_t flags = ReadU16LE(block, 0x20).value_or(0);
         if (policy.reject_unsupported_flags &&
-            ((full_object_type & ~(kObjectStorageTypeMask | kObjectTypeMask)) != 0 ||
+            ((full_object_type & ~(kObjectStorageTypeMask | kObjectTypeMask |
+                (node_context ? 0x10000000u : 0u))) != 0 ||
              (flags & ~0x0007u) != 0 || ReadU64LE(block, 0x10).value_or(0) == 0))
         {
             out_error = "CatalogBtreeUnsupportedFlagsOrZeroXid";
@@ -1228,8 +1355,9 @@ bool ReadBtreeLeafRecords(
                 const auto tree_flags = ReadU32LE(block, info_start).value_or(~0u);
                 const auto storage = full_object_type & kObjectStorageTypeMask;
                 // Accept the understood persistent layouts and hints.
-                // NONPERSISTENT, hashes, no-header, and actual ghost records
-                // are not supported by this strict on-disk traversal.
+                // NONPERSISTENT, hashes and no-header are unsupported. Ghosts
+                // require an explicit routing policy and include_ghost_records
+                // (used for authoritative spaceman singleton queue entries).
                 if ((tree_flags & ~0x7Fu) != 0 || (tree_flags & 0x20u) != 0 ||
                     ((tree_flags & 0x10u) != 0) != (storage == kObjectPhysical) ||
                     ((tree_flags & 0x08u) != 0) != (storage == kObjectEphemeral))
@@ -1282,6 +1410,10 @@ bool ReadBtreeLeafRecords(
             out_error = "CatalogBtreeTableInvalid";
             return false;
         }
+        std::vector<PendingNode> children;
+        BtreeRoutingBytes previous_key(node_context != nullptr);
+        if (routing.compare_keys && !current.root && key_count == 0)
+        { out_error = "CatalogBtreeRoutingEmptyChild"; return false; }
         for (std::uint32_t index = 0; index < key_count; ++index)
         {
             const std::size_t entry_offset = table_start + static_cast<std::size_t>(index) * entry_size;
@@ -1317,7 +1449,8 @@ bool ReadBtreeLeafRecords(
                 }
             }
             const bool ghost = level == 0 && value_offset == 0xFFFFu;
-            if (policy.require_complete_traversal && (key_offset == 0xFFFFu || ghost || key_length == 0))
+            if (policy.require_complete_traversal && (key_offset == 0xFFFFu ||
+                (ghost && !(routing.compare_keys && policy.include_ghost_records)) || key_length == 0))
             {
                 out_error = "CatalogBtreeMissingEntry";
                 return false;
@@ -1342,16 +1475,56 @@ bool ReadBtreeLeafRecords(
                 value_area_end - value_offset;
             if (policy.require_complete_traversal &&
                 (key_start > free_start || key_length > free_start - key_start ||
-                    value_start < value_area_start || value_length > value_area_end - value_start))
+                    (!ghost && (value_start < value_area_start || value_length > value_area_end - value_start))))
             {
                 out_error = "CatalogBtreeEntryRegionInvalid";
                 return false;
+            }
+            BtreeRoutingBytes routing_key(node_context != nullptr);
+            if (routing.compare_keys)
+            {
+                // Charge retained keys and temporary comparison/queue copies.
+                if (!Materialize(source, 0, 8ull * key_length +
+                        4ull * (current.lower.size() + current.upper.size()))) return false;
+                routing_key.assign(block.begin() + key_start, block.begin() + key_start + key_length);
+                const auto valid = routing.compare_keys(routing_key, routing_key, out_error);
+                if (!valid) return false;
+                if (*valid != 0) { out_error = "CatalogBtreeRoutingComparatorInvalid"; return false; }
+                if (!previous_key.empty())
+                {
+                    const auto order = routing.compare_keys(previous_key, routing_key, out_error);
+                    if (!order) return false;
+                    if (*order >= 0)
+                    { out_error = level ? "CatalogBtreeRoutingSeparatorOrder" : "CatalogBtreeLeafKeyOrder"; return false; }
+                }
+                if (!current.lower.empty())
+                {
+                    const auto order = routing.compare_keys(routing_key, current.lower, out_error);
+                    if (!order) return false;
+                    if (*order < 0 || (index == 0 && *order != 0))
+                    { out_error = "CatalogBtreeRoutingChildMinimumMismatch"; return false; }
+                }
+                if (!current.upper.empty())
+                {
+                    const auto order = routing.compare_keys(routing_key, current.upper, out_error);
+                    if (!order) return false;
+                    if (*order >= 0)
+                    { out_error = "CatalogBtreeRoutingChildUpperBound"; return false; }
+                }
+                if (!children.empty()) children.back().upper = routing_key;
+                previous_key = routing_key;
             }
             if (level == 0)
             {
                 if (!Materialize(source, 1, sizeof(BtreeRecord) +
                         static_cast<std::uint64_t>(key_length) + (ghost ? 0 : value_length))) return false;
                 BtreeRecord record;
+                struct ClearUnpublishedRecord
+                {
+                    BtreeRecord& record;
+                    bool wipe;
+                    ~ClearUnpublishedRecord() { if (wipe) WipeBtreeRecord(record); }
+                } clear_record{record, node_context != nullptr};
                 record.key.assign(
                     block.begin() + static_cast<std::vector<std::byte>::difference_type>(key_start),
                     block.begin() + static_cast<std::vector<std::byte>::difference_type>(key_start + key_length));
@@ -1428,11 +1601,15 @@ bool ReadBtreeLeafRecords(
             }
             if (child_block != 0)
             {
-                if (!Materialize(source, 0, sizeof(PendingNode))) return false;
-                pending.push({child_block, child_object_id, false,
-                    static_cast<std::uint16_t>(level - 1), child_mapping_xid});
+                if (!Materialize(source, 0, pending_charge)) return false;
+                PendingNode child{child_block, child_object_id, false,
+                    static_cast<std::uint16_t>(level - 1), child_mapping_xid,
+                    std::move(routing_key), current.upper};
+                if (routing.compare_keys) children.push_back(std::move(child));
+                else pending.push(std::move(child));
             }
         }
+        for (auto& child : children) pending.push(std::move(child));
     }
     if (policy.reject_unsupported_flags &&
         (declared_key_count != out_records.size() || declared_node_count != visited.size()))
@@ -1451,6 +1628,17 @@ std::optional<OmapValue> ResolveOmapValue(
     std::uint64_t oid,
     std::uint64_t max_xid,
     std::string& out_error)
+{
+    return ResolveOmapValue(source, block_size, map_oid, oid, max_xid, out_error, false);
+}
+
+std::optional<OmapValue> ResolveOmapValue(
+    const RandomAccessSource& source,
+    std::uint32_t block_size,
+    std::uint64_t map_oid,
+    std::uint64_t oid,
+    std::uint64_t max_xid,
+    std::string& out_error, bool strict)
 {
     BudgetErrorScope budget_error{source, out_error};
     out_error.clear();
@@ -1502,7 +1690,15 @@ std::optional<OmapValue> ResolveOmapValue(
         (omap_type & kObjectStorageTypeMask) == kObjectPhysical &&
         (tree_type & kObjectStorageTypeMask) == kObjectPhysical &&
         (tree_type & kObjectTypeMask) == kObjectTypeBtree;
+    if (strict && (!has_strict_identity || omap_type != (kObjectPhysical | kObjectTypeOmap) ||
+        tree_type != (kObjectPhysical | kObjectTypeBtree) || ReadU32LE(omap, 28) != 0u ||
+        ReadU64LE(omap, 16).value_or(0) == 0 || ReadU32LE(omap, 32) != 0u))
+    {
+        out_error = "CatalogOmapUnsupportedProfile";
+        return std::nullopt;
+    }
     BtreeReadPolicy policy;
+    policy.reject_unsupported_flags = strict;
     policy.require_complete_traversal = true;
     if (has_strict_identity)
     {
@@ -1533,6 +1729,11 @@ std::optional<OmapValue> ResolveOmapValue(
         }
         const auto candidate_oid = ReadU64LE(record.key, 0).value_or(0xFFFFFFFFFFFFFFFFull);
         const auto candidate_xid = ReadU64LE(record.key, 8).value_or(0xFFFFFFFFFFFFFFFFull);
+        if (strict && (candidate_oid == 0 || candidate_xid == 0))
+        {
+            out_error = "CatalogOmapRecordIdentityInvalid";
+            return std::nullopt;
+        }
         if (!Materialize(source, 0, 2 * sizeof(std::uint64_t))) return std::nullopt;
         if (!seen_xids[candidate_oid].insert(candidate_xid).second)
         {
@@ -1672,7 +1873,7 @@ bool ReadAppleObject(
     const std::string& error_prefix,
     AppleObjectLocation& out_location,
     std::vector<std::byte>& out_bytes,
-    std::string& out_error)
+    std::string& out_error, bool strict_header = false)
 {
     out_location = AppleObjectLocation{};
     out_bytes.clear();
@@ -1699,6 +1900,9 @@ bool ReadAppleObject(
         0xFFFFFFFFFFFFFFFFull);
     const std::uint32_t type = ReadU32LE(out_bytes, 0x18).value_or(0xFFFFFFFFu);
     const std::uint32_t subtype = ReadU32LE(out_bytes, 0x1C).value_or(0xFFFFFFFFu);
+    if (strict_header && (xid == 0 ||
+        (type & ~(kObjectStorageTypeMask | kObjectTypeMask)) != 0))
+    { out_error = error_prefix + "UnsupportedObjectFlagsOrZeroXid"; return false; }
     if (object_id != expected_object_id)
     {
         out_error = error_prefix + "ObjectIdMismatch";
@@ -1752,13 +1956,13 @@ bool LoadAppleOmap(
     std::uint64_t max_xid,
     const std::string& error_prefix,
     AppleOmapView& out_view,
-    std::string& out_error)
+    std::string& out_error, bool strict_header = false)
 {
     out_view = AppleOmapView{};
     std::vector<std::byte> omap_bytes;
     if (!ReadAppleObject(source, block_size, omap_oid, block_size,
             omap_oid, max_xid, kObjectPhysical, kObjectTypeOmap, std::nullopt,
-            error_prefix, out_view.object, omap_bytes, out_error))
+            error_prefix, out_view.object, omap_bytes, out_error, strict_header))
     {
         return false;
     }
@@ -1767,6 +1971,12 @@ bool LoadAppleOmap(
     out_view.snapshot_tree_type = ReadU32LE(omap_bytes, 0x2C).value_or(0);
     const std::uint64_t tree_oid = ReadU64LE(omap_bytes, 0x30).value_or(0);
     out_view.snapshot_tree_oid = ReadU64LE(omap_bytes, 0x38).value_or(0);
+    if (strict_header && (out_view.object.subtype != 0 || (out_view.flags & ~1u) != 0 ||
+        out_view.tree_type != (kObjectPhysical | kObjectTypeBtree) ||
+        ReadU64LE(omap_bytes, 0x48).value_or(~0ull) != 0 ||
+        ReadU64LE(omap_bytes, 0x50).value_or(~0ull) != 0))
+    { out_error = error_prefix + "CryptoOrRevertStateUnsupported"; return false; }
+
     if (tree_oid == 0 ||
         (out_view.tree_type & kObjectTypeMask) != kObjectTypeBtree ||
         (out_view.tree_type & kObjectStorageTypeMask) != kObjectPhysical)
@@ -1778,7 +1988,7 @@ bool LoadAppleOmap(
     return ReadAppleObject(source, block_size, tree_oid, block_size,
         tree_oid, max_xid, kObjectPhysical, kObjectTypeBtree,
         kObjectTypeOmap, error_prefix + "Tree", out_view.tree,
-        tree_bytes, out_error);
+        tree_bytes, out_error, strict_header);
 }
 
 std::optional<OmapValue> ResolveAppleOmapValue(
@@ -1790,7 +2000,7 @@ std::optional<OmapValue> ResolveAppleOmapValue(
     const std::string& error_prefix,
     std::string& out_error,
     std::uint64_t tree_max_xid = 0,
-    bool strict_snapshot = false)
+    bool strict_snapshot = false, bool strict_order = false)
 {
     std::vector<BtreeRecord> records;
     BtreeReadPolicy policy;
@@ -1810,6 +2020,8 @@ std::optional<OmapValue> ResolveAppleOmapValue(
     std::optional<OmapValue> selected;
     bool newest_is_tombstone = false;
     std::unordered_map<std::uint64_t, std::unordered_set<std::uint64_t>> seen_xids;
+    std::pair<std::uint64_t, std::uint64_t> previous_key{};
+    bool have_previous = false;
     for (const auto& record : records)
     {
         if (record.key.size() != 16 || record.value.size() != 16)
@@ -1821,6 +2033,10 @@ std::optional<OmapValue> ResolveAppleOmapValue(
             0xFFFFFFFFFFFFFFFFull);
         const auto candidate_xid = ReadU64LE(record.key, 8).value_or(
             0xFFFFFFFFFFFFFFFFull);
+        const auto key = std::make_pair(candidate_oid, candidate_xid);
+        if (strict_order && have_previous && key <= previous_key)
+        { out_error = error_prefix + "KeyOrderInvalid"; return std::nullopt; }
+        previous_key = key; have_previous = true;
         if (strict_snapshot && (candidate_oid == 0 || candidate_xid == 0 ||
             candidate_xid > tree_max_xid ||
             (ReadU32LE(record.value, 0).value() & ~0x3u) != 0))
@@ -1877,8 +2093,12 @@ bool ResolveAppleTreeRoot(
     std::uint32_t tree_type,
     std::uint32_t expected_subtype,
     AppleObjectLocation& out_location,
-    std::string& out_error)
+    std::string& out_error, bool strict_readonly = false)
 {
+    // A declared encrypted/headerless tree is not an ordinary tree even if
+    // its referenced bytes happen to contain a valid plaintext object header.
+    if (strict_readonly && (tree_type & ~(kObjectStorageTypeMask | kObjectTypeMask)) != 0)
+    { out_error = "AppleTreeObjectFlagsUnsupported"; return false; }
     if (tree_oid == 0 || (tree_type & kObjectTypeMask) != kObjectTypeBtree)
     {
         out_error = "AppleTreeTypeInvalid";
@@ -1887,6 +2107,7 @@ bool ResolveAppleTreeRoot(
     const std::uint32_t storage_type = tree_type & kObjectStorageTypeMask;
     std::uint64_t physical_block = 0;
     std::uint32_t object_size = checkpoint.superblock.block_size;
+    auto object_max_xid = checkpoint.superblock.xid;
     if (storage_type == kObjectPhysical)
     {
         physical_block = tree_oid;
@@ -1895,11 +2116,12 @@ bool ResolveAppleTreeRoot(
     {
         auto mapping = ResolveAppleOmapValue(source, checkpoint.superblock.block_size,
             volume_omap, tree_oid, checkpoint.superblock.xid,
-            "AppleVolumeOmap", out_error);
+            "AppleVolumeOmap", out_error, checkpoint.superblock.xid, strict_readonly, strict_readonly);
         if (!mapping.has_value())
         {
             return false;
         }
+        object_max_xid = strict_readonly ? mapping->xid : object_max_xid;
         physical_block = mapping->physical_block;
         object_size = mapping->size;
     }
@@ -1926,9 +2148,9 @@ bool ResolveAppleTreeRoot(
     }
     std::vector<std::byte> tree_bytes;
     return ReadAppleObject(source, checkpoint.superblock.block_size,
-        physical_block, object_size, tree_oid, checkpoint.superblock.xid,
+        physical_block, object_size, tree_oid, object_max_xid,
         storage_type, kObjectTypeBtree, expected_subtype, "AppleTree",
-        out_location, tree_bytes, out_error);
+        out_location, tree_bytes, out_error, strict_readonly);
 }
 
 bool ByteRangeFits(
@@ -2643,6 +2865,137 @@ bool LoadAppleSpacemanOwnershipView(
     return true;
 }
 
+namespace
+{
+std::optional<AppleReadOnlyVolumeView> LoadAppleVolumeViewImpl(
+    const RandomAccessSource& source, ContainerCheckpointView checkpoint,
+    std::string& out_error, bool strict_readonly, AppleSpacemanView* spaceman)
+{
+    BudgetErrorScope budget_error{source, out_error};
+    out_error.clear();
+    if (checkpoint.checkpoint_map_blocks.empty() || checkpoint.superblock.spaceman_oid == 0 ||
+        checkpoint.superblock.xid == 0 || checkpoint.superblock.block_size == 0)
+    { out_error = "AppleReadOnlyCheckpointInvalid"; return std::nullopt; }
+    AppleReadOnlyVolumeView view;
+    view.container = std::move(checkpoint);
+    const auto& nxsb = view.container.superblock;
+    if (!LoadAppleOmap(source, nxsb.block_size, nxsb.omap_oid, nxsb.xid,
+            "AppleContainerOmap", view.container_object_map, out_error, strict_readonly))
+    {
+        return std::nullopt;
+    }
+
+    if (spaceman && !LoadAppleSpacemanOwnershipViewImpl(source, view.container, *spaceman, out_error))
+        return std::nullopt;
+
+    std::unordered_set<std::uint64_t> seen_volume_oids;
+    for (const std::uint64_t volume_oid : nxsb.fs_oids)
+    {
+        if (!Materialize(source, 0, sizeof(std::uint64_t))) return std::nullopt;
+        if (volume_oid == 0 || !seen_volume_oids.insert(volume_oid).second)
+        {
+            out_error = "AppleVolumeOidInvalid";
+            return std::nullopt;
+        }
+        auto mapping = ResolveAppleOmapValue(source, nxsb.block_size,
+            view.container_object_map, volume_oid, nxsb.xid,
+            "AppleContainerOmap", out_error, nxsb.xid, strict_readonly, strict_readonly);
+        if (!mapping.has_value())
+        {
+            return std::nullopt;
+        }
+        AppleVolumeCheckpointView volume_view;
+        std::vector<std::byte> apsb_bytes;
+        if (!ReadAppleObject(source, nxsb.block_size, mapping->physical_block,
+                mapping->size, volume_oid, strict_readonly ? mapping->xid : nxsb.xid, 0, kObjectTypeFs,
+                strict_readonly ? std::optional<std::uint32_t>(0) : std::nullopt, "AppleVolumeSuperblock",
+                volume_view.superblock_object, apsb_bytes, out_error, strict_readonly))
+        {
+            return std::nullopt;
+        }
+        if (!Materialize(source, 0, sizeof(ApsbVolume) + 384)) return std::nullopt;
+        auto apsb = ParseApsb(apsb_bytes);
+        if (!apsb.has_value())
+        {
+            out_error = "AppleVolumeSuperblockInvalid";
+            return std::nullopt;
+        }
+        if (strict_readonly && (apsb->uuid_hex.empty() || !apsb->name_valid ||
+            apsb->xid == 0 || apsb->omap_oid == 0 || apsb->root_oid == 0))
+        { out_error = "AppleReadOnlyVolumeIdentityInvalid"; return std::nullopt; }
+        volume_view.superblock = std::move(apsb.value());
+        // Catalog the authoritative APSB even when this readonly reader cannot
+        // interpret its filesystem. No encrypted metadata probing or fallback.
+        if (strict_readonly && (volume_view.superblock.fs_flags != kFsFlagUnencrypted ||
+            (volume_view.superblock.features & ~kVolumeKnownOptionalFeaturesMask) ||
+            volume_view.superblock.readonly_features ||
+            (volume_view.superblock.incompatible_features & ~kVolumeSupportedIncompatibleFeaturesMask) ||
+            volume_view.superblock.fext_tree_oid || volume_view.superblock.fext_tree_type))
+        {
+            if (!Materialize(source, 1, sizeof(AppleVolumeCheckpointView))) return std::nullopt;
+            view.volumes.push_back(std::move(volume_view));
+            continue;
+        }
+        if (!LoadAppleOmap(source, nxsb.block_size, volume_view.superblock.omap_oid,
+                nxsb.xid, "AppleVolumeOmap", volume_view.object_map, out_error, strict_readonly))
+        {
+            return std::nullopt;
+        }
+        if (!ResolveAppleTreeRoot(source, view.container, volume_view.object_map,
+                volume_oid, volume_view.superblock.root_oid,
+                volume_view.superblock.root_tree_type, kObjectTypeFsTree,
+                volume_view.root_tree, out_error, strict_readonly))
+        {
+            return std::nullopt;
+        }
+        if (volume_view.superblock.extentref_tree_oid != 0)
+        {
+            AppleObjectLocation location;
+            if (!ResolveAppleTreeRoot(source, view.container, volume_view.object_map,
+                    volume_oid, volume_view.superblock.extentref_tree_oid,
+                    volume_view.superblock.extentref_tree_type,
+                    kObjectTypeBlockRefTree, location, out_error, strict_readonly))
+            {
+                return std::nullopt;
+            }
+            volume_view.extentref_tree = location;
+        }
+        if (volume_view.superblock.snap_meta_tree_oid != 0)
+        {
+            AppleObjectLocation location;
+            if (!ResolveAppleTreeRoot(source, view.container, volume_view.object_map,
+                    volume_oid, volume_view.superblock.snap_meta_tree_oid,
+                    volume_view.superblock.snap_meta_tree_type,
+                    kObjectTypeSnapMetaTree, location, out_error, strict_readonly))
+            {
+                return std::nullopt;
+            }
+            volume_view.snapshot_metadata_tree = location;
+        }
+        if (volume_view.superblock.fext_tree_oid != 0)
+        {
+            AppleObjectLocation location;
+            if (!ResolveAppleTreeRoot(source, view.container, volume_view.object_map,
+                    volume_oid, volume_view.superblock.fext_tree_oid,
+                    volume_view.superblock.fext_tree_type,
+                    kObjectTypeFileExtentTree, location, out_error, strict_readonly))
+            {
+                return std::nullopt;
+            }
+            volume_view.file_extent_tree = location;
+        }
+        if (!Materialize(source, 1, sizeof(AppleVolumeCheckpointView))) return std::nullopt;
+        view.volumes.push_back(std::move(volume_view));
+    }
+    if (view.volumes.empty())
+    {
+        out_error = "AppleCheckpointNoVolumes";
+        return std::nullopt;
+    }
+    return view;
+}
+} // namespace
+
 std::optional<AppleCheckpointView> LoadAppleCheckpointView(
     const RandomAccessSource& source,
     std::uint64_t store_offset_bytes,
@@ -2674,111 +3027,28 @@ std::optional<AppleCheckpointView> LoadAppleCheckpointView(
         return std::nullopt;
     }
 
+    // Ordinary admission retains the complete allocator gate and bounded source.
+    AppleSpacemanView spaceman;
+    auto readonly = LoadAppleVolumeViewImpl(store, std::move(*checkpoint), out_error, false, &spaceman);
+    if (!readonly) return std::nullopt;
     AppleCheckpointView view;
-    view.container = std::move(checkpoint.value());
-    const auto& nxsb = view.container.superblock;
-    if (!LoadAppleOmap(store, nxsb.block_size, nxsb.omap_oid, nxsb.xid,
-            "AppleContainerOmap", view.container_object_map, out_error))
-    {
-        return std::nullopt;
-    }
-
-    if (!LoadAppleSpacemanOwnershipViewImpl(
-            store, view.container, view.spaceman, out_error))
-    {
-        return std::nullopt;
-    }
-
-    std::unordered_set<std::uint64_t> seen_volume_oids;
-    for (const std::uint64_t volume_oid : nxsb.fs_oids)
-    {
-        if (!Materialize(source, 0, sizeof(std::uint64_t))) return std::nullopt;
-        if (volume_oid == 0 || !seen_volume_oids.insert(volume_oid).second)
-        {
-            out_error = "AppleVolumeOidInvalid";
-            return std::nullopt;
-        }
-        auto mapping = ResolveAppleOmapValue(store, nxsb.block_size,
-            view.container_object_map, volume_oid, nxsb.xid,
-            "AppleContainerOmap", out_error);
-        if (!mapping.has_value())
-        {
-            return std::nullopt;
-        }
-        AppleVolumeCheckpointView volume_view;
-        std::vector<std::byte> apsb_bytes;
-        if (!ReadAppleObject(store, nxsb.block_size, mapping->physical_block,
-                mapping->size, volume_oid, nxsb.xid, 0, kObjectTypeFs,
-                std::nullopt, "AppleVolumeSuperblock",
-                volume_view.superblock_object, apsb_bytes, out_error))
-        {
-            return std::nullopt;
-        }
-        if (!Materialize(source, 0, sizeof(ApsbVolume) + 384)) return std::nullopt;
-        auto apsb = ParseApsb(apsb_bytes);
-        if (!apsb.has_value())
-        {
-            out_error = "AppleVolumeSuperblockInvalid";
-            return std::nullopt;
-        }
-        volume_view.superblock = std::move(apsb.value());
-        if (!LoadAppleOmap(store, nxsb.block_size, volume_view.superblock.omap_oid,
-                nxsb.xid, "AppleVolumeOmap", volume_view.object_map, out_error))
-        {
-            return std::nullopt;
-        }
-        if (!ResolveAppleTreeRoot(store, view.container, volume_view.object_map,
-                volume_oid, volume_view.superblock.root_oid,
-                volume_view.superblock.root_tree_type, kObjectTypeFsTree,
-                volume_view.root_tree, out_error))
-        {
-            return std::nullopt;
-        }
-        if (volume_view.superblock.extentref_tree_oid != 0)
-        {
-            AppleObjectLocation location;
-            if (!ResolveAppleTreeRoot(store, view.container, volume_view.object_map,
-                    volume_oid, volume_view.superblock.extentref_tree_oid,
-                    volume_view.superblock.extentref_tree_type,
-                    kObjectTypeBlockRefTree, location, out_error))
-            {
-                return std::nullopt;
-            }
-            volume_view.extentref_tree = location;
-        }
-        if (volume_view.superblock.snap_meta_tree_oid != 0)
-        {
-            AppleObjectLocation location;
-            if (!ResolveAppleTreeRoot(store, view.container, volume_view.object_map,
-                    volume_oid, volume_view.superblock.snap_meta_tree_oid,
-                    volume_view.superblock.snap_meta_tree_type,
-                    kObjectTypeSnapMetaTree, location, out_error))
-            {
-                return std::nullopt;
-            }
-            volume_view.snapshot_metadata_tree = location;
-        }
-        if (volume_view.superblock.fext_tree_oid != 0)
-        {
-            AppleObjectLocation location;
-            if (!ResolveAppleTreeRoot(store, view.container, volume_view.object_map,
-                    volume_oid, volume_view.superblock.fext_tree_oid,
-                    volume_view.superblock.fext_tree_type,
-                    kObjectTypeFileExtentTree, location, out_error))
-            {
-                return std::nullopt;
-            }
-            volume_view.file_extent_tree = location;
-        }
-        if (!Materialize(source, 1, sizeof(AppleVolumeCheckpointView))) return std::nullopt;
-        view.volumes.push_back(std::move(volume_view));
-    }
-    if (view.volumes.empty())
-    {
-        out_error = "AppleCheckpointNoVolumes";
-        return std::nullopt;
-    }
+    view.container = std::move(readonly->container);
+    view.container_object_map = std::move(readonly->container_object_map);
+    view.volumes = std::move(readonly->volumes);
+    view.spaceman = std::move(spaceman);
     return view;
+}
+
+std::optional<AppleReadOnlyVolumeView> LoadAppleReadOnlyVolumeView(
+    const RandomAccessSource& source, const ContainerCheckpointView& checkpoint,
+    std::string& out_error)
+{
+    BudgetErrorScope budget_error{source, out_error};
+    if (!Materialize(source, 1, sizeof(ContainerCheckpointView) + checkpoint.superblock_bytes.size() +
+        checkpoint.mappings.size() * sizeof(CheckpointMapping) +
+        checkpoint.checkpoint_map_blocks.size() * sizeof(std::uint64_t) +
+        checkpoint.superblock.fs_oids.size() * sizeof(std::uint64_t) + 128)) return std::nullopt;
+    return LoadAppleVolumeViewImpl(source, checkpoint, out_error, true, nullptr);
 }
 
 namespace
@@ -2840,7 +3110,7 @@ bool SnapshotName(const std::vector<std::byte>& bytes, std::size_t offset,
 bool ReadSnapshotTree(const RandomAccessSource& source, std::uint32_t block_size,
     const AppleObjectLocation& tree, const AppleOmapView& omap,
     std::uint64_t tree_xid, std::uint64_t checkpoint_xid,
-    std::vector<BtreeRecord>& records, std::string& error)
+    std::vector<BtreeRecord>& records, std::string& error, bool strict_omap_order = false)
 {
     const auto storage = tree.type & kObjectStorageTypeMask;
     if (storage != 0 && storage != kObjectPhysical)
@@ -2858,7 +3128,7 @@ bool ReadSnapshotTree(const RandomAccessSource& source, std::uint32_t block_size
     policy.virtual_child_resolver = [&](std::uint64_t oid, std::string& child_error)
         -> std::optional<BtreeVirtualChildMapping> {
         const auto value = ResolveAppleOmapValue(source, block_size, omap, oid,
-            tree_xid, "SnapshotChildOmap", child_error, checkpoint_xid, true);
+            tree_xid, "SnapshotChildOmap", child_error, checkpoint_xid, true, strict_omap_order);
         if (!value) return std::nullopt;
         if (value->size != block_size)
         {
@@ -2962,6 +3232,15 @@ bool SnapshotOmapSupported(const RandomAccessSource& source, std::uint32_t block
     return true;
 }
 } // namespace
+
+bool ReadAppleVolumeFileSystemRecords(const RandomAccessSource& source,
+    const ContainerCheckpointView& checkpoint, const AppleVolumeCheckpointView& volume,
+    std::vector<BtreeRecord>& records, std::string& error)
+{
+    records.clear();
+    return ReadSnapshotTree(source, checkpoint.superblock.block_size, volume.root_tree,
+        volume.object_map, checkpoint.superblock.xid, checkpoint.superblock.xid, records, error, true);
+}
 
 bool LoadAppleSnapshotRecords(const RandomAccessSource& source,
     const AppleCheckpointView& checkpoint, std::uint64_t volume_oid,

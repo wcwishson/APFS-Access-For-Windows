@@ -53,6 +53,7 @@ typedef NTSTATUS* PNTSTATUS;
 #include "AppleTransactionCommit.h"
 #include "InodeMetadataPatch.h"
 #include "NativeApfsReader.h"
+#include "NativeClone.h"
 #include "ApfsNameCodec.h"
 #include "ApfsContainerCatalog.h"
 #include "ContainerMountCoordinator.h"
@@ -86,6 +87,7 @@ constexpr std::chrono::milliseconds kWinFspServiceStartProbeInterval{20};
 constexpr std::uint32_t kGroupedDeferredAcceptanceWindowMs = 25;
 constexpr std::uint32_t kGroupedDeferredAcceptanceMaxParticipants = 32;
 constexpr std::chrono::milliseconds kDeferredCommitMutationMutexRetryPeriod{10};
+constexpr std::chrono::milliseconds kDeferredAccessTimeRefusalRetryPeriod{250};
 constexpr std::uint64_t kDeferredCloseCommitBurstThreshold = 32;
 constexpr std::uint64_t kDeferredCloseCommitPayloadBytesThreshold = 512ull * 1024ull * 1024ull;
 constexpr std::uint64_t kCallbackStatusWriteMinIntervalMs = 500;
@@ -230,6 +232,9 @@ struct Arguments
     // Container UUID scope (32 lowercase hex digits, "" = unscoped). Constrains
     // name/OID resolution to one container; mismatches fail closed.
     std::wstring container_id;
+    // Explicit immutable historical selection; zero means ordinary current view.
+    std::uint64_t snapshot_xid = 0;
+    std::wstring snapshot_name;
     // Container-session manifest path ("" = single-volume mode). Mutually
     // exclusive with device/volume/mount/volume-oid/container-id; the
     // manifest carries the container identity, device, and per-volume OIDs.
@@ -386,8 +391,24 @@ struct NativeXattrStreamState
     std::optional<std::vector<std::byte>> unlinked_value;
 };
 
+// Lock order: mutation callback -> open authority -> ticket. Cleanup/Close
+// release both authority locks before entering any mutation or namespace gate.
+// Unrelated closes never wait for the volume mutation lock to revoke authority.
+struct NativeCloneTicketState
+{
+    std::mutex mutex;
+    std::array<std::uint8_t, 32> ticket{};
+    std::shared_ptr<Node> source;
+    std::uint64_t object_id = 0, generation = 0;
+    bool consumed = false;
+    bool revoked = false;
+};
+
 struct OpenContext
 {
+    std::mutex clone_authority_mutex;
+    bool clone_authority_closed = false;
+    std::shared_ptr<NativeCloneTicketState> clone_ticket;
     std::shared_ptr<Node> node;
     std::atomic<HANDLE> file{INVALID_HANDLE_VALUE};
     UINT32 granted_access = 0;
@@ -2423,6 +2444,7 @@ struct MountContext
     std::atomic<std::uint64_t> grouped_acceptance_last_failure_observed_accepted_sequence{0};
     std::atomic<std::uint64_t> grouped_acceptance_last_failure_batch_generation{0};
     std::atomic<bool> grouped_acceptance_last_failure_batch_sealed{false};
+    std::vector<std::weak_ptr<NativeCloneTicketState>> clone_tickets;
     mutable std::mutex tx_mutex;
     std::unique_ptr<apfsaccess::rw::TransactionManager> tx_manager;
     std::filesystem::path tx_journal_file;
@@ -2477,6 +2499,7 @@ struct MountContext
     std::atomic<bool> test_recovery_marker_arm_paused{false};
     std::atomic<bool> test_release_recovery_marker_arm{false};
     std::uint32_t test_grouped_acceptance_failure_recovery_count = 0;
+    std::function<void()> test_before_deferred_atime_publish;
     bool test_throw_deferred_worker_exception_after_claim = false;
     std::atomic<bool> test_pause_deferred_worker_after_wal_flush{false};
     std::atomic<bool> test_deferred_worker_paused_after_wal_flush{false};
@@ -2489,6 +2512,11 @@ struct MountContext
 };
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
+// These capabilities belong only to the executing worker thread. A foreground
+// waiter cannot inherit permission to cross Stop from context-wide drain state.
+thread_local MountContext* deferred_commit_worker_context = nullptr;
+thread_local MountContext* admitted_worker_atime_context = nullptr;
+
 void InvalidatePayloadIdentityCache(MountContext* context) noexcept
 {
     if (context)
@@ -4261,6 +4289,12 @@ std::uint32_t BuildStableVolumeSerial(const Arguments& args)
     constexpr std::uint32_t kFnvOffset = 2166136261u;
     constexpr std::uint32_t kFnvPrime = 16777619u;
 
+    if (args.snapshot_xid)
+    {
+        const auto hash = StableHashUtf16(kFnvOffset, L"apfs-snapshot:" + args.container_id + L":" +
+            std::to_wstring(args.volume_object_id) + L":" + std::to_wstring(args.snapshot_xid));
+        return hash == 0 ? 1u : hash;
+    }
     if (!args.recovery_identity.empty())
     {
         const auto identity_hash = StableHashUtf16(kFnvOffset, args.recovery_identity);
@@ -5441,6 +5475,7 @@ bool IsScaffoldCommitBlobReason(const std::wstring& reason)
 
 std::wstring ResolveNativeWriteCommitModelStatus(const MountContext& context)
 {
+    if (context.args.snapshot_xid) return L"None";
     if (!context.args.readwrite)
     {
         return L"ScaffoldCheckpoint";
@@ -5467,6 +5502,7 @@ std::wstring ResolveNativeWriteCommitModelStatus(const MountContext& context)
 
 std::wstring ResolveNativeWriteValidationStateStatus(const MountContext& context)
 {
+    if (context.args.snapshot_xid) return L"NotApplicable";
     if (!context.args.readwrite)
     {
         return L"Scaffold";
@@ -5788,6 +5824,7 @@ std::string ResolveReplayStageStatus(const MountContext& context)
 
 std::string ResolveCommitBlobMagicStatus(const MountContext& context)
 {
+    if (context.args.snapshot_xid) return {};
 #ifdef APFSACCESS_HAS_RW_ENGINE
     std::lock_guard<std::mutex> metadata_lock(context.metadata_mutex);
     if (context.metadata_store)
@@ -5830,6 +5867,7 @@ std::optional<std::uint64_t> ResolveIntegrityFailureObjectIdStatus(const MountCo
 
 std::wstring ResolveNativeWriteSafetyStateStatus(const MountContext& context)
 {
+    if (context.args.snapshot_xid != 0) return L"ImmutableSnapshotReadOnly";
     if (!context.args.readwrite)
     {
         return L"ReadOnlyFallback";
@@ -6490,7 +6528,15 @@ bool WriteHostStatusFileLocked(
             active_callback_name = context.active_callback_name;
             last_callback_name = context.last_callback_name;
         }
-        buffer << "{\"writeBackend\":\"" << write_backend
+        buffer << "{\"snapshotXid\":";
+        if (context.args.snapshot_xid) buffer << "\"" << context.args.snapshot_xid << "\"";
+        else buffer << "null";
+        buffer << ",\"snapshotName\":\"" << EscapeJson(WideToUtf8(context.args.snapshot_name))
+               << "\",\"snapshotContainerId\":\"" << EscapeJson(WideToUtf8(context.args.container_id))
+               << "\",\"snapshotVolumeOid\":" << context.args.volume_object_id
+               << ",\"immutableSnapshot\":" << (context.args.snapshot_xid ? "true" : "false")
+               << ",\"explicitReadOnly\":" << (context.args.readonly ? "true" : "false")
+               << ",\"writeBackend\":\"" << write_backend
                << "\",\"commitModel\":\"" << commit_model
                << "\",\"nativeWriteReadiness\":\"" << readiness
                << "\",\"nativeWriteValidationState\":\"" << validation_state
@@ -12277,6 +12323,7 @@ NTSTATUS CommitNativeMutationsBestEffort(
     , const apfsaccess::catalog::ContainerPostpublicationVerifierHook& manifest_verification_hook = {}
     , ManifestCommitOutcome* manifest_result = nullptr
     , bool preserve_unaccepted_manifest_queue = false
+    , const std::function<bool()>& namespace_publication = {}
 #endif
 );
 bool HasPendingNativeMutations(MountContext* c);
@@ -12510,6 +12557,8 @@ const wchar_t* operation_text_for_manifest(
         return L"RemoveExtendedAttribute";
     case apfsaccess::rw::MetadataStore::MutationOperation::RewriteCompressedContent:
         return L"RewriteCompressedContent";
+    case apfsaccess::rw::MetadataStore::MutationOperation::CloneFile:
+        return L"CloneFile";
     default:
         return L"Unknown";
     }
@@ -14127,6 +14176,8 @@ bool BuildAcceptedReplayMutationRequest(
     apfsaccess::rw::MetadataStore::MutationRequest& request)
 {
     request = {};
+    if (record.operation == apfsaccess::rw::WriteAheadLog::OperationKind::CloneFile)
+        return apfsaccess::rw::MetadataStore::NativeCloneFromWal(record, request);
     if (record.operation == apfsaccess::rw::WriteAheadLog::OperationKind::RewriteCompressedContent)
         return apfsaccess::fshost::NativeCompressionRewrite::ReplayRequest(record, request);
     request.path = Utf8ToWide(record.path_utf8);
@@ -15551,7 +15602,8 @@ bool RebuildPayloadSpoolIndexFromAcceptedWalBestEffort(MountContext& ctx)
             if (record.operation == apfsaccess::rw::WriteAheadLog::OperationKind::SetExtendedAttribute ||
                 record.operation == apfsaccess::rw::WriteAheadLog::OperationKind::RemoveExtendedAttribute ||
                 record.operation == apfsaccess::rw::WriteAheadLog::OperationKind::SetInodeMetadata ||
-                record.operation == apfsaccess::rw::WriteAheadLog::OperationKind::RewriteCompressedContent)
+                record.operation == apfsaccess::rw::WriteAheadLog::OperationKind::RewriteCompressedContent ||
+                record.operation == apfsaccess::rw::WriteAheadLog::OperationKind::CloneFile)
             {
                 // Inline metadata/proof envelopes are validated by their
                 // production decoder; only Write records reference the spool.
@@ -15854,6 +15906,8 @@ bool BindAcceptedReplayToRetainedVolumeHistory(MountContext& ctx,
     return true;
 }
 
+#include "NativeCloneReplay.h"
+
 bool ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(MountContext& ctx)
 {
     if (HasBlockedRecoveryEvidence(ctx))
@@ -15866,6 +15920,11 @@ bool ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(MountContext& ctx)
         SetRuntimeRecoveryReason(ctx, L"AcceptedWriteReplayValidationFailed");
         return false;
     }
+
+    // Clone acceptance drains and cleans all predecessors and blocks successors
+    // until cleanup. Its proof must never enter generic batched mutation replay.
+    const auto clone_replay = ReplayIsolatedNativeClone(ctx);
+    if (clone_replay.has_value()) return *clone_replay;
 
     std::vector<std::uint64_t> direct_checkpoint_pins;
     if (!IsManifestSession(&ctx))
@@ -16753,6 +16812,10 @@ NTSTATUS BlockNativeMutationAfterStagingFailure(
         c->write_degraded = true;
         c->native_write_enabled = false;
         c->overlay_write_enabled = false;
+        if (c->last_native_mutation_failure_operation.empty() && operation && *operation)
+        {
+            c->last_native_mutation_failure_operation = operation;
+        }
         if (c->runtime_recovery_reason.empty())
         {
             c->runtime_recovery_reason = metadata_staged
@@ -17082,6 +17145,8 @@ ManifestJournalKindForOperation(
         return JournalKind::RemoveExtendedAttribute;
     case MetadataOperation::RewriteCompressedContent:
         return JournalKind::RewriteCompressedContent;
+    case MetadataOperation::CloneFile:
+        return JournalKind::CloneFile;
     default:
         return std::nullopt;
     }
@@ -17644,6 +17709,7 @@ NTSTATUS CommitNativeMutationsBestEffort(
     , const apfsaccess::catalog::ContainerPostpublicationVerifierHook& manifest_verification_hook
     , ManifestCommitOutcome* manifest_result
     , bool preserve_unaccepted_manifest_queue
+    , const std::function<bool()>& namespace_publication
 #endif
 )
 {
@@ -17981,6 +18047,13 @@ NTSTATUS CommitNativeMutationsBestEffort(
         {
             c->test_forced_native_mutations_pending = false;
         }
+#endif
+#ifdef APFSACCESS_HAS_RW_ENGINE
+        if (namespace_publication)
+        {
+            if (!namespace_publication()) return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        else
 #endif
         if (!MergeLastCommittedInodeChangesIntoNodeIndex(c))
         {
@@ -18390,8 +18463,12 @@ bool BeginDeferredCommitBarrier(
         : (std::max)(
             c->deferred_commit_in_flight_target,
             c->deferred_commit_requested_target);
+    const bool admitted_atime = admitted_worker_atime_context == c;
+    // An admitted batch owns the mutation gate and must never wait for a
+    // barrier owned by this same worker. Admission does not imply durability.
+    if (admitted_atime && c->deferred_commit_in_flight) return false;
     const bool waited_for_worker = !from_worker && c->deferred_commit_in_flight;
-    if (!from_worker)
+    if (!from_worker && !admitted_atime)
     {
         c->deferred_commit_cv.wait(lock, [&]()
         {
@@ -18400,13 +18477,13 @@ bool BeginDeferredCommitBarrier(
                 c->deferred_commit_stop_generation != stop_generation_at_entry;
         });
     }
-    else if (!c->deferred_commit_in_flight)
+    else if (from_worker && !c->deferred_commit_in_flight)
     {
         return false;
     }
 
-    if (c->deferred_commit_thread_stop ||
-        c->deferred_commit_stop_generation != stop_generation_at_entry)
+    if (!admitted_atime && (c->deferred_commit_thread_stop ||
+        c->deferred_commit_stop_generation != stop_generation_at_entry))
     {
         return false;
     }
@@ -19763,15 +19840,20 @@ void DeferredCommitWorkerLoop(MountContext* c)
             std::chrono::steady_clock::now() >= c->deferred_access_time_deadline &&
             !c->deferred_commit_thread_stop)
         {
+            auto atime_status = STATUS_SUCCESS;
             lock.unlock();
             {
                 MutationCallbackScope mutation(c, false, true);
-                if (mutation.OwnsLock()) (void)DrainDeferredAccessTimes(c);
+                if (mutation.OwnsLock()) atime_status = DrainDeferredAccessTimes(c);
             }
             lock.lock();
+            // Clean admission refusals retain the exact batch. Back off even
+            // with no close request; Stop and terminal failures stay disarmed.
+            if (c->deferred_commit_thread_stop) break;
             if (c->deferred_access_time_requested)
                 c->deferred_access_time_deadline = std::chrono::steady_clock::now() +
-                    kDeferredCommitMutationMutexRetryPeriod;
+                    ((atime_status == STATUS_DEVICE_BUSY || atime_status == STATUS_DISK_FULL)
+                        ? std::chrono::milliseconds(250) : kDeferredCommitMutationMutexRetryPeriod);
         }
         if (c->deferred_access_time_requested)
         {
@@ -19981,10 +20063,38 @@ void DeferredCommitWorkerLoop(MountContext* c)
             continue;
         }
 
+        // Timestamp flushing uses the foreground barrier path. Drain it before
+        // claiming this worker's barrier, otherwise Flush waits for this same
+        // worker while it already owns the mutation gate.
+        NTSTATUS preclaim_atime_status = STATUS_SUCCESS;
+        const auto target_before_atime = c->deferred_commit_requested_target;
+        if (!c->deferred_access_times.empty() || c->deferred_access_time_overflow)
+        {
+            lock.unlock();
+            preclaim_atime_status = DrainDeferredAccessTimes(c);
+            lock.lock();
+            if (c->deferred_commit_thread_stop) break;
+            if (preclaim_atime_status == STATUS_DEVICE_BUSY || preclaim_atime_status == STATUS_DISK_FULL)
+            {
+                const auto retry = std::chrono::steady_clock::now() + kDeferredAccessTimeRefusalRetryPeriod;
+                c->deferred_access_time_requested = true;
+                c->deferred_access_time_deadline = retry;
+                if (c->deferred_commit_requested)
+                {
+                    c->deferred_commit_deadline = retry;
+                    c->deferred_commit_deadline_tick_ms = GetTickCount64() + kDeferredAccessTimeRefusalRetryPeriod.count();
+                }
+                continue;
+            }
+            if (NT_SUCCESS(preclaim_atime_status) && (!c->deferred_commit_requested ||
+                c->deferred_commit_deadline != deadline)) continue;
+        }
+
         const auto publish_deferred_status =
             c->deferred_close_status_publish_pending.exchange(false, std::memory_order_acq_rel);
         c->deferred_commit_in_flight = true;
-        c->deferred_commit_in_flight_target = c->deferred_commit_requested_target;
+        c->deferred_commit_in_flight_target = (std::max)(c->deferred_commit_requested_target,
+            NT_SUCCESS(preclaim_atime_status) ? std::uint64_t{0} : target_before_atime);
         c->deferred_commit_requested_target = 0;
         c->deferred_commit_requested = false;
         c->deferred_commit_first_request_tick_ms = 0;
@@ -20004,7 +20114,8 @@ void DeferredCommitWorkerLoop(MountContext* c)
             throw std::runtime_error("injected deferred worker failure");
         }
 #endif
-        const auto status = DrainNativeMutationsByPolicy(c, L"CloseDeferred");
+        const auto status = NT_SUCCESS(preclaim_atime_status)
+            ? DrainNativeMutationsByPolicy(c, L"CloseDeferred") : preclaim_atime_status;
         if (!NT_SUCCESS(status))
         {
             std::wcerr << L"[FsHost] RW native-commit warning (CloseDeferred): deferred close commit failed with status 0x"
@@ -20153,6 +20264,7 @@ void HandleDeferredCommitWorkerException(MountContext* c, const char* detail) no
 
 void DeferredCommitWorkerMain(MountContext* c) noexcept
 {
+    deferred_commit_worker_context = c;
     try
     {
         DeferredCommitWorkerLoop(c);
@@ -20166,6 +20278,8 @@ void DeferredCommitWorkerMain(MountContext* c) noexcept
         HandleDeferredCommitWorkerException(c, "non-standard exception");
     }
 
+    deferred_commit_worker_context = nullptr;
+    admitted_worker_atime_context = nullptr;
     if (c)
     {
         {
@@ -20201,12 +20315,9 @@ bool StopDeferredCommitWorker(MountContext* c)
         std::lock_guard<std::mutex> lock(c->deferred_commit_mutex);
         c->deferred_commit_thread_stop = true;
         ++c->deferred_commit_stop_generation;
-        c->deferred_commit_requested = false;
-        c->deferred_commit_requested_target = 0;
-        c->deferred_commit_first_request_tick_ms = 0;
-        c->deferred_commit_force_now = false;
-        c->deferred_commit_burst_count = 0;
-        c->deferred_commit_deadline_tick_ms = 0;
+        // Keep the request and its exact accepted target until the admitted
+        // batch or final shutdown drain claims it. Stop cancels waiters through
+        // the flag/generation; it is not a durability completion or rollback.
     }
     c->deferred_commit_cv.notify_all();
 
@@ -21680,7 +21791,8 @@ NTSTATUS CB_GetStreamInfo(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buffer, ULONG le
             std::shared_lock<std::shared_mutex> gate(c->committed_read_gate);
             std::lock_guard<std::mutex> metadata(c->metadata_mutex);
             if (c->metadata_store->IsRecoveryRequired()) return STATUS_IO_DEVICE_ERROR;
-            if (c->metadata_store->AuthoritativeAppleCheckpointView())
+            if (c->metadata_store->AuthoritativeAppleCheckpointView() ||
+                c->metadata_store->IsImmutableSnapshotView())
             {
                 attributes = c->metadata_store->SnapshotWorkingExtendedAttributes(o->node->object_id);
                 const auto inode = c->metadata_store->LookupCommittedInodeByObjectId(o->node->object_id);
@@ -21840,7 +21952,8 @@ void ConfigureVolumeParamsForExplorer(MountContext& ctx, const FILETIME& now, FS
     {
         std::lock_guard<std::mutex> lock(ctx.metadata_mutex);
         vp.PersistentAcls = !ctx.overlay_write_enabled && ctx.metadata_store &&
-            ctx.metadata_store->AuthoritativeAppleCheckpointView() != nullptr;
+            (ctx.metadata_store->AuthoritativeAppleCheckpointView() != nullptr ||
+             ctx.metadata_store->IsImmutableSnapshotView());
     }
 #endif
     vp.NamedStreams = 1;
@@ -21850,6 +21963,10 @@ void ConfigureVolumeParamsForExplorer(MountContext& ctx, const FILETIME& now, FS
     vp.FlushAndPurgeOnCleanup = 1;
     vp.PostDispositionWhenNecessaryOnly = 0;
     vp.UmFileContextIsUserContext2 = 1;
+#if defined(APFSACCESS_HAS_RW_ENGINE) && APFSACCESS_ENABLE_NATIVE_CLONE_CONTROL
+    // WinFsp must route private buffered IOCTLs before CB_Control can admit them.
+    vp.DeviceControl = IsNativeWriteEnabled(&ctx) && IsMutationWriteEnabled(&ctx);
+#endif
     wcscpy_s(vp.FileSystemName, sizeof(vp.FileSystemName) / sizeof(WCHAR), L"APFS");
 }
 
@@ -24915,6 +25032,21 @@ NTSTATUS CB_SetSecurity(FSP_FILE_SYSTEM* fs, PVOID ctx, SECURITY_INFORMATION inf
 #endif
 }
 
+void RevokeNativeCloneAuthority(OpenContext* o)
+{
+    if (!o) return;
+    std::lock_guard authority(o->clone_authority_mutex);
+    o->clone_authority_closed = true;
+    if (o->clone_ticket)
+    {
+        // An admitted import pins the ticket and source node until publication
+        // completes. This waits only for this open's authority, not other writes.
+        std::lock_guard ticket(o->clone_ticket->mutex);
+        o->clone_ticket->revoked = true;
+    }
+    o->clone_ticket.reset();
+}
+
 VOID CB_Cleanup(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, ULONG flags)
 {
     auto* c = Ctx(fs);
@@ -24922,6 +25054,7 @@ VOID CB_Cleanup(FSP_FILE_SYSTEM* fs, PVOID ctx, PWSTR file_name, ULONG flags)
     ScopedPerfTimer perf_scope(c ? &c->perf_cleanup : nullptr);
 
     auto* o = (OpenContext*)ctx;
+    RevokeNativeCloneAuthority(o);
     if (IsHostMoveTraceEnabled())
     {
         std::wostringstream message;
@@ -25158,6 +25291,7 @@ VOID CB_Close(FSP_FILE_SYSTEM* fs, PVOID ctx)
     ScopedPerfTimer perf_scope(c ? &c->perf_close : nullptr);
 
     auto* o = (OpenContext*)ctx;
+    RevokeNativeCloneAuthority(o);
     if (!o)
     {
         return;
@@ -25993,7 +26127,8 @@ NTSTATUS CB_Read(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG le
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
     if (!o->named_stream && c && c->metadata_store &&
-        HasUnsupportedDefaultContentTransform(c, o->node, false))
+        (c->metadata_store->IsImmutableSnapshotView() ||
+         HasUnsupportedDefaultContentTransform(c, o->node, false)))
     {
         std::wstring path;
         std::uint64_t object_id = 0;
@@ -26002,16 +26137,16 @@ NTSTATUS CB_Read(FSP_FILE_SYSTEM* fs, PVOID ctx, PVOID buf, UINT64 off, ULONG le
             path = CommittedReadPathForNodeLocked(c, *o->node);
             object_id = o->node->object_id;
         }
-        // Compressed DEFAULT data has no mutable overlay. Always validate the
-        // authoritative plan, even at EOF and on retained cache-backed handles;
-        // never return hydration/spool bytes or pad a short decode with zeros.
+        // Immutable snapshots and compressed DEFAULT data always use the
+        // authoritative plan, including EOF and hardlinks. No cache or spool
+        // may substitute bytes for this read view.
         std::size_t bytes_read = 0;
         if (object_id == 0 || !ReadCommittedFileRangeWithoutMetadataLock(c,
                 LowerPathKey(c, path), path, off, len,
                 reinterpret_cast<std::byte*>(buf), len, bytes_read, object_id))
-            return trace_return(STATUS_NOT_SUPPORTED, L"compressed-plan-read-failed");
+            return trace_return(STATUS_NOT_SUPPORTED, L"native-plan-read-failed");
         *done = static_cast<ULONG>(bytes_read);
-        return trace_return(STATUS_SUCCESS, L"compressed-plan-read");
+        return trace_return(STATUS_SUCCESS, L"native-plan-read");
     }
     if (!o->named_stream && c && c->metadata_store)
     {
@@ -26873,8 +27008,11 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
         return trace_return(STATUS_NOT_SUPPORTED, L"unsupported-content-transform");
     const bool compressed_default_read = transformed_default_content &&
         ((normalized_access & (FILE_READ_DATA | FILE_EXECUTE)) != 0 || compressed_write_candidate);
+    bool immutable_default_read = false;
 #ifdef APFSACCESS_HAS_RW_ENGINE
-    if (compressed_default_read)
+    immutable_default_read = n->node_kind == NodeKind::RegularFile && !stream_path.is_named_stream && c->metadata_store &&
+        c->metadata_store->IsImmutableSnapshotView();
+    if (compressed_default_read || (immutable_default_read && requires_content_check))
     {
         std::wstring path;
         std::uint64_t object_id = 0;
@@ -26987,7 +27125,7 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
         o->write_open = mutation_enabled && mutation_access_requested;
         // Validated compressed reads use the native plan for both single-name
         // and shared-payload inodes, regardless of any existing hydration file.
-        bool can_read_from_metadata = compressed_default_read;
+        bool can_read_from_metadata = compressed_default_read || immutable_default_read;
         bool can_read_from_spool = false;
         const auto can_use_metadata_read_fallback = !n->shared_payload && CanUseMetadataReadFallbackForOpen(
             o,
@@ -26995,7 +27133,7 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
             c->metadata_store != nullptr);
         const auto has_valid_existing_hydration = [&]()
         {
-            if (!requires_hydration_handle || o->named_stream || compressed_default_read)
+            if (!requires_hydration_handle || o->named_stream || compressed_default_read || immutable_default_read)
             {
                 return false;
             }
@@ -27072,7 +27210,7 @@ NTSTATUS CB_Open(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options, UI
             }
         };
 
-        if (!compressed_default_read && can_use_metadata_read_fallback && !has_valid_existing_hydration)
+        if (!compressed_default_read && !immutable_default_read && can_use_metadata_read_fallback && !has_valid_existing_hydration)
         {
             probe_metadata_or_spool();
         }
@@ -27512,12 +27650,50 @@ bool ResolveMountVolumeObjectId(Arguments& args)
     return true;
 }
 
+bool IsCanonicalNonzeroDecimal(const std::wstring& value)
+{
+    return !value.empty() && value.front() >= L'1' && value.front() <= L'9' &&
+        std::all_of(value.begin(), value.end(), [](wchar_t ch) { return ch >= L'0' && ch <= L'9'; });
+}
+
+bool ValidateSnapshotArguments(const Arguments& a)
+{
+    // Ordinary drive-absolute local image only. The stable device opener also
+    // verifies the final handle and refuses reparse/network/device targets.
+    const auto& p = a.device;
+    const bool local_image = p.size() > 3 &&
+        ((p[0] >= L'A' && p[0] <= L'Z') || (p[0] >= L'a' && p[0] <= L'z')) &&
+        p[1] == L':' && (p[2] == L'\\' || p[2] == L'/') &&
+        p.find(L':', 2) == std::wstring::npos;
+    return a.snapshot_xid && local_image && a.readonly && !a.readwrite &&
+        IsWriteBackendMode(a.write_backend, L"Disabled") &&
+        IsValidContainerId(a.container_id) && a.volume_object_id && !a.mount.empty() &&
+        a.recovery_identity.empty() && !a.allow_raw_physical_write &&
+        a.container_manifest.empty() && a.container_manifest_sha256.empty() &&
+        a.container_control_file.empty() && a.container_control_token.empty();
+}
+
 bool ParseArgs(int argc, wchar_t** argv, Arguments& a)
 {
+    bool snapshot_seen = false;
+    bool unknown_option = false;
+    bool duplicate_option = false;
+    bool canonical_selectors = true;
+    std::unordered_set<std::wstring> seen_options;
     for (int i = 1; i < argc; ++i)
     {
         auto* arg = argv[i];
+        std::wstring option(arg);
+        std::transform(option.begin(), option.end(), option.begin(), towlower);
+        if (!seen_options.insert(option).second) duplicate_option = true;
         if (IsOption(arg, L"--device")) a.device = NextArgValue(i, argc, argv);
+        else if (IsOption(arg, L"--snapshot-xid"))
+        {
+            snapshot_seen = true;
+            const auto value = NextArgValue(i, argc, argv);
+            if (!IsCanonicalNonzeroDecimal(value)) return false;
+            try { a.snapshot_xid = std::stoull(value); } catch (...) { return false; }
+        }
         else if (IsOption(arg, L"--volume")) a.volume = NextArgValue(i, argc, argv);
         else if (IsOption(arg, L"--container-manifest")) a.container_manifest = NextArgValue(i, argc, argv);
         else if (IsOption(arg, L"--container-manifest-sha256")) a.container_manifest_sha256 = NextArgValue(i, argc, argv);
@@ -27549,12 +27725,18 @@ bool ParseArgs(int argc, wchar_t** argv, Arguments& a)
                 return false;
             }
         }
-        else if (IsOption(arg, L"--device-offset")) { try { a.device_offset_bytes = static_cast<std::uint64_t>(std::stoull(NextArgValue(i, argc, argv))); } catch (...) { return false; } }
+        else if (IsOption(arg, L"--device-offset"))
+        {
+            const auto value = NextArgValue(i, argc, argv);
+            canonical_selectors = canonical_selectors && (value == L"0" || IsCanonicalNonzeroDecimal(value));
+            try { a.device_offset_bytes = std::stoull(value); } catch (...) { return false; }
+        }
         else if (IsOption(arg, L"--volume-oid"))
         {
             try
             {
                 const auto value = NextArgValue(i, argc, argv);
+                canonical_selectors = canonical_selectors && IsCanonicalNonzeroDecimal(value);
                 std::size_t consumed = 0;
                 const auto parsed = std::stoull(value, &consumed);
                 if (consumed != value.size() || parsed == 0)
@@ -27620,6 +27802,7 @@ bool ParseArgs(int argc, wchar_t** argv, Arguments& a)
         else if (IsOption(arg, L"--validation-last-validated-utc")) a.validation_last_validated_utc = NextArgValue(i, argc, argv);
         else if (IsOption(arg, L"--validation-last-profile-id")) a.validation_last_profile_id = NextArgValue(i, argc, argv);
         else if (IsOption(arg, L"--allow-raw-physical-write")) a.allow_raw_physical_write = true;
+        else unknown_option = true;
     }
     if (a.mount.size() == 2 &&
         std::iswalpha(a.mount[0]) != 0 &&
@@ -27628,6 +27811,7 @@ bool ParseArgs(int argc, wchar_t** argv, Arguments& a)
         a.mount = std::wstring(1, static_cast<wchar_t>(towupper(a.mount[0]))) + L":";
     }
     bool has_mode = a.readonly || a.readwrite;
+    if (snapshot_seen && (unknown_option || duplicate_option || !canonical_selectors || !ValidateSnapshotArguments(a))) return false;
     const bool manifest_mode = !a.container_manifest.empty();
     if (manifest_mode)
     {
@@ -27655,7 +27839,7 @@ bool ParseArgs(int argc, wchar_t** argv, Arguments& a)
            a.container_control_file.empty() &&
            a.container_control_token.empty() &&
            !a.device.empty() &&
-           !a.volume.empty() &&
+           (!a.volume.empty() || a.snapshot_xid != 0) &&
            !a.mount.empty() &&
            a.parent_pid != 0 &&
            !a.lifetime_file.empty() &&
@@ -27913,6 +28097,7 @@ void RefreshReportedVolumeInfoFromMetadata(MountContext& ctx)
 
 void PrintUsage()
 {
+    std::wcerr << L"Snapshot: --snapshot-xid <canonical-nonzero-decimal> --device <absolute-local-image> --container-id <32-lower-hex> --volume-oid <nonzero-id> --readonly --mount <path> (same parent/lifetime/startup-gate controls required). Optional --volume must match exactly. Image lease excludes writers and replacement; historical free capacity is unknown." << std::endl;
     std::wcerr << L"Usage: ApfsAccess.FsHost --device <path> [--device-offset <bytes>] --volume <name-or-id> [--volume-oid <nonzero-id>] [--recovery-identity <immutable-id>] --mount <X:|directory> (--readonly|--readwrite) --parent-pid <pid> --lifetime-file <file> --startup-gate-file <file> --startup-gate-token <token> [--status-file <file>] [--write-backend <Disabled|Overlay|Native>] [--write-safety-level <mode>] [--write-commit-timeout <seconds>] [--winfsp-teardown-timeout-ms <1..60000>] [--write-max-dirty-transactions <count>] [--write-recovery-policy <mode>] [--write-crash-replay-mode <FailClosed|ReplayIfSafe>] [--write-require-canonical-commit <true|false>] [--write-integrity-check-on-mount <true|false>] [--allow-legacy-scaffold-for-fixtures <true|false>] [--write-disallow-scaffold-commit-on-non-fixture <true|false>] [--write-reject-scaffold-replay-blob-on-non-fixture <true|false>] [--write-require-canonical-replay-candidate-on-non-fixture <true|false>] [--validation-crash-fault-passes <count>] [--validation-crash-stage-matrix-passes <count>] [--validation-hardware-pilot-passes <count>] [--validation-hot-unplug-passes <count>] [--validation-macos-validation-passes <count>] [--validation-macos-consistency-passes <count>] [--validation-power-loss-replay-passes <count>] [--validation-power-loss-pass-verified <true|false>] [--validation-last-validated-utc <iso-8601>] [--validation-last-profile-id <id>] [--allow-raw-physical-write]" << std::endl;
     std::wcerr << L"   or: ApfsAccess.FsHost --container-manifest <checksummed-json> --container-manifest-sha256 <sha256> --container-control-file <file> --container-control-token <sha256-token> (--readonly|--readwrite) --parent-pid <pid> --lifetime-file <file> --startup-gate-file <file> --startup-gate-token <token> --status-file <file> [write options as above]" << std::endl;
 }
@@ -28046,6 +28231,8 @@ apfsaccess::rw::MetadataStore::VolumeContext BuildMetadataStoreVolumeContext(
     context.incompatible_features = args.incompatible_features;
     return context;
 }
+
+#include "NativeSnapshotMount.h"
 
 // Expands a validated container manifest into per-volume arguments. Every
 // volume inherits the process lifetime/gate/backend controls; device, OID,
@@ -28405,6 +28592,8 @@ bool WriteContainerStatusFile(
     return WriteContainerStatusContents(process_args.status_file, json.str());
 }
 
+#include "NativeCloneControl.h"
+
 void FillContainerServeInterface(FSP_FILE_SYSTEM_INTERFACE& iface)
 {
     iface.GetVolumeInfo = CB_GetVolumeInfo;
@@ -28432,6 +28621,7 @@ void FillContainerServeInterface(FSP_FILE_SYSTEM_INTERFACE& iface)
     iface.SetDelete = CB_SetDelete;
     iface.GetStreamInfo = CB_GetStreamInfo;
     iface.ReadDirectory = CB_ReadDirectory;
+    iface.Control = CB_Control;
 }
 
 const FSP_FILE_SYSTEM_INTERFACE& ContainerServeInterface()
@@ -29136,6 +29326,23 @@ int RunManifestServe(
 }
 #endif
 
+bool InitializeMountNamespace(MountContext& ctx)
+{
+    FILETIME now{}; GetSystemTimeAsFileTime(&now);
+    auto root = std::make_shared<Node>();
+    SetNodePath(&ctx, *root, L"\\");
+    root->hydration_key = root->path_key;
+    root->apfs_path = ApfsRoot(ctx.args);
+    root->is_directory = true;
+    root->node_kind = NodeKind::Directory;
+    root->timestamp = now;
+    EmplaceNodeLocked(&ctx, root);
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    if (ctx.metadata_store && !MergeCommittedInodeStateIntoNodeIndex(&ctx) && ctx.args.snapshot_xid) return false;
+#endif
+    return EnsureDirectoryLoaded(&ctx, root);
+}
+
 #ifndef APFSACCESS_FSHOST_UNIT_TEST
 int wmain(int argc, wchar_t** argv)
 {
@@ -29146,7 +29353,7 @@ int wmain(int argc, wchar_t** argv)
         return 2;
     }
     const bool manifest_mode = !args.container_manifest.empty();
-    if (!manifest_mode && !ResolveMountVolumeObjectId(args))
+    if (!manifest_mode && !args.snapshot_xid && !ResolveMountVolumeObjectId(args))
     {
         std::wcerr << L"[FsHost] Volume identity resolution failed; mount initialization cancelled."
                    << std::endl;
@@ -29437,6 +29644,17 @@ int wmain(int argc, wchar_t** argv)
             bool write_ahead_log_recovery_pending = ctx.tx_manager &&
                 (!ctx.tx_manager->RecoveryStateValid() || ctx.tx_manager->HasUnappliedAcceptedWork() ||
                  recovered_watermarks.cleanup_sequence < recovered_watermarks.apfs_durable_sequence);
+    if (args.snapshot_xid)
+    {
+        std::string snapshot_error;
+        if (!PrepareExplicitSnapshotMount(ctx, snapshot_error))
+        {
+            std::wcerr << L"[FsHost] Snapshot startup refused: " << Utf8ToWide(snapshot_error) << std::endl;
+            return 23;
+        }
+        (void)WriteHostStatusFile(ctx);
+    }
+    else
     {
 #ifdef APFSACCESS_HAS_RW_ENGINE
         if (manifest_mode)
@@ -29702,32 +29920,7 @@ int wmain(int argc, wchar_t** argv)
         return 5;
     }
 
-    FILETIME now{}; GetSystemTimeAsFileTime(&now);
-    auto root = std::make_shared<Node>();
-    SetNodePath(&ctx, *root, L"\\");
-    root->hydration_key = root->path_key;
-    root->apfs_path = ApfsRoot(args);
-    root->is_directory = true;
-    root->node_kind = NodeKind::Directory;
-    root->timestamp = now;
-    EmplaceNodeLocked(&ctx, root);
-
-#ifdef APFSACCESS_HAS_RW_ENGINE
-    if (ctx.metadata_store && MergeCommittedInodeStateIntoNodeIndex(&ctx))
-    {
-        std::size_t committed_inode_count = 0;
-        {
-            std::lock_guard<std::mutex> metadata_lock(ctx.metadata_mutex);
-            committed_inode_count = ctx.metadata_store->CommittedInodeCount();
-        }
-        std::wcerr << L"[FsHost] Applied native metadata overlay for "
-            << committed_inode_count
-            << L" committed inode entries."
-            << std::endl;
-    }
-#endif
-
-    if (!EnsureDirectoryLoaded(&ctx, root))
+    if (!InitializeMountNamespace(ctx))
     {
         std::wstring root_failure_reason;
         {
@@ -29813,7 +30006,9 @@ int wmain(int argc, wchar_t** argv)
     }
 #endif
 
-    ctx.label = BuildExplorerVolumeLabel(args.volume);
+    ctx.label = ctx.args.snapshot_xid
+        ? L"Snapshot " + std::to_wstring(ctx.args.snapshot_xid) + L" (read-only)"
+        : BuildExplorerVolumeLabel(args.volume);
 
     FILETIME now{};
     GetSystemTimeAsFileTime(&now);

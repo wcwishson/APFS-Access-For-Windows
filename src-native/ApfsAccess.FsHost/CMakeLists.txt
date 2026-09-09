@@ -14,6 +14,13 @@ add_executable(ApfsAccess.FsHost
     src/main.cpp
 )
 
+# Candidate only: parent must pass the consistent-source and mounted gates.
+option(APFSACCESS_ENABLE_NATIVE_CLONE_CONTROL "Enable experimental private clone Control protocol" OFF)
+target_compile_definitions(ApfsAccess.FsHost PRIVATE
+    APFSACCESS_ENABLE_NATIVE_CLONE_CONTROL=$<BOOL:${APFSACCESS_ENABLE_NATIVE_CLONE_CONTROL}>)
+add_executable(ApfsAccess.CloneCopy tools/CloneCopy.cpp)
+target_compile_definitions(ApfsAccess.CloneCopy PRIVATE UNICODE _UNICODE NOMINMAX)
+
 target_compile_definitions(ApfsAccess.FsHost PRIVATE
     UNICODE
     _UNICODE
@@ -83,6 +90,7 @@ if(APFSACCESS_BUILD_FSHOST_TESTS)
         _UNICODE
         NOMINMAX
         APFSACCESS_FSHOST_UNIT_TEST=1
+        APFSACCESS_ENABLE_NATIVE_CLONE_CONTROL=1
     )
     target_include_directories(ApfsAccess.FsHost.SemanticsTests PRIVATE ${WINFSP_INCLUDE_DIR})
     # Shared synthetic fixture builder (test-only writer) from the engine tests.
@@ -101,5 +109,15 @@ if(APFSACCESS_BUILD_FSHOST_TESTS)
 
     if(BUILD_TESTING)
         add_test(NAME ApfsAccess.FsHost.Semantics COMMAND ApfsAccess.FsHost.SemanticsTests)
+        add_test(NAME ApfsAccess.FsHost.Clone513 COMMAND ApfsAccess.FsHost.SemanticsTests native-clone-host-500)
+    endif()
+    add_executable(ApfsAccess.FsHost.SnapshotMountTests tests/SnapshotMountTests.cpp)
+    target_compile_definitions(ApfsAccess.FsHost.SnapshotMountTests PRIVATE
+        UNICODE _UNICODE NOMINMAX APFSACCESS_HAS_RW_ENGINE=1)
+    target_include_directories(ApfsAccess.FsHost.SnapshotMountTests PRIVATE
+        ${WINFSP_INCLUDE_DIR} "${_rw_engine_dir}/tests")
+    target_link_libraries(ApfsAccess.FsHost.SnapshotMountTests PRIVATE ApfsAccess.ApfsRwEngine)
+    if(BUILD_TESTING)
+        add_test(NAME ApfsAccess.FsHost.SnapshotMount COMMAND ApfsAccess.FsHost.SnapshotMountTests)
     endif()
 endif()

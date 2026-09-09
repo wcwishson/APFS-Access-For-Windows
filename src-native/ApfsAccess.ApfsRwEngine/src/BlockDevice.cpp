@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <cstring>
 #include <cwchar>
 #include <cwctype>
 #include <filesystem>
@@ -2367,6 +2368,29 @@ bool BlockDevice::RevalidateStableReadOnlyImage() const
         identity.VolumeSerialNumber == stable_image_identity_.VolumeSerialNumber &&
         std::memcmp(identity.FileId.Identifier, stable_image_identity_.FileId.Identifier,
             sizeof(identity.FileId.Identifier)) == 0;
+}
+
+bool BlockDevice::QueryStableReadOnlyImageIdentity(StableImageIdentity& out) const
+{
+    out = {};
+    FILE_ID_INFO id{};
+    FILE_STANDARD_INFO standard{};
+    FILE_BASIC_INFO basic{};
+    const auto handle = read_handle_.load(std::memory_order_acquire);
+    if (!stable_read_only_image_ || HasWriteHandle() ||
+        !QueryRegularFileIdentity(handle, id) ||
+        id.VolumeSerialNumber != stable_image_identity_.VolumeSerialNumber ||
+        std::memcmp(id.FileId.Identifier, stable_image_identity_.FileId.Identifier, 16) != 0 ||
+        !GetFileInformationByHandleEx(handle, FileStandardInfo, &standard, sizeof(standard)) ||
+        standard.EndOfFile.QuadPart < 0 || standard.DeletePending ||
+        !GetFileInformationByHandleEx(handle, FileBasicInfo, &basic, sizeof(basic)))
+        return false;
+    out.volume_serial = id.VolumeSerialNumber;
+    std::memcpy(out.file_id.data(), id.FileId.Identifier, out.file_id.size());
+    out.size_bytes = static_cast<std::uint64_t>(standard.EndOfFile.QuadPart);
+    out.creation_time = static_cast<std::uint64_t>(basic.CreationTime.QuadPart);
+    out.write_time = static_cast<std::uint64_t>(basic.LastWriteTime.QuadPart);
+    return true;
 }
 
 HANDLE BlockDevice::EnsureReadHandle() const

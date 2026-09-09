@@ -484,6 +484,116 @@ bool TestDeferredAccessTimeOverdue311(bool manifest)
         owned.CheckFresh({{L"\\read18", latest}});
 }
 
+bool TestDeferredAccessTimeEarlierCommitRefusal568(bool retryable)
+{
+    if (!DeferredAccessTimeScratch302()) return false;
+    DeferredAccessTimeFixture302 owned(retryable);
+    if (!owned.Initialize(retryable)) return false;
+    auto& c = *owned.fixture.context;
+    std::uint64_t time = 0;
+    if (!owned.ReadCleanup(L"\\read17", time)) return false;
+    if (retryable)
+    {
+        owned.sibling.args = ManifestSessionArgs(owned.fixture.image.path, 102,
+            Utf8ToWide(owned.fixture.coordinator->ContainerUuidHex()), L"private-atime-sibling-568", true);
+        owned.sibling.args.write_require_canonical_commit = true;
+        owned.sibling.args.allow_legacy_scaffold_for_fixtures = false;
+        std::wstring error;
+        if (!MountManifestSession(*owned.fixture.coordinator, owned.sibling.args, owned.sibling, error) ||
+            !CompressionManifestRefusal279::SeedAcceptedSibling(owned)) return false;
+    }
+    else
+    {
+        // Lose the retained identity before staging, never invent another inode.
+        c.deferred_access_times.at(17).node.reset();
+    }
+    const auto image = ReadFileBytes(owned.fixture.image.path);
+    const auto wal = ReadFileBytes(c.session_root / "accepted.wal");
+    std::promise<void> published;
+    auto publication = published.get_future();
+    std::atomic<unsigned> count{0};
+    c.metadata_store->SetCommitStageHook([&](std::string_view stage) {
+        if (stage == "after-apple-publish" && count.fetch_add(1) == 0) published.set_value();
+        return true;
+    });
+    ScopeExit stop{[&] { StopDeferredCommitWorker(&c); c.metadata_store->SetCommitStageHook({}); }};
+    RequestDeferredCloseCommit(&c, 0);
+    {
+        std::lock_guard<std::mutex> schedule(c.deferred_commit_mutex);
+        c.deferred_commit_deadline = std::chrono::steady_clock::now();
+        c.deferred_commit_deadline_tick_ms = GetTickCount64();
+        c.deferred_access_time_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    }
+    StartDeferredCommitWorker(&c);
+    const auto first_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (c.deferred_commit_worker_claim_attempt_count.load() == 0 &&
+        std::chrono::steady_clock::now() < first_deadline) Sleep(5);
+    // Spans one retry interval; an expired unhandled request spins thousands
+    // of times here. The real sibling-census refusal must stay bounded.
+    Sleep(400);
+    const auto attempts = c.deferred_commit_worker_claim_attempt_count.load();
+    bool preserved = false;
+    {
+        std::lock_guard<std::mutex> mutation(c.mutation_callback_mutex);
+        preserved = c.deferred_access_times.size() == 1 &&
+            image == ReadFileBytes(owned.fixture.image.path) &&
+            wal == ReadFileBytes(c.session_root / "accepted.wal");
+    }
+    if (!Require(attempts > 0 && attempts <= 6 && count.load() == 0 && preserved,
+            "refused earlier-close atime keeps original bytes/WAL and bounds worker attempts")) return false;
+    if (!retryable)
+    {
+        bool terminal = false;
+        {
+            std::lock_guard<std::mutex> schedule(c.deferred_commit_mutex);
+            terminal = !c.deferred_commit_requested && !c.deferred_commit_in_flight &&
+                !NT_SUCCESS(c.deferred_commit_last_status);
+        }
+        return Require(StopDeferredCommitWorker(&c) && terminal && c.write_degraded &&
+                c.deferred_access_times.size() == 1 && std::filesystem::exists(c.recovery_marker_file),
+                "terminal preclaim failure settles the worker and retains recovery diagnostics");
+    }
+    if (!Require(!c.write_degraded && ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(owned.sibling),
+            "real sibling recovery releases retryable atime backpressure")) return false;
+    const bool completed = publication.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    if (!Require(StopDeferredCommitWorker(&c) && completed && count.load() == 1 && !c.write_degraded &&
+            c.deferred_access_times.empty(), "worker eventually publishes after sibling refusal clears")) return false;
+    return owned.CheckFresh({{L"\\read17", time}, {L"\\alias", time}});
+}
+
+bool TestDeferredAccessTimeEarlierCommitWorker562(bool manifest)
+{
+    if (!DeferredAccessTimeScratch302()) return false;
+    DeferredAccessTimeFixture302 owned(manifest);
+    if (!owned.Initialize(manifest)) return false;
+    auto& c = *owned.fixture.context;
+    std::uint64_t time = 0;
+    if (!owned.ReadCleanup(L"\\read17", time)) return false;
+    std::promise<void> published;
+    auto publication = published.get_future();
+    std::atomic<unsigned> count{0};
+    c.metadata_store->SetCommitStageHook([&](std::string_view stage) {
+        if (stage == "after-apple-publish" && count.fetch_add(1) == 0) published.set_value();
+        return true;
+    });
+    ScopeExit stop{[&] { StopDeferredCommitWorker(&c); c.metadata_store->SetCommitStageHook({}); }};
+    RequestDeferredCloseCommit(&c, 0);
+    {
+        std::lock_guard<std::mutex> schedule(c.deferred_commit_mutex);
+        // The data-close deadline can precede a more recent read cleanup.
+        c.deferred_commit_deadline = std::chrono::steady_clock::now();
+        c.deferred_commit_deadline_tick_ms = GetTickCount64();
+        c.deferred_access_time_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    }
+    StartDeferredCommitWorker(&c);
+    const bool completed = publication.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+    const bool stopped = StopDeferredCommitWorker(&c);
+    if (!Require(stopped && completed && count.load() == 1 && !c.write_degraded &&
+            c.deferred_access_times.empty() && c.deferred_commit_failed_target == 0,
+            "earlier close deadline drains queued atime without waiting on its own claimed barrier")) return false;
+    return owned.CheckFresh({{L"\\read17", time}, {L"\\alias", time}});
+}
+
 bool TestDeferredAccessTimePressure311()
 {
     if (!DeferredAccessTimeScratch302()) return false;
@@ -556,4 +666,204 @@ bool TestDeferredAccessTimePressure311()
             !c.deferred_access_time_overflow && !c.deferred_access_time_requested,
             "idle worker retries remaining spill after actual sibling recovery")) return false;
     return owned.CheckFresh(expected);
+}
+
+bool TestDeferredAccessTimeIdleSiblingRetry582(bool stop_before_recovery)
+{
+    if (!DeferredAccessTimeScratch302()) return false;
+    DeferredAccessTimeFixture302 owned(true);
+    if (!owned.Initialize(true)) return false;
+    auto& c = *owned.fixture.context;
+    std::uint64_t time = 0;
+    if (!owned.ReadCleanup(L"\\read17", time)) return false;
+    owned.sibling.args = ManifestSessionArgs(owned.fixture.image.path, 102,
+        Utf8ToWide(owned.fixture.coordinator->ContainerUuidHex()), L"private-atime-sibling-582", true);
+    owned.sibling.args.write_require_canonical_commit = true;
+    owned.sibling.args.allow_legacy_scaffold_for_fixtures = false;
+    std::wstring error;
+    if (!MountManifestSession(*owned.fixture.coordinator, owned.sibling.args, owned.sibling, error) ||
+        !CompressionManifestRefusal279::SeedAcceptedSibling(owned)) return false;
+    const auto image = ReadFileBytes(owned.fixture.image.path);
+    const auto wal = ReadFileBytes(c.session_root / "accepted.wal");
+    const auto before = owned.fixture.coordinator->DiagnosticsSnapshot(101);
+    std::vector<std::chrono::steady_clock::time_point> attempts; // mutation gate owns this vector
+    std::atomic<unsigned> publications{0};
+    std::promise<void> published;
+    auto publication = published.get_future();
+    c.test_before_deferred_atime_publish = [&] { attempts.push_back(std::chrono::steady_clock::now()); };
+    c.metadata_store->SetCommitStageHook([&](std::string_view stage) {
+        if (stage == "after-apple-publish" && publications.fetch_add(1) == 0) published.set_value();
+        return true;
+    });
+    ScopeExit stop{[&] {
+        StopDeferredCommitWorker(&c);
+        c.test_before_deferred_atime_publish = {};
+        c.metadata_store->SetCommitStageHook({});
+    }};
+    {
+        std::lock_guard<std::mutex> schedule(c.deferred_commit_mutex);
+        if (!Require(!c.deferred_commit_requested && c.deferred_commit_requested_target == 0,
+                "idle582: ordinary read queues no close request")) return false;
+        c.deferred_access_time_deadline = std::chrono::steady_clock::now();
+    }
+    StartDeferredCommitWorker(&c);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool observed = false;
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        {
+            std::lock_guard<std::mutex> mutation(c.mutation_callback_mutex);
+            observed = attempts.size() >= 3;
+        }
+        if (observed) break;
+        Sleep(5);
+    }
+    {
+        std::lock_guard<std::mutex> mutation(c.mutation_callback_mutex);
+        const auto after = owned.fixture.coordinator->DiagnosticsSnapshot(101);
+        const auto marks = c.tx_manager->Watermarks();
+        bool bounded = observed && attempts.size() <= 5;
+        for (std::size_t i = 1; i < attempts.size(); ++i)
+            bounded &= attempts[i] - attempts[i - 1] >= kDeferredAccessTimeIdleDelay;
+        bool scheduled = false;
+        {
+            std::lock_guard<std::mutex> schedule(c.deferred_commit_mutex);
+            scheduled = c.deferred_access_time_requested && !c.deferred_commit_requested &&
+                !c.deferred_commit_in_flight && c.deferred_commit_requested_target == 0;
+        }
+        std::cout << "idle582 refused attempts=" << attempts.size()
+            << " coordinator_attempts=" << after.commit_attempts - before.commit_attempts
+            << " coordinator_failures=" << after.commit_failures - before.commit_failures << '\n';
+        if (!Require(bounded && scheduled && publications.load() == 0 &&
+                after.commit_attempts - before.commit_attempts == attempts.size() &&
+                after.commit_failures - before.commit_failures == attempts.size() &&
+                c.deferred_commit_worker_claim_attempt_count.load() == 0 &&
+                c.deferred_access_times.size() == 1 && c.deferred_access_times.at(17).time == time &&
+                c.deferred_access_times.at(17).node->deferred_access_time == time &&
+                image == ReadFileBytes(owned.fixture.image.path) && wal == ReadFileBytes(c.session_root / "accepted.wal") &&
+                marks.accepted_sequence == 0 && marks.apfs_durable_sequence == 0 && marks.cleanup_sequence == 0 &&
+                !c.write_degraded && !HasBlockedRecoveryEvidence(c),
+                "idle582: real refused coordinator attempts are spaced, unaccepted and preserve exact queued time")) return false;
+    }
+    if (stop_before_recovery && !Require(StopDeferredCommitWorker(&c), "idle582: refused idle worker joins")) return false;
+    if (!Require(ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(owned.sibling),
+            "idle582: real sibling WAL recovery releases admission without a selected-context callback")) return false;
+    if (stop_before_recovery)
+    {
+        c.deferred_commit_cv.notify_all();
+        const auto count = attempts.size();
+        Sleep(300);
+        if (!Require(attempts.size() == count && publications.load() == 0 &&
+                c.deferred_access_times.size() == 1 && c.deferred_access_times.at(17).time == time &&
+                c.tx_manager->Watermarks().accepted_sequence == 0,
+                "idle582: stopped worker cannot publish or certify the retained batch")) return false;
+        if (!Require(RunFsHostShutdownDrain(owned.fixture.context) == 0,
+                "idle582: final shutdown drain persists retained time after sibling recovery")) return false;
+    }
+    else
+    {
+        const bool completed = publication.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+        if (!Require(StopDeferredCommitWorker(&c) && completed,
+                "idle582: idle retry publishes after sibling recovery and joins")) return false;
+    }
+    const auto marks = c.tx_manager->Watermarks();
+    if (!Require(publications.load() == 1 && c.deferred_access_times.empty() && !c.deferred_access_time_requested &&
+            !c.write_degraded && marks.accepted_sequence != 0 && marks.accepted_sequence == marks.apfs_durable_sequence &&
+            marks.accepted_sequence == marks.cleanup_sequence,
+            "idle582: one exact publication converges accepted/durable/cleanup boundaries")) return false;
+    return owned.CheckFresh({{L"\\read17", time}, {L"\\alias", time}});
+}
+
+bool TestDeferredAccessTimeIdleFullStatus582()
+{
+    if (!DeferredAccessTimeScratch302()) return false;
+    DeferredAccessTimeFixture302 owned(true);
+    if (!owned.Initialize(true)) return false;
+    auto& c = *owned.fixture.context;
+    std::uint64_t time = 0;
+    if (!owned.ReadCleanup(L"\\read17", time)) return false;
+    const auto image = ReadFileBytes(owned.fixture.image.path);
+    const auto wal = ReadFileBytes(c.session_root / "accepted.wal");
+    {
+        MutationCallbackScope mutation(&c, false);
+        // Fixed-size atime is non-growing, so an exhausted volume quota still
+        // admits it. Use the existing preaccept status slot solely to exercise
+        // FULL through the batch failure return; no WAL or APFS success is forced.
+        // Temporarily remove the retained identity to reach fail before staging.
+        auto node = std::exchange(c.deferred_access_times.at(17).node, {});
+        c.manifest_preaccept_failure_status.store(STATUS_DISK_FULL);
+        const auto status = DrainDeferredAccessTimes(&c);
+        c.deferred_access_times.at(17).node = std::move(node);
+        if (!Require(status == STATUS_DISK_FULL && c.deferred_access_time_requested && !c.deferred_commit_requested &&
+                !c.write_degraded && c.deferred_access_times.at(17).time == time &&
+                c.tx_manager->Watermarks().accepted_sequence == 0 &&
+                image == ReadFileBytes(owned.fixture.image.path) && wal == ReadFileBytes(c.session_root / "accepted.wal"),
+                "idle582: controlled clean FULL return preserves batch scheduling and exact unaccepted evidence")) return false;
+    }
+    std::promise<void> published;
+    auto publication = published.get_future();
+    std::atomic<unsigned> count{0};
+    c.metadata_store->SetCommitStageHook([&](std::string_view stage) {
+        if (stage == "after-apple-publish" && count.fetch_add(1) == 0) published.set_value();
+        return true;
+    });
+    ScopeExit stop{[&] { StopDeferredCommitWorker(&c); c.metadata_store->SetCommitStageHook({}); }};
+    StartDeferredCommitWorker(&c);
+    const bool completed = publication.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    if (!Require(StopDeferredCommitWorker(&c) && completed && count.load() == 1 &&
+            c.deferred_access_times.empty() && !c.write_degraded && c.deferred_commit_worker_claim_attempt_count.load() == 0,
+            "idle582: retained FULL batch persists through idle worker without another callback or close request")) return false;
+    const auto marks = c.tx_manager->Watermarks();
+    return Require(marks.accepted_sequence != 0 && marks.accepted_sequence == marks.apfs_durable_sequence &&
+            marks.accepted_sequence == marks.cleanup_sequence, "idle582: FULL recovery has honest durable watermarks") &&
+        owned.CheckFresh({{L"\\read17", time}, {L"\\alias", time}});
+}
+
+bool TestDeferredAccessTimeIdleTerminal582()
+{
+    if (!DeferredAccessTimeScratch302()) return false;
+    DeferredAccessTimeFixture302 owned(false);
+    if (!owned.Initialize(false)) return false;
+    auto& c = *owned.fixture.context;
+    std::uint64_t time = 0;
+    if (!owned.ReadCleanup(L"\\read17", time)) return false;
+    c.deferred_access_times.at(17).node.reset();
+    const auto image = ReadFileBytes(owned.fixture.image.path);
+    const auto wal = ReadFileBytes(c.session_root / "accepted.wal");
+    std::atomic<unsigned> publications{0};
+    c.metadata_store->SetCommitStageHook([&](std::string_view stage) {
+        if (stage == "after-apple-publish") ++publications;
+        return true;
+    });
+    ScopeExit stop{[&] { StopDeferredCommitWorker(&c); c.metadata_store->SetCommitStageHook({}); }};
+    {
+        std::lock_guard<std::mutex> schedule(c.deferred_commit_mutex);
+        if (!Require(!c.deferred_commit_requested, "idle582: terminal fixture has no close request")) return false;
+        c.deferred_access_time_deadline = std::chrono::steady_clock::now();
+    }
+    StartDeferredCommitWorker(&c);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!c.write_degraded.load() && std::chrono::steady_clock::now() < deadline) Sleep(5);
+    // Join an admitted terminal batch, including its ordinary diagnostic I/O,
+    // before asserting settled scheduling or attempting the final drain.
+    const bool stopped = StopDeferredCommitWorker(&c);
+    const bool disarmed = !c.deferred_access_time_requested && !c.deferred_commit_requested;
+    std::cerr << "idle582 terminal stopped=" << stopped << " disarmed=" << disarmed
+        << " degraded=" << c.write_degraded << " published=" << publications.load()
+        << " queue=" << c.deferred_access_times.size()
+        << " claims=" << c.deferred_commit_worker_claim_attempt_count.load()
+        << " requested=" << c.deferred_commit_requested << " atime=" << c.deferred_access_time_requested
+        << " marker=" << std::filesystem::exists(c.recovery_marker_file)
+        << " image=" << (image == ReadFileBytes(owned.fixture.image.path))
+        << " wal=" << (wal == ReadFileBytes(c.session_root / "accepted.wal")) << '\n';
+    if (!Require(stopped && disarmed && c.write_degraded &&
+            publications.load() == 0 && c.deferred_access_times.size() == 1 && c.deferred_access_times.at(17).time == time &&
+            c.deferred_commit_worker_claim_attempt_count.load() == 0 && std::filesystem::exists(c.recovery_marker_file) &&
+            image == ReadFileBytes(owned.fixture.image.path) && wal == ReadFileBytes(c.session_root / "accepted.wal"),
+            "idle582: terminal identity failure disarms, joins, and retains diagnostic evidence")) return false;
+    return Require(RunFsHostShutdownDrain(owned.fixture.context) != 0 && publications.load() == 0 &&
+            c.deferred_access_times.size() == 1 && c.tx_manager->Watermarks().accepted_sequence == 0 &&
+            image == ReadFileBytes(owned.fixture.image.path) && wal == ReadFileBytes(c.session_root / "accepted.wal") &&
+            std::filesystem::exists(c.recovery_marker_file),
+            "idle582: Stop is a join, and terminal final drain honestly fails without erasing evidence");
 }

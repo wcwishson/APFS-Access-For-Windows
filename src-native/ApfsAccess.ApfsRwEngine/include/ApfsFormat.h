@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,15 @@ namespace apfsaccess::catalog
     const std::vector<std::byte>& buffer, std::size_t offset);
 [[nodiscard]] std::optional<std::uint64_t> ReadU64LE(
     const std::vector<std::byte>& buffer, std::size_t offset);
+
+[[nodiscard]] std::optional<std::uint16_t> ReadU16LE(
+    std::span<const std::byte> buffer, std::size_t offset);
+[[nodiscard]] std::optional<std::uint32_t> ReadU32LE(
+    std::span<const std::byte> buffer, std::size_t offset);
+[[nodiscard]] std::optional<std::uint64_t> ReadU64LE(
+    std::span<const std::byte> buffer, std::size_t offset);
+[[nodiscard]] bool VerifyObjectChecksum(
+    std::span<const std::byte> block, std::size_t block_size);
 
 // ---- checksums --------------------------------------------------------------
 
@@ -166,6 +176,12 @@ struct NxSuperblock
     std::uint32_t xp_desc_len = 0;
     std::uint32_t xp_data_index = 0;
     std::uint32_t xp_data_len = 0;
+    // [APPLE] nx_superblock_t; raw UUID bytes retain their on-disk order.
+    std::array<std::byte, 16> fusion_uuid{};
+    std::uint64_t fusion_middle_tree_oid = 0;
+    std::uint64_t fusion_writeback_oid = 0;
+    std::uint64_t fusion_writeback_start = 0;
+    std::uint64_t fusion_writeback_blocks = 0;
 };
 
 // Parses one block_size-sized NXSB block ([CODE] offsets:
@@ -277,6 +293,45 @@ bool ReadBtreeLeafRecords(
     std::vector<BtreeRecord>& out_records,
     std::string& out_error);
 
+// Optional node storage boundary. The implementation owns the returned span until
+// ReleaseNode, called on every exit, including exceptions. No parser/key cache.
+// The parser still verifies checksum, OID, subtype, XID, layout and tree counts.
+class BtreeNodeReadContext
+{
+public:
+    virtual ~BtreeNodeReadContext() = default;
+    virtual bool ReadNode(std::uint64_t oid, std::uint64_t physical_block, bool root,
+        std::span<const std::byte>& bytes, std::string& error) = 0;
+    virtual void ReleaseNode() noexcept = 0;
+};
+bool ReadBtreeLeafRecords(const RandomAccessSource& source, std::uint32_t block_size,
+    std::uint64_t root_block, bool physical, std::uint64_t map_oid, std::uint64_t max_xid,
+    const BtreeReadPolicy& policy, std::vector<BtreeRecord>& records, std::string& error,
+    BtreeNodeReadContext* node_context);
+
+// Opt-in routing validation; kept separate to preserve existing policy ABI.
+// compare_keys validates both keys and returns -1/0/+1 under the exact tree
+// comparator, or nullopt with an error. A child minimum must equal its parent
+// separator; every child key is below the next separator (exclusive).
+struct BtreeRoutingPolicy
+{
+    std::function<std::optional<int>(const std::vector<std::byte>&,
+        const std::vector<std::byte>&, std::string&)> compare_keys;
+};
+
+bool ReadBtreeLeafRecords(
+    const RandomAccessSource& source, std::uint32_t block_size,
+    std::uint64_t root_block, bool child_addresses_are_physical,
+    std::uint64_t child_object_map_oid, std::uint64_t max_xid_hint,
+    const BtreeReadPolicy& policy, const BtreeRoutingPolicy& routing,
+    std::vector<BtreeRecord>& out_records, std::string& out_error);
+
+// Combined traversal for callers that require routing proof over transformed nodes.
+bool ReadBtreeLeafRecords(const RandomAccessSource& source, std::uint32_t block_size,
+    std::uint64_t root_block, bool physical, std::uint64_t map_oid, std::uint64_t max_xid,
+    const BtreeReadPolicy& policy, const BtreeRoutingPolicy& routing,
+    std::vector<BtreeRecord>& records, std::string& error, BtreeNodeReadContext* node_context);
+
 struct OmapValue
 {
     std::uint32_t flags = 0;
@@ -296,6 +351,11 @@ struct OmapValue
     std::uint64_t oid,
     std::uint64_t max_xid,
     std::string& out_error);
+
+// Opt-in strict physical OMAP profile; the original overload retains its defaults.
+[[nodiscard]] std::optional<OmapValue> ResolveOmapValue(
+    const RandomAccessSource& source, std::uint32_t block_size, std::uint64_t map_oid,
+    std::uint64_t oid, std::uint64_t max_xid, std::string& error, bool strict);
 
 // ---- volume superblock (APSB) -------------------------------------------------
 
@@ -500,6 +560,24 @@ struct AppleVolumeCheckpointView
     std::optional<AppleObjectLocation> snapshot_metadata_tree;
     std::optional<AppleObjectLocation> file_extent_tree;
 };
+
+// Object/volume validation only. No allocator ownership or writer capability.
+// Unsupported APSBs remain catalogable; their tree locations stay empty. Check
+// the catalog's typed VolumeReadSupport before requesting filesystem records.
+struct AppleReadOnlyVolumeView
+{
+    ContainerCheckpointView container;
+    AppleOmapView container_object_map;
+    std::vector<AppleVolumeCheckpointView> volumes;
+};
+// Precondition: checkpoint was validated on this same held source. Does not
+// select another generation or perform/claim allocator ownership validation.
+std::optional<AppleReadOnlyVolumeView> LoadAppleReadOnlyVolumeView(
+    const RandomAccessSource& source, const ContainerCheckpointView& checkpoint,
+    std::string& error);
+bool ReadAppleVolumeFileSystemRecords(const RandomAccessSource& source,
+    const ContainerCheckpointView& checkpoint, const AppleVolumeCheckpointView& volume,
+    std::vector<BtreeRecord>& records, std::string& error);
 
 struct AppleCheckpointView
 {

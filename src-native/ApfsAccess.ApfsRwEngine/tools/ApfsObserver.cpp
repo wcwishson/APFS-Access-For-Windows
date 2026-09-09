@@ -14,6 +14,7 @@
 #endif
 #ifdef _WIN32
 #include <Windows.h>
+#include "WindowsImageLease.h"
 #endif
 #ifndef _WIN32
 #include <unistd.h>
@@ -22,6 +23,8 @@
 #include "ApfsContainerCatalog.h"
 #include "ApfsFormat.h"
 #include "ApfsSnapshotStore.h"
+#include "ApfsVerifier.h"
+#include <set>
 #ifdef _WIN32
 #include "BlockDevice.h"
 #endif
@@ -57,6 +60,10 @@ int Usage()
                  "[--device-id <slug>] [--out <file>]\n"
               << "  ApfsObserver --image <file> --mode snapshots --container-uuid <hex32> "
                  "--volume-oid <decimal> [--out <file>]\n"
+              << "  ApfsObserver --image <file> --mode verify --container-uuid <hex32> "
+                 "--volume-uuid <hex32> --volume-oid <decimal> --checkpoint-xid <decimal> "
+                 "--store-offset-bytes <decimal> --store-size-bytes <decimal> "
+                 "[--require-whole-volume] [--require-payload-content-hashes] [--out <file>]\n"
               << "  ApfsObserver --help\n";
     return 2;
 }
@@ -911,14 +918,19 @@ struct ObserverOptions
     std::string out_path;
     std::string container_uuid;
     std::string volume_oid;
+    std::string volume_uuid, checkpoint_xid, store_offset_bytes, store_size_bytes;
+    bool require_whole_volume = false, require_payload_content_hashes = false;
+    bool duplicate_option = false;
 };
 
 ObserverOptions ParseOptions(int argc, char** argv)
 {
     ObserverOptions options;
+    std::set<std::string> seen;
     for (int index = 1; index < argc; ++index)
     {
         const std::string arg = argv[index];
+        if (!seen.insert(arg).second) options.duplicate_option = true;
         auto need_value = [&](const char* flag) -> std::string {
             if (index + 1 >= argc)
             {
@@ -966,6 +978,12 @@ ObserverOptions ParseOptions(int argc, char** argv)
         {
             options.volume_oid = need_value("--volume-oid");
         }
+        else if (arg == "--volume-uuid") options.volume_uuid = need_value("--volume-uuid");
+        else if (arg == "--checkpoint-xid") options.checkpoint_xid = need_value("--checkpoint-xid");
+        else if (arg == "--store-offset-bytes") options.store_offset_bytes = need_value("--store-offset-bytes");
+        else if (arg == "--store-size-bytes") options.store_size_bytes = need_value("--store-size-bytes");
+        else if (arg == "--require-whole-volume") options.require_whole_volume = true;
+        else if (arg == "--require-payload-content-hashes") options.require_payload_content_hashes = true;
         else if (arg == "--help" || arg == "-h" || arg == "/?")
         {
             std::exit(Usage());
@@ -976,6 +994,16 @@ ObserverOptions ParseOptions(int argc, char** argv)
         }
     }
     return options;
+}
+
+std::uint64_t ExactDecimal(const std::string& value, const char* flag, bool allow_zero = false)
+{
+    std::uint64_t number = 0;
+    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), number);
+    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+        (!allow_zero && !number) || value != std::to_string(number))
+        Fail(std::string(flag) + " must be a canonical decimal uint64" + (allow_zero ? "" : " greater than zero"));
+    return number;
 }
 
 void ValidateOptions(const ObserverOptions& options)
@@ -992,19 +1020,19 @@ void ValidateOptions(const ObserverOptions& options)
     {
         Fail("fusion mode requires both --store-a and --store-b");
     }
-    if (options.profile.empty() && options.mode != "snapshots")
+    if (options.profile.empty() && options.mode != "snapshots" && options.mode != "verify")
     {
         Fail("--profile is required");
     }
-    if (options.mode != "collect" && options.mode != "fusion" && options.mode != "snapshots")
+    if (options.mode != "collect" && options.mode != "fusion" && options.mode != "snapshots" && options.mode != "verify")
     {
-        Fail("--mode must be collect, fusion, or snapshots");
+        Fail("--mode must be collect, fusion, snapshots, or verify");
     }
     if (has_fusion && options.mode != "fusion")
     {
         Fail("two-store inputs require --mode fusion");
     }
-    if ((has_image || has_device) && options.mode != "collect" && options.mode != "snapshots")
+    if ((has_image || has_device) && options.mode != "collect" && options.mode != "snapshots" && options.mode != "verify")
     {
         Fail("single inputs require --mode collect");
     }
@@ -1012,7 +1040,29 @@ void ValidateOptions(const ObserverOptions& options)
     {
         Fail("--device-id must match [A-Za-z0-9_.-]{1,128}");
     }
-    if (options.mode == "snapshots")
+    if (options.mode == "verify")
+    {
+        if (!has_image || has_fusion || has_device) Fail("verification requires one regular --image input");
+        std::string regular_path = options.image;
+        std::replace(regular_path.begin(), regular_path.end(), '\\', '/');
+        if (regular_path.starts_with("//./") || regular_path.starts_with("//?/") || regular_path.starts_with("/??/"))
+            Fail("verification image cannot use a device namespace");
+        const auto colon = regular_path.find(':');
+        if (colon != std::string::npos && (colon != 1 ||
+            !((regular_path[0] >= 'a' && regular_path[0] <= 'z') || (regular_path[0] >= 'A' && regular_path[0] <= 'Z')) ||
+            regular_path.find(':', colon + 1) != std::string::npos))
+            Fail("verification image cannot use an alternate data stream");
+        if (options.duplicate_option) Fail("duplicate verification option");
+        if (!options.profile.empty() || !options.device_id.empty()) Fail("verification does not accept profile or device selectors");
+        for (const auto* uuid : {&options.container_uuid, &options.volume_uuid})
+            if (uuid->size() != 32 || uuid->find_first_not_of("0123456789abcdef") != std::string::npos || *uuid == std::string(32, '0'))
+                Fail("verification UUIDs must be nonzero lowercase 32-digit hex UUIDs");
+        (void)ExactDecimal(options.volume_oid, "--volume-oid");
+        (void)ExactDecimal(options.checkpoint_xid, "--checkpoint-xid");
+        (void)ExactDecimal(options.store_offset_bytes, "--store-offset-bytes", true);
+        (void)ExactDecimal(options.store_size_bytes, "--store-size-bytes");
+    }
+    else if (options.mode == "snapshots")
     {
         if (!has_image || has_fusion || has_device)
             Fail("snapshot inventory requires one regular --image input");
@@ -1028,7 +1078,148 @@ void ValidateOptions(const ObserverOptions& options)
             Fail("--volume-oid must be a nonzero canonical decimal object ID");
     }
     else if (!options.container_uuid.empty() || !options.volume_oid.empty())
-        Fail("snapshot selectors require --mode snapshots");
+        Fail("identity selectors require --mode snapshots or verify");
+    if (options.mode != "verify" && (!options.volume_uuid.empty() || !options.checkpoint_xid.empty() ||
+        !options.store_offset_bytes.empty() || !options.store_size_bytes.empty() ||
+        options.require_whole_volume || options.require_payload_content_hashes))
+        Fail("exact verification selectors require --mode verify");
+}
+
+#ifdef _WIN32
+// Common regular-image verification lease, also used by the encrypted reader.
+class VerificationImageLease final : public apfsaccess::catalog::RandomAccessSource
+{
+public:
+    explicit VerificationImageLease(const std::string& path)
+        try : lease_(ToWide(path), false) {}
+        catch (const std::runtime_error& error) {
+            if (std::string(error.what()) == "RegularImageRequired")
+                Fail("verification lease requires a regular non-reparse image file");
+            Fail("cannot acquire read-only verification image lease");
+        }
+    std::uint64_t SizeBytes() const override { return lease_.SizeBytes(); }
+    std::string Identity() const { return lease_.Identity(); }
+    bool VerifyUnchanged() const { return lease_.VerifyUnchanged(); }
+    bool Read(std::uint64_t offset, std::size_t size, std::vector<std::byte>& bytes) const override
+        { return lease_.Read(offset, size, bytes); }
+private:
+    apfsaccess::transport::WindowsImageLease lease_;
+};
+#endif
+
+std::string VerificationJson(const apfsaccess::catalog::VerificationReport& report, const std::string& image_path)
+{
+    using namespace apfsaccess::catalog;
+    JsonWriter json;
+    const auto number = [&](std::uint64_t n) { json.String(std::to_string(n)); };
+    const auto optional = [&](const std::optional<std::uint64_t>& n) { if (n) number(*n); else json.Null(); };
+    const auto identity = [&](const ApfsSnapshotScope& scope) {
+        json.Key("containerUuid"); json.String(scope.container_uuid_hex);
+        json.Key("volumeUuid"); json.String(scope.volume_uuid_hex);
+        json.Key("volumeOid"); number(scope.volume_oid);
+        json.Key("checkpointXid"); number(scope.checkpoint_xid);
+        json.Key("storeOffsetBytes"); number(scope.store_offset_bytes);
+        json.Key("storeSizeBytes"); number(scope.store_size_bytes);
+    };
+    json.BeginObject();
+    json.Key("format"); json.String("apfs-access-verification");
+    json.Key("version"); json.Integer(1);
+    json.Key("readOnly"); json.Bool(true);
+    json.Key("source"); json.BeginObject();
+    json.Key("kind"); json.String("image");
+    json.Key("path"); json.String(image_path);
+    json.Key("identity"); json.String(report.requested_scope.source_identity);
+    json.Key("lease"); json.String("windows-read-deny-write-delete");
+    json.EndObject();
+    json.Key("requestedScope"); json.BeginObject(); identity(report.requested_scope.exact);
+    json.Key("maxReads"); number(report.requested_scope.max_reads);
+    json.Key("maxReadBytes"); number(report.requested_scope.max_read_bytes);
+    json.Key("maxRecords"); number(report.requested_scope.max_records);
+    json.Key("maxRecordBytes"); number(report.requested_scope.max_record_bytes);
+    json.Key("requireWholeVolume"); json.Bool(report.requested_scope.require_whole_volume);
+    json.Key("requirePayloadContentHashes"); json.Bool(report.requested_scope.require_payload_content_hashes);
+    json.EndObject();
+    json.Key("selected");
+    if (report.selected)
+    {
+        const auto& selected = *report.selected;
+        json.BeginObject(); identity(selected.exact);
+        json.Key("checkpointPhysicalBlock"); number(selected.checkpoint_physical_block);
+        json.Key("volumeSuperblockPhysicalBlock"); number(selected.volume_superblock_physical_block);
+        json.Key("volumeSuperblockXid"); number(selected.volume_superblock_xid);
+        json.Key("rootOid"); number(selected.root_oid);
+        json.Key("rootPhysicalBlock"); number(selected.root_physical_block);
+        json.EndObject();
+    }
+    else json.Null();
+    json.Key("outcome"); json.Integer(static_cast<unsigned>(report.outcome));
+    json.Key("outcomeName"); json.String(report.outcome == VerificationOutcome::Complete ? "Complete" :
+        report.outcome == VerificationOutcome::Refused ? "Refused" : "Incomplete");
+    json.Key("wholeVolumeVerified"); json.Bool(report.whole_volume_verified);
+    json.Key("payloadContentHashesVerified"); json.Bool(report.payload_content_hashes_verified);
+    json.Key("sourceReads"); number(report.source_reads);
+    json.Key("sourceReadBytes"); number(report.source_read_bytes);
+    json.Key("coveredFilesystemRecords"); number(report.covered_filesystem_records);
+    json.Key("coveredPhysicalExtents"); number(report.covered_physical_extents);
+    json.Key("findings"); json.BeginArray();
+    for (const auto& finding : report.findings)
+    {
+        json.BeginObject();
+        json.Key("code"); json.Integer(static_cast<unsigned>(finding.code));
+        json.Key("severity"); json.Integer(static_cast<unsigned>(finding.severity));
+        json.Key("check"); json.Integer(static_cast<unsigned>(finding.check));
+        json.Key("volumeOid"); optional(finding.volume_oid);
+        json.Key("objectId"); optional(finding.object_id);
+        json.Key("physicalBlock"); optional(finding.physical_block);
+        json.Key("checkpointXid"); optional(finding.checkpoint_xid);
+        json.Key("failedSourceOffsetBytes"); optional(finding.failed_source_offset_bytes);
+        json.Key("detail"); json.String(finding.detail);
+        json.EndObject();
+    }
+    json.EndArray();
+    json.Key("coverage"); json.BeginArray();
+    for (const auto& coverage : report.coverage)
+    {
+        json.BeginObject();
+        json.Key("check"); json.Integer(static_cast<unsigned>(coverage.check));
+        json.Key("implemented"); json.Bool(coverage.implemented);
+        json.Key("required"); json.Bool(coverage.required);
+        json.Key("state"); json.Integer(static_cast<unsigned>(coverage.state));
+        json.Key("scopeDetail"); json.String(coverage.scope_detail);
+        json.EndObject();
+    }
+    json.EndArray();
+    json.Key("repair"); json.BeginObject();
+    json.Key("planId"); json.String(report.repair.plan_id);
+    json.Key("refusal"); json.Integer(static_cast<unsigned>(report.repair.refusal));
+    json.Key("nextActionableCandidate"); json.Null();
+    json.EndObject(); json.EndObject();
+    return json.Text();
+}
+
+int ObserveVerification(const ObserverOptions& options)
+{
+#ifdef _WIN32
+    using namespace apfsaccess::catalog;
+    RequireRegularInputFile(options.image, "verification input");
+    VerificationImageLease source(options.image);
+    VerificationScope scope;
+    scope.source_identity = source.Identity();
+    scope.exact = {ExactDecimal(options.store_offset_bytes, "--store-offset-bytes", true),
+        ExactDecimal(options.store_size_bytes, "--store-size-bytes"), options.container_uuid, options.volume_uuid,
+        ExactDecimal(options.volume_oid, "--volume-oid"), ExactDecimal(options.checkpoint_xid, "--checkpoint-xid")};
+    scope.require_whole_volume = options.require_whole_volume;
+    scope.require_payload_content_hashes = options.require_payload_content_hashes;
+    const auto report = ApfsVerifier::Verify(source, scope);
+    if (!source.VerifyUnchanged()) Fail("verification image identity changed during lease");
+    const auto json = VerificationJson(report, options.image);
+    if (options.out_path.empty()) std::cout << json << "\n";
+    else PublishEvidence(json, options.out_path, {options.image});
+    return report.outcome == VerificationOutcome::Complete ? 0 : report.outcome == VerificationOutcome::Refused ? 4 : 3;
+#else
+    (void)options;
+    Fail("verification requires the Windows stable image lease implementation");
+#endif
 }
 
 int ObserveSnapshots(const ObserverOptions& options)
@@ -1146,6 +1337,7 @@ int main(int argc, char** argv)
     const ObserverOptions options = ParseOptions(argc, argv);
     ValidateOptions(options);
     if (options.mode == "snapshots") return ObserveSnapshots(options);
+    if (options.mode == "verify") return ObserveVerification(options);
 
     using apfsaccess::catalog::ApfsContainerCatalog;
     using apfsaccess::catalog::HeldFileSource;

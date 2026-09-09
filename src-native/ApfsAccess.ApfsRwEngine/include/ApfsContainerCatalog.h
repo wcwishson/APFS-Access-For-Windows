@@ -27,6 +27,9 @@ class BlockDevice;
 
 namespace apfsaccess::catalog
 {
+class ApfsFusionStore;
+enum class CatalogValidation { Legacy, CompleteAllocator, ReadOnlyObjects };
+enum class VolumeReadSupport { Ordinary, EncryptionUnsupported, FeaturesUnsupported, FileExtentTreeUnsupported };
 
 struct GptPartitionDescriptor
 {
@@ -53,6 +56,8 @@ struct ApfsPhysicalStoreDescriptor
 
 struct ApfsVolumeDescriptor
 {
+    std::string stable_volume_id;
+    VolumeReadSupport read_support = VolumeReadSupport::Ordinary;
     std::uint64_t object_id = 0;
     std::string volume_uuid_hex; // "" when zero
     std::string group_uuid_hex; // "" when zero
@@ -112,6 +117,7 @@ struct ApfsContainerDescriptor
     std::vector<std::string> readonly_bits;
     std::vector<std::string> incompatible_bits;
     std::vector<std::string> unknown_bits;
+    CatalogValidation validation = CatalogValidation::Legacy;
     bool fusion = false; // more than one member store
 };
 
@@ -139,6 +145,10 @@ struct ApfsStoreCheckpointView
 class ApfsContainerCatalog
 {
 public:
+    static bool TryLoadFusion(const ApfsFusionStore& source, const std::string& disk_id,
+        const std::string& device_identifier, ApfsContainerCatalog& out, std::string& error);
+    bool CheckAvailable(std::string& error) const;
+    const AppleReadOnlyVolumeView* TryGetReadOnlyVolumeView() const;
     // Loads one image file (regular fixture). `disk_id` becomes the disk slug
     // (apfs-disk:<disk_id>); `device_identifier` is recorded verbatim.
     static bool TryLoadImage(
@@ -179,10 +189,10 @@ public:
     [[nodiscard]] const std::string& DiskId() const noexcept { return disk_id_; }
     [[nodiscard]] const std::string& DeviceIdentifier() const noexcept { return device_identifier_; }
     [[nodiscard]] const std::string& DiskGuid() const noexcept { return disk_guid_; }
-    [[nodiscard]] std::uint64_t DiskSizeBytes() const noexcept { return disk_size_bytes_; }
+    [[nodiscard]] std::uint64_t DiskSizeBytes() const noexcept { return IsAvailableNoThrow() ? disk_size_bytes_ : 0; }
     [[nodiscard]] const std::vector<GptPartitionDescriptor>& Partitions() const noexcept { return partitions_; }
-    [[nodiscard]] const std::vector<ApfsPhysicalStoreDescriptor>& Stores() const noexcept { return stores_; }
-    [[nodiscard]] const std::vector<ApfsContainerDescriptor>& Containers() const noexcept { return containers_; }
+    [[nodiscard]] const std::vector<ApfsPhysicalStoreDescriptor>& Stores() const noexcept { static const std::vector<ApfsPhysicalStoreDescriptor> empty; return IsAvailableNoThrow() ? stores_ : empty; }
+    [[nodiscard]] const std::vector<ApfsContainerDescriptor>& Containers() const noexcept { static const std::vector<ApfsContainerDescriptor> empty; return IsAvailableNoThrow() ? containers_ : empty; }
     [[nodiscard]] const AppleCheckpointView* TryGetAppleCheckpointView(
         const std::string& stable_store_id) const noexcept;
     // Uses the privately retained strict checkpoint; legacy/Fusion space is
@@ -191,6 +201,13 @@ public:
         ApfsSharedSpaceProjection& out, std::string& error) const;
 
 private:
+    bool IsAvailableNoThrow() const noexcept
+    {
+        try { std::string error; return CheckAvailable(error); }
+        catch (...) { return false; }
+    }
+    std::function<bool(std::string&)> availability_;
+    std::optional<AppleReadOnlyVolumeView> readonly_view_;
     std::string disk_id_;
     std::string device_identifier_;
     std::string disk_guid_; // GPT disk GUID, "" for partitionless stores

@@ -17,6 +17,28 @@
 #include <thread>
 #include <vector>
 
+// Thread-local allocation failure drives the production namespace body. Other
+// callback threads and fixture construction remain ordinary allocator users.
+thread_local long g_clone_allocation_fail_after = -1;
+thread_local unsigned g_clone_allocation_count = 0;
+thread_local bool g_clone_allocation_always_fail = false;
+void* operator new(std::size_t size)
+{
+    if (g_clone_allocation_always_fail) throw std::bad_alloc();
+    if (g_clone_allocation_fail_after >= 0)
+    {
+        ++g_clone_allocation_count;
+        if (g_clone_allocation_fail_after-- == 0) throw std::bad_alloc();
+    }
+    if (void* p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t size) { return ::operator new(size); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+
 #define APFSACCESS_FSHOST_UNIT_TEST 1
 #include "../src/main.cpp"
 #ifdef APFSACCESS_HAS_RW_ENGINE
@@ -335,8 +357,10 @@ NTSTATUS StartDispatcherForManifestControlTest(FSP_FILE_SYSTEM*, ULONG)
     return STATUS_SUCCESS;
 }
 
+std::atomic<unsigned> g_semantics_check_count{0};
 bool Require(bool condition, const char* message)
 {
+    ++g_semantics_check_count;
     if (!condition)
     {
         std::cerr << "[FAIL] " << message << std::endl;
@@ -516,12 +540,14 @@ bool ConfigureNativeCommitFailureForUnitTest(MountContext& context)
 
 bool PrepareUnitHydrationRoot(MountContext& context, const wchar_t* name)
 {
+    static std::atomic<std::uint64_t> unique_root{0};
     std::error_code ec;
     const auto suffix = name && *name ? std::wstring(name) : L"default";
     context.session_root = std::filesystem::temp_directory_path(ec) /
         "ApfsAccess" /
         "fs-host-semantics" /
-        (suffix + L"-" + std::to_wstring(GetTickCount64()));
+        (suffix + L"-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+            std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(unique_root.fetch_add(1)));
     if (ec)
     {
         return false;
@@ -44015,9 +44041,9 @@ bool TestCompressionHostReads()
             PVOID denied = nullptr;
             const auto status = CB_Open(&fs, const_cast<PWSTR>(L"\\compressed::$DATA"), FILE_NON_DIRECTORY_FILE | (FILE_OPEN << 24), access, &denied, &info);
             if (denied) CB_Close(&fs, denied);
-            const bool bounded_edit = supported && !manifest && !spec.empty && access != FILE_APPEND_DATA;
+            const bool bounded_edit = supported && !spec.empty && access != FILE_APPEND_DATA;
             if (!Require(bounded_edit ? status == STATUS_SUCCESS && denied : status == STATUS_NOT_SUPPORTED && !denied,
-                    "only supported nonempty direct images admit positional editing; append-only access stays refused")) return false;
+                    "supported nonempty direct and manifest images admit positional editing; append-only access stays refused")) return false;
         }
         for (const UINT32 disposition : {FILE_OVERWRITE, FILE_OVERWRITE_IF, FILE_SUPERSEDE})
         {
@@ -45458,13 +45484,19 @@ bool TestDirectorySymlinkAcceptedRecovery(bool restoring = false, bool renamed_f
 #include "NativeCompressionManifestRefusalTests.h"
 #include "NativeCompressionManifestAcceptanceTests.h"
 #include "DeferredAccessTimeTests.h"
+#include "DeferredAccessTimeStopTests567.h"
 #include "NativeLzvnReadTests.h"
 #include "NativeSparseWriteTests.h"
+#include "NativeCloneHost500Tests.h"
+#include "NativeCloneHost513Tests.h"
 #endif
 
 bool RunSelectedTest(const std::string& name)
 {
 #ifdef APFSACCESS_HAS_RW_ENGINE
+    if (name == "native-clone-host-500") return TestNativeCloneHost500() && TestNativeCloneHost513() && TestNativeCloneManifest513();
+    if (name == "native-clone-host-513") return TestNativeCloneHost513();
+    if (name == "native-clone-manifest-513") return TestNativeCloneManifest513();
     if (name == "native-xattr-streams-188-direct") return TestNativeXattrStreams188(false);
     if (name == "native-xattr-streams-188-manifest") return TestNativeXattrStreams188(true);
     if (name == "native-xattr-streams-188-accepted-recovery") return TestNativeXattrStreams188(false, true);
@@ -45519,6 +45551,19 @@ bool RunSelectedTest(const std::string& name)
     if (name == "deferred-atime-ordering-302") return TestDeferredAccessTimeOrdering302(false) && TestDeferredAccessTimeOrdering302(true);
     if (name == "deferred-atime-shutdown-302") return TestDeferredAccessTimeShutdown302(false) && TestDeferredAccessTimeShutdown302(true);
     if (name == "deferred-atime-worker-302") return TestDeferredAccessTimeWorker302(false) && TestDeferredAccessTimeWorker302(true);
+    if (name == "stop-atime-567-direct") return TestDeferredAccessTimeStop567(false, false, true);
+    if (name == "stop-atime-567-direct-failure") return TestDeferredAccessTimeStop567(false, true, true);
+    if (name == "stop-atime-567-idle") return TestDeferredAccessTimeStop567(false, false, false);
+    if (name == "stop-atime-567-idle-failure") return TestDeferredAccessTimeStop567(false, true, false);
+    if (name == "stop-atime-567-manifest") return TestDeferredAccessTimeStop567(true, false, true);
+    if (name == "stop-atime-567-manifest-failure") return TestDeferredAccessTimeStop567(true, true, true);
+    if (name == "deferred-atime-earlier-close-562") return TestDeferredAccessTimeEarlierCommitWorker562(false) && TestDeferredAccessTimeEarlierCommitWorker562(true);
+    if (name == "deferred-atime-earlier-terminal-568") return TestDeferredAccessTimeEarlierCommitRefusal568(false);
+    if (name == "deferred-atime-earlier-retry-568") return TestDeferredAccessTimeEarlierCommitRefusal568(true);
+    if (name == "deferred-atime-idle-sibling-582") return TestDeferredAccessTimeIdleSiblingRetry582(false);
+    if (name == "deferred-atime-idle-stop-582") return TestDeferredAccessTimeIdleSiblingRetry582(true);
+    if (name == "deferred-atime-idle-full-status-582") return TestDeferredAccessTimeIdleFullStatus582();
+    if (name == "deferred-atime-idle-terminal-582") return TestDeferredAccessTimeIdleTerminal582();
     if (name == "deferred-atime-overdue-311") return TestDeferredAccessTimeOverdue311(false) && TestDeferredAccessTimeOverdue311(true);
     if (name == "deferred-atime-pressure-311") return TestDeferredAccessTimePressure311();
     if (name == "native-lzvn-read-320") return TestNativeLzvnReadTask5();
@@ -47213,7 +47258,7 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        std::cout << "[PASS] Selected FsHost semantics tests passed." << std::endl;
+        std::cout << "[PASS] Selected FsHost semantics tests passed. Checks=" << g_semantics_check_count.load() << std::endl;
         return 0;
     }
 
@@ -47702,6 +47747,19 @@ int main(int argc, char** argv)
         ok &= TestDeferredAccessTimeOrdering302(manifest);
         ok &= TestDeferredAccessTimeShutdown302(manifest);
         ok &= TestDeferredAccessTimeWorker302(manifest);
+        ok &= TestDeferredAccessTimeStop567(manifest, false, true);
+        ok &= TestDeferredAccessTimeStop567(manifest, true, true);
+        if (!manifest)
+        {
+            ok &= TestDeferredAccessTimeStop567(false, false, false);
+            ok &= TestDeferredAccessTimeStop567(false, true, false);
+            ok &= TestDeferredAccessTimeIdleSiblingRetry582(false);
+            ok &= TestDeferredAccessTimeIdleSiblingRetry582(true);
+            ok &= TestDeferredAccessTimeIdleFullStatus582();
+            ok &= TestDeferredAccessTimeIdleTerminal582();
+        }
+        ok &= TestDeferredAccessTimeEarlierCommitWorker562(manifest);
+        ok &= TestDeferredAccessTimeEarlierCommitRefusal568(manifest);
         ok &= TestDeferredAccessTimeOverdue311(manifest);
         ok &= TestDeferredAccessTimeAcceptedFailure302(manifest, false);
         ok &= TestDeferredAccessTimeAcceptedFailure302(manifest, true);
