@@ -24,7 +24,8 @@ public sealed record FsHostSupervisorOptions(
     string? StatusFile = null,
     int GracefulTimeoutMs = 30_000,
     int ProcessAbsenceTimeoutMs = 15_000,
-    int OwnerPollIntervalMs = 100);
+    int OwnerPollIntervalMs = 100,
+    bool CredentialInput = false);
 
 public sealed class FsHostSupervisorEvidence
 {
@@ -259,6 +260,7 @@ public static class FsHostSupervisor
         SafeNativeHandle? jobHandle = null;
         SafeNativeHandle? processHandle = null;
         SafeNativeHandle? threadHandle = null;
+        SupervisedCredential? credential = null;
         var finalExitCode = 1;
         var ownershipTransferredToQuarantine = false;
 
@@ -271,12 +273,28 @@ public static class FsHostSupervisor
             ownerHandle = OpenOwner(ownerPid);
             evidence.OwnerAliveAtLaunch = true;
 
+            void CheckCredentialOwner()
+            {
+                if (WaitForObject(ownerHandle, 0, WaitKindOwner, "WaitForSingleObject(owner)") == WaitObject0 ||
+                    !File.Exists(evidence.LifetimeFile))
+                    throw new InvalidOperationException("Credential transport owner or lifetime ended.");
+            }
+            if (options.CredentialInput)
+            {
+                credential = SupervisedCredential.Receive(SupervisedCredential.TakeStandardInput(),
+                    cancellationToken, CheckCredentialOwner);
+                credential.CreateChildPipe();
+                cancellationToken.ThrowIfCancellationRequested();
+                CheckCredentialOwner();
+            }
+
             jobHandle = CreateKillOnCloseJob();
             evidence.JobCreated = true;
 
-            var launch = CreateSuspendedChild(hostPath, options.HostArguments, workingDirectory);
+            var launch = CreateSuspendedChild(hostPath, options.HostArguments, workingDirectory, credential?.Reader);
             processHandle = launch.ProcessHandle;
             threadHandle = launch.ThreadHandle;
+            credential?.ReleaseLocalReader();
             evidence.HostPid = checked((int)launch.ProcessId);
             evidence.HostParentPid = evidence.SupervisorPid;
             evidence.HostCreationTimeFileTime = CaptureProcessCreationTime(processHandle);
@@ -292,6 +310,7 @@ public static class FsHostSupervisor
             }
 
             evidence.JobAssigned = true;
+            cancellationToken.ThrowIfCancellationRequested();
             if (WaitForObject(ownerHandle, 0, WaitKindOwner, "WaitForSingleObject(owner)") == WaitObject0)
             {
                 throw new InvalidOperationException("The supervisor owner exited before the host could be resumed.");
@@ -322,6 +341,13 @@ public static class FsHostSupervisor
                 evidence.StartupGateAuthorized = true;
             }
 
+            credential?.Send(cancellationToken, () =>
+            {
+                CheckCredentialOwner();
+                if (WaitForObject(processHandle, 0, WaitKindProcess, "WaitForSingleObject(host)") == WaitObject0)
+                    throw new InvalidOperationException("Credential transport child exited.");
+            });
+            credential = null;
             evidence.SupervisionProven = evidence.JobCreated && evidence.JobAssigned && evidence.Resumed;
             evidence.LaunchProvenUtc = DateTime.UtcNow;
             WriteEvidence(evidence);
@@ -352,6 +378,7 @@ public static class FsHostSupervisor
         }
         finally
         {
+            credential?.Dispose();
             if (processHandle is not null)
             {
                 try
@@ -743,7 +770,8 @@ public static class FsHostSupervisor
     private static ChildLaunch CreateSuspendedChild(
         string hostPath,
         IReadOnlyList<string> arguments,
-        string workingDirectory)
+        string workingDirectory,
+        SafeFileHandle? credentialInput = null)
     {
         var commandLine = new StringBuilder();
         commandLine.Append(QuoteWindowsArgument(hostPath));
@@ -752,6 +780,9 @@ public static class FsHostSupervisor
             commandLine.Append(' ');
             commandLine.Append(QuoteWindowsArgument(argument));
         }
+
+        if (credentialInput is not null)
+            return CreateCredentialChild(hostPath, commandLine, workingDirectory, credentialInput);
 
         var startupInfo = new StartupInfo
         {
@@ -776,6 +807,50 @@ public static class FsHostSupervisor
             new SafeNativeHandle(processInformation.ProcessHandle),
             new SafeNativeHandle(processInformation.ThreadHandle),
             processInformation.ProcessId);
+    }
+
+    private static ChildLaunch CreateCredentialChild(string hostPath, StringBuilder commandLine,
+        string workingDirectory, SafeFileHandle input)
+    {
+        nuint size = 0;
+        _ = NativeMethods.InitializeProcThreadAttributeList(0, 1, 0, ref size);
+        if (size == 0 || Marshal.GetLastWin32Error() != ErrorInsufficientBuffer)
+            throw LastWin32Error("InitializeProcThreadAttributeList(credential size)");
+        var attributes = Marshal.AllocHGlobal(checked((nint)size));
+        var handles = Marshal.AllocHGlobal(nint.Size);
+        var initialized = false;
+        try
+        {
+            if (!NativeMethods.InitializeProcThreadAttributeList(attributes, 1, 0, ref size))
+                throw LastWin32Error("InitializeProcThreadAttributeList(credential)");
+            initialized = true;
+            Marshal.WriteIntPtr(handles, input.DangerousGetHandle());
+            if (!NativeMethods.UpdateProcThreadAttribute(attributes, 0, ProcThreadAttributeHandleList,
+                    handles, (nuint)nint.Size, 0, 0))
+                throw LastWin32Error("UpdateProcThreadAttribute(credential)");
+            var info = new StartupInfoEx
+            {
+                StartupInfo = new StartupInfo
+                {
+                    Cb = (uint)Marshal.SizeOf<StartupInfoEx>(), Flags = 0x100,
+                    StdInput = input.DangerousGetHandle(), StdOutput = -1, StdError = -1,
+                },
+                AttributeList = attributes,
+            };
+            if (!NativeMethods.CreateProcessW(hostPath, commandLine, 0, 0, true,
+                    CreateSuspended | CreateUnicodeEnvironment | CreateNoWindow | ExtendedStartupInfoPresent,
+                    0, workingDirectory, ref info, out var process))
+                throw LastWin32Error("CreateProcessW(credential)");
+            return new ChildLaunch(new SafeNativeHandle(process.ProcessHandle),
+                new SafeNativeHandle(process.ThreadHandle), process.ProcessId);
+        }
+        finally
+        {
+            GC.KeepAlive(input);
+            if (initialized) NativeMethods.DeleteProcThreadAttributeList(attributes);
+            Marshal.FreeHGlobal(handles);
+            Marshal.FreeHGlobal(attributes);
+        }
     }
 
     private static SafeNativeHandle OpenOwner(int ownerPid)
@@ -2782,6 +2857,7 @@ internal static class FsHostSupervisorCommand
         var gracefulTimeoutMs = 30_000;
         var processAbsenceTimeoutMs = 15_000;
         var ownerPollIntervalMs = 100;
+        var credentialInput = false;
 
         for (var index = 0; index < args.Length; index++)
         {
@@ -2808,6 +2884,10 @@ internal static class FsHostSupervisorCommand
                 case "--graceful-timeout-ms": gracefulTimeoutMs = ParseInteger(Value(), token); break;
                 case "--process-absence-timeout-ms": processAbsenceTimeoutMs = ParseInteger(Value(), token); break;
                 case "--owner-poll-interval-ms": ownerPollIntervalMs = ParseInteger(Value(), token); break;
+                case "--credential-input":
+                    if (credentialInput) throw new ArgumentException("Duplicate credential-input option.");
+                    credentialInput = true;
+                    break;
                 default: throw new ArgumentException($"Unknown supervisor option '{token}'.");
             }
         }
@@ -2826,7 +2906,8 @@ internal static class FsHostSupervisorCommand
             statusFile,
             gracefulTimeoutMs,
             processAbsenceTimeoutMs,
-            ownerPollIntervalMs);
+            ownerPollIntervalMs,
+            credentialInput);
     }
 
     private static int ParseInteger(string value, string option)

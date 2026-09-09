@@ -57,4 +57,7 @@ docs/performance-baselines.md
 docs/read-write-optimization-plan.md
 scripts/.scratch-*
 scripts/snapshot_supervision_selftest.js
+scripts/build_fshost_credential_probe.ps1
+scripts/test_fshost_credential_transport.ps1
+scripts/fshost_credential_selftest.js
 third_party/lzfse/*PROVENANCE.md
