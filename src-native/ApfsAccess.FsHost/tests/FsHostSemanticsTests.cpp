@@ -43471,6 +43471,9 @@ bool TestCompressionHostAdmission()
             inode.mode = 0100000; inode.owner = 501; inode.group = 20;
             inode.bsd_flags = id == 17 ? kAppleBsdCompressedFlag : 0;
             inode.uncompressed_size = payload.size();
+            // Apple APFS reference j_inode_val_t (p77): the size field is
+            // padding unless flagged; these owners claim a real size.
+            inode.internal_flags |= kAppleInodeHasUncompressedSize;
             inode.create_time = inode.modification_time = inode.change_time = inode.access_time = 1700000000000000000ULL;
             if (id == 19)
             {
@@ -45491,6 +45494,28 @@ bool TestDirectorySymlinkAcceptedRecovery(bool restoring = false, bool renamed_f
 #include "NativeCloneHost513Tests.h"
 #endif
 
+#ifdef APFSACCESS_HAS_RW_ENGINE
+// Sparse-control boundary pin: the WinFsp driver dispatch does not route
+// FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA or FSCTL_QUERY_ALLOCATED_RANGES to
+// user mode, and the host advertises no sparse capability anywhere. If a
+// future driver ever routes one, CB_Control must still refuse it
+// fail-closed (STATUS_INVALID_DEVICE_REQUEST, zero bytes transferred)
+// instead of misinterpreting it. Ordinary reads/writes are unaffected:
+// every other selector in this binary exercises them on the same build.
+bool TestSparseControlsRefuseFailClosed()
+{
+    const UINT32 sparse_codes[] = {FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA, FSCTL_QUERY_ALLOCATED_RANGES, 0xFFFFFFFF};
+    for (const UINT32 code : sparse_codes)
+    {
+        ULONG transferred = 99;
+        const auto status = CB_Control(nullptr, nullptr, code, nullptr, 0, nullptr, 0, &transferred);
+        if (!Require(status == STATUS_INVALID_DEVICE_REQUEST && transferred == 0,
+                "sparse filesystem control refuses fail-closed without side effects")) return false;
+    }
+    return true;
+}
+#endif
+
 bool RunSelectedTest(const std::string& name)
 {
 #ifdef APFSACCESS_HAS_RW_ENGINE
@@ -45503,6 +45528,8 @@ bool RunSelectedTest(const std::string& name)
     if (name == "native-xattr-preaccept-set") return TestNativeXattrStreams188(false, false, 1);
     if (name == "native-xattr-preaccept-remove") return TestNativeXattrStreams188(false, false, 2);
     if (name == "native-xattr-noncanonical-enumeration") return TestNativeXattrNoncanonicalEnumeration();
+    if (name == "native-xattr-large-fork-roundtrip") return TestNativeXattrLargeForkRoundtrip();
+    if (name == "sparse-controls-refuse-fail-closed") return TestSparseControlsRefuseFailClosed();
     if (name == "native-directory-xattr-direct") return TestNativeDirectoryXattr(false);
     if (name == "native-directory-xattr-manifest") return TestNativeDirectoryXattr(true);
     if (name == "native-xattr-winfsp-names") return TestNativeXattrStreams188(false, false, 0, true);

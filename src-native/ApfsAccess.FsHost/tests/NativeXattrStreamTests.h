@@ -311,3 +311,116 @@ bool TestNativeXattrStreams188(bool manifest, bool interrupt = false, int reject
         c.metadata_store->LookupCommittedInodeByPath(L"\\renamed")->object_id != 17 && !c.write_degraded,
         "retained stream reads old identity and cannot write the replacement inode");
 }
+
+// Large fork round-trip at the exact WAL payload bound through real host
+// callbacks: a 1 MiB resource fork is created and written in chunks,
+// committed, freshly reopened byte-exact (multi-block external stream),
+// while default data, identity, and FinderInfo survive; one byte past
+// the bound refuses without changing image bytes. Values above the
+// bound are a deliberate design limit (fail-closed), not a gap.
+bool TestNativeXattrLargeForkRoundtrip()
+{
+    using namespace apfsaccess::rw;
+    using Store = MetadataStore;
+    DirectorySymlinkFixture fixture(false);
+    auto builder = TwoProjectableVolumeStore();
+    builder.volumes.resize(1);
+    // The 1 MiB fork plus per-chunk commit overhead needs room: the
+    // default 512-block container exhausts near 900 KiB (proven by an
+    // early STATUS_DISK_FULL at chunk 14, kept as capacity honesty).
+    builder.block_count = 4096;
+    builder.authoritative_checkpoint = true; builder.dual_checkpoint = false; builder.xid = 20;
+    auto& volume = builder.volumes.front();
+    auto& records = volume.filesystem_records;
+    apfsaccess::catalog::BtreeRecord encoded;
+    std::string error;
+    const auto add = [&](bool ok) { if (ok) records.push_back(encoded); return ok; };
+    AppleInodeRecord root;
+    root.object_id = root.private_id = root.parent_id = 2; root.mode = 0040755; root.children_or_links = 1;
+    if (!add(EncodeAppleInodeRecord(root, encoded, error))) return false;
+    AppleInodeRecord inode;
+    inode.object_id = inode.private_id = 17; inode.parent_id = 2; inode.children_or_links = 1;
+    inode.mode = 0100640; inode.owner = 501; inode.group = 20;
+    inode.create_time = inode.modification_time = inode.change_time = inode.access_time = 1700000000000000000ULL;
+    if (!add(EncodeAppleInodeRecord(inode, encoded, error))) return false;
+    AppleDirectoryRecord link;
+    link.parent_id = 2; link.file_id = 17; link.flags = 8; link.name_utf8 = "file";
+    if (!add(EncodeAppleDirectoryRecord(link, encoded, error))) return false;
+    const std::vector<std::byte> finder(32, std::byte{0x46});
+    if (!add(EncodeAppleXattrRecord({17, "com.apple.FinderInfo", kAppleXattrDataEmbedded, finder}, encoded, error))) return false;
+    if (!WriteFileBytes(fixture.image.path, apfsaccess::testfixture::BuildStoreImage(builder)) || !fixture.Initialize(false)) return false;
+    auto& c = *fixture.context; auto fs = BuildFileSystem(&c);
+    FSP_FSCTL_FILE_INFO info{};
+    std::vector<PVOID> handles;
+    ScopeExit close{[&] { for (auto handle : handles) CB_Close(&fs, handle); }};
+    PVOID fork = nullptr;
+    auto fork_path = L"\\file:APFS.ResourceFork:$DATA";
+    if (!Require(NT_SUCCESS(CB_Create(&fs, const_cast<PWSTR>(fork_path), FILE_NON_DIRECTORY_FILE, GENERIC_READ | GENERIC_WRITE,
+            0, nullptr, 0, &fork, &info)), "large fork stream creates")) return false;
+    handles.push_back(fork);
+    constexpr std::size_t kForkBytes = WriteAheadLog::MaxExtendedAttributePayloadBytes;
+    const auto payload = BuildPatternPayloadForTest(kForkBytes, 0x71);
+    // Xattr mutations replace the whole value: successive chunks for one
+    // attribute must commit between writes (flush), or the second chunk
+    // conflicts with the still-pending first instead of appending to it.
+    constexpr ULONG kChunk = 65536;
+    std::size_t written = 0;
+    for (std::size_t offset = 0; offset < payload.size(); offset += kChunk)
+    {
+        ULONG done = 99;
+        const auto want = static_cast<ULONG>((std::min<std::size_t>)(kChunk, payload.size() - offset));
+        const auto wstatus = CB_Write(&fs, fork, const_cast<std::byte*>(payload.data() + offset), offset, want, FALSE, FALSE, &done, &info);
+        if (!Require(NT_SUCCESS(wstatus) &&
+                done == want, "large fork chunked writes stage")) return false;
+        written += done;
+        if (!Require(NT_SUCCESS(CB_Flush(&fs, fork, &info)), "large fork chunk commits durably")) return false;
+    }
+    if (!Require(written == kForkBytes, "large fork stages exactly one bound")) return false;
+    if (!Require(NT_SUCCESS(CB_Flush(&fs, fork, &info)) &&
+            c.tx_manager->Watermarks().apfs_durable_sequence == c.tx_manager->Watermarks().accepted_sequence,
+            "large fork flush reaches native durability")) return false;
+    Store fresh(fixture.volume);
+    if (!Require(fresh.PrepareNativeWritePath(), "large fork image reopens")) return false;
+    std::vector<std::byte> actual(kForkBytes); std::size_t count = 0;
+    const auto reopened = fresh.LookupCommittedInodeByPath(L"\\file");
+    const auto reopened_finder = fresh.LookupCommittedExtendedAttribute(17, "com.apple.FinderInfo");
+    if (!Require(reopened && reopened->object_id == 17 && reopened->mode == 0100640 &&
+            reopened->owner == 501 && reopened->group == 20 && reopened->logical_size == 0 &&
+            fresh.ReadCommittedExtendedAttributeRange(17, "com.apple.ResourceFork", 0, actual, count) &&
+            count == kForkBytes && actual == payload && reopened_finder &&
+            reopened_finder->data == finder,
+            "fresh image has exact large fork bytes and preserves identity mode owner and FinderInfo")) return false;
+    // Alias and generic spellings address the same bytes.
+    std::vector<std::byte> alias_read(kForkBytes, std::byte{0x55}); ULONG alias_done = 0;
+    PVOID generic = nullptr;
+    auto generic_path = L"\\file" + NativeXattrStreamName("com.apple.ResourceFork");
+    if (!Require(NT_SUCCESS(CB_Open(&fs, generic_path.data(), FILE_NON_DIRECTORY_FILE | (FILE_OPEN << 24),
+            GENERIC_READ, &generic, &info)), "generic fork spelling opens")) return false;
+    handles.push_back(generic);
+    if (!Require(NT_SUCCESS(CB_Read(&fs, generic, alias_read.data(), 0, static_cast<ULONG>(alias_read.size()), &alias_done)) &&
+            alias_done == kForkBytes && alias_read == payload,
+            "generic spelling reads alias-written fork bytes")) return false;
+    // FinderInfo round-trips through both spellings identically.
+    std::vector<std::byte> finder_alias(32, std::byte{0x55}), finder_generic(32, std::byte{0x55});
+    ULONG finder_done = 0;
+    PVOID finder_handle = nullptr;
+    if (!Require(NT_SUCCESS(CB_Open(&fs, const_cast<PWSTR>(L"\\file:APFS.FinderInfo:$DATA"),
+            FILE_NON_DIRECTORY_FILE | (FILE_OPEN << 24), GENERIC_READ, &finder_handle, &info)), "finder alias opens")) return false;
+    handles.push_back(finder_handle);
+    PVOID finder_generic_handle = nullptr;
+    auto finder_generic_path = L"\\file" + NativeXattrStreamName("com.apple.FinderInfo");
+    if (!Require(NT_SUCCESS(CB_Open(&fs, finder_generic_path.data(), FILE_NON_DIRECTORY_FILE | (FILE_OPEN << 24),
+            GENERIC_READ, &finder_generic_handle, &info)), "finder generic spelling opens")) return false;
+    handles.push_back(finder_generic_handle);
+    if (!Require(NT_SUCCESS(CB_Read(&fs, finder_handle, finder_alias.data(), 0, 32, &finder_done)) && finder_alias == finder &&
+            NT_SUCCESS(CB_Read(&fs, finder_generic_handle, finder_generic.data(), 0, 32, &finder_done)) && finder_generic == finder,
+            "finder info is identical through alias and generic spellings")) return false;
+    // One byte past the bound refuses without touching the image.
+    const auto image_before = ReadFileBytes(fixture.image.path);
+    std::byte extra{0x45}; ULONG extra_done = 99;
+    if (!Require(!NT_SUCCESS(CB_Write(&fs, fork, &extra, kForkBytes, 1, FALSE, FALSE, &extra_done, &info)) && extra_done == 0 &&
+            CB_SetFileSize(&fs, fork, kForkBytes + 1, FALSE, &info) == STATUS_NOT_SUPPORTED &&
+            !c.write_degraded && image_before == ReadFileBytes(fixture.image.path),
+            "over-bound fork growth refuses without degrading or changing bytes")) return false;
+    return true;
+}

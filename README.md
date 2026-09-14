@@ -106,6 +106,7 @@ APFS Access has write support, but it is deliberately guarded.
 - Encrypted APFS volumes are skipped.
 - APFS system, preboot, recovery, VM, sealed, snapshot-heavy, case-sensitive, or otherwise unsupported volumes may be read-only.
 - If recovery or validation checks fail, writable mode is blocked and the app falls back to read-only when possible.
+- Sparse files keep their holes (empty ranges read back as zeros without taking space), but Windows sparse-file controls such as `fsutil sparse` are not supported and report an error. Ordinary file reads and writes are unaffected.
 - Always eject from the tray before unplugging a drive.
 - Keep backups of important APFS drives. This is filesystem software, and backups are still the only real safety net.
 
