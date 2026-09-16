@@ -35,4 +35,21 @@ public sealed class DriveLetterCommandTests
     [Fact]
     public async Task TimeoutIsNotSuccess()
         => Assert.Equal(3, await DriveLetterCommand.RunAsync(Args(), _ => throw new OperationCanceledException()));
+    private static async Task<(int Exit, System.Text.Json.JsonElement Json)> RunEnvelopeAsync(string[] args)
+    {
+        var previous = Console.Out; using var output = new StringWriter();
+        try { Console.SetOut(output); var exit = await DriveLetterCommand.RunAsync(args, _ => throw new Exception("Transport must not run")); return (exit, System.Text.Json.JsonDocument.Parse(output.ToString()).RootElement.Clone()); }
+        finally { Console.SetOut(previous); }
+    }
+    [Fact]
+    public async Task ArgumentErrorEmitsSchema2EnvelopeWithOperationId()
+    {
+        var (exit, json) = await RunEnvelopeAsync(["--letter", "T"]);
+        Assert.Equal(2, exit);
+        Assert.Equal(2, json.GetProperty("schemaVersion").GetInt32());
+        Assert.Equal("drive-letter", json.GetProperty("command").GetString());
+        Assert.True(Guid.TryParseExact(json.GetProperty("operationId").GetString(), "D", out _));
+        Assert.False(json.GetProperty("success").GetBoolean());
+        Assert.Equal(2, json.GetProperty("exitCode").GetInt32());
+    }
 }

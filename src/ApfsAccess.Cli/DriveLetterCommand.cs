@@ -40,7 +40,8 @@ internal static class DriveLetterCommand
         catch (OperationCanceledException) { result = new(false, "Preference request timed out; refresh before retrying.", ApfsOperationCodes.Timeout); exit = 3; }
         catch (Exception ex) { result = new(false, ex.Message, ApfsOperationCodes.ServiceUnavailable); }
         Console.WriteLine(human ? result.Message : JsonSerializer.Serialize(new {
-            command = "drive-letter", success = result.Success, code = result.Code, message = result.Message,
+            schemaVersion = 2, command = "drive-letter", operationId = Guid.NewGuid().ToString("D"),
+            success = result.Success, code = result.Code, message = result.Message,
             exitCode = exit, appliesOn = "next-clean-mount"
         }));
         return exit;
