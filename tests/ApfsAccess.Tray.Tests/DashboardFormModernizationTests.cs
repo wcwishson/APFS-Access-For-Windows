@@ -505,6 +505,101 @@ public sealed class DashboardFormModernizationTests(Xunit.Abstractions.ITestOutp
         Assert.Equal(180, contentSplit.SplitterDistance);
     });
 
+    [Fact]
+    public void DashboardForm_ButtonOrder_And_ContainerSelection_DisplaysRows_DownBelowBar() => Sta(() =>
+    {
+        using var form = new DashboardForm(_ => Task.CompletedTask, _ => Task.CompletedTask, _ => Task.CompletedTask);
+        form.ClientSize = new Size(1000, 700);
+
+        var diskId = "apfs-disk:PhysicalDrive2";
+        var part1Id = "apfs-part:part1";
+        var part2Id = "apfs-part:part2";
+        var storeId = "apfs-store:store1";
+        var containerId = "apfs-container:cont1";
+        var vol1Id = "apfs-vol:cont1:101";
+        var vol2Id = "apfs-vol:cont1:102";
+
+        var sharedSpace = new ApfsSharedSpaceProjection(
+            ContainerId: containerId,
+            CheckpointXid: 50,
+            AllocationUnitBytes: 4096,
+            Total: new ApfsSpaceAmount(25000, 102400000),
+            Free: new ApfsSpaceAmount(15000, 61440000),
+            Used: new ApfsSpaceAmount(10000, 40960000),
+            Volumes: [
+                new ApfsVolumeSpaceProjection(vol1Id, 101, new ApfsSpaceAmount(6000, 24576000), null, null, new ApfsSpaceAmount(0, 0), new ApfsSpaceAmount(15000, 61440000), null, null),
+                new ApfsVolumeSpaceProjection(vol2Id, 102, new ApfsSpaceAmount(4000, 16384000), null, null, new ApfsSpaceAmount(0, 0), new ApfsSpaceAmount(15000, 61440000), null, null)
+            ]);
+
+        var topology = new ApfsTopologySnapshot(
+            Disks: [new(diskId, @"\\.\PhysicalDrive2".Replace(@"\\", @"\"), "uuid-disk", 100_000_000_000L)],
+            Partitions: [
+                new(part1Id, "uuid-p1", diskId, 1, 20480, 200_000_000L, "c12a7328-f81f-11d2-ba4b-00a0c93ec93b", "efi"),
+                new(part2Id, "uuid-p2", diskId, 2, 200020480, 99_800_000_000L, "7c3457ef-0000-11aa-aa11-00306543ecac", "apfs")
+            ],
+            Stores: [new(storeId, "uuid-store", part2Id, containerId, 200020480, 99_800_000_000L)],
+            Containers: [new(containerId, "uuid-cont", 4096, [storeId], [vol1Id, vol2Id], false, "50", [], [], [], SharedSpace: sharedSpace)],
+            Volumes: [
+                new(vol1Id, "uuid-v1", "101", containerId, "Alpha", true, ["data"], 64, null, "sensitive", "none", false, [], [], [], "10", "50"),
+                new(vol2Id, "uuid-v2", "102", containerId, "Beta", true, ["data"], 64, null, "sensitive", "none", false, [], [], [], "11", "50")
+            ],
+            Groups: []);
+
+        var status = new StatusChangedPayload(
+            State: RuntimeState.MountedRw,
+            MountPoints: ["E:\\".Replace(@"\\", @"\")],
+            LastError: null,
+            TimestampUtc: DateTime.UtcNow,
+            Warnings: [],
+            WriteEnabled: true,
+            CompatibilityWarnings: [],
+            MountedVolumes: [
+                new MountedVolumeDisplay(
+                    VolumeId: @"\\.\PhysicalDrive2|Alpha".Replace(@"\\", @"\"),
+                    MountPoint: "E:\\".Replace(@"\\", @"\"),
+                    VolumeName: "Alpha",
+                    DeviceId: @"\\.\PhysicalDrive2".Replace(@"\\", @"\"),
+                    DeviceDisplayName: "APFS Disk",
+                    AccessMode: MountAccessMode.ReadWrite,
+                    CatalogVolumeId: vol1Id)
+            ]);
+
+        form.ApplyTopologyStatus(status, topology);
+        form.PerformLayout();
+
+        var flags = BindingFlags.NonPublic | BindingFlags.Instance;
+        var tree = (TreeView)typeof(DashboardForm).GetField("_topologyTree", flags)!.GetValue(form)!;
+        var storageBar = (ApfsStorageBarControl)typeof(DashboardForm).GetField("_storageBar", flags)!.GetValue(form)!;
+        var memberPanel = (FlowLayoutPanel)typeof(DashboardForm).GetField("_memberPanel", flags)!.GetValue(form)!;
+        var detailsTopPanel = (Panel)typeof(DashboardForm).GetField("_detailsTopPanel", flags)!.GetValue(form)!;
+        var contentSplit = (SplitContainer)typeof(DashboardForm).GetField("_contentSplit", flags)!.GetValue(form)!;
+        var rowsPanel = (FlowLayoutPanel)typeof(DashboardForm).GetField("_rowsPanel", flags)!.GetValue(form)!;
+
+        var allNodes = tree.Nodes.Cast<TreeNode>().SelectMany(EnumerateTreeNodes).ToList();
+
+        // 1. Select Volume Alpha: verify storage bar is active and buttons are DOWN BELOW the storage bar
+        var volNode = allNodes.Single(n => n.Name == vol1Id);
+        tree.SelectedNode = volNode;
+        typeof(DashboardForm).GetMethod("ShowSelectedNode", flags)!.Invoke(form, null);
+        form.PerformLayout();
+
+        Assert.Equal(0, storageBar.Top);
+        Assert.True(memberPanel.Top >= storageBar.Bottom, $"Buttons ({memberPanel.Top}) must be down below the storage bar ({storageBar.Bottom})");
+        Assert.True(contentSplit.Top >= detailsTopPanel.Bottom, $"ContentSplit ({contentSplit.Top}) must not be covered by detailsTopPanel ({detailsTopPanel.Bottom})");
+
+        // 2. Select Container node: middle right rows card MUST BE DISPLAYED (NOT COLLAPSED)
+        var containerNode = allNodes.Single(n => n.Name == containerId);
+        tree.SelectedNode = containerNode;
+        typeof(DashboardForm).GetMethod("ShowSelectedNode", flags)!.Invoke(form, null);
+        form.PerformLayout();
+
+        Assert.False(contentSplit.Panel1Collapsed);
+        Assert.NotEmpty(rowsPanel.Controls);
+        var card = rowsPanel.Controls[0];
+        var openBtn = card.Controls.OfType<TableLayoutPanel>().SelectMany(t => t.Controls.OfType<FlowLayoutPanel>()).SelectMany(f => f.Controls.OfType<Button>()).FirstOrDefault(b => b.Text == "Open");
+        Assert.NotNull(openBtn);
+    });
+
     private static StatusChangedPayload ContainerMounted()
     {
         var mounted = new[]

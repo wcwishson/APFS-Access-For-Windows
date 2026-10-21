@@ -525,7 +525,7 @@ public sealed class DashboardForm : Form
         };
         _detailsTopPanel.Controls.Add(_memberPanel);
         _detailsTopPanel.Controls.Add(_storageBar);
-        _storageBar.BringToFront();
+        _storageBar.SendToBack();
 
         _contentSplit = new SplitContainer
         {
@@ -633,9 +633,9 @@ public sealed class DashboardForm : Form
             e.Graphics.FillPath(gripBrush, gripPath);
         };
 
-        _detailContainer.Controls.Add(_contentSplit);
         _detailContainer.Controls.Add(_detailsTopPanel);
-        _detailsTopPanel.BringToFront();
+        _detailContainer.Controls.Add(_contentSplit);
+        _contentSplit.BringToFront();
 
         _detailContainer.SizeChanged += (_, _) => AdjustMemberPanelHeight();
         _contentSplit.SizeChanged += (_, _) => { if (!_resizing && !_adjustingContentSplit) AdjustContentSplitDistance(); };
@@ -736,43 +736,64 @@ public sealed class DashboardForm : Form
     private void ShowSelectedNode()
     {
         if (_topologyTree.SelectedNode?.Tag is not TopologyDashboardNode node) return;
-        var details = _detailsNodeId == node.Id ? node.Details : (!string.IsNullOrWhiteSpace(node.Details) ? node.Details : node.Text);
-        if(node.Row is { } profileRow && DriveDashboardPresenter.ProfileVerificationUnavailableReason(profileRow) is { } profileReason)
-            details+="\r\n\r\nCurrent profile verification: "+profileReason;
-        if (_nodeDetails.Text != details) _nodeDetails.Text = details;
-        var members = node.MemberIds ?? [];
-        var choices = members.Select((id, index) => new MemberChoice(id,
-            $"Member {index + 1} · " + ((_topologyTree.Nodes.Find(id, true).FirstOrDefault()?.Tag as TopologyDashboardNode)?.Text ?? "Unavailable"))).ToArray();
-        if (!_members.Items.Cast<MemberChoice>().SequenceEqual(choices))
+
+        _memberPanel?.SuspendLayout();
+        try
         {
-            var selected = (_members.SelectedItem as MemberChoice)?.Id;
-            _members.Items.Clear();
-            _members.Items.AddRange(choices.Cast<object>().ToArray());
-            if (choices.FirstOrDefault(c => c.Id == selected) is {} retained) _members.SelectedItem = retained;
-            else if (_members.Items.Count > 0) _members.SelectedIndex = 0;
+            var details = _detailsNodeId == node.Id ? node.Details : (!string.IsNullOrWhiteSpace(node.Details) ? node.Details : node.Text);
+            if (node.Row is { } profileRow && DriveDashboardPresenter.ProfileVerificationUnavailableReason(profileRow) is { } profileReason)
+                details += "\r\n\r\nCurrent profile verification: " + profileReason;
+            if (_nodeDetails.Text != details) _nodeDetails.Text = details;
+
+            var members = node.MemberIds ?? [];
+            var choices = members.Select((id, index) => new MemberChoice(id,
+                $"Member {index + 1} · " + ((_topologyTree.Nodes.Find(id, true).FirstOrDefault()?.Tag as TopologyDashboardNode)?.Text ?? "Unavailable"))).ToArray();
+            if (!_members.Items.Cast<MemberChoice>().SequenceEqual(choices))
+            {
+                var selected = (_members.SelectedItem as MemberChoice)?.Id;
+                _members.Items.Clear();
+                _members.Items.AddRange(choices.Cast<object>().ToArray());
+                if (choices.FirstOrDefault(c => c.Id == selected) is { } retained) _members.SelectedItem = retained;
+                else if (_members.Items.Count > 0) _members.SelectedIndex = 0;
+
+                _members.DropDownWidth = Math.Min(ScaleDpi(900), Math.Max(_members.Width,
+                    choices.Select(c => TextRenderer.MeasureText(c.Text, _members.Font).Width + ScaleDpi(32)).DefaultIfEmpty(0).Max()));
+            }
+
+            _members.Visible = members.Count > 0;
+            _memberButton.Enabled = node.ReferenceId is not null || members.Count > 0 || _topologyTree.SelectedNode.Nodes.Count > 0;
+            _memberButton.Visible = _memberButton.Enabled;
+
+            ReconcileContainerButtons(_topologyTree.SelectedNode);
+            _memberHealthButton.Text = "Member health";
+
+            var rowsToDisplay = node.Row is { } singleRow
+                ? (IReadOnlyList<DriveDashboardRow>)[singleRow]
+                : (_selectedContainerRows is { Count: > 0 } containerRows
+                    ? containerRows
+                    : CollectDescendantRows(_topologyTree.SelectedNode));
+
+            ReconcileRows(rowsToDisplay);
+            UpdateStorageBar(_topologyTree.SelectedNode);
+            AdjustMemberPanelHeight();
+
+            if (_contentSplit is not null)
+            {
+                var hasRows = rowsToDisplay.Count > 0;
+                if (_contentSplit.Panel1Collapsed != !hasRows)
+                {
+                    _contentSplit.Panel1Collapsed = !hasRows;
+                }
+                if (hasRows && !_userAdjustedContentSplit)
+                {
+                    AdjustContentSplitDistance();
+                }
+            }
         }
-        _members.DropDownWidth = Math.Min(ScaleDpi(900), Math.Max(_members.Width,
-            choices.Select(c => TextRenderer.MeasureText(c.Text, _members.Font).Width + ScaleDpi(32)).DefaultIfEmpty(0).Max()));
-        _members.Visible = members.Count > 0;
-        _memberButton.Enabled = node.ReferenceId is not null || members.Count > 0 || _topologyTree.SelectedNode.Nodes.Count > 0;
-        _memberButton.Visible = _memberButton.Enabled;
-        ReconcileContainerButtons(_topologyTree.SelectedNode);
-        _memberHealthButton.Text = "Member health";
-        ReconcileRows(node.Row is {} row ? new[] { row } : []);
-        UpdateStorageBar(_topologyTree.SelectedNode);
-        if (_contentSplit is not null)
+        finally
         {
-            var hasRows = node.Row is not null;
-            if (_contentSplit.Panel1Collapsed != !hasRows)
-            {
-                _contentSplit.Panel1Collapsed = !hasRows;
-            }
-            if (hasRows)
-            {
-                AdjustContentSplitDistance();
-            }
+            _memberPanel?.ResumeLayout(true);
         }
-        AdjustMemberPanelHeight();
     }
 
     private void ReconcileContainerButtons(TreeNode? selected)
@@ -1429,8 +1450,15 @@ public sealed class DashboardForm : Form
             var minFlowHeight = ScaleDpi(28);
             var flowHeight = Math.Max(minFlowHeight, pref.Height);
 
-            var barHeight = (_storageBarActive && _storageBar is not null) ? _storageBar.Height : 0;
-            var totalHeight = barHeight + flowHeight;
+            var barReqHeight = (_storageBarActive && _storageBar is not null)
+                ? _storageBar.CalculateRequiredHeight()
+                : 0;
+            if (_storageBar is not null && _storageBarActive && _storageBar.Height != barReqHeight)
+            {
+                _storageBar.Height = barReqHeight;
+            }
+
+            var totalHeight = barReqHeight + flowHeight;
 
             _detailsTopPanel.SuspendLayout();
             _memberPanel.SuspendLayout();
@@ -1447,8 +1475,8 @@ public sealed class DashboardForm : Form
             }
             finally
             {
-                _memberPanel.ResumeLayout(true);
-                _detailsTopPanel.ResumeLayout(true);
+                _memberPanel.ResumeLayout(false);
+                _detailsTopPanel.ResumeLayout(false);
             }
 
             _memberPanel.PerformLayout();
@@ -1725,6 +1753,8 @@ public sealed class DashboardForm : Form
             _actionButtons.Clear();
             var currentRows = _renderedRows.ToDictionary(static row => row.Identity, StringComparer.Ordinal);
             var nextRows = new List<RenderedDashboardRow>(rows.Count);
+            bool anyControlAddedOrRemoved = false;
+            bool anyControlUpdated = false;
 
             foreach (var row in rows)
             {
@@ -1732,7 +1762,11 @@ public sealed class DashboardForm : Form
                 if (currentRows.TryGetValue(identity, out var existing) &&
                     existing.Control is not null)
                 {
-                    UpdateRow(existing.Control, row);
+                    if (existing.Control.Tag is not DriveDashboardRow existingRow || existingRow != row)
+                    {
+                        UpdateRow(existing.Control, row);
+                        anyControlUpdated = true;
+                    }
                     nextRows.Add(existing);
                     _actionButtons.AddRange(existing.Buttons);
                 }
@@ -1750,6 +1784,7 @@ public sealed class DashboardForm : Form
                     var newControl = BuildRow(row, buttons);
                     nextRows.Add(new RenderedDashboardRow(identity, newControl, buttons));
                     _actionButtons.AddRange(buttons);
+                    anyControlAddedOrRemoved = true;
                 }
             }
 
@@ -1762,6 +1797,7 @@ public sealed class DashboardForm : Form
                 {
                     _rowsPanel.Controls.Remove(oldRow.Control);
                     oldRow.Control.Dispose();
+                    anyControlAddedOrRemoved = true;
                 }
             }
 
@@ -1771,6 +1807,7 @@ public sealed class DashboardForm : Form
                 if (!_rowsPanel.Controls.Contains(control))
                 {
                     _rowsPanel.Controls.Add(control);
+                    anyControlAddedOrRemoved = true;
                 }
 
                 _rowsPanel.Controls.SetChildIndex(control, index);
@@ -1778,11 +1815,15 @@ public sealed class DashboardForm : Form
 
             _renderedRows.Clear();
             _renderedRows.AddRange(nextRows);
-            ResizeRows();
+
+            if (anyControlAddedOrRemoved || anyControlUpdated)
+            {
+                ResizeRows();
+            }
         }
         finally
         {
-            _rowsPanel.ResumeLayout();
+            _rowsPanel.ResumeLayout(true);
         }
     }
 
