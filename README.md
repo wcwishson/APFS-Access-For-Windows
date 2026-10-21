@@ -39,20 +39,22 @@ APFS Access opens a small dashboard and also runs from the Windows system tray.
 
 When a supported APFS volume is mounted, it appears in This PC with a normal drive letter. Use it from Explorer, file dialogs, terminals, and other Windows apps.
 
-## Everyday Use
+## Everyday Use & Advanced Capabilities
 
-Common supported operations:
+### Common Operations
+- **Browse & Open:** Browse APFS folders and open files directly in Windows File Explorer.
+- **Full Read/Write Support:** Create folders, copy files in/out, rename, move, and delete on supported APFS data volumes.
+- **Custom Drive Letters:** Pick your preferred drive letter (D:, E:, G:) directly from the dashboard; changes apply instantly via auto-remount with in-use safety warnings.
+- **Safe Eject & Quit:** Click Eject before unplugging. All pending writes and journal transactions flush cleanly before release.
+- **Fix & Refresh:** Use Fix when a drive is safely ejected but still connected, or needs a safe remount into read/write mode.
 
-- Browse APFS folders in File Explorer.
-- Open files directly from the APFS drive.
-- Copy files from APFS to Windows.
-- Create files and folders on writable APFS mounts.
-- Copy files onto writable APFS mounts.
-- Rename, move, cut/paste, and delete files on writable APFS mounts.
-- Eject APFS mounts from the dashboard or tray before unplugging the drive.
-- Use `Fix` when a drive is read-only, safely ejected but still connected, or needs a safe refresh/remount.
-- Select a drive and use the details pane when you want to see why it is read-only or unavailable. `Copy info` copies that information for a support report.
-- Use `APFS Access.exe --cli` or the bundled `ApfsAccess.Cli.exe` for status, mount, fix, eject, and quit operations from scripts.
+### Advanced APFS Features
+- **Encrypted APFS Volume Unlock:** Register encrypted APFS volumes and click **Unlock…** to enter your passphrase or recovery key. The volume mounts directly into Windows File Explorer, and you can **Lock** it when done.
+- **APFS Snapshots:** Open **Volume snapshots** to view historical snapshots, browse them read-only in File Explorer without touching the drive, copy out earlier file versions, or create/delete snapshots.
+- **Apple Fusion Drives:** Register multi-tier Fusion drive pairs (SSD + HDD) into unified APFS containers with pooled storage capacity.
+- **macOS System & Data Firmlinks:** Use **System Data Browse** to seamlessly navigate macOS Catalina+ split System and Data volumes as a unified filesystem.
+- **Volume & Container Management:** Rename volumes, configure storage quotas and reserve space, create/delete volumes, and format or resize containers directly from the dashboard.
+- **Case-Sensitive Volumes:** Full support for case-sensitive APFS volumes with Unicode normalization and collision-safe Windows name mapping.
 
 ## Automation
 

@@ -2,29 +2,67 @@
 
 ## APFS Access 1.0.6
 
-APFS Access 1.0.6 delivers substantial user experience and functionality upgrades over 1.0.5, introducing an interactive visual drive-and-container hierarchy, automatic drive-letter remounting with in-use safety warnings, automatic weekly update checks, a direct GitHub project button, theme customization, and robust multi-volume APFS container support.
+APFS Access 1.0.6 is a major feature release that directly tackles the primary limitations of 1.0.5 and earlier versions. It introduces encrypted APFS volume support (passwords and recovery keys), APFS snapshot browsing and management, Apple Fusion drive pairing, volume management (renaming, quotas, resize), macOS System/Data firmlink navigation, an interactive visual disk-and-container hierarchy, automatic drive-letter remounting with in-use safety warnings, and background weekly update checks.
 
 ### Download
 
 Most users should download:
 
-- `APFS Access.exe`
+- `APFS Access.exe` (Single-file portable application)
 
-Advanced users can also download `APFSAccess-1.0.6-win-x64-click-run.zip` for the unpackaged portable folder.
+Advanced users can also download `APFSAccess-1.0.6-win-x64-click-run.zip` for the unpackaged folder.
 
-### What Changed in 1.0.6
+---
 
-- **Visual Drive & Container Hierarchy:** The Dashboard now organizes your storage into an intuitive visual tree showing physical drives, partitions, APFS containers, and individual volumes, showing available capacity and mount status at a glance.
-- **Drive Letter Customization & Auto-Remount:** You can now change the preferred drive letter for any volume directly in the dashboard. Saving a new letter automatically remounts the volume immediately onto your chosen drive letter.
-- **Smart In-Use Safety Warning:** If files are open or File Explorer is browsing a volume when changing its drive letter, the app prompts you with options to **Queue Remount** (which automatically remounts as soon as applications finish using the drive) or **Cancel**.
+### Breaking Past 1.0.5 Limitations
+
+In previous releases, encrypted volumes, snapshots, Fusion drives, case-sensitive layouts, and volume modifications were strictly unsupported or read-only. Version 1.0.6 introduces first-class support for these scenarios:
+
+1. **Encrypted APFS Volume Support (Unlock & Lock):**
+   - In 1.0.5, encrypted APFS volumes were completely skipped and could not be accessed.
+   - In 1.0.6, you can now register and unlock encrypted APFS volumes using your passphrase or Apple recovery key.
+   - An interactive password prompt allows one-click **Unlock…**, mounting the volume directly into Windows File Explorer with guarded credentials, and **Lock** when you are finished.
+   - Secure Key Management allows reviewing and rotating passphrases and recovery credentials safely.
+
+2. **APFS Volume Snapshots (Browse, Copy Out, Create, Delete):**
+   - In 1.0.5, snapshots were not supported.
+   - In 1.0.6, the new **Volume snapshots** workflow lets you browse past volume snapshots in read-only Windows folders without modifying the drive.
+   - Copy individual files or folders out of any historical snapshot, create new point-in-time snapshots, delete unwanted snapshots, or recover pending snapshot work.
+
+3. **Apple Fusion Drive Support:**
+   - In 1.0.5, Apple Fusion drives (split SSD and HDD tiers) were unsupported.
+   - In 1.0.6, you can now register Apple Fusion storage pairs into unified APFS containers, allowing Windows to mount and browse Fusion drives with pooled storage recognition.
+
+4. **Case-Sensitive & Unicode APFS Volume Support:**
+   - In 1.0.5, case-sensitive volumes were often refused or restricted.
+   - In 1.0.6, case-sensitive APFS volumes are fully supported with robust Unicode normalization (UTF-8 / UTF-16) and Windows collision handling.
+
+5. **macOS System & Data Firmlink Navigation:**
+   - On modern macOS installations (Catalina and later), files are split across read-only System and writable Data volumes connected by "firmlinks".
+   - Version 1.0.6 introduces **System Data Browse**, linking the System and Data volumes into a seamless, unified browsing experience in File Explorer.
+
+6. **Volume & Container Management (Rename, Quotas, Resize, Format):**
+   - You can now manage volumes directly from the dashboard: rename volumes, adjust storage quotas and reserve space, create new volumes, delete old volumes, and format or resize image containers with built-in safety confirmations.
+
+---
+
+### Everyday User Experience & Front-End Enhancements
+
+- **Interactive Visual Drive Hierarchy:** The Dashboard organizes your storage into an intuitive visual tree showing physical drives, partitions, APFS containers, and individual volumes, with live capacity bars displaying used and free space.
+- **Drive Letter Customization with Instant Auto-Remount:** You can now change the preferred drive letter for any volume directly in the dashboard. Saving a new letter automatically unmounts and remounts the volume immediately onto your chosen drive letter.
+- **Smart In-Use Safety Warning:** If files are open or File Explorer is browsing a volume when changing its drive letter, the app warns you and lets you choose:
+  - **Queue Remount:** Remounts automatically as soon as applications finish using the drive.
+  - **Cancel:** Reverts and keeps the current drive letter without interruption.
 - **Automatic Weekly Update Checks:** APFS Access now checks GitHub in the background once weekly for new releases and notifies you when an update is available.
-- **Direct GitHub Access:** Added a dedicated **GitHub** button right next to "Check for updates" in the dashboard footer to open the repository and release notes with a single click.
+- **Direct GitHub Access Button:** A dedicated **GitHub** button right in the dashboard footer opens the project repository and releases in one click.
 - **Theme Selection (Follow Windows, Light, Dark):** Choose your preferred appearance from the dashboard dropdown or the tray context menu; your preference is remembered across restarts.
-- **Multi-Volume Container Co-Mounting:** Greatly improved handling for APFS containers containing multiple volumes, ensuring sibling volumes co-mount seamlessly and clearing prior ejection states cleanly.
-- **Durable Read/Write Performance:** High-throughput, low-latency file operations (copy, move, rename, delete) on supported ordinary APFS data volumes with safe checkpoint commits and drain guarantees.
+- **Multi-Volume Container Co-Mounting:** APFS containers with multiple data volumes now cleanly co-mount sibling volumes, ensuring ejecting or remounting one volume never suppresses its siblings.
+- **Durable Read/Write Performance:** High-throughput, low-latency file operations (copy, move, rename, delete) on supported ordinary APFS data volumes with safe checkpoint commits and write-drain guarantees.
 - **Clean Safe Eject & Graceful Quit:** Ejection and application shutdown wait until all pending writes and background tasks are fully flushed, preventing filesystem inconsistencies.
-- **Recycle Bin Integration:** Deleting files to the Windows Recycle Bin preserves security descriptor metadata needed for standard recycling.
+- **Windows Recycle Bin Integration:** Deleting files to the Windows Recycle Bin preserves security descriptor metadata needed for standard recycling.
 - **Clearer Error Guidance:** The dashboard details pane explains exact mounting states and includes a one-click **Copy info** button for easy reporting.
+
+---
 
 ### Everyday Use
 
@@ -39,7 +77,7 @@ Advanced users can also download `APFSAccess-1.0.6-win-x64-click-run.zip` for th
 ### Known Limits
 
 - Windows SmartScreen may show a one-time prompt on first launch for new releases (click "More info" -> "Run anyway").
-- Encrypted physical drives, macOS System/sealed containers, and Fusion drives remain read-only or unsupported for write safety.
+- Physical system drives with T2/Secure Enclave hardware-locked encryption require macOS for key escrow; software-encrypted images and standard APFS passwords/recovery keys are supported.
 - Always eject drives from the dashboard or tray icon before unplugging.
 
 ## APFS Access 1.0.5
