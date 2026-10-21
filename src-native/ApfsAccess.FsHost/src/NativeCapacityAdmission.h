@@ -25,9 +25,12 @@ NTSTATUS PreflightDirectCallbackLocked(MountContext* c,
     std::vector<std::uint64_t> pins;
     std::string error;
     if (!LoadDirectCheckpointPinsLocked(*c, pins, error, true)) return STATUS_IO_DEVICE_ERROR;
-    const auto result = c->metadata_store->PreflightNativeCapacityMutations(requests, pins);
+    const auto result = c->backup_held && c->backup_held->source
+        ? c->metadata_store->PreflightBackupRetainedCapacityMutations(*c->backup_held->source, requests, pins)
+        : c->metadata_store->PreflightNativeCapacityMutations(requests, pins);
     if (result == Store::MutationStatus::Applied) return STATUS_SUCCESS;
     if (result == Store::MutationStatus::CapacityBlocked) return STATUS_DISK_FULL;
+    if (c->backup_held && result == Store::MutationStatus::UnsupportedOperation) return STATUS_NOT_SUPPORTED;
     if (result == Store::MutationStatus::AllocationFailed) return STATUS_INSUFFICIENT_RESOURCES;
     if (result == Store::MutationStatus::NotReady &&
         !c->metadata_store->IsRecoveryRequired() && c->metadata_store->IsCanonicalCommitReady() &&

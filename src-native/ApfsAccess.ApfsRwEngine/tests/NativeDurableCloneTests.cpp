@@ -48,7 +48,8 @@ void AcceptanceReplay(){
   Store::MutationRequest remove;remove.operation=Store::MutationOperation::Delete;remove.path=L"\\clone0";
   Check(s.StageMutation(remove)!=Store::MutationStatus::Applied&&s.PendingMutationCount()==1,"source cannot mutate in isolated accepted transaction");
  }
- std::filesystem::copy_file("accept.wal","accept-original.wal");
+  std::filesystem::copy_file("accept.wal","accept-original.wal",
+      std::filesystem::copy_options::overwrite_existing);
  for(unsigned attempt=0;attempt<2;++attempt){Tx tx(L"Strict");tx.SetJournalPath(std::filesystem::absolute("accept.wal").wstring());tx.SetVolumeIdentity(L"native-clone-486");std::vector<Tx::AcceptedTransaction> a;std::string error;
   Check(tx.LoadUnappliedAcceptedTransactions(a,&error)&&a.size()==1,"restart reads accepted clone: "+error);Check(a[0].preimage_checkpoint_xid==xid&&a[0].accepted_sequence==seq,"exact accepted preimage and sequence survive");
   auto record=a[0].mutations[0];Store::MutationRequest r;Check(Store::NativeCloneFromWal(record,r),"typed clone WAL decode");
@@ -198,8 +199,18 @@ void PreservedMetadataReplay()
 #include "NativeInodePaddingTests.h"
 #endif
 }
-int main(){try{AdmissionRedGreen();
+int main(){try{
+    // Isolate fixed filenames from the shared CTest working directory and from
+    // reruns: each invocation runs in a fresh private directory.
+    const auto root=std::filesystem::current_path();std::filesystem::path run_dir;
+    for(unsigned n=0;n<1024;++n){auto path=root/("native-durable-clone-run-"+std::to_string(n));
+        if(std::filesystem::create_directory(path)){run_dir=std::move(path);break;}}
+    Check(!run_dir.empty(),"fresh private durable-clone evidence directory");
+    std::filesystem::current_path(run_dir);
+    try{AdmissionRedGreen();
 #ifndef BASELINE_RED
-AcceptanceReplay();Refusal();CodecCases();ChangedSourceCases();UnsupportedMetadata();QuotaCases();PreservedMetadataReplay();NativeInodePaddingCases();
+    AcceptanceReplay();Refusal();CodecCases();ChangedSourceCases();UnsupportedMetadata();QuotaCases();PreservedMetadataReplay();NativeInodePaddingCases();
 #endif
-std::cout<<"PASS native durable clone "<<checks<<" checks\n";return 0;}catch(const std::exception& e){std::cerr<<"FAIL "<<e.what()<<"\n";return 1;}}
+    }catch(...){std::filesystem::current_path(root);throw;}
+    std::filesystem::current_path(root);
+    std::cout<<"PASS native durable clone "<<checks<<" checks\n";return 0;}catch(const std::exception& e){std::cerr<<"FAIL "<<e.what()<<"\n";return 1;}}

@@ -98,7 +98,8 @@ public:
     [[nodiscard]] static bool CanAllocateFromFragmentedFreeExtents(
         const std::vector<Extent>& free_extents,
         std::uint64_t aligned_total,
-        const AllocationPolicy& policy);
+        const AllocationPolicy& policy,
+        std::uint64_t block_size = 4096);
 
     [[nodiscard]] static std::optional<std::vector<FileExtent>> AllocateFileExtents(
         std::vector<Extent>& free_extents,

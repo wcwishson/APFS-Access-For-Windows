@@ -7,16 +7,26 @@ using ApfsAccess.Ipc;
 
 namespace ApfsAccess.Tray;
 
-public sealed record EjectMenuDescriptor(string Text, string? VolumeId);
+public sealed record EjectMenuDescriptor(string Text, string? VolumeId, DriveDashboardRow? Row = null);
 
-public sealed class TrayApplicationContext : ApplicationContext
+public sealed partial class TrayApplicationContext : ApplicationContext
 {
+    public static readonly TimeSpan WeeklyUpdateCheckInterval = TimeSpan.FromDays(7);
+    private static readonly TimeSpan AutoUpdateStartupDelay = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan AutoUpdatePollInterval = TimeSpan.FromHours(6);
     private static readonly TimeSpan ServiceStartThrottle = TimeSpan.FromSeconds(4);
     private static readonly TimeSpan EjectRequestTimeout = TimeSpan.FromSeconds(130);
     private static readonly TimeSpan FixRequestTimeout = TimeSpan.FromSeconds(90);
     private static readonly TimeSpan UpdateShutdownTimeout = TimeSpan.FromSeconds(150);
     private static readonly Uri LatestReleasePage = new("https://github.com/wcwishson/APFS-Access-For-Windows/releases/latest");
     private static readonly object DiagnosticLogSync = new();
+
+    private sealed record QueuedDriveLetterRemount(
+        string DeviceId,
+        string VolumeId,
+        string? ContainerUuid,
+        string VolumeName,
+        string TargetLetter);
 
     private readonly SynchronizationContext _uiContext;
     private readonly Control _uiInvoker = new();
@@ -25,14 +35,29 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly StartupSettingsManager _startupSettingsManager;
     private readonly GitHubReleaseUpdateClient _updateClient = new();
     private readonly ToolStripMenuItem _ejectItem;
+    private readonly ToolStripMenuItem? _fixItem;
+    private readonly ToolStripMenuItem? _mountItem;
+    private readonly ToolStripMenuItem _verifyItem;
+    private readonly ToolStripMenuItem _manageItem;
+    private readonly ToolStripMenuItem _snapshotsItem;
+    private readonly ToolStripMenuItem _createVolumeItem;
+    private readonly ToolStripMenuItem _deleteVolumeItem;
+    private readonly ToolStripMenuItem _registerImageItem;
+    private bool _serviceConnected;
+    private readonly ToolStripMenuItem _themeFollowWindowsItem;
+    private readonly ToolStripMenuItem _themeLightItem;
+    private readonly ToolStripMenuItem _themeDarkItem;
     private readonly List<Icon> _ownedIcons = [];
     private readonly Dictionary<RuntimeState, Icon> _iconByState;
     private readonly HashSet<string> _shownWarnings = new(StringComparer.OrdinalIgnoreCase);
     private readonly CancellationTokenSource _shutdownCts = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<AckPayload>> _pendingAcks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, QueuedDriveLetterRemount> _queuedDriveLetterRemounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _statusPeerSync = new();
     private string? _ejectMenuSignature;
     private AppUpdateDownload? _readyUpdate;
+    private int _updateCheckInFlight;
+    private int _queuedRemountInFlight;
 
 private PipePeer? _statusPeer;
     private StatusChangedPayload? _latestStatus;
@@ -50,7 +75,12 @@ private PipePeer? _statusPeer;
 
         _iconByState = LoadIcons();
 
+        _startupSettingsManager = StartupSettingsManager.CreateDefault();
+        var startupPreferences = _startupSettingsManager.Load();
+        var initialTheme = DashboardTheme.Resolve(startupPreferences.ThemeMode);
+
         var menu = new ContextMenuStrip();
+        menu.Renderer = initialTheme.IsDark ? new DarkToolStripRenderer() : new ToolStripProfessionalRenderer();
         var showItem = new ToolStripMenuItem("Show APFS Access");
         showItem.Click += (_, _) => ShowDashboard();
         menu.Items.Add(showItem);
@@ -60,6 +90,38 @@ private PipePeer? _statusPeer;
         _ejectItem.Click += OnEjectClicked;
         _ejectItem.Enabled = false;
         menu.Items.Add(_ejectItem);
+        _fixItem = new ToolStripMenuItem("Fix APFS volume") { Enabled = false };
+        _mountItem = new ToolStripMenuItem("Mount APFS volume") { Enabled = false };
+        menu.Items.Add(_fixItem); menu.Items.Add(_mountItem);
+        _verifyItem = new ToolStripMenuItem("Verify image volume") { Enabled = false };
+        _manageItem = new ToolStripMenuItem("Manage image volume") { Enabled = false };
+        menu.Items.Add(_verifyItem); menu.Items.Add(_manageItem);
+        _snapshotsItem = new ToolStripMenuItem("Volume snapshots") { Enabled = false };
+        menu.Items.Add(_snapshotsItem);
+        _createVolumeItem = new ToolStripMenuItem("Create image volume") { Enabled = false };
+        _deleteVolumeItem = new ToolStripMenuItem("Delete image volume") { Enabled = false };
+        menu.Items.Add(_createVolumeItem); menu.Items.Add(_deleteVolumeItem);
+        _registerImageItem = new ToolStripMenuItem("Register encrypted image...", null, async (_, _) =>
+        {
+            try { await RegisterEncryptedImageAsync().ConfigureAwait(true); }
+            catch (Exception ex) { _dashboard?.SetFooter(ex.Message); }
+        }) { Enabled = false };
+        menu.Items.Add(_registerImageItem);
+        AddFusionRegistrationMenu(menu);
+        AddProfileVerificationMenu(menu);
+        AddImageKeyManagementMenu(menu);
+        AddSystemDataBrowseMenu(menu);
+        menu.Items.Add(new ToolStripSeparator());
+
+        var themeMenu = new ToolStripMenuItem("Theme");
+        _themeFollowWindowsItem = new ToolStripMenuItem("Follow Windows", null, async (_, _) => await SetThemeModeAsync(AppThemeMode.System).ConfigureAwait(false));
+        _themeLightItem = new ToolStripMenuItem("Light", null, async (_, _) => await SetThemeModeAsync(AppThemeMode.Light).ConfigureAwait(false));
+        _themeDarkItem = new ToolStripMenuItem("Dark", null, async (_, _) => await SetThemeModeAsync(AppThemeMode.Dark).ConfigureAwait(false));
+        themeMenu.DropDownItems.Add(_themeFollowWindowsItem);
+        themeMenu.DropDownItems.Add(_themeLightItem);
+        themeMenu.DropDownItems.Add(_themeDarkItem);
+        UpdateThemeMenuChecks(startupPreferences.ThemeMode);
+        menu.Items.Add(themeMenu);
         menu.Items.Add(new ToolStripSeparator());
 
         var quitItem = new ToolStripMenuItem("Quit");
@@ -76,8 +138,6 @@ private PipePeer? _statusPeer;
 
         _notifyIcon.MouseClick += OnNotifyIconMouseClick;
 
-        _startupSettingsManager = StartupSettingsManager.CreateDefault();
-        var startupPreferences = _startupSettingsManager.Load();
         _dashboard = new DashboardForm(
             OpenMountPointAsync,
             RequestEjectAsync,
@@ -87,8 +147,26 @@ private PipePeer? _statusPeer;
             SetStartMinimizedAsync,
             HandleUpdateButtonAsync,
             SetDriveLetterPreferenceAsync,
-            MountConnectedVolumeAsync);
-if (!startupPreferences.StartMinimized)
+            MountConnectedVolumeAsync,
+            async () => {
+                var result = await TrySendRefreshAsync(false).ConfigureAwait(true);
+                if (!result.Success) throw new InvalidOperationException(result.Message ?? "Inventory refresh failed.");
+                _dashboard?.SetFooter(result.Message ?? "Inventory refreshed.");
+            },             row => SendSelectedVolumeAsync(row, ApfsControlCommands.Eject),
+            row => SendSelectedVolumeAsync(row, ApfsControlCommands.Fix),
+            row => SendSelectedVolumeAsync(row, row.IsMounted ? ApfsControlCommands.Lock : ApfsControlCommands.Unlock),
+            (deviceId, containerUuid) => SendContainerAsync(
+                ResolveContainerRows(deviceId, containerUuid), ApfsControlCommands.ContainerMount),
+            (deviceId, containerUuid) => SendContainerAsync(
+                ResolveContainerRows(deviceId, containerUuid), ApfsControlCommands.ContainerUnmount),
+            EjectDeviceAsync,
+            rows => FixContainerAsync(rows),
+            SetThemeModeAsync,
+            VerifySelectedVolumeAsync,
+            ManageSelectedVolumeAsync,
+            ShowSelectedSnapshotsAsync, CreateImageVolumeAsync, DeleteImageVolumeAsync, ResizeImageAsync, FormatImageAsync,
+            VerifyContainerVolumesAsync, RegisterEncryptedImageAsync, VerifySelectedProfileAsync);
+        if (!startupPreferences.StartMinimized)
         {
             _dashboard.Show();
         }
@@ -96,17 +174,20 @@ if (!startupPreferences.StartMinimized)
         HandleIntentionalQuitMarker();
         TryStartServiceProcessIfMissing();
         _ = Task.Run(() => RunStatusListenerAsync(_shutdownCts.Token));
+        _ = Task.Run(() => RunWeeklyUpdateCheckLoopAsync(_shutdownCts.Token));
+        _ = Task.Run(() => RunQueuedRemountWatchLoopAsync(_shutdownCts.Token));
         UpdateReceiptPublisher.TryWriteCurrentProcessPhase("ready");
     }
 
     private void OnNotifyIconMouseClick(object? sender, MouseEventArgs e)
     {
         _ = sender;
-        if (e.Button == MouseButtons.Left)
-        {
-            ShowDashboard();
-            return;
-        }
+        HandleNotifyIconClick(e.Button, ShowDashboard);
+    }
+
+    internal static void HandleNotifyIconClick(MouseButtons button, Action showDashboard)
+    {
+        if (button == MouseButtons.Left) showDashboard();
     }
 
     private void ShowDashboard()
@@ -128,6 +209,14 @@ if (!startupPreferences.StartMinimized)
     private async void OnEjectClicked(object? sender, EventArgs e)
     {
         _ = e;
+        if (sender is ToolStripMenuItem { Tag: DriveDashboardRow selected })
+        {
+            try { await SendSelectedVolumeAsync(selected, ApfsControlCommands.Eject).ConfigureAwait(false); }
+            catch (Exception ex) { PostToUi(() => _dashboard.SetFooter(ex.Message)); }
+            return;
+        }
+        // A parent menu without a selected row is not a volume action.
+        if (sender is ToolStripMenuItem { HasDropDownItems: true }) return;
         var volumeId = sender is ToolStripMenuItem { Tag: string taggedVolumeId } &&
                        !string.IsNullOrWhiteSpace(taggedVolumeId)
             ? taggedVolumeId
@@ -198,6 +287,132 @@ if (!startupPreferences.StartMinimized)
         return Task.CompletedTask;
     }
 
+    private void UpdateThemeMenuChecks(AppThemeMode mode)
+    {
+        if (_themeFollowWindowsItem is not null) _themeFollowWindowsItem.Checked = mode == AppThemeMode.System;
+        if (_themeLightItem is not null) _themeLightItem.Checked = mode == AppThemeMode.Light;
+        if (_themeDarkItem is not null) _themeDarkItem.Checked = mode == AppThemeMode.Dark;
+    }
+
+    private Task SetThemeModeAsync(AppThemeMode mode)
+    {
+        _startupSettingsManager.SetThemeMode(mode);
+        PostToUi(() =>
+        {
+            UpdateThemeMenuChecks(mode);
+            var resolved = DashboardTheme.Resolve(mode);
+            if (_notifyIcon.ContextMenuStrip is not null)
+            {
+                _notifyIcon.ContextMenuStrip.Renderer = resolved.IsDark ? new DarkToolStripRenderer() : new ToolStripProfessionalRenderer();
+            }
+            _dashboard.SetThemeMode(mode);
+        });
+        return Task.CompletedTask;
+    }
+
+    public static bool IsWeeklyUpdateCheckDue(DateTimeOffset? lastCheckUtc, DateTimeOffset nowUtc)
+        => lastCheckUtc is null || (nowUtc - lastCheckUtc.Value) >= WeeklyUpdateCheckInterval;
+
+    private async Task RunWeeklyUpdateCheckLoopAsync(CancellationToken cancellationToken)
+    {
+        if (string.Equals(
+                Environment.GetEnvironmentVariable("APFSACCESS_DISABLE_AUTO_UPDATE_CHECK"),
+                "1",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        try
+        {
+            await Task.Delay(AutoUpdateStartupDelay, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+
+        while (!cancellationToken.IsCancellationRequested && Volatile.Read(ref _exitRequested) == 0)
+        {
+            try
+            {
+                if (_readyUpdate is null &&
+                    IsWeeklyUpdateCheckDue(_startupSettingsManager.GetLastAutoUpdateCheckUtc(), DateTimeOffset.UtcNow))
+                {
+                    await TryRunAutomaticUpdateCheckAsync(cancellationToken).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                LogDiagnostic($"Weekly automatic update check failed: {ex.GetType().Name}: {ex.Message}");
+            }
+
+            try
+            {
+                await Task.Delay(AutoUpdatePollInterval, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
+        }
+    }
+
+    private async Task TryRunAutomaticUpdateCheckAsync(CancellationToken cancellationToken)
+    {
+        if (!TryResolveInstalledLauncherPath(out var launcherPath))
+        {
+            return;
+        }
+
+        if (Interlocked.CompareExchange(ref _updateCheckInFlight, 1, 0) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            var currentVersion = typeof(TrayApplicationContext).Assembly.GetName().Version ?? new Version(1, 0, 6);
+            var result = await _updateClient.CheckAndDownloadAsync(
+                launcherPath,
+                currentVersion,
+                progress: null,
+                cancellationToken).ConfigureAwait(false);
+
+            switch (result.Decision)
+            {
+                case AppUpdateDecision.UpToDate:
+                    _startupSettingsManager.SetLastAutoUpdateCheckUtc(DateTimeOffset.UtcNow);
+                    break;
+                case AppUpdateDecision.Ready when result.Download is not null:
+                    _startupSettingsManager.SetLastAutoUpdateCheckUtc(DateTimeOffset.UtcNow);
+                    var download = result.Download;
+                    PostToUi(() =>
+                    {
+                        _readyUpdate = download;
+                        _dashboard.SetUpdateStatus(
+                            $"Version {download.Release.Version.ToString(3)} is downloaded and verified.",
+                            "Install update",
+                            enabled: true);
+                        _notifyIcon.ShowBalloonTip(
+                            5000,
+                            "APFS Access Update Ready",
+                            $"Version {download.Release.Version.ToString(3)} is downloaded and ready to install.",
+                            ToolTipIcon.Info);
+                    });
+                    break;
+            }
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _updateCheckInFlight, 0);
+        }
+    }
+
     private async Task HandleUpdateButtonAsync()
     {
         if (_readyUpdate is not null)
@@ -225,35 +440,49 @@ if (!startupPreferences.StartMinimized)
             return;
         }
 
-        _dashboard.SetUpdateStatus("Checking GitHub and downloading any available update...", "Checking...", enabled: false);
-        var progress = new Progress<AppUpdateProgress>(value =>
-            _dashboard.SetUpdateStatus($"Downloading update: {value.Percentage}%", "Checking...", enabled: false));
-
-        var currentVersion = typeof(TrayApplicationContext).Assembly.GetName().Version ?? new Version(1, 0, 5);
-        var result = await _updateClient.CheckAndDownloadAsync(
-            launcherPath,
-            currentVersion,
-            progress,
-            _shutdownCts.Token).ConfigureAwait(true);
-
-        switch (result.Decision)
+        if (Interlocked.CompareExchange(ref _updateCheckInFlight, 1, 0) != 0)
         {
-            case AppUpdateDecision.UpToDate:
-                _dashboard.SetUpdateStatus("APFS Access is up to date.", "Check for updates", enabled: true);
-                break;
-            case AppUpdateDecision.Ready when result.Download is not null:
-                _readyUpdate = result.Download;
-                _dashboard.SetUpdateStatus(
-                    $"Version {result.Download.Release.Version.ToString(3)} is downloaded and verified.",
-                    "Install update",
-                    enabled: true);
-                break;
-            default:
-                _dashboard.SetUpdateStatus(
-                    result.Error ?? "The update could not be downloaded.",
-                    "Check for updates",
-                    enabled: true);
-                break;
+            return;
+        }
+
+        try
+        {
+            _dashboard.SetUpdateStatus("Checking GitHub and downloading any available update...", "Checking...", enabled: false);
+            var progress = new Progress<AppUpdateProgress>(value =>
+                _dashboard.SetUpdateStatus($"Downloading update: {value.Percentage}%", "Checking...", enabled: false));
+
+            var currentVersion = typeof(TrayApplicationContext).Assembly.GetName().Version ?? new Version(1, 0, 6);
+            var result = await _updateClient.CheckAndDownloadAsync(
+                launcherPath,
+                currentVersion,
+                progress,
+                _shutdownCts.Token).ConfigureAwait(true);
+
+            switch (result.Decision)
+            {
+                case AppUpdateDecision.UpToDate:
+                    _startupSettingsManager.SetLastAutoUpdateCheckUtc(DateTimeOffset.UtcNow);
+                    _dashboard.SetUpdateStatus("APFS Access is up to date.", "Check for updates", enabled: true);
+                    break;
+                case AppUpdateDecision.Ready when result.Download is not null:
+                    _startupSettingsManager.SetLastAutoUpdateCheckUtc(DateTimeOffset.UtcNow);
+                    _readyUpdate = result.Download;
+                    _dashboard.SetUpdateStatus(
+                        $"Version {result.Download.Release.Version.ToString(3)} is downloaded and verified.",
+                        "Install update",
+                        enabled: true);
+                    break;
+                default:
+                    _dashboard.SetUpdateStatus(
+                        result.Error ?? "The update could not be downloaded.",
+                        "Check for updates",
+                        enabled: true);
+                    break;
+            }
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _updateCheckInFlight, 0);
         }
     }
 
@@ -968,41 +1197,673 @@ private void HandleServiceStopping()
             "Timed out waiting for APFS Access to fix drives.")
             .ConfigureAwait(false);
 
+    internal Func<DriveDashboardRow, string, string, Task<bool>>? PromptDriveLetterInUseOverride { get; set; }
+
     private async Task SetDriveLetterPreferenceAsync(DriveDashboardRow row, string letter)
     {
         if (row.DeviceId is null || row.DriveLetterPreference is not { CanEdit: true, VolumeUuid: not null } preference)
             throw new InvalidOperationException("Volume identity is unavailable. Refresh and try again.");
-        var result = await TrySendRequestAsync(ApfsMessageTypes.DriveLetterPreferenceRequested,
-            new DriveLetterPreferenceRequestPayload(row.DeviceId, row.VolumeId, preference.VolumeUuid, letter),
-            TimeSpan.FromSeconds(15), "Save preferred drive letter", "Preference request timed out; refresh before retrying.").ConfigureAwait(false);
-        if (!result.Success) throw new InvalidOperationException(result.Message ?? "Could not save the preferred letter.");
+        if (string.IsNullOrWhiteSpace(letter))
+            throw new InvalidOperationException("Choose a valid drive letter A-Z.");
+
+        var normalizedLetter = char.ToUpperInvariant(letter.Trim()[0]).ToString();
+        var currentStatus = _latestStatus ?? throw new InvalidOperationException("Service status is unavailable.");
+        var queueKey = GetDriveLetterQueueKey(row.DeviceId, row.VolumeId);
+
+        if (row.IsMounted && string.Equals(preference.ActualLetter, normalizedLetter, StringComparison.OrdinalIgnoreCase))
+        {
+            await SaveDriveLetterPreferenceToServiceAsync(row, normalizedLetter).ConfigureAwait(false);
+            _queuedDriveLetterRemounts.TryRemove(queueKey, out _);
+            PostToUi(() => _dashboard?.SetFooter($"Preferred drive letter {normalizedLetter}: saved for {row.VolumeName}."));
+            return;
+        }
+
+        if (TryDetectVolumeOrContainerInUse(currentStatus, row, out var inUseReason))
+        {
+            var queueRemount = await ConfirmQueueRemountWhenInUseAsync(
+                row,
+                normalizedLetter,
+                inUseReason ?? $"'{row.VolumeName}' is currently in use.").ConfigureAwait(false);
+            if (!queueRemount)
+            {
+                PostToUi(() => _dashboard?.SetFooter("Drive letter change cancelled."));
+                return;
+            }
+
+            await SaveDriveLetterPreferenceToServiceAsync(row, normalizedLetter).ConfigureAwait(false);
+            _queuedDriveLetterRemounts[queueKey] = new QueuedDriveLetterRemount(
+                row.DeviceId,
+                row.VolumeId,
+                row.CatalogContainerUuid,
+                row.VolumeName,
+                normalizedLetter);
+            PostToUi(() => _dashboard?.SetFooter(
+                $"Preferred drive letter {normalizedLetter}: saved for {row.VolumeName}. Remount queued until the volume is no longer in use."));
+            return;
+        }
+
+        var previousLetter = preference.PreferredLetter ?? preference.ActualLetter;
+        await SaveDriveLetterPreferenceToServiceAsync(row, normalizedLetter).ConfigureAwait(false);
+        _queuedDriveLetterRemounts.TryRemove(queueKey, out _);
+
+        PostToUi(() => _dashboard?.SetFooter($"Remounting {row.VolumeName} as {normalizedLetter}:…"));
+        await ExecuteDriveLetterRemountAsync(
+            row,
+            normalizedLetter,
+            previousLetter,
+            allowInUsePrompt: true).ConfigureAwait(false);
     }
 
-    private async Task MountConnectedVolumeAsync(DriveDashboardRow row)
+    private async Task<bool> SaveDriveLetterPreferenceToServiceAsync(
+        DriveDashboardRow row,
+        string letter,
+        bool throwOnFailure = true)
     {
-        var current = _latestStatus ?? throw new InvalidOperationException("Service status is unavailable. Refresh first.");
-        var request = DriveDashboardPresenter.CreateMountRequest(current, row);
-        using var timeout = new CancellationTokenSource(FixRequestTimeout);
+        var current = _latestStatus ?? throw new InvalidOperationException("Service status is unavailable.");
+        var freshRow = FindMatchingRow(current, row) ?? row;
+        var result = await TrySendRequestAsync(
+            ApfsMessageTypes.DriveLetterPreferenceRequested,
+            DriveDashboardPresenter.CreatePreferenceRequest(current, freshRow, letter),
+            TimeSpan.FromSeconds(15),
+            "Save preferred drive letter",
+            "Preference request timed out; refresh before retrying.").ConfigureAwait(false);
+        if (!result.Success && throwOnFailure)
+            throw new InvalidOperationException(result.Message ?? "Could not save the preferred letter.");
+        return result.Success;
+    }
+
+    private async Task<bool> ExecuteDriveLetterRemountAsync(
+        DriveDashboardRow row,
+        string targetLetter,
+        string? previousLetter,
+        bool allowInUsePrompt)
+    {
+        var queueKey = GetDriveLetterQueueKey(row.DeviceId!, row.VolumeId);
+        var current = _latestStatus;
+        var freshRow = current is null ? row : (FindMatchingRow(current, row) ?? row);
+
+        if (freshRow.IsMounted)
+        {
+            var ejectResult = await TrySendEjectAsync(freshRow.VolumeId).ConfigureAwait(false);
+            if (!ejectResult.Success)
+            {
+                if (!allowInUsePrompt)
+                {
+                    return false;
+                }
+
+                var queueRemount = await ConfirmQueueRemountWhenInUseAsync(
+                    freshRow,
+                    targetLetter,
+                    ejectResult.Message ?? $"'{freshRow.VolumeName}' is currently in use and could not be unmounted immediately.").ConfigureAwait(false);
+                if (queueRemount)
+                {
+                    _queuedDriveLetterRemounts[queueKey] = new QueuedDriveLetterRemount(
+                        freshRow.DeviceId!,
+                        freshRow.VolumeId,
+                        freshRow.CatalogContainerUuid,
+                        freshRow.VolumeName,
+                        targetLetter);
+                    PostToUi(() => _dashboard?.SetFooter(
+                        $"Preferred drive letter {targetLetter}: saved for {freshRow.VolumeName}. Remount queued until the volume is no longer in use."));
+                    return false;
+                }
+
+                if (!string.IsNullOrWhiteSpace(previousLetter) &&
+                    !string.Equals(previousLetter, targetLetter, StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        await SaveDriveLetterPreferenceToServiceAsync(freshRow, previousLetter, throwOnFailure: false).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogDiagnostic($"Best-effort rollback of preferred drive letter failed: {ex.Message}");
+                    }
+                }
+
+                PostToUi(() => _dashboard?.SetFooter("Drive letter change cancelled."));
+                return false;
+            }
+        }
+
+        var mountResult = await TrySendRefreshAsync(clearUserEjectedVolumes: true, volumeId: freshRow.VolumeId).ConfigureAwait(false);
+        if (!mountResult.Success && current is not null)
+        {
+            var mountedSiblings = GetMountedContainerRows(_latestStatus ?? current, freshRow)
+                .Where(r => !string.Equals(r.VolumeId, freshRow.VolumeId, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            if (mountedSiblings.Length > 0)
+            {
+                var allSiblingsUnmounted = true;
+                foreach (var sibling in mountedSiblings)
+                {
+                    var siblingEject = await TrySendEjectAsync(sibling.VolumeId).ConfigureAwait(false);
+                    if (!siblingEject.Success)
+                    {
+                        allSiblingsUnmounted = false;
+                        break;
+                    }
+                }
+
+                if (allSiblingsUnmounted)
+                {
+                    mountResult = await TrySendRefreshAsync(clearUserEjectedVolumes: true, volumeId: freshRow.VolumeId).ConfigureAwait(false);
+                }
+            }
+        }
+
+        if (!mountResult.Success)
+        {
+            if (allowInUsePrompt)
+            {
+                throw new InvalidOperationException(
+                    mountResult.Message ?? $"Preferred drive letter {targetLetter}: was saved, but automatic remount failed.");
+            }
+
+            return false;
+        }
+
+        _queuedDriveLetterRemounts.TryRemove(queueKey, out _);
+        PostToUi(() => _dashboard?.SetFooter($"Remounted {freshRow.VolumeName} on {targetLetter}:."));
+        return true;
+    }
+
+    internal static bool TryDetectVolumeOrContainerInUse(
+        StatusChangedPayload status,
+        DriveDashboardRow targetRow,
+        out string? reason,
+        Func<IReadOnlyList<string>, string?>? hostMountPointInUseDetector = null)
+    {
+        reason = null;
+        var mountedRows = GetMountedContainerRows(status, targetRow);
+        if (mountedRows.Count == 0 && !targetRow.IsMounted)
+        {
+            return false;
+        }
+
+        if (targetRow.State == DriveDashboardState.FinishingWrites ||
+            mountedRows.Any(r => r.State == DriveDashboardState.FinishingWrites))
+        {
+            reason = $"'{targetRow.VolumeName}' is currently finishing pending writes.";
+            return true;
+        }
+
+        var mountedDisplays = (status.MountedVolumes ?? [])
+            .Where(m => string.Equals(m.DeviceId, targetRow.DeviceId, StringComparison.OrdinalIgnoreCase) &&
+                (string.Equals(m.VolumeId, targetRow.VolumeId, StringComparison.OrdinalIgnoreCase) ||
+                 (!string.IsNullOrWhiteSpace(targetRow.CatalogContainerUuid) &&
+                  string.Equals(m.CatalogContainerUuid, targetRow.CatalogContainerUuid, StringComparison.OrdinalIgnoreCase))))
+            .ToArray();
+
+        if (mountedDisplays.Any(m => m.InFlightMutationCallbacks > 0) ||
+            (mountedDisplays.Length == 0 && status.InFlightMutationCallbacks > 0))
+        {
+            reason = $"'{targetRow.VolumeName}' has active file operations in progress.";
+            return true;
+        }
+
+        if (mountedDisplays.Any(m => m.DirtyTransactionCount > 0) ||
+            (mountedDisplays.Length == 0 && status.DirtyTransactionCount > 0))
+        {
+            reason = $"'{targetRow.VolumeName}' has uncommitted filesystem changes being flushed.";
+            return true;
+        }
+
+        if (mountedDisplays.Any(m => m.ShutdownDrainActive || m.RecoveryActive) ||
+            (mountedDisplays.Length == 0 && (status.ShutdownDrainActive || status.RecoveryActive)))
+        {
+            reason = $"'{targetRow.VolumeName}' is currently draining or recovering.";
+            return true;
+        }
+
+        var mountPoints = mountedRows
+            .Select(static r => r.MountPoint)
+            .Append(targetRow.MountPoint)
+            .Where(static mp => !string.IsNullOrWhiteSpace(mp))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (mountPoints.Length > 0)
+        {
+            var detector = hostMountPointInUseDetector ?? DetectHostMountPointsInUse;
+            var hostReason = detector(mountPoints);
+            if (!string.IsNullOrWhiteSpace(hostReason))
+            {
+                reason = hostReason;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static string? DetectHostMountPointsInUse(IReadOnlyList<string> mountPoints)
+    {
+        var roots = mountPoints
+            .Select(NormalizeDriveRoot)
+            .Where(static r => !string.IsNullOrWhiteSpace(r))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (roots.Length == 0)
+        {
+            return null;
+        }
+
         try
         {
-            await using var peer = await NamedPipeMessageClient.ConnectAsync(
+            var shellType = Type.GetTypeFromProgID("Shell.Application");
+            if (shellType is not null)
+            {
+                dynamic? shell = Activator.CreateInstance(shellType);
+                if (shell is not null)
+                {
+                    dynamic windows = shell.Windows();
+                    int count = (int)windows.Count;
+                    for (var i = 0; i < count; i++)
+                    {
+                        try
+                        {
+                            dynamic? win = windows.Item(i);
+                            if (win is null) continue;
+                            string? locationUrl = win.LocationURL as string;
+                            if (!string.IsNullOrWhiteSpace(locationUrl))
+                            {
+                                foreach (var root in roots)
+                                {
+                                    var fileUriPrefix = $"file:///{root[0]}:/";
+                                    if (locationUrl.StartsWith(fileUriPrefix, StringComparison.OrdinalIgnoreCase) ||
+                                        string.Equals(locationUrl, $"file:///{root[0]}:", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        return $"File Explorer is currently open on {root}.";
+                                    }
+                                }
+                            }
+                        }
+                        catch
+                        {
+                            // Ignore individual COM window inspection errors.
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Ignore Shell.Application COM errors.
+        }
+
+        var currentPid = Environment.ProcessId;
+        foreach (var process in Process.GetProcesses())
+        {
+            try
+            {
+                if (process.Id == currentPid) continue;
+                var fileName = process.MainModule?.FileName;
+                if (string.IsNullOrWhiteSpace(fileName)) continue;
+                foreach (var root in roots)
+                {
+                    if (fileName.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return $"Process '{process.ProcessName}' is currently running from {root}.";
+                    }
+                }
+            }
+            catch
+            {
+                // Access denied on system/elevated processes is expected.
+            }
+            finally
+            {
+                process.Dispose();
+            }
+        }
+
+        return null;
+    }
+
+    private static string NormalizeDriveRoot(string? mountPoint)
+    {
+        if (string.IsNullOrWhiteSpace(mountPoint)) return string.Empty;
+        var trimmed = mountPoint.Trim();
+        if (trimmed.Length >= 2 && trimmed[1] == ':' && char.IsAsciiLetter(trimmed[0]))
+        {
+            return $"{char.ToUpperInvariant(trimmed[0])}:\\";
+        }
+
+        return string.Empty;
+    }
+
+    private static IReadOnlyList<DriveDashboardRow> GetMountedContainerRows(StatusChangedPayload status, DriveDashboardRow targetRow)
+    {
+        var rows = DriveDashboardPresenter.BuildRows(status);
+        return rows
+            .Where(r => r.IsMounted &&
+                !string.IsNullOrWhiteSpace(r.VolumeId) &&
+                string.Equals(r.DeviceId, targetRow.DeviceId, StringComparison.OrdinalIgnoreCase) &&
+                (string.Equals(r.VolumeId, targetRow.VolumeId, StringComparison.OrdinalIgnoreCase) ||
+                 (!string.IsNullOrWhiteSpace(targetRow.CatalogContainerUuid) &&
+                  string.Equals(r.CatalogContainerUuid, targetRow.CatalogContainerUuid, StringComparison.OrdinalIgnoreCase))))
+            .ToArray();
+    }
+
+    private static DriveDashboardRow? FindMatchingRow(StatusChangedPayload status, DriveDashboardRow targetRow)
+        => TopologyDashboard.Project(status)
+            .Select(static n => n.Row)
+            .Where(static r => r is not null)
+            .Select(static r => r!)
+            .FirstOrDefault(r =>
+                string.Equals(r.DeviceId, targetRow.DeviceId, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(r.VolumeId, targetRow.VolumeId, StringComparison.OrdinalIgnoreCase));
+
+    private static string GetDriveLetterQueueKey(string deviceId, string volumeId)
+        => $"{deviceId.Trim()}|{volumeId.Trim()}";
+
+    private Task<bool> ConfirmQueueRemountWhenInUseAsync(DriveDashboardRow row, string targetLetter, string inUseReason)
+    {
+        if (PromptDriveLetterInUseOverride is { } overridePrompt)
+        {
+            return overridePrompt(row, targetLetter, inUseReason);
+        }
+
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _uiContext.Post(_ =>
+        {
+            try
+            {
+                if (_shutdownCts.IsCancellationRequested || _dashboard.IsDisposed)
+                {
+                    completion.TrySetResult(false);
+                    return;
+                }
+
+                completion.TrySetResult(ShowDriveLetterInUseDialog(row, targetLetter, inUseReason));
+            }
+            catch (Exception ex)
+            {
+                completion.TrySetException(ex);
+            }
+        }, null);
+        return completion.Task;
+    }
+
+    private bool ShowDriveLetterInUseDialog(DriveDashboardRow row, string targetLetter, string inUseReason)
+    {
+        var theme = _dashboard.CurrentTheme;
+        using var dialog = new Form
+        {
+            Text = "Volume Currently in Use",
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterParent,
+            MaximizeBox = false,
+            MinimizeBox = false,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            BackColor = theme.WindowBackground,
+            ForeColor = theme.TextPrimary,
+            Font = _dashboard.Font,
+            Padding = new Padding(16),
+        };
+
+        var panel = new FlowLayoutPanel
+        {
+            FlowDirection = FlowDirection.TopDown,
+            WrapContents = false,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            BackColor = theme.WindowBackground,
+            Margin = new Padding(0),
+            Padding = new Padding(8),
+        };
+
+        panel.Controls.Add(new Label
+        {
+            Text = $"{row.VolumeName} is currently in use",
+            Font = new Font(_dashboard.Font, FontStyle.Bold),
+            AutoSize = true,
+            ForeColor = theme.TextPrimary,
+            Margin = new Padding(0, 0, 0, 8),
+        });
+
+        panel.Controls.Add(new Label
+        {
+            Text = $"{inUseReason}\n\nCannot remount '{row.VolumeName}' to {targetLetter}: right now.\nWould you like to queue a remount so it switches to {targetLetter}: automatically as soon as it is no longer in use, or cancel?",
+            AutoSize = true,
+            MaximumSize = new Size(440, 0),
+            ForeColor = theme.TextSecondary,
+            Margin = new Padding(0, 0, 0, 16),
+        });
+
+        var actions = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            BackColor = theme.WindowBackground,
+            Margin = new Padding(0),
+        };
+
+        var queueButton = new Button
+        {
+            Text = "Queue Remount",
+            DialogResult = DialogResult.Yes,
+            AutoSize = true,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = theme.ButtonBackground,
+            ForeColor = theme.ButtonText,
+            Padding = new Padding(14, 6, 14, 6),
+            Margin = new Padding(0, 0, 10, 0),
+        };
+        queueButton.FlatAppearance.BorderColor = theme.ButtonBorder;
+
+        var cancelButton = new Button
+        {
+            Text = "Cancel",
+            DialogResult = DialogResult.Cancel,
+            AutoSize = true,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = theme.ButtonBackground,
+            ForeColor = theme.ButtonText,
+            Padding = new Padding(14, 6, 14, 6),
+            Margin = new Padding(0),
+        };
+        cancelButton.FlatAppearance.BorderColor = theme.ButtonBorder;
+
+        actions.Controls.Add(queueButton);
+        actions.Controls.Add(cancelButton);
+        panel.Controls.Add(actions);
+        dialog.Controls.Add(panel);
+        dialog.AcceptButton = queueButton;
+        dialog.CancelButton = cancelButton;
+
+        return dialog.ShowDialog(_dashboard) == DialogResult.Yes;
+    }
+
+    private async Task RunQueuedRemountWatchLoopAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(3), cancellationToken).ConfigureAwait(false);
+                if (!_queuedDriveLetterRemounts.IsEmpty && _latestStatus is { } status)
+                {
+                    await TryProcessQueuedDriveLetterRemountsAsync(status).ConfigureAwait(false);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            LogDiagnostic($"Queued remount watch loop stopped: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private async Task TryProcessQueuedDriveLetterRemountsAsync(StatusChangedPayload status)
+    {
+        if (_queuedDriveLetterRemounts.IsEmpty ||
+            Interlocked.CompareExchange(ref _queuedRemountInFlight, 1, 0) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            foreach (var pair in _queuedDriveLetterRemounts.ToArray())
+            {
+                var queued = pair.Value;
+                var rows = DriveDashboardPresenter.BuildRows(status);
+                var row = rows.FirstOrDefault(r =>
+                    string.Equals(r.DeviceId, queued.DeviceId, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(r.VolumeId, queued.VolumeId, StringComparison.OrdinalIgnoreCase));
+                if (row is null)
+                {
+                    _queuedDriveLetterRemounts.TryRemove(pair.Key, out _);
+                    continue;
+                }
+
+                if (row.IsMounted &&
+                    string.Equals(row.DriveLetterPreference?.ActualLetter, queued.TargetLetter, StringComparison.OrdinalIgnoreCase))
+                {
+                    _queuedDriveLetterRemounts.TryRemove(pair.Key, out _);
+                    continue;
+                }
+
+                if (TryDetectVolumeOrContainerInUse(status, row, out _))
+                {
+                    continue;
+                }
+
+                PostToUi(() => _dashboard?.SetFooter($"Volume '{queued.VolumeName}' is no longer in use. Remounting on {queued.TargetLetter}:…"));
+                await ExecuteDriveLetterRemountAsync(
+                    row,
+                    queued.TargetLetter,
+                    previousLetter: null,
+                    allowInUsePrompt: false).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogDiagnostic($"Queued drive letter remount attempt failed: {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _queuedRemountInFlight, 0);
+        }
+    }
+
+    private Task MountConnectedVolumeAsync(DriveDashboardRow row) => SendSelectedVolumeAsync(row, ApfsControlCommands.Mount);
+
+    private async Task SendSelectedVolumeAsync(DriveDashboardRow row, string command)
+    {
+        var current = _latestStatus ?? throw new InvalidOperationException("Service status is unavailable. Refresh first.");
+        var request = DriveDashboardPresenter.CreateSelectedRequest(current, row, command);
+        using var credential = command == ApfsControlCommands.Unlock ? EncryptedPasswordPrompt.Show(_dashboard!, row, _dashboard?.CurrentTheme.IsDark ?? false) : null;
+        if (command == ApfsControlCommands.Unlock && credential is null) return;
+        if (command == ApfsControlCommands.Fix)
+        {
+            var result = await ImageRepairFixFlow.ExecuteAsync(request,
+                value => SendControlRequestAsync(value, null, allowImageRepairOffer: true), ConfirmImageRepairAsync).ConfigureAwait(false);
+            PostToUi(() => _dashboard?.SetFooter(result is null ? "Repair confirmation declined. No repair was approved." :
+                result.Diagnostic ?? "Fix completed."));
+            return;
+        }
+        await SendControlRequestAsync(request, credential).ConfigureAwait(false);
+    }
+
+    private Task<bool> ConfirmImageRepairAsync(ImageRepairOffer offer)
+    {
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _uiContext.Post(_ =>
+        {
+            try
+            {
+                if (_shutdownCts.IsCancellationRequested || _dashboard.IsDisposed) { completion.TrySetResult(false); return; }
+                var answer = MessageBox.Show(_dashboard, ImageRepairFixFlow.ConfirmationText(offer), "Review APFS image repair",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
+                completion.TrySetResult(answer == DialogResult.Yes);
+            }
+            catch (Exception ex) { completion.TrySetException(ex); }
+        }, null);
+        return completion.Task;
+    }
+
+    private Task SendContainerAsync(IReadOnlyList<DriveDashboardRow> rows, string command)
+    {
+        var current = _latestStatus ?? throw new InvalidOperationException("Service status is unavailable. Refresh first.");
+        var request = DriveDashboardPresenter.CreateContainerRequest(current, rows, command);
+        return SendControlRequestAsync(request, null);
+    }
+
+    public Task MountContainerAsync(string deviceId, string containerUuid)
+        => SendContainerAsync(ResolveContainerRows(deviceId, containerUuid), ApfsControlCommands.ContainerMount);
+
+    public Task UnmountContainerAsync(string deviceId, string containerUuid)
+        => SendContainerAsync(ResolveContainerRows(deviceId, containerUuid), ApfsControlCommands.ContainerUnmount);
+
+    public Task EjectDeviceAsync(string deviceId)
+    {
+        var current = _latestStatus ?? throw new InvalidOperationException("Service status is unavailable. Refresh first.");
+        var rows = DriveDashboardPresenter.BuildRows(current)
+            .Where(r => string.Equals(r.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase) &&
+                !string.IsNullOrWhiteSpace(r.VolumeId))
+            .ToArray();
+        var request = DriveDashboardPresenter.CreateDeviceRequest(current, rows);
+        return SendControlRequestAsync(request, null);
+    }
+
+    public async Task FixContainerAsync(IReadOnlyList<DriveDashboardRow> rows)
+    {
+        var flow = ContainerFixFlow.Capture(_latestStatus ?? throw new InvalidOperationException("Service status is unavailable."), rows);
+        var report = await flow.RunAsync(() => _latestStatus ?? throw new InvalidOperationException("Service status is unavailable."),
+            request => SendControlRequestAsync(request, null, allowImageRepairOffer: true), ConfirmImageRepairAsync, _shutdownCts.Token).ConfigureAwait(true);
+        _dashboard.SetFooter(report.Summary);
+    }
+
+    private IReadOnlyList<DriveDashboardRow> ResolveContainerRows(string deviceId, string containerUuid)
+    {
+        var current = _latestStatus ?? throw new InvalidOperationException("Service status is unavailable. Refresh first.");
+        var rows = DriveDashboardPresenter.BuildRows(current)
+            .Where(r => string.Equals(r.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase) &&
+                ApfsTopology.MatchesContainerUuid(containerUuid, r.CatalogContainerUuid))
+            .ToArray();
+        if (rows.Length == 0) throw new InvalidOperationException("Selected container has no volumes. Refresh before acting.");
+        return rows;
+    }
+
+    private async Task<OperationResultPayload> SendControlRequestAsync(ControlOperationRequestPayload request, ApfsAccess.Cli.SupervisedCredential? credential,
+        bool allowImageRepairOffer = false)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_shutdownCts.Token);
+        timeout.CancelAfter(ControlRequestTimeout(request.Command));
+        try
+        {
+            await using var peer = await AgentControlClient.ConnectAsync(
                 ApfsPipeConstants.PipeName, 1000, timeout.Token).ConfigureAwait(false);
             await peer.SendAsync(PipeMessageCodec.Create(ApfsMessageTypes.ControlOperationRequest, request,
                 request.OperationId, PipeSchemaVersions.Schema2), timeout.Token).ConfigureAwait(false);
+            if (credential is not null) await EncryptedCredentialTransport.SendAsync(request.OperationId, credential, timeout.Token).ConfigureAwait(false);
             while (true)
             {
                 var response = await peer.ReadMessageAsync(timeout.Token).ConfigureAwait(false)
-                    ?? throw new IOException("Service connection closed. Refresh to check the mount result.");
+                    ?? throw new IOException("Service connection closed. Refresh to check the operation result.");
                 if (response.Type != ApfsMessageTypes.OperationResult || response.RequestId != request.OperationId) continue;
                 if (!PipeMessageCodec.Validate(response).IsValid ||
                     !PipeMessageCodec.TryGetPayload<OperationResultPayload>(response, out var result) || result is null ||
                     result.OperationId != request.OperationId || result.Command != request.Command ||
                     !string.Equals(result.Target?.DeviceId, request.Target?.DeviceId, StringComparison.OrdinalIgnoreCase) ||
                     !string.Equals(result.Target?.VolumeId, request.Target?.VolumeId, StringComparison.OrdinalIgnoreCase) ||
+                    result.Target?.VolumeUuid != request.Target?.VolumeUuid ||
+                    result.Target?.ContainerUuid != request.Target?.ContainerUuid ||
+                    result.Target?.VolumeObjectId != request.Target?.VolumeObjectId ||
+                    result.Target?.ObservationContract != request.Target?.ObservationContract ||
                     result.Target?.RecoveryIdentity != request.Target?.RecoveryIdentity ||
+                    result.ApprovedImageRepairPlanId != request.ApprovedImageRepairPlanId ||
                     result.RequestedMode != request.RequestedMode ||
                     result.Fingerprint != ApfsOperationFingerprint.Compute(request))
-                    throw new IOException("Service returned an invalid mount result. Refresh before retrying.");
+                    throw new IOException("Service returned an invalid operation result. Refresh before retrying.");
                 if (result.State is ApfsOperationStates.Accepted or ApfsOperationStates.InProgress)
                 {
                     await Task.Delay(250, timeout.Token).ConfigureAwait(false);
@@ -1010,14 +1871,155 @@ private void HandleServiceStopping()
                         new OperationResultQueryPayload(request.OperationId), request.OperationId, PipeSchemaVersions.Schema2), timeout.Token).ConfigureAwait(false);
                     continue;
                 }
-                if (!result.Success) throw new InvalidOperationException(result.Diagnostic ?? "Mount request failed.");
-                return;
+                if (!result.Success && !(allowImageRepairOffer && result.ImageRepairOffer is not null))
+                    throw new InvalidOperationException(result.Diagnostic ?? "Selected operation failed.");
+                return result;
             }
         }
         catch (OperationCanceledException)
         {
-            throw new InvalidOperationException("Mount result timed out. Refresh to check the result before retrying.");
+            // Closing a pipe does not cancel an idempotent service operation.
+            // Deliver explicit cancellation with its own short, bounded transport.
+            using var cancelDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            try
+            {
+                await using var peer = await AgentControlClient.ConnectAsync(ApfsPipeConstants.PipeName, 1000, cancelDeadline.Token).ConfigureAwait(false);
+                await peer.SendAsync(PipeMessageCodec.Create(ApfsMessageTypes.CancellationRequest,
+                    new OperationCancellationRequestPayload(request.OperationId), request.OperationId, PipeSchemaVersions.Schema2), cancelDeadline.Token).ConfigureAwait(false);
+                while ((await peer.ReadMessageAsync(cancelDeadline.Token).ConfigureAwait(false)) is {} response)
+                    if (response.Type == ApfsMessageTypes.OperationResult && response.RequestId == request.OperationId) break;
+            }
+            catch (Exception ex) when (ex is IOException or OperationCanceledException or InvalidOperationException) { }
+            throw new InvalidOperationException("Operation cancelled or timed out. Refresh to confirm the result before retrying.");
         }
+    }
+
+    private static TimeSpan ControlRequestTimeout(string command)
+        => command switch
+        {
+            ApfsControlCommands.DeviceEject or
+            ApfsControlCommands.Eject or
+            ApfsControlCommands.ContainerUnmount => EjectRequestTimeout,
+            _ => FixRequestTimeout,
+        };
+
+    private async Task VerifySelectedVolumeAsync(DriveDashboardRow selected)
+    {
+        var current = _latestStatus ?? throw new InvalidOperationException("Service status is unavailable.");
+        var result = await SendControlRequestAsync(DriveDashboardPresenter.CreateSelectedRequest(current, selected,
+            ApfsControlCommands.VolumeVerify), null).ConfigureAwait(true);
+        _dashboard.SetFooter(result.Diagnostic ?? "Covered metadata verified.");
+    }
+
+    private async Task VerifyContainerVolumesAsync(ContainerVolumeVerification selection)
+    {
+        var report = await selection.RunAsync(
+            () => _latestStatus ?? throw new InvalidOperationException("Service status is unavailable. Refresh first."),
+            request => SendControlRequestAsync(request, null)).ConfigureAwait(true);
+        _dashboard.SetFooter(report.Summary);
+        MessageBox.Show(_dashboard, report.Details, "Verify volumes", MessageBoxButtons.OK,
+            report.Success ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+    }
+
+    private async Task ManageSelectedVolumeAsync(DriveDashboardRow selected)
+    {
+        using var dialog = new VolumeManagementDialog(selected);
+        if (dialog.ShowDialog(_dashboard) != DialogResult.OK) return;
+        var current = _latestStatus ?? throw new InvalidOperationException("Service status is unavailable.");
+        var plan = await SendControlRequestAsync(DriveDashboardPresenter.CreateManagementPlanRequest(current,
+            selected, dialog.Operation), null).ConfigureAwait(true);
+        if (string.IsNullOrWhiteSpace(plan.ManagementToken) || string.IsNullOrWhiteSpace(plan.ManagementPlanId) ||
+            string.IsNullOrWhiteSpace(plan.ManagementObservedXid))
+            throw new IOException("Service returned no complete management plan.");
+        var change = dialog.Operation == ApfsManagementOperations.RenameVolume ? $"Name: {dialog.NewName}" :
+            $"Quota: {dialog.QuotaBytes} bytes\r\nReserve: {dialog.ReserveBytes} bytes";
+        if (MessageBox.Show(_dashboard,
+            $"Image: {selected.DeviceId}\r\nContainer: {selected.CatalogContainerUuid}\r\nVolume: {selected.CatalogVolumeUuid}\r\nObject: {selected.CatalogVolumeObjectId}\r\nCheckpoint: {plan.ManagementObservedXid}\r\n{change}\r\n\r\nApply this plan?",
+            "Confirm volume change", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+        current = _latestStatus ?? throw new InvalidOperationException("Service status is unavailable.");
+        var result = await SendControlRequestAsync(DriveDashboardPresenter.CreateManagementApplyRequest(current,
+            selected, dialog.Operation, plan.ManagementToken, dialog.NewName, dialog.QuotaBytes, dialog.ReserveBytes,
+            selected.DeviceId), null).ConfigureAwait(true);
+        _dashboard.SetFooter(result.Diagnostic ?? "Volume change applied.");
+    }
+
+    private async Task CreateImageVolumeAsync(string deviceId, string containerUuid)
+    {
+        var rows = ResolveContainerRows(deviceId, containerUuid);
+        if (rows.Count == 0 || rows.Any(r => !r.CanManageTopologyImage)) throw new InvalidOperationException("Offline volume management observation is unavailable.");
+        using var dialog = new VolumeCreateDialog(deviceId, containerUuid);
+        if (dialog.ShowDialog(_dashboard) != DialogResult.OK) return;
+        var target = new ApfsControlTarget(deviceId, "", ContainerUuid: containerUuid);
+        await RunVolumeTopologyPlanAsync(new(Guid.NewGuid().ToString("D"), ApfsControlCommands.VolumeCreatePlan, target,
+            ExpiresAtUtc: DateTime.UtcNow.AddSeconds(80), VolumeManagement: dialog.Parameters)).ConfigureAwait(true);
+    }
+
+    private async Task DeleteImageVolumeAsync(DriveDashboardRow selected)
+    {
+        var status = _latestStatus ?? throw new InvalidOperationException("Service status is unavailable.");
+        var current = TopologyDashboard.Project(status).SingleOrDefault(n => n.Row is not null &&
+            DriveDashboardPresenter.RowIdentity(n.Row) == DriveDashboardPresenter.RowIdentity(selected))?.Row;
+        if (current?.CanManageTopologyImage != true) throw new InvalidOperationException("Offline volume management observation is unavailable.");
+        var device = status.ConnectedInventory!.Single(d => d.Device.DeviceId == current.DeviceId);
+        var volume = device.Volumes.Single(v => v.VolumeId == current.VolumeId);
+        await RunVolumeTopologyPlanAsync(new(Guid.NewGuid().ToString("D"), ApfsControlCommands.VolumeDeletePlan,
+            SelectedControlTarget.Create(device, volume), ExpiresAtUtc: DateTime.UtcNow.AddSeconds(80),
+            VolumeManagement: new("delete"))).ConfigureAwait(true);
+    }
+
+    private Task ResizeImageAsync(DriveDashboardRow row) => ChangeImageAsync(row, false);
+    private Task FormatImageAsync(DriveDashboardRow row) => ChangeImageAsync(row, true);
+    private async Task ChangeImageAsync(DriveDashboardRow selected, bool format)
+    {
+        var status = _latestStatus ?? throw new InvalidOperationException("Service status is unavailable.");
+        var current = TopologyDashboard.Project(status).SingleOrDefault(n => n.Row is not null &&
+            DriveDashboardPresenter.RowIdentity(n.Row) == DriveDashboardPresenter.RowIdentity(selected))?.Row;
+        if (current is null || !(format ? current.CanFormatImage : current.CanResizeImage))
+            throw new InvalidOperationException("Image resize/format is unavailable or not enabled.");
+        using var dialog = new VolumeImageDialog(current, format);
+        if (dialog.ShowDialog(_dashboard) != DialogResult.OK) return;
+        var device = status.ConnectedInventory!.Single(d => d.Device.DeviceId == current.DeviceId);
+        var volume = device.Volumes.Single(v => v.VolumeId == current.VolumeId);
+        await RunVolumeTopologyPlanAsync(new(Guid.NewGuid().ToString("D"),
+            format ? ApfsControlCommands.VolumeFormatPlan : ApfsControlCommands.VolumeResizePlan,
+            SelectedControlTarget.Create(device, volume), ExpiresAtUtc: DateTime.UtcNow.AddSeconds(80),
+            VolumeManagement: dialog.Parameters)).ConfigureAwait(true);
+    }
+    private async Task RunVolumeTopologyPlanAsync(ControlOperationRequestPayload request)
+    {
+        var result = await VolumeTopologyWorkflow.RunAsync(request, r => SendControlRequestAsync(r, null), text =>
+            MessageBox.Show(_dashboard, text, "Confirm image volume change", MessageBoxButtons.OKCancel,
+                request.VolumeManagement!.Kind is "delete" or "format" or "erase" ? MessageBoxIcon.Warning : MessageBoxIcon.Question) == DialogResult.OK,
+            () => _latestStatus ?? throw new InvalidOperationException("Service status is unavailable.")).ConfigureAwait(true);
+        _dashboard.SetFooter(result.FinalStatus ?? result.Diagnostic ?? "Volume management completed.");
+    }
+
+    private Task ShowSelectedSnapshotsAsync(DriveDashboardRow selected)
+    {
+        var workflow = new VolumeSnapshotWorkflow(selected,
+            () => _serviceConnected ? _latestStatus ?? throw new InvalidOperationException("Service status is unavailable.") :
+                throw new InvalidOperationException("Service is disconnected. Reconnect before acting on snapshots."),
+            request => SendControlRequestAsync(request, null));
+        using var dialog = new VolumeSnapshotDialog(workflow, path =>
+            Process.Start(new ProcessStartInfo { FileName = path, UseShellExecute = true }));
+        dialog.ShowDialog(_dashboard);
+        return Task.CompletedTask;
+    }
+
+    private async Task RegisterEncryptedImageAsync()
+    {
+        if (!_serviceConnected) throw new IOException("Service is disconnected. Reconnect before registering an image.");
+        using var picker = new OpenFileDialog { Title = "Register encrypted image", Filter = "Image selector profiles (*.json)|*.json",
+            CheckFileExists = true, Multiselect = false };
+        if (picker.ShowDialog(_dashboard) != DialogResult.OK) return;
+        EncryptedImageProfile profile;
+        using (var source = File.OpenRead(picker.FileName)) profile = EncryptedImageRegistration.ReadProfile(source);
+        var result = await EncryptedImageRegistration.RunAsync(profile,
+            text => MessageBox.Show(_dashboard, text, "Review encrypted image", MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Question) == DialogResult.OK,
+            request => _serviceConnected ? SendControlRequestAsync(request, null) :
+                throw new IOException("Service is disconnected. Reconnect before registering an image.")).ConfigureAwait(true);
+        _dashboard.SetFooter(result is null ? "Image registration cancelled." : result.Diagnostic ?? "Encrypted image registered.");
     }
 
     private async Task<(bool Success, string? Message)> TrySendRequestAsync(
@@ -1118,6 +2120,11 @@ private void HandleServiceStopping()
 
                 if (PipeMessageCodec.TryGetPayload<AckPayload>(response, out var ack) && ack is not null)
                 {
+                    if (ack.Status is not null && !IsOlderStatus(_latestStatus, ack.Status))
+                    {
+                        _latestStatus = ack.Status;
+                        PostToUi(() => UpdateUi(ack.Status));
+                    }
                     LogDiagnostic($"Transient {messageType} ACK received. requestId={requestId}; success={ack.Success}; message='{ack.Message ?? string.Empty}'");
                     return (ack.Success, ack.Message);
                 }
@@ -1145,6 +2152,11 @@ private void HandleServiceStopping()
 
         if (PipeMessageCodec.TryGetPayload<AckPayload>(message, out var ack) && ack is not null)
         {
+            if (ack.Status is not null && !IsOlderStatus(_latestStatus, ack.Status))
+            {
+                _latestStatus = ack.Status;
+                PostToUi(() => UpdateUi(ack.Status));
+            }
             LogDiagnostic($"Status-channel ACK received. requestId={message.RequestId}; success={ack.Success}; message='{ack.Message ?? string.Empty}'");
             pending.TrySetResult(ack);
             return;
@@ -1197,6 +2209,10 @@ private void HandleServiceStopping()
 
     private void SetDisconnectedUi()
     {
+        _serviceConnected = false;
+        _registerImageItem.Enabled = false;
+        if (_registerFusionItem is not null) _registerFusionItem.Enabled = false;
+        _dashboard.SetImageRegistrationAvailable(false);
         _notifyIcon.Icon = _iconByState[RuntimeState.Error];
         _notifyIcon.Text = "APFS Access: service disconnected";
         _ejectMenuSignature = null;
@@ -1214,8 +2230,18 @@ private void HandleServiceStopping()
         _dashboard.ApplyStatus(disconnected);
     }
 
+    internal static bool IsOlderStatus(StatusChangedPayload? current, StatusChangedPayload incoming)
+        => current?.InventoryGeneration is {} previous && incoming.InventoryGeneration is {} next && next < previous;
+
     private void UpdateUi(StatusChangedPayload payload)
     {
+        if (IsOlderStatus(_latestStatus, payload)) return;
+        _serviceConnected = true;
+        _registerImageItem.Enabled = true;
+        if (_registerFusionItem is not null) _registerFusionItem.Enabled = true;
+        _dashboard.SetImageRegistrationAvailable(true);
+        if (!TopologyStatusProjection.IsBounded(payload))
+            payload = new(RuntimeState.Error, [], "Details unavailable", DateTime.UtcNow, [], false, []);
         _latestStatus = payload;
         var previousBalloonState = _lastStatusBalloonState;
         var rows = DriveDashboardPresenter.BuildRows(payload);
@@ -1236,6 +2262,9 @@ private void HandleServiceStopping()
 
         _notifyIcon.Text = text;
         UpdateEjectMenu(payload);
+        UpdateSelectedActionMenu(_fixItem, payload, ApfsControlCommands.Fix);
+        UpdateSelectedActionMenu(_mountItem, payload, ApfsControlCommands.Mount);
+        UpdateOfflineActionMenus(payload);
         _dashboard.ApplyStatus(payload);
         if (currentBalloonState == DriveDashboardState.HealthyReadWrite)
         {
@@ -1244,12 +2273,106 @@ private void HandleServiceStopping()
         ShowWarnings(payload, BuildStatusBalloonWarnings(payload, currentBalloonState), currentBalloonState);
         ShowHealthTransition(payload, previousBalloonState, currentBalloonState);
         _lastStatusBalloonState = currentBalloonState;
+        if (!_queuedDriveLetterRemounts.IsEmpty)
+        {
+            _ = Task.Run(() => TryProcessQueuedDriveLetterRemountsAsync(payload));
+        }
+    }
+
+    private void UpdateOfflineActionMenus(StatusChangedPayload status)
+    {
+        _verifyItem.DropDownItems.Clear();
+        _manageItem.DropDownItems.Clear();
+        _snapshotsItem.DropDownItems.Clear();
+        _createVolumeItem.DropDownItems.Clear();
+        _deleteVolumeItem.DropDownItems.Clear();
+        var rows = TopologyDashboard.Project(status).Where(n => n.Row is not null).Select(n => n.Row!).ToArray();
+        foreach (var row in rows)
+        {
+            var label = $"{row.VolumeName} ({row.DeviceName}, {row.CatalogVolumeUuid})";
+            if (row.CanVerifyOffline || row.CanVerifyLive)
+                _verifyItem.DropDownItems.Add(new ToolStripMenuItem(label, null, async (_, _) =>
+                {
+                    try { await VerifySelectedVolumeAsync(row).ConfigureAwait(true); }
+                    catch (Exception ex) { _dashboard.SetFooter(ex.Message); }
+                }) { Tag = row });
+            if (row.CanManageOffline)
+                _manageItem.DropDownItems.Add(new ToolStripMenuItem(label, null, async (_, _) =>
+                {
+                    try { await ManageSelectedVolumeAsync(row).ConfigureAwait(true); }
+                    catch (Exception ex) { _dashboard.SetFooter(ex.Message); }
+                }) { Tag = row });
+            if (row.CanVerifyOffline || row.CanListSnapshots || row.CanRecoverSnapshots)
+                _snapshotsItem.DropDownItems.Add(new ToolStripMenuItem(label, null, async (_, _) =>
+                {
+                    try { await ShowSelectedSnapshotsAsync(row).ConfigureAwait(true); }
+                    catch (Exception ex) { _dashboard.SetFooter(ex.Message); }
+                }) { Tag = row });
+            if (row.CanManageTopologyImage)
+                _deleteVolumeItem.DropDownItems.Add(new ToolStripMenuItem(label, null, async (_, _) =>
+                {
+                    try { await DeleteImageVolumeAsync(row).ConfigureAwait(true); }
+                    catch (Exception ex) { _dashboard.SetFooter(ex.Message); }
+                }) { Tag = row });
+            if (row.CanResizeImage)
+                _manageItem.DropDownItems.Add(new ToolStripMenuItem("Resize container: " + label, null, async (_, _) =>
+                { try { await ResizeImageAsync(row).ConfigureAwait(true); } catch (Exception ex) { _dashboard.SetFooter(ex.Message); } }));
+            if (row.CanFormatImage)
+                _manageItem.DropDownItems.Add(new ToolStripMenuItem("Format container: " + label, null, async (_, _) =>
+                { try { await FormatImageAsync(row).ConfigureAwait(true); } catch (Exception ex) { _dashboard.SetFooter(ex.Message); } }));
+        }
+        foreach (var group in rows.GroupBy(r => (r.DeviceId, r.CatalogContainerUuid)).Where(g => g.All(r => r.CanManageTopologyImage)))
+        {
+            var first = group.First();
+            _createVolumeItem.DropDownItems.Add(new ToolStripMenuItem($"{first.DeviceName} ({first.CatalogContainerUuid})", null, async (_, _) =>
+            {
+                try { await CreateImageVolumeAsync(first.DeviceId!, first.CatalogContainerUuid!).ConfigureAwait(true); }
+                catch (Exception ex) { _dashboard.SetFooter(ex.Message); }
+            }));
+        }
+        _verifyItem.Enabled = _verifyItem.HasDropDownItems;
+        _manageItem.Enabled = _manageItem.HasDropDownItems;
+        _snapshotsItem.Enabled = _snapshotsItem.HasDropDownItems;
+        _createVolumeItem.Enabled = _createVolumeItem.HasDropDownItems;
+        _deleteVolumeItem.Enabled = _deleteVolumeItem.HasDropDownItems;
+    }
+
+    private void UpdateSelectedActionMenu(ToolStripMenuItem? menu, StatusChangedPayload status, string command)
+    {
+        if (menu is null) return;
+        var rows = SelectedActionRows(status, command);
+        var signature = JsonSerializer.Serialize(rows);
+        if (menu.Tag is string previous && previous == signature) return;
+        foreach (var item in menu.DropDownItems.Cast<ToolStripItem>().ToArray()) { menu.DropDownItems.Remove(item); item.Dispose(); }
+        menu.Tag = signature;
+        foreach (var row in rows) menu.DropDownItems.Add(CreateSelectedActionItem(row, command, SendSelectedVolumeAsync,
+            ex => PostToUi(() => _dashboard.SetFooter(ex.Message))));
+        menu.Enabled = rows.Length > 0;
+    }
+
+    internal static DriveDashboardRow[] SelectedActionRows(StatusChangedPayload status, string command)
+        => TopologyDashboard.Project(status).Where(n => n.Row is not null).Select(n => n.Row!)
+            .Where(r => command == ApfsControlCommands.Fix ? DriveDashboardPresenter.CanFixVolume(r) :
+                r.CanMount).ToArray();
+
+    internal static ToolStripMenuItem CreateSelectedActionItem(DriveDashboardRow row, string command,
+        Func<DriveDashboardRow, string, Task> send, Action<Exception> failed)
+    {
+        var label = command == ApfsControlCommands.Fix ? "Fix" : command == ApfsControlCommands.Eject ? "Eject" :
+            row.CanMountBackupReadWrite ? "Mount backup read/write" : row.CanInspectReadOnly ? "Inspect read-only" : "Mount";
+        var item = new ToolStripMenuItem($"{label} {row.DeviceName} ({row.MountPoint}, {row.VolumeName})") { Tag = row };
+        item.Click += async (sender, _) => {
+            if (sender is not ToolStripMenuItem { Tag: DriveDashboardRow selected }) return;
+            try { await send(selected, command).ConfigureAwait(false); }
+            catch (Exception ex) { failed(ex); }
+        };
+        return item;
     }
 
     private void UpdateEjectMenu(StatusChangedPayload payload)
     {
         var descriptors = BuildEjectMenuDescriptors(payload);
-        var signature = BuildEjectMenuSignature(descriptors);
+        var signature = BuildEjectMenuSignature(descriptors) + System.Text.Json.JsonSerializer.Serialize(descriptors.Select(d => d.Row));
         if (string.Equals(_ejectMenuSignature, signature, StringComparison.Ordinal))
         {
             return;
@@ -1270,18 +2393,18 @@ private void HandleServiceStopping()
         {
             var descriptor = descriptors[0];
             _ejectItem.Text = descriptor.Text;
-            _ejectItem.Tag = descriptor.VolumeId;
+            _ejectItem.Tag = (object?)descriptor.Row ?? descriptor.VolumeId;
             return;
         }
 
         _ejectItem.Text = $"Eject APFS drives ({descriptors.Count})";
         foreach (var descriptor in descriptors)
         {
-            var child = new ToolStripMenuItem(descriptor.Text)
-            {
-                Tag = descriptor.VolumeId,
-            };
-            child.Click += OnEjectClicked;
+            var child = descriptor.Row is {} selected
+                ? CreateSelectedActionItem(selected, ApfsControlCommands.Eject, SendSelectedVolumeAsync,
+                    ex => PostToUi(() => _dashboard.SetFooter(ex.Message)))
+                : new ToolStripMenuItem(descriptor.Text) { Tag = descriptor.VolumeId };
+            if (descriptor.Row is null) child.Click += OnEjectClicked;
             _ejectItem.DropDownItems.Add(child);
         }
     }
@@ -1356,6 +2479,12 @@ private void HandleServiceStopping()
 
     private static IReadOnlyList<EjectMenuDescriptor> BuildEjectMenuDescriptors(StatusChangedPayload payload)
     {
+        if (payload.InventoryGeneration is not null || payload.ConnectedInventory?.Any(d => d.Topology is not null) == true)
+        {
+            return TopologyDashboard.Project(payload).Where(n => n.Row?.CanEject == true)
+                .Select(n => n.Row!).OrderBy(r => r.MountPoint, StringComparer.OrdinalIgnoreCase)
+                .Select(r => new EjectMenuDescriptor($"Eject {r.DeviceName} ({r.MountPoint}, {r.VolumeName})", r.VolumeId, r)).ToArray();
+        }
         if (payload.MountedVolumes is { Count: > 0 })
         {
             return payload.MountedVolumes

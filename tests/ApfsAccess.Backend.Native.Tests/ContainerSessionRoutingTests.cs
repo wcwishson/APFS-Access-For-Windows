@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using ApfsAccess.Core;
 
 namespace ApfsAccess.Backend.Native.Tests;
@@ -13,7 +14,7 @@ namespace ApfsAccess.Backend.Native.Tests;
 // live container group (else starts one), eject of one volume never touches
 // siblings, and eject of the last volume stops the owner. Fake FsHost shim
 // follows HostProcessGuardianTests (StartProcess hook + real ping child).
-public sealed class ContainerSessionRoutingTests : IDisposable
+public sealed partial class ContainerSessionRoutingTests : IDisposable
 {
     private const string ContainerHexA = "a9cb92d28b7c4b599eab633c7625f491";
 
@@ -31,7 +32,7 @@ public sealed class ContainerSessionRoutingTests : IDisposable
             ObserverEvidenceJson.BuildSingleContainer(
                 ContainerHexA,
                 [new ObserverEvidenceJson.VolumeJson("Data", 101),
-                 new ObserverEvidenceJson.VolumeJson("Backup", 102)]),
+                 new ObserverEvidenceJson.VolumeJson("Backup", 102)], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")),
             launched);
         var planned = BuildPlanned(backend, ["R", "S"], MountAccessMode.ReadOnly);
 
@@ -70,7 +71,7 @@ public sealed class ContainerSessionRoutingTests : IDisposable
             ObserverEvidenceJson.BuildSingleContainer(
                 ContainerHexA,
                 [new ObserverEvidenceJson.VolumeJson("Data", 101),
-                 new ObserverEvidenceJson.VolumeJson("Backup", 102)]),
+                 new ObserverEvidenceJson.VolumeJson("Backup", 102)], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")),
             launched);
         var planned = BuildPlanned(backend, ["R", "S"], MountAccessMode.ReadOnly);
 
@@ -80,6 +81,7 @@ public sealed class ContainerSessionRoutingTests : IDisposable
         // one-volume container (the fake shim never exposes its drive).
         Assert.False(result.Success);
         Assert.Equal("FsHostStartupTimeout", result.DiagnosticCode);
+        PublishTerminalContainerStatus(backend);
         Assert.True(
             SpinWait.SpinUntil(
                 () => GetContainerGroupCount(backend) == 0,
@@ -88,8 +90,10 @@ public sealed class ContainerSessionRoutingTests : IDisposable
         Assert.Contains("--container-manifest", launched[0]);
     }
 
-    [Fact]
-    public async Task Eject_OneVolume_KeepsSiblingsAndOwnerAlive()
+    [Theory]
+    [InlineData("R:\\", 101ul, "S:\\")]
+    [InlineData("S:\\", 102ul, "R:\\")]
+    public async Task Eject_OneVolume_KeepsSiblingsAndOwnerAlive(string targetMount, ulong targetOid, string siblingMount)
     {
         using var temp = DTempDirectory.Create("container-route-ejectone");
         var launched = new List<string[]>();
@@ -99,7 +103,7 @@ public sealed class ContainerSessionRoutingTests : IDisposable
             ObserverEvidenceJson.BuildSingleContainer(
                 ContainerHexA,
                 [new ObserverEvidenceJson.VolumeJson("Data", 101),
-                 new ObserverEvidenceJson.VolumeJson("Backup", 102)]),
+                 new ObserverEvidenceJson.VolumeJson("Backup", 102)], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")),
             launched,
             visibility);
         var planned = BuildPlanned(backend, ["R", "S"], MountAccessMode.ReadOnly);
@@ -108,25 +112,37 @@ public sealed class ContainerSessionRoutingTests : IDisposable
         visibility["R:\\"] = true;
         visibility["S:\\"] = true;
         var ownerPid = GetContainerOwnerPid(backend, ContainerHexA);
+        var target = planned.Single(member => member.MountPoint == targetMount);
+        var sibling = planned.Single(member => member.MountPoint == siblingMount);
 
         var detachResponse = RespondToNextControlRequestAsync(
-            launched[0], "detach", 102, visibility, "S:\\", ownerPid);
+            launched[0], "detach", targetOid, visibility, targetMount, ownerPid);
 
-        var result = await backend.UnmountAsync("S:\\", CancellationToken.None);
+        var result = await backend.UnmountAsync(targetMount, CancellationToken.None);
         await detachResponse;
 
         Assert.True(result.Success);
         Assert.True(result.MountRemoved);
+        Assert.True(result.ContainerMemberDetached);
+        Assert.True(result.PendingDurabilityCleared);
+        Assert.False(result.HostOwnershipReleased);
         Assert.Single(launched);
         Assert.Equal(2, GetContainerGroupMemberCount(backend, ContainerHexA));
         Assert.True(IsProcessAlive(ownerPid));
         var mounts = await backend.GetMountStateAsync(CancellationToken.None);
         var remaining = Assert.Single(mounts);
-        Assert.Equal("R:\\", remaining.MountPoint);
+        Assert.Equal(siblingMount, remaining.MountPoint);
+        Assert.True(remaining.MountReady);
+        Assert.Equal(ownerPid, remaining.HostProcessId);
+        using (var owner = Process.GetProcessById(ownerPid))
+            Assert.Equal(owner.StartTime.ToUniversalTime().ToFileTimeUtc(), remaining.HostProcessCreationTimeFileTimeUtc);
+        Assert.Equal(sibling.Volume.DeviceId, remaining.DeviceId);
+        Assert.Equal(sibling.Volume.VolumeId, remaining.VolumeId);
+        Assert.Equal(sibling.RecoveryIdentity, remaining.RecoveryIdentity);
 
         var attachResponse = RespondToNextControlRequestAsync(
-            launched[0], "attach", 102, visibility, "S:\\", ownerPid);
-        var remounted = await backend.MountAsync(planned[1].Request, CancellationToken.None);
+            launched[0], "attach", targetOid, visibility, targetMount, ownerPid);
+        var remounted = await backend.MountAsync(target.Request, CancellationToken.None);
         await attachResponse;
 
         Assert.True(remounted.Success);
@@ -147,7 +163,7 @@ public sealed class ContainerSessionRoutingTests : IDisposable
             ObserverEvidenceJson.BuildSingleContainer(
                 ContainerHexA,
                 [new ObserverEvidenceJson.VolumeJson("Data", 101),
-                 new ObserverEvidenceJson.VolumeJson("Backup", 102)]),
+                 new ObserverEvidenceJson.VolumeJson("Backup", 102)], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")),
             launched,
             visibility);
         var planned = BuildPlanned(backend, ["R", "S"], MountAccessMode.ReadOnly);
@@ -174,6 +190,7 @@ public sealed class ContainerSessionRoutingTests : IDisposable
         Assert.Equal("ContainerOwnerPoisoned", reattach.DiagnosticCode);
         Assert.Single(launched);
 
+        PublishTerminalContainerStatus(backend);
         visibility["R:\\"] = false;
         Assert.Equal(1, GetContainerGroupCount(backend));
         visibility["S:\\"] = false;
@@ -201,7 +218,7 @@ public sealed class ContainerSessionRoutingTests : IDisposable
             ObserverEvidenceJson.BuildSingleContainer(
                 ContainerHexA,
                 [new ObserverEvidenceJson.VolumeJson("Data", 101),
-                 new ObserverEvidenceJson.VolumeJson("Backup", 102)]),
+                 new ObserverEvidenceJson.VolumeJson("Backup", 102)], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")),
             launched,
             visibility,
             hooks => hooks.ProbeExactProcessHandleExit = process => process.HasExited);
@@ -220,11 +237,15 @@ public sealed class ContainerSessionRoutingTests : IDisposable
 
         Assert.True(cancellation.IsCancellationRequested);
         Assert.True(result.Success, result.Error);
+        Assert.True(result.ContainerMemberDetached);
+        Assert.True(result.PendingDurabilityCleared);
+        Assert.False(result.HostOwnershipReleased);
         Assert.True(IsProcessAlive(ownerPid));
         Assert.Equal(1, GetContainerGroupCount(backend));
         Assert.Single(await backend.GetMountStateAsync(CancellationToken.None));
         Assert.Single(launched);
 
+        PublishTerminalContainerStatus(backend);
         visibility["R:\\"] = false;
         using (var owner = Process.GetProcessById(ownerPid))
         {
@@ -254,7 +275,7 @@ public sealed class ContainerSessionRoutingTests : IDisposable
             ObserverEvidenceJson.BuildSingleContainer(
                 ContainerHexA,
                 [new ObserverEvidenceJson.VolumeJson("Data", 101),
-                 new ObserverEvidenceJson.VolumeJson("Backup", 102)]),
+                 new ObserverEvidenceJson.VolumeJson("Backup", 102)], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")),
             launched,
             visibility);
         var planned = BuildPlanned(backend, ["R", "S"], MountAccessMode.ReadOnly);
@@ -283,6 +304,7 @@ public sealed class ContainerSessionRoutingTests : IDisposable
         Assert.Equal(1, GetContainerGroupCount(backend));
         Assert.Single(launched);
 
+        PublishTerminalContainerStatus(backend);
         visibility["R:\\"] = false;
         visibility["S:\\"] = false;
         Assert.True(
@@ -308,7 +330,7 @@ public sealed class ContainerSessionRoutingTests : IDisposable
             ObserverEvidenceJson.BuildSingleContainer(
                 ContainerHexA,
                 [new ObserverEvidenceJson.VolumeJson("Data", 101),
-                 new ObserverEvidenceJson.VolumeJson("Backup", 102)]),
+                 new ObserverEvidenceJson.VolumeJson("Backup", 102)], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")),
             launched,
             visibility);
         var planned = BuildPlanned(backend, ["R", "S"], MountAccessMode.ReadOnly);
@@ -338,6 +360,7 @@ public sealed class ContainerSessionRoutingTests : IDisposable
         Assert.Equal("ContainerOwnerPoisoned", retry.DiagnosticCode);
         Assert.Single(launched);
 
+        PublishTerminalContainerStatus(backend);
         visibility["R:\\"] = false;
         visibility["S:\\"] = false;
         Assert.True(
@@ -363,7 +386,7 @@ public sealed class ContainerSessionRoutingTests : IDisposable
             ObserverEvidenceJson.BuildSingleContainer(
                 ContainerHexA,
                 [new ObserverEvidenceJson.VolumeJson("Data", 101),
-                 new ObserverEvidenceJson.VolumeJson("Backup", 102)]),
+                 new ObserverEvidenceJson.VolumeJson("Backup", 102)], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")),
             launched,
             visibility,
             hooks => hooks.ProbeExactProcessHandleExit = process =>
@@ -390,6 +413,9 @@ public sealed class ContainerSessionRoutingTests : IDisposable
         Assert.True((await backend.UnmountAsync("S:\\", CancellationToken.None)).Success);
         await detachResponse;
         var last = await backend.UnmountAsync("R:\\", CancellationToken.None);
+        Assert.False(last.ContainerMemberDetached);
+        PublishTerminalContainerStatus(backend);
+        visibility["R:\\"] = false;
 
         // Last eject stops the owner (force-stopped shim => legacy
         // not-clean shape with MountRemoved, mirroring UnmountAsync).
@@ -414,7 +440,7 @@ public sealed class ContainerSessionRoutingTests : IDisposable
             ObserverEvidenceJson.BuildSingleContainer(
                 ContainerHexA,
                 [new ObserverEvidenceJson.VolumeJson("Data", 101),
-                 new ObserverEvidenceJson.VolumeJson("Backup", 102)]),
+                 new ObserverEvidenceJson.VolumeJson("Backup", 102)], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")),
             launched,
             configureHooks: hooks =>
             {
@@ -433,6 +459,7 @@ public sealed class ContainerSessionRoutingTests : IDisposable
         var manifestPath = GetContainerManifestPath(backend, ContainerHexA);
         Assert.True(File.Exists(manifestPath));
 
+        PublishTerminalContainerStatus(backend);
         allowExitProof = true;
         Assert.True(
             SpinWait.SpinUntil(
@@ -453,7 +480,7 @@ public sealed class ContainerSessionRoutingTests : IDisposable
             ObserverEvidenceJson.BuildSingleContainer(
                 ContainerHexA,
                 [new ObserverEvidenceJson.VolumeJson("Data", 101),
-                 new ObserverEvidenceJson.VolumeJson("Backup", 102)]),
+                 new ObserverEvidenceJson.VolumeJson("Backup", 102)], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")),
             launched);
         var planned = BuildPlanned(backend, ["R", "S"], MountAccessMode.ReadOnly);
         backend.StartContainerGroupOwner(
@@ -487,7 +514,7 @@ public sealed class ContainerSessionRoutingTests : IDisposable
             ObserverEvidenceJson.BuildSingleContainer(
                 ContainerHexA,
                 [new ObserverEvidenceJson.VolumeJson("Data", 101),
-                 new ObserverEvidenceJson.VolumeJson("Backup", 102)]),
+                 new ObserverEvidenceJson.VolumeJson("Backup", 102)], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")),
             launched,
             visibility);
         var planned = BuildPlanned(backend, ["R", "S"], MountAccessMode.ReadOnly);
@@ -530,7 +557,7 @@ public sealed class ContainerSessionRoutingTests : IDisposable
             ObserverEvidenceJson.BuildSingleContainer(
                 ContainerHexA,
                 [new ObserverEvidenceJson.VolumeJson("Data", 101),
-                 new ObserverEvidenceJson.VolumeJson("Backup", 102)]),
+                 new ObserverEvidenceJson.VolumeJson("Backup", 102)], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")),
             launched);
         var planned = BuildPlanned(backend, ["R", "S"], MountAccessMode.ReadOnly);
         backend.StartContainerGroupOwner(
@@ -567,7 +594,7 @@ public sealed class ContainerSessionRoutingTests : IDisposable
             temp,
             ObserverEvidenceJson.BuildSingleContainer(
                 ContainerHexA,
-                [new ObserverEvidenceJson.VolumeJson("Data", 101)]));
+                [new ObserverEvidenceJson.VolumeJson("Data", 101)], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")));
 
         var status = await backend.GetContainerMountStatusAsync(
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", CancellationToken.None);
@@ -623,7 +650,8 @@ public sealed class ContainerSessionRoutingTests : IDisposable
         string evidence,
         List<string[]>? launched = null,
         ConcurrentDictionary<string, bool>? visibility = null,
-        Action<HostProcessLifecycleTestHooks>? configureHooks = null)
+        Action<HostProcessLifecycleTestHooks>? configureHooks = null,
+        Action<ServiceHostOptions>? configureOptions = null)
     {
         var imagePath = Path.Combine(temp.Path, "fixture.apfs.img");
         SyntheticApfsTestImage.CreateCatalogFixture(imagePath);
@@ -638,10 +666,11 @@ public sealed class ContainerSessionRoutingTests : IDisposable
             },
             IsMountVisible = mountPoint =>
                 visibility?.GetValueOrDefault(mountPoint) ?? false,
+            QueryDosDevice = (name, _) => visibility?.GetValueOrDefault(name + ":\\") == true
+                ? (1u, 0) : (0u, 2),
         };
         configureHooks?.Invoke(hooks);
-        var backend = new NativeApfsBackend(
-            new ServiceHostOptions
+        var options = new ServiceHostOptions
             {
                 BackendMode = "Native",
                 NativeAutoDiscoverPhysicalDrives = false,
@@ -649,7 +678,10 @@ public sealed class ContainerSessionRoutingTests : IDisposable
                 NativeHostStartupTimeoutSeconds = 2,
                 NativeHostStopTimeoutSeconds = 2,
                 NativeWriteEvidenceStorePath = Path.Combine(temp.Path, "evidence.json"),
-            },
+            };
+        configureOptions?.Invoke(options);
+        var backend = new NativeApfsBackend(
+            options,
             hooks,
             observerRunner: new StubRunner(new ObserverRunResult(0, evidence, string.Empty)),
             observerPathOverride: observerShim);
@@ -745,6 +777,21 @@ public sealed class ContainerSessionRoutingTests : IDisposable
         return (string)owner.GetType().GetProperty("StatusFilePath")!.GetValue(owner)!;
     }
 
+    private static void PublishTerminalContainerStatus(NativeApfsBackend backend)
+    {
+        var group = GetContainerGroup(backend, ContainerHexA);
+        var owner = group.GetType().GetProperty("Owner")!.GetValue(group)!;
+        var pid = (int)owner.GetType().GetProperty("ProcessId")!.GetValue(owner)!;
+        var creation = (long?)owner.GetType().GetProperty("ProcessCreationTimeFileTimeUtc")!.GetValue(owner);
+        Assert.True(pid > 0 && creation > 0);
+        File.WriteAllText(GetContainerStatusPath(backend, ContainerHexA), JsonSerializer.Serialize(new
+        {
+            containerUuid = ContainerHexA, ownerPid = pid, ownerStartFileTimeUtc = creation,
+            leaseHeld = false, checkpointXid = 7ul, recoveryRequired = false,
+            recoveryVolumeObjectId = (ulong?)null, recoveryReason = string.Empty, volumes = Array.Empty<object>(),
+        }));
+    }
+
     private static string ArgumentValue(string[] arguments, string name)
     {
         var index = Array.IndexOf(arguments, name);
@@ -759,7 +806,13 @@ public sealed class ContainerSessionRoutingTests : IDisposable
         ConcurrentDictionary<string, bool> visibility,
         string mountPoint,
         int ownerPid,
-        CancellationTokenSource? cancelAfterPublication = null)
+        CancellationTokenSource? cancelAfterPublication = null,
+        Action<JsonObject>? configureStatus = null,
+        string? responseCode = null,
+        string? responseRequestId = null,
+        string responseStatus = "ok",
+        bool keepMountVisible = false,
+        Action? beforeResponse = null)
     {
         var requestPath = ArgumentValue(launchArguments, "--container-control-file");
         var token = ArgumentValue(launchArguments, "--container-control-token");
@@ -773,9 +826,20 @@ public sealed class ContainerSessionRoutingTests : IDisposable
                 }
 
                 Assert.True(File.Exists(requestPath), "Backend did not publish a container control request.");
-                var fields = File.ReadAllLines(requestPath)
-                    .Select(static value => value.TrimEnd('\r'))
-                    .ToArray();
+                string[] fields;
+                while (true)
+                {
+                    try
+                    {
+                        fields = File.ReadAllLines(requestPath)
+                            .Select(static value => value.TrimEnd('\r')).ToArray();
+                        break;
+                    }
+                    catch (IOException) when (DateTime.UtcNow < deadline)
+                    {
+                        Thread.Sleep(1);
+                    }
+                }
                 Assert.Equal(5, fields.Length);
                 Assert.Equal("APFS-CONTROL/1", fields[0]);
                 Assert.Equal(token, fields[2]);
@@ -784,16 +848,18 @@ public sealed class ContainerSessionRoutingTests : IDisposable
 
                 cancelAfterPublication?.Cancel();
                 File.Delete(requestPath);
-                visibility[mountPoint] = string.Equals(expectedAction, "attach", StringComparison.Ordinal);
+                visibility[mountPoint] = keepMountVisible || string.Equals(expectedAction, "attach", StringComparison.Ordinal);
                 PublishContainerStatus(
                     launchArguments,
                     ownerPid,
-                    visibility);
+                    visibility,
+                    configureStatus);
+                beforeResponse?.Invoke();
                 var responsePath = requestPath + ".response";
                 var temporaryResponsePath = responsePath + ".tmp-" + Guid.NewGuid().ToString("N");
                 File.WriteAllText(
                     temporaryResponsePath,
-                    $"APFS-CONTROL/1\n{fields[1]}\nok\n{(expectedAction == "attach" ? "Attached" : "Detached")}\n");
+                    $"APFS-CONTROL/1\n{responseRequestId ?? fields[1]}\n{responseStatus}\n{responseCode ?? (expectedAction == "attach" ? "Attached" : "Detached")}\n");
                 File.Move(temporaryResponsePath, responsePath, overwrite: false);
             },
             CancellationToken.None,
@@ -834,7 +900,8 @@ public sealed class ContainerSessionRoutingTests : IDisposable
     private static void PublishContainerStatus(
         string[] launchArguments,
         int ownerPid,
-        ConcurrentDictionary<string, bool> visibility)
+        ConcurrentDictionary<string, bool> visibility,
+        Action<JsonObject>? configureStatus = null)
     {
         var manifestPath = ArgumentValue(launchArguments, "--container-manifest");
         var statusPath = ArgumentValue(launchArguments, "--status-file");
@@ -857,6 +924,19 @@ public sealed class ContainerSessionRoutingTests : IDisposable
                     writeDegraded = false,
                     recoveryReason = string.Empty,
                     recoveryIdentity = volume.GetProperty("recoveryIdentity").GetString() ?? string.Empty,
+                    dirtyTransactionCount = 0,
+                    inFlightMutationCallbacks = 0,
+                    shutdownDrainActive = false,
+                    closeCommitDeferred = false,
+                    deferredCommitRequested = false,
+                    deferredCommitInFlight = false,
+                    walRecoveryStateValid = true,
+                    walAcceptedSequence = 7ul,
+                    walApfsDurableSequence = 7ul,
+                    walCleanupSequence = 7ul,
+                    payloadSpoolDirtyRangeCount = 0ul,
+                    payloadSpoolIndexDirty = false,
+                    payloadSpoolRecoveryRequired = false,
                 };
             })
             .ToArray();
@@ -872,8 +952,10 @@ public sealed class ContainerSessionRoutingTests : IDisposable
             recoveryReason = string.Empty,
             volumes = rows,
         };
+        var statusNode = JsonSerializer.SerializeToNode(status)!.AsObject();
+        configureStatus?.Invoke(statusNode);
         var temporary = statusPath + ".test-tmp";
-        File.WriteAllText(temporary, JsonSerializer.Serialize(status));
+        File.WriteAllText(temporary, statusNode.ToJsonString());
         File.Move(temporary, statusPath, overwrite: true);
     }
 

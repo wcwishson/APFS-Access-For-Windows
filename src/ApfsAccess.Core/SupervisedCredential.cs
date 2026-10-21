@@ -6,15 +6,15 @@ using Microsoft.Win32.SafeHandles;
 namespace ApfsAccess.Cli;
 
 // Owns the only supervisor copy. No managed strings/arrays contain frame bytes.
-internal sealed class SupervisedCredential : IDisposable
+public sealed partial class SupervisedCredential : IDisposable
 {
     private const int Capacity = 8 + 1024 + 1;
     private nint memory;
     private int length;
-    internal SafeFileHandle? Reader { get; private set; }
+    public SafeFileHandle? Reader { get; private set; }
     private SafeFileHandle? writer;
 
-    internal static SupervisedCredential Receive(nint input, CancellationToken cancellation, Action checkOwner,
+    public static SupervisedCredential Receive(nint input, CancellationToken cancellation, Action checkOwner,
         int timeoutMs = 5000)
     {
         var frame = new SupervisedCredential();
@@ -68,15 +68,16 @@ internal sealed class SupervisedCredential : IDisposable
         catch { frame.Dispose(); throw; }
     }
 
-    internal static nint TakeStandardInput()
+    public static nint TakeStandardInput()
     {
         var input = GetStdHandle(-10);
         if (!SetStdHandle(-10, 0)) throw Failure("InputHandle");
         return input;
     }
 
-    internal void CreateChildPipe()
+    public void CreateChildPipe()
     {
+        if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException();
         using var identity = WindowsIdentity.GetCurrent();
         var user = identity.User?.Value ?? throw Failure("PipeIdentity");
         // Explicit owner is required even for elevated tokens whose default owner is Administrators.
@@ -99,9 +100,9 @@ internal sealed class SupervisedCredential : IDisposable
         finally { LocalFree(descriptor); }
     }
 
-    internal void ReleaseLocalReader() { Reader?.Dispose(); Reader = null; }
+    public void ReleaseLocalReader() { Reader?.Dispose(); Reader = null; }
 
-    internal void Send(CancellationToken cancellation, Action checkOwnerAndChild)
+    public void Send(CancellationToken cancellation, Action checkOwnerAndChild)
     {
         try
         {

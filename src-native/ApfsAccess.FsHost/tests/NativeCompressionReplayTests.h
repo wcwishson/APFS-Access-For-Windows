@@ -32,26 +32,38 @@ struct HostCompressionReplay222Fixture
     std::vector<std::byte> expected;
     std::vector<Tx::MutationIntent> intents;
 
-    bool Initialize(unsigned type, bool external = false, bool omit_name = false, bool external_finder = false)
+    bool Initialize(unsigned type, bool external = false, bool omit_name = false, bool external_finder = false,
+        std::uint64_t private_id = 17)
     {
         using namespace apfsaccess::rw;
         using Preparation = apfsaccess::fshost::NativeCompressionRewrite;
-        if (!owned.Initialize(type, false, omit_name, external_finder)) return false;
+        if (!owned.Initialize(type, false, omit_name, external_finder, false, 0, private_id))
+        { std::cerr << "[compression fixture] source initialization type=" << type << " private=" << private_id << '\n'; return false; }
         auto& c = *owned.fixture.context;
         auto& store = *c.metadata_store;
         auto& tx = *c.tx_manager;
         const auto inode = store.LookupCommittedInodeByPath(L"\\alias");
-        if (!inode || !store.ReadCommittedFileRange(L"\\alias", 0, static_cast<std::size_t>(owned.eof), expected) ||
-            expected.size() != owned.eof || !tx.Begin()) return false;
+        const auto preserve_failure = [&] {
+            const auto saved = std::filesystem::temp_directory_path() /
+                (owned.fixture.image.path.filename().wstring() + L".c1-source-failure");
+            (void)WriteFileBytes(saved, ReadFileBytes(owned.fixture.image.path));
+            std::wcerr << L"[compression fixture] retained source " << saved.wstring() << L'\n';
+        };
+        if (!inode) {preserve_failure();std::cerr << "[compression fixture] alias absent\n";return false;}
+        if (!store.ReadCommittedFileRange(L"\\alias", 0, static_cast<std::size_t>(owned.eof), expected) || expected.size() != owned.eof)
+        { preserve_failure();std::cerr << "[compression fixture] source read type=" << type << " private=" << private_id << " bytes=" << expected.size() << " eof=" << owned.eof << '\n';return false; }
+        if (!tx.Begin()) {preserve_failure();std::cerr << "[compression fixture] Begin refused\n";return false;}
         Preparation::Failure reason;
         auto plan = Preparation::Prepare(store, tx, HostCompressionRewrite211Admission(), L"\\alias",
             {inode->object_id, inode->xid}, 1, 1, reason);
-        if (!plan) return false;
+        if (!plan)
+        { std::cerr << "[compression fixture] prepare failure=" << static_cast<int>(reason) << " type=" << type << " private=" << private_id << '\n'; return false; }
         preimage = plan->PreimageCheckpoint();
         intents.push_back(plan->JournalIntent());
         Store::PayloadIdentity target;
         if (!tx.RecordMutation(intents.back()) ||
-            store.StageMutation(plan->Request(), &target) != Store::MutationStatus::Applied) return false;
+            store.StageMutation(plan->Request(), &target) != Store::MutationStatus::Applied)
+        { std::cerr << "[compression fixture] record or stage rewrite type=" << type << " private=" << private_id << '\n'; return false; }
         const auto times = [&](std::uint64_t ticks) {
             Tx::MutationIntent intent;
             intent.kind = Tx::MutationKind::SetInodeMetadata;
@@ -65,12 +77,14 @@ struct HostCompressionReplay222Fixture
             intents.push_back(intent);
             return tx.RecordMutation(intent) && store.StageMutation(request) == Store::MutationStatus::Applied;
         };
-        if (!times(InodeMetadataPatch::UnixEpochTicks + 123456789)) return false;
+        if (!times(InodeMetadataPatch::UnixEpochTicks + 123456789))
+        { std::cerr << "[compression fixture] initial times\n"; return false; }
         for (const auto [offset, byte] : std::vector<std::pair<std::uint64_t, std::byte>>{
                 {1, std::byte{'X'}}, {1, std::byte{'Z'}}, {owned.eof - 1, std::byte{'Y'}}})
         {
             Store::MutationRequest request;
-            if (!plan->PrepareWrite(store, target, L"\\compressed", offset, 1, request)) return false;
+            if (!plan->PrepareWrite(store, target, L"\\compressed", offset, 1, request))
+            { std::cerr << "[compression fixture] prepare write\n"; return false; }
             Tx::MutationIntent intent;
             intent.kind = Tx::MutationKind::Write; intent.path = request.path;
             intent.object_id = target.object_id; intent.generation = target.generation; intent.offset = offset;
@@ -87,10 +101,12 @@ struct HostCompressionReplay222Fixture
                 intent.inline_payload.clear();
             }
             intents.push_back(intent);
-            if (!tx.RecordMutation(intent) || store.StageMutation(request) != Store::MutationStatus::Applied) return false;
+            if (!tx.RecordMutation(intent) || store.StageMutation(request) != Store::MutationStatus::Applied)
+            { std::cerr << "[compression fixture] record or stage write\n"; return false; }
             expected[static_cast<std::size_t>(offset)] = byte;
         }
-        if (!times(InodeMetadataPatch::UnixEpochTicks + 987654321)) return false;
+        if (!times(InodeMetadataPatch::UnixEpochTicks + 987654321))
+        { std::cerr << "[compression fixture] final times\n"; return false; }
         // The test provider supplies ordinary write ranges; the native engine
         // remains responsible for decompression and untouched original bytes.
         store.SetFilePayloadRangeProvider([this, target](const auto&, auto identity, auto offset, auto bytes) {
@@ -100,7 +116,8 @@ struct HostCompressionReplay222Fixture
             return true;
         });
         if (external && !c.payload_spool->FlushDirtyState()) return false;
-        if (!tx.Accept(preimage)) return false;
+        if (!tx.Accept(preimage))
+        { std::cerr << "[compression fixture] accept\n"; return false; }
         sequence = tx.Watermarks().accepted_sequence;
         return sequence != 0;
     }
@@ -355,13 +372,23 @@ bool TestNativeCompressionReplayForged222()
     return true;
 }
 
-bool TestNativeCompressionPreservedStreamAuthentication()
+bool TestNativeCompressionPreservedStreamAuthentication(std::uint64_t private_id = 17)
 {
     using F = HostCompressionReplay222Fixture;
     using Result = F::Replay::Result;
     if (!CompressionReplay222ScratchReady()) return false;
     F fixture;
-    if (!Require(fixture.Initialize(3, false, false, true) && fixture.Publish(),
+    const bool initialized = fixture.Initialize(3, false, false, true, private_id);
+    const bool published = initialized && fixture.Publish();
+    if (!published)
+    {
+        const auto& failed = *fixture.owned.fixture.context;
+        std::wcerr << L"[compression attribute] private=" << private_id << L" initialized=" << initialized
+            << L" stage=" << Utf8ToWide(failed.metadata_store->LastCommitStage())
+            << L" reason=" << failed.metadata_store->LastCommitFailureReason()
+            << L" detail=" << failed.metadata_store->LastCommitFailureDetail() << L'\n';
+    }
+    if (!Require(published,
         "publish compressed owner with a separately stored ordinary FinderInfo")) return false;
     auto& c = *fixture.owned.fixture.context;
     F::Store fresh(fixture.owned.fixture.volume);
@@ -389,6 +416,79 @@ bool TestNativeCompressionPreservedStreamAuthentication()
         "file content still exactly matches accepted writes after unrelated stream tamper")) return false;
     return Require(fixture.Verify(corrupted) == Result::MetadataMismatch,
         "accepted fingerprint detects external metadata tamper despite shared old and new extents");
+}
+
+bool TestNativeCompressionDistinctStreamOwner()
+{
+    using namespace apfsaccess;
+    using F = HostCompressionReplay222Fixture;
+    if (!CompressionReplay222ScratchReady()) return false;
+    {
+    F fixture;
+    if (!Require(fixture.Initialize(4, true, false, true, 29) && fixture.Publish(),
+        "distinct stream owner publishes accepted conversion with independent FinderInfo")) return false;
+    auto& c = *fixture.owned.fixture.context;
+    F::Store fresh(fixture.owned.fixture.volume);
+    if (!Require(fresh.PrepareNativeWritePath() && fixture.Verify(fresh) == F::Replay::Result::Verified,
+        "distinct stream owner verifies from actual accepted original and retained preimage")) return false;
+    const auto inode = fresh.LookupCommittedInodeByPath(L"\\compressed");
+    std::vector<std::byte> content;
+    if (!Require(inode && inode->object_id == 17 && inode->private_id == 29 &&
+        fresh.ReadCommittedFileRange(L"\\alias", 0, fixture.expected.size(), content) && content == fixture.expected,
+        "distinct stream identity and every published byte survive fresh native read")) return false;
+    auto image = ReadFileBytes(fixture.owned.fixture.image.path);
+    catalog::VectorRandomAccessSource source(image);std::string error;
+    const auto checkpoint = catalog::LoadAppleCheckpointView(source, 0, source.SizeBytes(), error);
+    if (!Require(checkpoint && checkpoint->volumes.size() == 1 && checkpoint->volumes[0].extentref_tree,
+        "wrong-owner control finds actual current reference tree")) return false;
+    const auto& root = *checkpoint->volumes[0].extentref_tree;
+    const auto bs = checkpoint->container.superblock.block_size;
+    std::vector<catalog::BtreeRecord> records;
+    if (!catalog::ReadBtreeLeafRecords(source, bs, root.physical_block, true, 0,
+        checkpoint->container.superblock.xid, records, error)) return false;
+    bool changed = false, finder = false;
+    for (auto& record : records)
+    {
+        rw::ApplePhysicalExtentRecord extent;
+        if (!rw::DecodeApplePhysicalExtentRecord(record, extent, error)) return false;
+        if (extent.owning_object_id == 29)
+        {
+            extent.owning_object_id = 17;
+            if (!rw::EncodeApplePhysicalExtentRecord(extent, record, error)) return false;
+            changed = true;
+        }
+        if (extent.physical_block <= 103 && 103 - extent.physical_block < extent.block_count)
+            finder = extent.owning_object_id == 17 && extent.reference_count == 1;
+    }
+    if (!Require(changed && finder, "new file owner is 29 while independent attribute remains header-owned 17")) return false;
+    std::vector<std::vector<std::byte>> keys, values;
+    for (const auto& record : records){keys.push_back(record.key);values.push_back(record.value);}
+    const auto leaf = testfixture::BuildRawLeafNode(keys, values, checkpoint->container.superblock.xid,
+        bs, 0, root.object_id, root.type, root.subtype);
+    const auto offset = root.physical_block * bs;
+    if (offset > image.size() || leaf.size() > image.size() - offset) return false;
+    std::copy(leaf.begin(), leaf.end(), image.begin() + static_cast<std::size_t>(offset));
+    ContainerFixtureFile forged("compression-distinct-wrong-owner", true, true);
+    auto context = fixture.owned.fixture.volume;context.device_path = forged.path.wstring();
+    if (!WriteFileBytes(forged.path, ReadFileBytes(fixture.owned.fixture.image.path))) return false;
+    {
+        F::Store valid(context);
+        if (!Require(valid.PrepareNativeWritePath() && fixture.Verify(valid) == F::Replay::Result::Verified,
+            "identical private copy verifies before only the physical owner is changed")) return false;
+    }
+    if (!WriteFileBytes(forged.path, image)) return false;
+    const auto marks = c.tx_manager->Watermarks();
+    const auto wal = ReadFileBytes(c.session_root / "accepted.wal");
+    F::Store wrong(context);
+    const bool loaded = wrong.PrepareNativeWritePath();
+    if (!Require((!loaded || fixture.Verify(wrong) != F::Replay::Result::Verified) &&
+        image == ReadFileBytes(forged.path) && wal == ReadFileBytes(c.session_root / "accepted.wal") &&
+        c.tx_manager->Watermarks().accepted_sequence == marks.accepted_sequence &&
+        c.tx_manager->Watermarks().apfs_durable_sequence == marks.apfs_durable_sequence &&
+        c.tx_manager->Watermarks().cleanup_sequence == marks.cleanup_sequence,
+        "checksummed wrong ordinary owner refuses without changing image or accepted authority")) return false;
+    }
+    return TestNativeCompressionPreservedStreamAuthentication(29);
 }
 
 bool TestCompressionReplayWalBudget()

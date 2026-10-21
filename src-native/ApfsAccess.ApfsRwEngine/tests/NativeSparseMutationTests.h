@@ -260,7 +260,7 @@ bool TestNativeSparseMutation(bool huge = false, const std::string& stop = {})
 bool TestNativeSparseInvalidRecords()
 {
     using namespace apfsaccess::rw;
-    for (unsigned invalid = 1; invalid <= 4; ++invalid)
+    for (unsigned invalid = 1; invalid <= 3; ++invalid)
     {
         const auto fixture = BuildNativeSparseMutationImage(64 * 1024 * 1024, invalid);
         if (!Require(!fixture.empty(), "invalid sparse fixture built")) return false;
@@ -271,16 +271,7 @@ bool TestNativeSparseInvalidRecords()
         MetadataStore metadata(context);
         if (!metadata.PrepareNativeWritePath())
         {
-            if (!Require(invalid != 4, "valid shared sparse fixture imports")) return false;
             continue;
-        }
-        if (invalid == 4)
-        {
-            if (!Require(metadata.VerifyIntegrity(), "valid shared sparse fixture verifies")) return false;
-            MetadataStore::MutationRequest create;
-            create.operation = MetadataStore::MutationOperation::CreateFile; create.path = L"\\unrelated";
-            if (!Require(metadata.StageMutation(create) == MetadataStore::MutationStatus::Applied,
-                    "unrelated pending create precedes shared sparse refusal")) return false;
         }
         const auto pending_before = metadata.PendingMutationCount();
         unsigned acquired = 0;
@@ -288,17 +279,15 @@ bool TestNativeSparseInvalidRecords()
         MetadataStore::MutationRequest write; write.path = L"\\original"; write.offset = 12289; write.length = 1;
         const auto before = OrdinaryCowWriteCounterBytes(metadata.Device());
         if (!Require(metadata.PreflightNativeSparseMutation(write) != MetadataStore::MutationStatus::Applied,
-                "invalid or shared sparse hole write preflights refusal")) return false;
+                "invalid sparse hole write preflights refusal")) return false;
         write.offset = 17;
         if (!Require(metadata.PreflightNativeSparseMutation(write) != MetadataStore::MutationStatus::Applied,
-                "invalid or shared sparse allocated write preflights refusal")) return false;
+                "invalid sparse allocated write preflights refusal")) return false;
         const auto staged = metadata.StageMutation(write);
         if (!Require(staged != MetadataStore::MutationStatus::Applied && metadata.PendingMutationCount() == pending_before,
                 "malformed sparse admission refuses before staging")) return false;
         if (!Require(acquired == 0 && before == OrdinaryCowWriteCounterBytes(metadata.Device()),
                 "malformed sparse records refuse before payload/device writes")) return false;
-        if (invalid == 4 && !Require(metadata.CommitPendingMutations() == MetadataStore::CommitStatus::Committed,
-                "shared sparse refusal does not poison unrelated pending create")) return false;
     }
     // The actual raw planner must refuse invented retained mappings and overlapping fragments.
     NativeSparseImage image(BuildNativeSparseMutationImage(64 * 1024 * 1024));

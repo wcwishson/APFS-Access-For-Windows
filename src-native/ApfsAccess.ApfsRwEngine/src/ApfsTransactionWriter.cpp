@@ -246,7 +246,7 @@ int CompareKeys(const std::vector<std::byte>& left,
         }
         return left_pair < right_pair ? -1 : 1;
     }
-    if (order == AppleBtreeKeyOrder::PhysicalExtent)
+    if (order == AppleBtreeKeyOrder::PhysicalExtent || order == AppleBtreeKeyOrder::SnapshotObjectMap)
     {
         const auto lhs = catalog::ReadU64LE(left, 0).value();
         const auto rhs = catalog::ReadU64LE(right, 0).value();
@@ -588,6 +588,14 @@ bool SortAppleBtreeRecords(std::vector<catalog::BtreeRecord>& records,
             {
                 return Fail(out_error, "AppleBtreeFreeQueueRecordInvalid");
             }
+        }
+        else if (order == AppleBtreeKeyOrder::SnapshotObjectMap)
+        {
+            if (record.key.size()!=8 || record.value.size()!=16 ||
+                catalog::ReadU64LE(record.key,0).value_or(0)==0 ||
+                catalog::ReadU64LE(record.value,0).value_or(1)!=0 ||
+                catalog::ReadU64LE(record.value,8).value_or(1)!=0)
+                return Fail(out_error,"AppleBtreeSnapshotOmapRecordUnsupported");
         }
         else if (order == AppleBtreeKeyOrder::PhysicalExtent)
         {
@@ -1003,13 +1011,18 @@ bool EncodeAppleFileExtentRecord(const AppleFileExtentRecord& value,
     return true;
 }
 
-bool DecodeAppleFileExtentRecord(const catalog::BtreeRecord& record,
-    std::uint32_t block_size, AppleFileExtentRecord& out_value, std::string& out_error)
+static bool DecodeFileExtentFields(const catalog::BtreeRecord& record,
+    std::uint32_t block_size, std::uint8_t allowed_flags, AppleFileExtentRecord& out_value,
+    std::uint8_t& out_flags, std::string& out_error)
 {
     out_value = {};
+    out_flags = 0;
     out_error.clear();
     if (record.key.size() != 16 || record.value.size() != 24)
         return Fail(out_error, "AppleFileExtentRecordInvalid");
+    const auto flags = static_cast<std::uint8_t>(catalog::ReadU64LE(record.value, 0).value() >> 56);
+    if ((flags & ~allowed_flags) != 0)
+        return Fail(out_error, allowed_flags ? "AppleEncryptedFileExtentFlagsUnsupported" : "AppleFileExtentRecordInvalid");
     const auto header = catalog::ReadU64LE(record.key, 0).value_or(0);
     AppleFileExtentRecord decoded{
         header & kFsObjectIdMask,
@@ -1021,10 +1034,70 @@ bool DecodeAppleFileExtentRecord(const catalog::BtreeRecord& record,
     if ((header >> 60) != 8 || decoded.object_id == 0 || block_size == 0 || !IsPowerOfTwo(block_size) ||
         decoded.length_bytes == 0 || (decoded.physical_block == 0 && decoded.crypto_id != 0) ||
         decoded.logical_address % block_size != 0 || decoded.length_bytes % block_size != 0 ||
-        catalog::ReadU64LE(record.value, 0).value_or(0) != decoded.length_bytes ||
         decoded.length_bytes > std::numeric_limits<std::uint64_t>::max() - decoded.logical_address ||
         decoded.length_bytes / block_size > std::numeric_limits<std::uint64_t>::max() - decoded.physical_block)
         return Fail(out_error, "AppleFileExtentRecordInvalid");
+    out_value = decoded;
+    out_flags = flags;
+    return true;
+}
+
+bool DecodeAppleFileExtentRecord(const catalog::BtreeRecord& record,
+    std::uint32_t block_size, AppleFileExtentRecord& out_value, std::string& out_error)
+{
+    std::uint8_t flags = 0;
+    return DecodeFileExtentFields(record, block_size, 0, out_value, flags, out_error);
+}
+
+static bool ValidateEncryptedExtent(const AppleEncryptedFileExtentRecord& value,
+    AppleEncryptedExtentProfile profile, std::string& out_error)
+{
+    if (profile != AppleEncryptedExtentProfile::OneKeyGenerationZero)
+        return Fail(out_error, "AppleEncryptedFileExtentProfileUnsupported");
+    if ((value.flags & ~1u) != 0)
+        return Fail(out_error, "AppleEncryptedFileExtentFlagsUnsupported");
+    const auto& extent = value.extent;
+    if (extent.block_size < 4096 || extent.block_size > 65536 || !IsPowerOfTwo(extent.block_size))
+        return Fail(out_error, "AppleEncryptedFileExtentBlockSizeInvalid");
+    constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+    if (extent.length_bytes == 0 || extent.length_bytes % extent.block_size != 0 ||
+        extent.length_bytes > maximum - extent.logical_address ||
+        extent.length_bytes / extent.block_size > maximum - extent.physical_block)
+        return Fail(out_error, "AppleFileExtentRecordInvalid");
+    if (extent.physical_block == 0)
+        return extent.crypto_id == 0 || Fail(out_error, "AppleEncryptedFileExtentCryptoIdInvalid");
+    const auto blocks = extent.length_bytes / extent.block_size;
+    const auto units = static_cast<std::uint64_t>(extent.block_size / 512);
+    if (!extent.crypto_id || blocks - 1 > maximum - extent.crypto_id ||
+        extent.crypto_id + blocks - 1 > (maximum - (units - 1)) / units)
+        return Fail(out_error, "AppleEncryptedFileExtentCryptoIdInvalid");
+    return true;
+}
+
+bool EncodeAppleEncryptedFileExtentRecord(const AppleEncryptedFileExtentRecord& value,
+    AppleEncryptedExtentProfile profile, catalog::BtreeRecord& out_record, std::string& out_error)
+{
+    out_record = {};
+    out_error.clear();
+    if (!ValidateEncryptedExtent(value, profile, out_error) ||
+        !EncodeAppleFileExtentRecord(value.extent, out_record, out_error))
+        return false;
+    PutU64(out_record.value, 0, value.extent.length_bytes | (static_cast<std::uint64_t>(value.flags) << 56));
+    return true;
+}
+
+bool DecodeAppleEncryptedFileExtentRecord(const catalog::BtreeRecord& record,
+    std::uint32_t block_size, AppleEncryptedExtentProfile profile,
+    AppleEncryptedFileExtentRecord& out_value, std::string& out_error)
+{
+    out_value = {};
+    out_error.clear();
+    if (profile != AppleEncryptedExtentProfile::OneKeyGenerationZero)
+        return Fail(out_error, "AppleEncryptedFileExtentProfileUnsupported");
+    AppleEncryptedFileExtentRecord decoded;
+    if (!DecodeFileExtentFields(record, block_size, 1, decoded.extent, decoded.flags, out_error) ||
+        !ValidateEncryptedExtent(decoded, profile, out_error))
+        return false;
     out_value = decoded;
     return true;
 }
@@ -1078,7 +1151,7 @@ bool EncodeApplePhysicalExtentRecord(const ApplePhysicalExtentRecord& value,
          value.kind != kApplePhysicalExtentKindUpdate) ||
         value.owning_object_id == 0 ||
         value.owning_object_id > kFsObjectIdMask ||
-        value.reference_count <= 0)
+        (value.kind == kApplePhysicalExtentKindNew && value.reference_count <= 0))
     {
         return Fail(out_error, "ApplePhysicalExtentRecordInvalid");
     }
@@ -1122,7 +1195,7 @@ bool DecodeApplePhysicalExtentRecord(const catalog::BtreeRecord& record,
          decoded.kind != kApplePhysicalExtentKindUpdate) ||
         decoded.owning_object_id == 0 ||
         decoded.owning_object_id > kFsObjectIdMask ||
-        decoded.reference_count <= 0)
+        (decoded.kind == kApplePhysicalExtentKindNew && decoded.reference_count <= 0))
     {
         return Fail(out_error, "ApplePhysicalExtentRecordInvalid");
     }

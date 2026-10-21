@@ -18,13 +18,20 @@ container range**:
 ApfsEncryptedReadTool --mode source --image D:\images\sample.img --store-offset 0 --store-size 524288
 ```
 
-This reports source metadata only. It does not discover APFS selectors or unlock
-anything. Preserve its `sourceId`. A subsequent operation acquires a new lease
+This reports source metadata only. Preserve its `sourceId`. A subsequent operation acquires a new lease
 and requires an exact identity match. The source ID contains the observer's
 Windows volume/file ID, file size and last-write time plus exact offset/size.
 It is a public binding token, not a cryptographic authenticity claim. Each actual
 lease also receives a fresh opaque random revision token used internally by the
 production session; file times are never treated as that revision.
+
+For a known exact volume OID, `--mode selectors --volume-oid [decimal]
+--bag-length includes-header` also requires the image and exact store range.
+It reuses the production checkpoint, OMAP, APSB and keybag validation chain to
+return public UUID/OID/XID selectors and user UUIDs in a `Locked` JSON result.
+It takes no credential and grants no unlock, mount or write authority. Special
+keybag object OIDs can be zero; they are taken from validated headers and must
+compare exactly. Physical block addresses are never substituted for them.
 
 Launch inspection with public selectors, using a protected parent-created pipe
 for stdin (the brackets below stand for public values):
@@ -54,6 +61,24 @@ single read is 1 MiB. No EOF clipping: an over-EOF range fails, a zero-byte read
 at EOF succeeds. Byte count and exit status are both part of the caller's result
 contract. A failed output write/cancellation can leave a partial caller-owned
 destination; do not accept it as a completed read.
+
+`--mode metadata --inode [id]` returns scalar inode facts, including mode, size,
+and internal flags. `--mode xattr --inode [id] --xattr [ASCII name]
+--binary-stdout` returns the original embedded attribute bytes. Both use the
+same protected credential channel, source binding, close and output contract.
+Symlinks are metadata only: their bounded filesystem-owned embedded target can
+be read as `com.apple.fs.symlink`; file reads and path traversal do not follow
+it. Apple's exact reserved root/private-directory entries are validated and
+excluded from the user namespace. Nonempty private directories remain refused.
+
+The image read projection admits `INODE_NO_RSRC_FORK` on regular files,
+directories and symlinks. It adapts exact bounded data-only xfield framing to
+the existing record codec and admits only extent flag `FEXT_CRYPTO_ID_IS_TWEAK`
+besides zero. ONEKEY `CRYPTO_SW_ID` is accepted only as a 24-byte no-key zero
+state or the observed version-5/minor-0/class-3/revision-1 meta state. Other
+classes, wrapped-key lengths and flags remain refused. Historical ENC_ROLLED
+alone is supported; active rolling state or OMAP crypto generations are refused.
+These are local read profiles; writer and catalog admission is unchanged.
 
 Stderr carries only fixed public JSON states/failure names on a best-effort basis.
 Use separate stdout/stderr handles; merged streams are not a binary read result.
@@ -143,8 +168,8 @@ handles and file replacement, and all reads stay on the acquired file object.
 This is the observer's OS file-lease model, not a claim of authentication against
 hostile kernel/storage changes or previously established writable mappings.
 Source checksums and UUID checks cannot authenticate malicious or replayed media.
-Real APFS/macOS fixtures, hardware encryption, mounted behavior and service/GUI
-credential capture have not been validated by this synthetic image gate.
+The synthetic gate does not establish real fixture acceptance, hardware
+encryption, mounted behavior or service/GUI credential capture.
 
 Exit codes: 0 success; 2 public CLI/selectors; 3 source lease/scope/identity;
 4 credential framing/pipe/deadline; 5 production unlock/profile refusal;
@@ -171,3 +196,17 @@ change `NxSuperblock` / checkpoint layouts. Do not mix old frozen541 C++ objects
 with new headers. The private review build retains current routing/Fusion and
 encrypted-session cleanup sources, reuses frozen third-party C objects only,
 and does not extend this single-image tool to encrypted Fusion reads.
+
+## Opt-in real fixture reads
+
+`tests/EncryptedRealFixtureIntegration.py` accepts `--fixtures`, `--root`,
+`--tool`, and optional `--baseline-tool` / `--profile`. Keep the acquired images,
+pinned licenses/commit/source notes and evidence outside the repository on D:.
+The harness checks pinned SHA-256 before and after reading, passes only public
+fixture credentials through protected stdin, compares exact independent expected
+file bytes and range hashes, and checks wrong credentials, trailing framing,
+keybag identity, EOF, root flags and metadata-only symlink handling. Evidence
+retains hashes and public selectors/status, not credentials, keys or file bytes.
+It exercises the production parser/unlock/read chain on the actual images.
+Synthetic framing/generation/refusal vectors remain separate evidence. A real
+image read result grants no encrypted writer, physical mount or macOS acceptance.

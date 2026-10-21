@@ -42,7 +42,7 @@ struct PasswordRecordResult
 
 // Low-level DER records only: does NOT establish container/volume identity.
 // Inputs are exact container tag-2 and selected user tag-3 payloads, not lockers.
-// Supports explicit KEK info flags 0 / 0x10 / 2 and VEK flags 0 / 2, 22-byte
+// Supports explicit KEK info flags 0 / 0x10 / 2 and VEK flags 0 / 2, 8/22-byte
 // info, and exact RFC3394 lengths (40 bytes for class 0/0x10, 24 for class 2).
 // Class-2 VEK expands its second XTS half as SHA256(VEK16 || DER key UUID)[:16].
 // Other classes/lengths/extensions, including class-2 ignored tails, unsupported.
@@ -54,6 +54,24 @@ struct PasswordRecordResult
     std::span<const std::byte> vek_der, std::span<const std::byte> kek_der,
     std::span<const std::byte> password, PasswordUnlockBudget& budget) noexcept;
 
+struct PasswordRecordRewrapResult
+{
+    UnlockError error = UnlockError::InvalidArgument;
+    std::vector<std::byte> kek_der; // Authenticated wrapped record only.
+    [[nodiscard]] explicit operator bool() const noexcept
+        { return error == UnlockError::None && !kek_der.empty(); }
+};
+// Low-level record transform, NOT source identity or publication authority.
+// Reuses the authenticated parser and verifies both old and new unwrap chains.
+// Preserves opaque DER fields, lengths, key class and KDF iteration encoding.
+// Fresh envelope/KDF salts; unchanged KEK and VEK. New password must be nonempty
+// and different. All credentials and unwrapped keys require locked owners.
+// One attempt and three KDF charges share the existing cumulative budget.
+[[nodiscard]] PasswordRecordRewrapResult RewrapPasswordKeyRecords(
+    std::span<const std::byte> vek_der, std::span<const std::byte> kek_der,
+    const crypto::SecureBytes& old_password, const crypto::SecureBytes& new_password,
+    PasswordUnlockBudget& budget) noexcept;
+
 // Exact-format exception to general XTS's unequal-halves rule. Decrypt only,
 // exactly one 4K..64K power-of-two APFS block, UUID used as both AES-128 keys,
 // 512-byte units, LE64(container-relative block * block_size/512 + sector) || 0.
@@ -63,11 +81,17 @@ struct PasswordRecordResult
 [[nodiscard]] crypto::CryptoResult DecryptApfsUuidKeybagBlock(
     const KeybagUuid& uuid, std::uint64_t physical_block,
     std::span<const std::byte> ciphertext) noexcept;
+// The inverse outer transform, solely for an already validated keybag object.
+// UUID encryption is public-format obfuscation; it grants no write authority.
+[[nodiscard]] crypto::CryptoResult EncryptApfsUuidKeybagBlock(
+    const KeybagUuid& uuid, std::uint64_t physical_block,
+    std::span<const std::byte> plaintext) noexcept;
 
 struct KeybagObjectExpectation
 {
-    // Must come from independent caller evidence, never guessed from paddr.
-    // No automatic OID/XID discovery is claimed for these special object types.
+    // Exact checksummed header identity, never guessed from paddr. Apple's
+    // special keybag objects may use OID zero; zero still compares exactly.
+    // InspectPasswordKeybagMetadata can return these validated public identities.
     std::uint64_t oid = 0;
     std::uint64_t xid = 0;
 };
@@ -88,6 +112,28 @@ struct PasswordUnlockResult
     [[nodiscard]] explicit operator bool() const noexcept
         { return error == UnlockError::None && xts_key.Size() == 32; }
 };
+
+struct PasswordKeybagMetadata
+{
+    // user_uuid stays empty: the caller selects one exact returned user.
+    PasswordUnlockRequest selection;
+    std::vector<KeybagUuid> users;
+};
+
+// Read-only, credential-free selection from a held immutable container-relative
+// source. Reuses complete checkpoint/OMAP/APSB and authenticated keybag parsers.
+// Returns only identity selectors and user UUIDs, never wrapped keys or hints.
+// Explicit length convention and volume OID; no unlock or write authorization.
+[[nodiscard]] std::optional<PasswordKeybagMetadata> InspectPasswordKeybagMetadata(
+    const RandomAccessSource& source, std::uint64_t volume_oid,
+    KeybagLength length, UnlockError& error);
+
+// Exact retained generation; returns only validated public range owners.
+// Original metadata result layout and ordinary inspector ABI stay unchanged.
+[[nodiscard]] std::optional<PasswordKeybagMetadata> InspectPasswordKeybagMetadataAtCheckpoint(
+    const RandomAccessSource& source, std::uint64_t volume_oid, KeybagLength length,
+    std::uint64_t checkpoint_xid, UnlockError& error,
+    std::uint64_t& container_block, std::uint64_t& volume_block);
 
 // Source is an immutable, container-relative snapshot (zero is NX block zero),
 // with a caller-supplied cumulative ReadBudget. Caller must prevent concurrent

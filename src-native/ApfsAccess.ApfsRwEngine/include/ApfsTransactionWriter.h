@@ -32,6 +32,7 @@ enum class AppleBtreeKeyOrder
     PhysicalExtent,
     FileSystemCaseSensitive,
     FileSystemHashedDirectory,
+    SnapshotObjectMap, // numeric xid_t key, ordinary omap_snapshot_t value
 };
 
 struct AppleBtreeOptions
@@ -149,6 +150,15 @@ struct AppleFileExtentRecord
     std::uint32_t block_size = 0;
 };
 
+enum class AppleEncryptedExtentProfile { OneKeyGenerationZero };
+
+// Separate format projection: keep the ordinary record's layout and ABI intact.
+struct AppleEncryptedFileExtentRecord
+{
+    AppleFileExtentRecord extent;
+    std::uint8_t flags = 0;
+};
+
 struct AppleDataStreamIdRecord
 {
     std::uint64_t object_id = 0;
@@ -215,6 +225,21 @@ bool DecodeAppleFileExtentRecord(
     std::uint32_t block_size,
     AppleFileExtentRecord& out_value,
     std::string& out_error);
+// ONEKEY generation-zero serialization only: flags 0/1, unchanged crypto_id,
+// and bounded 512-byte tweak arithmetic. Holes retain crypto_id zero. This
+// neither authenticates a source/key generation nor grants write capability.
+// Unknown profiles/flags and invalid fields refuse with empty output.
+bool EncodeAppleEncryptedFileExtentRecord(
+    const AppleEncryptedFileExtentRecord& value,
+    AppleEncryptedExtentProfile profile,
+    catalog::BtreeRecord& out_record,
+    std::string& out_error);
+bool DecodeAppleEncryptedFileExtentRecord(
+    const catalog::BtreeRecord& record,
+    std::uint32_t block_size,
+    AppleEncryptedExtentProfile profile,
+    AppleEncryptedFileExtentRecord& out_value,
+    std::string& out_error);
 bool EncodeAppleDataStreamIdRecord(
     const AppleDataStreamIdRecord& value,
     catalog::BtreeRecord& out_record,
@@ -240,6 +265,36 @@ bool ValidateApplePayloadExtentGraph(
     std::uint64_t container_block_count,
     std::vector<ApplePhysicalExtentRecord>& out_extents,
     std::string& out_error);
+// Complete reference proof using the explicit ONEKEY generation-zero codec.
+// Raw records and flags are never rewritten into an ordinary filesystem view.
+bool ValidateAppleEncryptedPayloadExtentGraph(
+    const std::vector<catalog::BtreeRecord>& filesystem_records,
+    const std::vector<catalog::BtreeRecord>& extentref_records,
+    std::uint32_t block_size, std::uint64_t container_block_count,
+    std::vector<ApplePhysicalExtentRecord>& out_extents, std::string& out_error);
+// Resolves one chronological extent-reference layer against its exact filesystem.
+// UPDATE refcnt is signed; zero-count intervals disappear from this view only.
+// prior is the preceding resolved view, historical is the union of all older
+// view ownership (not a sum of clone counts). NEW cannot reuse historical blocks.
+// Pure interval algebra over existing decoded records; no disk parser or I/O.
+bool ResolveAppleSnapshotExtentLayer(
+    const std::vector<ApplePhysicalExtentRecord>& prior,
+    const std::vector<ApplePhysicalExtentRecord>& historical,
+    const std::vector<catalog::BtreeRecord>& filesystem,
+    const std::vector<catalog::BtreeRecord>& layer,
+    std::uint32_t block_size, std::uint64_t container_blocks,
+    std::vector<ApplePhysicalExtentRecord>& out_resolved, std::string& out_error);
+
+// Produces a canonical NEW/UPDATE layer from two independently validated views.
+// The after view is checked against exact filesystem mappings before encoding.
+bool PlanAppleSnapshotExtentLayer(
+    const std::vector<ApplePhysicalExtentRecord>& prior,
+    const std::vector<ApplePhysicalExtentRecord>& historical,
+    const std::vector<catalog::BtreeRecord>& filesystem,
+    const std::vector<catalog::BtreeRecord>& complete_extentrefs,
+    std::uint32_t block_size, std::uint64_t container_blocks,
+    std::vector<catalog::BtreeRecord>& out_layer, std::string& out_error);
+
 bool EncodeAppleSiblingLinkRecord(
     const AppleSiblingLinkRecord& value,
     catalog::BtreeRecord& out_record,

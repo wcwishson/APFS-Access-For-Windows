@@ -77,7 +77,8 @@ void ReadAdapter(bool offset, bool sparse) {
     { BlockDevice live(path.wstring());Bytes bytes;
       Check(live.Read(id.scope.store_offset_bytes+221*4096,8,bytes)&&
           std::string(reinterpret_cast<char*>(bytes.data()),bytes.size())=="LIVEVIEW","live historical control differs"); }
-    Check(s.PrepareNativeSnapshotReadPath(id,error),"prepare exact snapshot: "+error);
+    const bool prepared = s.PrepareNativeSnapshotReadPath(id,error);
+    Check(prepared,"prepare exact snapshot: "+error);
     Check(s.IsImmutableSnapshotView()&&s.NativeSnapshot()&&s.NativeSnapshot()->identity==id,"exact identity query");
     Check(s.CheckpointXid()==10&&s.LastCommittedXid()==10&&s.TotalSizeBytes()==id.scope.store_size_bytes&&
         s.TotalBlocks()==512&&s.BlockSizeBytes()==4096&&!s.FreeSizeBytes(),"historical generation and exact store geometry");

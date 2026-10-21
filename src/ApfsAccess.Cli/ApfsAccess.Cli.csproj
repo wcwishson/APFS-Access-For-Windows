@@ -4,11 +4,19 @@
     <TargetFramework>net9.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <EnableStandardMount Condition="'$(EnableStandardMount)' == ''">true</EnableStandardMount>
+    <DefineConstants Condition="'$(EnableStandardMount)' == 'true'">$(DefineConstants);APFSACCESS_STANDARD_MOUNT</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\ApfsAccess.Backend.Native\ApfsAccess.Backend.Native.csproj" />
     <ProjectReference Include="..\ApfsAccess.Core\ApfsAccess.Core.csproj" />
     <ProjectReference Include="..\ApfsAccess.Ipc\ApfsAccess.Ipc.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(EnableStandardMount)' == 'true'">
+    <ProjectReference Include="..\ApfsAccess.StandardMount\ApfsAccess.StandardMount.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(EnableStandardMount)' != 'true'">
+    <Compile Remove="StandardShareCommand.cs" />
   </ItemGroup>
 </Project>

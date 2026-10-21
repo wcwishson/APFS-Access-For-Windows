@@ -1,13 +1,15 @@
 #include "BlockDevice.h"
+#include "SoftwareTransitionHeldImageAuthority.h"
+#include "VolumePhysicalInstanceInternal.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <cstring>
 #include <cwchar>
 #include <cwctype>
+#include <cstdio>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -19,6 +21,8 @@
 #include <utility>
 
 #include <winioctl.h>
+#include <setupapi.h>
+#include <winternl.h>
 
 namespace apfsaccess::rw
 {
@@ -39,8 +43,9 @@ constexpr DWORD kOverlappedIoFinalWaitTimeoutMs = 5'000;
 constexpr UINT kUncancelableIoExitCode = 0xE1;
 constexpr std::size_t kReadCacheMaxWindowBytes = 64 * 1024;
 constexpr std::size_t kReadCacheMaxBytes = 8 * 1024 * 1024;
-constexpr std::size_t kReadCacheMaxEntries = 256;
+constexpr std::size_t kReadCacheMaxEntries = 2048;
 constexpr std::size_t kReadThreadLocalScratchMaxBytes = 1024 * 1024;
+constexpr std::uint64_t kRawPresenceProbeCacheMs = 250;
 
 bool IsRawPhysicalDevicePath(std::wstring_view path) noexcept
 {
@@ -62,6 +67,206 @@ bool IsRawPhysicalDevicePath(std::wstring_view path) noexcept
             [](wchar_t ch) { return std::iswdigit(ch) != 0; });
     }
     return false;
+}
+
+std::optional<DWORD> TryParsePhysicalDriveNumber(std::wstring_view path) noexcept
+{
+    constexpr std::array<std::wstring_view, 2> prefixes = {
+        LR"(\\.\PhysicalDrive)",
+        LR"(\\?\PhysicalDrive)",
+    };
+    std::wstring_view prefix;
+    for (const auto candidate : prefixes)
+    {
+        if (path.size() > candidate.size() &&
+            _wcsnicmp(path.data(), candidate.data(), candidate.size()) == 0)
+        {
+            prefix = candidate;
+            break;
+        }
+    }
+    if (prefix.empty())
+    {
+        return std::nullopt;
+    }
+
+    DWORD value = 0;
+    for (const auto ch : path.substr(prefix.size()))
+    {
+        if (!std::iswdigit(ch))
+        {
+            return std::nullopt;
+        }
+        const auto digit = static_cast<DWORD>(ch - L'0');
+        if (value > (std::numeric_limits<DWORD>::max() - digit) / 10)
+        {
+            return std::nullopt;
+        }
+        value = value * 10 + digit;
+    }
+    return value;
+}
+
+struct DiskInterfaceIdentity
+{
+    std::wstring instance;
+    std::wstring path;
+    DWORD devinst = 0;
+};
+
+struct DeviceInfoSet
+{
+    HDEVINFO value;
+    ~DeviceInfoSet() { if (value != INVALID_HANDLE_VALUE) SetupDiDestroyDeviceInfoList(value); }
+};
+
+bool SameInterfacePath(std::wstring_view left, std::wstring_view right)
+{
+    return left.size() <= 4096 && right.size() <= 4096 && !left.empty() &&
+        CompareStringOrdinal(left.data(), static_cast<int>(left.size()),
+            right.data(), static_cast<int>(right.size()), TRUE) == CSTR_EQUAL;
+}
+
+bool ReadDiskInterface(HDEVINFO devices, SP_DEVICE_INTERFACE_DATA& item,
+    DiskInterfaceIdentity& out, DWORD& error)
+{
+    if (!(item.Flags & SPINT_ACTIVE) || (item.Flags & SPINT_REMOVED))
+    {
+        error = ERROR_DEVICE_NOT_CONNECTED;
+        return false;
+    }
+    DWORD size = 0;
+    (void)SetupDiGetDeviceInterfaceDetailW(devices, &item, nullptr, 0, &size, nullptr);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER ||
+        size < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W) || size > 65536)
+    {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+    std::vector<std::byte> storage(size);
+    auto* detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(storage.data());
+    detail->cbSize = sizeof(*detail);
+    SP_DEVINFO_DATA device{};
+    device.cbSize = sizeof(device);
+    if (!SetupDiGetDeviceInterfaceDetailW(devices, &item, detail, size, nullptr, &device))
+    {
+        error = GetLastError();
+        return false;
+    }
+    const auto maximum = (size - offsetof(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath)) / sizeof(wchar_t);
+    const auto length = wcsnlen(detail->DevicePath, maximum);
+    wchar_t instance[401]{};
+    if (!length || length == maximum || length > 4096 ||
+        !SetupDiGetDeviceInstanceIdW(devices, &device, instance, 401, nullptr))
+    {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+    const auto instance_length = wcsnlen(instance, 401);
+    if (!instance_length || instance_length == 401)
+    {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+    out.instance.assign(instance, instance_length);
+    if (!physical_instance::Normalize(out.instance))
+    {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+    out.path.assign(detail->DevicePath, length);
+    out.devinst = device.DevInst;
+    return true;
+}
+
+bool FindPresentDiskInterface(const std::wstring& instance, std::wstring_view exact_path,
+    DiskInterfaceIdentity& out, DWORD& error)
+{
+    DeviceInfoSet devices{SetupDiGetClassDevsW(
+        &GUID_DEVINTERFACE_DISK,
+        instance.c_str(),
+        nullptr,
+        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE)};
+    if (devices.value == INVALID_HANDLE_VALUE)
+    {
+        error = GetLastError();
+        return false;
+    }
+
+    unsigned matches = 0;
+    for (DWORD index = 0; index < 64; ++index)
+    {
+        SP_DEVICE_INTERFACE_DATA interface_data{};
+        interface_data.cbSize = sizeof(interface_data);
+        if (!SetupDiEnumDeviceInterfaces(
+                devices.value, nullptr, &GUID_DEVINTERFACE_DISK, index, &interface_data))
+        {
+            const auto enumeration_error = GetLastError();
+            if (enumeration_error == ERROR_NO_MORE_ITEMS && matches == 1) return true;
+            error = enumeration_error == ERROR_NO_MORE_ITEMS ? ERROR_DEVICE_NOT_CONNECTED : enumeration_error;
+            return false;
+        }
+        DiskInterfaceIdentity candidate;
+        if (!ReadDiskInterface(devices.value, interface_data, candidate, error)) return false;
+        if (candidate.instance != instance)
+        {
+            error = ERROR_INVALID_DATA;
+            return false;
+        }
+        if (!exact_path.empty() && !SameInterfacePath(candidate.path, exact_path)) continue;
+        if (++matches != 1) { error = ERROR_DUP_NAME; return false; }
+        out = std::move(candidate);
+    }
+    error = ERROR_MORE_DATA;
+    return false;
+}
+
+bool ResolveRawDiskInterface(std::wstring_view path, DiskInterfaceIdentity& out, DWORD& error)
+{
+    if (const auto number = TryParsePhysicalDriveNumber(path))
+    {
+        std::wstring instance;
+        const auto selected = L"\\\\.\\PhysicalDrive" + std::to_wstring(*number);
+        if (!physical_instance::Selected(selected, instance))
+        {
+            error = ERROR_DEVICE_NOT_CONNECTED;
+            return false;
+        }
+        return FindPresentDiskInterface(instance, {}, out, error);
+    }
+    DeviceInfoSet devices{SetupDiCreateDeviceInfoList(nullptr, nullptr)};
+    SP_DEVICE_INTERFACE_DATA item{};
+    item.cbSize = sizeof(item);
+    const std::wstring exact_path(path);
+    if (devices.value == INVALID_HANDLE_VALUE ||
+        !SetupDiOpenDeviceInterfaceW(devices.value, exact_path.c_str(), 0, &item))
+    {
+        error = GetLastError();
+        return false;
+    }
+    DiskInterfaceIdentity selected;
+    return ReadDiskInterface(devices.value, item, selected, error) &&
+        SameInterfacePath(selected.path, path) &&
+        FindPresentDiskInterface(selected.instance, path, out, error);
+}
+
+bool IsPresentDiskInterface(const DiskInterfaceIdentity& selected, DWORD& error)
+{
+    DiskInterfaceIdentity current;
+    if (!FindPresentDiskInterface(selected.instance, selected.path, current, error)) return false;
+    if (current.devinst != selected.devinst)
+    {
+        error = ERROR_DEVICE_NOT_CONNECTED;
+        return false;
+    }
+    return true;
+}
+
+bool IsProbeUnsupportedError(DWORD error) noexcept
+{
+    return error == ERROR_INVALID_FUNCTION ||
+        error == ERROR_NOT_SUPPORTED ||
+        error == ERROR_INVALID_PARAMETER;
 }
 
 bool QueryRegularFileIdentity(HANDLE handle, FILE_ID_INFO& identity)
@@ -98,6 +303,38 @@ bool QueryRegularFileIdentity(HANDLE handle, FILE_ID_INFO& identity)
     return final_path.starts_with(LR"(\\?\Volume{)") &&
         volume_end != std::wstring::npos && volume_end + 2 < final_path.size() &&
         final_path.find(L':', volume_end + 2) == std::wstring::npos;
+}
+
+bool QueryHeldReadWriteHandle(HANDLE handle, ULONG expected_handles)
+{
+    using QueryObject = NTSTATUS (NTAPI*)(HANDLE, OBJECT_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+    static const auto query_object = reinterpret_cast<QueryObject>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject"));
+    PUBLIC_OBJECT_BASIC_INFORMATION information{};
+    constexpr ACCESS_MASK access = FILE_READ_DATA | FILE_WRITE_DATA;
+    return query_object != nullptr &&
+        query_object(handle, ObjectBasicInformation, &information, sizeof(information), nullptr) >= 0 &&
+        (information.GrantedAccess & access) == access &&
+        information.HandleCount == expected_handles;
+}
+
+bool IsExclusiveRepairImageHandle(HANDLE handle)
+{
+    if (!QueryHeldReadWriteHandle(handle, 1)) return false;
+    // Only ordinary files reach this check. Probe the held object at adoption,
+    // never a pathname, and accept only an explicit sharing refusal.
+    for (const DWORD access : std::array<DWORD, 3>{FILE_READ_DATA, FILE_WRITE_DATA, DELETE})
+    {
+        const auto probe = ReOpenFile(handle, access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_OVERLAPPED);
+        if (probe != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(probe);
+            return false;
+        }
+        if (GetLastError() != ERROR_SHARING_VIOLATION) return false;
+    }
+    return true;
 }
 
 struct ThreadLocalOverlappedEvent
@@ -158,6 +395,16 @@ std::optional<std::wstring> ReadEnvironmentValue(const wchar_t* variable_name)
 
     value.resize(copied);
     return value;
+}
+
+std::size_t ReadCacheEntryBudget()
+{
+    const auto value = ReadEnvironmentValue(L"APFSACCESS_BLOCK_READ_CACHE_ENTRIES");
+    if (value == L"256") return 256;
+    if (value == L"512") return 512;
+    if (value == L"1024") return 1024;
+    if (value == L"2048") return 2048;
+    return kReadCacheMaxEntries;
 }
 
 [[noreturn]] void FailClosedForUncancelableIo() noexcept
@@ -430,10 +677,22 @@ std::uint64_t LatencyBucketUpperBoundUs(
 }
 } // namespace
 
+struct BlockDevice::RawPresenceIdentity
+{
+    DiskInterfaceIdentity selected;
+    DWORD disk_number = MAXDWORD;
+};
+
 BlockDevice::BlockDevice(std::wstring path, std::uint64_t base_offset_bytes)
     : path_(std::move(path))
     , base_offset_bytes_(base_offset_bytes)
-    , read_cache_enabled_(IsExperimentalBlockReadCacheEnabled())
+    // Raw APFS containers repeatedly reread immutable checkpoint metadata
+    // during one owner-serialized commit. Keep the cache scoped to physical
+    // handles so image fixtures retain their exact uncached behavior; writes
+    // advance the cache epoch before publication and therefore invalidate it.
+    , read_cache_enabled_(IsExperimentalBlockReadCacheEnabled() ||
+        IsRawPhysicalDevicePath(path_))
+    , read_cache_max_entries_(ReadCacheEntryBudget())
 {
 }
 
@@ -490,13 +749,33 @@ struct BlockDevice::ScopedPerfTimer
     }
 };
 
+struct BlockDevice::WriteSourceAdmission
+{
+    explicit WriteSourceAdmission(BlockDevice& owner)
+        : owner_(owner)
+    {
+        owner_.BeginWriteSourceAdmission();
+    }
+
+    ~WriteSourceAdmission() noexcept
+    {
+        owner_.EndWriteSourceAdmission();
+    }
+
+    WriteSourceAdmission(const WriteSourceAdmission&) = delete;
+    WriteSourceAdmission& operator=(const WriteSourceAdmission&) = delete;
+
+private:
+    BlockDevice& owner_;
+};
+
 struct BlockDevice::ReadCacheWriteEpoch
 {
-    explicit ReadCacheWriteEpoch(BlockDevice& owner)
+    ReadCacheWriteEpoch(BlockDevice& owner, std::span<const WriteSpan> writes)
         : owner_(owner)
         , epoch_lock_(owner.write_epoch_mutex_)
     {
-        owner_.BeginReadCacheWriteEpoch();
+        owner_.BeginReadCacheWriteEpoch(writes);
     }
 
     ~ReadCacheWriteEpoch() noexcept
@@ -686,6 +965,10 @@ std::string BlockDevice::PerformanceJson() const
            << read_cache_invalidation_count_.load(std::memory_order_relaxed)
            << ",\"bytes\":"
            << read_cache_bytes_.load(std::memory_order_relaxed)
+           << ",\"maxEntries\":" << read_cache_max_entries_
+           << ",\"maxBytes\":" << kReadCacheMaxBytes
+           << ",\"evictions\":" << read_cache_eviction_count_.load(std::memory_order_relaxed)
+           << ",\"evictedBytes\":" << read_cache_evicted_bytes_.load(std::memory_order_relaxed)
            << "},\"lastIoError\":"
            << last_io_error_.load(std::memory_order_relaxed);
     buffer << "}";
@@ -757,6 +1040,61 @@ void BlockDevice::EndReadCacheWriteAdmission() noexcept
     }
 }
 
+void BlockDevice::BeginWriteSourceAdmission()
+{
+    std::lock_guard<std::mutex> source_lock(write_source_mutex_);
+    AdvanceWriteSourceGenerationLocked();
+    if (write_source_admissions_ == std::numeric_limits<std::uint64_t>::max())
+    {
+        write_source_generation_exhausted_ = true;
+    }
+    else
+    {
+        ++write_source_admissions_;
+    }
+}
+
+void BlockDevice::EndWriteSourceAdmission() noexcept
+{
+    std::lock_guard<std::mutex> source_lock(write_source_mutex_);
+    AdvanceWriteSourceGenerationLocked();
+    if (write_source_admissions_ > 0)
+    {
+        --write_source_admissions_;
+    }
+}
+
+void BlockDevice::AdvanceWriteSourceGenerationLocked() const noexcept
+{
+    if (write_source_generation_ == std::numeric_limits<std::uint64_t>::max())
+    {
+        write_source_generation_exhausted_ = true;
+    }
+    else
+    {
+        ++write_source_generation_;
+    }
+}
+
+void BlockDevice::InvalidateWriteSourceHandlesLocked() const
+{
+    // The caller holds handle_mutex_; source admission never holds it in reverse.
+    InvalidateReadCache();
+    std::lock_guard<std::mutex> source_lock(write_source_mutex_);
+    AdvanceWriteSourceGenerationLocked();
+    write_source_handles_retired_ = true;
+    RetireRawSnapshotLeaseLocked();
+}
+
+void BlockDevice::RetireRawSnapshotLeaseLocked() const noexcept
+{
+    raw_snapshot_lease_retired_ = true;
+    if (raw_snapshot_retirement_epoch_ == std::numeric_limits<std::uint64_t>::max())
+        raw_snapshot_epoch_exhausted_ = true;
+    else
+        ++raw_snapshot_retirement_epoch_;
+}
+
 void BlockDevice::BeginReadCacheWriteEpoch()
 {
     if (!read_cache_enabled_)
@@ -766,6 +1104,118 @@ void BlockDevice::BeginReadCacheWriteEpoch()
 
     std::lock_guard<std::mutex> cache_lock(read_cache_mutex_);
     ++read_cache_generation_;
+    if (!read_cache_.empty())
+    {
+        read_cache_.clear();
+        read_cache_bytes_.store(0, std::memory_order_relaxed);
+        read_cache_invalidation_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void BlockDevice::BeginReadCacheWriteEpoch(std::span<const WriteSpan> writes)
+{
+    if (!read_cache_enabled_)
+    {
+        return;
+    }
+
+    // Resolve geometry before taking the cache lock (geometry can open a handle).
+    const auto block_size = static_cast<std::uint64_t>(LogicalBlockSize());
+    const auto range_for = [&](const WriteSpan& write, std::uint64_t& start, std::uint64_t& size)
+    {
+        const auto bytes = static_cast<std::uint64_t>(write.buffer.size());
+        const auto maximum = (std::numeric_limits<std::uint64_t>::max)();
+        if (bytes == 0 || bytes > (std::numeric_limits<DWORD>::max)() ||
+            write.offset_bytes > maximum - base_offset_bytes_)
+        {
+            return false;
+        }
+        const auto absolute = write.offset_bytes + base_offset_bytes_;
+        start = AlignDown(absolute, block_size);
+        if (absolute > maximum - bytes)
+        {
+            return false;
+        }
+        const auto end = AlignUp(absolute + bytes, block_size);
+        if (end == 0 || end <= start ||
+            end > static_cast<std::uint64_t>((std::numeric_limits<LONGLONG>::max)()))
+        {
+            return false;
+        }
+        size = end - start;
+        return size <= (std::numeric_limits<DWORD>::max)() &&
+            RawWriteSpanAllowed(start, size);
+    };
+
+    // An unprovable interval keeps the original full-invalidation behavior.
+    for (const auto& write : writes)
+    {
+        std::uint64_t start = 0, size = 0;
+        if (!write.buffer.empty() && !range_for(write, start, size))
+        {
+            BeginReadCacheWriteEpoch();
+            return;
+        }
+    }
+    if (writes.empty())
+    {
+        BeginReadCacheWriteEpoch();
+        return;
+    }
+
+    std::lock_guard<std::mutex> cache_lock(read_cache_mutex_);
+    ++read_cache_generation_;
+    bool invalidated = false;
+    for (const auto& write : writes)
+    {
+        if (!write.buffer.empty())
+        {
+            const auto absolute = write.offset_bytes + base_offset_bytes_;
+            const auto start = AlignDown(absolute, block_size);
+            const auto end = AlignUp(absolute + write.buffer.size(), block_size);
+            invalidated |= InvalidateReadCacheRangeLocked(start, end - start);
+        }
+    }
+    if (invalidated)
+    {
+        read_cache_invalidation_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+bool BlockDevice::InvalidateReadCacheRangeLocked(
+    std::uint64_t absolute_offset_bytes, std::uint64_t size_bytes) const
+{
+    bool invalidated = false;
+    for (auto entry = read_cache_.begin(); entry != read_cache_.end();)
+    {
+        const auto cached_offset = entry->first.offset_bytes;
+        const auto cached_size = static_cast<std::uint64_t>(entry->first.size_bytes);
+        const bool overlaps = cached_offset >= absolute_offset_bytes
+            ? cached_offset - absolute_offset_bytes < size_bytes
+            : absolute_offset_bytes - cached_offset < cached_size;
+        if (overlaps)
+        {
+            read_cache_bytes_.fetch_sub(entry->second.bytes.size(), std::memory_order_relaxed);
+            entry = read_cache_.erase(entry);
+            invalidated = true;
+        }
+        else
+        {
+            ++entry;
+        }
+    }
+    return invalidated;
+}
+
+void BlockDevice::InvalidateReadCache() const
+{
+    if (!read_cache_enabled_)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> cache_lock(read_cache_mutex_);
+    // Reject pre-retirement misses without changing an active writer's parity.
+    read_cache_generation_ += 2;
     if (!read_cache_.empty())
     {
         read_cache_.clear();
@@ -814,7 +1264,7 @@ void BlockDevice::InsertReadCacheEntryLocked(
     }
     read_cache_bytes_.fetch_add(static_cast<std::uint64_t>(size_bytes), std::memory_order_relaxed);
 
-    while (read_cache_.size() > kReadCacheMaxEntries ||
+    while (read_cache_.size() > read_cache_max_entries_ ||
            read_cache_bytes_.load(std::memory_order_relaxed) > kReadCacheMaxBytes)
     {
         const auto oldest = std::min_element(
@@ -828,9 +1278,10 @@ void BlockDevice::InsertReadCacheEntryLocked(
         {
             break;
         }
-        read_cache_bytes_.fetch_sub(
-            static_cast<std::uint64_t>(oldest->second.bytes.size()),
-            std::memory_order_relaxed);
+        const auto evicted_bytes = static_cast<std::uint64_t>(oldest->second.bytes.size());
+        read_cache_bytes_.fetch_sub(evicted_bytes, std::memory_order_relaxed);
+        read_cache_eviction_count_.fetch_add(1, std::memory_order_relaxed);
+        read_cache_evicted_bytes_.fetch_add(evicted_bytes, std::memory_order_relaxed);
         read_cache_.erase(oldest);
     }
 }
@@ -853,6 +1304,272 @@ bool BlockDevice::IsWritable() const
         (void)EnsureWriteHandle();
     }
     return writable_.load(std::memory_order_acquire);
+}
+
+bool BlockDevice::IsRawWriterAccepted() const noexcept
+{
+    return raw_writer_accepted_.load(std::memory_order_acquire);
+}
+
+std::uint64_t BlockDevice::RawWriteLimitBytes() const noexcept
+{
+    return raw_write_limit_bytes_.load(std::memory_order_acquire);
+}
+
+const std::string& BlockDevice::RawWriterIdentity() const noexcept
+{
+    return raw_writer_identity_;
+}
+
+bool BlockDevice::RawWriteRangeAllowed(
+    std::uint64_t limit_bytes, std::uint64_t offset_bytes, std::uint64_t size_bytes) noexcept
+{
+    if (limit_bytes == 0 || size_bytes > limit_bytes ||
+        offset_bytes > limit_bytes - size_bytes)
+    {
+        return false;
+    }
+    return true;
+}
+
+bool BlockDevice::RawWriteSpanAllowed(
+    std::uint64_t absolute_offset_bytes, std::uint64_t size_bytes) const noexcept
+{
+    if (!raw_writer_accepted_.load(std::memory_order_acquire))
+    {
+        return true;
+    }
+    if (absolute_offset_bytes < base_offset_bytes_)
+    {
+        return false;
+    }
+    return RawWriteRangeAllowed(
+        raw_write_limit_bytes_.load(std::memory_order_acquire),
+        absolute_offset_bytes - base_offset_bytes_,
+        size_bytes);
+}
+
+bool BlockDevice::IsDeviceUnavailableError(std::uint32_t error) noexcept
+{
+    switch (error)
+    {
+    case ERROR_DEVICE_NOT_CONNECTED:
+    case ERROR_DEVICE_REMOVED:
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+    case ERROR_INVALID_HANDLE:
+    case ERROR_NO_SUCH_DEVICE:
+    case ERROR_NOT_READY:
+    case ERROR_GEN_FAILURE:
+    case ERROR_IO_DEVICE:
+    case ERROR_DEVICE_HARDWARE_ERROR:
+    case ERROR_WRITE_FAULT:
+    case ERROR_SEM_TIMEOUT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool BlockDevice::ProbeUnderlyingDevice(bool force) const
+{
+    if (!raw_writer_accepted_.load(std::memory_order_acquire))
+    {
+        return true;
+    }
+
+    const auto now = static_cast<std::uint64_t>(GetTickCount64());
+    const auto previous = raw_presence_probe_tick_ms_.load(std::memory_order_acquire);
+    if (!force && previous != 0 && now >= previous &&
+        now - previous < kRawPresenceProbeCacheMs)
+    {
+        return raw_presence_probe_result_.load(std::memory_order_acquire);
+    }
+
+    std::lock_guard<std::mutex> probe_lock(raw_presence_probe_mutex_);
+    const auto locked_previous = raw_presence_probe_tick_ms_.load(std::memory_order_relaxed);
+    const auto locked_now = static_cast<std::uint64_t>(GetTickCount64());
+    if (!force && locked_previous != 0 && locked_now >= locked_previous &&
+        locked_now - locked_previous < kRawPresenceProbeCacheMs)
+    {
+        return raw_presence_probe_result_.load(std::memory_order_relaxed);
+    }
+
+    DWORD error = ERROR_SUCCESS;
+    bool present = false;
+    bool unbuffered_probe = true;
+    if (!raw_presence_probe_result_.load(std::memory_order_acquire))
+    {
+        // Retirement is one-way, including forced probes after a later replug.
+        error = raw_presence_probe_error_.load(std::memory_order_acquire);
+    }
+    else if (raw_presence_probe_hook_for_tests_)
+    {
+        try { present = raw_presence_probe_hook_for_tests_(error); }
+        catch (...) { error = ERROR_GEN_FAILURE; }
+    }
+    else if (!raw_presence_identity_ ||
+        !IsPresentDiskInterface(raw_presence_identity_->selected, error))
+    {
+        // A PnP-removed disk may keep an already-open raw handle usable until
+        // the next I/O. Require a currently present disk interface before the
+        // handle-level checks so logical removal cannot become a phantom write.
+    }
+    else
+    {
+        auto probe_handle = CreateFileW(
+            raw_presence_identity_->selected.path.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING,
+            nullptr);
+        if (probe_handle == INVALID_HANDLE_VALUE &&
+            GetLastError() == ERROR_INVALID_PARAMETER)
+        {
+            // Some virtual image providers reject NO_BUFFERING even though they
+            // still support the storage verification IOCTLs. Keep the image fast
+            // path usable while retaining the transport read for real devices.
+            unbuffered_probe = false;
+            probe_handle = CreateFileW(
+                raw_presence_identity_->selected.path.c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+        }
+        if (probe_handle == INVALID_HANDLE_VALUE)
+        {
+            error = GetLastError();
+        }
+        else if (GetFileType(probe_handle) != FILE_TYPE_DISK)
+        {
+            error = ERROR_INVALID_HANDLE;
+            CloseHandle(probe_handle);
+        }
+        else
+        {
+            DWORD returned = 0;
+            STORAGE_DEVICE_NUMBER number{};
+            present = DeviceIoControl(probe_handle, IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                nullptr, 0, &number, sizeof(number), &returned, nullptr) != FALSE;
+            error = present ? ERROR_SUCCESS : GetLastError();
+            if (present && !physical_instance::WholeDisk(number, returned, raw_presence_identity_->disk_number))
+            {
+                present = false;
+                error = ERROR_DEVICE_NOT_CONNECTED;
+            }
+            const bool number_matches = present;
+            if (present)
+            {
+                present = DeviceIoControl(
+                    probe_handle,
+                    IOCTL_STORAGE_CHECK_VERIFY2,
+                    nullptr,
+                    0,
+                    nullptr,
+                    0,
+                    &returned,
+                    nullptr) != FALSE;
+                error = present ? ERROR_SUCCESS : GetLastError();
+            }
+
+            // A few storage bridges do not implement CHECK_VERIFY2. A successful
+            // geometry query still proves that the device object is live; an
+            // actual transport/media error remains a hard failure.
+            if (!present && number_matches && IsProbeUnsupportedError(error))
+            {
+                DISK_GEOMETRY_EX geometry{};
+                present = DeviceIoControl(
+                    probe_handle,
+                    IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+                    nullptr,
+                    0,
+                    &geometry,
+                    sizeof(geometry),
+                    &returned,
+                    nullptr) != FALSE;
+                error = present ? ERROR_SUCCESS : GetLastError();
+            }
+
+            if (present && unbuffered_probe)
+            {
+                // CHECK_VERIFY can remain successful for a short period after a
+                // surprise removal on USB bridges. Read the first physical sector
+                // through the fresh handle to force the transport to answer.
+                void* aligned_buffer = VirtualAlloc(
+                    nullptr,
+                    4096,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE);
+                if (aligned_buffer == nullptr)
+                {
+                    present = false;
+                    error = ERROR_NOT_ENOUGH_MEMORY;
+                }
+                else
+                {
+                    DWORD bytes_read = 0;
+                    const auto read_ok = ReadFile(
+                        probe_handle,
+                        aligned_buffer,
+                        4096,
+                        &bytes_read,
+                        nullptr);
+                    if (!read_ok || bytes_read != 4096)
+                    {
+                        error = read_ok ? ERROR_IO_DEVICE : GetLastError();
+                        if (!IsProbeUnsupportedError(error) || !read_ok)
+                            present = false;
+                    }
+                    VirtualFree(aligned_buffer, 0, MEM_RELEASE);
+                }
+            }
+            if (present && !IsPresentDiskInterface(raw_presence_identity_->selected, error))
+                present = false;
+            CloseHandle(probe_handle);
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> source_lock(write_source_mutex_);
+        if (!present && !write_source_handles_retired_)
+        {
+            AdvanceWriteSourceGenerationLocked();
+            write_source_handles_retired_ = true;
+            RetireRawSnapshotLeaseLocked();
+        }
+        raw_presence_probe_result_.store(present, std::memory_order_release);
+    }
+    raw_presence_probe_error_.store(present ? ERROR_SUCCESS : error, std::memory_order_release);
+    raw_presence_probe_tick_ms_.store(
+        static_cast<std::uint64_t>(GetTickCount64()), std::memory_order_release);
+    if (!present)
+    {
+        InvalidateReadCache();
+        last_io_error_.store(error == ERROR_SUCCESS ? ERROR_DEVICE_NOT_CONNECTED : error,
+            std::memory_order_relaxed);
+        // Do not let an already-open raw handle keep serving as a phantom
+        // device after PnP removal. Writes and flushes already hold
+        // write_mutex_ when they call this method, so use try_to_lock here:
+        // the background monitor closes handles as soon as the current I/O
+        // finishes, while an in-flight write can never be invalidated under
+        // its feet.
+        std::unique_lock<std::mutex> write_guard(write_mutex_, std::try_to_lock);
+        if (write_guard.owns_lock())
+        {
+            std::lock_guard<std::mutex> handle_lock(handle_mutex_);
+            CloseHandlesLocked();
+        }
+    }
+    else
+    {
+        last_io_error_.store(ERROR_SUCCESS, std::memory_order_relaxed);
+    }
+    return present;
 }
 
 bool BlockDevice::HasWriteHandle() const noexcept
@@ -904,6 +1621,88 @@ bool BlockDevice::Read(std::uint64_t offset_bytes, std::size_t size_bytes, std::
     }
 
     out_buffer.resize(bytes_read);
+    return true;
+}
+
+bool BlockDevice::ReadForVerification(
+    std::uint64_t offset_bytes, std::size_t size_bytes, std::vector<std::byte>& out_buffer) const
+{
+    out_buffer.clear();
+    if (size_bytes == 0) return true;
+    if (size_bytes > static_cast<std::size_t>((std::numeric_limits<DWORD>::max)()) ||
+        offset_bytes > (std::numeric_limits<std::uint64_t>::max)() - base_offset_bytes_)
+    {
+        last_io_error_.store(ERROR_INVALID_PARAMETER, std::memory_order_relaxed);
+        return false;
+    }
+    const auto absolute_offset = base_offset_bytes_ + offset_bytes;
+    if (size_bytes > (std::numeric_limits<std::uint64_t>::max)() - absolute_offset)
+    {
+        last_io_error_.store(ERROR_INVALID_PARAMETER, std::memory_order_relaxed);
+        return false;
+    }
+
+    // Pin the original reader without reopening or changing source identity.
+    std::lock_guard<std::mutex> write_lock(write_mutex_);
+    std::lock_guard<std::mutex> handle_lock(handle_mutex_);
+    const auto held_reader = read_handle_.load(std::memory_order_acquire);
+    if (held_reader == nullptr || held_reader == INVALID_HANDLE_VALUE)
+    {
+        last_io_error_.store(ERROR_INVALID_HANDLE, std::memory_order_relaxed);
+        return false;
+    }
+    auto logical_block_size = logical_block_size_cache_.load(std::memory_order_acquire);
+    if (logical_block_size == 0)
+    {
+        Geometry geometry{};
+        if (!QueryGeometryLocked(held_reader, geometry))
+        {
+            last_io_error_.store(ERROR_READ_FAULT, std::memory_order_relaxed);
+            return false;
+        }
+        logical_block_size = geometry.logical_block_size;
+    }
+    const auto block_size = (std::max)(std::uint32_t{512}, logical_block_size);
+    // Buffered images align APFS blocks within their selected source window.
+    // Raw devices still require alignment in the physical address space.
+    const auto aligned_offset = regular_file_.load(std::memory_order_acquire) ? offset_bytes : absolute_offset;
+    if (aligned_offset % block_size != 0 || size_bytes % block_size != 0)
+    {
+        last_io_error_.store(ERROR_INVALID_PARAMETER, std::memory_order_relaxed);
+        return false;
+    }
+
+    std::lock_guard<std::mutex> source_lock(write_source_mutex_);
+    const bool raw = raw_writer_accepted_.load(std::memory_order_acquire);
+    if (write_source_admissions_ != 0 ||
+        ((raw || exclusive_write_image_) && write_source_handles_retired_) ||
+        (stable_read_only_image_ && !RevalidateStableReadOnlyImage()) ||
+        (!regular_file_.load(std::memory_order_acquire) && !raw) ||
+        (raw && (stable_read_only_image_ || regular_file_.load(std::memory_order_acquire) ||
+            !writable_.load(std::memory_order_acquire) ||
+            write_handle_.load(std::memory_order_acquire) == INVALID_HANDLE_VALUE ||
+            !raw_presence_probe_result_.load(std::memory_order_acquire) || raw_writer_identity_.empty() ||
+            RawWriteLimitBytes() == 0 || RawWriteLimitBytes() > raw_write_source_size_bytes_)) ||
+        !RawWriteSpanAllowed(absolute_offset, size_bytes))
+    {
+        last_io_error_.store(ERROR_ACCESS_DENIED, std::memory_order_relaxed);
+        return false;
+    }
+
+    out_buffer.resize(size_bytes);
+    DWORD bytes_read = 0;
+    if (!ReadAt(held_reader, absolute_offset, out_buffer.data(), static_cast<DWORD>(size_bytes), bytes_read))
+    {
+        out_buffer.clear();
+        return false;
+    }
+    if (bytes_read != size_bytes)
+    {
+        out_buffer.clear();
+        last_io_error_.store(ERROR_HANDLE_EOF, std::memory_order_relaxed);
+        return false;
+    }
+    last_io_error_.store(ERROR_SUCCESS, std::memory_order_relaxed);
     return true;
 }
 
@@ -1154,14 +1953,20 @@ bool BlockDevice::Write(std::uint64_t offset_bytes, std::span<const std::byte> b
     }
     offset_bytes += base_offset_bytes_;
 
+    WriteSourceAdmission source_admission(*this);
     ReadCacheWriteAdmission write_admission(*this);
     InvokeWriteCacheInvalidationHookForTests();
-    ReadCacheWriteEpoch write_epoch(*this);
+    const WriteSpan cache_write{offset_bytes - base_offset_bytes_, buffer};
+    ReadCacheWriteEpoch write_epoch(*this, std::span<const WriteSpan>(&cache_write, 1));
 
     std::unique_lock<std::mutex> write_lock(write_mutex_, std::defer_lock);
     {
         ScopedPerfTimer queue_wait_scope(write_queue_wait_perf_);
         write_lock.lock();
+    }
+    if (!ProbeUnderlyingDevice())
+    {
+        return false;
     }
     HANDLE handle = EnsureWriteHandle();
     if (handle == INVALID_HANDLE_VALUE)
@@ -1216,6 +2021,7 @@ bool BlockDevice::WriteBatch(std::span<const WriteSpan> writes)
         return true;
     }
 
+    WriteSourceAdmission source_admission(*this);
     const auto fault_mode = ReadFaultMode(L"APFSACCESS_RW_FAULT_WRITE");
     if (fault_mode.has_value())
     {
@@ -1240,11 +2046,15 @@ bool BlockDevice::WriteBatch(std::span<const WriteSpan> writes)
     {
         ReadCacheWriteAdmission write_admission(*this);
         InvokeWriteCacheInvalidationHookForTests();
-        ReadCacheWriteEpoch write_epoch(*this);
+        ReadCacheWriteEpoch write_epoch(*this, writes);
         std::unique_lock<std::mutex> write_lock(write_mutex_, std::defer_lock);
         {
             ScopedPerfTimer queue_wait_scope(write_queue_wait_perf_);
             write_lock.lock();
+        }
+        if (!ProbeUnderlyingDevice())
+        {
+            return false;
         }
         HANDLE handle = EnsureWriteHandle();
         if (handle == INVALID_HANDLE_VALUE)
@@ -1361,11 +2171,15 @@ bool BlockDevice::WriteBatch(std::span<const WriteSpan> writes)
 
     ReadCacheWriteAdmission write_admission(*this);
     InvokeWriteCacheInvalidationHookForTests();
-    ReadCacheWriteEpoch write_epoch(*this);
+    ReadCacheWriteEpoch write_epoch(*this, writes);
     std::unique_lock<std::mutex> write_lock(write_mutex_, std::defer_lock);
     {
         ScopedPerfTimer queue_wait_scope(write_queue_wait_perf_);
         write_lock.lock();
+    }
+    if (!ProbeUnderlyingDevice())
+    {
+        return false;
     }
     HANDLE handle = EnsureWriteHandle();
     if (handle == INVALID_HANDLE_VALUE)
@@ -1662,6 +2476,13 @@ bool BlockDevice::WriteBatch(std::span<const WriteSpan> writes)
                 request.overlapped.OffsetHigh = static_cast<DWORD>(chunk.absolute_offset >> 32);
                 request.overlapped.hEvent = request.event;
 
+                if (!RawWriteSpanAllowed(chunk.absolute_offset, chunk.buffer.size()))
+                {
+                    // Admitted raw range breached: fail the batch before issuing.
+                    last_io_error_.store(ERROR_ACCESS_DENIED, std::memory_order_relaxed);
+                    window_ok = false;
+                    break;
+                }
                 if (WriteFile(
                         handle,
                         chunk.buffer.data(),
@@ -1884,6 +2705,15 @@ bool BlockDevice::WriteBatch(std::span<const WriteSpan> writes)
                 write_scratch_.begin() + static_cast<std::ptrdiff_t>(write.absolute_offset - group_start));
         }
 
+        // Grouped RMW also rewrites gaps between the validated caller spans.
+        if (read_cache_enabled_)
+        {
+            std::lock_guard<std::mutex> cache_lock(read_cache_mutex_);
+            if (InvalidateReadCacheRangeLocked(group_start, group_bytes_u64))
+            {
+                read_cache_invalidation_count_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         DWORD bytes_written = 0;
         if (!WriteAt(handle, group_start, write_scratch_.data(), static_cast<DWORD>(group_bytes), bytes_written) ||
             bytes_written != group_bytes)
@@ -2098,6 +2928,10 @@ bool BlockDevice::Flush()
         ScopedPerfTimer queue_wait_scope(flush_queue_wait_perf_);
         write_lock.lock();
     }
+    if (!ProbeUnderlyingDevice(true))
+    {
+        return false;
+    }
     HANDLE handle = EnsureWriteHandle();
     if (handle == INVALID_HANDLE_VALUE)
     {
@@ -2165,6 +2999,13 @@ bool BlockDevice::WriteLocked(
         return false;
     }
     const auto aligned_size = static_cast<std::size_t>(aligned_size_u64);
+    if (!RawWriteSpanAllowed(aligned_offset, aligned_size_u64))
+    {
+        // Admitted raw range breached (including RMW alignment spill):
+        // fail closed, never write outside the bound container.
+        last_io_error_.store(ERROR_ACCESS_DENIED, std::memory_order_relaxed);
+        return false;
+    }
 
     const bool already_aligned =
         prefix_bytes == 0 &&
@@ -2360,6 +3201,35 @@ std::shared_ptr<BlockDevice> BlockDevice::OpenStableReadOnlyImage(
     return device;
 }
 
+std::shared_ptr<BlockDevice> BlockDevice::AdoptExclusiveRepairImage(
+    std::wstring path, HANDLE handle, std::string& error)
+{
+    auto device = std::make_shared<BlockDevice>(std::move(path), 0);
+    device->read_handle_.store(handle);
+    FILE_ID_INFO identity{}; FILE_STANDARD_INFO standard{};
+    if (!QueryRegularFileIdentity(handle, identity) ||
+        !GetFileInformationByHandleEx(handle, FileStandardInfo, &standard, sizeof(standard)) ||
+        standard.DeletePending || standard.NumberOfLinks != 1 || standard.EndOfFile.QuadPart <= 0 ||
+        standard.EndOfFile.QuadPart > 256ll * 1024 * 1024) {
+        error = "Exclusive bounded ordinary image required"; return nullptr;
+    }
+    const bool exclusive_source = IsExclusiveRepairImageHandle(handle);
+    HANDLE writer = INVALID_HANDLE_VALUE;
+    if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &writer,
+        0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        error = "Cannot duplicate held repair image"; return nullptr;
+    }
+    device->write_handle_.store(writer);
+    device->regular_file_.store(true); device->writable_.store(true);
+    device->AdvanceWriteSourceGenerationLocked();
+    device->exclusive_write_image_identity_ = identity;
+    device->exclusive_write_image_size_bytes_ = static_cast<std::uint64_t>(standard.EndOfFile.QuadPart);
+    device->exclusive_write_image_ = exclusive_source;
+    return device;
+}
+
+#include "BlockDeviceSoftwareTransitionImage.inc"
+
 bool BlockDevice::RevalidateStableReadOnlyImage() const
 {
     FILE_ID_INFO identity{};
@@ -2368,6 +3238,299 @@ bool BlockDevice::RevalidateStableReadOnlyImage() const
         identity.VolumeSerialNumber == stable_image_identity_.VolumeSerialNumber &&
         std::memcmp(identity.FileId.Identifier, stable_image_identity_.FileId.Identifier,
             sizeof(identity.FileId.Identifier)) == 0;
+}
+
+std::shared_ptr<BlockDevice> BlockDevice::OpenExclusiveManagementImage(
+    std::wstring path, std::uint64_t offset, std::string& error)
+{
+    error.clear();
+    if (path.size()<3 || !std::iswalpha(path[0]) || path[1]!=L':' ||
+        (path[2]!=L'\\' && path[2]!=L'/') || path.find(L':',2)!=std::wstring::npos) {
+        error="VolumeManagementRequiresAbsoluteLocalImage"; return {};
+    }
+    auto device=std::make_shared<BlockDevice>(std::move(path),offset);
+    const auto handle=CreateFileW(device->path_.c_str(),GENERIC_READ|GENERIC_WRITE,0,nullptr,OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL|FILE_FLAG_OVERLAPPED|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+    if(handle==INVALID_HANDLE_VALUE){error="VolumeManagementExclusiveImageOpenFailed:"+std::to_string(GetLastError());return {};}
+    device->read_handle_.store(handle,std::memory_order_release);
+    FILE_ID_INFO identity{};
+    FILE_STANDARD_INFO standard{};
+    if(!QueryRegularFileIdentity(handle,identity) ||
+        !GetFileInformationByHandleEx(handle,FileStandardInfo,&standard,sizeof(standard)) ||
+        standard.EndOfFile.QuadPart < 0){error="VolumeManagementSourceNotRegularImage";return {};}
+    HANDLE writer=INVALID_HANDLE_VALUE;
+    if(!DuplicateHandle(GetCurrentProcess(),handle,GetCurrentProcess(),&writer,0,FALSE,DUPLICATE_SAME_ACCESS)) {
+        error="VolumeManagementDuplicateLeaseFailed";return {};
+    }
+    device->write_handle_.store(writer,std::memory_order_release);
+    device->regular_file_.store(true,std::memory_order_release);
+    device->writable_.store(true,std::memory_order_release);
+    device->AdvanceWriteSourceGenerationLocked();
+    device->exclusive_write_image_identity_ = identity;
+    device->exclusive_write_image_size_bytes_ = static_cast<std::uint64_t>(standard.EndOfFile.QuadPart);
+    device->exclusive_write_image_ = true;
+    return device;
+}
+
+namespace
+{
+// APFS GPT partition type {7C3457EF-0000-11AA-AA11-00306543ECAC}.
+constexpr GUID kApfsGptPartitionType =
+    {0x7C3457EF, 0x0000, 0x11AA, {0xAA, 0x11, 0x00, 0x30, 0x65, 0x43, 0xEC, 0xAC}};
+
+std::string FormatGuidLower(const GUID& value)
+{
+    char text[64] = {};
+    std::snprintf(text, sizeof(text),
+        "%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        value.Data1, value.Data2, value.Data3,
+        value.Data4[0], value.Data4[1], value.Data4[2], value.Data4[3],
+        value.Data4[4], value.Data4[5], value.Data4[6], value.Data4[7]);
+    return std::string(text);
+}
+
+struct ExclusiveHandleGuard
+{
+    HANDLE value = INVALID_HANDLE_VALUE;
+    ExclusiveHandleGuard() = default;
+    ~ExclusiveHandleGuard()
+    {
+        if (value != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(value);
+        }
+    }
+    ExclusiveHandleGuard(const ExclusiveHandleGuard&) = delete;
+    ExclusiveHandleGuard& operator=(const ExclusiveHandleGuard&) = delete;
+};
+} // namespace
+
+bool BlockDevice::AdmitExclusiveRawWriter(std::uint64_t limit_bytes, std::string& error)
+{
+    return AdmitExclusiveRawWriterImpl(limit_bytes, error, false);
+}
+
+bool BlockDevice::AdmitExclusiveRawWriterImpl(std::uint64_t limit_bytes, std::string& error,
+    bool qualified_interface)
+{
+    std::lock_guard<std::mutex> probe_lock(raw_presence_probe_mutex_);
+    error.clear();
+    const auto fail = [&](const std::string& reason) {
+        error = reason;
+        return false;
+    };
+    if (limit_bytes == 0 || (limit_bytes % 4096ull) != 0 ||
+        base_offset_bytes_ > std::numeric_limits<std::uint64_t>::max() - limit_bytes)
+    {
+        return fail("RawWriterLimitInvalid");
+    }
+    if ((base_offset_bytes_ % 512ull) != 0)
+    {
+        return fail("RawWriterBaseUnaligned");
+    }
+    if (!IsRawPhysicalDevicePath(path_) && !qualified_interface)
+    {
+        return fail("RawWriterPathNotPhysicalDrive");
+    }
+    if (qualified_interface && (path_.size() > 4096 || path_.find(L'\0') != std::wstring::npos ||
+        path_.size() <= 12 || _wcsnicmp(path_.c_str(), L"\\\\?\\USBSTOR#", 12) != 0))
+        return fail("RawWriterQualifiedInterfaceInvalid");
+    if (write_handle_.load(std::memory_order_acquire) != INVALID_HANDLE_VALUE ||
+        raw_writer_accepted_.load(std::memory_order_acquire))
+    {
+        return fail("RawWriterAlreadyAdmitted");
+    }
+    auto presence = std::make_unique<RawPresenceIdentity>();
+    DWORD presence_error = ERROR_SUCCESS;
+    if (!ResolveRawDiskInterface(path_, presence->selected, presence_error))
+        return fail("RawWriterSelectedInterfaceUnavailable:" + std::to_string(presence_error));
+    // Release our own shared lazy handles first: a share-deny-all open
+    // conflicts even with handles this same process already holds.
+    {
+        std::lock_guard<std::mutex> lock(handle_mutex_);
+        if (write_handle_.load(std::memory_order_acquire) != INVALID_HANDLE_VALUE ||
+            raw_writer_accepted_.load(std::memory_order_acquire))
+        {
+            return fail("RawWriterAlreadyAdmitted");
+        }
+        InvalidateWriteSourceHandlesLocked();
+        const auto previous_read =
+            read_handle_.exchange(INVALID_HANDLE_VALUE, std::memory_order_acq_rel);
+        if (previous_read != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(previous_read);
+        }
+        const auto previous_write =
+            write_handle_.exchange(INVALID_HANDLE_VALUE, std::memory_order_acq_rel);
+        if (previous_write != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(previous_write);
+        }
+    }
+    // Deny-write sharing: any later open requesting write/delete access
+    // fails, so no second writer (ours, a filesystem mounter, or a format
+    // tool) can join mid-session. Pure readers (our own earlier handles are
+    // already closed above; system inventory readers) stay admitted, which is
+    // also what makes this open succeed on a live Windows disk where a
+    // share-deny-all open is refused while system readers exist.
+    ExclusiveHandleGuard exclusive;
+    exclusive.value = CreateFileW(presence->selected.path.c_str(), GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
+    if (exclusive.value == INVALID_HANDLE_VALUE)
+    {
+        return fail("RawWriterExclusiveOpenFailed:" + std::to_string(GetLastError()));
+    }
+    DWORD file_type = GetFileType(exclusive.value);
+    if (file_type != FILE_TYPE_DISK)
+    {
+        return fail("RawWriterNotDiskDevice");
+    }
+    STORAGE_DEVICE_NUMBER source_number{};
+    DWORD number_bytes = 0;
+    const auto selected_number = TryParsePhysicalDriveNumber(path_);
+    if (!DeviceIoControl(exclusive.value, IOCTL_STORAGE_GET_DEVICE_NUMBER, nullptr, 0,
+            &source_number, sizeof(source_number), &number_bytes, nullptr) ||
+        source_number.DeviceNumber == MAXDWORD ||
+        !physical_instance::WholeDisk(source_number, number_bytes,
+            selected_number.value_or(source_number.DeviceNumber)))
+        return fail("RawWriterSelectedDeviceNumberMismatch");
+    presence->disk_number = source_number.DeviceNumber;
+    DWORD layout_bytes = 4096;
+    std::vector<std::byte> layout_buffer(static_cast<std::size_t>(layout_bytes));
+    DWORD returned = 0;
+    bool layout_ok = false;
+    for (int attempt = 0; attempt < 4; ++attempt)
+    {
+        if (DeviceIoControl(exclusive.value, IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
+                nullptr, 0, layout_buffer.data(), layout_bytes, &returned, nullptr))
+        {
+            layout_ok = true;
+            break;
+        }
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || layout_bytes >= 65536)
+        {
+            break;
+        }
+        layout_bytes *= 2;
+        layout_buffer.assign(static_cast<std::size_t>(layout_bytes), std::byte{0});
+    }
+    if (!layout_ok)
+    {
+        return fail("RawWriterLayoutUnreadable:" + std::to_string(GetLastError()));
+    }
+    constexpr auto layout_header_bytes = offsetof(DRIVE_LAYOUT_INFORMATION_EX, PartitionEntry);
+    if (returned < layout_header_bytes || returned > layout_buffer.size())
+    {
+        return fail("RawWriterLayoutTruncated");
+    }
+    const auto* layout =
+        reinterpret_cast<const DRIVE_LAYOUT_INFORMATION_EX*>(layout_buffer.data());
+    if (layout->PartitionCount > (returned - layout_header_bytes) / sizeof(PARTITION_INFORMATION_EX))
+    {
+        return fail("RawWriterLayoutTruncated");
+    }
+    if (layout->PartitionStyle != PARTITION_STYLE_GPT)
+    {
+        return fail("RawWriterDiskNotGpt");
+    }
+    bool contained = false;
+    for (DWORD index = 0; index < layout->PartitionCount; ++index)
+    {
+        const auto& entry = layout->PartitionEntry[index];
+        if (entry.StartingOffset.QuadPart < 0 || entry.PartitionLength.QuadPart <= 0 ||
+            entry.PartitionStyle != PARTITION_STYLE_GPT ||
+            std::memcmp(&entry.Gpt.PartitionType, &kApfsGptPartitionType, sizeof(GUID)) != 0)
+        {
+            continue;
+        }
+        const auto start = static_cast<std::uint64_t>(entry.StartingOffset.QuadPart);
+        const auto length = static_cast<std::uint64_t>(entry.PartitionLength.QuadPart);
+        if (base_offset_bytes_ >= start && limit_bytes <= length &&
+            base_offset_bytes_ - start <= length - limit_bytes)
+        {
+            contained = true;
+            break;
+        }
+    }
+    if (!contained)
+    {
+        return fail("RawWriterRangeNotInApfsPartition");
+    }
+    Geometry source_geometry{};
+    const bool fixed_size = QueryGeometryLocked(exclusive.value, source_geometry) &&
+        limit_bytes <= source_geometry.total_bytes;
+    std::string identity = "gpt:" + FormatGuidLower(layout->Gpt.DiskId) +
+        "|base:" + std::to_string(base_offset_bytes_) +
+        "|limit:" + std::to_string(limit_bytes);
+    if (selected_number)
+    {
+        std::wstring current;
+        if (!physical_instance::Selected(L"\\\\.\\PhysicalDrive" + std::to_wstring(*selected_number), current) ||
+            current != presence->selected.instance)
+            return fail("RawWriterSelectedInstanceChanged");
+    }
+    if (!IsPresentDiskInterface(presence->selected, presence_error))
+        return fail("RawWriterSelectedInterfaceChanged:" + std::to_string(presence_error));
+    HANDLE writer = INVALID_HANDLE_VALUE;
+    if (!DuplicateHandle(GetCurrentProcess(), exclusive.value, GetCurrentProcess(),
+            &writer, 0, FALSE, DUPLICATE_SAME_ACCESS))
+    {
+        return fail("RawWriterDuplicateLeaseFailed:" + std::to_string(GetLastError()));
+    }
+    {
+        std::lock_guard<std::mutex> lock(handle_mutex_);
+        InvalidateWriteSourceHandlesLocked();
+        const auto previous_read = read_handle_.exchange(exclusive.value, std::memory_order_acq_rel);
+        if (previous_read != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(previous_read);
+        }
+        exclusive.value = INVALID_HANDLE_VALUE;
+        const auto previous_write = write_handle_.exchange(writer, std::memory_order_acq_rel);
+        if (previous_write != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(previous_write);
+        }
+        regular_file_.store(false, std::memory_order_release);
+        writable_.store(true, std::memory_order_release);
+        raw_write_limit_bytes_.store(limit_bytes, std::memory_order_release);
+        raw_writer_identity_ = std::move(identity);
+        raw_write_source_size_bytes_ = fixed_size ? source_geometry.total_bytes : 0;
+        raw_presence_identity_ = std::move(presence);
+        raw_presence_probe_result_.store(true, std::memory_order_relaxed);
+        raw_presence_probe_error_.store(ERROR_SUCCESS, std::memory_order_relaxed);
+        raw_presence_probe_tick_ms_.store(0, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> source_lock(write_source_mutex_);
+            write_source_handles_retired_ = false;
+            raw_snapshot_lease_retired_ = false;
+            raw_snapshot_descriptors_attempted_ = false;
+            raw_snapshot_descriptors_complete_ = false;
+            raw_snapshot_descriptors_ = {};
+            raw_snapshot_descriptors_error_.clear();
+        }
+        raw_writer_accepted_.store(true, std::memory_order_release);
+    }
+    return true;
+}
+
+bool BlockDevice::QueryRegularImageIdentity(std::string& out) const
+{
+    out.clear();
+    if (!IsRegularFile()) return false;
+    const auto handle = EnsureReadHandle();
+    FILE_ID_INFO id{}; FILE_STANDARD_INFO info{};
+    if (handle == INVALID_HANDLE_VALUE ||
+        !GetFileInformationByHandleEx(handle, FileIdInfo, &id, sizeof(id)) ||
+        !GetFileInformationByHandleEx(handle, FileStandardInfo, &info, sizeof(info)) ||
+        info.Directory || info.DeletePending || info.EndOfFile.QuadPart <= 0) return false;
+    const char hex[] = "0123456789abcdef";
+    const auto append = [&](std::uint64_t n) { for (int i=15; i>=0; --i) out.push_back(hex[(n>>(i*4))&15]); };
+    append(id.VolumeSerialNumber);
+    for (auto b : id.FileId.Identifier) { out.push_back(hex[b>>4]); out.push_back(hex[b&15]); }
+    append(base_offset_bytes_); append(static_cast<std::uint64_t>(info.EndOfFile.QuadPart));
+    return true;
 }
 
 bool BlockDevice::QueryStableReadOnlyImageIdentity(StableImageIdentity& out) const
@@ -2393,6 +3556,336 @@ bool BlockDevice::QueryStableReadOnlyImageIdentity(StableImageIdentity& out) con
     return true;
 }
 
+bool BlockDevice::QueryHeldImageIdentity(StableImageIdentity& out) const
+{
+    out = {};
+    FILE_ID_INFO id{}; FILE_STANDARD_INFO standard{}; FILE_BASIC_INFO basic{};
+    const auto handle = read_handle_.load(std::memory_order_acquire);
+    if (!QueryRegularFileIdentity(handle, id) ||
+        !GetFileInformationByHandleEx(handle, FileStandardInfo, &standard, sizeof(standard)) ||
+        standard.EndOfFile.QuadPart < 0 || standard.DeletePending ||
+        !GetFileInformationByHandleEx(handle, FileBasicInfo, &basic, sizeof(basic))) return false;
+    out.volume_serial = id.VolumeSerialNumber;
+    std::memcpy(out.file_id.data(), id.FileId.Identifier, out.file_id.size());
+    out.size_bytes = static_cast<std::uint64_t>(standard.EndOfFile.QuadPart);
+    out.creation_time = static_cast<std::uint64_t>(basic.CreationTime.QuadPart);
+    out.write_time = static_cast<std::uint64_t>(basic.LastWriteTime.QuadPart);
+    return true;
+}
+
+std::optional<BlockDevice::WriteSourceObservation> BlockDevice::CaptureExclusiveWriteSourceObservation() const
+{
+    std::lock_guard<std::mutex> handle_lock(handle_mutex_);
+    std::lock_guard<std::mutex> source_lock(write_source_mutex_);
+    const auto reader = read_handle_.load(std::memory_order_acquire);
+    const auto writer = write_handle_.load(std::memory_order_acquire);
+    DWORD flags = 0;
+    if (stable_read_only_image_ || write_source_generation_exhausted_ || write_source_handles_retired_ ||
+        write_source_admissions_ != 0 || !writable_.load(std::memory_order_acquire) ||
+        (!exclusive_write_image_ && !raw_writer_accepted_.load(std::memory_order_acquire)))
+    {
+        return std::nullopt;
+    }
+    const auto retire = [&]() -> std::optional<WriteSourceObservation> {
+        AdvanceWriteSourceGenerationLocked();
+        write_source_handles_retired_ = true;
+        RetireRawSnapshotLeaseLocked();
+        return std::nullopt;
+    };
+    if (reader == INVALID_HANDLE_VALUE || writer == INVALID_HANDLE_VALUE ||
+        !GetHandleInformation(reader, &flags) || !GetHandleInformation(writer, &flags))
+    {
+        return retire();
+    }
+
+    WriteSourceObservation observation;
+    observation.device_ = this;
+    observation.lifetime_ = write_source_lifetime_;
+    observation.read_handle_ = reader;
+    observation.write_handle_ = writer;
+    observation.generation_ = write_source_generation_;
+    observation.base_offset_bytes_ = base_offset_bytes_;
+    if (raw_writer_accepted_.load(std::memory_order_acquire))
+    {
+        Geometry source_geometry{};
+        observation.limit_bytes_ = raw_write_limit_bytes_.load(std::memory_order_acquire);
+        if (observation.limit_bytes_ == 0 || raw_writer_identity_.empty() ||
+            raw_writer_identity_.size() > observation.raw_identity_.size() ||
+            regular_file_.load(std::memory_order_acquire) ||
+            !raw_presence_probe_result_.load(std::memory_order_acquire) ||
+            GetFileType(reader) != FILE_TYPE_DISK || GetFileType(writer) != FILE_TYPE_DISK ||
+            raw_write_source_size_bytes_ == 0 ||
+            !QueryGeometryLocked(reader, source_geometry) ||
+            source_geometry.total_bytes != raw_write_source_size_bytes_ ||
+            observation.limit_bytes_ > source_geometry.total_bytes)
+        {
+            return retire();
+        }
+        observation.raw_identity_size_ = raw_writer_identity_.size();
+        std::copy(raw_writer_identity_.begin(), raw_writer_identity_.end(), observation.raw_identity_.begin());
+    }
+    else if (exclusive_write_image_ && regular_file_.load(std::memory_order_acquire))
+    {
+        FILE_ID_INFO reader_id{}, writer_id{};
+        FILE_STANDARD_INFO standard{};
+        const auto held_handles = SoftwareTransitionHeldImageAuthority::ExpectedHandleCount(*this, reader, writer);
+        if (!held_handles || !QueryHeldReadWriteHandle(reader, *held_handles) || !QueryHeldReadWriteHandle(writer, *held_handles) ||
+            !GetFileInformationByHandleEx(reader, FileIdInfo, &reader_id, sizeof(reader_id)) ||
+            !GetFileInformationByHandleEx(writer, FileIdInfo, &writer_id, sizeof(writer_id)) ||
+            reader_id.VolumeSerialNumber != exclusive_write_image_identity_.VolumeSerialNumber ||
+            writer_id.VolumeSerialNumber != reader_id.VolumeSerialNumber ||
+            std::memcmp(reader_id.FileId.Identifier, exclusive_write_image_identity_.FileId.Identifier, 16) != 0 ||
+            std::memcmp(writer_id.FileId.Identifier, reader_id.FileId.Identifier, 16) != 0 ||
+            !GetFileInformationByHandleEx(reader, FileStandardInfo, &standard, sizeof(standard)) ||
+            standard.Directory || standard.DeletePending || standard.NumberOfLinks == 0 ||
+            standard.EndOfFile.QuadPart <= 0 ||
+            static_cast<std::uint64_t>(standard.EndOfFile.QuadPart) != exclusive_write_image_size_bytes_ ||
+            base_offset_bytes_ >= static_cast<std::uint64_t>(standard.EndOfFile.QuadPart))
+        {
+            return retire();
+        }
+        observation.image_identity_.volume_serial = reader_id.VolumeSerialNumber;
+        std::memcpy(observation.image_identity_.file_id.data(), reader_id.FileId.Identifier, 16);
+        observation.image_identity_.size_bytes = static_cast<std::uint64_t>(standard.EndOfFile.QuadPart);
+        observation.limit_bytes_ = observation.image_identity_.size_bytes - base_offset_bytes_;
+    }
+    else
+    {
+        return std::nullopt;
+    }
+    return observation;
+}
+
+bool BlockDevice::IsExclusiveWriteSourceObservationCurrent(const WriteSourceObservation& observation) const
+{
+    if (observation.device_ != this || observation.lifetime_ != write_source_lifetime_)
+    {
+        return false;
+    }
+    const auto current = CaptureExclusiveWriteSourceObservation();
+    return current && *current == observation;
+}
+
+bool BlockDevice::IsHeldRawSnapshotLeaseCurrentLocked(const RawSnapshotLease& lease) const
+{
+    const auto reader = read_handle_.load(std::memory_order_acquire);
+    const auto writer = write_handle_.load(std::memory_order_acquire);
+    const auto limit = raw_write_limit_bytes_.load(std::memory_order_acquire);
+    return lease.device_ == this && lease.lifetime_ == write_source_lifetime_ &&
+        !raw_snapshot_epoch_exhausted_ && !raw_snapshot_lease_retired_ && !write_source_handles_retired_ &&
+        lease.retirement_epoch_ == raw_snapshot_retirement_epoch_ &&
+        reader != nullptr && reader != INVALID_HANDLE_VALUE &&
+        writer != nullptr && writer != INVALID_HANDLE_VALUE &&
+        lease.read_handle_ == reader && lease.write_handle_ == writer &&
+        lease.base_offset_bytes_ == base_offset_bytes_ && lease.limit_bytes_ == limit &&
+        raw_writer_accepted_.load(std::memory_order_acquire) && writable_.load(std::memory_order_acquire) &&
+        !regular_file_.load(std::memory_order_acquire) && !stable_read_only_image_ &&
+        raw_presence_probe_result_.load(std::memory_order_acquire) && !raw_writer_identity_.empty() &&
+        limit != 0 && limit <= raw_write_source_size_bytes_;
+}
+
+std::optional<BlockDevice::RawSnapshotLease> BlockDevice::CaptureHeldRawSnapshotLease() const
+{
+    std::lock_guard<std::mutex> source_lock(write_source_mutex_);
+    RawSnapshotLease lease;
+    lease.device_ = this;
+    lease.lifetime_ = write_source_lifetime_;
+    lease.read_handle_ = read_handle_.load(std::memory_order_acquire);
+    lease.write_handle_ = write_handle_.load(std::memory_order_acquire);
+    lease.retirement_epoch_ = raw_snapshot_retirement_epoch_;
+    lease.base_offset_bytes_ = base_offset_bytes_;
+    lease.limit_bytes_ = raw_write_limit_bytes_.load(std::memory_order_acquire);
+    if (!IsHeldRawSnapshotLeaseCurrentLocked(lease)) return std::nullopt;
+    return lease;
+}
+
+bool BlockDevice::IsHeldRawSnapshotLeaseCurrent(const RawSnapshotLease& lease) const
+{
+    std::lock_guard<std::mutex> source_lock(write_source_mutex_);
+    return IsHeldRawSnapshotLeaseCurrentLocked(lease);
+}
+
+bool BlockDevice::RawSnapshotIoctl(
+    HANDLE handle, DWORD code, void* input, DWORD input_bytes,
+    void* output, DWORD output_bytes, DWORD& returned, DWORD& error) const
+{
+    returned = 0;
+    error = ERROR_SUCCESS;
+    ExclusiveHandleGuard event;
+    event.value = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!event.value)
+    {
+        error = GetLastError();
+        event.value = INVALID_HANDLE_VALUE;
+        return false;
+    }
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = event.value;
+    if (DeviceIoControl(handle, code, input, input_bytes, output, output_bytes, &returned, &overlapped))
+        return true;
+    error = GetLastError();
+    if (error != ERROR_IO_PENDING) return false;
+    return WaitForOverlappedCompletion(handle, overlapped, returned, error);
+}
+
+bool BlockDevice::QueryRawSnapshotProperty(
+    HANDLE handle, STORAGE_PROPERTY_ID property, std::vector<std::byte>& out, DWORD& error) const
+{
+    out.clear();
+    STORAGE_PROPERTY_QUERY query{};
+    query.PropertyId = property;
+    query.QueryType = PropertyStandardQuery;
+    STORAGE_DESCRIPTOR_HEADER header{};
+    DWORD returned = 0;
+    if (!RawSnapshotIoctl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query),
+            &header, sizeof(header), returned, error)) return false;
+    if (returned != sizeof(header) || header.Size < sizeof(header) ||
+        header.Size > kRawSnapshotDescriptorMaxBytes || header.Version < sizeof(header) || header.Version > header.Size)
+    {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+    std::vector<std::byte> bytes(header.Size);
+    if (!RawSnapshotIoctl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query),
+            bytes.data(), static_cast<DWORD>(bytes.size()), returned, error)) return false;
+    STORAGE_DESCRIPTOR_HEADER actual{};
+    if (returned > bytes.size() || !raw_snapshot_detail::Load(std::span<const std::byte>(bytes).first(returned), 0, actual) ||
+        actual.Size != header.Size || actual.Version != header.Version || returned < actual.Size)
+    {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+    bytes.resize(actual.Size);
+    out = std::move(bytes);
+    return true;
+}
+
+bool BlockDevice::QueryHeldRawSnapshotDescriptors(
+    const RawSnapshotLease& lease, RawSnapshotDescriptors& out, std::string& error) const
+{
+    out = {};
+    error.clear();
+    // Pin original handles through pending I/O, but leave the leaf source lock
+    // available for cached continuity checks, writes and known retirement.
+    std::lock_guard<std::mutex> handle_lock(handle_mutex_);
+    {
+        std::lock_guard<std::mutex> source_lock(write_source_mutex_);
+        if (!IsHeldRawSnapshotLeaseCurrentLocked(lease))
+            return raw_snapshot_detail::Refuse(error, "RawSnapshotLeaseNotCurrent");
+    }
+    if (!raw_snapshot_descriptors_attempted_)
+    {
+        // A query exception also consumes this attempt; a retry never reopens or
+        // manufactures replacement evidence for the original held lifetime.
+        const auto query = [&]() -> bool {
+            raw_snapshot_descriptors_error_ = "RawSnapshotDescriptorQueryIncomplete";
+            RawSnapshotDescriptors descriptors;
+            const auto reader = lease.read_handle_;
+            DWORD io_error = ERROR_SUCCESS, returned = 0;
+            const auto io_failure = [&](const char* operation) {
+                raw_snapshot_descriptors_error_ = std::string(operation) + ":" + std::to_string(io_error);
+                if (IsDeviceUnavailableError(io_error))
+                {
+                    std::lock_guard<std::mutex> source_lock(write_source_mutex_);
+                    RetireRawSnapshotLeaseLocked();
+                }
+                return false;
+            };
+            std::vector<std::byte> device_bytes, id_bytes, alignment_bytes, geometry_bytes;
+            if (!QueryRawSnapshotProperty(reader, StorageDeviceProperty, device_bytes, io_error))
+                return io_failure("RawHardwareDescriptorUnavailable");
+            if (!ParseRawDeviceDescriptor(device_bytes, descriptors.device, raw_snapshot_descriptors_error_)) return false;
+            if (QueryRawSnapshotProperty(reader, StorageDeviceIdProperty, id_bytes, io_error))
+            {
+                if (!ParseRawDeviceIdDescriptor(id_bytes, descriptors.identifiers, raw_snapshot_descriptors_error_)) return false;
+                descriptors.device_id_available = true;
+            }
+            else if (io_error != ERROR_NOT_SUPPORTED && io_error != ERROR_INVALID_FUNCTION && io_error != ERROR_INVALID_PARAMETER)
+                return io_failure("RawHardwareIdentifierUnavailable");
+            if (!QueryRawSnapshotProperty(reader, StorageAccessAlignmentProperty, alignment_bytes, io_error))
+            {
+                if (io_error != ERROR_NOT_SUPPORTED && io_error != ERROR_INVALID_FUNCTION && io_error != ERROR_INVALID_PARAMETER)
+                    return io_failure("RawSnapshotAlignmentUnavailable");
+                DISK_GEOMETRY geometry{};
+                if (!RawSnapshotIoctl(reader,IOCTL_DISK_GET_DRIVE_GEOMETRY,nullptr,0,
+                        &geometry,sizeof(geometry),returned,io_error)) return io_failure("RawSnapshotLogicalGeometryUnavailable");
+                if (returned!=sizeof(geometry))
+                    return raw_snapshot_detail::Refuse(raw_snapshot_descriptors_error_,"RawSnapshotLogicalGeometryTruncated");
+                const auto bytes=std::as_bytes(std::span(&geometry,1));
+                geometry_bytes.assign(bytes.begin(),bytes.end());
+            }
+            GET_LENGTH_INFORMATION length{};
+            if (!RawSnapshotIoctl(reader, IOCTL_DISK_GET_LENGTH_INFO, nullptr, 0,
+                    &length, sizeof(length), returned, io_error)) return io_failure("RawSnapshotDiskLengthUnavailable");
+            if (returned != sizeof(length))
+                return raw_snapshot_detail::Refuse(raw_snapshot_descriptors_error_, "RawSnapshotDiskLengthTruncated");
+            std::vector<std::byte> layout_bytes(4096);
+            for (;;)
+            {
+                if (RawSnapshotIoctl(reader, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, nullptr, 0,
+                        layout_bytes.data(), static_cast<DWORD>(layout_bytes.size()), returned, io_error)) break;
+                if ((io_error != ERROR_INSUFFICIENT_BUFFER && io_error != ERROR_MORE_DATA) ||
+                    layout_bytes.size() >= kRawSnapshotDescriptorMaxBytes) return io_failure("RawSnapshotLayoutUnavailable");
+                layout_bytes.resize(layout_bytes.size() * 2);
+            }
+            if (returned > layout_bytes.size())
+                return raw_snapshot_detail::Refuse(raw_snapshot_descriptors_error_, "RawSnapshotLayoutTruncated");
+            layout_bytes.resize(returned);
+            const auto length_span = std::as_bytes(std::span(&length, 1));
+            if (!ParseRawSnapshotMediaBinding(layout_bytes, length_span, alignment_bytes,
+                    lease.base_offset_bytes_, lease.limit_bytes_, descriptors.media, raw_snapshot_descriptors_error_,geometry_bytes)) return false;
+            DRIVE_LAYOUT_INFORMATION_EX layout{};
+            std::memcpy(&layout, layout_bytes.data(), offsetof(DRIVE_LAYOUT_INFORMATION_EX, PartitionEntry));
+            const auto expected_identity = "gpt:" + FormatGuidLower(layout.Gpt.DiskId) +
+                "|base:" + std::to_string(lease.base_offset_bytes_) + "|limit:" + std::to_string(lease.limit_bytes_);
+            if (expected_identity != raw_writer_identity_ ||
+                descriptors.media.disk_size_bytes - base_offset_bytes_ != raw_write_source_size_bytes_)
+            {
+                std::lock_guard<std::mutex> source_lock(write_source_mutex_);
+                RetireRawSnapshotLeaseLocked();
+                return raw_snapshot_detail::Refuse(raw_snapshot_descriptors_error_, "RawSnapshotAdmittedMediaChanged");
+            }
+            {
+                std::lock_guard<std::mutex> source_lock(write_source_mutex_);
+                if (!IsHeldRawSnapshotLeaseCurrentLocked(lease))
+                    return raw_snapshot_detail::Refuse(raw_snapshot_descriptors_error_, "RawSnapshotLeaseNotCurrent");
+            }
+            raw_snapshot_descriptors_ = std::move(descriptors);
+            raw_snapshot_descriptors_error_.clear();
+            return true;
+        };
+        raw_snapshot_detail::AttemptDescriptorCacheOnce(raw_snapshot_descriptors_attempted_,
+            raw_snapshot_descriptors_complete_,query);
+    }
+    {
+        std::lock_guard<std::mutex> source_lock(write_source_mutex_);
+        if (!IsHeldRawSnapshotLeaseCurrentLocked(lease))
+            return raw_snapshot_detail::Refuse(error, "RawSnapshotLeaseNotCurrent");
+    }
+    if (!raw_snapshot_descriptors_complete_ || !raw_snapshot_descriptors_error_.empty())
+    {
+        error = raw_snapshot_descriptors_error_.empty() ? "RawSnapshotDescriptorQueryIncomplete" : raw_snapshot_descriptors_error_;
+        return false;
+    }
+    out = raw_snapshot_descriptors_;
+    return true;
+}
+
+bool BlockDevice::QueryHeldRawSnapshotBinding(
+    const RawSnapshotLease& lease, const RawHardwareQualification& qualification,
+    RawSnapshotBinding& out, std::string& error) const
+{
+    out = {};
+    RawSnapshotDescriptors descriptors;
+    if (!QueryHeldRawSnapshotDescriptors(lease, descriptors, error)) return false;
+    RawSnapshotBinding binding;
+    if (!QualifyRawSnapshotBinding(descriptors, qualification, binding, error)) return false;
+    if (!IsHeldRawSnapshotLeaseCurrent(lease))
+        return raw_snapshot_detail::Refuse(error, "RawSnapshotLeaseNotCurrent");
+    out = std::move(binding);
+    return true;
+}
+
 HANDLE BlockDevice::EnsureReadHandle() const
 {
     auto handle = read_handle_.load(std::memory_order_acquire);
@@ -2408,6 +3901,12 @@ HANDLE BlockDevice::EnsureReadHandle() const
         return handle;
     }
 
+    if (raw_writer_accepted_.load(std::memory_order_acquire) ||
+        stable_read_only_image_ || exclusive_write_image_)
+    {
+        last_io_error_.store(ERROR_INVALID_HANDLE, std::memory_order_relaxed);
+        return INVALID_HANDLE_VALUE;
+    }
     handle = CreateFileW(
         path_.c_str(),
         GENERIC_READ,
@@ -2417,6 +3916,7 @@ HANDLE BlockDevice::EnsureReadHandle() const
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
         nullptr);
     FILE_ID_INFO identity{};
+    InvalidateWriteSourceHandlesLocked();
     regular_file_.store(QueryRegularFileIdentity(handle, identity), std::memory_order_release);
     read_handle_.store(handle, std::memory_order_release);
     return handle;
@@ -2472,6 +3972,7 @@ HANDLE BlockDevice::EnsureWriteHandle() const
         last_io_error_.store(ERROR_NOT_SUPPORTED, std::memory_order_relaxed);
         return INVALID_HANDLE_VALUE;
     }
+    InvalidateWriteSourceHandlesLocked();
     write_handle_.store(handle, std::memory_order_release);
     writable_.store(handle != INVALID_HANDLE_VALUE, std::memory_order_release);
     return handle;
@@ -2491,6 +3992,7 @@ void BlockDevice::CloseAsyncEventPoolLocked()
 
 void BlockDevice::CloseHandlesLocked() const
 {
+    InvalidateWriteSourceHandlesLocked();
     const auto read_handle = read_handle_.exchange(INVALID_HANDLE_VALUE, std::memory_order_acq_rel);
     if (read_handle != INVALID_HANDLE_VALUE)
     {
@@ -2665,6 +4167,11 @@ bool BlockDevice::WriteAt(
     DWORD& bytes_written) const
 {
     bytes_written = 0;
+    if (!RawWriteSpanAllowed(offset_bytes, bytes_to_write))
+    {
+        last_io_error_.store(ERROR_ACCESS_DENIED, std::memory_order_relaxed);
+        return false;
+    }
     const auto completion_event = CurrentBlockIoEvent().Ensure();
     if (completion_event == nullptr || !ResetEvent(completion_event))
     {

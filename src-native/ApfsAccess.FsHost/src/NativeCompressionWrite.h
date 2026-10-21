@@ -138,6 +138,7 @@ NTSTATUS WriteNativeCompressedContentImpl(MountContext* c, OpenContext* o, const
             if (c->tx_manager->CurrentState() != Tx::State::Idle)
                 return STATUS_DEVICE_BUSY;
         }
+        std::optional<Store::MutationStatus> preparation_refusal;
         const apfsaccess::catalog::ContainerMutationPreparationHook prepare =
             [&](const Store& live, auto& requests, std::string& error) {
                 Preparation::Admission admission;
@@ -166,6 +167,9 @@ NTSTATUS WriteNativeCompressedContentImpl(MountContext* c, OpenContext* o, const
                         {inode->object_id, inode->xid}, offset, length, failure);
                 if (!plan || plan->Revalidate(live, *c->tx_manager, admission) != Preparation::Failure::None)
                 {
+                    if (!plan && (failure == Preparation::Failure::SourceUnsupported ||
+                        failure == Preparation::Failure::RangeUnsupported))
+                        preparation_refusal = Store::MutationStatus::UnsupportedOperation;
                     error = "CompressedManifestPreparationRefused:" + std::to_string(static_cast<int>(failure));
                     return false;
                 }
@@ -198,7 +202,7 @@ NTSTATUS WriteNativeCompressedContentImpl(MountContext* c, OpenContext* o, const
         expectation.payload = bytes; expectation.payload_bytes = length; expectation.has_payload = true;
         ManifestCommitOutcome manifest_result;
         accepted = CommitQueuedManifestMutationWithWalBestEffort(
-            c, expectation, L"CompressedManifestWrite", prepare, verify, true, &manifest_result);
+            c, expectation, L"CompressedManifestWrite", prepare, verify, true, &manifest_result, false, &preparation_refusal);
         if (!accepted || !verified)
         {
             bool empty = false;

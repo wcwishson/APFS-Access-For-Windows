@@ -146,7 +146,7 @@ public sealed class RuntimeStatusPublisherTests
         var count = delivered.Count;
         PublishInventory(publisher, empty, conditional);
         Assert.Same(empty, publisher.Latest);
-        Assert.Equal(count, delivered.Count);
+        Assert.Equal(count + 1, delivered.Count); // Legacy absence differs from known-empty inventory.
 
         void ExpectNotification(StatusChangedPayload next)
         {
@@ -156,6 +156,120 @@ public sealed class RuntimeStatusPublisherTests
             Assert.Same(next, delivered[^1]);
             Assert.Same(next, publisher.Latest);
         }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void FreshTopologyObservationDoesNotNotifyUntilGraphContentChanges(bool conditional)
+    {
+        var publisher = new RuntimeStatusPublisher();
+        var graph = new ApfsTopologySnapshot(
+            [new("disk", "device-1", null, 4096)], [], [], [], [], []);
+        var inventory = NewInventory();
+        inventory[0] = inventory[0] with { Topology = new(1, "device-1", ["disk"], graph) };
+        publisher.Publish(NewPayload() with { ConnectedInventory = inventory, InventoryGeneration = 1 });
+        var notifications = 0;
+        publisher.StatusChanged += _ => ++notifications;
+        var cloned = System.Text.Json.JsonSerializer.Deserialize<ApfsTopologySnapshot>(
+            System.Text.Json.JsonSerializer.Serialize(graph))!;
+        var fresh = inventory.ToArray();
+        fresh[0] = fresh[0] with { Topology = new(2, "device-1", ["disk"], cloned) };
+        var payload = publisher.Latest with { ConnectedInventory = fresh, InventoryGeneration = 2 };
+        PublishInventory(publisher, payload, conditional);
+        Assert.Same(payload, publisher.Latest);
+        Assert.Equal(0, notifications);
+
+        var changed = fresh.ToArray();
+        changed[0] = changed[0] with { Topology = changed[0].Topology! with {
+            Snapshot = cloned with { Disks = [cloned.Disks[0] with { SizeBytes = 8192 }] } } };
+        PublishInventory(publisher, payload with { ConnectedInventory = changed }, conditional);
+        Assert.Equal(1, notifications);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void FreshMountedListsDoNotFlashButCapabilityChangesNotify(bool conditional)
+    {
+        var publisher = new RuntimeStatusPublisher();
+        var initial = NewPayload();
+        initial = initial with { MountedVolumes = [initial.MountedVolumes![0] with {
+            CatalogReasons = [], WriteIncompatibilities = ["limited"], WriteUnsupportedFeatures = [], NativeWriteDiagnostics = [] }] };
+        publisher.Publish(initial);
+        var delivered = 0;
+        publisher.StatusChanged += _ => ++delivered;
+        var cloned = System.Text.Json.JsonSerializer.Deserialize<StatusChangedPayload>(System.Text.Json.JsonSerializer.Serialize(initial))!;
+        PublishInventory(publisher, cloned, conditional);
+        Assert.Equal(0, delivered);
+        PublishInventory(publisher, cloned with { MountedVolumes = [cloned.MountedVolumes![0] with { CatalogReasons = null }] }, conditional);
+        Assert.Equal(1, delivered);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void MalformedRecordsAndRequiredNullListsAreComparedWithoutThrowing(bool conditional)
+    {
+        var publisher = new RuntimeStatusPublisher();
+        var graph = new ApfsTopologySnapshot([], [], [], [], [], []);
+        var device = NewInventory()[0] with { Topology = new(1, "device-1", [], graph) };
+        publisher.Publish(NewPayload() with { ConnectedInventory = [device] });
+        var changes = new DeviceInventory[][] {
+            [device with { Topology = device.Topology with { Snapshot = graph with { Volumes = null! } } }],
+            [device with { Topology = device.Topology with { Snapshot = null! } }],
+            [device with { Topology = device.Topology with { Snapshot = graph with { Containers = [null!] } } }],
+            [device with { Topology = device.Topology with { Snapshot = graph with { Groups = [null!] } } }],
+            [device with { Volumes = [null!] }],
+            [null!],
+            [device with { Topology = device.Topology with { Snapshot = graph with {
+                Disks = Enumerable.Repeat(new ApfsDiskRecord("disk", "d", null, 0), 4097).ToArray() } } }],
+        };
+        foreach (var inventory in changes)
+        {
+            var next = publisher.Latest with { ConnectedInventory = inventory };
+            PublishInventory(publisher, next, conditional);
+            var cloned = System.Text.Json.JsonSerializer.Deserialize<StatusChangedPayload>(System.Text.Json.JsonSerializer.Serialize(next))!;
+            PublishInventory(publisher, cloned, conditional);
+            Assert.Same(cloned, publisher.Latest);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void MissingCapabilityEvidenceIsNotEquivalentToAnEmptyVerdict(bool conditional)
+    {
+        var publisher = new RuntimeStatusPublisher();
+        var device = NewInventory()[0];
+        device = device with { Volumes = [device.Volumes[0] with {
+            CatalogDecision = ApfsCapabilityDecision.Writable, CatalogAutoMountAllowed = true, CatalogReasons = [] }] };
+        publisher.Publish(NewPayload() with { ConnectedInventory = [device] });
+        var delivered = 0;
+        publisher.StatusChanged += _ => ++delivered;
+        var missing = device with { Volumes = [device.Volumes[0] with { CatalogReasons = null }] };
+        PublishInventory(publisher, publisher.Latest with { ConnectedInventory = [missing] }, conditional);
+        Assert.Equal(1, delivered);
+        Assert.False(CatalogMountPolicy.AllowsOrdinaryMount(missing.Volumes[0]));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void InvalidOrMissingGenerationMustNotifyFailClosedConsumers(bool conditional)
+    {
+        var publisher = new RuntimeStatusPublisher();
+        var device = NewInventory()[0] with { Topology = new(1, "device-1", [], new([], [], [], [], [], [])) };
+        publisher.Publish(NewPayload() with { ConnectedInventory = [device], InventoryGeneration = 1 });
+        var delivered = 0;
+        publisher.StatusChanged += _ => ++delivered;
+        PublishInventory(publisher, publisher.Latest with { ConnectedInventory = [device with {
+            Topology = device.Topology with { Generation = 0 } }] }, conditional);
+        Assert.Equal(1, delivered);
+        PublishInventory(publisher, publisher.Latest with { InventoryGeneration = 0 }, conditional);
+        Assert.Equal(2, delivered);
+        PublishInventory(publisher, publisher.Latest with { InventoryGeneration = null }, conditional);
+        Assert.Equal(3, delivered);
     }
 
     private static void PublishInventory(RuntimeStatusPublisher publisher, StatusChangedPayload payload, bool conditional)

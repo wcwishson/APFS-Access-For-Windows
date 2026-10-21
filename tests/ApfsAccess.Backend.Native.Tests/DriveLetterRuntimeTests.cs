@@ -24,7 +24,7 @@ public sealed class DriveLetterRuntimeTests
         var state = Path.Combine(temp.Path, "letters.json");
         var pool = FreeLetters();
 
-        using (var native = Native(Evidence(reverse: false), temp))
+        using (var native = Native(Evidence(reverse: false, devicePath: image), temp))
         {
             var backend = new RecordingBackend(native, image);
             using var worker = Worker(backend, Policy(state, pool));
@@ -45,7 +45,7 @@ public sealed class DriveLetterRuntimeTests
         }
 
         // New backend, worker and policy: the observer now enumerates identical labels in reverse order.
-        using (var native = Native(Evidence(reverse: true), temp))
+        using (var native = Native(Evidence(reverse: true, devicePath: image), temp))
         {
             var backend = new RecordingBackend(native, image);
             using var worker = Worker(backend, Policy(state, pool));
@@ -56,7 +56,7 @@ public sealed class DriveLetterRuntimeTests
         Assert.Equal(original, File.ReadAllBytes(state));
 
         // Explicit mounting also feeds discovery before selection, including an occupied preference.
-        using (var native = Native(Evidence(reverse: true), temp))
+        using (var native = Native(Evidence(reverse: true, devicePath: image), temp))
         {
             var backend = new RecordingBackend(native, image);
             backend.Mounts.Add(new MountedVolumeState("occupied", $"{pool[1]}:\\", MountAccessMode.ReadOnly));
@@ -67,7 +67,7 @@ public sealed class DriveLetterRuntimeTests
         }
         Assert.Equal(original, File.ReadAllBytes(state));
 
-        using (var native = Native(Evidence(reverse: true), temp))
+        using (var native = Native(Evidence(reverse: true, devicePath: image), temp))
         {
             var backend = new RecordingBackend(native, image);
             using var worker = Worker(backend, Policy(state, pool), autoMount: false);
@@ -136,10 +136,10 @@ public sealed class DriveLetterRuntimeTests
         Assert.False(File.Exists(state));
     }
 
-    private static string Evidence(bool reverse)
+    private static string Evidence(bool reverse, string? devicePath = null)
     {
         var evidence = JsonNode.Parse(ObserverEvidenceJson.BuildSingleContainer(Container,
-            [new("Same name", 201), new("Same name", 202)]))!;
+            [new("Same name", 201), new("Same name", 202)], devicePath: devicePath ?? "given-path"))!;
         var volumes = evidence["topology"]!["volumes"]!.AsArray();
         volumes[0]!["uuid"] = Guid.Parse(FirstUuid).ToString("N");
         volumes[1]!["uuid"] = Guid.Parse(SecondUuid).ToString("N");

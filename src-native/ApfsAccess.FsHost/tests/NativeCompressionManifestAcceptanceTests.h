@@ -139,9 +139,11 @@ bool AcceptedFailure(bool census_failure, unsigned route, const wchar_t* policy)
     if (older) { EnqueueManifestRequest(&c, create); EnqueueManifestRequest(&c, rename); }
     const auto source_xid = f.fixture.coordinator->CheckpointXid();
     const auto initial_marks = c.tx_manager->Watermarks();
+    const auto initial_flushes = c.tx_manager->DeferredWalGroupFlushCount();
     FileEvidence original_image(f.fixture.image.path);
     unsigned accepts = 0, census_faults = 0, publication_faults = 0, verifications = 0;
     bool acceptance_finished = false;
+    bool census_cache_invalidated = false;
     std::optional<FileEvidence> accepted_wal, accepted_spool, accepted_index;
     const auto capture = [&] {
         if (accepted_wal) return;
@@ -150,11 +152,15 @@ bool AcceptedFailure(bool census_failure, unsigned route, const wchar_t* policy)
         accepted_index.emplace(c.payload_spool->SpoolFilePath().parent_path() / "payload-spool.idx");
     };
     c.tx_manager->SetFaultInjectionHook([&](const std::string& stage) {
-        if (stage == "accept-finish") { ++accepts; acceptance_finished = true; }
+        if (stage != "accept-finish") return;
+        ++accepts; acceptance_finished = true;
+        if (!census_failure) return;
+        // Force the host's own post-durability census to read the retained WAL.
+        // This removes only cached read coverage; the owner and debt stay armed.
+        c.tx_manager->InvalidateJournalReadCacheForTest();
+        census_cache_invalidated = true;
     });
     c.tx_manager->SetJournalFaultInjectionHook([&](std::string_view stage) {
-        // The host reaches this census rescan only after its real deferred WAL
-        // durability wait succeeds. Preaccept lease/reseed reads remain intact.
         if (!census_failure || !acceptance_finished || stage != "read-all-exclusive") return false;
         ++census_faults; capture(); return true;
     });
@@ -186,6 +192,10 @@ bool AcceptedFailure(bool census_failure, unsigned route, const wchar_t* policy)
     c.metadata_store->SetCommitStageHook({});
     g_compressed_manifest_before_verification_hook = {};
     const auto marks = c.tx_manager->Watermarks();
+    if (census_failure && !Require(census_cache_invalidated && census_faults >= 1 &&
+            c.tx_manager->DeferredWalGroupFlushCount() > initial_flushes &&
+            !c.tx_manager->RecoveryStateValid() && c.tx_manager->HasUnappliedAcceptedWork(),
+            "acceptance295: host census read after durable acceptance poisons recovery proof without retiring its debt")) return false;
     if (!Require(accepts == 1 && verifications == 0 &&
             (census_failure ? census_faults >= 1 && publication_faults == 0 : census_faults == 0 && publication_faults == 1) &&
             accepted_wal && !accepted_wal->bytes.empty() && accepted_wal->Unchanged() &&

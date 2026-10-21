@@ -34,7 +34,7 @@ public sealed class CatalogCapabilityEnforcementTests
                 "P", Volumes: [new CatalogVolumeSpec("Data")])]));
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
             ContainerHex,
-            [new ObserverEvidenceJson.VolumeJson("Data", 201, EncryptionMode: "password", Locked: true)]);
+            [new ObserverEvidenceJson.VolumeJson("Data", 201, EncryptionMode: "password", Locked: true)], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp, WritableConfig());
 
         var volume = Assert.Single(
@@ -60,7 +60,7 @@ public sealed class CatalogCapabilityEnforcementTests
                 "P", Volumes: [new CatalogVolumeSpec("Data")])]));
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
             ContainerHex,
-            [new ObserverEvidenceJson.VolumeJson("Data", 201, IncompatibleFeatures: 0x4)]);
+            [new ObserverEvidenceJson.VolumeJson("Data", 201, IncompatibleFeatures: 0x4)], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp, WritableConfig());
 
         var volume = Assert.Single(
@@ -83,7 +83,7 @@ public sealed class CatalogCapabilityEnforcementTests
                 "P", Volumes: [new CatalogVolumeSpec("Data")])]));
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
             ContainerHex,
-            [new ObserverEvidenceJson.VolumeJson("Data", 201, ReadonlyFeatures: 0x2)]);
+            [new ObserverEvidenceJson.VolumeJson("Data", 201, ReadonlyFeatures: 0x2)], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp, WritableConfig());
 
         var volume = Assert.Single(
@@ -105,7 +105,7 @@ public sealed class CatalogCapabilityEnforcementTests
                 "P", Volumes: [new CatalogVolumeSpec("Data")])]));
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
             ContainerHex,
-            [new ObserverEvidenceJson.VolumeJson("Data", 201, Roles: ["system"])]);
+            [new ObserverEvidenceJson.VolumeJson("Data", 201, Roles: ["system"])], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp, WritableConfig());
 
         var volume = Assert.Single(
@@ -127,7 +127,7 @@ public sealed class CatalogCapabilityEnforcementTests
             new CatalogFixtureSpec(16, [new CatalogPartitionSpec(
                 "P", Volumes: [new CatalogVolumeSpec("Data")])]));
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
-            ContainerHex, [new ObserverEvidenceJson.VolumeJson("Data", 201)]);
+            ContainerHex, [new ObserverEvidenceJson.VolumeJson("Data", 201)], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp, WritableConfig());
 
         var volume = Assert.Single(
@@ -155,7 +155,7 @@ public sealed class CatalogCapabilityEnforcementTests
             new CatalogFixtureSpec(16, [new CatalogPartitionSpec(
                 "P", Volumes: [new CatalogVolumeSpec("Data")])]));
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
-            ContainerHex, [new ObserverEvidenceJson.VolumeJson("Data", 201)]);
+            ContainerHex, [new ObserverEvidenceJson.VolumeJson("Data", 201)], devicePath: imagePath);
         var observerShim = Path.Combine(temp.Path, "ApfsObserver.exe");
         File.WriteAllBytes(observerShim, [0x4D, 0x5A]);
         var previous = Environment.GetEnvironmentVariable(NativeApfsObserver.PathOverrideVariable);
@@ -210,7 +210,7 @@ public sealed class CatalogCapabilityEnforcementTests
             new CatalogFixtureSpec(16, [new CatalogPartitionSpec(
                 "P", Volumes: [new CatalogVolumeSpec("Data")])]));
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
-            ContainerHex, [new ObserverEvidenceJson.VolumeJson("Data", 201)]);
+            ContainerHex, [new ObserverEvidenceJson.VolumeJson("Data", 201)], devicePath: imagePath);
         // Deliberately NOT the staged helper: this override lives outside the
         // packaged tree, so provenance must cap it.
         var observerShim = Path.Combine(temp.Path, "ApfsObserver.exe");

@@ -177,6 +177,93 @@ bool IsCleanWholeExtent(
            FitsContainer(extent.physical_address, extent.bytes, policy) &&
            !OverlapsUnavailable(extent.physical_address, extent.bytes, policy);
 }
+
+std::vector<ExtentAllocator::Extent> ExtractCleanSubExtents(
+    const ExtentAllocator::Extent& extent,
+    std::uint64_t block_size,
+    const ExtentAllocator::AllocationPolicy& policy)
+{
+    std::vector<ExtentAllocator::Extent> clean_runs;
+    std::uint64_t extent_end = 0;
+    if (block_size == 0 ||
+        (extent.physical_address % block_size) != 0 ||
+        (extent.bytes % block_size) != 0 ||
+        !RangeEnd(extent.physical_address, extent.bytes, extent_end) ||
+        !FitsContainer(extent.physical_address, extent.bytes, policy))
+    {
+        return clean_runs;
+    }
+
+    if (!OverlapsUnavailable(extent.physical_address, extent.bytes, policy))
+    {
+        clean_runs.push_back(extent);
+        return clean_runs;
+    }
+
+    if (!policy.advance_past_unavailable)
+    {
+        return clean_runs;
+    }
+
+    auto curr = extent.physical_address;
+    while (curr < extent_end)
+    {
+        const auto remaining = extent_end - curr;
+        if (remaining == 0)
+        {
+            break;
+        }
+
+        const auto check_size = block_size;
+        if (OverlapsUnavailable(curr, check_size, policy))
+        {
+            const auto advanced = policy.advance_past_unavailable(policy.context, curr, check_size);
+            if (!advanced.has_value() || advanced.value() <= curr ||
+                advanced.value() >= extent_end ||
+                (advanced.value() % block_size) != 0)
+            {
+                break;
+            }
+            curr = advanced.value();
+            continue;
+        }
+
+        const auto max_possible = extent_end - curr;
+        if (!OverlapsUnavailable(curr, max_possible, policy))
+        {
+            clean_runs.push_back({ curr, max_possible });
+            break;
+        }
+
+        std::uint64_t low = check_size;
+        std::uint64_t high = max_possible;
+        std::uint64_t clean_len = check_size;
+        while (low <= high)
+        {
+            const auto low_blocks = low / block_size;
+            const auto high_blocks = high / block_size;
+            const auto mid = (low_blocks + ((high_blocks - low_blocks) / 2)) * block_size;
+            if (!OverlapsUnavailable(curr, mid, policy))
+            {
+                clean_len = mid;
+                low = mid + block_size;
+            }
+            else
+            {
+                if (mid <= block_size)
+                {
+                    break;
+                }
+                high = mid - block_size;
+            }
+        }
+
+        clean_runs.push_back({ curr, clean_len });
+        curr += clean_len;
+    }
+
+    return clean_runs;
+}
 } // namespace
 
 bool ExtentAllocator::Normalize(std::vector<Extent>& extents)
@@ -518,22 +605,17 @@ std::optional<std::uint64_t> ExtentAllocator::AllocateContiguousFromFree(
 
             const auto advanced = policy.advance_past_unavailable(policy.context, allocation_address, bytes);
             if (!advanced.has_value() ||
-                advanced.value() < allocation_address ||
+                advanced.value() <= allocation_address ||
                 advanced.value() > extent_end ||
                 advanced.value() > (std::numeric_limits<std::uint64_t>::max() - bytes) ||
-                (advanced.value() + bytes) > extent_end)
+                (advanced.value() + bytes) > extent_end ||
+                !FitsContainer(advanced.value(), bytes, policy) ||
+                OverlapsUnavailable(advanced.value(), bytes, policy))
             {
                 continue;
             }
 
             allocation_address = advanced.value();
-            it->physical_address = allocation_address;
-            it->bytes = extent_end - allocation_address;
-
-            if (!FitsContainer(allocation_address, bytes, policy))
-            {
-                continue;
-            }
         }
 
         const auto allocation_end = allocation_address + bytes;
@@ -586,7 +668,7 @@ std::optional<std::uint64_t> ExtentAllocator::AllocateContiguous(
         }
 
         const auto advanced = policy.advance_past_unavailable(policy.context, current, bytes);
-        if (!advanced.has_value() || advanced.value() < current)
+        if (!advanced.has_value() || advanced.value() <= current)
         {
             return std::nullopt;
         }
@@ -598,6 +680,10 @@ std::optional<std::uint64_t> ExtentAllocator::AllocateContiguous(
     }
 
     if (!FitsContainer(current, bytes, policy))
+    {
+        return std::nullopt;
+    }
+    if (OverlapsUnavailable(current, bytes, policy))
     {
         return std::nullopt;
     }
@@ -660,9 +746,10 @@ bool ExtentAllocator::RollbackContiguousAllocation(
 bool ExtentAllocator::CanAllocateFromFragmentedFreeExtents(
     const std::vector<Extent>& free_extents,
     std::uint64_t aligned_total,
-    const AllocationPolicy& policy)
+    const AllocationPolicy& policy,
+    std::uint64_t block_size)
 {
-    if (aligned_total == 0)
+    if (aligned_total == 0 || block_size == 0 || (aligned_total % block_size) != 0)
     {
         return false;
     }
@@ -670,18 +757,40 @@ bool ExtentAllocator::CanAllocateFromFragmentedFreeExtents(
     std::uint64_t available_fragmented_bytes = 0;
     for (const auto& extent : free_extents)
     {
-        if (!IsCleanWholeExtent(extent, policy))
-        {
-            continue;
-        }
-        if (available_fragmented_bytes > (std::numeric_limits<std::uint64_t>::max() - extent.bytes))
+        if ((extent.physical_address % block_size) != 0 ||
+            (extent.bytes % block_size) != 0)
         {
             return false;
         }
-        available_fragmented_bytes += extent.bytes;
-        if (available_fragmented_bytes >= aligned_total)
+        if (IsCleanWholeExtent(extent, policy))
         {
-            return true;
+            if (available_fragmented_bytes > (std::numeric_limits<std::uint64_t>::max() - extent.bytes))
+            {
+                return false;
+            }
+            available_fragmented_bytes += extent.bytes;
+            if (available_fragmented_bytes >= aligned_total)
+            {
+                return true;
+            }
+            continue;
+        }
+
+        if (policy.advance_past_unavailable)
+        {
+            const auto clean_runs = ExtractCleanSubExtents(extent, block_size, policy);
+            for (const auto& run : clean_runs)
+            {
+                if (available_fragmented_bytes > (std::numeric_limits<std::uint64_t>::max() - run.bytes))
+                {
+                    return false;
+                }
+                available_fragmented_bytes += run.bytes;
+                if (available_fragmented_bytes >= aligned_total)
+                {
+                    return true;
+                }
+            }
         }
     }
 
@@ -700,9 +809,18 @@ std::optional<std::vector<ExtentAllocator::FileExtent>> ExtentAllocator::Allocat
     {
         return std::vector<FileExtent>{};
     }
-    if (aligned_total == 0 || block_size == 0)
+    if (aligned_total == 0 || block_size == 0 ||
+        (aligned_total % block_size) != 0 || aligned_total < logical_size)
     {
         return std::nullopt;
+    }
+    for (const auto& extent : free_extents)
+    {
+        if ((extent.physical_address % block_size) != 0 ||
+            (extent.bytes % block_size) != 0)
+        {
+            return std::nullopt;
+        }
     }
 
     AllocationPolicy clean_prefix_policy = policy;
@@ -713,57 +831,84 @@ std::optional<std::vector<ExtentAllocator::FileExtent>> ExtentAllocator::Allocat
         return std::vector<FileExtent>{ FileExtent{ 0, contiguous.value(), logical_size } };
     }
 
-    std::vector<Extent> staged_free_extents;
-    staged_free_extents.reserve(free_extents.size());
     std::vector<FileExtent> file_extents;
     file_extents.reserve(free_extents.size());
+    std::vector<Extent> allocated_physical_extents;
+    allocated_physical_extents.reserve(free_extents.size());
     std::uint64_t remaining_logical = logical_size;
     std::uint64_t logical_offset = 0;
+
     for (const auto& extent : free_extents)
     {
-        if (remaining_logical == 0 || !IsCleanWholeExtent(extent, policy))
+        if (remaining_logical == 0)
         {
-            staged_free_extents.push_back(extent);
-            continue;
+            break;
         }
 
-        const auto remaining_aligned = AlignBytes(remaining_logical, block_size);
-        if (remaining_aligned == 0)
+        std::vector<Extent> clean_runs;
+        if (IsCleanWholeExtent(extent, policy))
         {
-            return std::nullopt;
+            clean_runs.push_back(extent);
+        }
+        else if (policy.advance_past_unavailable)
+        {
+            clean_runs = ExtractCleanSubExtents(extent, block_size, policy);
         }
 
-        const auto allocation_bytes = std::min(extent.bytes, remaining_aligned);
-        const auto logical_bytes = std::min(remaining_logical, allocation_bytes);
-        if (logical_bytes == 0 ||
-            extent.physical_address > (std::numeric_limits<std::uint64_t>::max() - allocation_bytes))
+        for (const auto& run : clean_runs)
         {
-            return std::nullopt;
-        }
+            if (remaining_logical == 0)
+            {
+                break;
+            }
 
-        file_extents.push_back(FileExtent{ logical_offset, extent.physical_address, logical_bytes });
-        logical_offset += logical_bytes;
-        remaining_logical -= logical_bytes;
+            const auto remaining_aligned = AlignBytes(remaining_logical, block_size);
+            if (remaining_aligned == 0)
+            {
+                return std::nullopt;
+            }
 
-        if (allocation_bytes < extent.bytes)
-        {
-            staged_free_extents.push_back(
-                {
-                    extent.physical_address + allocation_bytes,
-                    extent.bytes - allocation_bytes,
-                });
+            const auto allocation_bytes = std::min(run.bytes, remaining_aligned);
+            const auto logical_bytes = std::min(remaining_logical, allocation_bytes);
+            if (logical_bytes == 0 ||
+                run.physical_address > (std::numeric_limits<std::uint64_t>::max() - allocation_bytes))
+            {
+                return std::nullopt;
+            }
+
+            file_extents.push_back(FileExtent{ logical_offset, run.physical_address, logical_bytes });
+            allocated_physical_extents.push_back(Extent{ run.physical_address, allocation_bytes });
+            logical_offset += logical_bytes;
+            remaining_logical -= logical_bytes;
         }
     }
 
     if (remaining_logical == 0 && HasLogicalExtentCoverage(file_extents, logical_size))
     {
-        free_extents = std::move(staged_free_extents);
+        auto remaining_free_extents = free_extents;
+        if (!RemoveAllocatedExtents(remaining_free_extents, allocated_physical_extents))
+        {
+            return std::nullopt;
+        }
+        free_extents = std::move(remaining_free_extents);
         return file_extents;
     }
 
+    const auto original_free_extents = free_extents;
+    const auto original_next_ephemeral_extent = next_ephemeral_extent;
     auto fallback = AllocateContiguous(free_extents, next_ephemeral_extent, aligned_total, policy);
     if (!fallback.has_value())
     {
+        free_extents = original_free_extents;
+        next_ephemeral_extent = original_next_ephemeral_extent;
+        return std::nullopt;
+    }
+    if ((fallback.value() % block_size) != 0 ||
+        !FitsContainer(fallback.value(), aligned_total, policy) ||
+        OverlapsUnavailable(fallback.value(), aligned_total, policy))
+    {
+        free_extents = original_free_extents;
+        next_ephemeral_extent = original_next_ephemeral_extent;
         return std::nullopt;
     }
 

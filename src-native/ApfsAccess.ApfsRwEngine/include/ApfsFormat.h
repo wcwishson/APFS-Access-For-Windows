@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -245,6 +246,16 @@ struct BtreeVirtualChildMapping
 {
     std::uint64_t physical_block = 0;
     std::uint64_t xid = 0;
+    std::uint32_t flags = 0, size = 0;
+};
+
+// Authenticated headers from a complete canonical walk. A mapping XID is
+// present only for virtual nodes actually selected through the supplied OMAP.
+struct BtreeNodeIdentity
+{
+    std::uint64_t object_id = 0, xid = 0, physical_block = 0;
+    std::uint32_t type = 0, subtype = 0;
+    std::optional<std::uint64_t> mapping_xid;
 };
 
 struct BtreeReadPolicy
@@ -303,6 +314,10 @@ public:
     virtual bool ReadNode(std::uint64_t oid, std::uint64_t physical_block, bool root,
         std::span<const std::byte>& bytes, std::string& error) = 0;
     virtual void ReleaseNode() noexcept = 0;
+    // Additive mapped-node boundary. Legacy contexts keep their original API.
+    virtual bool ReadMappedNode(std::uint64_t oid, const BtreeVirtualChildMapping& mapping,
+        bool root, std::span<const std::byte>& bytes, std::string& error)
+    { return ReadNode(oid, mapping.physical_block, root, bytes, error); }
 };
 bool ReadBtreeLeafRecords(const RandomAccessSource& source, std::uint32_t block_size,
     std::uint64_t root_block, bool physical, std::uint64_t map_oid, std::uint64_t max_xid,
@@ -331,6 +346,16 @@ bool ReadBtreeLeafRecords(const RandomAccessSource& source, std::uint32_t block_
     std::uint64_t root_block, bool physical, std::uint64_t map_oid, std::uint64_t max_xid,
     const BtreeReadPolicy& policy, const BtreeRoutingPolicy& routing,
     std::vector<BtreeRecord>& records, std::string& error, BtreeNodeReadContext* node_context);
+
+// Opt-in ordinary header provenance; no transformed-node context is accepted.
+// Existing policy/context layouts remain unchanged.
+// All outputs clear on an incomplete walk. root_mapping_xid must come from the
+// same authenticated resolver as virtual children, never from a caller guess.
+bool ReadBtreeLeafRecords(const RandomAccessSource& source, std::uint32_t block_size,
+    std::uint64_t root_block, bool physical, std::uint64_t map_oid, std::uint64_t max_xid,
+    const BtreeReadPolicy& policy, const BtreeRoutingPolicy& routing,
+    std::vector<BtreeRecord>& records, std::string& error, BtreeNodeReadContext* node_context,
+    std::vector<BtreeNodeIdentity>* identities, std::optional<std::uint64_t> root_mapping_xid);
 
 struct OmapValue
 {
@@ -380,6 +405,7 @@ struct ApsbVolume
     std::uint64_t root_oid = 0;
     std::uint64_t extentref_tree_oid = 0;
     std::uint64_t snap_meta_tree_oid = 0;
+    std::uint64_t snap_meta_ext_oid = 0; // [APPLE] virtual OID; no writer support
     std::uint64_t fext_tree_oid = 0;
     std::uint32_t fext_tree_type = 0;
     std::uint64_t file_count = 0;
@@ -423,6 +449,12 @@ struct AppleOmapView
     std::uint32_t snapshot_tree_type = 0;
     std::uint64_t snapshot_tree_oid = 0;
 };
+
+// Container-only metadata admission also applies before the first volume exists.
+// This view does not load or authorize allocation.
+std::optional<AppleOmapView> LoadAppleContainerObjectMapView(
+    const RandomAccessSource& source, const ContainerCheckpointView& checkpoint,
+    std::string& out_error);
 
 struct AppleSpacemanFreeQueueEntry
 {
@@ -549,6 +581,12 @@ bool LoadAppleSpacemanOwnershipView(
     const ContainerCheckpointView& checkpoint,
     AppleSpacemanView& out_view,
     std::string& out_error);
+// Read-only historical rotation pins, never allocator authority. A CIB can
+// have advanced since this retained generation; only the already validated
+// spaceman/internal-pool prefix is returned in that exact case.
+bool LoadAppleSpacemanRetentionBitmaps(const RandomAccessSource& source,
+    const ContainerCheckpointView& checkpoint, AppleSpacemanInternalPoolView& out_pool,
+    std::string& out_error);
 
 struct AppleVolumeCheckpointView
 {
@@ -573,6 +611,11 @@ struct AppleReadOnlyVolumeView
 // Precondition: checkpoint was validated on this same held source. Does not
 // select another generation or perform/claim allocator ownership validation.
 std::optional<AppleReadOnlyVolumeView> LoadAppleReadOnlyVolumeView(
+    const RandomAccessSource& source, const ContainerCheckpointView& checkpoint,
+    std::string& error);
+// Same held-checkpoint/read-only contract, with the canonical inactive plain
+// file-extent type admitted for transition history. No allocation authority.
+std::optional<AppleReadOnlyVolumeView> LoadApplePlainTransitionVolumeView(
     const RandomAccessSource& source, const ContainerCheckpointView& checkpoint,
     std::string& error);
 bool ReadAppleVolumeFileSystemRecords(const RandomAccessSource& source,
@@ -611,13 +654,73 @@ bool LoadAppleSnapshotRecords(const RandomAccessSource& source,
 // walk, never by a second raw parser. Selection is exact; failure clears both.
 struct AppleSnapshotTreeRecords
 {
+    // Complete inventory metadata footprint; conservative retained ownership,
+    // never a list of blocks safe to release.
+    std::vector<std::uint64_t> metadata_blocks;
     std::vector<BtreeRecord> filesystem;
     std::vector<BtreeRecord> extentref;
+    // Exact selected walks, emitted by the canonical parser. These contain
+    // only FS/extentref nodes, not OMAP or other snapshot dependencies.
+    std::vector<std::uint64_t> filesystem_blocks;
+    std::vector<std::uint64_t> extentref_blocks;
 };
 bool LoadAppleSnapshotRecords(const RandomAccessSource& source,
     const AppleCheckpointView& checkpoint, std::uint64_t volume_oid,
     std::vector<AppleSnapshotRecord>& out_records, std::string& out_error,
     std::uint64_t exact_snapshot_xid, AppleSnapshotTreeRecords& out_trees);
+
+// Owned results of one complete canonical inventory walk. These decoded trees
+// establish parsing/version bounds, not allocator currency or release rights.
+struct AppleSnapshotCatalogRecords {
+    AppleSnapshotTreeRecords live;
+    std::vector<AppleSnapshotRecord> inventory;
+    std::vector<AppleSnapshotTreeRecords> snapshots;
+    std::vector<std::uint64_t> metadata_blocks;
+};
+bool LoadAppleSnapshotCatalog(const RandomAccessSource& source,
+    const AppleCheckpointView& checkpoint, std::uint64_t volume_oid,
+    AppleSnapshotCatalogRecords& out_catalog, std::string& out_error);
+
+enum class AppleSnapshotMetadataClass
+{
+    VolumeSuperblock, OmapObject, OmapNode, OmapSnapshotNode,
+    FileSystemNode, ExtentReferenceNode, SnapshotInventoryNode
+};
+
+// Selected dependency ownership only, not all mapped OIDs or historical
+// allocation continuity. volume_oid==0 denotes a container-owned dependency.
+// Different authenticated view/map selections may share one immutable object.
+struct AppleSnapshotMetadataClaim
+{
+    std::uint64_t volume_oid = 0, map_oid = 0, view_xid = 0, selection_xid = 0;
+    std::uint64_t object_id = 0, object_xid = 0, physical_block = 0, block_count = 0;
+    std::uint32_t type = 0, subtype = 0;
+    std::optional<std::uint64_t> mapping_xid;
+    AppleSnapshotMetadataClass metadata_class = AppleSnapshotMetadataClass::VolumeSuperblock;
+};
+
+// The same canonical catalog walk emits typed owners; no partial result on
+// failure, no new read authority and no interpretation of unselected targets.
+bool LoadAppleSnapshotCatalog(const RandomAccessSource& source,
+    const AppleCheckpointView& checkpoint, std::uint64_t volume_oid,
+    AppleSnapshotCatalogRecords& out_catalog,
+    std::vector<AppleSnapshotMetadataClaim>& out_owners, std::string& out_error);
+
+// A physical descriptor admitted by an actual inventory identity. The caller
+// retains that identity's filesystem XID; descriptor and OMAP bytes are reloaded
+// under the enclosing checkpoint, and physical reference metadata uses its own
+// descriptor generation. This parsing result grants no allocator authority.
+bool LoadAppleSnapshotDescriptorCatalog(const RandomAccessSource& source,
+    const AppleCheckpointView& checkpoint, std::uint64_t owner_volume_oid,
+    std::uint64_t descriptor_block, std::uint64_t filesystem_xid,
+    AppleSnapshotCatalogRecords& out_catalog, std::string& out_error);
+
+// Canonical complete traversal with independent tree-selection and OMAP
+// checkpoint bounds. Historical retirement must retain each child mapping XID.
+bool ReadAppleSnapshotTree(const RandomAccessSource& source, std::uint32_t block_size,
+    const AppleObjectLocation& tree, const AppleOmapView& omap,
+    std::uint64_t tree_xid, std::uint64_t checkpoint_xid,
+    std::vector<BtreeRecord>& records, std::vector<std::uint64_t>& blocks, std::string& error);
 
 // Loads all transaction roots needed by the native reader and writer from one
 // complete descriptor-ring generation. This API is strict: legacy two-copy
@@ -630,6 +733,57 @@ bool LoadAppleSnapshotRecords(const RandomAccessSource& source,
     std::uint64_t store_size_bytes,
     std::string& out_error,
     std::optional<std::uint64_t> exact_checkpoint_xid = std::nullopt);
+
+class ApfsEncryptedReadSession;
+// A session-minted capability for current-generation metadata reads only.
+// Retains the protected session, never exports a key or accepts a callback.
+// Close/Cancel on the originating session revoke every retained context.
+class AppleEncryptedMetadataReadContext final
+{
+public:
+    ~AppleEncryptedMetadataReadContext();
+    AppleEncryptedMetadataReadContext(const AppleEncryptedMetadataReadContext&) = delete;
+    AppleEncryptedMetadataReadContext& operator=(const AppleEncryptedMetadataReadContext&) = delete;
+private:
+    friend class ApfsEncryptedReadSession;
+    friend class AppleEncryptedSnapshotReadContext;
+    struct State;
+    explicit AppleEncryptedMetadataReadContext(std::shared_ptr<State> state);
+    std::shared_ptr<State> state_;
+    // Only the minted context may enter these canonical helpers under its lock.
+    static std::optional<AppleCheckpointView> LoadCanonical(const RandomAccessSource&,
+        const ContainerCheckpointView&, const ApsbVolume&, BtreeNodeReadContext&, std::string&,
+        bool load_allocator = true);
+    static bool ReadCanonical(const RandomAccessSource&, const ContainerCheckpointView&,
+        const AppleVolumeCheckpointView&, BtreeNodeReadContext&, std::vector<BtreeRecord>&, std::string&);
+    friend std::optional<AppleCheckpointView> LoadAppleCheckpointView(const RandomAccessSource&,
+        std::uint64_t, std::uint64_t, std::string&, AppleEncryptedMetadataReadContext&,
+        std::optional<std::uint64_t>);
+    friend std::optional<AppleCheckpointView> LoadAppleCheckpointView(const RandomAccessSource&,
+        std::uint64_t, std::uint64_t, std::string&, AppleEncryptedMetadataReadContext&,
+        std::optional<std::uint64_t>, bool);
+    friend bool ReadAppleVolumeFileSystemRecords(const RandomAccessSource&,
+        const ContainerCheckpointView&, const AppleVolumeCheckpointView&,
+        std::vector<BtreeRecord>&, std::string&, AppleEncryptedMetadataReadContext&);
+};
+
+// Exact original container-relative source only (offset 0, full held geometry).
+// The ordinary overloads and all write admissions retain their original policy.
+[[nodiscard]] std::optional<AppleCheckpointView> LoadAppleCheckpointView(
+    const RandomAccessSource& source, std::uint64_t store_offset_bytes,
+    std::uint64_t store_size_bytes, std::string& error,
+    AppleEncryptedMetadataReadContext& context,
+    std::optional<std::uint64_t> exact_checkpoint_xid = std::nullopt);
+// Metadata-only inspection of the same admitted generation when false. Its
+// spaceman is empty: this result supplies no allocation or allocator proof.
+[[nodiscard]] std::optional<AppleCheckpointView> LoadAppleCheckpointView(
+    const RandomAccessSource& source, std::uint64_t store_offset_bytes,
+    std::uint64_t store_size_bytes, std::string& error,
+    AppleEncryptedMetadataReadContext& context,
+    std::optional<std::uint64_t> exact_checkpoint_xid, bool load_allocator);
+bool ReadAppleVolumeFileSystemRecords(const RandomAccessSource& source,
+    const ContainerCheckpointView& checkpoint, const AppleVolumeCheckpointView& volume,
+    std::vector<BtreeRecord>& records, std::string& error, AppleEncryptedMetadataReadContext& context);
 
 // ---- single-authority interpretation (known-bit table v1) ---------------------
 

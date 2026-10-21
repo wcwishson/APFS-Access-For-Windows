@@ -9,6 +9,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace
@@ -663,6 +664,151 @@ bool TestFileExtentDecodeIsStrict()
     return ok;
 }
 
+bool TestEncryptedFileExtentCodec()
+{
+    constexpr auto profile = AppleEncryptedExtentProfile::OneKeyGenerationZero;
+    const auto hex = [](std::string_view text) {
+        std::vector<std::byte> bytes;
+        const auto digit = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
+        for (std::size_t i = 0; i < text.size(); i += 2)
+            bytes.push_back(static_cast<std::byte>((digit(text[i]) << 4) | digit(text[i + 1])));
+        return bytes;
+    };
+    struct Fixture { const char* key; const char* value; std::uint64_t object_id, physical; };
+    // Actual raw records from authenticated ciphertext images, not codec output.
+    // native-filevault.raw SHA256 1a46eb22cdab37ae553c5c70b7b172419c9cda7285de7f5b4fd3129c73e29171
+    // dfvfs-apfs-encrypted.dmg SHA256 33fe6f183aeb1a95fec68efdab17d59aedbad3d8ef1a117d411117376d9d8485
+    const Fixture fixtures[] = {
+        {"10000000000000800000000000000000", "001000000000000159010000000000005901000000000000", 16, 345},
+        {"15000000000000800000000000000000", "001000000000000179000000000000007900000000000000", 21, 121},
+    };
+    unsigned checks = 0;
+    const auto check = [&](bool condition, const std::string& message) {
+        ++checks; return Require(condition, "encrypted extent: " + message);
+    };
+    bool ok = true;
+    std::string error;
+    for (const auto& fixture : fixtures)
+    {
+        const BtreeRecord raw{hex(fixture.key), hex(fixture.value)};
+        const auto original = raw;
+        AppleEncryptedFileExtentRecord decoded;
+        if (!check(DecodeAppleEncryptedFileExtentRecord(raw, 4096, profile, decoded, error),
+                "actual flag-1 record decodes: " + error)) return false;
+        ok &= check(decoded.flags == 1 && decoded.extent.object_id == fixture.object_id &&
+            decoded.extent.logical_address == 0 && decoded.extent.length_bytes == 4096 &&
+            decoded.extent.physical_block == fixture.physical && decoded.extent.crypto_id == fixture.physical &&
+            decoded.extent.block_size == 4096, "actual fields and crypto identity survive");
+        BtreeRecord encoded;
+        ok &= check(EncodeAppleEncryptedFileExtentRecord(decoded, profile, encoded, error) && SameRecord(raw, encoded),
+            "actual raw key/value bytes re-encode exactly");
+        AppleFileExtentRecord ordinary{1, 1, 1, 1, 1, 1};
+        ok &= check(!DecodeAppleFileExtentRecord(raw, 4096, ordinary, error) &&
+            ordinary.object_id == 0 && ordinary.crypto_id == 0 && error == "AppleFileExtentRecordInvalid",
+            "ordinary decoder still refuses actual flag 1");
+        ok &= check(SameRecord(raw, original), "input record is unchanged");
+    }
+    const BtreeRecord raw{hex(fixtures[0].key), hex(fixtures[0].value)};
+    AppleEncryptedFileExtentRecord valid;
+    if (!DecodeAppleEncryptedFileExtentRecord(raw, 4096, profile, valid, error)) return false;
+    for (const auto flags : {0u, 1u})
+    {
+        auto value = valid;
+        value.flags = static_cast<std::uint8_t>(flags);
+        value.extent.crypto_id = 0x123456789ULL;
+        value.extent.length_bytes = 8192;
+        BtreeRecord encoded;
+        AppleEncryptedFileExtentRecord decoded;
+        ok &= check(EncodeAppleEncryptedFileExtentRecord(value, profile, encoded, error) &&
+            DecodeAppleEncryptedFileExtentRecord(encoded, 4096, profile, decoded, error) &&
+            decoded.flags == flags && decoded.extent.crypto_id == value.extent.crypto_id &&
+            decoded.extent.length_bytes == 8192, "synthetic multiblock ID remains raw, never allocated or incremented");
+        value.extent.physical_block = value.extent.crypto_id = 0;
+        ok &= check(EncodeAppleEncryptedFileExtentRecord(value, profile, encoded, error) &&
+            DecodeAppleEncryptedFileExtentRecord(encoded, 4096, profile, decoded, error) &&
+            decoded.flags == flags && !decoded.extent.crypto_id && !decoded.extent.physical_block,
+            "existing sparse-hole representation survives either supported flag");
+    }
+    for (unsigned flag = 2; flag <= 0x80; flag <<= 1)
+    {
+        auto invalid = raw;
+        invalid.value[7] = static_cast<std::byte>(flag | 1);
+        auto decoded = valid;
+        ok &= check(!DecodeAppleEncryptedFileExtentRecord(invalid, 4096, profile, decoded, error) &&
+            decoded.extent.object_id == 0 && decoded.flags == 0 && error == "AppleEncryptedFileExtentFlagsUnsupported",
+            "unknown/mixed flag refuses with empty output");
+    }
+    for (unsigned fault = 0; fault < 20; ++fault)
+    {
+        auto invalid = raw;
+        std::uint32_t block_size = 4096;
+        if (fault == 0) invalid.key.pop_back();
+        if (fault == 1) invalid.value.pop_back();
+        if (fault == 2) invalid.key.push_back(std::byte{});
+        if (fault == 3) invalid.value.push_back(std::byte{});
+        if (fault == 4) PutU64(invalid.key, 0, 8ULL << 60);
+        if (fault == 5) PutU64(invalid.key, 0, (9ULL << 60) | 16);
+        if (fault == 6) PutU64(invalid.key, 8, 4095);
+        if (fault == 7) PutU64(invalid.value, 0, 1ULL << 56);
+        if (fault == 8) PutU64(invalid.value, 0, (1ULL << 56) | 4095);
+        if (fault == 9) PutU64(invalid.key, 8, 0xfffffffffffff000ULL);
+        if (fault == 10) PutU64(invalid.value, 8, UINT64_MAX);
+        if (fault == 11) PutU64(invalid.value, 16, 0);
+        if (fault == 12) PutU64(invalid.value, 16, UINT64_MAX);
+        if (fault == 13) PutU64(invalid.value, 16, UINT64_MAX / 8 + 1);
+        if (fault == 14) { PutU64(invalid.value, 0, (1ULL << 56) | 8192); PutU64(invalid.value, 16, UINT64_MAX / 8); }
+        if (fault == 15) PutU64(invalid.value, 8, 0);
+        if (fault == 16) block_size = 512;
+        if (fault == 17) block_size = 3;
+        if (fault == 18) block_size = 131072;
+        if (fault == 19) block_size = 0;
+        auto decoded = valid;
+        ok &= check(!DecodeAppleEncryptedFileExtentRecord(invalid, block_size, profile, decoded, error) &&
+            decoded.extent.object_id == 0 && decoded.extent.crypto_id == 0 && decoded.flags == 0 && !error.empty(),
+            "malformed/length/overflow/crypto-ID refusal " + std::to_string(fault));
+    }
+    for (unsigned fault = 0; fault < 13; ++fault)
+    {
+        auto invalid = valid;
+        if (fault == 0) invalid.flags = 0x81;
+        if (fault == 1) invalid.extent.object_id = 0;
+        if (fault == 2) invalid.extent.object_id = 1ULL << 60;
+        if (fault == 3) invalid.extent.logical_address = 4095;
+        if (fault == 4) invalid.extent.length_bytes = 0;
+        if (fault == 5) invalid.extent.length_bytes = 4095;
+        if (fault == 6) invalid.extent.length_bytes = 1ULL << 56;
+        if (fault == 7) invalid.extent.physical_block = 0;
+        if (fault == 8) invalid.extent.crypto_id = 0;
+        if (fault == 9) invalid.extent.crypto_id = UINT64_MAX;
+        if (fault == 10) invalid.extent.physical_block = UINT64_MAX;
+        if (fault == 11) invalid.extent.logical_address = 0xfffffffffffff000ULL;
+        if (fault == 12) invalid.extent.block_size = 512;
+        auto encoded = raw;
+        ok &= check(!EncodeAppleEncryptedFileExtentRecord(invalid, profile, encoded, error) &&
+            encoded.key.empty() && encoded.value.empty() && !error.empty(),
+            "invalid encode clears output " + std::to_string(fault));
+    }
+    auto boundary = valid;
+    boundary.extent.length_bytes = 8192;
+    boundary.extent.crypto_id = UINT64_MAX / 8 - 1;
+    BtreeRecord encoded;
+    AppleEncryptedFileExtentRecord decoded;
+    ok &= check(EncodeAppleEncryptedFileExtentRecord(boundary, profile, encoded, error) &&
+        DecodeAppleEncryptedFileExtentRecord(encoded, 4096, profile, decoded, error) &&
+        decoded.extent.crypto_id == boundary.extent.crypto_id, "last representable tweak range is accepted unchanged");
+    const auto unknown = static_cast<AppleEncryptedExtentProfile>(99);
+    decoded = valid;
+    ok &= check(!DecodeAppleEncryptedFileExtentRecord(raw, 4096, unknown, decoded, error) &&
+        decoded.extent.object_id == 0 && decoded.flags == 0 && error == "AppleEncryptedFileExtentProfileUnsupported",
+        "unknown decode profile refuses");
+    encoded = raw;
+    ok &= check(!EncodeAppleEncryptedFileExtentRecord(valid, unknown, encoded, error) &&
+        encoded.key.empty() && encoded.value.empty() && error == "AppleEncryptedFileExtentProfileUnsupported",
+        "unknown encode profile refuses");
+    std::cout << "ENCRYPTED EXTENT CODEC " << (ok ? "PASS " : "FAIL ") << checks << " checks\n";
+    return ok;
+}
+
 bool TestPayloadExtentGraphRequiresExactCoverage()
 {
     std::string error;
@@ -703,6 +849,60 @@ bool TestPayloadExtentGraphRequiresExactCoverage()
         const auto refused = !ValidateApplePayloadExtentGraph(bad_files, bad_physical, 4096, 512, ranges, error);
         ok &= Require(refused && ranges.empty(), "incomplete/ambiguous payload graph refuses, mode=" + std::to_string(mode));
     }
+    AppleXattrRecord external;
+    external.object_id = 23;
+    external.name_utf8 = "com.apple.ResourceFork";
+    external.flags = kAppleXattrDataStream;
+    external.data.resize(kAppleXattrDataStreamBytes);
+    PutU64(external.data, 0, 24);
+    PutU64(external.data, 8, 4096);
+    PutU64(external.data, 16, 4096);
+    BtreeRecord attribute;
+    ok &= Require(EncodeAppleXattrRecord(external, attribute, error), "external attribute descriptor encodes");
+    const std::vector<BtreeRecord> attribute_files{file(24, 0, 98, 1), attribute};
+    ok &= Require(ValidateApplePayloadExtentGraph(attribute_files, {physical(23, 98, 1, 1)},
+            4096, 512, ranges, error) && ranges.size() == 1 && ranges.front().owning_object_id == 23,
+        "external attribute physical owner is its header object ID, distinct from stream ID");
+    ok &= Require(!ValidateApplePayloadExtentGraph(attribute_files, {physical(24, 98, 1, 1)},
+            4096, 512, ranges, error) && ranges.empty() && error == "AppleVolumePhysicalExtentOwnerMismatch",
+        "external stream ID cannot impersonate the physical owner");
+    auto wrong_attribute = attribute_files;
+    external.object_id = 25;
+    ok &= Require(EncodeAppleXattrRecord(external, wrong_attribute.back(), error), "alternate owner encodes");
+    ok &= Require(!ValidateApplePayloadExtentGraph(wrong_attribute, {physical(23, 98, 1, 1)},
+            4096, 512, ranges, error) && ranges.empty(), "wrong external attribute owner refuses");
+    wrong_attribute.push_back(attribute);
+    ok &= Require(!ValidateApplePayloadExtentGraph(wrong_attribute, {physical(23, 98, 1, 1)},
+            4096, 512, ranges, error) && ranges.empty() && error == "AppleVolumeAttributeOwnerAmbiguous",
+        "contradictory external stream owners refuse");
+    AppleInodeRecord alias_inode;
+    alias_inode.object_id = alias_inode.private_id = 24;
+    alias_inode.parent_id = 2;
+    alias_inode.mode = 0100644;
+    BtreeRecord alias;
+    ok &= Require(EncodeAppleInodeRecord(alias_inode, alias, error), "alias control inode encodes");
+    auto aliased_files = attribute_files;
+    aliased_files.push_back(alias);
+    ok &= Require(!ValidateApplePayloadExtentGraph(aliased_files, {physical(23, 98, 1, 1)},
+            4096, 512, ranges, error) && ranges.empty() && error == "AppleVolumeAttributeInodeAlias",
+        "external stream cannot also be an inode data stream");
+    AppleEncryptedFileExtentRecord encrypted;
+    encrypted.extent = {24, 0, 4096, 98, 98, 4096};
+    BtreeRecord encrypted_extent;
+    ok &= Require(EncodeAppleEncryptedFileExtentRecord(encrypted,
+        AppleEncryptedExtentProfile::OneKeyGenerationZero, encrypted_extent, error), "encrypted owner control encodes");
+    std::vector<BtreeRecord> encrypted_files{encrypted_extent, attribute};
+    ok &= Require(ValidateAppleEncryptedPayloadExtentGraph(encrypted_files, {physical(23, 98, 1, 1)},
+        4096, 512, ranges, error), "encrypted external stream retains its distinct header owner");
+    encrypted_files.push_back(alias);
+    ok &= Require(!ValidateAppleEncryptedPayloadExtentGraph(encrypted_files, {physical(23, 98, 1, 1)},
+        4096, 512, ranges, error) && ranges.empty() && error == "AppleVolumeAttributeInodeAlias",
+        "encrypted external stream cannot also be an inode data stream");
+    auto valid_owner = alias_inode;
+    valid_owner.object_id = valid_owner.private_id = 23;
+    ok &= Require(EncodeAppleInodeRecord(valid_owner, encrypted_files.back(), error), "non-aliased encrypted owner encodes");
+    ok &= Require(ValidateAppleEncryptedPayloadExtentGraph(encrypted_files, {physical(23, 98, 1, 1)},
+        4096, 512, ranges, error), "encrypted owning inode is distinct from its attribute stream");
     return ok;
 }
 
@@ -1042,8 +1242,10 @@ bool TestRejectsInvalidInputsAndFutureXid()
 }
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+    if (argc == 2 && std::string_view(argv[1]) == "--encrypted-extents-only")
+        return TestEncryptedFileExtentCodec() && g_failures == 0 ? 0 : 1;
     bool ok = true;
     ok &= TestVariableTreeGrowthShrinkAndDeterminism();
     ok &= TestFixedOmapTreeAndTombstone();
@@ -1052,6 +1254,7 @@ int main()
     ok &= TestEphemeralTreeUsesCheckpointMappedExplicitChildren();
     ok &= TestRecordEncoders();
     ok &= TestFileExtentDecodeIsStrict();
+    ok &= TestEncryptedFileExtentCodec();
     ok &= TestPayloadExtentGraphRequiresExactCoverage();
     ok &= TestPhysicalExtentRecordCodecAndOrdering();
     ok &= TestDataStreamIdRecordCodec();

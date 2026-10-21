@@ -43,4 +43,71 @@ public sealed class FirstFreeMountPolicyTests
 
         Assert.True(should);
     }
+
+    [Fact]
+    public void ShouldAutoMount_AllowsOrdinaryEligibleDataVolume()
+    {
+        var policy = new FirstFreeMountPolicy();
+        var data = SampleVolume with
+        {
+            CatalogDecision = ApfsCapabilityDecision.Writable,
+            CatalogReasons = [],
+            CatalogAutoMountAllowed = true,
+        };
+
+        Assert.True(policy.ShouldAutoMount(data));
+    }
+
+    [Theory]
+    [InlineData("system")]
+    [InlineData("recovery")]
+    [InlineData("preboot")]
+    [InlineData("vm")]
+    [InlineData("update")]
+    [InlineData("backup")]
+    public void ShouldAutoMount_RefusesSpecialRoleVolumes(string role)
+    {
+        var policy = new FirstFreeMountPolicy();
+        var special = SampleVolume with
+        {
+            CatalogDecision = ApfsCapabilityDecision.Readable,
+            CatalogReasons = [$"special-role:{role}"],
+            CatalogAutoMountAllowed = false,
+        };
+
+        Assert.False(policy.ShouldAutoMount(special));
+    }
+
+    [Theory]
+    [InlineData(ApfsCapabilityDecision.Locked)]
+    [InlineData(ApfsCapabilityDecision.Unsupported)]
+    [InlineData(ApfsCapabilityDecision.ReadOnlyFeature)]
+    public void ShouldAutoMount_RefusesNonWritableDecisions(ApfsCapabilityDecision decision)
+    {
+        var policy = new FirstFreeMountPolicy();
+        var blocked = SampleVolume with
+        {
+            CatalogDecision = decision,
+            CatalogReasons = ["locked-encrypted"],
+            CatalogAutoMountAllowed = false,
+        };
+
+        Assert.False(policy.ShouldAutoMount(blocked));
+    }
+
+    [Fact]
+    public void ShouldAutoMount_RefusesWritableDecisionWithReasons()
+    {
+        // A Writable verdict accompanied by any reason is incoherent and must
+        // fail closed rather than auto-mount.
+        var policy = new FirstFreeMountPolicy();
+        var incoherent = SampleVolume with
+        {
+            CatalogDecision = ApfsCapabilityDecision.Writable,
+            CatalogReasons = ["special-role:system"],
+            CatalogAutoMountAllowed = true,
+        };
+
+        Assert.False(policy.ShouldAutoMount(incoherent));
+    }
 }

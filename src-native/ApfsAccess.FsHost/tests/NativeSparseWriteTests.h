@@ -6,7 +6,64 @@ struct HostNativeSparse340Fixture
 {
     DirectorySymlinkFixture fixture{false};
     static constexpr std::uint64_t tail = 64ULL * 1024 * 1024;
-    bool Initialize(bool shared = false, bool aliases = true)
+    std::vector<std::byte> saved_reference_block;
+    std::uint64_t reference_offset = 0;
+
+    bool SetIncompleteCensus(bool incomplete)
+    {
+        auto& store = *fixture.context->metadata_store;
+        auto& device = const_cast<apfsaccess::rw::BlockDevice&>(store.Device());
+        if (!device.IsRegularFile()) return false;
+        if (!incomplete)
+        {
+            std::vector<std::byte> actual;
+            return !saved_reference_block.empty() && device.Write(reference_offset, saved_reference_block) && device.Flush() &&
+                device.ReadForVerification(reference_offset, saved_reference_block.size(), actual) && actual == saved_reference_block;
+        }
+        const auto* checkpoint = store.AuthoritativeAppleCheckpointView();
+        if (!checkpoint || checkpoint->volumes.size() != 1 || !checkpoint->volumes.front().extentref_tree) return false;
+        const auto& root = *checkpoint->volumes.front().extentref_tree;
+        const auto block_size = checkpoint->container.superblock.block_size;
+        reference_offset = root.physical_block * block_size;
+        if (!device.ReadForVerification(reference_offset, block_size, saved_reference_block)) return false;
+        class Source final : public apfsaccess::catalog::RandomAccessSource
+        {
+        public:
+            explicit Source(const apfsaccess::rw::BlockDevice& d) : device(d) {}
+            std::uint64_t SizeBytes() const override { return device.GetGeometry().total_bytes; }
+            bool Read(std::uint64_t at, std::size_t size, std::vector<std::byte>& out) const override
+            {
+                out.clear();
+                return at <= SizeBytes() && size <= SizeBytes() - at &&
+                    (size == 0 || device.ReadForVerification(at, size, out));
+            }
+            const apfsaccess::rw::BlockDevice& device;
+        } source(device);
+        apfsaccess::catalog::BtreeReadPolicy policy;
+        policy.enforce_object_identity = true; policy.require_complete_traversal = true;
+        policy.root_object_id = root.object_id; policy.storage_type = root.type; policy.subtype = root.subtype;
+        std::vector<apfsaccess::catalog::BtreeRecord> records;
+        std::string error;
+        if (!apfsaccess::catalog::ReadBtreeLeafRecords(source, block_size, root.physical_block, true, 0,
+                checkpoint->container.superblock.xid, policy, records, error) || records.size() != 2) return false;
+        std::vector<std::vector<std::byte>> keys, values;
+        for (auto& record : records)
+        {
+            apfsaccess::rw::ApplePhysicalExtentRecord reference;
+            if (!apfsaccess::rw::DecodeApplePhysicalExtentRecord(record, reference, error) || reference.reference_count != 2)
+                return false;
+            reference.reference_count = 3;
+            if (!apfsaccess::rw::EncodeApplePhysicalExtentRecord(reference, record, error)) return false;
+            keys.push_back(record.key); values.push_back(record.value);
+        }
+        const auto changed = apfsaccess::testfixture::BuildRawLeafNode(keys, values,
+            apfsaccess::catalog::ReadU64LE(saved_reference_block, 0x10).value_or(0), block_size, 0,
+            root.object_id, root.type, root.subtype);
+        std::vector<std::byte> actual;
+        return device.Write(reference_offset, changed) && device.Flush() &&
+            device.ReadForVerification(reference_offset, changed.size(), actual) && actual == changed;
+    }
+    bool Initialize(bool shared = false, bool aliases = true, unsigned head_blocks = 3)
     {
         using namespace apfsaccess::rw;
         auto builder = TwoProjectableVolumeStore();
@@ -14,7 +71,7 @@ struct HostNativeSparse340Fixture
         builder.authoritative_checkpoint = true; builder.dual_checkpoint = false; builder.xid = 20;
         builder.authoritative_internal_pool_blocks = 16; builder.authoritative_checkpoint_ring_blocks = 16;
         auto& volume = builder.volumes.front(); volume.incompat = 0;
-        volume.additional_file_system_allocated_blocks = 6;
+        volume.additional_file_system_allocated_blocks = head_blocks + 3;
         auto& records = volume.filesystem_records;
         records.clear(); volume.extentref_records.clear();
         apfsaccess::catalog::BtreeRecord encoded; std::string error;
@@ -29,7 +86,7 @@ struct HostNativeSparse340Fixture
         inode.create_time = inode.modification_time = inode.change_time = inode.access_time = 1700000000000000000ULL;
         AppleExtendedField stream; stream.type = 8; stream.data.resize(40);
         apfsaccess::testfixture::PutU64LE(stream.data, 0, tail + 12288);
-        apfsaccess::testfixture::PutU64LE(stream.data, 8, 24576);
+        apfsaccess::testfixture::PutU64LE(stream.data, 8, (head_blocks + 3ULL) * 4096);
         inode.extended_fields.push_back(stream);
         AppleExtendedField name; name.type = 4;
         const std::string primary("original\0", 9);
@@ -45,6 +102,12 @@ struct HostNativeSparse340Fixture
             if (!aliases && sibling == 701) continue;
             const auto leaf = sibling == 700 ? "original" : "alias";
             AppleDirectoryRecord link; link.parent_id = 2; link.file_id = 17; link.flags = 8; link.name_utf8 = leaf;
+            if (aliases)
+            {
+                AppleExtendedField sibling_id{1, 0, std::vector<std::byte>(8)};
+                apfsaccess::testfixture::PutU64LE(sibling_id.data, 0, sibling);
+                link.extended_fields.push_back(std::move(sibling_id));
+            }
             if (!add(EncodeAppleDirectoryRecord(link, encoded, error))) return false;
             if (aliases && (!add(EncodeAppleSiblingLinkRecord({17, sibling, 2, leaf}, encoded, error)) ||
                 !add(EncodeAppleSiblingMapRecord({sibling, 17}, encoded, error)))) return false;
@@ -58,15 +121,16 @@ struct HostNativeSparse340Fixture
                 !add(EncodeAppleDataStreamIdRecord({18, 1}, encoded, error))) return false;
         }
         for (auto owner = 17ULL; owner <= (shared ? 18ULL : 17ULL); ++owner)
-            for (const auto& extent : {AppleFileExtentRecord{owner, 0, 12288, 100, 0, 4096},
-                AppleFileExtentRecord{owner, 12288, tail - 12288, 0, 0, 4096},
-                AppleFileExtentRecord{owner, tail, 12288, 110, 0, 4096}})
+            for (const auto& extent : {AppleFileExtentRecord{owner, 0, head_blocks * 4096ULL, 100, 0, 4096},
+                AppleFileExtentRecord{owner, head_blocks * 4096ULL, tail - head_blocks * 4096ULL, 0, 0, 4096},
+                AppleFileExtentRecord{owner, tail, 12288, head_blocks + 107ULL, 0, 4096}})
                 if (!add(EncodeAppleFileExtentRecord(extent, encoded, error))) return false;
-        for (const auto block : {100ULL, 110ULL})
+        for (const auto block : {100ULL, head_blocks + 107ULL})
         {
-            if (!EncodeApplePhysicalExtentRecord({block, 3, kApplePhysicalExtentKindNew, 17, shared ? 2u : 1u}, encoded, error)) return false;
+            const auto count = block == 100 ? head_blocks : 3u;
+            if (!EncodeApplePhysicalExtentRecord({block, count, kApplePhysicalExtentKindNew, 17, shared ? 2u : 1u}, encoded, error)) return false;
             volume.extentref_records.push_back(encoded);
-            for (auto i = 0ULL; i < 3; ++i)
+            for (auto i = 0ULL; i < count; ++i)
                 builder.authoritative_seeded_main_blocks.push_back({block + i, std::vector<std::byte>(4096,
                     block == 100 ? std::byte{0x31} : std::byte{0xa7})});
         }
@@ -144,8 +208,32 @@ bool TestNativeSparseRefusalCallbacks340()
 {
     const auto drive = std::filesystem::temp_directory_path().root_name().wstring();
     if (!Require(drive == L"D:" || drive == L"d:", "sparse host gates require TEMP/TMP on D:")) return false;
+    {
+        HostNativeSparse340Fixture supported;
+        if (!Require(supported.Initialize(true), "complete shared sparse census initializes")) return false;
+        auto& c = *supported.fixture.context; auto fs = BuildFileSystem(&c);
+        PVOID writer = nullptr; FSP_FSCTL_FILE_INFO info{};
+        ScopeExit close{[&] { if (writer) CB_Close(&fs, writer); }};
+        std::byte value{0x5a}; ULONG done = 999;
+        if (!Require(CB_Open(&fs, const_cast<PWSTR>(L"\\original"), FILE_OPEN << 24,
+                GENERIC_READ | GENERIC_WRITE, &writer, &info) == STATUS_SUCCESS &&
+                CB_Write(&fs, writer, &value, 17, 1, FALSE, FALSE, &done, &info) == STATUS_SUCCESS && done == 1 &&
+                CB_Flush(&fs, writer, &info) == STATUS_SUCCESS,
+                "complete sharing proof permits actual sparse copy-on-write publication")) return false;
+        apfsaccess::rw::MetadataStore fresh(supported.fixture.volume);
+        std::vector<std::byte> expected(12288, std::byte{0x31}), actual;
+        expected[17] = value;
+        if (!Require(fresh.PrepareNativeWritePath() && fresh.VerifyIntegrity() &&
+                fresh.ReadCommittedFileRange(L"\\original", 0, expected.size(), actual) && actual == expected &&
+                fresh.ReadCommittedFileRange(L"\\alias", 0, expected.size(), actual) && actual == expected &&
+                fresh.ReadCommittedFileRange(L"\\shared", 0, expected.size(), actual) &&
+                actual == std::vector<std::byte>(12288, std::byte{0x31}) &&
+                c.tx_manager->Watermarks().accepted_sequence == c.tx_manager->Watermarks().cleanup_sequence &&
+                !c.write_degraded && !c.recovery_active,
+                "fresh owner sees both inode aliases changed and the separate clone peer unchanged")) return false;
+    }
     HostNativeSparse340Fixture owned;
-    if (!Require(owned.Initialize(true), "valid shared sparse callback fixture initializes")) return false;
+    if (!Require(owned.Initialize(true), "shared source initializes before the actual census fault")) return false;
     auto& c = *owned.fixture.context; auto fs = BuildFileSystem(&c);
     c.args.write_max_dirty_transactions = 64;
     PVOID writer = nullptr, other = nullptr; FSP_FSCTL_FILE_INFO info{};
@@ -154,6 +242,7 @@ bool TestNativeSparseRefusalCallbacks340()
             &writer, &info) == STATUS_SUCCESS && CB_Create(&fs, const_cast<PWSTR>(L"\\other"), FILE_NON_DIRECTORY_FILE,
             GENERIC_READ | GENERIC_WRITE, FILE_ATTRIBUTE_ARCHIVE, nullptr, 0, &other, &info) == STATUS_SUCCESS,
             "shared sparse opens beside unrelated pending work")) return false;
+    if (!Require(owned.SetIncompleteCensus(true), "actual reference leaf gains an unproved third owner after valid Open")) return false;
     const auto pending = c.metadata_store->PendingMutationCount();
     const auto journal = c.tx_manager->PendingMutationCount(); const auto marks = c.tx_manager->Watermarks();
     const auto sequence = c.tx_manager->NextMutationSequence(); const auto xid = c.metadata_store->CheckpointXid();
@@ -166,6 +255,9 @@ bool TestNativeSparseRefusalCallbacks340()
             operation == 0 ? 17 : operation == 1 ? owned.tail / 2 : owned.tail + 12288,
             1, FALSE, FALSE, &done, &info) : CB_SetFileSize(&fs, writer, operation == 3 ? 8193 : owned.tail + 32768, FALSE, &info);
         const auto after = c.tx_manager->Watermarks(); const auto after_spool = c.payload_spool->SnapshotCounters();
+        std::fwprintf(stderr, L"[sparse-refusal] operation=%u status=%lx bytes=%lu pending=%zu/%zu journal=%zu/%zu recovery=%d reason=%ls\n",
+            operation, static_cast<unsigned long>(status), done, pending, c.metadata_store->PendingMutationCount(),
+            journal, c.tx_manager->PendingMutationCount(), c.recovery_active.load(), c.runtime_recovery_reason.c_str());
         if (!Require(status == STATUS_NOT_SUPPORTED && (operation >= 3 || done == 0) &&
                 pending == c.metadata_store->PendingMutationCount() && journal == c.tx_manager->PendingMutationCount() &&
                 sequence == c.tx_manager->NextMutationSequence() && xid == c.metadata_store->CheckpointXid() &&
@@ -173,8 +265,9 @@ bool TestNativeSparseRefusalCallbacks340()
                 marks.cleanup_sequence == after.cleanup_sequence && wal == ReadFileBytes(c.session_root / "accepted.wal") &&
                 image == ReadFileBytes(owned.fixture.image.path) && spool.spool_bytes == after_spool.spool_bytes &&
                 spool.dirty_range_count == after_spool.dirty_range_count && !c.recovery_active && !c.write_degraded,
-                "shared sparse refusal precedes companion staging and preserves unrelated work and WAL")) return false;
+                "incomplete shared census refuses before companion staging and preserves unrelated work and WAL")) return false;
     }
+    if (!Require(owned.SetIncompleteCensus(false), "restore the exact saved reference leaf before publishing unrelated work")) return false;
     std::byte value{0x71}; ULONG done = 0;
     return Require(CB_Write(&fs, other, &value, 0, 1, FALSE, FALSE, &done, &info) == STATUS_SUCCESS && done == 1 &&
         CB_Flush(&fs, other, &info) == STATUS_SUCCESS && !c.write_degraded,

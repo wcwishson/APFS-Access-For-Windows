@@ -72,7 +72,11 @@ if ([string]::IsNullOrWhiteSpace($cmakeExe)) {
 
 if ($Generator -eq "NMake Makefiles" -and -not (Get-Command nmake -ErrorAction SilentlyContinue)) {
     Write-Warning "nmake was not found in PATH. Falling back to Visual Studio generator."
-    $Generator = "Visual Studio 17 2022"
+    $Generator = if (Test-Path "C:\Program Files (x86)\Microsoft Visual Studio\18") {
+        "Visual Studio 18 2026"
+    } else {
+        "Visual Studio 17 2022"
+    }
 }
 
 New-Item -ItemType Directory -Force -Path $BuildDir, $OutputDir | Out-Null
@@ -90,6 +94,7 @@ $configureArgs = @(
     "-B", $BuildDir,
     "-G", $Generator
 )
+$configureArgs += "-DAPFSACCESS_BUILD_PRIVATE_VOLUME_QUOTA_TOOL=ON"
 
 if ($Generator -match "NMake|Ninja|Unix Makefiles|MinGW Makefiles") {
     $configureArgs += "-DCMAKE_BUILD_TYPE=$Configuration"
@@ -115,7 +120,10 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "[native-build] building ApfsAccess.FsHost ($Configuration)..."
-& $cmakeExe --build $BuildDir --config $Configuration
+& $cmakeExe --build $BuildDir --config $Configuration --target `
+    ApfsAccess.FsHost ApfsObserver ApfsVolumeRepairTool VolumeRenameImage `
+    SnapshotImage ApfsEncryptedReadTool ApfsFusionReadTool ApfsAccess.ApfsImageKeyManagementTool `
+    VolumeQuotaReserveImageTool VolumeManagementImage VolumeResizeImage VolumeFormatImage VolumePhysicalObserve VolumeKeeperInspect
 if ($LASTEXITCODE -ne 0) {
     if (-not (Handle-MissingTooling "CMake build failed for ApfsAccess.FsHost.")) {
         return
@@ -147,6 +155,17 @@ if ([string]::IsNullOrWhiteSpace($observerExe)) {
 try {
     Copy-Item -LiteralPath $hostExe -Destination (Join-Path $OutputDir "ApfsAccess.FsHost.exe") -Force
     Copy-Item -LiteralPath $observerExe -Destination (Join-Path $OutputDir "ApfsObserver.exe") -Force
+    foreach ($toolName in @(
+        "ApfsVolumeRepairTool.exe", "VolumeRenameImage.exe",
+        "SnapshotImage.exe", "ApfsEncryptedReadTool.exe", "ApfsFusionReadTool.exe", "ApfsAccess.ApfsImageKeyManagementTool.exe",
+        "VolumeQuotaReserveImageTool.exe", "VolumeManagementImage.exe", "VolumeResizeImage.exe", "VolumeFormatImage.exe", "VolumePhysicalObserve.exe", "VolumeKeeperInspect.exe"
+    )) {
+        $toolPath = Join-Path (Split-Path -Parent $observerExe) $toolName
+        if (-not (Test-Path -LiteralPath $toolPath -PathType Leaf)) {
+            throw "Native runtime helper was not produced: $toolPath"
+        }
+        Copy-Item -LiteralPath $toolPath -Destination (Join-Path $OutputDir $toolName) -Force
+    }
 }
 catch {
     if ($SkipIfUnavailable) {

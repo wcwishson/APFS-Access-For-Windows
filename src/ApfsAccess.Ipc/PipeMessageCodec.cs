@@ -4,7 +4,7 @@ using ApfsAccess.Core;
 
 namespace ApfsAccess.Ipc;
 
-public static class PipeMessageCodec
+public static partial class PipeMessageCodec
 {
     private static readonly JsonSerializerOptions SerializerOptions = new()
     {
@@ -36,6 +36,25 @@ public static class PipeMessageCodec
         return JsonSerializer.Serialize(envelope, SerializerOptions);
     }
 
+    private static void RejectDuplicateJsonFields(string json)
+    {
+        using var document = JsonDocument.Parse(json);
+        void Visit(JsonElement node)
+        {
+            if (node.ValueKind == JsonValueKind.Object)
+            {
+                var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var property in node.EnumerateObject())
+                {
+                    if (!names.Add(property.Name)) throw new JsonException("Duplicate message identity or evidence field.");
+                    Visit(property.Value);
+                }
+            }
+            else if (node.ValueKind == JsonValueKind.Array) foreach (var item in node.EnumerateArray()) Visit(item);
+        }
+        Visit(document.RootElement);
+    }
+
     public static bool TryDeserializeSyntaxOnly(string json, out PipeEnvelope? envelope)
     {
         envelope = null;
@@ -46,6 +65,7 @@ public static class PipeMessageCodec
 
         try
         {
+            RejectDuplicateJsonFields(json);
             var parsed = JsonSerializer.Deserialize<PipeEnvelope>(json, SerializerOptions);
             if (parsed is null || string.IsNullOrWhiteSpace(parsed.Type))
             {
@@ -85,6 +105,7 @@ public static class PipeMessageCodec
 
         try
         {
+            RejectDuplicateJsonFields(json);
             var parsed = JsonSerializer.Deserialize<PipeEnvelope>(json, SerializerOptions);
             if (parsed is null || string.IsNullOrWhiteSpace(parsed.Type))
             {
@@ -131,6 +152,12 @@ public static class PipeMessageCodec
                 $"Schema version '{envelope.SchemaVersion}' is not supported.");
         }
 
+        if (envelope.Type == ApfsMessageTypes.StatusChanged)
+        {
+            var authorityValidation = ValidateRuntimeOwnerIncarnation(envelope);
+            if (!authorityValidation.IsValid) return authorityValidation;
+        }
+
         if (envelope.SchemaVersion == PipeSchemaVersions.Schema1)
         {
             return Valid();
@@ -156,6 +183,31 @@ public static class PipeMessageCodec
             ApfsMessageTypes.OperationResult => ValidateOperationResult(envelope),
             _ => Valid(),
         };
+    }
+
+    private static PipeMessageValidationResult ValidateRuntimeOwnerIncarnation(PipeEnvelope envelope)
+    {
+        if (envelope.Payload is not {} payload ||
+            !TryGetProperty(payload, "mountedVolumes", out var mounts) || mounts is not JsonArray volumes) return Valid();
+        foreach (var node in volumes)
+        {
+            if (node is not JsonObject volume ||
+                !TryGetProperty(volume, "hostProcessCreationTimeFileTimeUtc", out var creation)) continue;
+            try
+            {
+                if (creation is null) throw new InvalidOperationException();
+                var value = creation.GetValue<long>();
+                if (value == 0) continue; // Legacy or unknown incarnation never enables raw actions.
+                if (value < 0 || !TryGetProperty(volume, "hostProcessId", out var pid) || pid?.GetValue<int>() is not > 0)
+                    throw new InvalidOperationException();
+                _ = DateTime.FromFileTimeUtc(value);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or FormatException or OverflowException or ArgumentOutOfRangeException)
+            {
+                return Invalid(ApfsOperationCodes.MalformedMessage, "Mounted runtime owner incarnation is invalid.");
+            }
+        }
+        return Valid();
     }
 
     public static bool TryValidate(
@@ -217,6 +269,9 @@ public static class PipeMessageCodec
             return identityValidation;
         }
 
+        if (payload.Any(p => !new[] { "operationId", "command", "target", "requestedMode", "expiresAtUtc", "snapshotName", "snapshotIdentity", "managementOperation", "managementToken", "managementName", "managementQuotaBytes", "managementReserveBytes", "managementImagePath", "volumeManagement", "approvedImageRepairPlanId", "keyManagement" }.Contains(p.Key, StringComparer.OrdinalIgnoreCase)))
+            return Invalid(ApfsOperationCodes.InvalidArguments,"Unknown control request field.");
+
         if (!TryGetString(payload, "command", out var command) ||
             !IsCanonicalCommand(command))
         {
@@ -226,7 +281,14 @@ public static class PipeMessageCodec
         }
 
         var hasTarget = TryGetProperty(payload, "target", out var targetNode);
-        var targetValidation = ValidateCommandTarget(command!, targetNode, hasTarget);
+        var keyManagementValidation = ValidateKeyManagementRequest(command!, operationId!, payload);
+        if (!keyManagementValidation.IsValid) return keyManagementValidation;
+        VolumeManagementParameters? topology;
+        try { topology = payload["volumeManagement"]?.Deserialize<VolumeManagementParameters>(SerializerOptions); }
+        catch (JsonException) { return Invalid(ApfsOperationCodes.InvalidArguments, "Invalid volume management parameters."); }
+        if (!VolumeManagementParameters.Valid(command!, topology))
+            return Invalid(ApfsOperationCodes.InvalidArguments, "Invalid volume management parameters.");
+        var targetValidation = ValidateCommandTarget(command!, targetNode, hasTarget, topology);
         if (!targetValidation.IsValid)
         {
             return targetValidation;
@@ -245,6 +307,12 @@ public static class PipeMessageCodec
             return modeValidation;
         }
 
+        if (!TryGetOptionalString(payload, "approvedImageRepairPlanId", out var repairId) ||
+            repairId is not null && (command != ApfsControlCommands.Fix || !ImageRepairPersistence.Hex(repairId) ||
+                requestedMode == ApfsControlModes.ReadOnly || targetNode is not JsonObject repairTarget ||
+                !TryGetString(repairTarget, "deviceId", out var image) || !ImageRepairPersistence.LocalPath(image)))
+            return Invalid(ApfsOperationCodes.InvalidArguments, "Only ordinary image Fix accepts an exact opaque repair plan ID.");
+
         if (!TryGetString(payload, "expiresAtUtc", out var expiresAtUtc) ||
             !DateTimeOffset.TryParse(
                 expiresAtUtc,
@@ -258,8 +326,170 @@ public static class PipeMessageCodec
                 "Control operation request expiresAtUtc is required and must be an absolute UTC timestamp.");
         }
 
-        return Valid();
+        var snapshotValidation = ValidateSnapshotParameters(command!, payload);
+        if (!snapshotValidation.IsValid)
+        {
+            return snapshotValidation;
+        }
+
+        return ValidateManagementParameters(command!, payload);
     }
+
+    private static PipeMessageValidationResult ValidateSnapshotParameters(string command, JsonObject payload)
+    {
+        var isCreate = command == ApfsControlCommands.SnapshotCreate;
+        var isDelete = command == ApfsControlCommands.SnapshotDelete;
+        var isRecover = command == ApfsControlCommands.SnapshotRecover;
+        if (!TryGetOptionalString(payload, "snapshotName", out var snapshotName))
+        {
+            return Invalid(
+                ApfsOperationCodes.InvalidArguments,
+                "Control operation request snapshotName must be null or a string.");
+        }
+
+        var hasIdentity = TryGetProperty(payload, "snapshotIdentity", out var identityNode) && identityNode is not null;
+        if (isCreate)
+        {
+            if (!IsSnapshotName(snapshotName) || hasIdentity)
+            {
+                return Invalid(
+                    ApfsOperationCodes.InvalidArguments,
+                    "Snapshot create requires exactly one valid name and no identity.");
+            }
+
+            return Valid();
+        }
+
+        if (isDelete)
+        {
+            if (snapshotName is not null || !IsSnapshotIdentity(identityNode))
+            {
+                return Invalid(
+                    ApfsOperationCodes.InvalidArguments,
+                    "Snapshot delete requires the nine-line exact identity and no separate name.");
+            }
+
+            return Valid();
+        }
+
+        if (isRecover)
+        {
+            return snapshotName is null && !hasIdentity
+                ? Valid()
+                : Invalid(
+                    ApfsOperationCodes.InvalidArguments,
+                    "Snapshot recover carries no snapshot parameters.");
+        }
+
+        return snapshotName is null && !hasIdentity
+            ? Valid()
+            : Invalid(
+                ApfsOperationCodes.InvalidArguments,
+                $"The {command} command must not include snapshot parameters.");
+    }
+
+    private static bool IsSnapshotName(string? value)
+        => value is not null && value.Length is > 0 and <= 255 &&
+            value.All(static ch => ch != '\0' && ch != '\r' && ch != '\n');
+
+    // Management parameters ride the envelope as plain strings. The codec
+    // enforces presence/shape per command; membership and canonical values
+    // belong to service admission and the executor, mirroring snapshots.
+    private static PipeMessageValidationResult ValidateManagementParameters(string command, JsonObject payload)
+    {
+        var isPlan = command == ApfsControlCommands.ManagementPlan;
+        var isApply = command == ApfsControlCommands.ManagementApply;
+        if (!TryGetOptionalString(payload, "managementOperation", out var operation) ||
+            !TryGetOptionalString(payload, "managementToken", out var token) ||
+            !TryGetOptionalString(payload, "managementName", out _) ||
+            !TryGetOptionalString(payload, "managementQuotaBytes", out _) ||
+            !TryGetOptionalString(payload, "managementReserveBytes", out _) ||
+            !TryGetOptionalString(payload, "managementImagePath", out var imagePath))
+        {
+            return Invalid(
+                ApfsOperationCodes.InvalidArguments,
+                "Control operation request management parameters must be null or strings.");
+        }
+
+        if (isPlan)
+        {
+            return !string.IsNullOrWhiteSpace(operation) && token is null &&
+                !HasManagementValue(payload, "managementName") &&
+                !HasManagementValue(payload, "managementQuotaBytes") &&
+                !HasManagementValue(payload, "managementReserveBytes") &&
+                !HasManagementValue(payload, "managementImagePath")
+                ? Valid()
+                : Invalid(
+                    ApfsOperationCodes.InvalidArguments,
+                    "Management plan requires exactly one operation and no token, path, or mutation values.");
+        }
+
+        if (isApply)
+        {
+            return !string.IsNullOrWhiteSpace(operation) && !string.IsNullOrWhiteSpace(token) &&
+                !string.IsNullOrWhiteSpace(imagePath)
+                ? Valid()
+                : Invalid(
+                    ApfsOperationCodes.InvalidArguments,
+                    "Management apply requires an operation, a confirmation token, and an image path.");
+        }
+
+        return operation is null && token is null &&
+            !HasManagementValue(payload, "managementName") &&
+            !HasManagementValue(payload, "managementQuotaBytes") &&
+            !HasManagementValue(payload, "managementReserveBytes") &&
+            !HasManagementValue(payload, "managementImagePath")
+            ? Valid()
+            : Invalid(
+                ApfsOperationCodes.InvalidArguments,
+                $"The {command} command must not include management parameters.");
+    }
+
+    private static bool HasManagementValue(JsonObject payload, string name)
+        => TryGetProperty(payload, name, out var node) && node is not null;
+
+    private static bool IsSnapshotIdentity(JsonNode? node)
+    {
+        if (node is not System.Text.Json.Nodes.JsonArray identity || identity.Count != 9)
+        {
+            return false;
+        }
+
+        var fields = new string?[9];
+        for (var index = 0; index < 9; index++)
+        {
+            try
+            {
+                fields[index] = identity[index]?.GetValue<string>();
+            }
+            catch (InvalidOperationException)
+            {
+                return false;
+            }
+        }
+
+        if (!IsSnapshotName(fields[1]))
+        {
+            return false;
+        }
+
+        foreach (var index in new[] { 0, 2, 3, 4, 5, 6, 7, 8 })
+        {
+            if (!IsCanonicalNonzeroDecimal(fields[index]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsCanonicalNonzeroDecimal(string? value)
+        => value is not null &&
+            ulong.TryParse(value, System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out var parsed) &&
+            parsed != 0 &&
+            parsed.ToString(System.Globalization.CultureInfo.InvariantCulture) == value;
 
     private static PipeMessageValidationResult ValidateOperationIdRequest(
         PipeEnvelope envelope,
@@ -331,7 +561,9 @@ public static class PipeMessageCodec
         else if (!isPreAdmissionFailure)
         {
             var hasTarget = TryGetProperty(payload, "target", out var targetNode);
-            var targetValidation = ValidateCommandTarget(result.Command, targetNode, hasTarget);
+            if (!VolumeManagementParameters.Valid(result.Command, result.VolumeManagement))
+                return Invalid(ApfsOperationCodes.MalformedMessage, "Invalid volume management request echoes.");
+            var targetValidation = ValidateCommandTarget(result.Command, targetNode, hasTarget, result.VolumeManagement);
             if (!targetValidation.IsValid)
             {
                 return targetValidation;
@@ -406,6 +638,17 @@ public static class PipeMessageCodec
             return Invalid(ApfsOperationCodes.MalformedMessage, "Operation result completedAtUtc precedes startedAtUtc.");
         }
 
+        if (result.VolumeVerificationReport is not null)
+        {
+            if (result.State is not (ApfsOperationStates.Succeeded or ApfsOperationStates.Failed))
+                return Invalid(ApfsOperationCodes.MalformedMessage, "A pending operation cannot carry verification proof.");
+            var verification = ValidateVerificationProof(result);
+            if (!verification.IsValid) return verification;
+        }
+        var imageRepair = ValidateImageRepairProof(result, payload);
+        if (!imageRepair.IsValid) return imageRepair;
+        var keyManagement = ValidateKeyManagementResult(result);
+        if (!keyManagement.IsValid) return keyManagement;
         return result.State switch
         {
             ApfsOperationStates.Accepted => ValidateAcceptedResult(result),
@@ -415,6 +658,46 @@ public static class PipeMessageCodec
             ApfsOperationStates.Cancelled => ValidateCancelledResult(result),
             _ => Invalid(ApfsOperationCodes.MalformedMessage, "Operation result state is unknown."),
         };
+    }
+
+    private static PipeMessageValidationResult ValidateImageRepairProof(OperationResultPayload result, JsonObject payload)
+    {
+        if (result.ApprovedImageRepairPlanId is not null && (result.Command != ApfsControlCommands.Fix ||
+            !ImageRepairPersistence.Hex(result.ApprovedImageRepairPlanId)))
+            return Invalid(ApfsOperationCodes.MalformedMessage, "Invalid image repair approval echo.");
+        if (result.ImageRepairOffer is null && result.ImageRepairReceipt is null)
+            return result.ApprovedImageRepairPlanId is not null && result.Success
+                ? Invalid(ApfsOperationCodes.MalformedMessage, "Approved image repair success requires its original native receipt.") : Valid();
+        if (result.Command != ApfsControlCommands.Fix || result.Target is null ||
+            result.State is ApfsOperationStates.Accepted or ApfsOperationStates.InProgress)
+            return Invalid(ApfsOperationCodes.MalformedMessage, "Repair proof belongs only to terminal ordinary image Fix.");
+        static bool ScopeClosed(JsonNode? offer) => offer is JsonObject obj && obj["scope"] is JsonObject scope &&
+            scope.Count == 7 && scope.All(p => new[] { "imagePath", "containerId", "volumeUuid", "volumeObjectId", "checkpointXid", "storeOffsetBytes", "storeSizeBytes" }.Contains(p.Key, StringComparer.Ordinal));
+        var offer = result.ImageRepairOffer;
+        if (offer is not null && (!ImageRepairPersistence.ValidOffer(offer) || !ScopeClosed(payload["imageRepairOffer"]) ||
+            result.Success || result.State != ApfsOperationStates.Failed || result.ApprovedImageRepairPlanId is not null || result.ImageRepairReceipt is not null ||
+            result.FinalStatus != "repair-confirmation-required" || result.Code != ApfsOperationCodes.BlockedRecovery ||
+            offer.ExpiresAtUtc <= result.RequestedAtUtc || offer.ExpiresAtUtc > result.RequestedAtUtc.AddMinutes(5)))
+            return Invalid(ApfsOperationCodes.MalformedMessage, "Invalid image repair offer.");
+        var receipt = result.ImageRepairReceipt;
+        if (receipt is not null && (!ImageRepairPersistence.ValidReceipt(receipt) ||
+            !ScopeClosed(payload["imageRepairReceipt"]?["binding"]) ||
+            receipt.PlanId != result.ApprovedImageRepairPlanId && !(result.ApprovedImageRepairPlanId is null &&
+                receipt.OriginalAcceptedOperationId is not null && receipt.State is "recovery-required" or "repaired" or "refused") ||
+            receipt.State is "applying" or "recovery-required" && !result.PendingDurability ||
+            result.Success && (receipt.State != "repaired" || !receipt.NativePostVerifyComplete)))
+            return Invalid(ApfsOperationCodes.MalformedMessage, "Invalid image repair receipt or terminal claim.");
+        var binding = offer ?? receipt!.Binding;
+        var target = result.Target;
+        if (!string.Equals(target.DeviceId, binding.Scope.ImagePath, StringComparison.OrdinalIgnoreCase) ||
+            target.VolumeId != ImageRepairPersistence.VolumeId(binding.Scope) ||
+            target.VolumeUuid is not null && !TopologyAdmission.SameUuid(target.VolumeUuid, binding.Scope.VolumeUuid) ||
+            target.ContainerUuid is not null && !TopologyAdmission.SameUuid(target.ContainerUuid, binding.Scope.ContainerId[15..]) ||
+            target.VolumeObjectId is not null && target.VolumeObjectId.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) != binding.Scope.VolumeObjectId ||
+            target.RecoveryIdentity is not null && target.RecoveryIdentity != binding.RecoveryIdentity ||
+            target.ObservationContract is not null && target.ObservationContract != binding.ObservationContract)
+            return Invalid(ApfsOperationCodes.MalformedMessage, "Repair proof differs from the selected request target.");
+        return Valid();
     }
 
     private static PipeMessageValidationResult ValidateAcceptedResult(OperationResultPayload result)
@@ -444,8 +727,23 @@ public static class PipeMessageCodec
 
         if (result.Code == ApfsOperationCodes.AlreadyAchieved)
         {
-            return result.Command == ApfsControlCommands.Eject &&
-                   result.FinalStatus == "absent" &&
+            if (result.Command == ApfsControlCommands.Lock)
+                return result.Target?.RegisteredImage is { Writable: true } image && image.IsValid() &&
+                       result.FinalStatus == "already-locked" && result.EncryptionState == EncryptedVolumeState.Locked &&
+                       result.MountProof == "absent" && result.OwnershipProof == "proven" &&
+                       result.DurabilityProof == "not-applicable" && !result.PendingDurability && !result.RecoveryActive &&
+                       result.RequestedMode is null && result.EffectiveMode is null
+                    ? Valid() : Invalid(ApfsOperationCodes.MalformedMessage, "Already-locked image result lacks exact retirement observation.");
+            // Container unmount mirrors per-volume eject: nothing mounted is a
+            // stable success, with absence proven and ownership/durability
+            // honestly not-proven (nothing was released by this operation).
+            // Device eject shares the same already-achieved shape.
+            return (result.Command == ApfsControlCommands.Eject &&
+                   result.FinalStatus == "absent" ||
+                   result.Command == ApfsControlCommands.ContainerUnmount &&
+                   result.FinalStatus == "container-unmounted" ||
+                   result.Command == ApfsControlCommands.DeviceEject &&
+                   result.FinalStatus == "device-ejected") &&
                    result.MountProof == "absent" &&
                    result.OwnershipProof == "not-proven" &&
                    result.DurabilityProof == "not-proven" &&
@@ -514,11 +812,10 @@ public static class PipeMessageCodec
         string expected;
         try
         {
-            expected = ApfsOperationFingerprint.Compute(
-                result.Command,
-                result.Target,
-                result.RequestedMode,
-                result.ExpiresAtUtc.Value);
+            // Results echo the operation, plan token, and mutation values
+            // (mirroring the snapshot name/identity echo); ComputeForResult
+            // reproduces the request fingerprint from those echoes.
+            expected = ApfsOperationFingerprint.ComputeForResult(result);
         }
         catch (ArgumentException exception)
         {
@@ -548,6 +845,19 @@ public static class PipeMessageCodec
 
         return result.Command switch
         {
+            ApfsControlCommands.ImageKeyManagement => ValidateKeyManagementSuccess(result),
+            ApfsControlCommands.RegisterFusion => result.FinalStatus == "registered" && result.Target?.RegisteredFusion is {} fusion && fusion.IsValid()
+                ? Valid() : Invalid(ApfsOperationCodes.MalformedMessage, "Invalid Fusion registration result."),
+            ApfsControlCommands.RegisterImage => result.FinalStatus == "locked" && result.EncryptionState == EncryptedVolumeState.Locked
+                ? Valid() : Invalid(ApfsOperationCodes.MalformedMessage,"Invalid registered image result."),
+            ApfsControlCommands.Unlock => result.Target?.RegisteredImage is {} image && image.IsValid() &&
+                result.FinalStatus == (image.Writable ? "unlocked-read-write" : "unlocked-read-only") &&
+                result.EncryptionState == EncryptedVolumeState.Unlocked &&
+                result.EffectiveMode == (image.Writable ? ApfsControlModes.ReadWrite : ApfsControlModes.ReadOnly) && result.MountProof == "present"
+                ? Valid() : Invalid(ApfsOperationCodes.MalformedMessage,"Unlock lacks the exact selected access-mode mount proof."),
+            ApfsControlCommands.Lock => result.FinalStatus == "locked" && result.EncryptionState == EncryptedVolumeState.Locked &&
+                result.MountProof == "absent" && result.OwnershipProof == "proven" && result.DurabilityProof == "proven"
+                ? Valid() : Invalid(ApfsOperationCodes.MalformedMessage,"Lock lacks original host and mount absence proof."),
             ApfsControlCommands.Mount =>
                 result.RequestedMode == result.EffectiveMode &&
                 result.MountProof == "present" &&
@@ -582,6 +892,100 @@ public static class PipeMessageCodec
                 result.DirtyTransactionCount == 0
                     ? Valid()
                     : Invalid(ApfsOperationCodes.MalformedMessage, "Successful quit result lacks shutdown, ownership, durability, or marker proof."),
+            ApfsControlCommands.SnapshotCreate =>
+                result.FinalStatus == "snapshot-created" &&
+                result.MountProof == "present" &&
+                result.OwnershipProof == "proven" &&
+                result.DurabilityProof == "not-applicable"
+                    ? Valid()
+                    : Invalid(ApfsOperationCodes.MalformedMessage, "Successful snapshot-create result lacks creation, mount, or ownership proof."),
+            ApfsControlCommands.SnapshotDelete =>
+                result.FinalStatus == "snapshot-deleted" &&
+                result.MountProof == "present" &&
+                result.OwnershipProof == "proven" &&
+                result.DurabilityProof == "not-applicable"
+                    ? Valid()
+                    : Invalid(ApfsOperationCodes.MalformedMessage, "Successful snapshot-delete result lacks deletion, mount, or ownership proof."),
+            ApfsControlCommands.SnapshotRecover =>
+                (result.FinalStatus == "snapshot-recovered" || result.FinalStatus == "snapshot-recover-noop") &&
+                result.MountProof == "present" &&
+                result.OwnershipProof == "proven" &&
+                result.DurabilityProof == "not-applicable"
+                    ? Valid()
+                    : Invalid(ApfsOperationCodes.MalformedMessage, "Successful snapshot-recover result lacks recovery, mount, or ownership proof."),
+            ApfsControlCommands.SnapshotList =>
+                ValidateSnapshotInventorySuccess(result),
+            ApfsControlCommands.VolumeCreatePlan or ApfsControlCommands.VolumeDeletePlan or ApfsControlCommands.VolumeResizePlan or ApfsControlCommands.VolumeFormatPlan =>
+                ValidateVolumeManagementSuccess(result, "prepared", "volume-management-prepared", "not-applicable"),
+            ApfsControlCommands.VolumeManagementApply =>
+                ValidateVolumeManagementSuccess(result, "committed", "volume-management-committed", "proven"),
+            ApfsControlCommands.VolumeManagementCancel =>
+                ValidateVolumeManagementSuccess(result, "cancelled", "volume-management-cancelled", "not-applicable"),
+            ApfsControlCommands.VolumeManagementRecover =>
+                result.VolumeManagementReport is { ValueKind: JsonValueKind.Object } nativeReport &&
+                    nativeReport.TryGetProperty("outcome", out var nativeOutcome) && nativeOutcome.ValueKind == JsonValueKind.String && nativeOutcome.GetString() == "committed"
+                    ? ValidateVolumeManagementSuccess(result, "committed", "volume-management-committed", "proven")
+                    : ValidateVolumeManagementSuccess(result, "cancelled", "volume-management-cancelled", "not-applicable"),
+            ApfsControlCommands.VolumeVerify =>
+                result.FinalStatus == "verified-covered-scope" && result.MountProof is "absent" or "present" &&
+                result.OwnershipProof == "proven" && result.DurabilityProof == "not-applicable"
+                    ? ValidateVerificationProof(result) : Invalid(ApfsOperationCodes.MalformedMessage, "Verification lacks covered-scope or ownership proof."),
+            // A dry-run plan binds identity and generation without mounting
+            // or mutating: the target must be provably absent, the identity
+            // proven from the live row, and the issued plan echoes present.
+            ApfsControlCommands.ManagementPlan =>
+                result.FinalStatus == "management-plan-issued" &&
+                result.MountProof == "absent" &&
+                result.OwnershipProof == "proven" &&
+                result.DurabilityProof == "not-applicable" &&
+                !string.IsNullOrWhiteSpace(result.ManagementOperation) &&
+                !string.IsNullOrWhiteSpace(result.ManagementPlanId) &&
+                !string.IsNullOrWhiteSpace(result.ManagementToken) &&
+                IsCanonicalNonzeroDecimal(result.ManagementObservedXid)
+                    ? Valid()
+                    : Invalid(ApfsOperationCodes.MalformedMessage, "Successful management-plan result lacks issuance, quiesce, identity, or plan echoes."),
+            // A committed apply proves the keeper executed exactly once: the
+            // target stayed absent, the identity stayed proven, the journal
+            // reached a durable commit, and every request echo round-trips
+            // (the observed generation is the post-commit checkpoint, which
+            // must advance past the plan generation).
+            ApfsControlCommands.ManagementApply =>
+                result.FinalStatus == "management-applied" &&
+                result.MountProof == "absent" &&
+                result.OwnershipProof == "proven" &&
+                result.DurabilityProof == "proven" &&
+                !string.IsNullOrWhiteSpace(result.ManagementOperation) &&
+                !string.IsNullOrWhiteSpace(result.ManagementToken) &&
+                !string.IsNullOrWhiteSpace(result.ManagementImagePath) &&
+                IsCanonicalNonzeroDecimal(result.ManagementObservedXid)
+                    ? Valid()
+                    : Invalid(ApfsOperationCodes.MalformedMessage, "Successful management-apply result lacks commit, quiesce, identity, or apply echoes."),
+            // Container-wide results aggregate per-volume terminal evidence in
+            // the diagnostic (`vol:<volumeId>=mounted|absent|skipped|failed`
+            // tokens); the scalar proofs below describe the container as a
+            // whole and are only valid when every attempted member is proven.
+            ApfsControlCommands.ContainerMount =>
+                result.FinalStatus == "container-mounted" &&
+                result.RequestedMode == result.EffectiveMode &&
+                result.MountProof == "present" &&
+                result.OwnershipProof == "not-applicable" &&
+                result.DurabilityProof == "not-applicable"
+                    ? Valid()
+                    : Invalid(ApfsOperationCodes.MalformedMessage, "Successful container-mount result lacks uniform mode or all-members-present proof."),
+            ApfsControlCommands.ContainerUnmount =>
+                result.FinalStatus == "container-unmounted" &&
+                result.MountProof == "absent" &&
+                result.OwnershipProof == "proven" &&
+                result.DurabilityProof == "proven"
+                    ? Valid()
+                    : Invalid(ApfsOperationCodes.MalformedMessage, "Successful container-unmount result lacks absence, ownership, or durability proof."),
+            ApfsControlCommands.DeviceEject =>
+                result.FinalStatus == "device-ejected" &&
+                result.MountProof == "absent" &&
+                result.OwnershipProof == "proven" &&
+                result.DurabilityProof == "proven"
+                    ? Valid()
+                    : Invalid(ApfsOperationCodes.MalformedMessage, "Successful device-eject result lacks absence, ownership, or durability proof."),
             _ => Invalid(ApfsOperationCodes.UnknownCommand, "Operation result command is unknown."),
         };
     }
@@ -624,8 +1028,11 @@ public static class PipeMessageCodec
     private static PipeMessageValidationResult ValidateCommandTarget(
         string command,
         JsonNode? targetNode,
-        bool hasTarget)
+        bool hasTarget,
+        VolumeManagementParameters? topology = null)
     {
+        if (command == ApfsControlCommands.ImageKeyManagement)
+            return targetNode is null ? Valid() : Invalid(ApfsOperationCodes.InvalidArguments, "Key management uses its exact typed image endpoint.");
         if (command == ApfsControlCommands.Quit)
         {
             return hasTarget && targetNode is not null
@@ -633,12 +1040,101 @@ public static class PipeMessageCodec
                 : Valid();
         }
 
+        if (command is ApfsControlCommands.ContainerMount or ApfsControlCommands.ContainerUnmount ||
+            VolumeManagementParameters.IsCommand(command) && topology?.Kind == "create")
+        {
+            return ValidateContainerTarget(targetNode, hasTarget);
+        }
+
+        if (command == ApfsControlCommands.DeviceEject)
+        {
+            return ValidateDeviceTarget(targetNode, hasTarget);
+        }
+
         return ValidateTarget(targetNode, hasTarget);
+    }
+
+    private static PipeMessageValidationResult ValidateVerificationProof(OperationResultPayload result)
+    {
+        if (result.MountProof == "absent" && result.VolumeVerificationReport is null) return Valid();
+        if (result.MountProof != "present" || result.VolumeVerificationReport is not {} json ||
+            result.Command != ApfsControlCommands.VolumeVerify || result.Target is not {} target ||
+            result.PendingDurability || result.OwnershipProof != "proven" || result.DurabilityProof != "not-applicable")
+            return Invalid(ApfsOperationCodes.MalformedMessage, "Live verification lacks the retained-source report.");
+        try
+        {
+            var report = LiveVolumeVerificationReport.Parse(json);
+            return result.Success == report.Complete && TopologyAdmission.SameUuid(report.Scope.ContainerUuid, target.ContainerUuid) &&
+                TopologyAdmission.SameUuid(report.Scope.VolumeUuid, target.VolumeUuid) &&
+                report.Scope.VolumeOid == target.VolumeObjectId?.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                ? Valid() : Invalid(ApfsOperationCodes.MalformedMessage, "Live verification verdict or identity conflicts with its report.");
+        }
+        catch (InvalidDataException) { return Invalid(ApfsOperationCodes.MalformedMessage, "Invalid live verification report."); }
+    }
+
+    private static PipeMessageValidationResult ValidateSnapshotInventorySuccess(OperationResultPayload result)
+    {
+        if (result.FinalStatus != "snapshot-inventory" || result.OwnershipProof != "proven" ||
+            result.DurabilityProof != "not-applicable" || result.SnapshotInventory is not { ValueKind: JsonValueKind.Object } inventory)
+            return Invalid(ApfsOperationCodes.MalformedMessage, "Snapshot inventory lacks ownership or inventory evidence.");
+        if (result.MountProof == "absent")
+            return inventory.TryGetProperty("format", out var format) && format.ValueKind == JsonValueKind.String &&
+                format.GetString() == "apfs-access-snapshot-inventory" ? Valid() :
+                Invalid(ApfsOperationCodes.MalformedMessage, "Offline inventory has the wrong format.");
+        try
+        {
+            var live = ApfsAccess.Core.LiveSnapshotInventory.Parse(inventory);
+            return result.MountProof == "present" && result.Target is {} target &&
+                ApfsAccess.Core.TopologyAdmission.SameUuid(live.ContainerUuid, target.ContainerUuid) &&
+                ApfsAccess.Core.TopologyAdmission.SameUuid(live.VolumeUuid, target.VolumeUuid) &&
+                live.VolumeOid == target.VolumeObjectId?.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                ? Valid() : Invalid(ApfsOperationCodes.MalformedMessage, "Live inventory has a different target scope.");
+        }
+        catch (InvalidDataException)
+        { return Invalid(ApfsOperationCodes.MalformedMessage, "Live inventory is malformed."); }
+    }
+
+    private static PipeMessageValidationResult ValidateVolumeManagementSuccess(OperationResultPayload r,
+        string outcome, string status, string durability)
+    {
+        if (r.FinalStatus != status || r.MountProof != "absent" || r.OwnershipProof != "proven" ||
+            r.DurabilityProof != durability || r.VolumeManagementReport is not { ValueKind: JsonValueKind.Object } report)
+            return Invalid(ApfsOperationCodes.MalformedMessage, "Volume management lacks native terminal proof.");
+        try
+        {
+            var imageKind = r.VolumeManagement is {} options && VolumeManagementParameters.IsImageKind(options.Kind);
+            if (report.GetProperty("schemaVersion").GetInt32() != 1 || report.GetProperty("operation").GetString() != (imageKind ? r.VolumeManagement!.Kind : "volume-" + r.VolumeManagement?.Kind) ||
+                report.GetProperty("outcome").GetString() != outcome || report.GetProperty("sourceIdentity").GetString() is not { Length: 80 } identity || !identity.All(char.IsAsciiHexDigitLower) ||
+                !VolumeTopologyProfile.Uuid(report.GetProperty("containerUuid").GetString()) ||
+                !TopologyAdmission.SameUuid(report.GetProperty("containerUuid").GetString(), r.Target?.ContainerUuid) ||
+                !VolumeTopologyProfile.Uuid(report.GetProperty("volumeUuid").GetString()) ||
+                !IsCanonicalNonzeroDecimal(report.GetProperty("volumeOid").GetString()) ||
+                !(outcome == "cancelled" ? VolumeTopologyProfile.Number(report.GetProperty("preXid").GetString()) : IsCanonicalNonzeroDecimal(report.GetProperty("preXid").GetString())))
+                return Invalid(ApfsOperationCodes.MalformedMessage, "Volume management native evidence is incomplete.");
+            if ((r.VolumeManagement?.Kind == "delete" || imageKind) && (!TopologyAdmission.SameUuid(report.GetProperty("volumeUuid").GetString(), r.Target?.VolumeUuid) ||
+                report.GetProperty("volumeOid").GetString() != r.Target?.VolumeObjectId?.ToString(System.Globalization.CultureInfo.InvariantCulture)))
+                return Invalid(ApfsOperationCodes.MalformedMessage, "Volume deletion native evidence targets another volume.");
+            if (imageKind && (!IsCanonicalNonzeroDecimal(report.GetProperty("expectedBytes").GetString()) ||
+                !IsCanonicalNonzeroDecimal(report.GetProperty("targetBytes").GetString()) ||
+                (r.VolumeManagement!.Kind is "grow" or "shrink" && report.GetProperty("targetBytes").GetString() != r.VolumeManagement.TargetBytes) ||
+                (r.VolumeManagement.Kind is "format" or "erase" &&
+                 (!VolumeTopologyProfile.Uuid(report.GetProperty("newContainerUuid").GetString()) ||
+                  !VolumeTopologyProfile.Uuid(report.GetProperty("newVolumeUuid").GetString()) || report.GetProperty("newVolumeOid").GetString() != "1024"))))
+                return Invalid(ApfsOperationCodes.MalformedMessage, "Image management capacity or destination proof is missing.");
+            if (outcome == "committed" && (!IsCanonicalNonzeroDecimal(report.GetProperty("postXid").GetString()) ||
+                ulong.Parse(report.GetProperty("postXid").GetString()!) <= ulong.Parse(report.GetProperty("preXid").GetString()!)))
+                return Invalid(ApfsOperationCodes.MalformedMessage, "Volume management commit did not advance the checkpoint.");
+            if (outcome == "prepared" && report.GetProperty("confirmationToken").GetString() is not { Length: 64 })
+                return Invalid(ApfsOperationCodes.MalformedMessage, "Volume management plan has no native token.");
+            return Valid();
+        }
+        catch (Exception e) when (e is InvalidOperationException or KeyNotFoundException or FormatException or OverflowException)
+        { return Invalid(ApfsOperationCodes.MalformedMessage, "Invalid native volume management evidence."); }
     }
 
     private static PipeMessageValidationResult ValidateRequestedMode(string command, string? requestedMode)
     {
-        if (command == ApfsControlCommands.Mount)
+        if (command is ApfsControlCommands.Mount or ApfsControlCommands.ContainerMount)
         {
             return IsCanonicalMode(requestedMode)
                 ? Valid()
@@ -659,6 +1155,8 @@ public static class PipeMessageCodec
                 "Mount, fix, and eject require an exact deviceId and volumeId target.");
         }
 
+        if (target.Select(p => p.Key).Distinct(StringComparer.OrdinalIgnoreCase).Count() != target.Count)
+            return Invalid(ApfsOperationCodes.AmbiguousTarget, "Duplicate target identity fields are ambiguous.");
         foreach (var property in target)
         {
             if (!IsTargetProperty(property.Key))
@@ -699,6 +1197,102 @@ public static class PipeMessageCodec
             return Invalid(
                 ApfsOperationCodes.AmbiguousTarget,
                 "Target recoveryIdentity must be null or a nonblank string.");
+        }
+
+        try
+        {
+            var typed = target.Deserialize<ApfsControlTarget>(new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            if (typed is null || !SelectedControlTarget.IsWellFormed(typed))
+                return Invalid(ApfsOperationCodes.AmbiguousTarget, "Selected identity requires UUID, container, object, recovery and observation contract together.");
+        }
+        catch (JsonException) { return Invalid(ApfsOperationCodes.AmbiguousTarget, "Malformed selected identity."); }
+        return Valid();
+    }
+
+    // Container-wide commands address a whole APFS container, never one
+    // volume: deviceId plus containerUuid are required, and a volumeId is
+    // refused so a container request can never be mistaken for (or routed
+    // as) a single-volume request. Membership is resolved against live
+    // inventory downstream; the envelope only enforces shape here.
+    private static PipeMessageValidationResult ValidateContainerTarget(JsonNode? targetNode, bool hasTarget)
+    {
+        if (!hasTarget || targetNode is not JsonObject target)
+        {
+            return Invalid(
+                ApfsOperationCodes.AmbiguousTarget,
+                "Container mount and unmount require an exact deviceId and containerUuid target.");
+        }
+
+        if (target.Select(p => p.Key).Distinct(StringComparer.OrdinalIgnoreCase).Count() != target.Count)
+            return Invalid(ApfsOperationCodes.AmbiguousTarget, "Duplicate target identity fields are ambiguous.");
+        foreach (var property in target)
+        {
+            if (!IsTargetProperty(property.Key))
+            {
+                return Invalid(
+                    ApfsOperationCodes.AmbiguousTarget,
+                    $"Target property '{property.Key}' is not part of the stable target identity.");
+            }
+        }
+
+        if (!TryGetString(target, "deviceId", out var deviceId) ||
+            string.IsNullOrWhiteSpace(deviceId) ||
+            !TryGetString(target, "containerUuid", out var containerUuid) ||
+            string.IsNullOrWhiteSpace(containerUuid))
+        {
+            return Invalid(
+                ApfsOperationCodes.AmbiguousTarget,
+                "Container target must contain nonblank deviceId and containerUuid values.");
+        }
+
+        if (TryGetString(target, "volumeId", out var volumeId) && !string.IsNullOrWhiteSpace(volumeId))
+        {
+            return Invalid(
+                ApfsOperationCodes.AmbiguousTarget,
+                "Container target must not contain a volumeId; address one volume with mount/unmount/eject instead.");
+        }
+
+        return Valid();
+    }
+
+    // Device-wide eject addresses a whole physical device: deviceId only, no
+    // container or volume identity. Membership (every container on the
+    // device) is resolved against live inventory downstream.
+    private static PipeMessageValidationResult ValidateDeviceTarget(JsonNode? targetNode, bool hasTarget)
+    {
+        if (!hasTarget || targetNode is not JsonObject target)
+        {
+            return Invalid(
+                ApfsOperationCodes.AmbiguousTarget,
+                "Device eject requires an exact deviceId target.");
+        }
+
+        if (target.Select(p => p.Key).Distinct(StringComparer.OrdinalIgnoreCase).Count() != target.Count)
+            return Invalid(ApfsOperationCodes.AmbiguousTarget, "Duplicate target identity fields are ambiguous.");
+        foreach (var property in target)
+        {
+            if (!IsTargetProperty(property.Key))
+            {
+                return Invalid(
+                    ApfsOperationCodes.AmbiguousTarget,
+                    $"Target property '{property.Key}' is not part of the stable target identity.");
+            }
+        }
+
+        if (!TryGetString(target, "deviceId", out var deviceId) ||
+            string.IsNullOrWhiteSpace(deviceId))
+        {
+            return Invalid(
+                ApfsOperationCodes.AmbiguousTarget,
+                "Device target must contain a nonblank deviceId value.");
+        }
+
+        if ((TryGetString(target, "volumeId", out var volumeId) && !string.IsNullOrWhiteSpace(volumeId)) ||
+            (TryGetString(target, "containerUuid", out var containerUuid) && !string.IsNullOrWhiteSpace(containerUuid)))
+        {
+            return Invalid(
+                ApfsOperationCodes.AmbiguousTarget,
+                "Device target must not contain a volumeId or containerUuid; address narrower scopes with their own commands.");
         }
 
         return Valid();
@@ -775,10 +1369,21 @@ public static class PipeMessageCodec
            string.Equals(operationId, parsed.ToString("D"), StringComparison.Ordinal);
 
     private static bool IsCanonicalCommand(string? command)
-        => command is ApfsControlCommands.Mount or
+        => command is ApfsControlCommands.ImageKeyManagement or ApfsControlCommands.RegisterFusion or ApfsControlCommands.RegisterImage or ApfsControlCommands.Unlock or ApfsControlCommands.Lock or ApfsControlCommands.Mount or
+            ApfsControlCommands.ContainerMount or
+            ApfsControlCommands.ContainerUnmount or
+            ApfsControlCommands.DeviceEject or
             ApfsControlCommands.Fix or
             ApfsControlCommands.Eject or
-            ApfsControlCommands.Quit;
+            ApfsControlCommands.Quit or
+            ApfsControlCommands.SnapshotCreate or
+            ApfsControlCommands.SnapshotDelete or
+            ApfsControlCommands.SnapshotRecover or
+            ApfsControlCommands.SnapshotList or
+            ApfsControlCommands.VolumeCreatePlan or ApfsControlCommands.VolumeDeletePlan or ApfsControlCommands.VolumeResizePlan or ApfsControlCommands.VolumeFormatPlan or
+            ApfsControlCommands.VolumeManagementApply or ApfsControlCommands.VolumeManagementCancel or ApfsControlCommands.VolumeManagementRecover or
+            ApfsControlCommands.ManagementPlan or
+            ApfsControlCommands.ManagementApply or ApfsControlCommands.VolumeVerify;
 
     private static bool IsCanonicalMode(string? mode)
         => mode is ApfsControlModes.ReadOnly or ApfsControlModes.ReadWrite;
@@ -822,7 +1427,8 @@ public static class PipeMessageCodec
     private static bool IsTargetProperty(string propertyName)
         => string.Equals(propertyName, "deviceId", StringComparison.OrdinalIgnoreCase) ||
            string.Equals(propertyName, "volumeId", StringComparison.OrdinalIgnoreCase) ||
-           string.Equals(propertyName, "recoveryIdentity", StringComparison.OrdinalIgnoreCase);
+           string.Equals(propertyName, "recoveryIdentity", StringComparison.OrdinalIgnoreCase) ||
+             new[] { "volumeUuid", "containerUuid", "volumeObjectId", "observationContract", "registeredImage", "registeredFusion" }.Contains(propertyName, StringComparer.OrdinalIgnoreCase);
 
     private static bool IsSchema2Type(string type)
         => IsLegacyMessageType(type) ||

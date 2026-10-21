@@ -23,7 +23,14 @@
 #include "ApfsContainerCatalog.h"
 #include "ApfsFormat.h"
 #include "ApfsSnapshotStore.h"
+#include "ApfsSpaceAccounting.h"
 #include "ApfsVerifier.h"
+#include "ApfsVerificationJson.h"
+#include "ApfsVerifierEncryptedSource.h"
+#include "ApfsFusionStore.h"
+#ifdef _WIN32
+#include "EncryptedReadTransport.h"
+#endif
 #include <set>
 #ifdef _WIN32
 #include "BlockDevice.h"
@@ -39,7 +46,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace
@@ -63,7 +72,16 @@ int Usage()
               << "  ApfsObserver --image <file> --mode verify --container-uuid <hex32> "
                  "--volume-uuid <hex32> --volume-oid <decimal> --checkpoint-xid <decimal> "
                  "--store-offset-bytes <decimal> --store-size-bytes <decimal> "
-                 "[--require-whole-volume] [--require-payload-content-hashes] [--out <file>]\n"
+                 "[--require-whole-volume] [--require-payload-content-hashes] [--account-retained-ownership] [--out <file>]\n"
+              << "  ApfsObserver --image <file> --mode verify-history --container-uuid <hex32> "
+                 "--volume-uuid <hex32> --volume-oid <decimal> --checkpoint-xid <decimal> "
+                 "--retained-from-xid <older-decimal> --store-offset-bytes <decimal> --store-size-bytes <decimal> [--out <file>]\n"
+              << "  ApfsObserver --image <file> --mode snapshot-space --container-uuid <hex32> "
+                 "--volume-uuid <hex32> --volume-oid <decimal> --checkpoint-xid <decimal> "
+                 "--store-offset-bytes <decimal> --store-size-bytes <decimal> [--out <file>]\n"
+              << "  ApfsObserver --image <file> --mode snapshot-attribution --container-uuid <hex32> "
+                 "--volume-uuid <hex32> --volume-oid <decimal> --checkpoint-xid <decimal> "
+                 "--store-offset-bytes <decimal> --store-size-bytes <decimal> [--out <file>]\n"
               << "  ApfsObserver --help\n";
     return 2;
 }
@@ -72,6 +90,20 @@ int Usage()
 {
     std::cerr << "error: " << message << "\n";
     std::exit(2);
+}
+
+int WriteStdoutEvidence(const std::string& text, int semantic_exit_code)
+{
+    std::cout << text << '\n';
+    std::cout.flush();
+    // Check the synchronized CRT buffer too, before process teardown hides errors.
+    const int flush_result = std::fflush(stdout);
+    if (!std::cout.good() || flush_result != 0 || std::ferror(stdout) != 0)
+    {
+        std::cerr << "error: observer stdout transport failed\n" << std::flush;
+        return 5;
+    }
+    return semantic_exit_code;
 }
 
 bool IsSlugChar(char ch)
@@ -97,33 +129,70 @@ bool IsValidSlug(const std::string& slug)
 }
 
 #ifdef _WIN32
+std::string ToUtf8(std::wstring_view text)
+{
+    if (text.empty()) return {};
+    if (text.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
+        Fail("argument is too long");
+    const auto length = static_cast<int>(text.size());
+    const int needed = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+        text.data(), length, nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) Fail("argument is not valid UTF-16");
+    std::string utf8(static_cast<std::size_t>(needed), '\0');
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), length,
+            utf8.data(), needed, nullptr, nullptr) != needed)
+        Fail("argument is not valid UTF-16");
+    return utf8;
+}
+
 std::wstring ToWide(const std::string& text)
 {
     if (text.empty())
     {
         return std::wstring{};
     }
+    if (text.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
+        Fail("device path is too long");
+    const auto length = static_cast<int>(text.size());
     const int needed = MultiByteToWideChar(
-        CP_UTF8, MB_ERR_INVALID_CHARS, text.c_str(), -1, nullptr, 0);
-    if (needed <= 1)
+        CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), length, nullptr, 0);
+    if (needed <= 0)
     {
         Fail("device path is not valid UTF-8");
     }
-    std::wstring wide(static_cast<std::size_t>(needed) - 1, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, wide.data(), needed);
+    std::wstring wide(static_cast<std::size_t>(needed), L'\0');
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), length,
+            wide.data(), needed) != needed)
+        Fail("device path is not valid UTF-8");
     return wide;
 }
 #endif
+
+std::filesystem::path ObserverPath(const std::string& text)
+{
+#ifdef _WIN32
+    return std::filesystem::path(ToWide(text));
+#else
+    return std::filesystem::path(text);
+#endif
+}
+
+std::string PathUtf8(const std::filesystem::path& path)
+{
+    const auto utf8 = path.u8string();
+    return std::string(utf8.begin(), utf8.end());
+}
 
 void RequireRegularInputFile(const std::string& path, const std::string& what)
 {
     namespace fs = std::filesystem;
     std::error_code code;
-    if (fs::is_symlink(path, code) && !code)
+    const auto native_path = ObserverPath(path);
+    if (fs::is_symlink(native_path, code) && !code)
     {
         Fail(std::string("refusing symlinked observer input: ") + what);
     }
-    if (!fs::is_regular_file(path, code) || code)
+    if (!fs::is_regular_file(native_path, code) || code)
     {
         Fail(std::string("observer input is not a regular file: ") + what);
     }
@@ -134,7 +203,7 @@ void RequireRegularInputFile(const std::string& path, const std::string& what)
 bool SameFile(const std::string& first, const std::string& second)
 {
     std::error_code code;
-    const bool same = std::filesystem::equivalent(first, second, code);
+    const bool same = std::filesystem::equivalent(ObserverPath(first), ObserverPath(second), code);
     return !code && same;
 }
 
@@ -154,25 +223,26 @@ void PublishEvidence(
 {
     namespace fs = std::filesystem;
     std::error_code code;
+    const auto output_path = ObserverPath(out_path);
     for (const std::string& input : input_paths)
     {
-        if (fs::equivalent(out_path, input, code) && !code)
+        if (fs::equivalent(output_path, ObserverPath(input), code) && !code)
         {
             Fail("refusing to overwrite observer input: " + out_path);
         }
         code.clear();
     }
-    if (fs::symlink_status(out_path, code).type() == fs::file_type::symlink && !code)
+    if (fs::symlink_status(output_path, code).type() == fs::file_type::symlink && !code)
     {
         Fail("refusing symlinked --out path: " + out_path);
     }
     code.clear();
-    if (fs::exists(out_path, code) && !code)
+    if (fs::exists(output_path, code) && !code)
     {
         Fail("--out already exists (delete first to re-run): " + out_path);
     }
     code.clear();
-    fs::path parent = fs::path(out_path).parent_path();
+    fs::path parent = output_path.parent_path();
     if (parent.empty())
     {
         parent = ".";
@@ -188,11 +258,11 @@ void PublishEvidence(
             if (code || kind == fs::file_type::symlink)
             {
                 Fail("refusing --out under a symlinked or unreadable directory: " +
-                    ancestor.string());
+                    PathUtf8(ancestor));
             }
             if (kind == fs::file_type::not_found)
             {
-                Fail("--out directory does not exist: " + ancestor.string());
+                Fail("--out directory does not exist: " + PathUtf8(ancestor));
             }
             const fs::path up = ancestor.parent_path();
             if (up.empty() || up == ancestor)
@@ -204,7 +274,7 @@ void PublishEvidence(
     }
     if (!fs::is_directory(parent, code) || code)
     {
-        Fail("--out directory does not exist: " + parent.string());
+        Fail("--out directory does not exist: " + PathUtf8(parent));
     }
 #ifdef _WIN32
     const std::uint64_t process_id = static_cast<std::uint64_t>(GetCurrentProcessId());
@@ -221,13 +291,14 @@ void PublishEvidence(
         const std::string temp = out_path + ".tmp-" + std::to_string(process_id) + "-" +
             std::to_string(stamp) + "-" +
             std::to_string(g_publish_counter.fetch_add(1));
-        if (fs::symlink_status(temp, code).type() != fs::file_type::not_found)
+        const auto temp_path = ObserverPath(temp);
+        if (fs::symlink_status(temp_path, code).type() != fs::file_type::not_found)
         {
             code.clear();
             continue;
         }
         {
-            std::ofstream out(temp, std::ios::out | std::ios::binary | std::ios::trunc);
+            std::ofstream out(temp_path, std::ios::out | std::ios::binary | std::ios::trunc);
             if (!out.is_open())
             {
                 Fail("cannot open --out temp file: " + temp);
@@ -237,15 +308,15 @@ void PublishEvidence(
             if (!out.good())
             {
                 std::error_code remove_code;
-                fs::remove(temp, remove_code);
+                fs::remove(temp_path, remove_code);
                 Fail("writing --out temp file failed: " + temp);
             }
         }
-        fs::rename(temp, out_path, code);
+        fs::rename(temp_path, output_path, code);
         if (code)
         {
             std::error_code remove_code;
-            fs::remove(temp, remove_code);
+            fs::remove(temp_path, remove_code);
             Fail("atomic --out publish failed: " + out_path);
         }
         return;
@@ -919,7 +990,12 @@ struct ObserverOptions
     std::string container_uuid;
     std::string volume_oid;
     std::string volume_uuid, checkpoint_xid, store_offset_bytes, store_size_bytes;
+    std::string retained_from_xid;
+    std::string verification_profile, tier2_offset, tier2_size, fusion_uuid, fusion_convention;
+    std::string expected_main_identity, expected_tier2_identity;
+    bool credential_stdin = false;
     bool require_whole_volume = false, require_payload_content_hashes = false;
+    bool account_retained_ownership = false;
     bool duplicate_option = false;
 };
 
@@ -980,10 +1056,20 @@ ObserverOptions ParseOptions(int argc, char** argv)
         }
         else if (arg == "--volume-uuid") options.volume_uuid = need_value("--volume-uuid");
         else if (arg == "--checkpoint-xid") options.checkpoint_xid = need_value("--checkpoint-xid");
+        else if (arg == "--retained-from-xid") options.retained_from_xid = need_value("--retained-from-xid");
         else if (arg == "--store-offset-bytes") options.store_offset_bytes = need_value("--store-offset-bytes");
         else if (arg == "--store-size-bytes") options.store_size_bytes = need_value("--store-size-bytes");
         else if (arg == "--require-whole-volume") options.require_whole_volume = true;
         else if (arg == "--require-payload-content-hashes") options.require_payload_content_hashes = true;
+        else if (arg == "--account-retained-ownership") options.account_retained_ownership = true;
+        else if (arg == "--verification-profile") options.verification_profile = need_value("--verification-profile");
+        else if (arg == "--tier2-offset-bytes") options.tier2_offset = need_value("--tier2-offset-bytes");
+        else if (arg == "--tier2-size-bytes") options.tier2_size = need_value("--tier2-size-bytes");
+        else if (arg == "--fusion-uuid") options.fusion_uuid = need_value("--fusion-uuid");
+        else if (arg == "--fusion-role-convention") options.fusion_convention = need_value("--fusion-role-convention");
+        else if (arg == "--expected-main-identity") options.expected_main_identity = need_value("--expected-main-identity");
+        else if (arg == "--expected-tier2-identity") options.expected_tier2_identity = need_value("--expected-tier2-identity");
+        else if (arg == "--credential-stdin") options.credential_stdin = true;
         else if (arg == "--help" || arg == "-h" || arg == "/?")
         {
             std::exit(Usage());
@@ -1020,19 +1106,66 @@ void ValidateOptions(const ObserverOptions& options)
     {
         Fail("fusion mode requires both --store-a and --store-b");
     }
-    if (options.profile.empty() && options.mode != "snapshots" && options.mode != "verify")
+    if (options.mode == "verify-profile" || options.mode == "verify-profile-history" || options.mode == "verify-profile-snapshots")
+    {
+        const bool fusion = options.verification_profile == "fusion-clean-cache";
+        const bool encrypted = options.verification_profile == "encrypted-onekey-generation-zero";
+        if ((!fusion && !encrypted) || has_device || options.duplicate_option || !options.profile.empty() || !options.device_id.empty() ||
+            (fusion ? (!has_fusion || has_image || options.credential_stdin || options.fusion_convention != "linux-apfs-last-byte-low-bit") :
+                (!has_image || has_fusion || !options.credential_stdin || !options.fusion_uuid.empty() || !options.fusion_convention.empty() ||
+                 !options.tier2_offset.empty() || !options.tier2_size.empty() || !options.expected_tier2_identity.empty())))
+            Fail("verify-profile requires exact supported profile/source selectors and encrypted credential pipe or explicit Fusion role convention");
+        for (const auto* uuid : {&options.container_uuid, &options.volume_uuid})
+            if (uuid->size() != 32 || uuid->find_first_not_of("0123456789abcdef") != std::string::npos || *uuid == std::string(32, '0'))
+                Fail("profile UUIDs must be nonzero lowercase hex32");
+        (void)ExactDecimal(options.volume_oid, "--volume-oid");
+        (void)ExactDecimal(options.checkpoint_xid, "--checkpoint-xid");
+        (void)ExactDecimal(options.store_offset_bytes, "--store-offset-bytes", true);
+        (void)ExactDecimal(options.store_size_bytes, "--store-size-bytes");
+        if (!options.retained_from_xid.empty()) (void)ExactDecimal(options.retained_from_xid, "--retained-from-xid");
+        if (options.mode == "verify-profile-history" && (options.retained_from_xid.empty() ||
+            ExactDecimal(options.retained_from_xid, "--retained-from-xid") >= ExactDecimal(options.checkpoint_xid, "--checkpoint-xid")))
+            Fail("verify-profile-history requires an earlier explicit --retained-from-xid");
+        if (options.mode == "verify-profile-snapshots" && !options.retained_from_xid.empty() &&
+            ExactDecimal(options.retained_from_xid, "--retained-from-xid") >= ExactDecimal(options.checkpoint_xid, "--checkpoint-xid"))
+            Fail("verify-profile-snapshots requires an earlier explicit --retained-from-xid when provided");
+        if (fusion)
+        {
+            if (options.fusion_uuid.size() != 32 || options.fusion_uuid.find_first_not_of("0123456789abcdef") != std::string::npos || options.fusion_uuid == std::string(32, '0'))
+                Fail("explicit Fusion UUID required");
+            (void)ExactDecimal(options.tier2_offset, "--tier2-offset-bytes", true);
+            (void)ExactDecimal(options.tier2_size, "--tier2-size-bytes");
+        }
+        return;
+    }
+    if (!options.verification_profile.empty() || !options.tier2_offset.empty() || !options.tier2_size.empty() ||
+        !options.fusion_uuid.empty() || !options.fusion_convention.empty() || options.credential_stdin ||
+        !options.expected_main_identity.empty() || !options.expected_tier2_identity.empty())
+        Fail("current profile selectors require --mode verify-profile");
+    const bool history = options.mode == "verify-history";
+    const bool snapshot_query = options.mode == "snapshot-space" || options.mode == "snapshot-attribution" ||
+        options.mode == "marked-reference-space" || options.mode == "marked-owner-space";
+    if (options.account_retained_ownership && options.mode != "verify")
+        Fail("--account-retained-ownership requires --mode verify");
+    if (!history && options.mode != "marked-owner-space" && !options.retained_from_xid.empty()) Fail("--retained-from-xid requires --mode verify-history");
+    if (options.mode == "marked-owner-space" && !options.retained_from_xid.empty() &&
+        ExactDecimal(options.retained_from_xid, "--retained-from-xid") >= ExactDecimal(options.checkpoint_xid, "--checkpoint-xid"))
+        Fail("marked-owner-space requires an earlier explicit retained checkpoint");
+    if (options.profile.empty() && options.mode != "snapshots" && options.mode != "verify" && !snapshot_query && !history)
     {
         Fail("--profile is required");
     }
-    if (options.mode != "collect" && options.mode != "fusion" && options.mode != "snapshots" && options.mode != "verify")
+    if (options.mode != "collect" && options.mode != "fusion" && options.mode != "snapshots" &&
+        options.mode != "verify" && !snapshot_query && !history)
     {
-        Fail("--mode must be collect, fusion, snapshots, or verify");
+        Fail("--mode must be collect, fusion, snapshots, verify, verify-history, snapshot-space, or snapshot-attribution");
     }
     if (has_fusion && options.mode != "fusion")
     {
         Fail("two-store inputs require --mode fusion");
     }
-    if ((has_image || has_device) && options.mode != "collect" && options.mode != "snapshots" && options.mode != "verify")
+    if ((has_image || has_device) && options.mode != "collect" && options.mode != "snapshots" &&
+        options.mode != "verify" && !snapshot_query && !history)
     {
         Fail("single inputs require --mode collect");
     }
@@ -1040,8 +1173,10 @@ void ValidateOptions(const ObserverOptions& options)
     {
         Fail("--device-id must match [A-Za-z0-9_.-]{1,128}");
     }
-    if (options.mode == "verify")
+    if (options.mode == "verify" || snapshot_query || history)
     {
+        if (snapshot_query && (options.require_whole_volume || options.require_payload_content_hashes))
+            Fail("snapshot space query does not accept broader verification requests");
         if (!has_image || has_fusion || has_device) Fail("verification requires one regular --image input");
         std::string regular_path = options.image;
         std::replace(regular_path.begin(), regular_path.end(), '\\', '/');
@@ -1059,6 +1194,14 @@ void ValidateOptions(const ObserverOptions& options)
                 Fail("verification UUIDs must be nonzero lowercase 32-digit hex UUIDs");
         (void)ExactDecimal(options.volume_oid, "--volume-oid");
         (void)ExactDecimal(options.checkpoint_xid, "--checkpoint-xid");
+        if (history)
+        {
+            if (options.require_whole_volume || options.require_payload_content_hashes)
+                Fail("requested history cannot be combined with whole-volume or content-hash verification");
+            if (ExactDecimal(options.retained_from_xid, "--retained-from-xid") >=
+                ExactDecimal(options.checkpoint_xid, "--checkpoint-xid"))
+                Fail("--retained-from-xid must precede the exact selected checkpoint");
+        }
         (void)ExactDecimal(options.store_offset_bytes, "--store-offset-bytes", true);
         (void)ExactDecimal(options.store_size_bytes, "--store-size-bytes");
     }
@@ -1079,7 +1222,7 @@ void ValidateOptions(const ObserverOptions& options)
     }
     else if (!options.container_uuid.empty() || !options.volume_oid.empty())
         Fail("identity selectors require --mode snapshots or verify");
-    if (options.mode != "verify" && (!options.volume_uuid.empty() || !options.checkpoint_xid.empty() ||
+    if (options.mode != "verify" && !snapshot_query && !history && (!options.volume_uuid.empty() || !options.checkpoint_xid.empty() ||
         !options.store_offset_bytes.empty() || !options.store_size_bytes.empty() ||
         options.require_whole_volume || options.require_payload_content_hashes))
         Fail("exact verification selectors require --mode verify");
@@ -1091,7 +1234,7 @@ class VerificationImageLease final : public apfsaccess::catalog::RandomAccessSou
 {
 public:
     explicit VerificationImageLease(const std::string& path)
-        try : lease_(ToWide(path), false) {}
+        try : lease_(ToWide(path)) {}
         catch (const std::runtime_error& error) {
             if (std::string(error.what()) == "RegularImageRequired")
                 Fail("verification lease requires a regular non-reparse image file");
@@ -1110,6 +1253,19 @@ private:
 std::string VerificationJson(const apfsaccess::catalog::VerificationReport& report, const std::string& image_path)
 {
     using namespace apfsaccess::catalog;
+    if (report.requested_scope.retained_from_xid || report.requested_history)
+        throw std::length_error("requested history requires its explicit report transport");
+    if (report.requested_scope.observe_payload_content)
+    {
+        std::string output;
+        payload::Reason failure;
+        if (!SerializeImageVerificationReport(report, image_path, [] { return true; },
+                MaxImageVerificationJsonBytes, output, failure))
+            throw std::length_error("verification report cannot be serialized");
+        return output;
+    }
+    // Reserve the Windows stdout CRLF within the shared 64 MiB byte limit.
+    constexpr std::size_t max_json_bytes = 64ull * 1024 * 1024 - 2;
     JsonWriter json;
     const auto number = [&](std::uint64_t n) { json.String(std::to_string(n)); };
     const auto optional = [&](const std::optional<std::uint64_t>& n) { if (n) number(*n); else json.Null(); };
@@ -1123,7 +1279,7 @@ std::string VerificationJson(const apfsaccess::catalog::VerificationReport& repo
     };
     json.BeginObject();
     json.Key("format"); json.String("apfs-access-verification");
-    json.Key("version"); json.Integer(1);
+    json.Key("version"); json.Integer(2);
     json.Key("readOnly"); json.Bool(true);
     json.Key("source"); json.BeginObject();
     json.Key("kind"); json.String("image");
@@ -1161,6 +1317,36 @@ std::string VerificationJson(const apfsaccess::catalog::VerificationReport& repo
     json.Key("sourceReadBytes"); number(report.source_read_bytes);
     json.Key("coveredFilesystemRecords"); number(report.covered_filesystem_records);
     json.Key("coveredPhysicalExtents"); number(report.covered_physical_extents);
+    // These are observations of the admitted current graph, never reclaim candidates.
+    json.Key("allocationCensus");
+    if (report.allocation_census)
+    {
+        const auto& census = *report.allocation_census;
+        json.BeginObject();
+        json.Key("blockSizeBytes"); number(census.block_size_bytes);
+        json.Key("containerBlockCount"); number(census.container_block_count);
+        json.Key("currentMetadataBlocks"); number(census.current_metadata_blocks);
+        json.Key("currentPayloadBlocks"); number(census.current_payload_blocks);
+        json.Key("unattributedMainBlocks"); number(census.unattributed_main_blocks);
+        json.Key("unattributedInternalBlocks"); number(census.unattributed_internal_blocks);
+        const auto ranges = [&](const char* key, const auto& values) {
+            json.Key(key); json.BeginArray();
+            for (const auto& range : values)
+            {
+                json.BeginObject();
+                json.Key("physicalBlock"); number(range.physical_block);
+                json.Key("blockCount"); number(range.block_count);
+                json.EndObject();
+                if (json.Text().size() > max_json_bytes)
+                    throw std::length_error("verification report exceeds transport limit");
+            }
+            json.EndArray();
+        };
+        ranges("unattributedMainRanges", census.unattributed_main_ranges);
+        ranges("unattributedInternalRanges", census.unattributed_internal_ranges);
+        json.EndObject();
+    }
+    else json.Null();
     json.Key("findings"); json.BeginArray();
     for (const auto& finding : report.findings)
     {
@@ -1194,8 +1380,61 @@ std::string VerificationJson(const apfsaccess::catalog::VerificationReport& repo
     json.Key("refusal"); json.Integer(static_cast<unsigned>(report.repair.refusal));
     json.Key("nextActionableCandidate"); json.Null();
     json.EndObject(); json.EndObject();
+    if (json.Text().size() > max_json_bytes)
+        throw std::length_error("verification report exceeds transport limit");
     return json.Text();
 }
+
+#ifdef _WIN32
+class ObservedImageVerificationSource final : public apfsaccess::catalog::RandomAccessSource
+{
+public:
+    ObservedImageVerificationSource(const VerificationImageLease& lease,
+        const apfsaccess::catalog::VerificationScope& scope, const std::function<bool()>& within_deadline)
+        : lease_(lease), within_deadline_(within_deadline), budget_(std::make_shared<apfsaccess::catalog::ApfsReadBudget>(
+            scope.max_reads, scope.max_read_bytes, scope.max_records, scope.max_record_bytes)) {}
+    std::uint64_t SizeBytes() const override { return lease_.SizeBytes(); }
+    std::shared_ptr<apfsaccess::catalog::ApfsReadBudget> ReadBudget() const override { return budget_; }
+    bool Read(std::uint64_t offset, std::size_t size, std::vector<std::byte>& bytes) const override
+    {
+        bytes.clear();
+        if (!within_deadline_ || !within_deadline_()) return budget_->Refuse("ImageVerificationTimeLimit");
+        if (!budget_->Read(size)) return false;
+        const bool read = lease_.Read(offset, size, bytes) && bytes.size() == size;
+        if (!within_deadline_()) { bytes.clear(); return budget_->Refuse("ImageVerificationTimeLimit"); }
+        return read;
+    }
+private:
+    const VerificationImageLease& lease_;
+    const std::function<bool()>& within_deadline_;
+    std::shared_ptr<apfsaccess::catalog::ApfsReadBudget> budget_;
+};
+
+// The lease remains held across verification, response materialization and the
+// final identity check. Engine-owned store views perform the sole base translation.
+bool BuildObservedImageVerification(const VerificationImageLease& source,
+    apfsaccess::catalog::VerificationScope scope, const std::string& image_path,
+    const std::function<bool()>& within_deadline, std::size_t response_limit,
+    apfsaccess::catalog::VerificationReport& report, std::string& json, apfsaccess::catalog::payload::Reason& failure)
+{
+    using namespace apfsaccess::catalog;
+    json.clear();
+    if (!source.VerifyUnchanged() || scope.source_identity != source.Identity())
+    { failure = payload::Reason::InvalidBinding; return false; }
+    scope.observe_payload_content = !scope.retained_from_xid.has_value();
+    ObservedImageVerificationSource bounded(source, scope, within_deadline);
+    report = ApfsVerifier::VerifyReadOnly(bounded, scope, within_deadline);
+    const bool serialized = scope.retained_from_xid
+        ? SerializeProtectedHistoryVerificationReport(report, image_path, within_deadline, response_limit, json, failure)
+        : SerializeImageVerificationReport(report, image_path, within_deadline, response_limit, json, failure);
+    if (!serialized) return false;
+    if (!source.VerifyUnchanged())
+    { json.clear(); failure = payload::Reason::InvalidBinding; return false; }
+    return true;
+}
+#endif
+
+#include "ObserverProfileVerification.h"
 
 int ObserveVerification(const ObserverOptions& options)
 {
@@ -1210,15 +1449,163 @@ int ObserveVerification(const ObserverOptions& options)
         ExactDecimal(options.volume_oid, "--volume-oid"), ExactDecimal(options.checkpoint_xid, "--checkpoint-xid")};
     scope.require_whole_volume = options.require_whole_volume;
     scope.require_payload_content_hashes = options.require_payload_content_hashes;
-    const auto report = ApfsVerifier::Verify(source, scope);
-    if (!source.VerifyUnchanged()) Fail("verification image identity changed during lease");
-    const auto json = VerificationJson(report, options.image);
-    if (options.out_path.empty()) std::cout << json << "\n";
+    scope.account_retained_ownership = options.account_retained_ownership;
+    if (options.mode == "verify-history")
+        scope.retained_from_xid = ExactDecimal(options.retained_from_xid, "--retained-from-xid");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    const auto within_deadline = [deadline] { return std::chrono::steady_clock::now() < deadline; };
+    VerificationReport report;
+    std::string json;
+    payload::Reason failure;
+    try {
+        if (!BuildObservedImageVerification(source, scope, options.image, within_deadline,
+                MaxImageVerificationJsonBytes, report, json, failure))
+            Fail("verification response refused: " + std::string(payload::Name(failure)));
+    }
+    catch (const std::length_error&) { Fail("verification report exceeds transport limit"); }
+    catch (const std::bad_alloc&) { Fail("cannot materialize verification report"); }
+    const int semantic_exit_code = report.outcome == VerificationOutcome::Complete ? 0 : report.outcome == VerificationOutcome::Refused ? 4 : 3;
+    if (options.out_path.empty()) return WriteStdoutEvidence(json, semantic_exit_code);
     else PublishEvidence(json, options.out_path, {options.image});
-    return report.outcome == VerificationOutcome::Complete ? 0 : report.outcome == VerificationOutcome::Refused ? 4 : 3;
+    return semantic_exit_code;
 #else
     (void)options;
     Fail("verification requires the Windows stable image lease implementation");
+#endif
+}
+
+// Explicit query only: regular catalog inventory never invokes this census.
+int ObserveSnapshotSpace(const ObserverOptions& options)
+{
+#ifdef _WIN32
+    using namespace apfsaccess::catalog;
+    VerificationImageLease source(options.image);
+    VerificationScope scope;
+    scope.source_identity = source.Identity();
+    scope.exact = {ExactDecimal(options.store_offset_bytes, "--store-offset-bytes", true),
+        ExactDecimal(options.store_size_bytes, "--store-size-bytes"), options.container_uuid,
+        options.volume_uuid, ExactDecimal(options.volume_oid, "--volume-oid"),
+        ExactDecimal(options.checkpoint_xid, "--checkpoint-xid")};
+    std::optional<ApfsSnapshotPayloadSpaceObservation> observation;
+    std::string error;
+    const bool observed = TryObserveAppleSnapshotPayloadSpace(source, scope, observation, error);
+    if (!source.VerifyUnchanged()) Fail("snapshot space input changed during observation");
+
+    JsonWriter json;
+    json.BeginObject();
+    json.Key("format"); json.String("apfs-access-snapshot-payload-space");
+    json.Key("version"); json.Integer(1);
+    json.Key("readOnly"); json.Bool(true);
+    json.Key("status"); json.String(observed ? "observed" : "unknown");
+    json.Key("accountingScope"); json.String("snapshot-payload-only");
+    json.Key("source"); json.BeginObject();
+    json.Key("kind"); json.String("image");
+    json.Key("path"); json.String(options.image);
+    json.Key("identity"); json.String(scope.source_identity);
+    json.EndObject();
+    json.Key("requested"); json.BeginObject();
+    json.Key("containerUuid"); json.String(scope.exact.container_uuid_hex);
+    json.Key("volumeUuid"); json.String(scope.exact.volume_uuid_hex);
+    json.Key("volumeOid"); json.String(options.volume_oid);
+    json.Key("checkpointXid"); json.String(options.checkpoint_xid);
+    json.Key("storeOffsetBytes"); json.String(options.store_offset_bytes);
+    json.Key("storeSizeBytes"); json.String(options.store_size_bytes);
+    json.EndObject();
+    json.Key("allocationUnitBytes");
+    if (observation) json.Integer(observation->allocation_unit_bytes); else json.Null();
+    json.Key("snapshotCount");
+    if (observation) json.String(std::to_string(observation->snapshot_count)); else json.Null();
+    json.Key("snapshotPayloadReferenced");
+    if (observation) WriteAmount(json, observation->referenced_payload); else json.Null();
+    json.Key("snapshotPayloadSharedWithLive");
+    if (observation) WriteAmount(json, observation->shared_with_live_payload); else json.Null();
+    json.Key("snapshotPayloadAbsentFromLive");
+    if (observation) WriteAmount(json, observation->absent_from_live_payload); else json.Null();
+    // Payload reachability supplies no authority for any of these totals.
+    json.Key("snapshot"); json.Null();
+    json.Key("purgeable"); json.Null();
+    json.Key("reclaimable"); json.Null();
+    json.Key("reason"); if (observed) json.Null(); else json.String(error);
+    json.EndObject();
+    const int semantic_exit = observed ? 0 : 3;
+    if (options.out_path.empty()) return WriteStdoutEvidence(json.Text(), semantic_exit);
+    PublishEvidence(json.Text(), options.out_path, {options.image});
+    return semantic_exit;
+#else
+    (void)options;
+    Fail("snapshot space observation requires the Windows stable image lease implementation");
+#endif
+}
+
+int ObserveSnapshotAttribution(const ObserverOptions& options, bool marked_references = false, bool marked_owners = false)
+{
+#ifdef _WIN32
+    using namespace apfsaccess::catalog;
+    VerificationImageLease source(options.image);
+    VerificationScope scope;
+    scope.source_identity = source.Identity();
+    scope.exact = {ExactDecimal(options.store_offset_bytes, "--store-offset-bytes", true),
+        ExactDecimal(options.store_size_bytes, "--store-size-bytes"), options.container_uuid,
+        options.volume_uuid, ExactDecimal(options.volume_oid, "--volume-oid"),
+        ExactDecimal(options.checkpoint_xid, "--checkpoint-xid")};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    const auto within_deadline = [deadline] { return std::chrono::steady_clock::now() < deadline; };
+    std::optional<ApfsSnapshotSpaceAttribution> observation;
+    std::optional<ApfsMarkedReferenceSpaceObservation> marked;
+    std::optional<ApfsMarkedOwnerSpaceAttribution> owners;
+    const auto from = options.retained_from_xid.empty() ? std::optional<std::uint64_t>{} :
+        std::optional<std::uint64_t>{ExactDecimal(options.retained_from_xid, "--retained-from-xid")};
+    std::string error, text;
+    payload::Reason failure;
+    const bool observed = marked_owners ?
+        TryAttributeAppleMarkedOwnerSpaceReadOnly(source, scope, from, owners, error, within_deadline) : marked_references ?
+        TryObserveAppleMarkedReferenceSpaceReadOnly(source, scope, marked, error, within_deadline) :
+        TryAttributeAppleSnapshotSpaceReadOnly(source, scope, observation, error, within_deadline);
+    if (observed)
+    {
+        const bool encoded = marked_owners ?
+            SerializeMarkedOwnerSpaceAttribution(owners, scope, from, options.image, within_deadline,
+                MaxSnapshotSpaceAttributionJsonBytes, text, failure) : marked_references ?
+            SerializeMarkedReferenceSpace(marked, scope, options.image, within_deadline,
+                MaxSnapshotSpaceAttributionJsonBytes, text, failure) :
+            SerializeSnapshotSpaceAttribution(observation, scope, options.image, within_deadline,
+                MaxSnapshotSpaceAttributionJsonBytes, text, failure);
+        if (!encoded)
+            Fail("snapshot attribution response refused: " + std::string(payload::Name(failure)));
+    }
+    else
+    {
+        JsonWriter json;
+        json.BeginObject();
+        json.Key("format"); json.String(marked_owners ? "apfs-access-marked-owner-space-attribution" : marked_references ? "apfs-access-marked-reference-space" : "apfs-access-snapshot-space-attribution");
+        json.Key("version"); json.Integer(marked_owners ? 1 : marked_references ? MarkedReferenceSpaceVersion : SnapshotSpaceAttributionVersion);
+        json.Key("readOnly"); json.Bool(true);
+        json.Key("complete"); json.Bool(false);
+        if (marked_owners) { json.Key("fromXid"); if (from) json.String(options.retained_from_xid); else json.Null(); }
+        json.Key("source"); json.BeginObject();
+        json.Key("path"); json.String(options.image);
+        json.Key("identity"); json.String(scope.source_identity);
+        json.EndObject();
+        json.Key("scope"); json.BeginObject();
+        json.Key("containerUuid"); json.String(options.container_uuid);
+        json.Key("volumeUuid"); json.String(options.volume_uuid);
+        json.Key("volumeOid"); json.String(options.volume_oid);
+        json.Key("checkpointXid"); json.String(options.checkpoint_xid);
+        json.Key("storeOffsetBytes"); json.String(options.store_offset_bytes);
+        json.Key("storeSizeBytes"); json.String(options.store_size_bytes);
+        json.EndObject();
+        json.Key("reason"); json.String(error.empty() ? "SnapshotAttributionIncomplete" : error);
+        json.EndObject();
+        text = json.Text();
+    }
+    if (!source.VerifyUnchanged()) Fail("snapshot attribution input changed during observation");
+    const int semantic_exit = observed ? 0 : 3;
+    if (options.out_path.empty()) return WriteStdoutEvidence(text, semantic_exit);
+    PublishEvidence(text, options.out_path, {options.image});
+    return semantic_exit;
+#else
+    (void)options;
+    Fail("snapshot attribution requires the Windows stable image lease implementation");
 #endif
 }
 
@@ -1301,7 +1688,7 @@ int ObserveSnapshots(const ObserverOptions& options)
         json.EndObject();
     }
     json.EndArray(); json.EndObject();
-    if (options.out_path.empty()) std::cout << json.Text() << "\n";
+    if (options.out_path.empty()) return WriteStdoutEvidence(json.Text(), 0);
     else PublishEvidence(json.Text(), options.out_path, {options.image});
     return 0;
 }
@@ -1328,7 +1715,13 @@ std::string DefaultDeviceId(const std::string& path, const std::string& fallback
 
 } // namespace
 
+// Existing consumer tests include this file with main renamed. Keep that
+// narrow UTF-8 entry for them and for non-Windows builds.
+#if defined(_WIN32) && !defined(main)
+int ObserverUtf8Main(int argc, char** argv)
+#else
 int main(int argc, char** argv)
+#endif
 {
     if (argc <= 1)
     {
@@ -1336,8 +1729,15 @@ int main(int argc, char** argv)
     }
     const ObserverOptions options = ParseOptions(argc, argv);
     ValidateOptions(options);
+    if (options.mode == "verify-profile") return ObserveCurrentProfile(options);
+    if (options.mode == "verify-profile-history") return ObserveCurrentProfile(options, true);
+    if (options.mode == "verify-profile-snapshots") return ObserveCurrentProfile(options, false, true);
+    if (options.mode == "snapshot-space") return ObserveSnapshotSpace(options);
+    if (options.mode == "snapshot-attribution") return ObserveSnapshotAttribution(options);
+    if (options.mode == "marked-reference-space") return ObserveSnapshotAttribution(options, true);
+    if (options.mode == "marked-owner-space") return ObserveSnapshotAttribution(options, false, true);
     if (options.mode == "snapshots") return ObserveSnapshots(options);
-    if (options.mode == "verify") return ObserveVerification(options);
+    if (options.mode == "verify" || options.mode == "verify-history") return ObserveVerification(options);
 
     using apfsaccess::catalog::ApfsContainerCatalog;
     using apfsaccess::catalog::HeldFileSource;
@@ -1517,6 +1917,19 @@ int main(int argc, char** argv)
         PublishEvidence(text, options.out_path, inputs);
         return 0;
     }
-    std::cout << text << "\n";
-    return 0;
+    return WriteStdoutEvidence(text, 0);
 }
+
+#if defined(_WIN32) && !defined(main)
+int wmain(int argc, wchar_t** argv)
+{
+    std::vector<std::string> arguments;
+    arguments.reserve(static_cast<std::size_t>(argc));
+    for (int index = 0; index < argc; ++index) arguments.push_back(ToUtf8(argv[index]));
+    std::vector<char*> utf8_argv;
+    utf8_argv.reserve(arguments.size() + 1);
+    for (auto& argument : arguments) utf8_argv.push_back(argument.data());
+    utf8_argv.push_back(nullptr);
+    return ObserverUtf8Main(argc, utf8_argv.data());
+}
+#endif

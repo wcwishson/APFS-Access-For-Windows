@@ -22,6 +22,12 @@ namespace apfsaccess::catalog
 class ApfsReadBudget final
 {
 public:
+    struct Consumption {
+        std::uint64_t reads = 0, read_bytes = 0, records = 0, record_bytes = 0;
+    };
+    struct RefusedReservation {
+        std::uint64_t count = 0, bytes = 0;
+    };
     ApfsReadBudget(std::uint64_t reads, std::uint64_t read_bytes,
         std::uint64_t records, std::uint64_t record_bytes)
         : reads_left_(reads), read_bytes_left_(read_bytes),
@@ -47,15 +53,21 @@ public:
             return Refuse("ApfsReadBudgetSourceLimit");
         --reads_left_;
         read_bytes_left_ -= bytes;
+        ++consumed_.reads;
+        consumed_.read_bytes += bytes;
         return true;
     }
     [[nodiscard]] bool Materialize(std::uint64_t count, std::uint64_t bytes) noexcept
     {
         if (Failed()) return false;
-        if (count > records_left_ || bytes > record_bytes_left_)
+        if (count > records_left_ || bytes > record_bytes_left_) {
+            refused_ = {count, bytes};
             return Refuse("ApfsReadBudgetRecordLimit");
+        }
         records_left_ -= count;
         record_bytes_left_ -= bytes;
+        consumed_.records += count;
+        consumed_.record_bytes += bytes;
         return true;
     }
     // reason must have static lifetime (all parser reasons are string literals).
@@ -66,9 +78,13 @@ public:
     }
     [[nodiscard]] bool Failed() const noexcept { return failure_ != nullptr; }
     [[nodiscard]] const char* Failure() const noexcept { return failure_ ? failure_ : ""; }
+    [[nodiscard]] Consumption Consumed() const noexcept { return consumed_; }
+    [[nodiscard]] RefusedReservation ReservationFailure() const noexcept { return refused_; }
 private:
     std::uint64_t reads_left_, read_bytes_left_, records_left_, record_bytes_left_;
     const char* failure_ = nullptr;
+    Consumption consumed_;
+    RefusedReservation refused_;
 };
 
 class RandomAccessSource
@@ -166,7 +182,7 @@ class FileRandomAccessSource final : public RandomAccessSource
         , size_bytes_(0)
         , open_(false)
     {
-        std::ifstream probe(path_, std::ios::in | std::ios::binary | std::ios::ate);
+        std::ifstream probe(std::filesystem::u8path(path_), std::ios::in | std::ios::binary | std::ios::ate);
         if (!probe.is_open())
         {
             return;
@@ -208,7 +224,7 @@ class FileRandomAccessSource final : public RandomAccessSource
         {
             return false;
         }
-        std::ifstream stream(path_, std::ios::in | std::ios::binary);
+        std::ifstream stream(std::filesystem::u8path(path_), std::ios::in | std::ios::binary);
         if (!stream.is_open())
         {
             return false;
@@ -251,14 +267,15 @@ public:
         , size_bytes_(0)
         , open_(false)
     {
-        stream_.open(path_, std::ios::in | std::ios::binary);
+        const auto native_path = std::filesystem::u8path(path_);
+        stream_.open(native_path, std::ios::in | std::ios::binary);
         if (!stream_.is_open())
         {
             return;
         }
         std::error_code code;
-        const auto observed_size = std::filesystem::file_size(path_, code);
-        const auto observed_time = std::filesystem::last_write_time(path_, code);
+        const auto observed_size = std::filesystem::file_size(native_path, code);
+        const auto observed_time = std::filesystem::last_write_time(native_path, code);
         if (code)
         {
             stream_.close();
@@ -328,8 +345,9 @@ public:
             return false;
         }
         std::error_code code;
-        const auto current_size = std::filesystem::file_size(path_, code);
-        const auto current_time = std::filesystem::last_write_time(path_, code);
+        const auto native_path = std::filesystem::u8path(path_);
+        const auto current_size = std::filesystem::file_size(native_path, code);
+        const auto current_time = std::filesystem::last_write_time(native_path, code);
         if (code)
         {
             out_detail = "held source cannot be re-stated";

@@ -103,7 +103,7 @@ internal sealed class LegacyTrayOperationAdapter
         {
             var match = matches[0];
             return new LegacyTargetResolution(
-                new ApfsControlTarget(
+                match.Volume.RegisteredImage is {} image ? SelectedControlTarget.ForImage(image) : new ApfsControlTarget(
                     match.Device.DeviceId,
                     match.Volume.VolumeId,
                     match.Volume.RecoveryIdentity),

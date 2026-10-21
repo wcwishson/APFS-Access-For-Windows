@@ -45,12 +45,11 @@ public static class WriteGatePolicy
                 volume.NativeWriteAdmissionBlockReason);
         }
 
-        // A4 single capability enforcement: with a catalog attachment,
-        // format eligibility derives from the capability decision. Any
-        // non-Writable decision blocks here, before (and regardless of) the
-        // pilot allow-lists, incompatibility flags, and the testing override
-        // below. No flag, config, or override path may re-enable it.
-        if (!CatalogMountPolicy.AllowsOrdinaryMount(volume))
+        // Ordinary write permission comes from the catalog. The separate exact
+        // backup-image candidate only requests its stricter native admission;
+        // pilot/source/feature checks and the native graph proof still apply.
+        var backupImage = BackupImageMountPolicy.CanRequest(options, volume);
+        if (!CatalogMountPolicy.AllowsOrdinaryMount(volume) && !backupImage)
         {
             var catalogDetail = volume.CatalogReasons is { Count: > 0 }
                 ? string.Join(", ", volume.CatalogReasons)
@@ -192,16 +191,12 @@ public static class WriteGatePolicy
                 continue;
             }
 
-            var token = entry.Trim();
-            if (string.Equals(token, deviceId, StringComparison.OrdinalIgnoreCase))
+            var token = NormalizeRawDeviceSpelling(entry.Trim());
+            if (string.Equals(token, NormalizeRawDeviceSpelling(deviceId), StringComparison.OrdinalIgnoreCase))
             {
                 return true;
             }
 
-            if (deviceId.Contains(token, StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
         }
 
         return false;
@@ -211,4 +206,7 @@ public static class WriteGatePolicy
         => !string.IsNullOrWhiteSpace(deviceId) &&
            (deviceId.StartsWith(@"\\.\PhysicalDrive", StringComparison.OrdinalIgnoreCase) ||
             deviceId.StartsWith(@"\\?\PhysicalDrive", StringComparison.OrdinalIgnoreCase));
+
+    private static string NormalizeRawDeviceSpelling(string deviceId)
+        => deviceId.StartsWith(@"\\?\", StringComparison.Ordinal) ? @"\\.\" + deviceId[4..] : deviceId;
 }

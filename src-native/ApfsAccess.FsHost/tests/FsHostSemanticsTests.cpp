@@ -41,6 +41,7 @@ void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 
 #define APFSACCESS_FSHOST_UNIT_TEST 1
 #include "../src/main.cpp"
+#include "../src/NativeSparseRangeProtocol.h"
 #ifdef APFSACCESS_HAS_RW_ENGINE
 #include "ApfsExtendedRecordCodec.h"
 #include "ApfsTransactionWriter.h"
@@ -2004,6 +2005,8 @@ bool TestSetDeleteToggleClearsDeletePending()
     }
 
     const auto after = g_normalize_path_call_count_for_test;
+    std::fprintf(stderr, "[INFO] setdelete normalize before=%llu after=%llu\n",
+        (unsigned long long)before, (unsigned long long)after);
     if (!Require(
             after == before + 3,
             "SetDelete toggle should normalize only the three incoming callback paths"))
@@ -14286,7 +14289,10 @@ bool TestDiagnosticWatchdogDuringTeardownOwnerTransfer()
             "Real watchdog writer should emit captured callback fields during owner transfer");
         ok &= Require(json.find("\"operations\":[{\"thread\":123,\"kind\":7,"
                 "\"waitingForGuard\":false,\"startedTickMs\":101,\"acquiredTickMs\":102,"
-                "\"callback\":\"owner-transfer-operation\"}]") != std::string::npos,
+                "\"callback\":\"owner-transfer-operation\",\"requestId\":0,"
+                "\"volumeObjectId\":0,\"grantedAccess\":0,\"createOptions\":0,"
+                "\"root\":false,\"desiredAccess\":0,\"requestorPid\":0,\"guardBypassed\":false,"
+                "\"stage\":\"\",\"stageStartedTickMs\":0}]") != std::string::npos,
             "Real watchdog writer should emit the captured operation fields during owner transfer");
         ok &= Require(!contexts[0] && result.task->context.get() == original_context &&
                 WaitForSingleObject(result.task->worker_thread, 0) == WAIT_TIMEOUT &&
@@ -17130,8 +17136,10 @@ bool TestPostStagePayloadSpoolFailureCannotExitShutdownCleanly()
 
     MountContext context{};
     OpenContext open_context{};
+    HANDLE spool_blocker = INVALID_HANDLE_VALUE;
     ScopeExit cleanup{[&]()
     {
+        if (spool_blocker != INVALID_HANDLE_VALUE) CloseHandle(spool_blocker);
         if (open_context.file != INVALID_HANDLE_VALUE)
         {
             CloseHandle(open_context.file);
@@ -17247,17 +17255,8 @@ bool TestPostStagePayloadSpoolFailureCannotExitShutdownCleanly()
     file->open_handle_count = 1;
     file->write_handle_count = 1;
 
-    const auto blocked_spool_root = run_root / "spool-root-is-a-file";
-    {
-        std::ofstream blocker(blocked_spool_root, std::ios::binary | std::ios::trunc);
-        blocker << "not-a-directory";
-        if (!Require(
-                blocker.good(),
-                "Post-stage spool failure test should create its blocked spool root"))
-        {
-            return false;
-        }
-    }
+    const auto blocked_spool_root = run_root / "payload-spool";
+    std::filesystem::create_directories(blocked_spool_root);
     context.payload_spool_volume_identity = "post-stage-spool-failure-volume";
     context.payload_spool = std::make_unique<apfsaccess::rw::PayloadSpool>(
         apfsaccess::rw::PayloadSpool::Options{
@@ -17269,6 +17268,15 @@ bool TestPostStagePayloadSpoolFailureCannotExitShutdownCleanly()
         std::make_unique<apfsaccess::rw::TransactionManager>(L"DeferredContent");
     context.tx_manager->SetVolumeIdentity(L"post-stage-spool-failure-volume");
     context.tx_manager->SetJournalPath((run_root / "write-ahead.wal").wstring());
+
+    // Admit a valid empty spool, then deny only its actual append handle.
+    // A malformed root now correctly refuses before native metadata staging.
+    spool_blocker = CreateFileW((blocked_spool_root / "payload-spool.bin").c_str(),
+        GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (!Require(spool_blocker != INVALID_HANDLE_VALUE &&
+            context.payload_spool->CheckAppendCapacityFast(4) ==
+                apfsaccess::rw::PayloadSpool::AppendStatus::Succeeded,
+            "Post-stage spool failure admits capacity before the real append sharing denial")) return false;
 
     auto fs = BuildFileSystem(&context);
     FSP_FSCTL_FILE_INFO info{};
@@ -20997,7 +21005,56 @@ bool RequireContentTimestampRecord(const apfsaccess::rw::WriteAheadLog::Record& 
 }
 #endif
 
-bool TestPersistentWindowsSecurity(bool manifest, bool create_fault = false, int refusal = 0)
+bool TestWindowsIntegrityLabelEncoding()
+{
+    for (const auto* level : {L"LW", L"ME", L"HI", L"SI", L"S-1-16-0", L"S-1-16-8448", L"S-1-16-8202", L"S-1-16-20480"})
+    {
+        const auto sddl = std::wstring(L"O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FR;;;WD)S:(ML;OICI;NW;;;") + level + L")";
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        if (!Require(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1,
+                &descriptor, nullptr), "valid inherited integrity label builds through Windows")) return false;
+        ScopeExit release{[&] { LocalFree(descriptor); }};
+        const auto size = GetSecurityDescriptorLength(descriptor);
+        const std::span<const std::byte> raw(static_cast<const std::byte*>(descriptor), size);
+        std::vector<std::byte> encoded;
+        if (!Require(!HasNoWindowsAuditEntries(descriptor) && ValidBoundedWindowsSecurity(raw) &&
+                EncodeWindowsSecurity(descriptor, encoded) == STATUS_SUCCESS && encoded.size() == size + 4 &&
+                std::equal(raw.begin(), raw.end(), encoded.begin() + 4),
+                "nonempty integrity SACL is accepted and preserved byte for byte")) return false;
+        for (unsigned invalid = 0; invalid < 4; ++invalid)
+        {
+            std::vector<std::byte> changed(raw.begin(), raw.end());
+            BOOL present = FALSE, defaulted = FALSE; PACL sacl = nullptr; void* entry = nullptr;
+            if (!Require(GetSecurityDescriptorSacl(changed.data(), &present, &sacl, &defaulted) && present && sacl &&
+                    GetAce(sacl, 0, &entry), "negative label control locates its bounded ACE")) return false;
+            auto* ace = static_cast<SYSTEM_MANDATORY_LABEL_ACE*>(entry);
+            if (invalid == 0) ace->Mask |= 8;
+            else if (invalid == 1) ace->Header.AceFlags |= SUCCESSFUL_ACCESS_ACE_FLAG;
+            else if (invalid == 2) GetSidIdentifierAuthority(&ace->SidStart)->Value[5] = 5;
+            else *GetSidSubAuthority(&ace->SidStart, 0) = 0x1234;
+            const auto previous = encoded;
+            if (!Require(!NT_SUCCESS(EncodeWindowsSecurity(changed.data(), encoded)) && encoded == previous,
+                    "unknown integrity mask, audit flag, SID authority or RID refuses without replacing payload")) return false;
+        }
+    }
+    for (const auto* sddl : {
+        L"O:BAG:BAD:(A;;FA;;;WD)S:(AU;SAFA;FA;;;WD)",
+        L"O:BAG:BAD:(A;;FA;;;WD)S:(ML;;NW;;;LW)(AU;SAFA;FA;;;WD)",
+        L"O:BAG:BAD:(A;;FA;;;WD)S:(ML;;NW;;;LW)(ML;;NW;;;ME)"})
+    {
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        if (!Require(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1,
+                &descriptor, nullptr), "valid unsupported SACL control builds")) return false;
+        ScopeExit release{[&] { LocalFree(descriptor); }};
+        std::vector<std::byte> encoded;
+        if (!Require(EncodeWindowsSecurity(descriptor, encoded) == STATUS_NOT_SUPPORTED && encoded.empty(),
+                "audit, mixed audit/label and duplicate labels remain unsupported")) return false;
+    }
+    return true;
+}
+
+bool TestPersistentWindowsSecurity(bool manifest, bool create_fault = false, int refusal = 0, bool powershell_request = false,
+    bool integrity_label = false, bool compressed_copy = false, bool chunked_flush = false)
 {
 #ifdef APFSACCESS_HAS_RW_ENGINE
     using namespace apfsaccess::rw;
@@ -21014,6 +21071,8 @@ bool TestPersistentWindowsSecurity(bool manifest, bool create_fault = false, int
         ScopeExit cleanup{[&] { std::filesystem::remove_all(root, ec); }};
         apfsaccess::testfixture::BuilderStore builder;
         builder.authoritative_checkpoint = true;
+        if (compressed_copy) builder.block_count = 1024;
+        if (chunked_flush) builder.block_count = 16384;
         auto& records = builder.volumes[0].filesystem_records;
         apfsaccess::catalog::BtreeRecord encoded;
         std::string error;
@@ -21112,15 +21171,131 @@ bool TestPersistentWindowsSecurity(bool manifest, bool create_fault = false, int
         if (!Require(context.api.SetSecurityDescriptor && context.api.DeleteSecurityDescriptor, "both security helper exports resolve")) return false;
         PSECURITY_DESCRIPTOR requested = nullptr;
         if (!Require(ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                L"O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FR;;;WD)", SDDL_REVISION_1, &requested, nullptr),
+                integrity_label ? L"O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FR;;;WD)S:(ML;OICI;NW;;;LW)" :
+                    L"O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FR;;;WD)", SDDL_REVISION_1, &requested, nullptr),
                 "explicit restricted Windows descriptor builds")) return false;
         ScopeExit free_requested{[&] { LocalFree(requested); }};
         auto fs = BuildFileSystem(&context);
         PVOID opened = nullptr, reader = nullptr, child = nullptr;
         ScopeExit close{[&] { if (child) CB_Close(&fs, child); if (reader) CB_Close(&fs, reader); if (opened) CB_Close(&fs, opened); }};
         FSP_FSCTL_FILE_INFO info{};
+        if (compressed_copy || chunked_flush)
+        {
+            const auto before_create = ReadFileBytes(image), before_wal = ReadFileBytes(root / "accepted.wal");
+            if (!Require(CB_Create(&fs, const_cast<PWSTR>(L"\\unsupported-encryption"), FILE_NON_DIRECTORY_FILE,
+                    FILE_WRITE_DATA, FILE_ATTRIBUTE_ENCRYPTED | FILE_ATTRIBUTE_COMPRESSED, requested, 0,
+                    &child, &info) == STATUS_NOT_SUPPORTED && !child &&
+                    !FindNode(&context, L"\\unsupported-encryption") && store.PendingMutationCount() == 0 &&
+                    ReadFileBytes(image) == before_create && ReadFileBytes(root / "accepted.wal") == before_wal,
+                    "compressed source hint cannot enable unsupported encryption or accept partial creation")) return false;
+            constexpr UINT32 retained_attributes = FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_HIDDEN;
+            if (!Require(CB_Create(&fs, const_cast<PWSTR>(L"\\from-ntfs"), FILE_NON_DIRECTORY_FILE,
+                    FILE_WRITE_DATA | FILE_READ_DATA | FILE_READ_ATTRIBUTES | DELETE,
+                    retained_attributes | FILE_ATTRIBUTE_COMPRESSED, requested, 0, &child, &info) == STATUS_SUCCESS && child,
+                    "CopyFile source compression hint creates an ordinary writable destination")) return false;
+            if (!Require((info.FileAttributes & FILE_ATTRIBUTE_COMPRESSED) == 0 &&
+                    (info.FileAttributes & retained_attributes) == retained_attributes,
+                    "destination retains ordinary attributes without advertising NTFS compression")) return false;
+            auto payload = BuildPatternPayloadForTest(chunked_flush ? 4194304 : 65536, 0x63);
+            ULONG written = 0;
+            const auto write_chunks = [&](const std::vector<std::byte>& bytes, const char* stage) {
+                const auto begin = std::chrono::steady_clock::now();
+                for (std::size_t offset = 0; offset < bytes.size(); offset += 65536)
+                {
+                    const auto count = static_cast<ULONG>((std::min)(std::size_t{65536}, bytes.size() - offset));
+                    if (!Require(CB_Write(&fs, child, const_cast<std::byte*>(bytes.data()) + offset, offset,
+                            count, FALSE, FALSE, &written, &info) == STATUS_SUCCESS && written == count,
+                            "copy callback chunk is fully accepted")) return false;
+                }
+                if (chunked_flush) std::cerr << "[FLUSH-STAGE] " << stage << " writes-ms=" <<
+                    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count() << '\n';
+                const auto flush_begin = std::chrono::steady_clock::now();
+                const auto status = CB_Flush(&fs, child, &info);
+                if (chunked_flush)
+                {
+                    std::cerr << "[FLUSH-STAGE] " << stage << " flush-ms=" <<
+                        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - flush_begin).count()
+                        << " status=" << status << '\n';
+                    LatencyTrace::Snapshot trace;
+                    if (context.latency_trace.Capture(trace)) { LatencyTrace::Write(std::cerr, trace); std::cerr << '\n'; }
+                }
+                return status == STATUS_SUCCESS;
+            };
+            if (!Require(write_chunks(payload, "initial"),
+                    "copied ordinary payload reaches durable APFS storage")) return false;
+            CB_Close(&fs, child); child = nullptr;
+            MetadataStore fresh(volume);
+            if (!Require(fresh.PrepareNativeWritePath(), "compressed-source destination reopens through a fresh raw store")) return false;
+            const auto created = fresh.LookupCommittedInodeByPath(L"\\from-ntfs");
+            std::vector<std::byte> observed;
+            if (!Require(created && !created->is_directory && (created->bsd_flags & kAppleBsdCompressedFlag) == 0 &&
+                    !fresh.LookupCommittedExtendedAttribute(created->object_id, "com.apple.decmpfs") &&
+                    fresh.ReadCommittedFileRange(L"\\from-ntfs", 0, payload.size(), observed) && observed == payload,
+                    "fresh raw destination has exact payload bytes without an APFS compression transform")) return false;
+            const auto attributes = fresh.LookupCommittedExtendedAttribute(created->object_id, kWindowsAttributesName);
+            const auto security = fresh.LookupCommittedExtendedAttribute(created->object_id, kWindowsSecurityName);
+            const auto expected_attributes = EncodeWindowsAttributes(retained_attributes);
+            std::vector<std::byte> expected_security;
+            if (!Require(EncodeWindowsSecurity(requested, expected_security) == STATUS_SUCCESS &&
+                    attributes && attributes->data.size() == expected_attributes.size() &&
+                    std::equal(attributes->data.begin(), attributes->data.end(), expected_attributes.begin()) &&
+                    security && security->data == expected_security && context.native_write_enabled && !context.write_degraded,
+                    "ordinary metadata and security survive the source-compression hint without degrading the mount")) return false;
+            if (chunked_flush)
+            {
+                if (!Require(CB_Open(&fs, const_cast<PWSTR>(L"\\from-ntfs"), FILE_NON_DIRECTORY_FILE | (FILE_OPEN << 24),
+                        FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES, &child, &info) == STATUS_SUCCESS && child,
+                        "committed destination opens for a longer seed")) return false;
+                payload.assign(4198400, std::byte{0xa7});
+                if (!Require(CB_SetFileSize(&fs, child, payload.size(), FALSE, &info) == STATUS_SUCCESS &&
+                        write_chunks(payload, "seed"), "longer seed chunks and durable Flush complete")) return false;
+                CB_Close(&fs, child); child = nullptr;
+                MetadataStore seeded(volume);
+                std::vector<std::byte> actual;
+                if (!Require(seeded.PrepareNativeWritePath() &&
+                        seeded.ReadCommittedFileRange(L"\\from-ntfs", 0, payload.size() + 1, actual) && actual == payload,
+                        "fresh raw store proves all 65 seed chunks and exact EOF")) return false;
+                const auto marks = context.tx_manager->Watermarks();
+                const auto spool = context.payload_spool->SnapshotCounters();
+                return Require(marks.accepted_sequence == marks.apfs_durable_sequence &&
+                    marks.apfs_durable_sequence == marks.cleanup_sequence && spool.dirty_range_count == 0 &&
+                    !spool.index_dirty && !spool.recovery_required && context.native_write_enabled && !context.write_degraded,
+                    "durable seed has aligned accepted/durable/cleaned watermarks and clean spool");
+            }
+            for (const bool replace : {false, true})
+            {
+                if (!Require(CB_Open(&fs, const_cast<PWSTR>(L"\\from-ntfs"), FILE_NON_DIRECTORY_FILE | (FILE_OPEN << 24),
+                        FILE_READ_DATA | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES | DELETE,
+                        &child, &info) == STATUS_SUCCESS && child, "existing copy destination opens for replacement")) return false;
+                const auto raw_before = ReadFileBytes(image), wal_before = ReadFileBytes(root / "accepted.wal");
+                if (!Require(CB_Overwrite(&fs, child, FILE_ATTRIBUTE_ENCRYPTED | FILE_ATTRIBUTE_COMPRESSED, replace, 0, &info) ==
+                        STATUS_NOT_SUPPORTED && ReadFileBytes(image) == raw_before &&
+                        ReadFileBytes(root / "accepted.wal") == wal_before && store.PendingMutationCount() == 0,
+                        "source compression hint cannot authorize encrypted overwrite or truncate the destination")) return false;
+                if (!Require(CB_Overwrite(&fs, child, FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_COMPRESSED, replace, 0, &info) == STATUS_SUCCESS,
+                        "CopyFile overwrite also ignores only the NTFS source-compression hint")) return false;
+                auto replacement = BuildPatternPayloadForTest(replace ? 12347 : 32768, replace ? 0x79 : 0x78);
+                if (!Require(CB_Write(&fs, child, replacement.data(), 0, static_cast<ULONG>(replacement.size()), FALSE, FALSE,
+                        &written, &info) == STATUS_SUCCESS && written == replacement.size() &&
+                        CB_Flush(&fs, child, &info) == STATUS_SUCCESS, "shorter replacement reaches durable storage")) return false;
+                CB_Close(&fs, child); child = nullptr;
+                MetadataStore replaced(volume);
+                std::vector<std::byte> actual;
+                if (!Require(replaced.PrepareNativeWritePath() &&
+                        replaced.ReadCommittedFileRange(L"\\from-ntfs", 0, replacement.size() + 1, actual) && actual == replacement,
+                        "fresh raw replacement has exact bytes and no stale tail")) return false;
+                const auto inode = replaced.LookupCommittedInodeByPath(L"\\from-ntfs");
+                const auto stored = inode ? replaced.LookupCommittedExtendedAttribute(inode->object_id, kWindowsAttributesName) : std::nullopt;
+                const auto expected = EncodeWindowsAttributes(replace ? FILE_ATTRIBUTE_ARCHIVE : retained_attributes);
+                if (!Require(inode && (inode->bsd_flags & kAppleBsdCompressedFlag) == 0 &&
+                        !replaced.LookupCommittedExtendedAttribute(inode->object_id, "com.apple.decmpfs") && stored &&
+                        stored->data.size() == expected.size() && std::equal(stored->data.begin(), stored->data.end(), expected.begin()),
+                        "overwrite merge and replacement preserve ordinary attribute semantics without compression")) return false;
+            }
+            return true;
+        }
         if (!Require(CB_Open(&fs, const_cast<PWSTR>(L"\\secure"), FILE_NON_DIRECTORY_FILE | (FILE_OPEN << 24),
-                READ_CONTROL | WRITE_DAC | WRITE_OWNER | ((refusal == 1 || refusal == 3) ? 0 : FILE_WRITE_DATA) | DELETE, &opened, &info) == STATUS_SUCCESS && opened &&
+                READ_CONTROL | WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY | ((refusal == 1 || refusal == 3) ? 0 : FILE_WRITE_DATA) | DELETE, &opened, &info) == STATUS_SUCCESS && opened &&
                 CB_Open(&fs, const_cast<PWSTR>(L"\\alias"), FILE_NON_DIRECTORY_FILE | (FILE_OPEN << 24),
                 READ_CONTROL | FILE_WRITE_ATTRIBUTES | DELETE, &reader, &info) == STATUS_SUCCESS && reader,
                 "security callbacks open handles with distinct granted rights")) return false;
@@ -21136,7 +21311,47 @@ bool TestPersistentWindowsSecurity(bool manifest, bool create_fault = false, int
         if (!query(opened, initial) || !Require(initial.size() == default_size &&
                 std::memcmp(initial.data(), context.sd, default_size) == 0,
                 "mode-zero imported Mac file retains easy Windows access by default")) return false;
+        PSECURITY_DESCRIPTOR powershell_descriptor = nullptr;
+        ScopeExit free_powershell_descriptor{[&] { if (powershell_descriptor) context.api.DeleteSecurityDescriptor(
+            powershell_descriptor, reinterpret_cast<NTSTATUS (*)()>(context.api.SetSecurityDescriptor)); }};
+        if (powershell_request && !Require(context.api.SetSecurityDescriptor(context.sd,
+                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION, requested,
+                &powershell_descriptor) == STATUS_SUCCESS,
+                "PowerShell descriptor changes only its DACL and keeps queried owner/group")) return false;
+        const auto modification = powershell_request ? powershell_descriptor : requested;
         const auto before = ReadFileBytes(image), wal_before = ReadFileBytes(root / "accepted.wal");
+        if (powershell_request)
+        {
+            PSECURITY_DESCRIPTOR audited = nullptr;
+            if (!Require(ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    L"D:(A;;FA;;;WD)S:(AU;SAFA;FA;;;WD)", SDDL_REVISION_1, &audited, nullptr),
+                    "existing audit descriptor builds")) return false;
+            ScopeExit free_audited{[&] { LocalFree(audited); }};
+            auto* node = static_cast<OpenContext*>(opened)->node.get();
+            const auto original = VisibleNativeSecurity(*node);
+            auto stored = std::make_shared<NativeInodeSecurity>(*original);
+            stored->windows_security_flags = kAppleXattrDataEmbedded;
+            stored->windows_security = std::vector<std::byte>{std::byte{'W'}, std::byte{'S'}, std::byte{'D'}, std::byte{1}};
+            const auto* audit_bytes = static_cast<const std::byte*>(audited);
+            stored->windows_security->insert(stored->windows_security->end(), audit_bytes,
+                audit_bytes + GetSecurityDescriptorLength(audited));
+            SetVisibleNativeSecurityLocked(static_cast<OpenContext*>(opened)->node, stored, node->security_generation, true);
+            const auto refused = CB_SetSecurity(&fs, opened,
+                DACL_SECURITY_INFORMATION | SACL_SECURITY_INFORMATION | UNPROTECTED_SACL_SECURITY_INFORMATION, requested);
+            const auto after_refusal = VisibleNativeSecurity(*node);
+            SetVisibleNativeSecurityLocked(static_cast<OpenContext*>(opened)->node, original, node->security_generation, true);
+            if (!Require(refused == STATUS_NOT_SUPPORTED && after_refusal == stored && store.PendingMutationCount() == 0 &&
+                    ReadFileBytes(image) == before && ReadFileBytes(root / "accepted.wal") == wal_before,
+                    "empty SACL cannot erase an existing unsupported audit entry or accept a mutation")) return false;
+            auto* access = static_cast<OpenContext*>(reader);
+            const auto granted = access->granted_access;
+            access->granted_access = WRITE_DAC | WRITE_OWNER | READ_CONTROL;
+            const auto unauthorized = CB_SetSecurity(&fs, reader, SACL_SECURITY_INFORMATION, requested);
+            access->granted_access = granted;
+            if (!Require(unauthorized == STATUS_ACCESS_DENIED && ReadFileBytes(image) == before &&
+                    ReadFileBytes(root / "accepted.wal") == wal_before,
+                    "empty audit roundtrip still requires ACCESS_SYSTEM_SECURITY")) return false;
+        }
         if (refusal)
         {
             NTSTATUS rejected = STATUS_SUCCESS;
@@ -21157,6 +21372,8 @@ bool TestPersistentWindowsSecurity(bool manifest, bool create_fault = false, int
                         "audit refusal premise is a valid bounded nonempty SACL")) return false;
                 rejected = CB_Create(&fs, const_cast<PWSTR>(L"\\audit-unsupported"), FILE_DIRECTORY_FILE,
                     FILE_READ_ATTRIBUTES, FILE_ATTRIBUTE_DIRECTORY, audited, 0, &child, &info);
+                if (!Require(CB_SetSecurity(&fs, opened, SACL_SECURITY_INFORMATION, audited) == STATUS_NOT_SUPPORTED,
+                        "real audit entries refuse SetSecurity before WAL or image mutation")) return false;
             }
             if (!Require(rejected == STATUS_NOT_SUPPORTED && !child && !FindNode(&context, L"\\audit-unsupported") &&
                     store.PendingMutationCount() == 0 && context.native_write_enabled && !context.write_degraded && !context.recovery_active &&
@@ -21212,9 +21429,18 @@ bool TestPersistentWindowsSecurity(bool manifest, bool create_fault = false, int
             fault_reached = true; return false;
         });
         ScopeExit clear_hook{[&] { store.SetCommitStageHook({}); }};
+        const SECURITY_INFORMATION security_information = powershell_request ?
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION |
+                SACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION | UNPROTECTED_SACL_SECURITY_INFORMATION :
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
         const auto status = create_fault ? CB_Create(&fs, const_cast<PWSTR>(L"\\recovery-child"), FILE_DIRECTORY_FILE,
             FILE_READ_ATTRIBUTES, FILE_ATTRIBUTE_DIRECTORY, requested, 0, &child, &info) :
-            CB_SetSecurity(&fs, opened, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, requested);
+            CB_SetSecurity(&fs, opened, security_information, modification);
+        if (fault.empty() && status != STATUS_SUCCESS)
+        {
+            std::wcerr << L"[FAIL] Security update status " << FormatNtStatus(status) << L'\n';
+            return false;
+        }
         if (!Require(captured.size() == 1 && captured[0].mutations.size() == (create_fault ? 3 : 1),
                 "security publication accepts exactly its complete operation batch")) return false;
         const auto security_record = std::find_if(captured[0].mutations.begin(), captured[0].mutations.end(), [](const auto& record) {
@@ -21280,7 +21506,7 @@ bool TestPersistentWindowsSecurity(bool manifest, bool create_fault = false, int
         if (!Require(CB_GetSecurityByName(&fs, const_cast<PWSTR>(L"\\alias:metadata"), nullptr, by_name.data(), &size) == STATUS_SUCCESS &&
                 by_name == std::vector<std::byte>(expected.begin() + 4, expected.end()), "named-stream security query uses its base inode")) return false;
         const auto unchanged = ReadFileBytes(image), unchanged_wal = ReadFileBytes(root / "accepted.wal");
-        if (!Require(CB_SetSecurity(&fs, opened, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, requested) == STATUS_SUCCESS &&
+        if (!Require(CB_SetSecurity(&fs, opened, security_information, modification) == STATUS_SUCCESS &&
                 ReadFileBytes(image) == unchanged && ReadFileBytes(root / "accepted.wal") == unchanged_wal,
                 "identical authorized security update performs no disk or WAL write")) return false;
         if (!Require(CB_SetSecurity(&fs, opened, GROUP_SECURITY_INFORMATION, requested) == STATUS_SUCCESS,
@@ -21306,6 +21532,38 @@ bool TestPersistentWindowsSecurity(bool manifest, bool create_fault = false, int
         if (!Require(persisted && persisted->data.size() == child_security.size() + 4 &&
                 std::equal(child_security.begin(), child_security.end(), persisted->data.begin() + 4),
                 "fresh image contains the created inode and its Windows permissions together")) return false;
+        if (integrity_label)
+        {
+            BOOL present = FALSE, defaulted = FALSE; PACL label = nullptr;
+            if (!Require(GetSecurityDescriptorSacl(child_security.data(), &present, &label, &defaulted) && present && label,
+                    "created directory exposes its integrity label")) return false;
+            const auto* begin = reinterpret_cast<const std::byte*>(label);
+            const std::vector<std::byte> original_label(begin, begin + label->AclSize);
+            PVOID label_writer = nullptr;
+            if (!Require(CB_Open(&fs, const_cast<PWSTR>(L"\\child"), FILE_DIRECTORY_FILE | (FILE_OPEN << 24),
+                    READ_CONTROL | WRITE_DAC | ACCESS_SYSTEM_SECURITY, &label_writer, &info) == STATUS_SUCCESS && label_writer,
+                    "labelled directory opens with explicit security update rights")) return false;
+            ScopeExit close_label_writer{[&] { CB_Close(&fs, label_writer); }};
+            if (!Require(CB_SetSecurity(&fs, label_writer, DACL_SECURITY_INFORMATION | SACL_SECURITY_INFORMATION,
+                    context.sd) == STATUS_SUCCESS,
+                    "ordinary DACL plus empty audit update preserves a known integrity label")) return false;
+            std::vector<std::byte> observed;
+            if (!query(label_writer, observed) || !Require(GetSecurityDescriptorSacl(observed.data(), &present, &label, &defaulted) &&
+                    present && label && label->AclSize == original_label.size() &&
+                    std::memcmp(label, original_label.data(), original_label.size()) == 0,
+                    "permission update retains every integrity ACE byte")) return false;
+            const auto before_refusal = ReadFileBytes(image), wal_before_refusal = ReadFileBytes(root / "accepted.wal");
+            if (!Require(CB_SetSecurity(&fs, label_writer, LABEL_SECURITY_INFORMATION, requested) == STATUS_NOT_SUPPORTED &&
+                    CB_SetSecurity(&fs, label_writer, PROTECTED_SACL_SECURITY_INFORMATION, context.sd) == STATUS_NOT_SUPPORTED &&
+                    ReadFileBytes(image) == before_refusal && ReadFileBytes(root / "accepted.wal") == wal_before_refusal,
+                    "unsupported label or protection changes refuse without a false success or mutation")) return false;
+            MetadataStore reopened(volume);
+            if (!Require(reopened.PrepareNativeWritePath(), "labelled security fresh store prepares")) return false;
+            const auto stored = reopened.LookupCommittedExtendedAttribute(created->object_id, kWindowsSecurityName);
+            if (!Require(stored && stored->data.size() == observed.size() + 4 &&
+                    std::equal(observed.begin(), observed.end(), stored->data.begin() + 4),
+                    "fresh raw metadata preserves the label after an ordinary permission update")) return false;
+        }
         if (!Require(CB_Rename(&fs, opened, const_cast<PWSTR>(L"\\secure"), const_cast<PWSTR>(L"\\renamed"), FALSE) == STATUS_SUCCESS &&
                 CB_SetSecurity(&fs, opened, DACL_SECURITY_INFORMATION, context.sd) == STATUS_SUCCESS,
                 "security update follows the same inode after rename")) return false;
@@ -21920,6 +22178,19 @@ bool TestNativeOverwritePreservesAliasIdentity(
     using namespace apfsaccess::rw;
     using Store = MetadataStore;
     bool ok = true;
+    // Manifest assertions below assume inline publication of payload writes.
+    // Manifest write batching is default-on in unit-test builds and would
+    // defer publication past the assertion windows, so disable it for
+    // manifest variants here. Native variants are unaffected (the toggle only
+    // gates manifest write paths), and dedicated deferred-batch coverage
+    // lives in TestManifestCallbacksBindWalIdentityBeforeCanonicalPublication.
+    ScopeExit restore_manifest_writeback{[&]() {
+        SetEnvironmentVariableW(L"APFSACCESS_DISABLE_CONTENT_WRITEBACK", nullptr);
+    }};
+    if (manifest)
+    {
+        SetEnvironmentVariableW(L"APFSACCESS_DISABLE_CONTENT_WRITEBACK", L"1");
+    }
     std::size_t completed_access = 0;
     for (const bool supersede : {false, true}) for (const std::string_view fail_stage :
         {"", "before-apple-publish", "after-apple-publish"})
@@ -25102,11 +25373,17 @@ bool TestExternalAttributeRemovalAcceptedRecovery(bool unlink = false)
         if (shared)
         {
             attribute.object_id = 2; attribute.name_utf8 = "user.shared";
+            fixture::PutU64LE(attribute.data, 0, 778);
             if (!Require(rw::EncodeAppleXattrRecord(attribute, encoded, error), "shared recovery attribute encodes")) return false;
             volume.filesystem_records.push_back(encoded);
         }
-        if (!Require(rw::EncodeAppleDataStreamIdRecord({777, shared ? 2u : 1u}, encoded, error), "external recovery reference encodes")) return false;
+        if (!Require(rw::EncodeAppleDataStreamIdRecord({777, 1}, encoded, error), "external recovery reference encodes")) return false;
         volume.filesystem_records.push_back(encoded);
+        if (shared)
+        {
+            if (!Require(rw::EncodeAppleDataStreamIdRecord({778, 1}, encoded, error), "shared recovery reference encodes")) return false;
+            volume.filesystem_records.push_back(encoded);
+        }
         std::vector<std::byte> expected(empty ? 0 : 5000);
         if (!empty)
         {
@@ -25115,7 +25392,12 @@ bool TestExternalAttributeRemovalAcceptedRecovery(bool unlink = false)
                 const std::uint64_t block = n == 0 ? 52 : 55;
                 if (!Require(rw::EncodeAppleFileExtentRecord({777, n * 4096ULL, 4096, block, 0, 4096}, encoded, error), "recovery fragmented extent encodes")) return false;
                 volume.filesystem_records.push_back(encoded);
-                if (!Require(rw::EncodeApplePhysicalExtentRecord({block, 1, rw::kApplePhysicalExtentKindNew, 777, 1}, encoded, error), "recovery physical extent encodes")) return false;
+                if (shared)
+                {
+                    if (!Require(rw::EncodeAppleFileExtentRecord({778, n * 4096ULL, 4096, block, 0, 4096}, encoded, error), "shared fragmented extent encodes")) return false;
+                    volume.filesystem_records.push_back(encoded);
+                }
+                if (!Require(rw::EncodeApplePhysicalExtentRecord({block, 1, rw::kApplePhysicalExtentKindNew, 17, shared ? 2 : 1}, encoded, error), "recovery physical extent encodes")) return false;
                 volume.extentref_records.push_back(encoded);
                 std::vector<std::byte> payload(4096);
                 for (std::size_t i = 0; i < payload.size(); ++i)
@@ -25126,6 +25408,40 @@ bool TestExternalAttributeRemovalAcceptedRecovery(bool unlink = false)
                 builder.authoritative_seeded_main_blocks.push_back({block, std::move(payload)});
             }
         }
+        std::vector<rw::ApplePhysicalExtentRecord> proved_physical;
+        if (!empty && !shared)
+        {
+            auto wrong_owner = volume.extentref_records;
+            for (auto& record : wrong_owner)
+            {
+                rw::ApplePhysicalExtentRecord extent;
+                if (!rw::DecodeApplePhysicalExtentRecord(record, extent, error)) return false;
+                extent.owning_object_id = 777;
+                if (!rw::EncodeApplePhysicalExtentRecord(extent, record, error)) return false;
+            }
+            if (!Require(!rw::ValidateApplePayloadExtentGraph(volume.filesystem_records, wrong_owner,
+                    4096, builder.block_count, proved_physical, error) && error == "AppleVolumePhysicalExtentOwnerMismatch",
+                    "external recovery refuses stream-ID physical owners before accepting work")) return false;
+        }
+        if (shared)
+        {
+            auto crossed = volume.filesystem_records;
+            for (auto& record : crossed)
+            {
+                if ((apfsaccess::catalog::ReadU64LE(record.key, 0).value_or(0) >> 60) != 4) continue;
+                rw::AppleXattrRecord attribute;
+                if (!rw::ApfsExtendedRecordCodec::DecodeXattr(record, attribute, error)) return false;
+                if (attribute.object_id != 2) continue;
+                fixture::PutU64LE(attribute.data, 0, 777);
+                if (!rw::EncodeAppleXattrRecord(attribute, record, error)) return false;
+            }
+            if (!Require(!rw::ValidateApplePayloadExtentGraph(crossed, volume.extentref_records,
+                    4096, builder.block_count, proved_physical, error) && error == "AppleVolumeAttributeOwnerAmbiguous",
+                    "external recovery refuses one external stream crossing inode headers")) return false;
+        }
+        if (!Require(rw::ValidateApplePayloadExtentGraph(volume.filesystem_records, volume.extentref_records,
+                4096, builder.block_count, proved_physical, error),
+                "external recovery source proves canonical header owners and shared physical references")) return false;
         if (!Require(rw::SortAppleBtreeRecords(volume.filesystem_records, rw::AppleBtreeKeyOrder::FileSystemCaseSensitive, error) &&
                 WriteFileBytes(image, fixture::BuildStoreImage(builder)), "external recovery fixture writes")) return false;
         Store::VolumeContext config;
@@ -25262,7 +25578,8 @@ bool TestExternalAttributeRemovalAcceptedRecovery(bool unlink = false)
                     const auto key = apfsaccess::catalog::ReadU64LE(record.key, 0).value_or(0);
                     const auto oid = key & 0x0fffffffffffffffULL;
                     if (!Require(oid != 17, "unlink recovery leaves no orphaned inode/xattr/main-stream record")) return false;
-                    if (oid != 777) continue;
+                    if (!Require(oid != 777, "unlink recovery retires the removed external stream")) return false;
+                    if (oid != 778) continue;
                     if ((key >> 60) == 6)
                     {
                         rw::AppleDataStreamIdRecord reference;
@@ -25284,7 +25601,7 @@ bool TestExternalAttributeRemovalAcceptedRecovery(bool unlink = false)
                     rw::ApplePhysicalExtentRecord extent;
                     if (!Require(rw::DecodeApplePhysicalExtentRecord(record, extent, error) && extent.owning_object_id != 17,
                             "unlink recovery main-file physical ownership is released")) return false;
-                    if (extent.owning_object_id == 777) attribute_blocks += extent.block_count;
+                    if (extent.owning_object_id == 2) attribute_blocks += extent.block_count;
                 }
                 if (!Require(attribute_blocks == (shared && !empty ? 2u : 0u),
                         "unlink recovery external physical ownership equals surviving owners")) return false;
@@ -28837,6 +29154,12 @@ bool TestCommitTimeoutBudgetScalesWithPendingPayload()
             "Deadline arithmetic saturates instead of wrapping")) return false;
     const auto empty_budget = ComputeWriteCommitTimeoutBudgetSeconds(15, 0);
     if (!Require(empty_budget == 15, "Commit timeout budget should preserve configured timeout for metadata-only commits"))
+    {
+        return false;
+    }
+
+    const auto bulk_delete_budget = ComputeWriteCommitTimeoutBudgetSeconds(15, 0, 5000);
+    if (!Require(bulk_delete_budget == 45, "Commit timeout budget should adaptively scale for high mutation counts like bulk deletes"))
     {
         return false;
     }
@@ -37032,6 +37355,8 @@ bool TestRecoveryRootOverrideSurvivesTempChange()
            Require(second == stable_root, "Recovery-root path should remain stable when TEMP changes");
 }
 
+#include "ShellDriveNotificationTests.h"
+
 bool TestBuildWinFspMountPointUsesGlobalDriveForExplorer()
 {
     if (!Require(BuildWinFspMountPoint(L"E:") == L"\\\\.\\E:", "Drive-letter mounts should use Mount Manager syntax"))
@@ -37288,6 +37613,151 @@ bool TestCallbacksRoundTripCaseSensitiveApfsNames()
                "Case-sensitive callback delete must remove the remaining case variant") &&
            Require(context.nodes.size() == 1 && root->children.empty(),
                "Case-sensitive create/rename/delete round trip must leave only the root");
+}
+
+bool TestCallbacksRespectApfsNamePolicyAndDirectoryMarkers()
+{
+    for (const auto flags : {0ULL, 0x8ULL, 0x1ULL, 0x9ULL})
+    {
+        MountContext context{};
+        context.overlay_write_enabled = true;
+        context.args.incompatible_features = flags;
+        context.session_root = std::filesystem::temp_directory_path() /
+            (L"apfs-name-policy-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(flags));
+        context.cache_root = context.session_root / L"hydrate";
+        std::filesystem::create_directories(context.cache_root);
+        ScopeExit remove_fixture{[&]() {
+            std::error_code ignored;
+            std::filesystem::remove_all(context.session_root, ignored);
+        }};
+        std::array<std::byte, 16> security{};
+        SeedSecurity(context, security);
+        auto root = std::make_shared<Node>();
+        SetNodePath(&context, *root, L"\\");
+        root->hydration_key = root->path_key;
+        root->is_directory = true;
+        root->node_kind = NodeKind::Directory;
+        root->loaded = true;
+        root->timestamp = UtcNow();
+        context.nodes.emplace(root->path_key, root);
+        auto fs = BuildFileSystem(&context);
+        const bool normalized = flags != 0;
+        const bool folded = (flags & apfsaccess::catalog::kIncompatCaseInsensitive) != 0;
+        const auto create = [&](const wchar_t* path)
+        {
+            PVOID opened = nullptr;
+            FSP_FSCTL_FILE_INFO info{};
+            const auto status = CB_Create(&fs, const_cast<PWSTR>(path), FILE_NON_DIRECTORY_FILE,
+                FILE_READ_ATTRIBUTES | DELETE, 0, nullptr, 0, &opened, &info);
+            if (opened) CB_Close(&fs, opened);
+            return status;
+        };
+        const auto open = [&](const std::wstring& path, std::shared_ptr<Node>* node = nullptr)
+        {
+            PVOID opened = nullptr;
+            FSP_FSCTL_FILE_INFO info{};
+            const auto status = CB_Open(&fs, const_cast<PWSTR>(path.c_str()), FILE_NON_DIRECTORY_FILE,
+                FILE_READ_ATTRIBUTES | DELETE, &opened, &info);
+            if (opened)
+            {
+                if (node) *node = static_cast<OpenContext*>(opened)->node;
+                CB_Close(&fs, opened);
+            }
+            return status;
+        };
+        if (!Require(create(L"\\accent-\u00e9.txt") == STATUS_SUCCESS,
+                "Name policy callbacks must create the composed spelling") ||
+            !Require(open(L"\\accent-e\u0301.txt") ==
+                (normalized ? STATUS_SUCCESS : STATUS_OBJECT_NAME_NOT_FOUND),
+                "Alternate open must follow the volume normalization policy") ||
+            !Require(create(L"\\accent-e\u0301.txt") ==
+                (normalized ? STATUS_OBJECT_NAME_COLLISION : STATUS_SUCCESS),
+                "Canonical duplicate creation must follow the volume normalization policy") ||
+            !Require(create(L"\\Case.txt") == STATUS_SUCCESS,
+                "Name policy callbacks must create the uppercase spelling") ||
+            !Require(create(L"\\case.txt") ==
+                (folded ? STATUS_OBJECT_NAME_COLLISION : STATUS_SUCCESS),
+                "Case-sensitive callbacks must preserve the lowercase sibling")) return false;
+
+        std::shared_ptr<Node> composed, decomposed, upper, lower;
+        if (!Require(open(L"\\accent-\u00e9.txt", &composed) == STATUS_SUCCESS &&
+                open(L"\\accent-e\u0301.txt", &decomposed) == STATUS_SUCCESS &&
+                (composed == decomposed) == normalized,
+                "Cached node identity must follow canonical equivalence only when enabled") ||
+            !Require((HydrationPath(&context, *composed) == HydrationPath(&context, *decomposed)) == normalized,
+                "Hydration cache identity must follow the volume normalization policy") ||
+            !Require(open(L"\\Case.txt", &upper) == STATUS_SUCCESS &&
+                open(L"\\case.txt", &lower) == STATUS_SUCCESS && (upper == lower) == folded,
+                "Cached node identity must retain case-sensitive siblings") ||
+            !Require((HydrationPath(&context, *upper) == HydrationPath(&context, *lower)) == folded,
+                "Hydration cache identity must retain case-sensitive siblings")) return false;
+
+        std::vector<std::wstring> names;
+        static std::vector<std::wstring>* captured = nullptr;
+        captured = &names;
+        ScopeExit clear_capture{[]() { captured = nullptr; }};
+        context.api.AddDir = [](FSP_FSCTL_DIR_INFO* info, PVOID, ULONG, PULONG done) -> BOOLEAN
+        {
+            if (info && captured)
+            {
+                captured->emplace_back(info->FileNameBuf,
+                    (info->Size - FIELD_OFFSET(FSP_FSCTL_DIR_INFO, FileNameBuf)) / sizeof(WCHAR));
+                if (done) *done += info->Size;
+            }
+            return TRUE;
+        };
+        const auto enumerate = [&](const wchar_t* marker)
+        {
+            names.clear();
+            OpenContext opened{};
+            opened.node = root;
+            opened.allow_list_directory = true;
+            std::array<std::byte, 4096> buffer{};
+            ULONG done = 0;
+            return CB_ReadDirectory(&fs, &opened, nullptr, const_cast<PWSTR>(marker),
+                buffer.data(), static_cast<ULONG>(buffer.size()), &done);
+        };
+        if (!Require(enumerate(nullptr) == STATUS_SUCCESS &&
+                names.size() == (normalized ? 1u : 2u) + (folded ? 1u : 2u),
+                "Directory enumeration must preserve all policy-distinct entries")) return false;
+        for (const auto& name : names)
+            if (!Require(open(L"\\" + name) == STATUS_SUCCESS,
+                    "Every enumerated spelling must open with the same volume policy")) return false;
+
+        PVOID renamed = nullptr;
+        FSP_FSCTL_FILE_INFO info{};
+        if (!Require(CB_Open(&fs, const_cast<PWSTR>(L"\\accent-e\u0301.txt"), FILE_NON_DIRECTORY_FILE,
+                DELETE, &renamed, &info) == STATUS_SUCCESS && renamed,
+                "Rename source must resolve with the same volume policy")) return false;
+        const auto rename_status = CB_Rename(&fs, renamed, const_cast<PWSTR>(L"\\accent-e\u0301.txt"),
+            const_cast<PWSTR>(L"\\renamed-\u00e9.txt"), FALSE);
+        CB_Close(&fs, renamed);
+        if (!Require(rename_status == STATUS_SUCCESS,
+                "Unicode rename must accept a source addressed by the volume name policy") ||
+            !Require(open(L"\\accent-e\u0301.txt") == STATUS_OBJECT_NAME_NOT_FOUND &&
+                (open(L"\\accent-\u00e9.txt") == STATUS_SUCCESS) == !normalized,
+                "Rename must remove its source and preserve an exact-policy canonical sibling") ||
+            !Require(open(L"\\Case.txt", &composed) == STATUS_SUCCESS && composed == upper &&
+                open(L"\\case.txt", &decomposed) == STATUS_SUCCESS && decomposed == lower,
+                "Unicode rename must leave case-distinct cached siblings intact") ||
+            !Require((open(L"\\renamed-e\u0301.txt") == STATUS_SUCCESS) == normalized,
+                "Rename target lookup must follow the volume normalization policy") ||
+            !Require(create(L"\\z-tail.txt") == STATUS_SUCCESS,
+                "Marker fixture must retain a later entry") ||
+            !Require(enumerate(L"renamed-e\u0301.txt") == STATUS_SUCCESS,
+                "Directory enumeration must resume using a Unicode marker")) return false;
+        const std::vector<std::wstring> expected = normalized
+            ? std::vector<std::wstring>{L"z-tail.txt"}
+            : std::vector<std::wstring>{L"renamed-\u00e9.txt", L"z-tail.txt"};
+        if (!Require(names == expected,
+                "Resume markers must skip only entries equal under the volume name policy") ||
+            !Require(enumerate(L"CASE.txt") == STATUS_SUCCESS,
+                "Directory enumeration must resume using a case marker")) return false;
+        for (const auto& name : names)
+            if (!Require(ChildNameKey(*root, name) > ChildNameKey(*root, L"CASE.txt"),
+                    "Case resume markers must skip every policy-equivalent spelling")) return false;
+    }
+    return true;
 }
 
 bool TestNamedStreamCopyCompatibility()
@@ -38226,7 +38696,10 @@ bool TestLegacyNamedStreamArtifactsAreHidden()
         buffer.data(),
         static_cast<ULONG>(buffer.size()),
         &transferred);
-    if (!Require(read_status == STATUS_SUCCESS, "Directory enumeration should succeed when legacy stream artifacts are present"))
+    // Empty-or-fully-hidden listings terminate with STATUS_NO_MORE_FILES (the
+    // EOF convention pinned for empty roots); what matters here is that the
+    // enumeration does not error on the artifact and emits nothing for it.
+    if (!Require(read_status == STATUS_NO_MORE_FILES, "Directory enumeration should succeed when legacy stream artifacts are present"))
     {
         return false;
     }
@@ -39374,6 +39847,111 @@ bool TestRecoveryIdentityStartupPolicyAllowsValidCleanIdentity()
 #endif
 }
 
+bool TestRecoveryIdentityPreflightUsesResolvedMarkerRoot()
+{
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    const auto run_root = std::filesystem::temp_directory_path() /
+        "ApfsAccess" / "fs-host-semantics" / "recovery-preflight-resolved-root";
+    const std::array<const wchar_t*, 4> names{
+        L"APFSACCESS_RECOVERY_ROOT", L"LOCALAPPDATA", L"TEMP", L"TMP"};
+    std::array<std::wstring, 4> saved{};
+    for (std::size_t i = 0; i < names.size(); ++i)
+        saved[i] = ReadEnvironmentPath(names[i]).wstring();
+    const char* old_spool = std::getenv("APFSACCESS_SPOOL_ROOT");
+    const std::string saved_spool = old_spool ? old_spool : "";
+    ScopeExit restore_environment{[&]()
+    {
+        for (std::size_t i = 0; i < names.size(); ++i)
+            SetEnvironmentVariableW(names[i], saved[i].empty() ? nullptr : saved[i].c_str());
+        (void)_putenv_s("APFSACCESS_SPOOL_ROOT", saved_spool.c_str());
+    }};
+    std::error_code ec;
+    std::filesystem::create_directories(run_root / "spool", ec);
+    if (!Require(!ec, "Preflight regression should create its private root") ||
+        !Require(_putenv_s("APFSACCESS_SPOOL_ROOT", (run_root / "spool").string().c_str()) == 0,
+            "Preflight regression should isolate the CRT spool resolver")) return false;
+
+    bool ok = true;
+    for (int mode = 0; mode != 3; ++mode)
+    {
+        const auto base = run_root / std::to_string(mode);
+        const auto temporary = base / "temp";
+        const auto local = base / "local";
+        const auto configured = temporary / "ApfsAccess" / "recovery";
+        const auto expected_root = mode == 0 ? configured : mode == 1
+            ? local / "ApfsAccess" / "Recovery" : temporary / "ApfsAccess" / "recovery";
+        std::filesystem::create_directories(temporary, ec);
+        std::filesystem::create_directories(expected_root, ec);
+        if (!Require(!ec, "Preflight regression should create its marker directory") ||
+            !Require(SetEnvironmentVariableW(L"APFSACCESS_RECOVERY_ROOT",
+                mode == 0 ? configured.c_str() : nullptr) != 0,
+                "Preflight regression should select the configured-root branch") ||
+            !Require(SetEnvironmentVariableW(L"LOCALAPPDATA", mode == 1 ? local.c_str() : nullptr) != 0,
+                "Preflight regression should select the LocalAppData branch") ||
+            !Require(SetEnvironmentVariableW(L"TEMP", temporary.c_str()) != 0 &&
+                SetEnvironmentVariableW(L"TMP", temporary.c_str()) != 0,
+                "Preflight regression should isolate the temporary-root branch") ||
+            !Require(ResolveRecoveryRoot() == expected_root,
+                "Resolver must return the final marker directory")) return false;
+
+        Arguments legacy{};
+        legacy.device = L"\\\\.\\PhysicalDrive2";
+        legacy.volume = L"Main";
+        legacy.write_backend = L"Native";
+        const auto legacy_marker = BuildLegacyRecoveryMarkerPath(legacy, expected_root);
+        for (int scenario = 0; scenario != 6; ++scenario)
+        {
+            MountContext context{};
+            context.args = legacy;
+            context.args.device = L"\\\\.\\PhysicalDrive9";
+            context.args.readwrite = true;
+            context.args.enable_raw_snapshots = true;
+            context.args.recovery_identity = scenario == 4 ? L"" : scenario == 5
+                ? L"apfs-recovery-v1-invalid" : kRecoveryIdentityA;
+            context.native_write_enabled = true;
+            const auto stable_marker = scenario < 4
+                ? BuildRecoveryMarkerPath(context.args) : legacy_marker;
+            if (!Require(stable_marker.parent_path() == expected_root,
+                "Marker writer and preflight must share the resolved directory")) return false;
+            const auto marker = scenario == 3 ? stable_marker : legacy_marker;
+            const std::string contents = scenario == 2 ? "dirty=0\ndirty=1\nlastCommitXid=17\n"
+                : scenario == 0 || scenario == 3 ? "dirty=1\nlastCommitXid=17\n"
+                : "dirty=0\nlastCommitXid=17\n";
+            {
+                std::ofstream output(marker, std::ios::binary | std::ios::trunc);
+                output << contents;
+                if (!Require(output.good(), "Preflight regression should persist marker evidence")) return false;
+            }
+            PreflightRecoveryIdentityStartup(context);
+            const bool blocked = scenario == 0 || scenario == 2 || scenario >= 4;
+            std::cout << "Recovery preflight root=" << mode << " scenario=" << scenario
+                << " blocked=" << context.recovery_identity_blocked.load() << '\n';
+            ok &= Require(context.recovery_identity_blocked == blocked &&
+                context.write_degraded == blocked && context.recovery_active == blocked &&
+                context.native_write_enabled == !blocked,
+                "Preflight must find ambiguous legacy evidence in the writer's exact root");
+            if (blocked)
+            {
+                const auto reason = scenario == 4 ? L"ImmutableRecoveryIdentityMissing" : scenario == 5
+                    ? L"ImmutableRecoveryIdentityInvalid" : L"LegacyRecoveryEvidenceAmbiguous";
+                ok &= Require(context.runtime_recovery_reason == reason &&
+                    context.pending_native_writes == (scenario < 4),
+                    "Preflight must preserve canonical identity and pending-evidence distinctions");
+            }
+            std::ifstream input(marker, std::ios::binary);
+            const std::string after{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+            ok &= Require(after == contents, "Startup inspection must preserve marker bytes");
+            input.close();
+            std::filesystem::remove(marker, ec);
+            if (!Require(!ec, "Preflight regression should retire only its own marker")) return false;
+        }
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
 bool TestRecoveryIdentityBlockCannotBeClearedByMetadataReplay()
 {
 #ifdef APFSACCESS_HAS_RW_ENGINE
@@ -40001,10 +40579,34 @@ bool TestLegacyCleanWalDoesNotBlockStableIdentity()
         renumbered,
         spool_base,
         marker_root);
+    const auto wal_path = legacy_root / "write-ahead.wal";
+    const auto clean_bytes = ReadFileBytes(wal_path);
+    renumbered.enable_raw_snapshots = true;
+    bool ok = Require(!ambiguous.has_value(),
+        "Ordinary clean legacy WAL still permits immutable identity migration") &&
+        Require(LegacySpoolRootHasAmbiguousEvidence(legacy_root, renumbered) &&
+            ReadFileBytes(wal_path) == clean_bytes,
+            "Raw profile preserves and refuses matching legacy history without migrating it");
+    {
+        std::ofstream tail(wal_path, std::ios::binary | std::ios::app);
+        tail.write("torn", 4);
+        ok &= Require(tail.good(), "Inject actual torn legacy journal suffix");
+    }
+    const auto orphan = legacy_root / "write-ahead.wal.compact.999";
+    {
+        std::ofstream output(orphan, std::ios::binary);
+        output << "retained-orphan";
+        ok &= Require(output.good(), "Retain actual legacy compaction orphan");
+    }
+    const auto torn_bytes = ReadFileBytes(wal_path), orphan_bytes = ReadFileBytes(orphan);
+    for (unsigned attempt = 0; attempt != 2; ++attempt)
+    {
+        ok &= Require(LegacySpoolRootHasAmbiguousEvidence(legacy_root, renumbered) &&
+            ReadFileBytes(wal_path) == torn_bytes && ReadFileBytes(orphan) == orphan_bytes,
+            "Repeated raw legacy inspection preserves torn tail and compaction evidence");
+    }
     std::filesystem::remove_all(run_root, ec);
-    return Require(
-        !ambiguous.has_value(),
-        "Clean legacy WAL should not block immutable recovery identity migration");
+    return ok;
 #else
     return true;
 #endif
@@ -40191,8 +40793,9 @@ bool TestMetadataOnlyRootDoesNotWaitOnCommit()
         UINT32 attributes = 0;
         SIZE_T size = security.size();
         std::array<std::byte, 16> descriptor{};
-        if (CB_GetSecurityByName(&fs, const_cast<PWSTR>(L"\\"), &attributes,
-                descriptor.data(), &size) != STATUS_SUCCESS) return false;
+        const auto security_status = CB_GetSecurityByName(&fs, const_cast<PWSTR>(L"\\"), &attributes,
+                descriptor.data(), &size);
+        if (security_status != STATUS_SUCCESS) return false;
         PVOID opened = nullptr;
         FSP_FSCTL_FILE_INFO info{};
         step = "open";
@@ -40216,7 +40819,10 @@ bool TestMetadataOnlyRootDoesNotWaitOnCommit()
         step = "directory-cleanup-close";
         CB_Cleanup(&fs, opened, nullptr, 0);
         CB_Close(&fs, opened);
-        return listing == STATUS_SUCCESS;
+        // An empty root listing terminates with STATUS_NO_MORE_FILES (the EOF
+        // convention pinned for empty roots); responsiveness (no commit-mutex
+        // wait) is already proven above by the 200ms bound.
+        return listing == STATUS_NO_MORE_FILES;
     });
     const bool responsive = result.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready;
     if (!responsive) std::cerr << "[INFO] root query blocked at " << step.load() << '\n';
@@ -40963,6 +41569,126 @@ Arguments ManifestSessionArgs(
 
 #include "NativeVolumeSpaceTests.h"
 
+bool TestVerificationPayloadCoalescing()
+{
+    using namespace apfsaccess::catalog;
+    using Store = apfsaccess::rw::MetadataStore;
+    namespace payload = apfsaccess::catalog::payload;
+    struct Source final : RandomAccessSource
+    {
+        std::vector<std::byte> bytes = std::vector<std::byte>(5 * payload::ChunkBytes);
+        mutable std::vector<std::pair<std::uint64_t, std::size_t>> reads;
+        std::function<void()> after_read;
+        std::size_t fail_read = 0;
+        Source() { for (std::size_t i = 0; i < bytes.size(); ++i) bytes[i] = std::byte(i % 251); }
+        std::uint64_t SizeBytes() const override { return bytes.size(); }
+        bool Read(std::uint64_t offset, std::size_t size, std::vector<std::byte>& out) const override
+        {
+            out.clear();
+            reads.emplace_back(offset, size);
+            if (reads.size() == fail_read || offset > bytes.size() || size > bytes.size() - offset) return false;
+            out.assign(bytes.begin() + offset, bytes.begin() + offset + size);
+            if (after_read) after_read();
+            return true;
+        }
+    };
+    const auto projection = [](unsigned mode) {
+        apfsaccess::rw::NativeApfsVolumeProjection p;
+        p.volume_object_id = 101; p.checkpoint_xid = 20;
+        p.block_size = 4096; p.total_blocks = 5 * payload::ChunkBytes / p.block_size;
+        Store::InodeRecord inode;
+        inode.object_id = 30; inode.private_id = 30;
+        inode.node_type = Store::NodeType::RegularFile; inode.mode = 0100644;
+        inode.logical_size = 2 * payload::ChunkBytes + 137;
+        std::vector<Store::FileExtent> extents;
+        for (std::uint64_t at = 0; at < 3 * payload::ChunkBytes; at += 4096)
+            extents.push_back({at, 4096 + at + (mode == 1 && at >= payload::ChunkBytes ? 4096 : 0), 4096});
+        if (mode == 2) {
+            for (auto& e : extents) if (e.logical_offset >= payload::ChunkBytes) e.logical_offset += 8192;
+            extents.insert(extents.begin() + payload::ChunkBytes / 4096, {payload::ChunkBytes, 0, 8192});
+            inode.logical_size += 8192;
+        }
+        if (mode == 3) {
+            inode.logical_size = 0;
+            apfsaccess::rw::AppleXattrRecord attr;
+            attr.object_id = 30; attr.name_utf8 = "user.coalesced";
+            attr.flags = apfsaccess::rw::kAppleXattrDataStream;
+            attr.data.resize(apfsaccess::rw::kAppleXattrDataStreamBytes);
+            const auto put = [&](std::size_t at, std::uint64_t value) {
+                for (unsigned b = 0; b < 8; ++b) attr.data[at + b] = std::byte((value >> (8 * b)) & 255);
+            };
+            put(0, 40); put(8, 2 * payload::ChunkBytes + 137); put(16, 3 * payload::ChunkBytes);
+            p.extended_attributes_by_inode[30].emplace(attr.name_utf8, attr);
+            p.attribute_stream_extents.emplace(40, std::make_shared<const std::vector<Store::FileExtent>>(extents));
+        } else p.read_extents_by_inode.emplace(30, std::move(extents));
+        p.inodes.push_back(inode);
+        return p;
+    };
+    const auto allowance = [](std::uint64_t reads = 65536, std::uint64_t bytes = 268435456) {
+        return std::make_shared<ApfsReadBudget>(reads, bytes, 1000000, 268435456);
+    };
+    // Digests independently calculated with .NET SHA256 over the intended bytes.
+    const std::array<const char*, 4> hashes{
+        "085207ec76c6419484643713295ff5a75337a6ed7539bac1bb72df06c0072df6",
+        "bebd99284260e7711472e3a9c2aaa0b761e75290545813a5ed989b1f9137564b",
+        "7fb6250b2e81b9d08688296e64e7aeead83e19372f580907d638a51395362e85",
+        "085207ec76c6419484643713295ff5a75337a6ed7539bac1bb72df06c0072df6"};
+    for (unsigned mode = 0; mode < hashes.size(); ++mode) {
+        const auto p = projection(mode);
+        Source source;
+        auto budget = allowance();
+        const auto result = payload::ObserveCurrentPayload({p, source, {0, source.SizeBytes()}, budget, [] { return true; }});
+        if (!Require(result.exactComplete() && result.entries.back().observedSha256 == hashes[mode] &&
+                !result.wholeVolumeVerified && !result.payloadContentHashesVerified,
+                "coalesced payload preserves independent hashes, holes, xattrs and EOF clipping")) return false;
+        const auto second = 4096 + payload::ChunkBytes + (mode == 1 ? 4096 : 0);
+        const std::vector<std::pair<std::uint64_t, std::size_t>> expected{
+            {4096, payload::ChunkBytes}, {second, payload::ChunkBytes}, {second + payload::ChunkBytes, 137}};
+        if (!Require(source.reads == expected && budget->Consumed().reads == 3 &&
+                budget->Consumed().read_bytes == 2 * payload::ChunkBytes + 137,
+                "adjacent 4 KiB descriptors use three capped reads, no gap/hole/padding I/O")) return false;
+    }
+    for (unsigned failure = 0; failure < 5; ++failure) {
+        const auto p = projection(0);
+        Source source;
+        auto budget = allowance(failure == 1 ? 1 : 65536,
+            failure == 2 ? payload::ChunkBytes : 268435456);
+        bool alive = failure != 4;
+        if (failure == 0) source.fail_read = 2;
+        if (failure == 3) source.after_read = [&] { alive = false; };
+        const auto deadline = [&] { return alive; };
+        const auto result = payload::ObserveCurrentPayload({p, source, {0, source.SizeBytes()}, budget, deadline});
+        if (!Require(!result.exactComplete() && !result.readComplete && !result.hashesObserved &&
+                (result.entries.empty() || !result.entries.front().observedSha256),
+                "read, allowance or deadline failure never publishes a completed digest")) return false;
+        if (failure == 0) {
+            if (!Require(source.reads.size() == 2 && result.failedSourceOffset == 4096 + payload::ChunkBytes &&
+                    result.logicalBytesRead == payload::ChunkBytes,
+                    "failed coalesced read keeps exact failure offset and only the hashed prefix")) return false;
+        } else {
+            const auto count = source.reads.size();
+            const auto retry = payload::ObserveCurrentPayload({p, source, {0, source.SizeBytes()}, budget, deadline});
+            if (!Require(budget->Failed() && !retry.exactComplete() && source.reads.size() == count &&
+                    count == (failure == 4 ? 0u : 1u), "expired or exhausted allowance stays sticky without more I/O")) return false;
+        }
+    }
+    {
+        auto p = projection(0);
+        p.inodes.front().bsd_flags = apfsaccess::rw::kAppleBsdCompressedFlag;
+        Source source;
+        const auto result = payload::ObserveCurrentPayload({p, source, {0, source.SizeBytes()}, allowance(), [] { return true; }});
+        if (!Require(!result.exactComplete() && source.reads.empty() &&
+                result.reason == payload::Reason::UnsupportedRepresentation,
+                "compression remains refused before any coalesced payload read")) return false;
+        p.inodes.front().bsd_flags = 0;
+        p.read_extents_by_inode[30][1].logical_offset += 1;
+        const auto invalid = payload::ObserveCurrentPayload({p, source, {0, source.SizeBytes()}, allowance(), [] { return true; }});
+        if (!Require(!invalid.exactComplete() && source.reads.empty() && invalid.reason == payload::Reason::InvalidProjection,
+                "coalescing never repairs a gap or overlap in the admitted descriptor sequence")) return false;
+    }
+    return true;
+}
+
 bool TestManifestArgsValidation()
 {
     bool ok = true;
@@ -41070,6 +41796,71 @@ bool TestManifestArgsValidation()
         raw.insert(raw.end(), {L"--readonly"});
         rejects(raw, "manifest: readonly+readwrite fails closed");
     }
+    {
+        auto raw = ManifestBaseArgv();
+        raw.insert(raw.end(), {L"--write-backend", L"Native", L"--allow-raw-physical-write", L"--enable-raw-snapshots"});
+        raw.insert(raw.end(), {L"--raw-snapshot-qualified-bus", L"7", L"--raw-snapshot-qualified-vendor", L"FixtureVendor",
+            L"--raw-snapshot-qualified-product", L"FixtureDevice", L"--raw-snapshot-qualified-serial", L"unit-001-serial"});
+        auto argv = ManifestArgv(raw);
+        Arguments parsed{};
+        ok &= Require(ParseArgs(static_cast<int>(argv.size()), argv.data(), parsed) && parsed.enable_raw_snapshots,
+            "raw snapshot: complete canonical manifest launch accepted");
+        const auto qualification = BuildRawSnapshotHardwareQualification(parsed.raw_snapshot_hardware);
+        ok &= Require(qualification.kind == apfsaccess::rw::RawHardwareIdentityKind::QualifiedSerialTuple &&
+            qualification.bus_type == BusTypeUsb && qualification.vendor == "FixtureVendor" &&
+            qualification.product == "FixtureDevice" && qualification.qualified_serial == "unit-001-serial",
+            "raw snapshot: operator hardware qualification survives CLI parsing exactly");
+        for (const auto* missing : {L"--raw-snapshot-qualified-bus", L"--raw-snapshot-qualified-vendor",
+            L"--raw-snapshot-qualified-product", L"--raw-snapshot-qualified-serial"})
+        {
+            auto invalid = raw;
+            const auto first = std::find(invalid.begin(), invalid.end(), missing);
+            invalid.erase(first, first + 2);
+            rejects(invalid, "raw snapshot: incomplete operator qualification refused");
+        }
+        for (const auto* serial : {L"abc", L"UNKNOWN", L"123456789", L" unit-001-serial", L"unit-001-serial\n"})
+        {
+            auto invalid = raw;
+            *(std::find(invalid.begin(), invalid.end(), L"--raw-snapshot-qualified-serial") + 1) = serial;
+            rejects(invalid, "raw snapshot: generic or noncanonical serial refused");
+        }
+        for (const auto* bus : {L"0", L"07", L"15", L"16", L"4294967296"})
+        {
+            auto invalid = raw;
+            *(std::find(invalid.begin(), invalid.end(), L"--raw-snapshot-qualified-bus") + 1) = bus;
+            rejects(invalid, "raw snapshot: unavailable virtual or malformed bus refused");
+        }
+        auto vpd = raw;
+        *(std::find(vpd.begin(), vpd.end(), L"--raw-snapshot-qualified-serial")) = L"--raw-snapshot-qualified-vpd-type";
+        *(std::find(vpd.begin(), vpd.end(), L"--raw-snapshot-qualified-vpd-type") + 1) = L"2";
+        auto vpd_argv = ManifestArgv(vpd);
+        Arguments vpd_parsed{};
+        ok &= Require(ParseArgs(static_cast<int>(vpd_argv.size()), vpd_argv.data(), vpd_parsed) &&
+            BuildRawSnapshotHardwareQualification(vpd_parsed.raw_snapshot_hardware).kind ==
+                apfsaccess::rw::RawHardwareIdentityKind::QualifiedDeviceVpd,
+            "raw snapshot: explicitly qualified device-associated VPD scheme accepted");
+        auto mixed_hardware = raw;
+        mixed_hardware.insert(mixed_hardware.end(), {L"--raw-snapshot-qualified-vpd-type", L"2"});
+        rejects(mixed_hardware, "raw snapshot: two competing hardware schemes refused");
+        auto no_raw = raw;
+        no_raw.erase(std::find(no_raw.begin(), no_raw.end(), L"--enable-raw-snapshots"));
+        rejects(no_raw, "raw snapshot: unused qualification cannot affect an ordinary launch");
+        for (const auto* missing : {L"--allow-raw-physical-write", L"--readwrite"})
+        {
+            auto invalid = raw;
+            invalid.erase(std::remove(invalid.begin(), invalid.end(), missing), invalid.end());
+            rejects(invalid, "raw snapshot: raw write admission and requested writer are required");
+        }
+        for (const auto* conflict : {L"--readonly", L"--enable-image-snapshots", L"--enable-raw-snapshots"})
+        {
+            auto invalid = raw;
+            invalid.push_back(conflict);
+            rejects(invalid, "raw snapshot: mixed image, read-only and duplicate selectors refused");
+        }
+        auto nonnative = raw;
+        *(std::find(nonnative.begin(), nonnative.end(), L"--write-backend") + 1) = L"Overlay";
+        rejects(nonnative, "raw snapshot: overlay backend cannot authorize native snapshots");
+    }
     return ok;
 }
 
@@ -41087,7 +41878,7 @@ bool TestManifestVolumeArgsExpansion()
     alpha.name_utf8 = "Alpha";
     alpha.mount_point = "A:\\mnt\\Alpha";
     alpha.requested_write = true;
-    alpha.recovery_identity = "ident-a";
+    alpha.recovery_identity = WideToUtf8(kRecoveryIdentityA);
     apfsaccess::catalog::ManifestVolumeEntry beta{};
     beta.object_id = 102;
     beta.container_uuid_hex = manifest.container_uuid_hex;
@@ -41126,7 +41917,7 @@ bool TestManifestVolumeArgsExpansion()
             volumes[0].container_id == L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" &&
             volumes[0].mount == L"A:\\mnt\\Alpha" &&
             volumes[0].readwrite && !volumes[0].readonly &&
-            volumes[0].recovery_identity == L"ident-a" &&
+            volumes[0].recovery_identity == kRecoveryIdentityA &&
             volumes[0].status_file.empty(),
         "manifest: writable volume inherits process writability");
     ok &= Require(
@@ -41139,6 +41930,35 @@ bool TestManifestVolumeArgsExpansion()
         BuildManifestVolumeArgs(process_args, manifest, volumes, error) &&
             !volumes[0].readwrite,
         "manifest: read-only process forces every volume read-only");
+    for (const auto malformed : {"ident-a", "snapshot:container:101:7", "apfs-recovery-v1-not-a-sha256-digest"})
+    {
+        manifest.volumes[1].recovery_identity = malformed;
+        ok &= Require(!BuildManifestVolumeArgs(process_args, manifest, volumes, error) &&
+            volumes.empty() && error == L"ManifestRecoveryIdentityInvalid",
+            "manifest: malformed child recovery identity refuses before spool initialization");
+    }
+    process_args.readwrite = true;
+    process_args.readonly = false;
+    process_args.allow_raw_physical_write = true;
+    process_args.enable_raw_snapshots = true;
+    process_args.raw_snapshot_hardware = {BusTypeUsb, 0, L"FixtureVendor", L"FixtureDevice", L"unit-001-serial"};
+    manifest.device_path = "\\\\.\\PhysicalDrive2";
+    manifest.volumes[1].requested_write = true;
+    manifest.volumes[1].recovery_identity = WideToUtf8(kRecoveryIdentityB);
+    ok &= Require(BuildManifestVolumeArgs(process_args, manifest, volumes, error) && volumes.size() == 2 &&
+        std::all_of(volumes.begin(), volumes.end(), [](const auto& v) { return v.enable_raw_snapshots && v.readwrite; }),
+        "raw snapshot: every declared member inherits runtime enrollment");
+    manifest.volumes[1].requested_write = false;
+    ok &= Require(!BuildManifestVolumeArgs(process_args, manifest, volumes, error) && volumes.empty() &&
+        error == L"RawSnapshotRuntimeProfileRequired", "raw snapshot: mixed writer cohort refused before expansion");
+    manifest.volumes[1].requested_write = true;
+    manifest.volumes[1].recovery_identity.clear();
+    ok &= Require(!BuildManifestVolumeArgs(process_args, manifest, volumes, error) && volumes.empty(),
+        "raw snapshot: missing original recovery identity refuses whole cohort");
+    manifest.volumes[1].recovery_identity = WideToUtf8(kRecoveryIdentityB);
+    manifest.device_path = "D:\\dev\\c.img";
+    ok &= Require(!BuildManifestVolumeArgs(process_args, manifest, volumes, error) && volumes.empty(),
+        "raw snapshot: ordinary image cannot impersonate raw manifest source");
     return ok;
 }
 
@@ -41432,8 +42252,17 @@ bool TestExtendedAttributeForegroundJournal(bool manifest, int mismatch = 0, boo
         "four foreground metadata publications never append attribute bytes to the file-range spool");
 }
 
-bool TestManifestCallbacksBindWalIdentityBeforeCanonicalPublication()
+bool TestManifestCallbacksBindWalIdentityBeforeCanonicalPublication(bool deferred_batch = false)
 {
+    std::array<wchar_t, 32> previous_defer{};
+    const auto previous_defer_size = GetEnvironmentVariableW(
+        L"APFSACCESS_DEFER_CLOSE_COMMITS", previous_defer.data(),
+        static_cast<DWORD>(previous_defer.size()));
+    if (deferred_batch) SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", L"1");
+    ScopeExit restore_defer{[&] {
+        if (deferred_batch) SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS",
+            previous_defer_size ? previous_defer.data() : nullptr);
+    }};
     ContainerFixtureFile fixture("callback-wal-identity", true);
     std::string error;
     auto coordinator = OpenContainerFixtureCoordinator(
@@ -41575,7 +42404,7 @@ bool TestManifestCallbacksBindWalIdentityBeforeCanonicalPublication()
         return false;
     }
 
-    const std::array<std::byte, 8> payload{
+    std::array<std::byte, 8> payload{
         std::byte{'A'}, std::byte{'P'}, std::byte{'F'}, std::byte{'S'},
         std::byte{'-'}, std::byte{'R'}, std::byte{'W'}, std::byte{'!'},
     };
@@ -41590,6 +42419,33 @@ bool TestManifestCallbacksBindWalIdentityBeforeCanonicalPublication()
         FALSE,
         &written,
         &info);
+    if (deferred_batch)
+    {
+        const auto before_xid = coordinator->CheckpointXid();
+        const auto accepted = context.tx_manager->Watermarks();
+        if (!Require(accepted.accepted_sequence > accepted.apfs_durable_sequence,
+                "manifest-batch: first callback is WAL accepted before APFS publication")) return false;
+        for (std::size_t index : {std::size_t{0}, std::size_t{7}})
+        {
+            payload[index] = std::byte{'X'};
+            ULONG changed = 0;
+            if (!Require(CB_Write(&fs, open_handle, &payload[index], index, 1,
+                    FALSE, FALSE, &changed, &info) == STATUS_SUCCESS && changed == 1,
+                    "manifest-batch: overlapping callback remains writable")) return false;
+        }
+        std::array<std::byte, 8> visible{};
+        ULONG read = 0;
+        if (!Require(coordinator->CheckpointXid() == before_xid &&
+                coordinator->DiagnosticsSnapshot(101).commit_deferred_acceptances == 3 &&
+                coordinator->DiagnosticsSnapshot(101).commit_failures == 0,
+                "manifest-batch: three accepted writes do not publish or report failures") ||
+            !Require(CB_Read(&fs, open_handle, visible.data(), 0,
+                    static_cast<ULONG>(visible.size()), &read) == STATUS_SUCCESS &&
+                    read == visible.size() && visible == payload,
+                "manifest-batch: read before flush sees all overlapping accepted bytes") ||
+            !Require(CB_Flush(&fs, open_handle, &info) == STATUS_SUCCESS,
+                "manifest-batch: explicit flush publishes accepted callbacks")) return false;
+    }
     CB_Close(&fs, open_handle);
 
     std::vector<std::byte> committed;
@@ -41619,6 +42475,366 @@ bool TestManifestCallbacksBindWalIdentityBeforeCanonicalPublication()
                    !context.recovery_active,
                "manifest-callback: healthy RW state is retained");
 }
+
+bool TestManifestSiblingAcceptedWritePressure()
+{
+    std::array<wchar_t, 32> previous{};
+    const auto previous_size = GetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS",
+        previous.data(), static_cast<DWORD>(previous.size()));
+    SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS", L"1");
+    ScopeExit restore{[&] { SetEnvironmentVariableW(L"APFSACCESS_DEFER_CLOSE_COMMITS",
+        previous_size ? previous.data() : nullptr); }};
+    ContainerFixtureFile fixture("sibling-write-pressure", true);
+    std::string error;
+    auto coordinator = apfsaccess::catalog::ContainerMountCoordinator::Open(fixture.path.string(), 0, error,
+        apfsaccess::catalog::CatalogLoadPolicy::StrictApple, true, true);
+    if (!Require(coordinator != nullptr, "sibling pressure: strict owner opens")) return false;
+    std::vector<std::unique_ptr<MountContext>> sessions;
+    std::array<FSP_FILE_SYSTEM, 2> filesystems{};
+    std::array<PVOID, 2> handles{};
+    ScopeExit cleanup{[&] {
+        std::error_code ec;
+        for (std::size_t i = 0; i < sessions.size(); ++i)
+        {
+            auto& c = *sessions[i];
+            if (handles[i]) CB_Close(&filesystems[i], handles[i]);
+            StopDeferredCommitWorker(&c);
+            c.tx_manager.reset();
+            c.payload_spool.reset();
+            std::filesystem::remove(c.recovery_marker_file, ec);
+            std::filesystem::remove_all(c.session_root, ec);
+        }
+        (void)coordinator->DrainAndStop(std::chrono::seconds(5));
+    }};
+    for (const auto oid : {101ULL, 102ULL})
+    {
+        auto ctx = std::make_unique<MountContext>();
+        ctx->args = ManifestSessionArgs(fixture.path, oid, Utf8ToWide(coordinator->ContainerUuidHex()),
+            L"private-" + std::to_wstring(oid), true);
+        ctx->args.write_backend = L"Native";
+        ctx->args.write_require_canonical_commit = true;
+        ctx->args.allow_legacy_scaffold_for_fixtures = false;
+        ctx->native_write_enabled = true;
+        SeedRoot(*ctx);
+        std::array<std::byte, 16> security{};
+        SeedSecurity(*ctx, security);
+        const auto scratch_name = L"sibling-pressure-" + std::to_wstring(oid);
+        if (!Require(PrepareUnitHydrationRoot(*ctx, scratch_name.c_str()) &&
+                ConfigureUnitRecoveryMarker(*ctx, scratch_name.c_str()),
+                "sibling pressure: private recovery paths")) return false;
+        std::wstring mount_error;
+        if (!Require(MountManifestSession(*coordinator, ctx->args, *ctx, mount_error),
+                "sibling pressure: mount each exact volume")) return false;
+        auto* c = ctx.get();
+        c->metadata_store->SetFilePayloadRangeProvider([c](const auto& path, auto identity,
+            std::uint64_t offset, std::span<std::byte> destination) {
+            return ReadHydratedPayloadRangeForPath(c, path, identity, offset, destination);
+        });
+        c->payload_spool_volume_identity = "unit-sibling-" + std::to_string(oid);
+        c->payload_spool = std::make_unique<apfsaccess::rw::PayloadSpool>(
+            apfsaccess::rw::PayloadSpool::Options{c->session_root / "payload-spool",
+                c->payload_spool_volume_identity, 1024 * 1024});
+        c->tx_manager = std::make_unique<apfsaccess::rw::TransactionManager>(L"Conservative");
+        c->tx_manager->SetVolumeIdentity(Utf8ToWide(c->payload_spool_volume_identity));
+        c->tx_manager->SetJournalPath((c->session_root / "accepted.wal").wstring());
+        sessions.push_back(std::move(ctx));
+    }
+    if (!Require(InitializeManifestCheckpointCensus(*coordinator, sessions, error),
+            "sibling pressure: exact complete startup census")) return false;
+    for (std::size_t i = 0; i < sessions.size(); ++i) filesystems[i] = BuildFileSystem(sessions[i].get());
+    FSP_FSCTL_FILE_INFO info{};
+    const auto create = [&](std::size_t i) {
+        return CB_Create(&filesystems[i], const_cast<PWSTR>(L"\\pressure.bin"), FILE_NON_DIRECTORY_FILE,
+            FILE_READ_DATA | FILE_WRITE_DATA, 0, nullptr, 0, &handles[i], &info);
+    };
+    std::array<std::byte, 8> payload{};
+    payload.fill(std::byte{'F'});
+    ULONG written = 0;
+    if (!Require(create(0) == STATUS_SUCCESS && handles[0], "sibling pressure: first writer stays open") ||
+        !Require(CB_Write(&filesystems[0], handles[0], payload.data(), 0, 8, FALSE, FALSE,
+            &written, &info) == STATUS_SUCCESS && written == 8, "sibling pressure: first write accepted")) return false;
+    const auto before = coordinator->CheckpointXid();
+    if (!Require(sessions[0]->tx_manager->HasUnappliedAcceptedWork() && HasOpenWriteHandles(sessions[0].get()),
+            "sibling pressure: exercise unpublished work with a passive open handle")) return false;
+    std::atomic<bool> completed{false};
+    NTSTATUS sibling_status = STATUS_UNSUCCESSFUL;
+    bool stayed_blocked = false;
+    std::thread sibling;
+    {
+        MutationCallbackScope active(sessions[0].get());
+        sibling = std::thread([&] { sibling_status = create(1); completed.store(true); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        stayed_blocked = !completed.load() && coordinator->CheckpointXid() == before;
+    }
+    sibling.join();
+    if (!Require(stayed_blocked, "sibling pressure: active callback prevents publication") ||
+        !Require(sibling_status == STATUS_SUCCESS && handles[1] && HasOpenWriteHandles(sessions[0].get()),
+            "sibling pressure: second create succeeds while first handle remains open")) return false;
+    std::vector<std::byte> bytes;
+    if (!Require(sessions[0]->metadata_store->ReadCommittedFileRange(L"\\pressure.bin", 0, 8, bytes) &&
+            bytes == std::vector<std::byte>(payload.begin(), payload.end()),
+            "sibling pressure: owner publication retains exact bytes")) return false;
+    payload.fill(std::byte{'G'});
+    if (!Require(CB_Write(&filesystems[1], handles[1], payload.data(), 0, 8, FALSE, FALSE,
+            &written, &info) == STATUS_SUCCESS, "sibling pressure: second owner accepts work")) return false;
+    const std::byte changed{'X'};
+    if (!Require(CB_Write(&filesystems[0], handles[0], const_cast<std::byte*>(&changed), 0, 1,
+            FALSE, FALSE, &written, &info) == STATUS_SUCCESS,
+            "sibling pressure: original handle resumes after draining second owner") ||
+        !Require(CB_Flush(&filesystems[0], handles[0], &info) == STATUS_SUCCESS &&
+            CB_Flush(&filesystems[1], handles[1], &info) == STATUS_SUCCESS,
+            "sibling pressure: both owners flush cleanly")) return false;
+    for (std::size_t i = 0; i < sessions.size(); ++i)
+    {
+        std::array<std::byte, 8> expected{};
+        expected.fill(i ? std::byte{'G'} : std::byte{'F'});
+        if (!i) expected[0] = changed;
+        if (!Require(sessions[i]->metadata_store->ReadCommittedFileRange(L"\\pressure.bin", 0, 8, bytes) &&
+                bytes == std::vector<std::byte>(expected.begin(), expected.end()),
+                "sibling pressure: final payload isolated to exact volume")) return false;
+        const auto marks = sessions[i]->tx_manager->Watermarks();
+        if (!Require(marks.accepted_sequence == marks.apfs_durable_sequence &&
+                marks.apfs_durable_sequence == marks.cleanup_sequence &&
+                !sessions[i]->write_degraded && !sessions[i]->recovery_active,
+                "sibling pressure: WAL cleanup and healthy state converge")) return false;
+    }
+    return true;
+}
+
+bool TestManifestSiblingCleanupAdmission(const std::string& mode)
+{
+    using Store = apfsaccess::rw::MetadataStore;
+    using Tx = apfsaccess::rw::TransactionManager;
+    using Spool = apfsaccess::rw::PayloadSpool;
+    ContainerFixtureFile fixture("sibling-cleanup-" + mode, true);
+    std::string error;
+    auto coordinator = apfsaccess::catalog::ContainerMountCoordinator::Open(fixture.path.string(), 0, error,
+        apfsaccess::catalog::CatalogLoadPolicy::StrictApple, true, true);
+    if (!Require(coordinator != nullptr, "sibling cleanup: strict image owner opens")) return false;
+    std::vector<std::unique_ptr<MountContext>> sessions;
+    ScopeExit cleanup{[&] {
+        for (auto& ctx : sessions) StopDeferredCommitWorker(ctx.get());
+        (void)coordinator->DrainAndStop(std::chrono::seconds(5));
+        for (auto& ctx : sessions)
+        {
+            const auto root = ctx->session_root;
+            ctx.reset();
+            std::error_code ec;
+            std::filesystem::remove_all(root, ec);
+        }
+    }};
+    for (const auto oid : {101ULL, 102ULL})
+    {
+        auto ctx = std::make_unique<MountContext>();
+        ctx->args = ManifestSessionArgs(fixture.path, oid, Utf8ToWide(coordinator->ContainerUuidHex()), L"private", true);
+        ctx->args.write_backend = L"Native";
+        ctx->args.write_require_canonical_commit = true;
+        ctx->args.allow_legacy_scaffold_for_fixtures = false;
+        ctx->native_write_enabled = true;
+        SeedRoot(*ctx);
+        std::array<std::byte, 16> security{};
+        SeedSecurity(*ctx, security);
+        if (!Require(PrepareUnitHydrationRoot(*ctx, (L"sibling-cleanup-" + std::to_wstring(oid)).c_str()),
+                "sibling cleanup: private journal and marker paths")) return false;
+        ctx->recovery_marker_file = ctx->session_root / "recovery.marker";
+        std::wstring mount_error;
+        if (!Require(MountManifestSession(*coordinator, ctx->args, *ctx, mount_error),
+                "sibling cleanup: bind real volume store without WinFsp mount")) return false;
+        ctx->payload_spool_volume_identity = "sibling-cleanup-" + std::to_string(oid);
+        ctx->payload_spool = std::make_unique<Spool>(Spool::Options{
+            ctx->session_root / "payload-spool", ctx->payload_spool_volume_identity, 1024 * 1024});
+        ctx->tx_manager = std::make_unique<Tx>(L"Conservative");
+        ctx->tx_manager->SetVolumeIdentity(Utf8ToWide(ctx->payload_spool_volume_identity));
+        ctx->tx_manager->SetJournalPath((ctx->session_root / "accepted.wal").wstring());
+        sessions.push_back(std::move(ctx));
+    }
+    if (!Require(InitializeManifestCheckpointCensus(*coordinator, sessions, error),
+            "sibling cleanup: complete real journal census")) return false;
+    auto& alpha = *sessions[0];
+    auto& beta = *sessions[1];
+    Store::MutationRequest create;
+    create.operation = Store::MutationOperation::CreateFile; create.path = L"\\durable-alpha.bin";
+    const auto preimage = coordinator->CheckpointXid();
+    Store::PayloadIdentity identity;
+    const auto published = coordinator->Commit(101, {create}, [&](const auto&, const auto& identities,
+        auto xid, auto& pins, auto& failure) {
+        identity = identities.front();
+        Tx::MutationIntent intent;
+        intent.kind = Tx::MutationKind::CreateFile; intent.path = create.path;
+        intent.object_id = identity.object_id; intent.generation = identity.generation;
+        return alpha.tx_manager->Begin() && alpha.tx_manager->RecordMutation(intent) &&
+            alpha.tx_manager->Accept(xid) && alpha.tx_manager->LoadRequiredCheckpointXidsSinceCleanup(pins, &failure);
+    });
+    const auto durable = alpha.tx_manager->Watermarks().accepted_sequence;
+    if (!Require(published.committed && durable != 0 && coordinator->CheckpointXid() > preimage &&
+            alpha.tx_manager->MarkApfsDurableThrough(durable) && RefreshManifestCheckpointPinsAfterCleanup(alpha),
+            "sibling cleanup: real published WAL retains its old preimage until cleanup")) return false;
+    alpha.pending_native_writes = true;
+    if (!Require(UpdateRecoveryMarkerBestEffort(&alpha, true), "sibling cleanup: retain dirty marker ownership")) return false;
+    if (mode == "stale")
+    {
+        if (!Require(alpha.tx_manager->MarkCleanedThrough(durable),
+                "sibling cleanup: durable cleanup precedes delayed census refresh")) return false;
+    }
+    const auto initial_census = coordinator->CheckpointCensusSnapshot();
+    if (!Require(initial_census.front().required_checkpoint_xids == std::vector<std::uint64_t>{preimage} &&
+            !initial_census.front().unapplied_accepted_work,
+            "sibling cleanup: reproduce cleanup-only old pin in coordinator census")) return false;
+    const auto marker = ReadFileBytes(alpha.recovery_marker_file);
+    const auto image = ReadFileBytes(fixture.path);
+    const auto checkpoint = coordinator->CheckpointXid();
+    if (mode == "newer")
+    {
+        const auto payload = BuildPatternPayloadForTest(32, 0x67);
+        Tx::MutationIntent intent;
+        intent.kind = Tx::MutationKind::Write; intent.path = create.path;
+        intent.object_id = identity.object_id; intent.generation = identity.generation;
+        if (!Require(alpha.tx_manager->Begin(), "sibling cleanup: begin newer accepted write")) return false;
+        intent.wal_sequence = alpha.tx_manager->NextMutationSequence();
+        Spool::AppendResult appended;
+        if (!Require(alpha.payload_spool->Append({alpha.payload_spool_volume_identity, identity.object_id,
+                identity.generation, 0, intent.wal_sequence, payload}, &appended),
+                "sibling cleanup: spool newer identity-bound payload")) return false;
+        intent.length = appended.payload_length; intent.payload_length = appended.payload_length;
+        intent.payload_spool_offset = appended.spool_offset; intent.payload_checksum = appended.payload_sha256;
+        if (!Require(alpha.tx_manager->RecordMutation(intent) && alpha.payload_spool->FlushDirtyState() &&
+                alpha.tx_manager->Accept(checkpoint) && RefreshManifestCheckpointPinsAfterCleanup(alpha),
+                "sibling cleanup: newer WAL accepted at current checkpoint")) return false;
+        const auto accepted = alpha.tx_manager->Watermarks().accepted_sequence;
+        const auto newer_wal = ReadFileBytes(alpha.session_root / "accepted.wal");
+        const auto spool = ReadFileBytes(alpha.session_root / "payload-spool" / "payload-spool.bin");
+        ExternalMutationRequestScope admission(&alpha, false);
+        MutationCallbackScope mutation(&alpha, false, true);
+        bool cleaned = false;
+        std::wstring failure;
+        if (!Require(admission.Acquired() && mutation.OwnsLock() &&
+                CleanupDurableJournalPrefixWithoutPinRefresh(alpha, cleaned, failure) && cleaned &&
+                RefreshManifestCheckpointPinsAfterCleanup(alpha),
+                "sibling cleanup: retire only durable prefix under sibling ownership gates")) return false;
+        const auto retained_wal = ReadFileBytes(alpha.session_root / "accepted.wal");
+        std::vector<Tx::AcceptedTransaction> retained;
+        std::vector<std::uint64_t> pins;
+        std::vector<std::byte> actual(payload.size());
+        std::size_t overlaid = 0;
+        return Require(alpha.tx_manager->Watermarks().accepted_sequence == accepted &&
+                alpha.tx_manager->Watermarks().apfs_durable_sequence == durable &&
+                alpha.tx_manager->Watermarks().cleanup_sequence == durable && alpha.tx_manager->HasUnappliedAcceptedWork() &&
+                alpha.tx_manager->LoadUnappliedAcceptedTransactions(retained, &error) && retained.size() == 1 &&
+                retained.front().mutations.front().payload_sha256 == appended.payload_sha256 &&
+                alpha.tx_manager->LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins == std::vector<std::uint64_t>{checkpoint} &&
+                retained_wal.size() >= newer_wal.size() && std::equal(newer_wal.begin(), newer_wal.end(), retained_wal.begin()) &&
+                ReadFileBytes(alpha.session_root / "payload-spool" / "payload-spool.bin") == spool &&
+                alpha.payload_spool->ReadFullyCoveredRange({alpha.payload_spool_volume_identity, identity.object_id,
+                    identity.generation, 0, actual}, overlaid) && actual == payload &&
+                ReadFileBytes(fixture.path) == image && ReadFileBytes(alpha.recovery_marker_file) == marker,
+            "sibling cleanup: newer accepted WAL, payload, pin and dirty ownership survive without publication");
+    }
+    const bool refused = mode == "failure" || mode == "blocked" || mode == "recovery" ||
+        mode == "unknown" || mode == "unjournaled" || mode == "unaccepted" || mode == "active";
+    if (mode == "failure")
+    {
+        alpha.args.write_recovery_policy = L"FailClosed";
+        alpha.args.status_file = (alpha.session_root / "host.status.json").wstring();
+        alpha.manifest_mount_attached = true;
+        alpha.mount_ready = true;
+        alpha.tx_manager->SetJournalFaultInjectionHook([](std::string_view stage) {
+            return stage == "durable-flush";
+        });
+    }
+    if (mode == "blocked") alpha.recovery_marker_blocked = true;
+    if (mode == "recovery") alpha.recovery_active = true;
+    if (mode == "unknown") alpha.tx_manager.reset();
+    if (mode == "unjournaled") alpha.unjournaled_native_mutation = true;
+    if (mode == "unaccepted")
+    {
+        const auto payload = BuildPatternPayloadForTest(32, 0x39);
+        Tx::MutationIntent intent;
+        intent.kind = Tx::MutationKind::Write; intent.path = create.path;
+        intent.object_id = identity.object_id; intent.generation = identity.generation;
+        if (!Require(alpha.tx_manager->Begin(), "sibling cleanup: begin unaccepted write")) return false;
+        intent.wal_sequence = alpha.tx_manager->NextMutationSequence();
+        Spool::AppendResult appended;
+        if (!Require(alpha.payload_spool->Append({alpha.payload_spool_volume_identity, identity.object_id,
+                identity.generation, 0, intent.wal_sequence, payload}, &appended),
+                "sibling cleanup: unaccepted write retains its real spool")) return false;
+        intent.length = appended.payload_length; intent.payload_length = appended.payload_length;
+        intent.payload_spool_offset = appended.spool_offset; intent.payload_checksum = appended.payload_sha256;
+        if (!Require(alpha.tx_manager->RecordMutation(intent) && alpha.tx_manager->FlushPreparedRecords() &&
+                alpha.payload_spool->FlushDirtyState(),
+                "sibling cleanup: persist unaccepted prepared WAL and payload without acceptance")) return false;
+    }
+    const auto wal = ReadFileBytes(alpha.session_root / "accepted.wal");
+    const auto spool = ReadFileBytes(alpha.session_root / "payload-spool" / "payload-spool.bin");
+    const auto index = ReadFileBytes(alpha.session_root / "payload-spool" / "payload-spool.idx");
+    std::optional<MutationCallbackScope> active;
+    if (mode == "active") active.emplace(&alpha);
+    const auto started = std::chrono::steady_clock::now();
+    const auto status = DrainManifestSiblingAcceptedWrites(&beta);
+    active.reset();
+    if (alpha.tx_manager) alpha.tx_manager->SetJournalFaultInjectionHook({});
+    const auto census = coordinator->CheckpointCensusSnapshot();
+    if (!Require(status == (refused ? STATUS_DEVICE_BUSY : STATUS_SUCCESS) &&
+            std::chrono::steady_clock::now() - started < std::chrono::seconds(6) &&
+            ReadFileBytes(fixture.path) == image && coordinator->CheckpointXid() == checkpoint &&
+            (mode == "failure" || ReadFileBytes(alpha.recovery_marker_file) == marker) && alpha.pending_native_writes,
+            "sibling cleanup: admission is bounded and preserves checkpoint and dirty ownership")) return false;
+    if (mode == "failure")
+    {
+        if (!Require(!alpha.tx_manager->RecoveryStateValid() && alpha.recovery_active && alpha.write_degraded &&
+                !alpha.native_write_enabled && !alpha.overlay_write_enabled && !IsMutationWriteEnabled(&alpha),
+                "sibling cleanup: invalid WAL latches fail-closed recovery and disables mutation admission")) return false;
+        const auto retained_marker = ReadFileBytes(alpha.recovery_marker_file);
+        const std::string marker_text(reinterpret_cast<const char*>(retained_marker.data()), retained_marker.size());
+        if (!Require(marker_text.find("dirty=1") != std::string::npos &&
+                std::filesystem::exists(alpha.args.status_file),
+                "sibling cleanup: failure retains dirty ownership and publishes host status")) return false;
+        Arguments process_args{};
+        process_args.status_file = (alpha.session_root / "container.status.json").wstring();
+        if (!Require(WriteContainerStatusFile(process_args, *coordinator, sessions),
+                "sibling cleanup: failed sibling container status is published")) return false;
+        const auto bytes = ReadFileBytes(process_args.status_file);
+        const std::string status_text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        const auto alpha_at = status_text.find("\"objectId\":101,");
+        const auto beta_at = status_text.find("\"objectId\":102,", alpha_at);
+        if (!Require(alpha_at != std::string::npos && beta_at != std::string::npos,
+                "sibling cleanup: both exact peer status entries exist")) return false;
+        const auto alpha_text = status_text.substr(alpha_at, beta_at - alpha_at);
+        if (!Require(alpha_text.find("\"mounted\":true") != std::string::npos &&
+                alpha_text.find("\"ready\":true") != std::string::npos &&
+                alpha_text.find("\"writable\":false") != std::string::npos &&
+                alpha_text.find("\"recoveryActive\":true") != std::string::npos &&
+                alpha_text.find("\"writeDegraded\":true") != std::string::npos,
+                "sibling cleanup: attached ready mount reports non-writable recovery rather than healthy RW")) return false;
+    }
+    if (refused)
+    {
+        const auto retained_wal = ReadFileBytes(alpha.session_root / "accepted.wal");
+        return Require(census.front().required_checkpoint_xids == initial_census.front().required_checkpoint_xids &&
+                retained_wal.size() >= wal.size() && std::equal(wal.begin(), wal.end(), retained_wal.begin()) &&
+                (mode == "failure" || retained_wal == wal) &&
+                ReadFileBytes(alpha.session_root / "payload-spool" / "payload-spool.bin") == spool &&
+                ReadFileBytes(alpha.session_root / "payload-spool" / "payload-spool.idx") == index &&
+                (!alpha.tx_manager || alpha.tx_manager->Watermarks().cleanup_sequence == 0),
+            "sibling cleanup: failed, active, unknown or recovery-owned debt retains its evidence");
+    }
+    if (!Require(alpha.tx_manager->Watermarks().cleanup_sequence == durable &&
+            census.front().required_checkpoint_xids.empty() && !census.front().unapplied_accepted_work &&
+            !alpha.write_degraded && !beta.write_degraded,
+            "sibling cleanup: idle cleanup-only or stale pin retires before writer admission")) return false;
+    auto fs = BuildFileSystem(&beta);
+    PVOID handle = nullptr;
+    FSP_FSCTL_FILE_INFO info{};
+    const auto created = CB_Create(&fs, const_cast<PWSTR>(L"\\after-alpha-cleanup.bin"), FILE_NON_DIRECTORY_FILE,
+        FILE_READ_DATA | FILE_WRITE_DATA, 0, nullptr, 0, &handle, &info);
+    if (handle) CB_Close(&fs, handle);
+    return Require(created == STATUS_SUCCESS && beta.metadata_store->LookupCommittedInodeByPath(L"\\after-alpha-cleanup.bin") &&
+            alpha.metadata_store->LookupCommittedInodeByPath(create.path) &&
+            !alpha.metadata_store->LookupCommittedInodeByPath(L"\\after-alpha-cleanup.bin"),
+        "sibling cleanup: actual sibling Create succeeds with isolated namespaces");
+}
+
+#include "RootObservationGuardTests.h"
+#include "RootObservationSdkTests.h"
 
 bool TestRetentionCleanupFailureDoesNotTakeRuntimeLock()
 {
@@ -41688,6 +42904,18 @@ bool TestManifestCallbackRetentionRetry()
         }};
         const bool write = mode == "write" || mode == "write-blocked";
         const bool blocked = mode.ends_with("-blocked");
+        // Non-deferred modes below assert inline plan/publication of an
+        // accepted write. Manifest write batching is default-on in unit-test
+        // builds and would defer that publication, so disable it for every
+        // mode except rename-deferred-blocked, which manages its own
+        // deferral environment. Restored at each iteration end.
+        ScopeExit restore_writeback{[&]() {
+            SetEnvironmentVariableW(L"APFSACCESS_DISABLE_CONTENT_WRITEBACK", nullptr);
+        }};
+        if (!deferred)
+        {
+            SetEnvironmentVariableW(L"APFSACCESS_DISABLE_CONTENT_WRITEBACK", L"1");
+        }
         ContainerFixtureFile fixture("retry-" + mode, true);
         std::string error;
         auto coordinator = Coordinator::Open(fixture.path.string(), 0, error,
@@ -41796,19 +43024,66 @@ bool TestManifestCallbackRetentionRetry()
         const auto watermarks = ctx.tx_manager->Watermarks();
         std::fprintf(stderr, "[INFO] manifest retry mode=%s status=%lx accepts=%u plans=%u publications=%u\n",
             mode.c_str(), static_cast<unsigned long>(status), accepted_count, plan_count, publication_count);
+        // Fail-before-staging contract (see TestRetentionBackpressureDoesNotDegradeMount):
+        // static retention pressure fails the callback with retryable
+        // STATUS_DEVICE_BUSY, stages/accepts/plans/publishes nothing, leaves
+        // watermarks frozen at the durable prefix and bytes unchanged, and keeps
+        // the mount healthy so the caller can retry. The old pins below demanded
+        // degraded+disabled flags with one WAL acceptance; that degrade-and-hold
+        // design is superseded and contradicts the passing no-degrade pin.
         if (blocked)
         {
-            ok &= Require(!NT_SUCCESS(status) && !ctx.native_write_enabled && ctx.write_degraded &&
-                    accepted_count == 1 && plan_count >= 1 && plan_count <= 2 && publication_count == 0 &&
-                    watermarks.accepted_sequence > watermarks.apfs_durable_sequence &&
+            if (mode == "delete-blocked")
+            {
+                // Void Cleanup/Close cannot report failure, so honesty for a
+                // pressured delete is the retained retryable pending
+                // disposition (Windows delete-pending semantics: fresh lookups
+                // miss, retry is idempotent via NOT_FOUND, the mount stays
+                // healthy). Nothing is staged/accepted/planned/published,
+                // watermarks stay frozen at the durable prefix, bytes are
+                // unchanged. A visible-present clean node with SUCCESS
+                // (phantom delete) or any publication fails. Raw map lookup
+                // is required: FindNodeNormalized hides pending nodes from
+                // fresh lookups by design.
+                const auto raw_delete_node = [&]() -> std::shared_ptr<Node> {
+                    std::lock_guard<std::mutex> lock(ctx.mutex);
+                    return TryGetNodeLockedNormalized(&ctx, prefix.path);
+                }();
+                ok &= Require(status == STATUS_SUCCESS && ctx.native_write_enabled && !ctx.write_degraded &&
+                        accepted_count == 0 && plan_count == 0 && publication_count == 0 &&
+                        raw_delete_node != nullptr && IsDeleteBlockedStateLocked(raw_delete_node) &&
+                        watermarks.accepted_sequence == prefix_sequence &&
+                        watermarks.apfs_durable_sequence == prefix_sequence && ReadFileBytes(fixture.path) == before_callback,
+                    "manifest retry: pressured delete stays pending for retry without publication or false health");
+                ok &= Require(NT_SUCCESS(DrainNativeMutationsByPolicy(&ctx, L"Flush")) &&
+                        FinalizeMutationJournalBestEffort(&ctx, L"Flush") &&
+                        ctx.tx_manager->Watermarks().apfs_durable_sequence == prefix_sequence &&
+                        ctx.tx_manager->Watermarks().cleanup_sequence == watermarks.cleanup_sequence &&
+                        ManifestQueuedRequestCount(&ctx) == 0 && ReadFileBytes(fixture.path) == before_callback &&
+                        IsDeleteBlockedStateLocked(( [&]() -> std::shared_ptr<Node> {
+                            std::lock_guard<std::mutex> lock(ctx.mutex);
+                            return TryGetNodeLockedNormalized(&ctx, prefix.path);
+                        })()),
+                    "manifest retry: drain preserves the armed delete instead of completing or dropping it");
+            }
+            else
+            {
+            ok &= Require(!NT_SUCCESS(status) && ctx.native_write_enabled && !ctx.write_degraded &&
+                    accepted_count == 0 && plan_count == 0 && publication_count == 0 &&
+                    watermarks.accepted_sequence == prefix_sequence &&
                     watermarks.apfs_durable_sequence == prefix_sequence && ReadFileBytes(fixture.path) == before_callback,
-                "manifest retry: exhausted pressure refuses without publication or false durability");
-            ok &= Require(!NT_SUCCESS(DrainNativeMutationsByPolicy(&ctx, L"Flush")) &&
-                    !FinalizeMutationJournalBestEffort(&ctx, L"Flush") &&
-                    ctx.tx_manager->Watermarks().apfs_durable_sequence == watermarks.apfs_durable_sequence &&
-                    ctx.tx_manager->Watermarks().cleanup_sequence == watermarks.cleanup_sequence,
-                "manifest retry: later empty drain cannot certify failed accepted work");
-            if (mode == "rename-blocked" || deferred || mode == "delete-blocked")
+                "manifest retry: exhausted pressure refuses before staging without publication or false durability");
+            ok &= Require(NT_SUCCESS(DrainNativeMutationsByPolicy(&ctx, L"Flush")) &&
+                    FinalizeMutationJournalBestEffort(&ctx, L"Flush") &&
+                    ctx.tx_manager->Watermarks().apfs_durable_sequence == prefix_sequence &&
+                    ctx.tx_manager->Watermarks().cleanup_sequence == watermarks.cleanup_sequence &&
+                    ManifestQueuedRequestCount(&ctx) == 0 && ReadFileBytes(fixture.path) == before_callback,
+                "manifest retry: later empty drain advances nothing and leaves bytes intact");
+            }
+            // Rename modes restore visible local paths on refusal; the delete
+            // mode instead retains a hidden pending disposition (pinned
+            // above), so it is excluded from the visible-restore pin.
+            if (mode == "rename-blocked" || deferred)
                 ok &= Require(FindNodeNormalized(&ctx, prefix.path) != nullptr &&
                         FindNodeNormalized(&ctx, L"\\renamed.bin") == nullptr,
                     "manifest retry: rejected namespace operation restores local paths");
@@ -41818,8 +43093,11 @@ bool TestManifestCallbackRetentionRetry()
         ok &= Require(status == STATUS_SUCCESS && handle != nullptr &&
                 ctx.native_write_enabled && !ctx.write_degraded && !ctx.recovery_active,
             "manifest retry: real callback succeeds without read-only fallback");
+        // Single-plan convergence: the pressure from the durable prefix is
+        // resolved without a second plan, and the single publication advances
+        // the checkpoint by exactly one. A redundant retry plan would fail this.
         ok &= Require(accepted_count == 1 && publication_count == 1 &&
-                (mode != "create" || plan_count == 2) &&
+                (mode != "create" || plan_count == 1) &&
                 coordinator->CheckpointXid() == published.checkpoint_xid + 1,
             "manifest retry: one WAL acceptance and one publication despite pressure");
         ok &= Require(watermarks.accepted_sequence > prefix_sequence &&
@@ -41912,6 +43190,11 @@ bool TestManifestCheckpointCensusBeforeReplay()
             std::wstring mount_error;
             if (!Require(MountManifestSession(*coordinator, ctx.args, ctx, mount_error),
                     "census: reopen read-only owner before cleanup fault injection")) return false;
+            if (!Require(ctx.metadata_store->PrepareNativeWritePath() &&
+                    ctx.metadata_store->AuthoritativeAppleCheckpointView() != nullptr &&
+                    ReadFileBytes(fixture.path) == image_before,
+                    "census: load the authoritative cleanup view without publishing")) return false;
+            ctx.tx_manager->InvalidateJournalReadCacheForTest();
             std::atomic<bool> fault_seen{false};
             ctx.tx_manager->SetJournalFaultInjectionHook([&](std::string_view stage) {
                 if (stage != "read-all-exclusive") return false;
@@ -42115,13 +43398,23 @@ bool TestManifestUnresolvedSiblingRecovery()
         restarted_sibling.native_write_enabled = true;
         restarted_sibling.recovery_marker_file = sibling.recovery_marker_file;
         const auto sibling_startup = LoadRecoveryMarkerAtStartup(restarted_sibling);
-        ok &= Require(own_busy == STATUS_DEVICE_BUSY && sibling.pending_native_writes &&
+        std::fwprintf(stderr, L"[sibling-debt] status=%lx pending=%d debt=%d enabled=%d degraded=%d recovery=%d unjournaled=%d reason=%ls action=%ls marker=%d/%d/%d image=%d\n",
+            static_cast<unsigned long>(own_busy), sibling.pending_native_writes.load(), sibling.tx_manager->HasUnappliedAcceptedWork(),
+            sibling.native_write_enabled.load(), sibling.write_degraded.load(), sibling.recovery_active.load(),
+            sibling.unjournaled_native_mutation.load(), sibling.runtime_recovery_reason.c_str(), sibling.runtime_last_recovery_action.c_str(),
+            static_cast<int>(sibling_startup.load_status), sibling_startup.state.dirty, static_cast<int>(sibling_startup.action),
+            ReadFileBytes(fixture.path) == before);
+        ok &= Require(own_busy == STATUS_MEDIA_WRITE_PROTECTED && sibling.pending_native_writes &&
+                sibling.recovery_active && sibling.write_degraded && !sibling.native_write_enabled &&
+                !sibling.overlay_write_enabled && !sibling.unjournaled_native_mutation &&
+                sibling.runtime_recovery_reason == L"CommitCapacityFailureWithJournalDebt" &&
+                sibling.runtime_last_recovery_action == L"DowngradedAfterCapacityFailureWithJournalDebt" &&
                 sibling.tx_manager->HasUnappliedAcceptedWork() &&
                 sibling.tx_manager->Watermarks().accepted_sequence == accepted &&
                 sibling_startup.load_status == RecoveryMarkerLoadStatus::Loaded &&
                 sibling_startup.state.dirty && sibling_startup.action == LoadedRecoveryMarkerAction::FailClosed &&
                 !restarted_sibling.native_write_enabled && ReadFileBytes(fixture.path) == before,
-            "sibling recovery: rejected fresh Create preserves real own-volume accepted recovery evidence");
+            "sibling recovery: rejected fresh Create latches real own-volume accepted debt and preserves recovery evidence");
         ResetRecoveryMarkerCache(&restarted_sibling);
         sibling.metadata_store->SetFilePayloadRangeProvider([&](const auto& path, auto id, auto offset, auto bytes) {
             return ReadHydratedPayloadRangeForPath(&sibling, path, id, offset, bytes);
@@ -42439,6 +43732,7 @@ bool TestManifestPreacceptFailureReconcilesCensus()
     using Store = apfsaccess::rw::MetadataStore;
     using Tx = apfsaccess::rw::TransactionManager;
     bool ok = true;
+    for (const NTSTATUS stale_status : {STATUS_DEVICE_BUSY, STATUS_NOT_SUPPORTED})
     for (const bool failed_census : {false, true})
     {
         ContainerFixtureFile fixture("preaccept-census", true);
@@ -42474,6 +43768,7 @@ bool TestManifestPreacceptFailureReconcilesCensus()
         create.operation = Store::MutationOperation::CreateFile; create.path = L"\\queued.bin";
         EnqueueManifestRequest(&ctx, create);
         if (!Require(ctx.tx_manager->Begin(), "preaccept census: begin an unaccepted real transaction")) return false;
+        ctx.tx_manager->InvalidateJournalReadCacheForTest();
         bool census_seen = false;
         ctx.tx_manager->SetJournalFaultInjectionHook([&](std::string_view stage) {
             if (stage != "read-all-exclusive") return false;
@@ -42507,15 +43802,15 @@ bool TestManifestPreacceptFailureReconcilesCensus()
                     coordinator->Commit(102, {create}).committed,
                 "preaccept census: a fresh validated journal reopen releases the conservative barrier");
         }
-        ctx.manifest_preaccept_failure_status.store(STATUS_DEVICE_BUSY);
+        ctx.manifest_preaccept_failure_status.store(stale_status);
         {
             MutationCallbackScope next_callback(&ctx);
             ok &= Require(BlockNativeMutationAfterStagingFailure(&ctx, L"NextCallback", true) == STATUS_MEDIA_WRITE_PROTECTED &&
-                    ctx.unjournaled_native_mutation,
-                "preaccept census: a new callback cannot reuse stale busy state to hide unjournaled mutation");
+                    ctx.unjournaled_native_mutation && ctx.manifest_preaccept_failure_status.load() == STATUS_SUCCESS,
+                "preaccept census: a new callback cannot reuse stale clean-refusal state to hide unjournaled mutation");
         }
     }
-    if (ok) std::cerr << "[PASS] Preaccept failure census: 2/2 cases\n";
+    if (ok) std::cerr << "[PASS] Preaccept failure census: 4/4 cases\n";
     return ok;
 }
 
@@ -42597,6 +43892,7 @@ bool TestManifestPayloadReplayBeforeNodeBootstrap()
             { return LoadHydratedPayloadForPath(&ctx, path, length, false); });
         if (!Require(coordinator->InitializeRequiredCheckpointCensus({{101, {source_xid}}, {102, {}}}, error),
                 "startup payload: complete container census")) return false;
+        ctx.container_session_contexts = {&ctx};
         if (!Require(ctx.nodes.empty(), "startup payload: production node bootstrap has not run")) return false;
         std::vector<Tx::AcceptedTransaction> pending_transactions;
         if (!Require(ctx.tx_manager->LoadUnappliedAcceptedTransactions(pending_transactions, &error) &&
@@ -42821,17 +44117,22 @@ bool TestDirectVolumeCheckpointPins()
         }
         std::uint64_t last_committed_sequence = accepted;
         bool pressure_seen = false;
+        unsigned last_staged_index = 0;
         for (unsigned index = 1; index <= 5; ++index)
         {
             if (!Require(stage(index) && AcceptMutationJournalForDeferredCommitBestEffort(&ctx, L"DirectPinNext", &accepted),
                     "direct pins: accept next native batch without cleaning the prior one")) return false;
+            last_staged_index = index;
             const auto precommit = ReadFileBytes(path);
             const auto result = CommitNativeMutationsBestEffort(&ctx, L"DirectPinRetained");
-            if (result == STATUS_DEVICE_BUSY)
+            if (result == STATUS_MEDIA_WRITE_PROTECTED)
             {
                 pressure_seen = true;
-                ok &= Require(ReadFileBytes(path) == precommit && ctx.native_write_enabled && !ctx.write_degraded,
-                    "direct pins: retention pressure performs no device write or downgrade");
+                ok &= Require(ReadFileBytes(path) == precommit && !ctx.native_write_enabled && ctx.write_degraded &&
+                        ctx.recovery_active && ctx.tx_manager->HasUnappliedAcceptedWork() &&
+                        ctx.runtime_recovery_reason == L"CommitCapacityFailureWithJournalDebt" &&
+                        ctx.runtime_last_recovery_action == L"DowngradedAfterCapacityFailureWithJournalDebt",
+                    "direct pins: accepted retention debt performs no image write and closes admission");
                 break;
             }
             if (!Require(NT_SUCCESS(result), "direct pins: publish or report bounded retention pressure")) return false;
@@ -42841,39 +44142,78 @@ bool TestDirectVolumeCheckpointPins()
                 "direct pins: uncleaned accepted preimage remains readable across publications");
         }
         ok &= Require(pressure_seen, "direct pins: finite checkpoint capacity applies backpressure");
-        if (mode == "durable-prefix-replay" || mode == "verified-prefix-replay")
-        {
-            if (mode == "durable-prefix-replay" &&
-                !Require(ctx.tx_manager->MarkApfsDurableThrough(last_committed_sequence),
-                    "direct pins: persist prior publication receipt without cleanup")) return false;
-            if (!Require(ctx.metadata_store->PrepareNativeWritePath(), "direct pins: drop uncommitted staging before restart")) return false;
-            ok &= Require(ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(ctx) &&
-                    ctx.tx_manager->Watermarks().cleanup_sequence == accepted &&
-                    ctx.metadata_store->LookupCommittedInodeByPath(L"\\direct-0").has_value(),
-                "direct pins: recovery cleans the durable or verified prefix before capacity-bound publication");
-            continue;
-        }
-        if (mode == "live-auto")
+        if (mode != "verified-prefix-replay")
         {
             if (!Require(ctx.tx_manager->MarkApfsDurableThrough(last_committed_sequence),
-                    "direct pins: preserve durable receipt for bounded live retry")) return false;
-            const auto attempts = ctx.test_native_commit_attempt_count;
-            ok &= Require(NT_SUCCESS(DrainNativeMutationsByPolicy(&ctx, L"Flush")) &&
-                    ctx.test_native_commit_attempt_count == attempts + 2 &&
-                    FinalizeMutationJournalBestEffort(&ctx, L"DirectPinAutoFinalize") &&
-                    ctx.tx_manager->Watermarks().cleanup_sequence == accepted,
-                "direct pins: live pressure cleans only durable work and retries publication exactly once");
-            continue;
+                    "direct pins: receipt covers only the already published prefix")) return false;
         }
-        if (!Require(ctx.tx_manager->MarkApfsDurableThrough(last_committed_sequence) &&
-                ctx.payload_spool->CleanupThroughSequence(last_committed_sequence) &&
-                ctx.tx_manager->MarkCleanedThrough(last_committed_sequence),
-                "direct pins: release only the prefix already proven published")) return false;
-        ok &= Require(NT_SUCCESS(CommitNativeMutationsBestEffort(&ctx, L"DirectPinRetry")) &&
-                FinalizeMutationJournalBestEffort(&ctx, L"DirectPinFinalize") &&
-                ctx.tx_manager->LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins.empty() &&
-                ctx.tx_manager->Watermarks().cleanup_sequence == accepted,
-            "direct pins: explicit safe cleanup permits retry and final convergence");
+        if (mode == "live")
+        {
+            if (!Require(ctx.payload_spool->CleanupThroughSequence(last_committed_sequence) &&
+                    ctx.tx_manager->MarkCleanedThrough(last_committed_sequence),
+                    "direct pins: explicit cleanup releases only the proven published prefix")) return false;
+        }
+        const auto pending_image = ReadFileBytes(path);
+        const auto pending_wal = ReadFileBytes(root / "accepted.wal");
+        const auto pending_spool = ReadFileBytes(ctx.payload_spool->SpoolFilePath());
+        const auto marks = ctx.tx_manager->Watermarks();
+        const auto refused = mode == "live-auto" ? DrainNativeMutationsByPolicy(&ctx, L"Flush") :
+            CommitNativeMutationsBestEffort(&ctx, L"DirectPinLatchedRetry");
+        if (!Require(refused == STATUS_MEDIA_WRITE_PROTECTED && ReadFileBytes(path) == pending_image &&
+                ReadFileBytes(root / "accepted.wal") == pending_wal &&
+                ReadFileBytes(ctx.payload_spool->SpoolFilePath()) == pending_spool &&
+                ctx.tx_manager->Watermarks().accepted_sequence == marks.accepted_sequence &&
+                ctx.tx_manager->Watermarks().apfs_durable_sequence == marks.apfs_durable_sequence &&
+                ctx.tx_manager->Watermarks().cleanup_sequence == marks.cleanup_sequence,
+                "direct pins: neither automatic nor explicit retry bypasses the accepted-debt latch")) return false;
+        StopDeferredCommitWorker(&ctx);
+        ctx.tx_manager.reset(); ctx.payload_spool.reset(); ctx.owned_metadata_store.reset(); ctx.metadata_store = nullptr;
+        ResetRecoveryMarkerCache(&ctx);
+        const auto held = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (!Require(held != INVALID_HANDLE_VALUE, "direct pins: fresh recovery acquires the sole image handle")) return false;
+        auto device = apfsaccess::rw::BlockDevice::AdoptExclusiveRepairImage(path.wstring(), held, error);
+        if (!Require(device && device->CaptureExclusiveWriteSourceObservation().has_value(),
+                "direct pins: original-history proof has actual exclusive source authority")) return false;
+        MountContext recovered;
+        recovered.args = ctx.args; recovered.native_write_enabled = true; recovered.session_root = root;
+        recovered.recovery_marker_file = ctx.recovery_marker_file; recovered.cache_root = root / "hydrate";
+        recovered.tx_journal_file = root / "accepted.wal";
+        recovered.owned_metadata_store = std::make_unique<Store>(volume, std::move(device));
+        recovered.metadata_store = recovered.owned_metadata_store.get();
+        recovered.tx_manager = std::make_unique<Tx>(L"Conservative");
+        recovered.payload_spool_volume_identity = "direct-pins-volume";
+        if (!Require(recovered.tx_manager->OpenStartupJournal(recovered.tx_journal_file.wstring(),
+                L"direct-pins-volume", error), "direct pins: original startup read retains accepted history")) return false;
+        recovered.payload_spool = std::make_unique<Spool>(Spool::Options{
+            root / "spool", "direct-pins-volume", 1024 * 1024});
+        if (!Require(recovered.metadata_store->PrepareNativeWritePath() &&
+                ReadFileBytes(root / "accepted.wal") == pending_wal &&
+                ReadFileBytes(recovered.payload_spool->SpoolFilePath()) == pending_spool,
+                "direct pins: fresh bootstrap preserves original WAL and spool before replay")) return false;
+        unsigned publications = 0;
+        recovered.metadata_store->SetCommitStageHook([&](std::string_view stage) {
+            if (stage == "before-apple-publish") ++publications;
+            return true;
+        });
+        if (!Require(ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(recovered) && publications == 1 &&
+                recovered.tx_manager->Watermarks().cleanup_sequence == accepted &&
+                recovered.tx_manager->Watermarks().apfs_durable_sequence == accepted &&
+                recovered.tx_manager->LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins.empty() &&
+                recovered.metadata_store->LookupCommittedInodeByPath(L"\\direct-0").has_value() &&
+                recovered.metadata_store->VerifyIntegrity(),
+                "direct pins: fresh owner proves the original prefix and publishes only the accepted pending tail")) return false;
+        for (unsigned index = 0; index <= last_staged_index; ++index)
+            if (!Require(recovered.metadata_store->LookupCommittedInodeByPath(
+                    L"\\direct-" + std::to_wstring(index)).has_value(),
+                    "direct pins: fresh recovery preserves every originally accepted creation")) return false;
+        std::vector<std::byte> stable, repeated;
+        const auto length = static_cast<std::size_t>(recovered.metadata_store->Device().GetGeometry().total_bytes);
+        if (!Require(recovered.metadata_store->Device().ReadForVerification(0, length, stable) &&
+                ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(recovered) && publications == 1 &&
+                recovered.metadata_store->Device().ReadForVerification(0, length, repeated) && stable == repeated,
+                "direct pins: completed recovery is byte-idempotent and performs no second publication")) return false;
+        recovered.metadata_store->SetCommitStageHook({});
     }
     return ok;
 }
@@ -43052,6 +44392,23 @@ bool TestManifestContainerStatusFile()
             text.find("\"recoveryReason\":\"CommitPersistFailed\"") !=
                 std::string::npos,
         "manifest-status: per-volume recovery state reported");
+    ok &= Require(
+        text.find("\"walAcceptedSequence\":0") != std::string::npos &&
+            text.find("\"walApfsDurableSequence\":0") != std::string::npos &&
+            text.find("\"walCleanupSequence\":0") != std::string::npos &&
+            text.find("\"payloadSpoolDirtyRangeCount\":0") != std::string::npos,
+        "manifest-status: per-volume durability evidence is present");
+    contexts.back()->deferred_commit_requested = true;
+    ok &= Require(WriteContainerStatusFile(process_args, *coordinator, contexts),
+        "manifest-status: pending acceptance snapshot written");
+    {
+        std::ifstream pending(status_path, std::ios::binary);
+        std::ostringstream body;
+        body << pending.rdbuf();
+        ok &= Require(body.str().find("\"deferredCommitRequested\":true") != std::string::npos,
+            "manifest-status: pending publication is not hidden by mounted state");
+    }
+    contexts.back()->deferred_commit_requested = false;
     (void)coordinator->DrainAndStop(std::chrono::seconds(5));
     // Serve teardown clears session bindings before the terminal write, so
     // the tombstone reports no mounted volumes and a dropped lease.
@@ -43070,6 +44427,135 @@ bool TestManifestContainerStatusFile()
             tombstone_text.find("\"volumes\":[]") != std::string::npos,
         "manifest-status: drained tombstone drops lease and sessions");
     return ok;
+}
+
+bool TestManifestInitializationFailureSettlement()
+{
+    using Coordinator = apfsaccess::catalog::ContainerMountCoordinator;
+    const std::filesystem::path scratch(L"D:\\ApfsAccessScratch");
+    if (!Require(std::filesystem::is_directory(scratch), "initialization settlement: D: fixture root exists")) return false;
+    for (unsigned scenario = 0; scenario < 4; ++scenario)
+    {
+        const bool timeout = scenario == 3;
+        const unsigned count = timeout ? 2 : scenario;
+        const auto root = scratch / ("manifest-init-settlement-" + std::to_string(GetCurrentProcessId()) + "-" +
+            std::to_string(GetTickCount64()) + "-" + std::to_string(g_manifest_fixture_counter.fetch_add(1)));
+        if (!Require(std::filesystem::create_directory(root), "initialization settlement: exclusive ordinary fixture directory")) return false;
+        const auto image = root / "ordinary-never-physical.apfs.img";
+        auto builder = TwoProjectableVolumeStore();
+        builder.authoritative_checkpoint = true;
+        builder.xid = 20;
+        builder.block_count = 2048;
+        builder.authoritative_checkpoint_ring_blocks = 64;
+        builder.authoritative_internal_pool_blocks = 64;
+        const auto original = apfsaccess::testfixture::BuildAuthoritativeStoreImage(builder);
+        {
+            std::ofstream output(image, std::ios::binary | std::ios::trunc);
+            output.write(reinterpret_cast<const char*>(original.data()), static_cast<std::streamsize>(original.size()));
+            if (!Require(static_cast<bool>(output), "initialization settlement: save ordinary authoritative source")) return false;
+        }
+        std::string error;
+        auto coordinator = Coordinator::Open(image.string(), 0, error,
+            apfsaccess::catalog::CatalogLoadPolicy::StrictApple, true);
+        if (!Require(coordinator && coordinator->RawLeaseHeld(), ("initialization settlement: actual writable coordinator: " + error).c_str())) return false;
+        const auto xid = coordinator->CheckpointXid();
+        const auto uuid = coordinator->ContainerUuidHex();
+        FILETIME created{}, exited{}, kernel{}, user{};
+        if (!Require(GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user) != FALSE,
+            "initialization settlement: independently query actual owner creation time")) return false;
+        const auto start = (std::uint64_t{created.dwHighDateTime} << 32) | created.dwLowDateTime;
+        Arguments process_args;
+        process_args.status_file = (root / "container.status.json").wstring();
+        std::vector<std::unique_ptr<MountContext>> contexts;
+        ScopeExit cleanup{[&] { (void)SettleFailedManifestInitialization(process_args, *coordinator, contexts); }};
+        for (unsigned index = 0; index < count; ++index)
+        {
+            contexts.push_back(std::make_unique<MountContext>());
+            auto& ctx = *contexts.back();
+            ctx.args = ManifestSessionArgs(image, 101 + index, Utf8ToWide(uuid), L"never-mounted", true);
+            ctx.args.write_backend = L"Native";
+            ctx.args.write_require_canonical_commit = true;
+            ctx.native_write_enabled = true;
+            std::wstring mount_error;
+            if (!Require(MountManifestSession(*coordinator, ctx.args, ctx, mount_error),
+                ("initialization settlement: actual metadata session before WinFsp: " + WideToUtf8(mount_error)).c_str())) return false;
+            ctx.sd = BuildWritableVolumeSecurityDescriptor(&ctx.sd_size);
+            if (!Require(ctx.sd != nullptr, "initialization settlement: real initialization security resource")) return false;
+            ctx.session_root = root / ("session-" + std::to_string(index));
+            ctx.cache_root = ctx.session_root / "hydrate";
+            if (!Require(std::filesystem::create_directories(ctx.cache_root), "initialization settlement: real hydration resource")) return false;
+            if (!Require(!ctx.fs && ctx.winfsp_lifecycle_phase.load() == WinFspLifecyclePhase::Empty &&
+                !ctx.manifest_mount_attached.load() && !ctx.mount_ready.load(),
+                "initialization settlement: no filesystem, dispatcher or mount ever created")) return false;
+        }
+        if (!Require(coordinator->MountedVolumeCount() == count && ReadFileBytes(image) == original,
+            "initialization settlement: original source and metadata-only sessions before drain")) return false;
+        bool settled = false;
+        if (timeout)
+        {
+            bool preparation_entered = false;
+            const auto refused = coordinator->Commit(101, {}, {}, {}, {}, false, std::nullopt,
+                [&](const auto&, auto&, std::string& why) {
+                    preparation_entered = true;
+                    // An actual admitted preparation owns the coordinator commit
+                    // lock. No mutation or acceptance is staged or published.
+                    auto failed_drain = std::async(std::launch::async, [&] {
+                        return SettleFailedManifestInitialization(process_args, *coordinator, contexts,
+                            std::chrono::milliseconds(1));
+                    });
+                    settled = failed_drain.get();
+                    why = "InitializationSettlementTestRefusal";
+                    return false;
+                });
+            if (!Require(preparation_entered && !refused.committed && !settled && coordinator->RawLeaseHeld() &&
+                coordinator->MountedVolumeCount() == count, "initialization settlement: real drain timeout retains actual lease and stores")) return false;
+            for (unsigned index = 0; index < count; ++index)
+            {
+                const auto& ctx = *contexts[index];
+                if (!Require(ctx.container_coordinator == coordinator.get() && ctx.container_volume_oid == 101 + index &&
+                    ctx.metadata_store == coordinator->FindSessionStore(101 + index) && ctx.sd &&
+                    std::filesystem::is_directory(ctx.cache_root) && !ctx.native_write_enabled &&
+                    !ctx.manifest_mount_attached.load() && !ctx.mount_ready.load(),
+                    "initialization settlement: failed drain preserves bindings and resources without claiming writable mounts")) return false;
+            }
+        }
+        else
+        {
+            settled = SettleFailedManifestInitialization(process_args, *coordinator, contexts);
+            if (!Require(settled && !coordinator->RawLeaseHeld() && coordinator->MountedVolumeCount() == 0,
+                "initialization settlement: successful real drain releases every session and lease")) return false;
+        }
+        const auto bytes = ReadFileBytes(process_args.status_file);
+        const std::string status(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        if (!Require(!bytes.empty() && status.find("\"containerUuid\":\"" + uuid + "\"") != std::string::npos &&
+            status.find("\"ownerPid\":" + std::to_string(GetCurrentProcessId()) + ",") != std::string::npos &&
+            status.find("\"ownerStartFileTimeUtc\":" + std::to_string(start) + ",") != std::string::npos &&
+            status.find("\"checkpointXid\":" + std::to_string(xid) + ",") != std::string::npos,
+            "initialization settlement: actual status identifies the exact original source, owner instance and checkpoint")) return false;
+        if (timeout)
+        {
+            if (!Require(status.find("\"leaseHeld\":true") != std::string::npos &&
+                status.find("\"volumes\":[]") == std::string::npos &&
+                status.find("\"canonicalId\":\"apfs-vol:" + uuid + ":101\"") != std::string::npos &&
+                status.find("\"canonicalId\":\"apfs-vol:" + uuid + ":102\"") != std::string::npos &&
+                status.find("\"mounted\":true") == std::string::npos && status.find("\"writable\":true") == std::string::npos,
+                "initialization settlement: failed drain publishes retained ownership, never an empty clean terminal")) return false;
+            if (!Require(SettleFailedManifestInitialization(process_args, *coordinator, contexts),
+                "initialization settlement: actual retry succeeds only after admitted preparation releases ownership")) return false;
+        }
+        const auto terminal_bytes = ReadFileBytes(process_args.status_file);
+        const std::string terminal(reinterpret_cast<const char*>(terminal_bytes.data()), terminal_bytes.size());
+        if (!Require(terminal.find("\"leaseHeld\":false") != std::string::npos &&
+            terminal.find("\"volumes\":[]") != std::string::npos && terminal.find("\"recoveryRequired\":false") != std::string::npos &&
+            coordinator->CheckpointXid() == xid && ReadFileBytes(image) == original,
+            "initialization settlement: real terminal status and drain cannot mutate or advance the original source")) return false;
+        for (const auto& context : contexts)
+            if (!Require(!context->container_coordinator && !context->container_volume_oid && !context->metadata_store &&
+                !context->sd && !context->sd_size && !context->native_write_enabled &&
+                !std::filesystem::exists(context->session_root),
+                "initialization settlement: only successful drain clears borrowers and frees initialization resources")) return false;
+    }
+    return true;
 }
 
 bool TestManifestPartialStartupDrainsStartedSibling()
@@ -43345,7 +44831,7 @@ struct DirectorySymlinkFixture
     explicit DirectorySymlinkFixture(bool manifest)
         : image("directory-symlink", true, !manifest) {}
 
-    bool Initialize(bool manifest)
+    bool Initialize(bool manifest, bool exclusive_image = false)
     {
         auto& c = *context;
         volume.device_path = image.path.wstring();
@@ -43367,7 +44853,7 @@ struct DirectorySymlinkFixture
             std::string error;
             coordinator = apfsaccess::catalog::ContainerMountCoordinator::Open(
                 image.path.string(), 0, error,
-                apfsaccess::catalog::CatalogLoadPolicy::StrictApple, true, true);
+                apfsaccess::catalog::CatalogLoadPolicy::StrictApple, true, true, exclusive_image);
             if (!Require(coordinator != nullptr, "directory link: strict coordinator opens")) return false;
             c.args.container_id = Utf8ToWide(coordinator->ContainerUuidHex());
             std::wstring mount_error;
@@ -43419,6 +44905,684 @@ struct DirectorySymlinkFixture
 };
 
 
+
+bool TestManifestFirstMutationFailure(bool batched, bool accepted_debt = false)
+{
+    using Store = apfsaccess::rw::MetadataStore;
+    using Operation = Store::MutationOperation;
+    DirectorySymlinkFixture fixture(true);
+    if (!Require(fixture.Initialize(true), "first failure: strict manifest fixture initializes")) return false;
+    auto& context = *fixture.context;
+    auto& coordinator = *fixture.coordinator;
+    if (!accepted_debt && !Require(context.tx_manager->Begin() && context.tx_manager->Abort() &&
+            context.tx_manager->CanClearRecoveryState(),
+            "first failure: complete zero-watermark WAL authenticates marker cleanup")) return false;
+    std::array<std::byte, 8> accepted_payload{};
+    if (accepted_debt)
+    {
+        Store::MutationRequest create;
+        create.operation = Operation::CreateFile; create.path = L"\\accepted.bin";
+        Store::MutationRequest write;
+        write.operation = Operation::Write; write.path = create.path; write.length = accepted_payload.size();
+        EnqueueManifestRequest(&context, create);
+        EnqueueManifestRequest(&context, write);
+        if (!Require(AcceptQueuedManifestWritesWithWalBestEffort(&context, write.path, 0,
+                accepted_payload.data(), static_cast<std::uint32_t>(accepted_payload.size()), L"FirstFailureSeed") ==
+                ManifestWriteBatchResult::Accepted && context.metadata_store->PendingMutationCount() != 0,
+                "first failure: real identity-bound WAL acceptance leaves older native work pending")) return false;
+    }
+
+    Store::MutationRequest first;
+    first.operation = Operation::CreateFile; first.path = L"\\first.bin";
+    Store::MutationRequest failed;
+    failed.operation = Operation::Write;
+    failed.path = accepted_debt ? first.path : L"\\missing.bin";
+    failed.offset = 2097152; failed.length = 1048576;
+    Store::MutationRequest later;
+    later.operation = Operation::CreateFile; later.path = L"\\later.bin";
+    const std::vector<Store::MutationRequest> requests{first, failed, later};
+    const auto expected_status = accepted_debt ? Store::MutationStatus::AllocationFailed : Store::MutationStatus::InvalidRequest;
+    const auto before_image = ReadFileBytes(fixture.image.path);
+    const auto before_wal = ReadFileBytes(context.session_root / "accepted.wal");
+    const auto before_spool_bytes = ReadFileBytes(context.session_root / "payload-spool" / "payload-spool.bin");
+    const auto before_spool_index = ReadFileBytes(context.session_root / "payload-spool" / "payload-spool.idx");
+    const auto before_marks = context.tx_manager->Watermarks();
+    const auto before_spool = context.payload_spool->SnapshotCounters();
+    const auto before_pending = context.metadata_store->PendingMutationCount();
+    const auto before_checkpoint = coordinator.CheckpointXid();
+    const auto before_census = coordinator.CheckpointCensusSnapshot();
+    if (!accepted_debt)
+    {
+        unsigned bind_calls = 0;
+        const auto result = coordinator.Commit(101, requests,
+            [&](const auto&, const auto&, auto, auto&, auto&) { ++bind_calls; return true; });
+        const auto& failure = result.mutation_staging_failure;
+        std::cerr << "[INFO] coordinator refusal: status=" << (result.mutation_staging_status
+                ? static_cast<int>(*result.mutation_staging_status) : -1)
+            << " index=" << (failure ? std::to_string(failure->mutation_index) : "absent")
+            << " reason=" << (failure ? WideToUtf8(failure->reason) : "absent")
+            << " clean=" << result.clean_prepublication_refusal
+            << " pending=" << context.metadata_store->PendingMutationCount()
+            << " error=" << result.error << '\n';
+        if (!Require(result.mutation_staging_status == expected_status && failure &&
+                failure->mutation_index == 1 && failure->operation == failed.operation &&
+                failure->path == failed.path && failure->secondary_path.empty() &&
+                failure->offset == failed.offset && failure->length == failed.length &&
+                failure->reason == L"WriteTargetMissingOrNotRegularFile" &&
+                result.error.find("WriteTargetMissingOrNotRegularFile") != std::string::npos &&
+                result.clean_prepublication_refusal && bind_calls == 0 &&
+                context.metadata_store->PendingMutationCount() == 0 &&
+                !context.metadata_store->LookupWorkingInodeByPath(first.path),
+                "first failure: coordinator preserves index, selectors and staging reason across actual rollback")) return false;
+    }
+
+    std::optional<MutationCallbackScope> callback;
+    callback.emplace(&context);
+    if (!Require(UpdateRecoveryMarkerBestEffort(&context, true),
+            "first failure: arm actual marker before staging the callback")) return false;
+    for (const auto& request : requests) EnqueueManifestRequest(&context, request);
+    const std::vector<std::byte> payload(static_cast<std::size_t>(failed.length), std::byte{0x5a});
+    ManifestCommitOutcome queued_outcome;
+    if (batched)
+    {
+        if (!Require(AcceptQueuedManifestWritesWithWalBestEffort(&context, failed.path, failed.offset,
+                payload.data(), static_cast<std::uint32_t>(payload.size()), L"FirstFailureBatch") ==
+                ManifestWriteBatchResult::Failed, "first failure: real deferred manifest batch refuses")) return false;
+    }
+    else
+    {
+        ManifestJournalExpectation expectation;
+        expectation.path = failed.path; expectation.offset = failed.offset; expectation.length = failed.length;
+        expectation.payload = payload.data(); expectation.payload_bytes = static_cast<std::uint32_t>(payload.size());
+        expectation.has_payload = true;
+        if (!Require(!CommitQueuedManifestMutationWithWalBestEffort(&context, expectation, L"FirstFailureQueue",
+                {}, {}, false, &queued_outcome) && queued_outcome.mutation_staging_failure &&
+                queued_outcome.mutation_staging_failure->mutation_index == 1 &&
+                queued_outcome.mutation_staging_status == expected_status,
+                "first failure: ordinary queued funnel propagates the typed result")) return false;
+    }
+    const auto after_marks = context.tx_manager->Watermarks();
+    const auto after_spool = context.payload_spool->SnapshotCounters();
+    if (!Require(context.last_native_mutation_failure_operation == L"Write" &&
+            context.last_native_mutation_failure_path == failed.path &&
+            context.last_native_mutation_failure_status == (accepted_debt ? L"allocation-failed" : L"invalid-request") &&
+            context.last_native_mutation_failure_status_code == static_cast<int>(expected_status) &&
+            context.last_native_mutation_failure_index == 1 &&
+            context.last_native_mutation_failure_offset == failed.offset &&
+            context.last_native_mutation_failure_length == failed.length &&
+            (accepted_debt || context.last_native_mutation_failure_reason == L"WriteTargetMissingOrNotRegularFile") &&
+            ReadFileBytes(fixture.image.path) == before_image &&
+            ReadFileBytes(context.session_root / "accepted.wal") == before_wal &&
+            ReadFileBytes(context.session_root / "payload-spool" / "payload-spool.bin") == before_spool_bytes &&
+            ReadFileBytes(context.session_root / "payload-spool" / "payload-spool.idx") == before_spool_index &&
+            after_marks.accepted_sequence == before_marks.accepted_sequence &&
+            after_marks.apfs_durable_sequence == before_marks.apfs_durable_sequence &&
+            after_marks.cleanup_sequence == before_marks.cleanup_sequence &&
+            after_spool.dirty_range_count == before_spool.dirty_range_count &&
+            after_spool.spool_bytes == before_spool.spool_bytes &&
+            after_spool.append_direct_count == before_spool.append_direct_count &&
+            after_spool.append_merged_count == before_spool.append_merged_count,
+            "first failure: precise refusal detail records without accepting, publishing or discarding WAL/spool")) return false;
+    if (accepted_debt)
+    {
+        const auto restored = DrainManifestRequests(&context);
+        if (!Require(restored.size() == 3 && restored[0].path == first.path &&
+                restored[1].path == failed.path && restored[1].deferred_payload == payload &&
+                restored[2].path == later.path && coordinator.RecoveryReason() == "DeferredStageFailed" &&
+                context.metadata_store->PendingMutationCount() >= before_pending,
+                "first failure: fail-closed batch retains older accepted work and ordered unaccepted queue")) return false;
+        RestoreManifestRequests(&context, restored);
+        if (!Require(BlockNativeMutationAfterStagingFailure(&context, L"Write") == STATUS_MEDIA_WRITE_PROTECTED &&
+                context.write_degraded && !context.native_write_enabled && context.recovery_active &&
+                context.runtime_recovery_reason == L"NativeMutationStagingFailed",
+                "first failure: allocation refusal with accepted debt preserves host fail-closed status")) return false;
+    }
+    else
+    {
+        const auto status = BlockNativeMutationAfterStagingFailure(&context, L"Write", false);
+        const auto after_census = coordinator.CheckpointCensusSnapshot();
+        RecoveryMarkerState marker;
+        std::fprintf(stderr, "[INFO] first clean failure batched=%d status=%lx native=%d degraded=%d\n",
+            batched, static_cast<unsigned long>(status), context.native_write_enabled.load(), context.write_degraded.load());
+        if (!Require(status == STATUS_NOT_SUPPORTED && context.native_write_enabled &&
+                !context.overlay_write_enabled && !context.write_degraded && !context.recovery_active &&
+                !context.pending_native_writes && !context.unjournaled_native_mutation &&
+                context.manifest_preaccept_failure_status.load() == STATUS_SUCCESS &&
+                ManifestQueuedRequestCount(&context) == 0 && !coordinator.IsRecoveryRequired() &&
+                context.metadata_store->PendingMutationCount() == 0 &&
+                coordinator.CheckpointXid() == before_checkpoint &&
+                before_census.size() == after_census.size() &&
+                std::equal(before_census.begin(), before_census.end(), after_census.begin(), [](const auto& a, const auto& b) {
+                    return a.volume_object_id == b.volume_object_id && a.required_checkpoint_xids == b.required_checkpoint_xids &&
+                        a.unapplied_accepted_work == b.unapplied_accepted_work;
+                }) && TryLoadRecoveryMarkerState(context.recovery_marker_file, marker) && !marker.dirty,
+                "first failure: final helper consumes proven clean refusal without degrading, moving census or retaining dirty marker")) return false;
+    }
+    callback.reset();
+
+    context.args.status_file = (context.session_root / "direct-status.json").wstring();
+    Arguments process_args;
+    process_args.status_file = (context.session_root / "shared-status.json").wstring();
+    std::vector<std::unique_ptr<MountContext>> contexts;
+    contexts.push_back(std::move(fixture.context));
+    ScopeExit restore_context{[&] { fixture.context = std::move(contexts[0]); }};
+    if (!Require(WriteHostStatusFile(context) && WriteContainerStatusFile(process_args, coordinator, contexts),
+            "first failure: direct and shared status both serialize")) return false;
+    std::ostringstream expected;
+    AppendNativeMutationFailureJson(expected, context);
+    const auto packet = expected.str();
+    std::cerr << "[INFO] first failure: " << packet << '\n';
+    for (const auto& path : {context.args.status_file, process_args.status_file})
+    {
+        const auto bytes = ReadFileBytes(path);
+        const std::string json(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        if (!Require(json.find("\"lastNativeMutationFailure\":" + packet) != std::string::npos &&
+                json.find("\"mutationIndex\":1") != std::string::npos &&
+                json.find("\"offset\":2097152,\"length\":1048576") != std::string::npos &&
+                json.find("deferred_payload") == std::string::npos && json.find(std::string(32, 'Z')) == std::string::npos,
+                "first failure: both status surfaces carry the same request selectors without payload")) return false;
+    }
+    const auto snapshot = CaptureCallbackStatusSnapshot(context);
+    context.last_native_mutation_failure_offset = failed.offset + 1;
+    if (!Require(!CallbackStatusSnapshotsEqual(snapshot, CaptureCallbackStatusSnapshot(context)),
+            "first failure: range-only changes invalidate callback status coalescing")) return false;
+    context.last_native_mutation_failure_offset = failed.offset;
+    if (!accepted_debt)
+    {
+        MutationCallbackScope next_callback(&context);
+        Store::MutationRequest healthy;
+        healthy.operation = Operation::CreateFile; healthy.path = L"\\healthy-after-refusal.bin";
+        bool staged = true;
+        Store::PayloadIdentity identity;
+        if (!Require(RecordNativeMutationBestEffort(&context, healthy.operation, healthy.path, L"", 0, 0,
+                    false, 0, &identity, &staged) && !staged &&
+                RecordMutationBestEffort(&context, apfsaccess::rw::TransactionManager::MutationKind::CreateFile,
+                    healthy.path, L"", 0, 0, false, 0, 0, &identity) &&
+                context.metadata_store->LookupCommittedInodeByPath(healthy.path) &&
+                !context.metadata_store->LookupCommittedInodeByPath(first.path) &&
+                !context.metadata_store->LookupCommittedInodeByPath(later.path) &&
+                context.tx_manager->Watermarks().accepted_sequence > before_marks.accepted_sequence &&
+                context.tx_manager->Watermarks().cleanup_sequence == context.tx_manager->Watermarks().accepted_sequence &&
+                context.native_write_enabled && !context.write_degraded && !context.recovery_active,
+                "first failure: same session publishes subsequent healthy work without replaying rejected requests")) return false;
+    }
+    return true;
+}
+
+bool TestManifestCleanRefusalCallbacks()
+{
+    using Store = apfsaccess::rw::MetadataStore;
+    using Tx = apfsaccess::rw::TransactionManager;
+    bool ok = true;
+    for (const std::string mode : {"queued-write", "batched-write", "create-security", "delete", "parent-delete"})
+    {
+        SetEnvironmentVariableW(L"APFSACCESS_DISABLE_MANIFEST_WRITE_BATCHING", mode == "batched-write" ? L"0" : L"1");
+        ScopeExit restore_batching{[] { SetEnvironmentVariableW(L"APFSACCESS_DISABLE_MANIFEST_WRITE_BATCHING", nullptr); }};
+        if (!Require(IsManifestWriteBatchingEnabled() == (mode == "batched-write"),
+                "clean callback: actual batching policy selects the intended funnel")) return false;
+        DirectorySymlinkFixture fixture(true);
+        if (!Require(fixture.Initialize(true), "clean callback: strict manifest fixture initializes")) return false;
+        auto& c = *fixture.context;
+        c.args.write_max_dirty_transactions = 32;
+        const bool parent_delete = mode == "parent-delete";
+        const std::wstring parent_path = L"\\callback-parent";
+        std::vector<Store::MutationRequest> seeds;
+        if (parent_delete)
+        {
+            Store::MutationRequest directory;
+            directory.operation = Store::MutationOperation::CreateDirectory;
+            directory.path = parent_path;
+            seeds.push_back(directory);
+        }
+        Store::MutationRequest seed;
+        seed.operation = Store::MutationOperation::CreateFile;
+        seed.path = parent_delete ? parent_path + L"\\callback.bin" : L"\\callback.bin";
+        seeds.push_back(seed);
+        if (!Require(fixture.coordinator->Commit(101, seeds).committed &&
+                MergeCommittedInodeStateIntoNodeIndex(&c) && c.tx_manager->Begin() && c.tx_manager->Abort() &&
+                c.tx_manager->CanClearRecoveryState(),
+                "clean callback: publish target and authenticate complete empty WAL")) return false;
+        auto fs = BuildFileSystem(&c);
+        PVOID handle = nullptr;
+        FSP_FSCTL_FILE_INFO info{};
+        if (mode != "create-security" && !Require(CB_Open(&fs, seed.path.data(), FILE_NON_DIRECTORY_FILE,
+                FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | DELETE, &handle, &info) == STATUS_SUCCESS,
+                "clean callback: open real committed target")) return false;
+        ScopeExit close_handle{[&] {
+            if (handle) { CB_Cleanup(&fs, handle, nullptr, 0); CB_Close(&fs, handle); }
+        }};
+        auto node = c.nodes.at(Key(&c, seed.path));
+        const auto parent_node = parent_delete ? c.nodes.at(Key(&c, parent_path)) : std::shared_ptr<Node>{};
+        if (parent_delete)
+        {
+            PVOID parent_handle = nullptr;
+            if (!Require(CB_Open(&fs, const_cast<PWSTR>(parent_path.c_str()), FILE_DIRECTORY_FILE,
+                    DELETE, &parent_handle, &info) == STATUS_SUCCESS,
+                    "clean parent callback: open committed directory while last child is held")) return false;
+            CB_Cleanup(&fs, parent_handle, const_cast<PWSTR>(parent_path.c_str()), FspCleanupDelete);
+            CB_Close(&fs, parent_handle);
+            if (!Require(parent_node->delete_requested_after_children &&
+                    c.metadata_store->LookupCommittedInodeByPath(parent_path) &&
+                    ManifestQueuedRequestCount(&c) == 0 && !c.write_degraded,
+                    "clean parent callback: real directory disposition waits for its last open child")) return false;
+        }
+        const auto times = VisibleInodeTimes(*node);
+        const auto size = node->file_size;
+        const auto hydration = ReadFileBytes(HydrationPath(&c, *node));
+        const auto image = ReadFileBytes(fixture.image.path);
+        const auto wal = ReadFileBytes(c.session_root / "accepted.wal");
+        const auto spool = ReadFileBytes(c.session_root / "payload-spool" / "payload-spool.bin");
+        const auto index = ReadFileBytes(c.session_root / "payload-spool" / "payload-spool.idx");
+        const auto marks = c.tx_manager->Watermarks();
+        const auto checkpoint = fixture.coordinator->CheckpointXid();
+        const auto before_attempts = c.test_native_commit_attempt_count;
+        unsigned accepts = 0, publications = 0;
+        c.tx_manager->SetFaultInjectionHook([&](std::string_view stage) { if (stage == "accept-start") ++accepts; });
+        c.metadata_store->SetCommitStageHook([&](std::string_view stage) {
+            if (stage == "before-apple-publish") ++publications;
+            return true;
+        });
+        ScopeExit reset_hooks{[&] { c.tx_manager->SetFaultInjectionHook({}); c.metadata_store->SetCommitStageHook({}); }};
+        // A real native missing-target refusal is encountered before the valid
+        // callback request. The batched path requires a genuinely bound payload.
+        Store::MutationRequest invalid;
+        invalid.operation = Store::MutationOperation::Write; invalid.path = L"\\missing.bin";
+        invalid.length = 1; invalid.deferred_payload = {std::byte{'X'}}; invalid.deferred_payload_bound = true;
+        EnqueueManifestRequest(&c, invalid);
+        const auto payload = BuildPatternPayloadForTest(32, 0x83);
+        ULONG done = 999;
+        NTSTATUS status = STATUS_UNSUCCESSFUL;
+        PSECURITY_DESCRIPTOR security = nullptr;
+        if (!Require(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"O:BAG:BAD:P(A;;FA;;;WD)",
+                SDDL_REVISION_1, &security, nullptr) != FALSE, "clean callback: valid creation security")) return false;
+        ScopeExit free_security{[&] { LocalFree(security); }};
+        if (mode == "create-security")
+            status = CB_Create(&fs, const_cast<PWSTR>(L"\\with-security.bin"), FILE_NON_DIRECTORY_FILE,
+                FILE_READ_DATA | FILE_WRITE_DATA, 0, security, 0, &handle, &info);
+        else if (mode == "delete" || parent_delete)
+        {
+            CB_Cleanup(&fs, handle, seed.path.data(), FspCleanupDelete);
+            CB_Close(&fs, handle); handle = nullptr;
+        }
+        else
+            status = CB_Write(&fs, handle, const_cast<std::byte*>(payload.data()), 0,
+                static_cast<ULONG>(payload.size()), FALSE, FALSE, &done, &info);
+        c.tx_manager->SetFaultInjectionHook({});
+        c.metadata_store->SetCommitStageHook({});
+        RecoveryMarkerState marker;
+        const auto after_marks = c.tx_manager->Watermarks();
+        const bool durable_unchanged = ReadFileBytes(fixture.image.path) == image &&
+            ReadFileBytes(c.session_root / "accepted.wal") == wal &&
+            ReadFileBytes(c.session_root / "payload-spool" / "payload-spool.bin") == spool &&
+            ReadFileBytes(c.session_root / "payload-spool" / "payload-spool.idx") == index &&
+            after_marks.accepted_sequence == marks.accepted_sequence &&
+            after_marks.apfs_durable_sequence == marks.apfs_durable_sequence &&
+            after_marks.cleanup_sequence == marks.cleanup_sequence && fixture.coordinator->CheckpointXid() == checkpoint;
+        const bool healthy_refusal = c.native_write_enabled && !c.write_degraded && !c.recovery_active &&
+            !c.pending_native_writes && !c.unjournaled_native_mutation &&
+            c.manifest_preaccept_failure_status.load() == STATUS_SUCCESS &&
+            ManifestQueuedRequestCount(&c) == 0 && c.metadata_store->PendingMutationCount() == 0 &&
+            !fixture.coordinator->IsRecoveryRequired() && TryLoadRecoveryMarkerState(c.recovery_marker_file, marker) && !marker.dirty;
+        std::fprintf(stderr, "[INFO] clean callback mode=%s accepts=%u publications=%u unchanged=%d healthy=%d\n",
+            mode.c_str(), accepts, publications, durable_unchanged, healthy_refusal);
+        ok &= Require((mode == "delete" || parent_delete || status == STATUS_NOT_SUPPORTED) && durable_unchanged && healthy_refusal &&
+                accepts == 0 && publications == 0 && c.last_native_mutation_failure_index == 0 &&
+                (mode == "batched-write" ? c.test_native_commit_attempt_count == before_attempts :
+                    c.test_native_commit_attempt_count > before_attempts) &&
+                c.last_native_mutation_failure_reason == L"WriteTargetMissingOrNotRegularFile",
+            "clean callback: actual pre-binder refusal keeps precise reason, durable evidence and write admission");
+        if (mode == "delete" || parent_delete)
+        {
+            ok &= Require(c.nodes.at(Key(&c, seed.path)) == node && node->caller_delete_retry_required &&
+                    IsDeleteBlockedStateLocked(node) && !FindNode(&c, seed.path) &&
+                    c.metadata_store->LookupCommittedInodeByPath(seed.path),
+                "clean callback: void delete restores the actual node and re-arms pending disposition without phantom success");
+            if (parent_delete)
+                ok &= Require(c.nodes.at(Key(&c, parent_path)) == parent_node && parent_node->caller_delete_retry_required &&
+                        IsDeleteBlockedStateLocked(parent_node) && !FindNode(&c, parent_path) &&
+                        c.metadata_store->LookupCommittedInodeByPath(parent_path),
+                    "clean parent callback: deferred parent survives rollback with hidden pending disposition and caller retry");
+            continue;
+        }
+        ok &= Require(node->file_size == size && VisibleInodeTimes(*node) == times &&
+                ReadFileBytes(HydrationPath(&c, *node)) == hydration &&
+                (mode != "create-security" || (!handle && !FindNode(&c, L"\\with-security.bin") &&
+                    !c.metadata_store->LookupCommittedInodeByPath(L"\\with-security.bin"))) &&
+                (mode == "create-security" || done == 0),
+            "clean callback: refused create/write rolls back local namespace, payload and metadata with no acknowledgement");
+        if (!healthy_refusal) continue;
+        if (mode == "create-security")
+        {
+            ok &= Require(CB_Create(&fs, const_cast<PWSTR>(L"\\with-security.bin"), FILE_NON_DIRECTORY_FILE,
+                    FILE_READ_DATA | FILE_WRITE_DATA, 0, security, 0, &handle, &info) == STATUS_SUCCESS && handle &&
+                    c.metadata_store->LookupCommittedInodeByPath(L"\\with-security.bin"),
+                "clean callback: same session subsequently publishes a security-bearing create");
+        }
+        else
+        {
+            done = 0;
+            std::array<std::byte, 32> actual{};
+            ULONG read = 0;
+            ok &= Require(CB_Write(&fs, handle, const_cast<std::byte*>(payload.data()), 0,
+                    static_cast<ULONG>(payload.size()), FALSE, FALSE, &done, &info) == STATUS_SUCCESS &&
+                    done == payload.size() && CB_Flush(&fs, handle, &info) == STATUS_SUCCESS &&
+                    CB_Read(&fs, handle, actual.data(), 0, static_cast<ULONG>(actual.size()), &read) == STATUS_SUCCESS &&
+                    read == actual.size() && std::equal(actual.begin(), actual.end(), payload.begin()),
+                "clean callback: same handle subsequently writes, flushes and reads exact payload without remount");
+        }
+        const auto final_marks = c.tx_manager->Watermarks();
+        ok &= Require(final_marks.accepted_sequence > marks.accepted_sequence &&
+                final_marks.accepted_sequence == final_marks.apfs_durable_sequence &&
+                final_marks.accepted_sequence == final_marks.cleanup_sequence && c.native_write_enabled &&
+                !c.write_degraded && !c.recovery_active && !c.pending_native_writes,
+            "clean callback: healthy follow-up completes real WAL/APFS/cleanup durability on the same session");
+    }
+    return ok;
+}
+
+bool TestManifestCleanupFailureClassification(const std::string& mode)
+{
+    using Store = apfsaccess::rw::MetadataStore;
+    const bool allocation = mode == "allocation-retention";
+    const bool accepted_debt = mode == "accepted-debt";
+    const bool invariant = mode == "invariant";
+    const bool unsupported = mode == "unsupported";
+    DirectorySymlinkFixture fixture(true);
+    if (!Require(fixture.Initialize(true, invariant), "cleanup classification: strict fixture initializes")) return false;
+    auto& c = *fixture.context;
+    c.args.write_max_dirty_transactions = 32;
+    Store::MutationRequest seed;
+    seed.operation = Store::MutationOperation::CreateFile;
+    seed.path = L"\\cleanup-classification.bin";
+    std::vector<Store::MutationRequest> seeds{seed};
+    if (allocation)
+    {
+        auto reserve = seed;
+        reserve.operation = Store::MutationOperation::SetAllocationSize;
+        reserve.length = 16384;
+        seeds.push_back(reserve);
+    }
+    if (!Require(fixture.coordinator->Commit(101, seeds).committed &&
+            MergeCommittedInodeStateIntoNodeIndex(&c) && c.tx_manager->Begin() && c.tx_manager->Abort(),
+            "cleanup classification: committed target and authenticated empty WAL")) return false;
+    auto fs = BuildFileSystem(&c);
+    PVOID handle = nullptr;
+    FSP_FSCTL_FILE_INFO info{};
+    if (!Require(CB_Open(&fs, seed.path.data(), FILE_NON_DIRECTORY_FILE,
+            FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, &handle, &info) == STATUS_SUCCESS,
+            "cleanup classification: real metadata handle opens")) return false;
+    ScopeExit close{[&] { CB_Close(&fs, handle); }};
+    const auto node = static_cast<OpenContext*>(handle)->node;
+    std::string error;
+    std::unique_ptr<apfsaccess::rw::TransactionManager> sibling_tx;
+    if (accepted_debt)
+    {
+        Store::MutationRequest create;
+        create.operation = Store::MutationOperation::CreateFile; create.path = L"\\accepted-before-cleanup.bin";
+        auto write = create;
+        write.operation = Store::MutationOperation::Write; write.length = 8;
+        std::array<std::byte, 8> payload{};
+        EnqueueManifestRequest(&c, create); EnqueueManifestRequest(&c, write);
+        if (!Require(AcceptQueuedManifestWritesWithWalBestEffort(&c, write.path, 0,
+                payload.data(), static_cast<std::uint32_t>(payload.size()), L"CleanupClassificationSeed") ==
+                ManifestWriteBatchResult::Accepted && c.tx_manager->HasUnappliedAcceptedWork() &&
+                c.metadata_store->PrepareNativeWritePath() && RefreshManifestCheckpointPinsAfterCleanup(c),
+                "cleanup classification: real accepted WAL/spool survive discarded unpublished staging")) return false;
+    }
+    else if (!invariant && !unsupported)
+    {
+        apfsaccess::catalog::ContainerVolumeSession sibling;
+        sibling.volume_object_id = 102; sibling.container_uuid_hex = fixture.coordinator->ContainerUuidHex();
+        sibling.requested_write = true; sibling.use_canonical_transaction = true;
+        sibling.metadata_context.allow_legacy_scaffold_for_fixtures = false;
+        if (!Require(fixture.coordinator->MountVolume(sibling, error),
+                "cleanup classification: real sibling session opens")) return false;
+        auto* store = fixture.coordinator->FindSessionStore(102);
+        Store::MutationRequest create;
+        create.operation = Store::MutationOperation::CreateFile; create.path = L"\\sibling-accepted.bin";
+        Store::PayloadIdentity identity;
+        if (!Require(store && store->StageMutation(create, &identity) == Store::MutationStatus::Applied,
+                "cleanup classification: sibling supplies a native replay identity")) return false;
+        sibling_tx = std::make_unique<apfsaccess::rw::TransactionManager>(L"Conservative");
+        sibling_tx->SetVolumeIdentity(L"cleanup-sibling");
+        sibling_tx->SetJournalPath((c.session_root / "sibling.wal").wstring());
+        apfsaccess::rw::TransactionManager::MutationIntent intent;
+        intent.kind = apfsaccess::rw::TransactionManager::MutationKind::CreateFile;
+        intent.path = create.path; intent.object_id = identity.object_id; intent.generation = identity.generation;
+        if (!Require(sibling_tx->Begin() && sibling_tx->RecordMutation(intent) &&
+                sibling_tx->Accept(fixture.coordinator->CheckpointXid()) &&
+                fixture.coordinator->UpdateRequiredCheckpointXids(102, {fixture.coordinator->CheckpointXid()}, error, true),
+                "cleanup classification: real accepted sibling WAL owns its checkpoint")) return false;
+    }
+    if (!invariant && !unsupported)
+    {
+        auto probe = seed;
+        probe.operation = Store::MutationOperation::SetAllocationSize; probe.length = 0;
+        unsigned bind_calls = 0;
+        const auto refusal = fixture.coordinator->Commit(101, {probe},
+            [&](const auto&, const auto&, auto, auto&, auto&) { ++bind_calls; return true; });
+        if (!Require(!refusal.committed && refusal.clean_prepublication_refusal && bind_calls == 0 &&
+                refusal.commit_status_code == static_cast<int>(Store::CommitStatus::RetentionBlocked) &&
+                refusal.commit_stage == "awaiting-accepted-recovery",
+                "cleanup classification: real coordinator proves typed pre-binder RetentionBlocked")) return false;
+    }
+    if (unsupported)
+    {
+        Store::MutationRequest invalid;
+        invalid.operation = Store::MutationOperation::Write; invalid.path = L"\\missing-cleanup-target";
+        invalid.length = 1;
+        EnqueueManifestRequest(&c, invalid);
+    }
+    auto& device = const_cast<apfsaccess::rw::BlockDevice&>(c.metadata_store->Device());
+    std::vector<std::byte> anchor;
+    if (invariant && !Require(device.Read(0, 4096, anchor), "cleanup invariant: fixture source anchor")) return false;
+    const auto image = ReadFileBytes(fixture.image.path);
+    const auto wal = ReadFileBytes(c.session_root / "accepted.wal");
+    const auto sibling_wal = ReadFileBytes(c.session_root / "sibling.wal");
+    const auto spool = ReadFileBytes(c.session_root / "payload-spool" / "payload-spool.bin");
+    const auto index = ReadFileBytes(c.session_root / "payload-spool" / "payload-spool.idx");
+    const auto marks = c.tx_manager->Watermarks();
+    const auto census = fixture.coordinator->CheckpointCensusSnapshot();
+    const auto checkpoint = fixture.coordinator->CheckpointXid();
+    const auto times = VisibleInodeTimes(*node);
+    const auto allocation_size = node->allocation_size;
+    unsigned accepts = 0, publications = 0, injected = 0;
+    c.tx_manager->SetFaultInjectionHook([&](std::string_view stage) { if (stage == "accept-start") ++accepts; });
+    c.metadata_store->SetCommitStageHook([&](std::string_view stage) {
+        if (stage == "before-apple-device-write") ++publications;
+        if (!invariant || stage != "after-apple-prepared-plan-retain") return true;
+        ++injected;
+        return device.Write(0, anchor) && device.Flush();
+    });
+    ScopeExit reset{[&] { c.tx_manager->SetFaultInjectionHook({}); c.metadata_store->SetCommitStageHook({}); }};
+    CB_Cleanup(&fs, handle, seed.path.data(), allocation ? FspCleanupSetAllocationSize : FspCleanupSetLastWriteTime);
+    c.tx_manager->SetFaultInjectionHook({}); c.metadata_store->SetCommitStageHook({});
+    const auto after = c.tx_manager->Watermarks();
+    const auto after_census = fixture.coordinator->CheckpointCensusSnapshot();
+    RecoveryMarkerState marker;
+    const bool marker_loaded = TryLoadRecoveryMarkerState(c.recovery_marker_file, marker);
+    bool ok = Require(accepts == 0 && publications == 0 && ReadFileBytes(fixture.image.path) == image &&
+            ReadFileBytes(c.session_root / "accepted.wal") == wal &&
+            ReadFileBytes(c.session_root / "sibling.wal") == sibling_wal &&
+            ReadFileBytes(c.session_root / "payload-spool" / "payload-spool.bin") == spool &&
+            ReadFileBytes(c.session_root / "payload-spool" / "payload-spool.idx") == index &&
+            after.accepted_sequence == marks.accepted_sequence && after.apfs_durable_sequence == marks.apfs_durable_sequence &&
+            after.cleanup_sequence == marks.cleanup_sequence && fixture.coordinator->CheckpointXid() == checkpoint &&
+            VisibleInodeTimes(*node) == times && node->allocation_size == allocation_size &&
+            c.metadata_store->PendingMutationCount() == 0 && ManifestQueuedRequestCount(&c) == 0 &&
+            census.size() == after_census.size() && std::equal(census.begin(), census.end(), after_census.begin(),
+                [](const auto& a, const auto& b) { return a.volume_object_id == b.volume_object_id &&
+                    a.required_checkpoint_xids == b.required_checkpoint_xids && a.unapplied_accepted_work == b.unapplied_accepted_work; }),
+        "cleanup classification: no acceptance, publication, visible update, evidence loss or census change");
+    if (invariant)
+        ok &= Require(injected == 1 && c.write_degraded && c.recovery_active && !c.native_write_enabled &&
+                !c.overlay_write_enabled && marker_loaded && marker.dirty &&
+                c.metadata_store->LastCommitFailureReason() == L"ApplePreparedPlanSourceChanged",
+            "cleanup invariant: actual source-invariant failure still hard degrades the mount");
+    else if (accepted_debt)
+        ok &= Require(!c.native_write_enabled && c.write_degraded && c.recovery_active &&
+                !c.overlay_write_enabled && !c.unjournaled_native_mutation &&
+                !fixture.coordinator->IsRecoveryRequired() && marker_loaded && marker.dirty &&
+                c.tx_manager->HasUnappliedAcceptedWork() && c.pending_native_writes &&
+                after.accepted_sequence > after.apfs_durable_sequence && after.accepted_sequence > after.cleanup_sequence &&
+                CommitNativeMutationsBestEffort(&c, L"CleanupAcceptedDebtRetry") == STATUS_MEDIA_WRITE_PROTECTED &&
+                ReadFileBytes(fixture.image.path) == image && ReadFileBytes(c.session_root / "accepted.wal") == wal,
+            "cleanup classification: own accepted debt stays recoverable and closes admission without publication");
+    else
+        ok &= Require(c.native_write_enabled && !c.write_degraded && !c.recovery_active &&
+                !c.unjournaled_native_mutation && !fixture.coordinator->IsRecoveryRequired() && marker_loaded &&
+                marker.dirty == accepted_debt && c.tx_manager->HasUnappliedAcceptedWork() == accepted_debt &&
+                c.pending_native_writes == accepted_debt &&
+                c.manifest_preaccept_failure_status.load() == STATUS_SUCCESS &&
+                (!accepted_debt || (after.accepted_sequence > after.apfs_durable_sequence &&
+                    after.accepted_sequence > after.cleanup_sequence)),
+            "cleanup classification: callee's clean refusal preserves admission and any older accepted debt");
+    if (sibling_tx)
+        ok &= Require(sibling_tx->HasUnappliedAcceptedWork() && !sibling_wal.empty(),
+            "cleanup classification: sibling accepted debt remains owned and recoverable");
+    std::fprintf(stderr, "[INFO] cleanup classification mode=%s accepts=%u publications=%u injections=%u degraded=%d debt=%d operation=%ls\n",
+        mode.c_str(), accepts, publications, injected, static_cast<int>(c.write_degraded),
+        static_cast<int>(c.tx_manager->HasUnappliedAcceptedWork()), c.last_native_mutation_failure_operation.c_str());
+    return ok;
+}
+
+bool TestManifestCapacityInvariantDisablesWrites()
+{
+    using Store = apfsaccess::rw::MetadataStore;
+    DirectorySymlinkFixture fixture(true);
+    if (!Require(fixture.Initialize(true, true), "capacity invariant: exclusive manifest initializes")) return false;
+    auto& c = *fixture.context;
+    Store::MutationRequest seed;
+    seed.operation = Store::MutationOperation::CreateFile;
+    seed.path = L"\\capacity-invariant.bin";
+    if (!Require(fixture.coordinator->Commit(101, {seed}).committed &&
+            MergeCommittedInodeStateIntoNodeIndex(&c) && c.tx_manager->Begin() && c.tx_manager->Abort(),
+            "capacity invariant: native target and clean original WAL")) return false;
+    auto fs = BuildFileSystem(&c);
+    PVOID handle = nullptr;
+    FSP_FSCTL_FILE_INFO info{};
+    if (!Require(CB_Open(&fs, seed.path.data(), FILE_NON_DIRECTORY_FILE, FILE_WRITE_ATTRIBUTES,
+            &handle, &info) == STATUS_SUCCESS, "capacity invariant: real attribute handle")) return false;
+    ScopeExit close{[&] { CB_Cleanup(&fs, handle, nullptr, 0); CB_Close(&fs, handle); }};
+    auto& device = const_cast<apfsaccess::rw::BlockDevice&>(c.metadata_store->Device());
+    std::vector<std::byte> anchor;
+    if (!Require(device.Read(0, 4096, anchor), "capacity invariant: held anchor bytes")) return false;
+    const auto image = ReadFileBytes(fixture.image.path);
+    const auto wal = ReadFileBytes(c.session_root / "accepted.wal");
+    const auto spool = ReadFileBytes(c.session_root / "payload-spool" / "payload-spool.bin");
+    const auto spool_index = ReadFileBytes(c.session_root / "payload-spool" / "payload-spool.idx");
+    const auto marks = c.tx_manager->Watermarks();
+    const auto checkpoint = fixture.coordinator->CheckpointXid();
+    const auto census = fixture.coordinator->CheckpointCensusSnapshot();
+    unsigned injected = 0, accepts = 0, publications = 0;
+    c.metadata_store->SetCommitStageHook([&](std::string_view stage) {
+        if (stage == "before-apple-device-write") ++publications;
+        if (stage != "after-apple-prepared-plan-retain") return true;
+        ++injected;
+        return device.Write(0, anchor) && device.Flush();
+    });
+    c.tx_manager->SetFaultInjectionHook([&](std::string_view stage) { if (stage == "accept-start") ++accepts; });
+    ScopeExit reset{[&] { c.metadata_store->SetCommitStageHook({}); c.tx_manager->SetFaultInjectionHook({}); }};
+    const auto status = CB_SetBasicInfo(&fs, handle, FILE_ATTRIBUTE_HIDDEN, 0, 0, 0, 0, &info);
+    const auto after = c.tx_manager->Watermarks();
+    const auto after_census = fixture.coordinator->CheckpointCensusSnapshot();
+    const auto diagnostics = fixture.coordinator->DiagnosticsSnapshot(101);
+    std::fprintf(stderr, "[INFO] capacity invariant status=%lx injections=%u accepts=%u writes=%u degraded=%d enabled=%d reason=%ls detail=%ls\n",
+        static_cast<unsigned long>(status), injected, accepts, publications, static_cast<int>(c.write_degraded),
+        static_cast<int>(c.native_write_enabled),
+        c.metadata_store->LastCommitFailureReason().c_str(), c.metadata_store->LastCommitFailureDetail().c_str());
+    bool ok = Require(injected == 1 && accepts == 0 && publications == 0,
+        "capacity invariant: source invalidation occurs before binder and publication");
+    ok &= Require(status == STATUS_MEDIA_WRITE_PROTECTED &&
+            c.write_degraded && c.recovery_active && !c.native_write_enabled && !c.overlay_write_enabled &&
+            c.metadata_store->LastCommitFailureReason() == L"ApplePreparedPlanSourceChanged" &&
+            diagnostics.last_failure_stage == "before-wal-capacity-admission" &&
+            diagnostics.last_failure_detail.find("ApplePreparedPlanSourceChanged") != std::string::npos,
+        "capacity invariant: real rollback-clean pre-WAL source change blocks further writes and retains diagnostics");
+    ok &= Require(
+            ReadFileBytes(fixture.image.path) == image && ReadFileBytes(c.session_root / "accepted.wal") == wal &&
+            ReadFileBytes(c.session_root / "payload-spool" / "payload-spool.bin") == spool &&
+            ReadFileBytes(c.session_root / "payload-spool" / "payload-spool.idx") == spool_index &&
+            after.accepted_sequence == marks.accepted_sequence && after.apfs_durable_sequence == marks.apfs_durable_sequence &&
+            after.cleanup_sequence == marks.cleanup_sequence && fixture.coordinator->CheckpointXid() == checkpoint &&
+            c.metadata_store->PendingMutationCount() == 0 && census.size() == after_census.size() &&
+            std::equal(census.begin(), census.end(), after_census.begin(), [](const auto& a, const auto& b) {
+                return a.volume_object_id == b.volume_object_id && a.required_checkpoint_xids == b.required_checkpoint_xids &&
+                    a.unapplied_accepted_work == b.unapplied_accepted_work;
+            }), "capacity invariant: source, original recovery evidence, watermarks and checkpoint census are unchanged");
+    return ok;
+}
+
+bool TestManifestPlanningInvariantDisablesWrites()
+{
+    using Store = apfsaccess::rw::MetadataStore;
+    namespace catalog = apfsaccess::catalog;
+    DirectorySymlinkFixture fixture(true);
+    if (!Require(fixture.Initialize(true), "planning invariant: strict manifest initializes")) return false;
+    auto& c = *fixture.context;
+    c.args.write_max_dirty_transactions = 512;
+    std::vector<Store::MutationRequest> seeds;
+    for (unsigned i = 0; i < 120; ++i)
+    {
+        Store::MutationRequest file;
+        file.operation = Store::MutationOperation::CreateFile;
+        file.path = L"\\planning-invariant-" + std::to_wstring(i) + L".bin";
+        seeds.push_back(std::move(file));
+    }
+    if (!Require(fixture.coordinator->Commit(101, seeds).committed &&
+            MergeCommittedInodeStateIntoNodeIndex(&c) && c.tx_manager->Begin() && c.tx_manager->Abort(),
+            "planning invariant: publish a real multilevel tree and clean WAL")) return false;
+    auto fs = BuildFileSystem(&c);
+    PVOID handle = nullptr;
+    FSP_FSCTL_FILE_INFO info{};
+    if (!Require(CB_Open(&fs, seeds.front().path.data(), FILE_NON_DIRECTORY_FILE,
+            FILE_READ_DATA | FILE_WRITE_DATA, &handle, &info) == STATUS_SUCCESS,
+            "planning invariant: open the real target before corrupting a child")) return false;
+    ScopeExit close{[&] { CB_Cleanup(&fs, handle, nullptr, 0); CB_Close(&fs, handle); }};
+    const auto checkpoint = *c.metadata_store->AuthoritativeAppleCheckpointView();
+    const auto selected = std::find_if(checkpoint.volumes.begin(), checkpoint.volumes.end(),
+        [](const auto& volume) { return volume.superblock.object_id == 101; });
+    if (!Require(selected != checkpoint.volumes.end(), "planning invariant: selected volume exists")) return false;
+    auto image = ReadFileBytes(fixture.image.path);
+    catalog::VectorRandomAccessSource source(image);
+    std::vector<catalog::BtreeRecord> records;
+    std::vector<std::uint64_t> visited;
+    std::string error;
+    const auto bs = checkpoint.container.superblock.block_size;
+    if (!Require(catalog::ReadAppleSnapshotTree(source, bs, selected->root_tree, selected->object_map,
+            checkpoint.container.superblock.xid, checkpoint.container.superblock.xid, records, visited, error) &&
+            visited.size() > 1, "planning invariant: canonical walk supplies a real child")) return false;
+    const auto child = *std::find_if(visited.begin(), visited.end(),
+        [&](const auto block) { return block != selected->root_tree.physical_block; });
+    std::vector<std::byte> damaged(image.begin() + child * bs, image.begin() + (child + 1) * bs);
+    const auto future_xid = checkpoint.container.superblock.xid + 5;
+    for (unsigned b = 0; b < 8; ++b) damaged[16 + b] = std::byte((future_xid >> (8 * b)) & 255);
+    auto& fixture_device = const_cast<apfsaccess::rw::BlockDevice&>(c.metadata_store->Device());
+    if (!Require(apfsaccess::rw::FinalizeAppleObjectChecksum(damaged, error) &&
+            fixture_device.Write(child * bs, damaged) && fixture_device.Flush(),
+            "planning invariant: valid-checksum future child is written only to the private fixture")) return false;
+    image = ReadFileBytes(fixture.image.path);
+    const auto wal = ReadFileBytes(c.session_root / "accepted.wal");
+    const auto marks = c.tx_manager->Watermarks();
+    unsigned accepts = 0;
+    c.tx_manager->SetFaultInjectionHook([&](std::string_view stage) { if (stage == "accept-start") ++accepts; });
+    ScopeExit reset{[&] { c.tx_manager->SetFaultInjectionHook({}); }};
+    const auto payload = BuildPatternPayloadForTest(32, 0xA4);
+    ULONG done = 999;
+    const auto status = CB_Write(&fs, handle, const_cast<std::byte*>(payload.data()), 0,
+        static_cast<ULONG>(payload.size()), FALSE, FALSE, &done, &info);
+    const auto after = c.tx_manager->Watermarks();
+    std::fprintf(stderr, "[INFO] planning invariant status=%lx accepted=%u degraded=%d enabled=%d reason=%ls detail=%ls\n",
+        static_cast<unsigned long>(status), accepts, static_cast<int>(c.write_degraded),
+        static_cast<int>(c.native_write_enabled), c.metadata_store->LastCommitFailureReason().c_str(),
+        c.metadata_store->LastCommitFailureDetail().c_str());
+    return Require(status == STATUS_MEDIA_WRITE_PROTECTED && done == 0 && accepts == 0 &&
+            c.write_degraded && c.recovery_active && !c.native_write_enabled &&
+            ReadFileBytes(fixture.image.path) == image && ReadFileBytes(c.session_root / "accepted.wal") == wal &&
+            after.accepted_sequence == marks.accepted_sequence && after.apfs_durable_sequence == marks.apfs_durable_sequence &&
+            after.cleanup_sequence == marks.cleanup_sequence,
+        "planning invariant: rollback-clean source corruption never gets the healthy unsupported-operation exemption");
+}
 
 bool TestCompressionHostAdmission()
 {
@@ -43877,13 +46041,20 @@ bool TestCompressionHostReads()
             AppleDirectoryRecord link;
             link.parent_id = 2; link.file_id = inode.object_id; link.flags = 8;
             link.name_utf8 = ordinary ? "ordinary" : "compressed";
-            if (!ordinary && spec.aliases) link.date_added = 700;
+            if (!ordinary && spec.aliases)
+            {
+                link.date_added = 700;
+                AppleExtendedField sibling{1, 0, std::vector<std::byte>(8)};
+                apfsaccess::testfixture::PutU64LE(sibling.data, 0, 700);
+                link.extended_fields.push_back(std::move(sibling));
+            }
             if (!append(EncodeAppleDirectoryRecord(link, encoded, error))) return false;
             if (!ordinary && spec.aliases)
             {
                 if (!append(EncodeAppleSiblingLinkRecord({17, 700, 2, "compressed"}, encoded, error)) ||
                     !append(EncodeAppleSiblingMapRecord({700, 17}, encoded, error))) return false;
                 link.name_utf8 = "alias"; link.date_added = 701;
+                apfsaccess::testfixture::PutU64LE(link.extended_fields.front().data, 0, 701);
                 if (!append(EncodeAppleDirectoryRecord(link, encoded, error)) ||
                     !append(EncodeAppleSiblingLinkRecord({17, 701, 2, "alias"}, encoded, error)) ||
                     !append(EncodeAppleSiblingMapRecord({701, 17}, encoded, error))) return false;
@@ -43893,7 +46064,7 @@ bool TestCompressionHostReads()
         const auto payload = [&](std::uint64_t id, const std::vector<std::byte>& bytes, std::uint64_t physical) {
             if (!append(EncodeAppleDataStreamIdRecord({id, 1}, encoded, error)) ||
                 !append(EncodeAppleFileExtentRecord({id, 0, 4096, physical, 0, 4096}, encoded, error)) ||
-                !Require(EncodeApplePhysicalExtentRecord({physical, 1, kApplePhysicalExtentKindNew, id, 1}, encoded, error),
+                !Require(EncodeApplePhysicalExtentRecord({physical, 1, kApplePhysicalExtentKindNew, id == 777 ? 17ULL : id, 1}, encoded, error),
                     "compression read fixture physical ownership encodes")) return false;
             volume.extentref_records.push_back(encoded);
             ++volume.additional_file_system_allocated_blocks;
@@ -45355,6 +47526,7 @@ bool TestDirectorySymlinkAcceptedRecovery(bool restoring = false, bool renamed_f
                     pins == std::vector<std::uint64_t>{accepted.front().preimage_checkpoint_xid} &&
                     fixture.coordinator->InitializeRequiredCheckpointCensus({{101, pins, true}, {102, {}}}, error),
                     "recovery setup: accepted link pins its preimage and untouched sibling has a clean census")) return false;
+            recovered->container_session_contexts = {recovered.get()};
         }
         if (renamed_final)
         {
@@ -45486,18 +47658,59 @@ bool TestDirectorySymlinkAcceptedRecovery(bool restoring = false, bool renamed_f
 #include "NativeCompressionManifestTests.h"
 #include "NativeCompressionManifestRefusalTests.h"
 #include "NativeCompressionManifestAcceptanceTests.h"
+#include "NativeLowSpaceRefusalTests.h"
 #include "DeferredAccessTimeTests.h"
+#include "RegularReadAccessTimeIsolationTests.h"
+#include "RootDirectoryAccessTimeTests.h"
+#include "OrdinaryDirectoryAccessTimeTests.h"
+#include "FsHostLongRuntimePathTests.h"
+
+bool TestRootDirectoryDeferredAccessTimes()
+{
+    bool ok = true;
+    for (const bool manifest : {false, true})
+    {
+        ok &= TestRootDirectoryAccessTimeIsolation(manifest, false);
+        ok &= TestRootDirectoryAccessTimeIsolation(manifest, true);
+        ok &= TestRootDirectoryAccessTimeOrdering(manifest);
+        ok &= TestRootDirectoryAccessTimeWorker(manifest);
+        ok &= TestRootDirectoryAccessTimeFailure(manifest, false);
+        ok &= TestRootDirectoryAccessTimeFailure(manifest, true);
+        ok &= TestRootDirectoryAccessTimeFailure(manifest, false, true);
+        ok &= TestRootDirectoryAccessTimeIdentity(manifest);
+    }
+    ok &= TestRootDirectoryAccessTimeRetry();
+    ok &= TestRootDirectoryAccessTimePressure();
+    return ok;
+}
+
 #include "DeferredAccessTimeStopTests567.h"
 #include "NativeLzvnReadTests.h"
 #include "NativeSparseWriteTests.h"
+#include "NativeSparseRangeTests.h"
+#include "NativeSparseZeroPreparationTests.h"
 #include "NativeCloneHost500Tests.h"
 #include "NativeCloneHost513Tests.h"
+#include "FragmentedCanonicalWriteTests.h"
+#include "RetainedGenerationPressureTests.h"
+#include "RetainedExtendedMutationTests.h"
+#include "RetainedSparseMutationTests.h"
+#include "DeferredManifestTimestampTests.h"
+#include "FreshFileCohortAcceptanceTests.h"
+constexpr const char* kRetainedSparseMutationProfiles[] = {
+    "", "implicit", "fully-sparse", "corrupt-source", "malformed-hole", "malformed-allocation",
+    "misbound-write", "misbound-tail", "corrupt-tail", "unlogged-hole"
+};
+constexpr const char* kRetainedExtendedMutationFaults[] = {
+    "misbound-attribute", "misbound-symlink", "misbound-remove", "misbound-restore", "misbound-tail",
+    "logged-link-bytes", "unlogged-xattr-time", "unlogged-attribute", "unlogged-symlink", "corrupt-attribute"
+};
 #endif
 
 #ifdef APFSACCESS_HAS_RW_ENGINE
 // Sparse-control boundary pin: the WinFsp driver dispatch does not route
 // FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA or FSCTL_QUERY_ALLOCATED_RANGES to
-// user mode, and the host advertises no sparse capability anywhere. If a
+// user mode. NativeSparseRangeProtocol is a distinct private interface. If a
 // future driver ever routes one, CB_Control must still refuse it
 // fail-closed (STATUS_INVALID_DEVICE_REQUEST, zero bytes transferred)
 // instead of misinterpreting it. Ordinary reads/writes are unaffected:
@@ -45516,9 +47729,52 @@ bool TestSparseControlsRefuseFailClosed()
 }
 #endif
 
+#ifdef APFSACCESS_HAS_RW_ENGINE
+bool TestRawKeeperStartupRefusesBeforeOpeningUnprovedSource()
+{
+    Arguments args;
+    args.device = L"\\\\.\\PhysicalDrive999999";
+    args.readwrite = true;
+    args.readonly = false;
+    args.write_backend = L"Native";
+    args.allow_raw_physical_write = true;
+    unsigned opens = 0;
+    const auto open = [&](const Arguments& selected) -> std::shared_ptr<apfsaccess::rw::BlockDevice> {
+        ++opens;
+        if (!Require(selected.device == args.device, "Raw keeper source selection stays exact")) return {};
+        return {};
+    };
+    std::string error;
+    if (!Require(!PrepareDirectRawKeeperSource(args, error, open) && opens == 0 &&
+            error == "VolumeKeeperJournalRootRequired", "Missing journal root refuses before opening a raw source")) return false;
+    args.management_journal_directory = L"D:\\ApfsAccessScratch\\unit-root-not-opened";
+    if (!Require(!PrepareDirectRawKeeperSource(args, error, open) && opens == 1 &&
+            error == "RawKeeperSourceUnavailable", "Unavailable retained source cannot reach journal or replay initialization")) return false;
+    for (unsigned variant = 0; variant != 5; ++variant)
+    {
+        auto invalid = args;
+        if (variant == 0) invalid.readwrite = false;
+        if (variant == 1) invalid.readonly = true;
+        if (variant == 2) invalid.write_backend = L"Overlay";
+        if (variant == 3) invalid.allow_raw_physical_write = false;
+        if (variant == 4) invalid.device = L"D:\\ApfsAccessScratch\\ordinary.img";
+        if (!Require(!PrepareDirectRawKeeperSource(invalid, error, open) && opens == 1 &&
+                error == "RawKeeperNativeSourceRequired", "Raw keeper preparation never grants a different source or write mode")) return false;
+    }
+    return true;
+}
+#endif
+
 bool RunSelectedTest(const std::string& name)
 {
 #ifdef APFSACCESS_HAS_RW_ENGINE
+    if (name.starts_with("manifest-fresh-file-cohort-"))
+        return TestFreshFileCohort(name.substr(std::string("manifest-fresh-file-cohort-").size()));
+    if (name.starts_with("manifest-write-timestamps-fallback-"))
+        return TestDeferredManifestTimestampFallback(name.substr(std::string("manifest-write-timestamps-fallback-").size()));
+    if (name.starts_with("manifest-write-timestamps-"))
+        return TestDeferredManifestTimestamps(name.substr(std::string("manifest-write-timestamps-").size()));
+    if (name == "raw-keeper-startup-root") return TestRawKeeperStartupRefusesBeforeOpeningUnprovedSource();
     if (name == "native-clone-host-500") return TestNativeCloneHost500() && TestNativeCloneHost513() && TestNativeCloneManifest513();
     if (name == "native-clone-host-513") return TestNativeCloneHost513();
     if (name == "native-clone-manifest-513") return TestNativeCloneManifest513();
@@ -45534,6 +47790,8 @@ bool RunSelectedTest(const std::string& name)
     if (name == "native-directory-xattr-manifest") return TestNativeDirectoryXattr(true);
     if (name == "native-xattr-winfsp-names") return TestNativeXattrStreams188(false, false, 0, true);
     if (name == "metadata-only-regular-file") return TestMetadataOnlyRegularFileDoesNotWaitOnCommit();
+    if (name == "metadata-cleanup-traverse") return TestTraverseOnlyDirectoryCleanupDoesNotWaitOnCommit();
+    if (name == "metadata-cleanup-access-policy") return TestCleanupAccessTimeClassificationPolicies();
     if (name == "native-xattr-retention-delete-direct") return TestNativeXattrRetention204(false, false);
     if (name == "native-xattr-retention-delete-manifest") return TestNativeXattrRetention204(true, false);
     if (name == "native-xattr-retention-replace-direct") return TestNativeXattrRetention204(false, true);
@@ -45551,6 +47809,10 @@ bool RunSelectedTest(const std::string& name)
     if (name == "compression-preserved-stream-authentication") return TestNativeCompressionPreservedStreamAuthentication();
     if (name == "compression-replay-wal-budget") return TestCompressionReplayWalBudget();
     if (name == "compression-write-callbacks") return TestNativeCompressionWriteCallbacks();
+    if (name == "compression-distinct-stream-owner") return TestNativeCompressionDistinctStreamOwner();
+    if (name == "compression-distinct-stream-attribute") return TestNativeCompressionPreservedStreamAuthentication(29);
+    if (name == "compression-distinct-stream-callbacks") return TestNativeCompressionWriteCallbacks(false, 8, 29);
+    if (name == "compression-distinct-stream-recovery") return TestNativeCompressionWriteCallbacks(true, 8, 29);
     if (name == "compression-modern-type7") return TestNativeModernCompressionType7();
     if (name == "compression-modern-type8") return TestNativeModernCompressionType8();
     if (name == "compression-modern-type11") return TestNativeModernCompressionType11();
@@ -45574,6 +47836,40 @@ bool RunSelectedTest(const std::string& name)
     if (name == "compression-manifest-accepted-census-failure-295") return TestNativeCompressionManifestAcceptedCensusFailure295();
     if (name == "compression-manifest-accepted-publication-failure-295") return TestNativeCompressionManifestAcceptedPublicationFailure295();
     if (name == "compression-manifest-external-staging-failure-295") return TestNativeCompressionManifestExternalStagingFailure295();
+    if (name == "root-directory-access-time") return TestRootDirectoryDeferredAccessTimes();
+    if (name == "ordinary-directory-access-time") return TestOrdinaryDirectoryDeferredAccessTimes();
+    if (name == "ordinary-directory-atime-cleanup") return OrdinaryDirectoryAccessTimeTests::CleanupAndFlush(false, 0);
+    if (name == "regular-read-atime-isolation") return TestRegularReadAccessTimeIsolation();
+    if (name == "fragmented-canonical-write") return FragmentedCanonicalWriteTests::Run();
+    if (name == "retained-generation-pressure") return RetainedGenerationPressureTests::Run();
+    if (name == "retained-generation-pressure-corrupt-spool") return RetainedGenerationPressureTests::Run(true);
+    if (name == "retained-generation-pressure-missing-receipt") return RetainedGenerationPressureTests::Run(false, true);
+    if (name == "retained-generation-pressure-history-missing") return RetainedGenerationPressureTests::Run(false, true, 1);
+    if (name == "retained-generation-pressure-history-misbound") return RetainedGenerationPressureTests::Run(false, true, 2);
+    if (name == "retained-generation-pressure-history-corrupt") return RetainedGenerationPressureTests::Run(false, true, 3);
+    if (name == "retained-generation-pressure-missing-receipt-corrupt-tail") return RetainedGenerationPressureTests::Run(true, true);
+    if (name == "retained-generation-pressure-unrecorded-timestamp") return RetainedGenerationPressureTests::Run(false, true, 0, true);
+    if (name == "retained-generation-pressure-mutable-source") return RetainedGenerationPressureTests::Run(false, true, 0, false, true);
+    if (name == "retained-generation-pressure-mixed") return RetainedGenerationPressureTests::RunGeneralized();
+    if (name == "retained-generation-pressure-mixed-partial-tail") return RetainedGenerationPressureTests::RunGeneralized({}, true);
+    if (name == "retained-generation-pressure-mixed-misbound-metadata") return RetainedGenerationPressureTests::RunGeneralized("misbound-metadata");
+    if (name == "retained-generation-pressure-mixed-misbound-unlink") return RetainedGenerationPressureTests::RunGeneralized("misbound-unlink");
+    if (name == "retained-generation-pressure-mixed-unlogged-metadata") return RetainedGenerationPressureTests::RunGeneralized("unlogged-metadata");
+    if (name == "retained-generation-pressure-mixed-unlogged-payload") return RetainedGenerationPressureTests::RunGeneralized("unlogged-payload");
+    if (name == "retained-generation-pressure-mixed-corrupt-tail") return RetainedGenerationPressureTests::RunGeneralized("corrupt-tail");
+    if (name == "retained-generation-pressure-extended") return RetainedExtendedMutationTests::Run();
+    if (name == "retained-generation-pressure-pending-create-attribute") return RetainedExtendedMutationTests::RunPendingCreateAttribute();
+    if (name == "retained-generation-pressure-replay-id-reservations") return RetainedExtendedMutationTests::RunReplayIdReservations();
+    for (const auto* profile : kRetainedSparseMutationProfiles)
+        if (name == std::string("retained-generation-pressure-sparse") + (*profile ? std::string("-") + profile : ""))
+            return RetainedSparseMutationTests::Run(profile);
+    for (const auto* fault : kRetainedExtendedMutationFaults)
+        if (name == std::string("retained-generation-pressure-extended-") + fault)
+            return RetainedExtendedMutationTests::Run(fault);
+    if (name == "contiguous-canonical-write") return FragmentedCanonicalWriteTests::Run(false);
+    if (name == "fragmented-canonical-replay-write") return FragmentedCanonicalWriteTests::Run(true, 1);
+    if (name == "fragmented-canonical-replay-resize") return FragmentedCanonicalWriteTests::Run(true, 2);
+    if (name == "fragmented-canonical-replay-cow") return FragmentedCanonicalWriteTests::Run(true, 3);
     if (name == "deferred-atime-batch-302") return TestDeferredAccessTimeBatch302(false) && TestDeferredAccessTimeBatch302(true);
     if (name == "deferred-atime-ordering-302") return TestDeferredAccessTimeOrdering302(false) && TestDeferredAccessTimeOrdering302(true);
     if (name == "deferred-atime-shutdown-302") return TestDeferredAccessTimeShutdown302(false) && TestDeferredAccessTimeShutdown302(true);
@@ -45596,6 +47892,12 @@ bool RunSelectedTest(const std::string& name)
     if (name == "native-lzvn-read-320") return TestNativeLzvnReadTask5();
     if (name == "native-remaining-codec-reads") return TestNativeRemainingCodecReads(false);
     if (name == "native-remaining-codec-malformed") return TestNativeRemainingCodecReads(true);
+    if (name == "native-sparse-zero-transaction-bounds") return TestNativeSparseZeroTransactionBounds();
+    if (name == "native-sparse-range-complete-validation") return TestNativeSparseRangeCompleteValidation();
+    if (name == "native-sparse-range-roundtrip") return TestNativeSparseRangeRoundTrip();
+    if (name == "native-sparse-reinitialization-replay") return TestNativeSparseReinitializationReplay();
+    if (name == "native-replay-extent-graph-binding") return TestNativeReplayExtentGraphBinding();
+    if (name == "native-sparse-range-boundaries-replay") return TestNativeSparseRangeBoundariesAndReplay();
     if (name == "native-sparse-write-340") return TestNativeSparseWriteCallbacks340();
     if (name == "native-sparse-refusal-340") return TestNativeSparseRefusalCallbacks340();
     if (name == "native-sparse-committed-355") return TestNativeSparseCommittedCallbacks355();
@@ -45738,6 +48040,18 @@ bool RunSelectedTest(const std::string& name)
     }
     if (name == "native-windows-security" || name == "manifest-windows-security")
         return TestPersistentWindowsSecurity(name == "manifest-windows-security");
+    if (name == "windows-compressed-source-copy")
+        return TestPersistentWindowsSecurity(false, false, 0, false, false, true) &&
+            TestPersistentWindowsSecurity(true, false, 0, false, false, true);
+    if (name == "chunked-copy-flush")
+        return TestPersistentWindowsSecurity(false, false, 0, false, false, false, true) &&
+            TestPersistentWindowsSecurity(true, false, 0, false, false, false, true);
+    if (name == "windows-integrity-labels")
+        return TestWindowsIntegrityLabelEncoding() && TestPersistentWindowsSecurity(false, false, 0, false, true) &&
+            TestPersistentWindowsSecurity(true, false, 0, false, true) &&
+            TestPersistentWindowsSecurity(false, true, 0, false, true) && TestPersistentWindowsSecurity(true, true, 0, false, true);
+    if (name == "powershell-windows-security-direct" || name == "powershell-windows-security-manifest")
+        return TestPersistentWindowsSecurity(name == "powershell-windows-security-manifest", false, 0, true);
     if (name == "security-refusals-direct" || name == "security-refusals-manifest")
     {
         const bool manifest = name == "security-refusals-manifest";
@@ -45888,6 +48202,23 @@ bool RunSelectedTest(const std::string& name)
     {
         return TestManifestCallbacksBindWalIdentityBeforeCanonicalPublication();
     }
+    if (name == "manifest-deferred-write-batch")
+    {
+        return TestManifestCallbacksBindWalIdentityBeforeCanonicalPublication(true);
+    }
+    if (name == "manifest-first-failure-queued") return TestManifestFirstMutationFailure(false);
+    if (name == "manifest-first-failure-batched") return TestManifestFirstMutationFailure(true);
+    if (name == "manifest-first-failure-accepted-debt") return TestManifestFirstMutationFailure(true, true);
+    if (name == "manifest-clean-refusal-callbacks") return TestManifestCleanRefusalCallbacks();
+    if (name == "cleanup-metadata-retention") return TestManifestCleanupFailureClassification("metadata-retention");
+    if (name == "cleanup-allocation-retention") return TestManifestCleanupFailureClassification("allocation-retention");
+    if (name == "cleanup-accepted-debt") return TestManifestCleanupFailureClassification("accepted-debt");
+    if (name == "cleanup-unsupported") return TestManifestCleanupFailureClassification("unsupported");
+    if (name == "cleanup-invariant") return TestManifestCleanupFailureClassification("invariant");
+    if (name == "manifest-planning-invariant") return TestManifestPlanningInvariantDisablesWrites();
+    if (name == "manifest-capacity-invariant") return TestManifestCapacityInvariantDisablesWrites();
+    if (name == "manifest-sibling-write-pressure") return TestManifestSiblingAcceptedWritePressure();
+    if (name.starts_with("manifest-sibling-cleanup-")) return TestManifestSiblingCleanupAdmission(name.substr(25));
     if (name == "manifest-checkpoint-census")
     {
         return TestManifestCheckpointCensusBeforeReplay();
@@ -45945,6 +48276,8 @@ bool RunSelectedTest(const std::string& name)
     {
         return TestRetentionBackpressureDoesNotDegradeMount();
     }
+    if (name == "low-space-refusal-mapping") return TestNativeLowSpaceRefusalMapping();
+    if (name == "low-space-original-debt") return TestNativeLowSpaceOriginalDebtLatch();
     if (name == "direct-volume-checkpoint-pins")
     {
         return TestDirectVolumeCheckpointPins();
@@ -45965,6 +48298,10 @@ bool RunSelectedTest(const std::string& name)
     {
         return TestManifestContainerStatusFile();
     }
+    if (name == "manifest-initialization-settlement")
+    {
+        return TestManifestInitializationFailureSettlement();
+    }
     if (name == "manifest-partial-startup-drain")
     {
         return TestManifestPartialStartupDrainsStartedSibling();
@@ -45977,6 +48314,10 @@ bool RunSelectedTest(const std::string& name)
     {
         return TestManifestControlRequestValidation();
     }
+    if (name == "long-runtime-control-paths")
+    {
+        return TestLongRuntimeControlAndDiagnostics();
+    }
     if (name == "manifest-control-lifecycle")
     {
         return TestManifestControlDetachAndAttachLifecycle();
@@ -45984,6 +48325,10 @@ bool RunSelectedTest(const std::string& name)
     if (name == "manifest-control-file")
     {
         return TestManifestControlFileRoundTrip();
+    }
+    if (name == "verification-payload-coalescing")
+    {
+        return TestVerificationPayloadCoalescing();
     }
 #endif
     if (name == "recycle-bin-attributes")
@@ -46006,6 +48351,10 @@ bool RunSelectedTest(const std::string& name)
     {
         return TestCallbacksRoundTripCaseSensitiveApfsNames();
     }
+    if (name == "apfs-name-policy-callback-roundtrip")
+    {
+        return TestCallbacksRespectApfsNamePolicyAndDirectoryMarkers();
+    }
     if (name == "stable-volume-serial")
     {
         return TestStableVolumeSerialDependsOnVolumeIdentityNotProcessUptime();
@@ -46021,6 +48370,10 @@ bool RunSelectedTest(const std::string& name)
     if (name == "recovery-root-override-survives-temp-change")
     {
         return TestRecoveryRootOverrideSurvivesTempChange();
+    }
+    if (name == "shell-drive-notifications")
+    {
+        return TestShellDriveNotificationsDoNotWaitForExplorer();
     }
     if (name == "build-winfsp-mount-point-directory-path")
     {
@@ -46053,6 +48406,8 @@ bool RunSelectedTest(const std::string& name)
     {
         return TestMetadataOnlyRootDoesNotWaitOnCommit();
     }
+    if (name == "cached-root-observation-guard") return TestCachedRootObservationGuard();
+    if (name == "cached-root-observation-sdk") return TestCachedRootObservationSdk();
     if (name == "fshost-performance-counter-percentile")
     {
         return TestFsHostPerformanceCounterReportsPercentile();
@@ -46164,6 +48519,10 @@ bool RunSelectedTest(const std::string& name)
     if (name == "immutable-recovery-identity-block-prevents-reenable")
     {
         return TestRecoveryIdentityBlockCannotBeClearedByMetadataReplay();
+    }
+    if (name == "immutable-recovery-identity-preflight-resolved-root")
+    {
+        return TestRecoveryIdentityPreflightUsesResolvedMarkerRoot();
     }
     if (name == "immutable-recovery-identity-bootstrap-reason-sticky")
     {
@@ -47289,570 +49648,660 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    unsigned trace_ordinal = 0;
+    const auto trace_case = [&](const char* name, auto invoke) {
+        const auto current = ++trace_ordinal;
+        if (current > 1024) throw std::runtime_error("SemanticsAggregateCaseLimitExceeded");
+        const auto started = GetTickCount64();
+        std::cerr << "CASE BEGIN " << current << " tick=" << started << " " << name << std::endl;
+        const bool passed = invoke();
+        std::cerr << "CASE END " << current << " elapsed_ms=" << GetTickCount64() - started
+            << " passed=" << passed << " checks=" << g_semantics_check_count.load() << std::endl;
+        return passed;
+    };
     bool ok = true;
-    ok &= TestCreateRejectsConflictingTypeFlags();
-    ok &= TestDeletePendingAncestorBlocksOpenSecurityDelete();
-    ok &= TestDeletePendingTargetSecurityLookupReportsMissingBeforeClose();
-    ok &= TestDeleteIntentAncestorBlocksOpenAndCreate();
-    ok &= TestRenameSamePathRequiresExistingNode();
-    ok &= TestRenameSamePathValidatesContextPermissions();
-    ok &= TestRenameRelativeTargetStaysInSourceParent();
-    ok &= TestRenameToDifferentDriveReportsNotSameDevice();
-    ok &= TestDirectoryInfoBufferNullTerminatesNameAndReportsUnterminatedSize();
-    ok &= TestDirectoryDotEntriesAndContinuation();
-    ok &= TestRecycleBinPathsExposeExplorerCompatibleAttributes();
-    ok &= TestSymbolicLinkExposesWinFspReparseContract();
-    ok &= TestSpecialNodeCallbackContract();
-    ok &= TestRenameRejectsMismatchedOpenContext();
-    ok &= TestRenameMissingSourceWithSourceHandleFailsClosed();
-    ok &= TestRenameCrossParentSourceHandleSucceedsWithDeleteAccess();
-    ok &= TestSetDeleteToggleClearsDeletePending();
-    ok &= TestSetDeleteContextNodeFastPathRejectsReplacedNode();
-    ok &= TestSetDeleteRemovesFileOnLastClose();
-    ok &= TestRenameFailsWhileSourceDeletePendingThenRecoversAfterClear();
-    ok &= TestRenameFailsWhenSourceDeleteIntentStateIsStale();
-    ok &= TestRenameReplaceFailsWhenTargetDeletePending();
-    ok &= TestRenameReplaceAllowsFileTargetWithAdditionalOpenHandle();
-    ok &= TestRenameRollsBackLocalNamespaceWhenNativeCommitFails();
-    ok &= TestRenameReplaceKeepsOpenTargetHandleOnOldHydration();
-    ok &= TestRenameReplaceRollsBackHydrationWhenNativeCommitFails();
-    ok &= TestExperimentalDeferredRenameFlushCommits();
-    ok &= TestExperimentalDeferredRenameFlushFailureRestoresLocalNamespace();
-    ok &= TestExperimentalDeferredRenameImmediateReadUsesCommittedSourcePath();
-    ok &= TestDefaultDeferredRenameWorkerFailureRestoresLocalNamespace();
-    ok &= TestDefaultDeferredRenameOpenDrainFailureRestoresLocalNamespace();
-    ok &= TestDeferredRenameChainBatchesBeforeFlush();
-    ok &= TestDeferredRenameChainFlushCommits();
-    ok &= TestDeferredRenameChainCoalescesAcrossInterleavedFileRename();
-    ok &= TestDeferredDirectoryRenameFlushCommits();
-    ok &= TestDeferredDirectoryRenameFlushFailureRestoresSubtree();
-    ok &= TestDeferredDirectoryRenameOpenDescendantFallbackReadsOldCommittedPath();
-    ok &= TestDeferredDirectoryRenameRejectsOpenDescendant();
-    ok &= TestCleanupDeleteTrustsPostedDeleteDisposition();
-    ok &= TestCleanupDeleteBlocksRenameUntilCloseRemovesSource();
-    ok &= TestCloseRemovesEmptyDirectoryAfterCleanupDelete();
-    ok &= TestRecursiveDirectoryDeleteCompletesAfterChildClose();
-    ok &= TestDirectoryCleanupDeleteDispositionWorksAfterMetadataOnlyOpen();
-    ok &= TestDirectoryCleanupFilenameWithoutDeleteFlagKeepsDirectory();
-    ok &= TestDeleteOnCloseDirectoryDefersUntilChildrenDrain();
-    ok &= TestDeleteAccessOpenCompletesRecentlyDrainedDirectoryDelete();
-    ok &= TestSetBasicInfoPreservesOpenRecentlyDrainedDirectory();
-    ok &= TestSetBasicInfoDoesNotDeleteDirectoryOpenedAfterChildDelete();
-    ok &= TestRecursiveCallerCanDeleteDrainedDirectoryAfterMetadataTouch();
-    ok &= TestDeferredDirectoryDeleteCompletesOnDirectoryClose();
-    ok &= TestSetDeleteNonEmptyDirectoryAllowsCallerFinalDeleteRetry();
-    ok &= TestCanDeleteNonEmptyDirectoryAllowsCallerFinalDeleteRetry();
-    ok &= TestCloseWithoutDeleteLatchPreservesNode();
-    ok &= TestPlainCloseSkipsRecursiveDeleteReadinessScan();
-    ok &= TestBroadAccessUnmodifiedCloseUsesFastPath();
-    ok &= TestObservedMutationRejectsFastClose();
-    ok &= TestCleanupWithoutDeleteReleasesFileForRename();
-    ok &= TestCleanupRetainsEagerPayloadHandlesUntilClose();
-    ok &= TestCanDeleteSupportsParentDeleteChildPermission();
-    ok &= TestRenameSupportsParentDeleteChildPermission();
-    ok &= TestRenameSameParentRequiresInsertPermission();
-    ok &= TestRenameCrossParentOldParentHandleDenied();
-    ok &= TestRenameParentWithoutDeleteChildDenied();
-    ok &= TestRenameReplaceUsesAuthorizedSourceContext();
-    ok &= TestRenameReplaceAllowsTargetParentDeleteChild();
-    ok &= TestRenameReplaceRequiresDeleteChildEvenWithInsertPermission();
-    ok &= TestRenameDirectoryReplaceRequiresDirectoryInsertPermission();
-    ok &= TestCanDeleteNullNameParentHandleRequiresDeleteNotDeleteChild();
-    ok &= TestCanDeleteFailsWhenAdditionalHandleOpen();
-    ok &= TestSetDeleteFailsWhenAdditionalHandleOpen();
-    ok &= TestCleanupDeleteLatchesEvenWhenAdditionalHandlesRemain();
-    ok &= TestCloseOnlyCommitsWhenDeleteMutationIsEmitted();
-    ok &= TestDeleteOnCloseCommitsWhenDeleteIsLatching();
-    ok &= TestSetFileSizeDefersNativeCommitUntilFlush();
-    ok &= TestSetFileSizeDefersNativeCommitUntilClose();
-    ok &= TestDeferredCloseAllowsNewFileIngestBatch();
-    ok &= TestDeferredWriteBackUsesSafeDefaultAndSupportsOptOut();
-    ok &= TestExperimentalDualHydrationMirrorSwitch();
-    ok &= TestPostCheckpointHydrationPromotionDefaultsOnAndSupportsOptOut();
-    ok &= TestPostCheckpointHydrationPromotionFailureDoesNotFailCleanup();
-    ok &= TestPostCheckpointHydrationPromotionRejectsConcurrentMutation();
-    ok &= TestPostCheckpointHydrationPromotionTracksRenameAndSkipsDelete();
-    ok &= TestDeferredCloseAllowsDirectoryCreateBatch();
-    ok &= TestReadOnlyReopenSeesDeferredSpoolWriteOnReadWriteMount();
-    ok &= TestFreshDeferredSpoolMoveOutSourceReadsPayload();
-    ok &= TestMetadataOnlyReopenAfterDeferredSpoolWriteDoesNotHydrate();
-    ok &= TestImmediateRenameAfterDeferredFreshWriteBatchesBeforeFlush();
-    ok &= TestRepeatedDeferredCloseStatusWritesAreCoalesced();
-    ok &= TestDeferredBarrierCompletionPublishesIdleStatus();
-    ok &= TestTargetlessDeferredBarrierFailureRemainsVisible();
-    ok &= TestDeferredCloseBurstExtendsQuietWindowWhileWriterOpen();
-    ok &= TestDeferredCloseIdleBurstKeepsBaseQuietWindow();
-    ok &= TestDeferredCloseRecentActivityCutoffAvoidsSecondQuietWindow();
-    ok &= TestDeferredWorkerCarriesAcceptedTargetThroughCleanup();
-    ok &= TestDeferredWorkerExceptionFailsClosedWithoutTerminatingHost();
-    ok &= TestDeferredClosePressureForcesImmediateScheduling();
-    ok &= TestDeferredPressureDrainsBeforeNextMutation();
-    ok &= TestDeferredPressureCountsObjectsNotRanges();
-    ok &= TestDeferredRequestQueuedBehindWorkerTracksAge();
-    ok &= TestDeferredCommitBarrierWaitsForInFlightWorker();
-    ok &= TestDeferredWorkerDoesNotPublishInFlightBeforeMutationQueueOwnership();
-    ok &= TestDeferredCommitBarrierPropagatesWorkerFailure();
-    ok &= TestDeferredCommitBarrierRejectsEarlierFailedTargetAfterLaterCompletion();
-    ok &= TestConcurrentDeferredCommitBarriersShareOrderedCompletion();
-    ok &= TestDeferredCommitBarrierWakesWhenWorkerStops();
-    ok &= TestFlushSurfacesPayloadFinalizationFailure();
-    ok &= TestVolumeFlushSurfacesPayloadFinalizationFailure();
-    ok &= TestCommittedMetadataDoesNotClearUnfinalizedWal();
-    ok &= TestDeferredBarrierRechecksCurrentWalWatermark();
-    ok &= TestFinalizationReportsUnmetDeferredDurabilityTarget();
-    ok &= TestCompactionIntentStartupDowngradesUntilPredecessorAliasIsRemoved();
-    ok &= TestBestEffortFinalizationFailureSurvivesNothingToCommit();
-    ok &= TestShutdownFailedCommitRetainsAcceptedEvidence();
-    ok &= TestShutdownDoesNotMarkAcceptedWriteDurableAfterFailedCommit();
-    ok &= TestOpenSurfacesPayloadFinalizationFailure();
-    ok &= TestDeferredCloseWorkerWaitsForOpenWriteHandles();
-    ok &= TestDeferredCloseWorkerWaitsForActiveForegroundCallback();
-    ok &= TestDeleteCloseHardBoundaryFailureRestoresLocalNode();
-    ok &= TestDeleteCloseHardBoundarySuccessRemovesHydration();
-    ok &= TestPlainCloseDoesNotDeferMixedPendingTransaction();
-    ok &= TestDeleteOnCloseRestoresLocalNodeWhenNativeCommitFails();
-    ok &= TestDirectoryDeleteStaysSynchronousAndRestoresSubtreeOnFailure();
-    ok &= TestRenameDirectoryFailsWhenDescendantHandleOpen();
-    ok &= TestRenameSourceHandleSucceedsWithOnlyCurrentHandleOpen();
-    ok &= TestRenameTargetParentRequiresFileInsertPermission();
-    ok &= TestRenameTargetParentRequiresDirectoryInsertPermission();
-    ok &= TestCleanupDeleteSkipsNonEmptyDirectory();
-    ok &= TestCleanupDeleteBlockedByAdditionalOpenHandle();
-    ok &= TestDeleteOnCloseRemovesOnlyAfterLastHandleCloses();
-    ok &= TestRenameReplaceFailsWhenTargetDirectoryNotEmpty();
-    ok &= TestRenameReplaceFailsWhenTargetDirectoryHasOpenHandle();
-    ok &= TestCreateRejectedWhenShutdownDrainActive();
-    ok &= TestRenameRejectedWhenShutdownDrainActive();
-    ok &= TestMetadataMutationsRejectedWhenShutdownDrainActive();
-    ok &= TestDataMutationsRejectedWhenShutdownDrainActive();
-    ok &= TestOpenMutationAccessDeniedWhenShutdownDrainActive();
-    ok &= TestOpenDeleteAccessDeniedWhenShutdownDrainActive();
-    ok &= TestOpenReadOnlyAllowedWhenShutdownDrainActive();
-    ok &= TestSetSecurityRejectedWhenShutdownDrainActive();
-    ok &= TestCleanupDeleteNoopWhenShutdownDrainActive();
-    ok &= TestFlushRejectedWhenShutdownDrainActive();
-    ok &= TestFlushAllowedWhenWriteDisabledDuringShutdownDrain();
-    ok &= TestFlushReleasesExternalMutationScopeAfterSuccessfulWriteEnabledFlush();
-    ok &= TestFlushFinalizesPendingMutationJournal();
-    ok &= TestVolumeFlushFinalizesPendingMutationJournal();
-    ok &= TestDeferredAcceptanceFlushesSpoolBeforeWalMarker();
-    ok &= TestDeferredAcceptanceUsesInlinePayloadWithoutSpoolFlush();
-    ok &= TestInlineAcceptedFinalizationSkipsRedundantSpoolFlush();
-    ok &= TestStrictFinalizationScanFailureFailsClosed();
-    ok &= TestGroupedDeferredAcceptanceBatchesConcurrentCloses();
-    ok &= TestSerialDeferredAcceptanceReturnsBeforeWalDurability();
-    ok &= TestSerialDeferredWalFlushFailureBlocksApfsCommit();
-    ok &= TestSerialDeferredAcceptanceFlushDrainsAllDurabilityStages();
-    ok &= TestSerialDeferredWalDurabilityProgressesWhileBusy();
-    ok &= TestSerialDeferredWorkerRevalidatesWriterOpenBeforeCommit();
-    ok &= TestSerialDeferredClosePublishesAcceptedPendingStatus();
-    ok &= TestSerialDeferredUnsafeInlineProofFallsBackToSynchronousDurability();
-    ok &= TestSerialDeferredIdleFollowerSkipsSpoolAndHonorsDurabilityMode();
-    ok &= TestSerialDeferredShutdownDrainConvergesQueuedTarget();
-    ok &= TestShutdownStopsPublishingDiagnosticsAtWinFspBoundary();
-    ok &= TestShutdownPublishesMountNotReadyBeforeWinFspTeardown();
-    ok &= TestShutdownFailsWhenTerminalStatusCannotBePersisted();
-    ok &= TestWinFspTeardownTimeoutPinsOwnershipAtEachPhase();
-    ok &= TestDiagnosticWatchdogDuringTeardownOwnerTransfer();
-    ok &= TestWinFspTeardownTimeoutStopsManifestSiblingCleanup();
-    ok &= TestWinFspTeardownWorkerStartFailurePinsOwnership();
-    ok &= TestWinFspRuntimeVersionRejectsKnownDeadlockBuilds();
-    ok &= TestWinFspCleanStartupStartsVerifiedDriver();
-    ok &= TestWinFspActiveDriverRequiresExactBinaryIdentity();
-    ok &= TestSerialDeferredProcessKillBeforeWalFlushHasNoFalseDurability();
-    ok &= TestSerialDeferredSafetyTestsAreRegisteredInAggregate();
-    ok &= TestGroupedDeferredAcceptanceIsAbsorbedByHardBoundary();
-    ok &= TestShutdownDrainFinishesGroupedDeferredAcceptance();
-    ok &= TestGroupedDeferredAcceptanceDisableSwitchUsesImmediateAcceptance();
-    ok &= TestGroupedDeferredAcceptanceSealedCohortDoesNotGrow();
-    ok &= TestGroupedDeferredAcceptanceFollowerRetriesLowerSharedTarget();
-    ok &= TestGroupedDeferredAcceptanceBoundaryCompletionTargetsCapturedCohort();
-    ok &= TestGroupedDeferredAcceptanceResolvesAlreadyAcceptedIdleTransaction();
-    ok &= TestGroupedDeferredAcceptanceProofCapacityFallsBackToImmediateAcceptance();
-    ok &= TestGroupedDeferredAcceptanceRejectsUnrelatedAcceptedTransaction();
-    ok &= TestGroupedDeferredAcceptanceFlushFailureHasSingleRecoveryOwner();
-    ok &= TestShutdownUnresolvedCleanupWatermarkFailsClosed();
-    ok &= TestAcceptedWriteRestartFailsClosedUntilReplay();
-    ok &= TestBestEffortBlocksNewMutationsWhileRecoveryEvidenceIsUnresolved();
-    ok &= TestBestEffortPostStageFailureBlocksWriteBackends();
-    ok &= TestPostStagePayloadSpoolFailureCannotExitShutdownCleanly();
-    ok &= TestInvalidWalWatermarkFailsClosed();
-    ok &= TestHostStatusExposesWalWatermarks();
-    ok &= TestAcceptedWriteReplayCommitsAndConvergesWatermarks();
-    ok &= TestAcceptedReplayRecognizesFinalDeleteState();
-    ok &= TestSymbolicLinkAcceptedReplay();
-    ok &= TestExtendedAttributeAcceptedReplay();
-    ok &= TestExtendedAttributeAcceptedReplay(true);
-    ok &= TestPersistentWindowsSecurity(false, false, 1);
-    ok &= TestPersistentWindowsSecurity(false, false, 2);
-    ok &= TestPersistentWindowsSecurity(false, false, 3);
-    ok &= TestPersistentWindowsSecurity(true, false, 1);
-    ok &= TestPersistentWindowsSecurity(true, false, 2);
-    ok &= TestPersistentWindowsSecurity(true, false, 3);
-    ok &= TestExternalAttributeRemovalAcceptedRecovery();
-    ok &= TestExternalAttributeRemovalAcceptedRecovery(true);
-    ok &= TestExtendedAttributeForegroundJournal(false);
-    ok &= TestExtendedAttributeForegroundJournal(false, 0, true);
-    ok &= TestExtendedAttributeForegroundJournal(true, 0, true);
-    ok &= TestExtendedAttributeForegroundJournal(true);
-    ok &= TestExtendedAttributeForegroundJournal(true, 1);
-    ok &= TestExtendedAttributeForegroundJournal(true, 2);
-    ok &= TestSymbolicLinkMutationCallbacks();
-    ok &= TestCaseOnlyRenameAcceptedReplay();
-    ok &= TestAliasUnlinkAcceptedReplay();
-    ok &= TestAliasUnlinkAcceptedReplay(1, true);
-    ok &= TestAliasUnlinkAcceptedReplay(4, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity();
-    ok &= TestNativeOverwritePreservesAliasIdentity(false, false, false, false, false, false,
-        false, false, false, false, false, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(false, true, false, false, false, false,
-        false, false, false, false, false, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(false, false, false, false, false, false, true);
-    ok &= TestIndependentWindowsTimestamps(false);
-    ok &= TestPersistentWindowsSecurity(false);
-    ok &= TestPersistentWindowsSecurity(true);
-    ok &= TestPersistentWindowsSecurity(false, true);
-    ok &= TestPersistentWindowsSecurity(true, true);
-    ok &= TestIndependentWindowsTimestamps(true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(false, true, false, false, false, false, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(false, false, false, false, false, false, false, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(false, true, false, false, false, false, false, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(true);
+#ifdef APFSACCESS_HAS_RW_ENGINE
+    for (const auto* mode : kFreshFileCohortCases)
+        ok &= trace_case("TestFreshFileCohort", [&] { return TestFreshFileCohort(mode); });
+    for (const auto* boundary : {"count", "flush", "close", "shutdown", "replay", "snapshot", "snapshot-during-ack", "wal-failure"})
+        ok &= trace_case("TestDeferredManifestTimestamps", [&] { return TestDeferredManifestTimestamps(boundary); });
+    for (const auto* kind : {"create", "resize", "allocation", "security", "xattr", "no-write", "attributes"})
+        ok &= trace_case("TestDeferredManifestTimestampFallback", [&] { return TestDeferredManifestTimestampFallback(kind); });
+    ok &= trace_case(R"TRACE(TestRawKeeperStartupRefusesBeforeOpeningUnprovedSource())TRACE", [&]() { return TestRawKeeperStartupRefusesBeforeOpeningUnprovedSource(); });
+#endif
+    ok &= trace_case(R"TRACE(TestCreateRejectsConflictingTypeFlags())TRACE", [&]() { return TestCreateRejectsConflictingTypeFlags(); });
+    ok &= trace_case(R"TRACE(TestDeletePendingAncestorBlocksOpenSecurityDelete())TRACE", [&]() { return TestDeletePendingAncestorBlocksOpenSecurityDelete(); });
+    ok &= trace_case(R"TRACE(TestDeletePendingTargetSecurityLookupReportsMissingBeforeClose())TRACE", [&]() { return TestDeletePendingTargetSecurityLookupReportsMissingBeforeClose(); });
+    ok &= trace_case(R"TRACE(TestDeleteIntentAncestorBlocksOpenAndCreate())TRACE", [&]() { return TestDeleteIntentAncestorBlocksOpenAndCreate(); });
+    ok &= trace_case(R"TRACE(TestRenameSamePathRequiresExistingNode())TRACE", [&]() { return TestRenameSamePathRequiresExistingNode(); });
+    ok &= trace_case(R"TRACE(TestRenameSamePathValidatesContextPermissions())TRACE", [&]() { return TestRenameSamePathValidatesContextPermissions(); });
+    ok &= trace_case(R"TRACE(TestRenameRelativeTargetStaysInSourceParent())TRACE", [&]() { return TestRenameRelativeTargetStaysInSourceParent(); });
+    ok &= trace_case(R"TRACE(TestRenameToDifferentDriveReportsNotSameDevice())TRACE", [&]() { return TestRenameToDifferentDriveReportsNotSameDevice(); });
+    ok &= trace_case(R"TRACE(TestDirectoryInfoBufferNullTerminatesNameAndReportsUnterminatedSize())TRACE", [&]() { return TestDirectoryInfoBufferNullTerminatesNameAndReportsUnterminatedSize(); });
+    ok &= trace_case(R"TRACE(TestDirectoryDotEntriesAndContinuation())TRACE", [&]() { return TestDirectoryDotEntriesAndContinuation(); });
+    ok &= trace_case(R"TRACE(TestRecycleBinPathsExposeExplorerCompatibleAttributes())TRACE", [&]() { return TestRecycleBinPathsExposeExplorerCompatibleAttributes(); });
+    ok &= trace_case(R"TRACE(TestSymbolicLinkExposesWinFspReparseContract())TRACE", [&]() { return TestSymbolicLinkExposesWinFspReparseContract(); });
+    ok &= trace_case(R"TRACE(TestSpecialNodeCallbackContract())TRACE", [&]() { return TestSpecialNodeCallbackContract(); });
+    ok &= trace_case(R"TRACE(TestRenameRejectsMismatchedOpenContext())TRACE", [&]() { return TestRenameRejectsMismatchedOpenContext(); });
+    ok &= trace_case(R"TRACE(TestRenameMissingSourceWithSourceHandleFailsClosed())TRACE", [&]() { return TestRenameMissingSourceWithSourceHandleFailsClosed(); });
+    ok &= trace_case(R"TRACE(TestRenameCrossParentSourceHandleSucceedsWithDeleteAccess())TRACE", [&]() { return TestRenameCrossParentSourceHandleSucceedsWithDeleteAccess(); });
+    ok &= trace_case(R"TRACE(TestSetDeleteToggleClearsDeletePending())TRACE", [&]() { return TestSetDeleteToggleClearsDeletePending(); });
+    ok &= trace_case(R"TRACE(TestSetDeleteContextNodeFastPathRejectsReplacedNode())TRACE", [&]() { return TestSetDeleteContextNodeFastPathRejectsReplacedNode(); });
+    ok &= trace_case(R"TRACE(TestSetDeleteRemovesFileOnLastClose())TRACE", [&]() { return TestSetDeleteRemovesFileOnLastClose(); });
+    ok &= trace_case(R"TRACE(TestRenameFailsWhileSourceDeletePendingThenRecoversAfterClear())TRACE", [&]() { return TestRenameFailsWhileSourceDeletePendingThenRecoversAfterClear(); });
+    ok &= trace_case(R"TRACE(TestRenameFailsWhenSourceDeleteIntentStateIsStale())TRACE", [&]() { return TestRenameFailsWhenSourceDeleteIntentStateIsStale(); });
+    ok &= trace_case(R"TRACE(TestRenameReplaceFailsWhenTargetDeletePending())TRACE", [&]() { return TestRenameReplaceFailsWhenTargetDeletePending(); });
+    ok &= trace_case(R"TRACE(TestRenameReplaceAllowsFileTargetWithAdditionalOpenHandle())TRACE", [&]() { return TestRenameReplaceAllowsFileTargetWithAdditionalOpenHandle(); });
+    ok &= trace_case(R"TRACE(TestRenameRollsBackLocalNamespaceWhenNativeCommitFails())TRACE", [&]() { return TestRenameRollsBackLocalNamespaceWhenNativeCommitFails(); });
+    ok &= trace_case(R"TRACE(TestRenameReplaceKeepsOpenTargetHandleOnOldHydration())TRACE", [&]() { return TestRenameReplaceKeepsOpenTargetHandleOnOldHydration(); });
+    ok &= trace_case(R"TRACE(TestRenameReplaceRollsBackHydrationWhenNativeCommitFails())TRACE", [&]() { return TestRenameReplaceRollsBackHydrationWhenNativeCommitFails(); });
+    ok &= trace_case(R"TRACE(TestExperimentalDeferredRenameFlushCommits())TRACE", [&]() { return TestExperimentalDeferredRenameFlushCommits(); });
+    ok &= trace_case(R"TRACE(TestExperimentalDeferredRenameFlushFailureRestoresLocalNamespace())TRACE", [&]() { return TestExperimentalDeferredRenameFlushFailureRestoresLocalNamespace(); });
+    ok &= trace_case(R"TRACE(TestExperimentalDeferredRenameImmediateReadUsesCommittedSourcePath())TRACE", [&]() { return TestExperimentalDeferredRenameImmediateReadUsesCommittedSourcePath(); });
+    ok &= trace_case(R"TRACE(TestDefaultDeferredRenameWorkerFailureRestoresLocalNamespace())TRACE", [&]() { return TestDefaultDeferredRenameWorkerFailureRestoresLocalNamespace(); });
+    ok &= trace_case(R"TRACE(TestDefaultDeferredRenameOpenDrainFailureRestoresLocalNamespace())TRACE", [&]() { return TestDefaultDeferredRenameOpenDrainFailureRestoresLocalNamespace(); });
+    ok &= trace_case(R"TRACE(TestDeferredRenameChainBatchesBeforeFlush())TRACE", [&]() { return TestDeferredRenameChainBatchesBeforeFlush(); });
+    ok &= trace_case(R"TRACE(TestDeferredRenameChainFlushCommits())TRACE", [&]() { return TestDeferredRenameChainFlushCommits(); });
+    ok &= trace_case(R"TRACE(TestDeferredRenameChainCoalescesAcrossInterleavedFileRename())TRACE", [&]() { return TestDeferredRenameChainCoalescesAcrossInterleavedFileRename(); });
+    ok &= trace_case(R"TRACE(TestDeferredDirectoryRenameFlushCommits())TRACE", [&]() { return TestDeferredDirectoryRenameFlushCommits(); });
+    ok &= trace_case(R"TRACE(TestDeferredDirectoryRenameFlushFailureRestoresSubtree())TRACE", [&]() { return TestDeferredDirectoryRenameFlushFailureRestoresSubtree(); });
+    ok &= trace_case(R"TRACE(TestDeferredDirectoryRenameOpenDescendantFallbackReadsOldCommittedPath())TRACE", [&]() { return TestDeferredDirectoryRenameOpenDescendantFallbackReadsOldCommittedPath(); });
+    ok &= trace_case(R"TRACE(TestDeferredDirectoryRenameRejectsOpenDescendant())TRACE", [&]() { return TestDeferredDirectoryRenameRejectsOpenDescendant(); });
+    ok &= trace_case(R"TRACE(TestCleanupDeleteTrustsPostedDeleteDisposition())TRACE", [&]() { return TestCleanupDeleteTrustsPostedDeleteDisposition(); });
+    ok &= trace_case(R"TRACE(TestCleanupDeleteBlocksRenameUntilCloseRemovesSource())TRACE", [&]() { return TestCleanupDeleteBlocksRenameUntilCloseRemovesSource(); });
+    ok &= trace_case(R"TRACE(TestCloseRemovesEmptyDirectoryAfterCleanupDelete())TRACE", [&]() { return TestCloseRemovesEmptyDirectoryAfterCleanupDelete(); });
+    ok &= trace_case(R"TRACE(TestRecursiveDirectoryDeleteCompletesAfterChildClose())TRACE", [&]() { return TestRecursiveDirectoryDeleteCompletesAfterChildClose(); });
+    ok &= trace_case(R"TRACE(TestDirectoryCleanupDeleteDispositionWorksAfterMetadataOnlyOpen())TRACE", [&]() { return TestDirectoryCleanupDeleteDispositionWorksAfterMetadataOnlyOpen(); });
+    ok &= trace_case(R"TRACE(TestDirectoryCleanupFilenameWithoutDeleteFlagKeepsDirectory())TRACE", [&]() { return TestDirectoryCleanupFilenameWithoutDeleteFlagKeepsDirectory(); });
+    ok &= trace_case(R"TRACE(TestDeleteOnCloseDirectoryDefersUntilChildrenDrain())TRACE", [&]() { return TestDeleteOnCloseDirectoryDefersUntilChildrenDrain(); });
+    ok &= trace_case(R"TRACE(TestDeleteAccessOpenCompletesRecentlyDrainedDirectoryDelete())TRACE", [&]() { return TestDeleteAccessOpenCompletesRecentlyDrainedDirectoryDelete(); });
+    ok &= trace_case(R"TRACE(TestSetBasicInfoPreservesOpenRecentlyDrainedDirectory())TRACE", [&]() { return TestSetBasicInfoPreservesOpenRecentlyDrainedDirectory(); });
+    ok &= trace_case(R"TRACE(TestSetBasicInfoDoesNotDeleteDirectoryOpenedAfterChildDelete())TRACE", [&]() { return TestSetBasicInfoDoesNotDeleteDirectoryOpenedAfterChildDelete(); });
+    ok &= trace_case(R"TRACE(TestRecursiveCallerCanDeleteDrainedDirectoryAfterMetadataTouch())TRACE", [&]() { return TestRecursiveCallerCanDeleteDrainedDirectoryAfterMetadataTouch(); });
+    ok &= trace_case(R"TRACE(TestDeferredDirectoryDeleteCompletesOnDirectoryClose())TRACE", [&]() { return TestDeferredDirectoryDeleteCompletesOnDirectoryClose(); });
+    ok &= trace_case(R"TRACE(TestSetDeleteNonEmptyDirectoryAllowsCallerFinalDeleteRetry())TRACE", [&]() { return TestSetDeleteNonEmptyDirectoryAllowsCallerFinalDeleteRetry(); });
+    ok &= trace_case(R"TRACE(TestCanDeleteNonEmptyDirectoryAllowsCallerFinalDeleteRetry())TRACE", [&]() { return TestCanDeleteNonEmptyDirectoryAllowsCallerFinalDeleteRetry(); });
+    ok &= trace_case(R"TRACE(TestCloseWithoutDeleteLatchPreservesNode())TRACE", [&]() { return TestCloseWithoutDeleteLatchPreservesNode(); });
+    ok &= trace_case(R"TRACE(TestPlainCloseSkipsRecursiveDeleteReadinessScan())TRACE", [&]() { return TestPlainCloseSkipsRecursiveDeleteReadinessScan(); });
+    ok &= trace_case(R"TRACE(TestBroadAccessUnmodifiedCloseUsesFastPath())TRACE", [&]() { return TestBroadAccessUnmodifiedCloseUsesFastPath(); });
+    ok &= trace_case(R"TRACE(TestObservedMutationRejectsFastClose())TRACE", [&]() { return TestObservedMutationRejectsFastClose(); });
+    ok &= trace_case(R"TRACE(TestCleanupWithoutDeleteReleasesFileForRename())TRACE", [&]() { return TestCleanupWithoutDeleteReleasesFileForRename(); });
+    ok &= trace_case(R"TRACE(TestCleanupRetainsEagerPayloadHandlesUntilClose())TRACE", [&]() { return TestCleanupRetainsEagerPayloadHandlesUntilClose(); });
+    ok &= trace_case(R"TRACE(TestCanDeleteSupportsParentDeleteChildPermission())TRACE", [&]() { return TestCanDeleteSupportsParentDeleteChildPermission(); });
+    ok &= trace_case(R"TRACE(TestRenameSupportsParentDeleteChildPermission())TRACE", [&]() { return TestRenameSupportsParentDeleteChildPermission(); });
+    ok &= trace_case(R"TRACE(TestRenameSameParentRequiresInsertPermission())TRACE", [&]() { return TestRenameSameParentRequiresInsertPermission(); });
+    ok &= trace_case(R"TRACE(TestRenameCrossParentOldParentHandleDenied())TRACE", [&]() { return TestRenameCrossParentOldParentHandleDenied(); });
+    ok &= trace_case(R"TRACE(TestRenameParentWithoutDeleteChildDenied())TRACE", [&]() { return TestRenameParentWithoutDeleteChildDenied(); });
+    ok &= trace_case(R"TRACE(TestRenameReplaceUsesAuthorizedSourceContext())TRACE", [&]() { return TestRenameReplaceUsesAuthorizedSourceContext(); });
+    ok &= trace_case(R"TRACE(TestRenameReplaceAllowsTargetParentDeleteChild())TRACE", [&]() { return TestRenameReplaceAllowsTargetParentDeleteChild(); });
+    ok &= trace_case(R"TRACE(TestRenameReplaceRequiresDeleteChildEvenWithInsertPermission())TRACE", [&]() { return TestRenameReplaceRequiresDeleteChildEvenWithInsertPermission(); });
+    ok &= trace_case(R"TRACE(TestRenameDirectoryReplaceRequiresDirectoryInsertPermission())TRACE", [&]() { return TestRenameDirectoryReplaceRequiresDirectoryInsertPermission(); });
+    ok &= trace_case(R"TRACE(TestCanDeleteNullNameParentHandleRequiresDeleteNotDeleteChild())TRACE", [&]() { return TestCanDeleteNullNameParentHandleRequiresDeleteNotDeleteChild(); });
+    ok &= trace_case(R"TRACE(TestCanDeleteFailsWhenAdditionalHandleOpen())TRACE", [&]() { return TestCanDeleteFailsWhenAdditionalHandleOpen(); });
+    ok &= trace_case(R"TRACE(TestSetDeleteFailsWhenAdditionalHandleOpen())TRACE", [&]() { return TestSetDeleteFailsWhenAdditionalHandleOpen(); });
+    ok &= trace_case(R"TRACE(TestCleanupDeleteLatchesEvenWhenAdditionalHandlesRemain())TRACE", [&]() { return TestCleanupDeleteLatchesEvenWhenAdditionalHandlesRemain(); });
+    ok &= trace_case(R"TRACE(TestCloseOnlyCommitsWhenDeleteMutationIsEmitted())TRACE", [&]() { return TestCloseOnlyCommitsWhenDeleteMutationIsEmitted(); });
+    ok &= trace_case(R"TRACE(TestDeleteOnCloseCommitsWhenDeleteIsLatching())TRACE", [&]() { return TestDeleteOnCloseCommitsWhenDeleteIsLatching(); });
+    ok &= trace_case(R"TRACE(TestSetFileSizeDefersNativeCommitUntilFlush())TRACE", [&]() { return TestSetFileSizeDefersNativeCommitUntilFlush(); });
+    ok &= trace_case(R"TRACE(TestSetFileSizeDefersNativeCommitUntilClose())TRACE", [&]() { return TestSetFileSizeDefersNativeCommitUntilClose(); });
+    ok &= trace_case(R"TRACE(TestDeferredCloseAllowsNewFileIngestBatch())TRACE", [&]() { return TestDeferredCloseAllowsNewFileIngestBatch(); });
+    ok &= trace_case(R"TRACE(TestDeferredWriteBackUsesSafeDefaultAndSupportsOptOut())TRACE", [&]() { return TestDeferredWriteBackUsesSafeDefaultAndSupportsOptOut(); });
+    ok &= trace_case(R"TRACE(TestExperimentalDualHydrationMirrorSwitch())TRACE", [&]() { return TestExperimentalDualHydrationMirrorSwitch(); });
+    ok &= trace_case(R"TRACE(TestPostCheckpointHydrationPromotionDefaultsOnAndSupportsOptOut())TRACE", [&]() { return TestPostCheckpointHydrationPromotionDefaultsOnAndSupportsOptOut(); });
+    ok &= trace_case(R"TRACE(TestPostCheckpointHydrationPromotionFailureDoesNotFailCleanup())TRACE", [&]() { return TestPostCheckpointHydrationPromotionFailureDoesNotFailCleanup(); });
+    ok &= trace_case(R"TRACE(TestPostCheckpointHydrationPromotionRejectsConcurrentMutation())TRACE", [&]() { return TestPostCheckpointHydrationPromotionRejectsConcurrentMutation(); });
+    ok &= trace_case(R"TRACE(TestPostCheckpointHydrationPromotionTracksRenameAndSkipsDelete())TRACE", [&]() { return TestPostCheckpointHydrationPromotionTracksRenameAndSkipsDelete(); });
+    ok &= trace_case(R"TRACE(TestDeferredCloseAllowsDirectoryCreateBatch())TRACE", [&]() { return TestDeferredCloseAllowsDirectoryCreateBatch(); });
+    ok &= trace_case(R"TRACE(TestReadOnlyReopenSeesDeferredSpoolWriteOnReadWriteMount())TRACE", [&]() { return TestReadOnlyReopenSeesDeferredSpoolWriteOnReadWriteMount(); });
+    ok &= trace_case(R"TRACE(TestFreshDeferredSpoolMoveOutSourceReadsPayload())TRACE", [&]() { return TestFreshDeferredSpoolMoveOutSourceReadsPayload(); });
+    ok &= trace_case(R"TRACE(TestMetadataOnlyReopenAfterDeferredSpoolWriteDoesNotHydrate())TRACE", [&]() { return TestMetadataOnlyReopenAfterDeferredSpoolWriteDoesNotHydrate(); });
+    ok &= trace_case(R"TRACE(TestImmediateRenameAfterDeferredFreshWriteBatchesBeforeFlush())TRACE", [&]() { return TestImmediateRenameAfterDeferredFreshWriteBatchesBeforeFlush(); });
+    ok &= trace_case(R"TRACE(TestRepeatedDeferredCloseStatusWritesAreCoalesced())TRACE", [&]() { return TestRepeatedDeferredCloseStatusWritesAreCoalesced(); });
+    ok &= trace_case(R"TRACE(TestDeferredBarrierCompletionPublishesIdleStatus())TRACE", [&]() { return TestDeferredBarrierCompletionPublishesIdleStatus(); });
+    ok &= trace_case(R"TRACE(TestTargetlessDeferredBarrierFailureRemainsVisible())TRACE", [&]() { return TestTargetlessDeferredBarrierFailureRemainsVisible(); });
+    ok &= trace_case(R"TRACE(TestDeferredCloseBurstExtendsQuietWindowWhileWriterOpen())TRACE", [&]() { return TestDeferredCloseBurstExtendsQuietWindowWhileWriterOpen(); });
+    ok &= trace_case(R"TRACE(TestDeferredCloseIdleBurstKeepsBaseQuietWindow())TRACE", [&]() { return TestDeferredCloseIdleBurstKeepsBaseQuietWindow(); });
+    ok &= trace_case(R"TRACE(TestDeferredCloseRecentActivityCutoffAvoidsSecondQuietWindow())TRACE", [&]() { return TestDeferredCloseRecentActivityCutoffAvoidsSecondQuietWindow(); });
+    ok &= trace_case(R"TRACE(TestDeferredWorkerCarriesAcceptedTargetThroughCleanup())TRACE", [&]() { return TestDeferredWorkerCarriesAcceptedTargetThroughCleanup(); });
+    ok &= trace_case(R"TRACE(TestDeferredWorkerExceptionFailsClosedWithoutTerminatingHost())TRACE", [&]() { return TestDeferredWorkerExceptionFailsClosedWithoutTerminatingHost(); });
+    ok &= trace_case(R"TRACE(TestDeferredClosePressureForcesImmediateScheduling())TRACE", [&]() { return TestDeferredClosePressureForcesImmediateScheduling(); });
+    ok &= trace_case(R"TRACE(TestDeferredPressureDrainsBeforeNextMutation())TRACE", [&]() { return TestDeferredPressureDrainsBeforeNextMutation(); });
+    ok &= trace_case(R"TRACE(TestDeferredPressureCountsObjectsNotRanges())TRACE", [&]() { return TestDeferredPressureCountsObjectsNotRanges(); });
+    ok &= trace_case(R"TRACE(TestDeferredRequestQueuedBehindWorkerTracksAge())TRACE", [&]() { return TestDeferredRequestQueuedBehindWorkerTracksAge(); });
+    ok &= trace_case(R"TRACE(TestDeferredCommitBarrierWaitsForInFlightWorker())TRACE", [&]() { return TestDeferredCommitBarrierWaitsForInFlightWorker(); });
+    ok &= trace_case(R"TRACE(TestDeferredWorkerDoesNotPublishInFlightBeforeMutationQueueOwnership())TRACE", [&]() { return TestDeferredWorkerDoesNotPublishInFlightBeforeMutationQueueOwnership(); });
+    ok &= trace_case(R"TRACE(TestDeferredCommitBarrierPropagatesWorkerFailure())TRACE", [&]() { return TestDeferredCommitBarrierPropagatesWorkerFailure(); });
+    ok &= trace_case(R"TRACE(TestDeferredCommitBarrierRejectsEarlierFailedTargetAfterLaterCompletion())TRACE", [&]() { return TestDeferredCommitBarrierRejectsEarlierFailedTargetAfterLaterCompletion(); });
+    ok &= trace_case(R"TRACE(TestConcurrentDeferredCommitBarriersShareOrderedCompletion())TRACE", [&]() { return TestConcurrentDeferredCommitBarriersShareOrderedCompletion(); });
+    ok &= trace_case(R"TRACE(TestDeferredCommitBarrierWakesWhenWorkerStops())TRACE", [&]() { return TestDeferredCommitBarrierWakesWhenWorkerStops(); });
+    ok &= trace_case(R"TRACE(TestFlushSurfacesPayloadFinalizationFailure())TRACE", [&]() { return TestFlushSurfacesPayloadFinalizationFailure(); });
+    ok &= trace_case(R"TRACE(TestVolumeFlushSurfacesPayloadFinalizationFailure())TRACE", [&]() { return TestVolumeFlushSurfacesPayloadFinalizationFailure(); });
+    ok &= trace_case(R"TRACE(TestCommittedMetadataDoesNotClearUnfinalizedWal())TRACE", [&]() { return TestCommittedMetadataDoesNotClearUnfinalizedWal(); });
+    ok &= trace_case(R"TRACE(TestDeferredBarrierRechecksCurrentWalWatermark())TRACE", [&]() { return TestDeferredBarrierRechecksCurrentWalWatermark(); });
+    ok &= trace_case(R"TRACE(TestFinalizationReportsUnmetDeferredDurabilityTarget())TRACE", [&]() { return TestFinalizationReportsUnmetDeferredDurabilityTarget(); });
+    ok &= trace_case(R"TRACE(TestCompactionIntentStartupDowngradesUntilPredecessorAliasIsRemoved())TRACE", [&]() { return TestCompactionIntentStartupDowngradesUntilPredecessorAliasIsRemoved(); });
+    ok &= trace_case(R"TRACE(TestBestEffortFinalizationFailureSurvivesNothingToCommit())TRACE", [&]() { return TestBestEffortFinalizationFailureSurvivesNothingToCommit(); });
+    ok &= trace_case(R"TRACE(TestShutdownFailedCommitRetainsAcceptedEvidence())TRACE", [&]() { return TestShutdownFailedCommitRetainsAcceptedEvidence(); });
+    ok &= trace_case(R"TRACE(TestShutdownDoesNotMarkAcceptedWriteDurableAfterFailedCommit())TRACE", [&]() { return TestShutdownDoesNotMarkAcceptedWriteDurableAfterFailedCommit(); });
+    ok &= trace_case(R"TRACE(TestOpenSurfacesPayloadFinalizationFailure())TRACE", [&]() { return TestOpenSurfacesPayloadFinalizationFailure(); });
+    ok &= trace_case(R"TRACE(TestDeferredCloseWorkerWaitsForOpenWriteHandles())TRACE", [&]() { return TestDeferredCloseWorkerWaitsForOpenWriteHandles(); });
+    ok &= trace_case(R"TRACE(TestDeferredCloseWorkerWaitsForActiveForegroundCallback())TRACE", [&]() { return TestDeferredCloseWorkerWaitsForActiveForegroundCallback(); });
+    ok &= trace_case(R"TRACE(TestDeleteCloseHardBoundaryFailureRestoresLocalNode())TRACE", [&]() { return TestDeleteCloseHardBoundaryFailureRestoresLocalNode(); });
+    ok &= trace_case(R"TRACE(TestDeleteCloseHardBoundarySuccessRemovesHydration())TRACE", [&]() { return TestDeleteCloseHardBoundarySuccessRemovesHydration(); });
+    ok &= trace_case(R"TRACE(TestPlainCloseDoesNotDeferMixedPendingTransaction())TRACE", [&]() { return TestPlainCloseDoesNotDeferMixedPendingTransaction(); });
+    ok &= trace_case(R"TRACE(TestDeleteOnCloseRestoresLocalNodeWhenNativeCommitFails())TRACE", [&]() { return TestDeleteOnCloseRestoresLocalNodeWhenNativeCommitFails(); });
+    ok &= trace_case(R"TRACE(TestDirectoryDeleteStaysSynchronousAndRestoresSubtreeOnFailure())TRACE", [&]() { return TestDirectoryDeleteStaysSynchronousAndRestoresSubtreeOnFailure(); });
+    ok &= trace_case(R"TRACE(TestRenameDirectoryFailsWhenDescendantHandleOpen())TRACE", [&]() { return TestRenameDirectoryFailsWhenDescendantHandleOpen(); });
+    ok &= trace_case(R"TRACE(TestRenameSourceHandleSucceedsWithOnlyCurrentHandleOpen())TRACE", [&]() { return TestRenameSourceHandleSucceedsWithOnlyCurrentHandleOpen(); });
+    ok &= trace_case(R"TRACE(TestRenameTargetParentRequiresFileInsertPermission())TRACE", [&]() { return TestRenameTargetParentRequiresFileInsertPermission(); });
+    ok &= trace_case(R"TRACE(TestRenameTargetParentRequiresDirectoryInsertPermission())TRACE", [&]() { return TestRenameTargetParentRequiresDirectoryInsertPermission(); });
+    ok &= trace_case(R"TRACE(TestCleanupDeleteSkipsNonEmptyDirectory())TRACE", [&]() { return TestCleanupDeleteSkipsNonEmptyDirectory(); });
+    ok &= trace_case(R"TRACE(TestCleanupDeleteBlockedByAdditionalOpenHandle())TRACE", [&]() { return TestCleanupDeleteBlockedByAdditionalOpenHandle(); });
+    ok &= trace_case(R"TRACE(TestDeleteOnCloseRemovesOnlyAfterLastHandleCloses())TRACE", [&]() { return TestDeleteOnCloseRemovesOnlyAfterLastHandleCloses(); });
+    ok &= trace_case(R"TRACE(TestRenameReplaceFailsWhenTargetDirectoryNotEmpty())TRACE", [&]() { return TestRenameReplaceFailsWhenTargetDirectoryNotEmpty(); });
+    ok &= trace_case(R"TRACE(TestRenameReplaceFailsWhenTargetDirectoryHasOpenHandle())TRACE", [&]() { return TestRenameReplaceFailsWhenTargetDirectoryHasOpenHandle(); });
+    ok &= trace_case(R"TRACE(TestCreateRejectedWhenShutdownDrainActive())TRACE", [&]() { return TestCreateRejectedWhenShutdownDrainActive(); });
+    ok &= trace_case(R"TRACE(TestRenameRejectedWhenShutdownDrainActive())TRACE", [&]() { return TestRenameRejectedWhenShutdownDrainActive(); });
+    ok &= trace_case(R"TRACE(TestMetadataMutationsRejectedWhenShutdownDrainActive())TRACE", [&]() { return TestMetadataMutationsRejectedWhenShutdownDrainActive(); });
+    ok &= trace_case(R"TRACE(TestDataMutationsRejectedWhenShutdownDrainActive())TRACE", [&]() { return TestDataMutationsRejectedWhenShutdownDrainActive(); });
+    ok &= trace_case(R"TRACE(TestOpenMutationAccessDeniedWhenShutdownDrainActive())TRACE", [&]() { return TestOpenMutationAccessDeniedWhenShutdownDrainActive(); });
+    ok &= trace_case(R"TRACE(TestOpenDeleteAccessDeniedWhenShutdownDrainActive())TRACE", [&]() { return TestOpenDeleteAccessDeniedWhenShutdownDrainActive(); });
+    ok &= trace_case(R"TRACE(TestOpenReadOnlyAllowedWhenShutdownDrainActive())TRACE", [&]() { return TestOpenReadOnlyAllowedWhenShutdownDrainActive(); });
+    ok &= trace_case(R"TRACE(TestSetSecurityRejectedWhenShutdownDrainActive())TRACE", [&]() { return TestSetSecurityRejectedWhenShutdownDrainActive(); });
+    ok &= trace_case(R"TRACE(TestCleanupDeleteNoopWhenShutdownDrainActive())TRACE", [&]() { return TestCleanupDeleteNoopWhenShutdownDrainActive(); });
+    ok &= trace_case(R"TRACE(TestFlushRejectedWhenShutdownDrainActive())TRACE", [&]() { return TestFlushRejectedWhenShutdownDrainActive(); });
+    ok &= trace_case(R"TRACE(TestFlushAllowedWhenWriteDisabledDuringShutdownDrain())TRACE", [&]() { return TestFlushAllowedWhenWriteDisabledDuringShutdownDrain(); });
+    ok &= trace_case(R"TRACE(TestFlushReleasesExternalMutationScopeAfterSuccessfulWriteEnabledFlush())TRACE", [&]() { return TestFlushReleasesExternalMutationScopeAfterSuccessfulWriteEnabledFlush(); });
+    ok &= trace_case(R"TRACE(TestFlushFinalizesPendingMutationJournal())TRACE", [&]() { return TestFlushFinalizesPendingMutationJournal(); });
+    ok &= trace_case(R"TRACE(TestVolumeFlushFinalizesPendingMutationJournal())TRACE", [&]() { return TestVolumeFlushFinalizesPendingMutationJournal(); });
+    ok &= trace_case(R"TRACE(TestDeferredAcceptanceFlushesSpoolBeforeWalMarker())TRACE", [&]() { return TestDeferredAcceptanceFlushesSpoolBeforeWalMarker(); });
+    ok &= trace_case(R"TRACE(TestDeferredAcceptanceUsesInlinePayloadWithoutSpoolFlush())TRACE", [&]() { return TestDeferredAcceptanceUsesInlinePayloadWithoutSpoolFlush(); });
+    ok &= trace_case(R"TRACE(TestInlineAcceptedFinalizationSkipsRedundantSpoolFlush())TRACE", [&]() { return TestInlineAcceptedFinalizationSkipsRedundantSpoolFlush(); });
+    ok &= trace_case(R"TRACE(TestStrictFinalizationScanFailureFailsClosed())TRACE", [&]() { return TestStrictFinalizationScanFailureFailsClosed(); });
+    ok &= trace_case(R"TRACE(TestGroupedDeferredAcceptanceBatchesConcurrentCloses())TRACE", [&]() { return TestGroupedDeferredAcceptanceBatchesConcurrentCloses(); });
+    ok &= trace_case(R"TRACE(TestSerialDeferredAcceptanceReturnsBeforeWalDurability())TRACE", [&]() { return TestSerialDeferredAcceptanceReturnsBeforeWalDurability(); });
+    ok &= trace_case(R"TRACE(TestSerialDeferredWalFlushFailureBlocksApfsCommit())TRACE", [&]() { return TestSerialDeferredWalFlushFailureBlocksApfsCommit(); });
+    ok &= trace_case(R"TRACE(TestSerialDeferredAcceptanceFlushDrainsAllDurabilityStages())TRACE", [&]() { return TestSerialDeferredAcceptanceFlushDrainsAllDurabilityStages(); });
+    ok &= trace_case(R"TRACE(TestSerialDeferredWalDurabilityProgressesWhileBusy())TRACE", [&]() { return TestSerialDeferredWalDurabilityProgressesWhileBusy(); });
+    ok &= trace_case(R"TRACE(TestSerialDeferredWorkerRevalidatesWriterOpenBeforeCommit())TRACE", [&]() { return TestSerialDeferredWorkerRevalidatesWriterOpenBeforeCommit(); });
+    ok &= trace_case(R"TRACE(TestSerialDeferredClosePublishesAcceptedPendingStatus())TRACE", [&]() { return TestSerialDeferredClosePublishesAcceptedPendingStatus(); });
+    ok &= trace_case(R"TRACE(TestSerialDeferredUnsafeInlineProofFallsBackToSynchronousDurability())TRACE", [&]() { return TestSerialDeferredUnsafeInlineProofFallsBackToSynchronousDurability(); });
+    ok &= trace_case(R"TRACE(TestSerialDeferredIdleFollowerSkipsSpoolAndHonorsDurabilityMode())TRACE", [&]() { return TestSerialDeferredIdleFollowerSkipsSpoolAndHonorsDurabilityMode(); });
+    ok &= trace_case(R"TRACE(TestSerialDeferredShutdownDrainConvergesQueuedTarget())TRACE", [&]() { return TestSerialDeferredShutdownDrainConvergesQueuedTarget(); });
+    ok &= trace_case(R"TRACE(TestShutdownStopsPublishingDiagnosticsAtWinFspBoundary())TRACE", [&]() { return TestShutdownStopsPublishingDiagnosticsAtWinFspBoundary(); });
+    ok &= trace_case(R"TRACE(TestShutdownPublishesMountNotReadyBeforeWinFspTeardown())TRACE", [&]() { return TestShutdownPublishesMountNotReadyBeforeWinFspTeardown(); });
+    ok &= trace_case(R"TRACE(TestShutdownFailsWhenTerminalStatusCannotBePersisted())TRACE", [&]() { return TestShutdownFailsWhenTerminalStatusCannotBePersisted(); });
+    ok &= trace_case(R"TRACE(TestWinFspTeardownTimeoutPinsOwnershipAtEachPhase())TRACE", [&]() { return TestWinFspTeardownTimeoutPinsOwnershipAtEachPhase(); });
+    ok &= trace_case(R"TRACE(TestDiagnosticWatchdogDuringTeardownOwnerTransfer())TRACE", [&]() { return TestDiagnosticWatchdogDuringTeardownOwnerTransfer(); });
+    ok &= trace_case(R"TRACE(TestWinFspTeardownTimeoutStopsManifestSiblingCleanup())TRACE", [&]() { return TestWinFspTeardownTimeoutStopsManifestSiblingCleanup(); });
+    ok &= trace_case(R"TRACE(TestWinFspTeardownWorkerStartFailurePinsOwnership())TRACE", [&]() { return TestWinFspTeardownWorkerStartFailurePinsOwnership(); });
+    ok &= trace_case(R"TRACE(TestWinFspRuntimeVersionRejectsKnownDeadlockBuilds())TRACE", [&]() { return TestWinFspRuntimeVersionRejectsKnownDeadlockBuilds(); });
+    ok &= trace_case(R"TRACE(TestWinFspCleanStartupStartsVerifiedDriver())TRACE", [&]() { return TestWinFspCleanStartupStartsVerifiedDriver(); });
+    ok &= trace_case(R"TRACE(TestWinFspActiveDriverRequiresExactBinaryIdentity())TRACE", [&]() { return TestWinFspActiveDriverRequiresExactBinaryIdentity(); });
+    ok &= trace_case(R"TRACE(TestSerialDeferredProcessKillBeforeWalFlushHasNoFalseDurability())TRACE", [&]() { return TestSerialDeferredProcessKillBeforeWalFlushHasNoFalseDurability(); });
+    ok &= trace_case(R"TRACE(TestSerialDeferredSafetyTestsAreRegisteredInAggregate())TRACE", [&]() { return TestSerialDeferredSafetyTestsAreRegisteredInAggregate(); });
+    ok &= trace_case(R"TRACE(TestGroupedDeferredAcceptanceIsAbsorbedByHardBoundary())TRACE", [&]() { return TestGroupedDeferredAcceptanceIsAbsorbedByHardBoundary(); });
+    ok &= trace_case(R"TRACE(TestShutdownDrainFinishesGroupedDeferredAcceptance())TRACE", [&]() { return TestShutdownDrainFinishesGroupedDeferredAcceptance(); });
+    ok &= trace_case(R"TRACE(TestGroupedDeferredAcceptanceDisableSwitchUsesImmediateAcceptance())TRACE", [&]() { return TestGroupedDeferredAcceptanceDisableSwitchUsesImmediateAcceptance(); });
+    ok &= trace_case(R"TRACE(TestGroupedDeferredAcceptanceSealedCohortDoesNotGrow())TRACE", [&]() { return TestGroupedDeferredAcceptanceSealedCohortDoesNotGrow(); });
+    ok &= trace_case(R"TRACE(TestGroupedDeferredAcceptanceFollowerRetriesLowerSharedTarget())TRACE", [&]() { return TestGroupedDeferredAcceptanceFollowerRetriesLowerSharedTarget(); });
+    ok &= trace_case(R"TRACE(TestGroupedDeferredAcceptanceBoundaryCompletionTargetsCapturedCohort())TRACE", [&]() { return TestGroupedDeferredAcceptanceBoundaryCompletionTargetsCapturedCohort(); });
+    ok &= trace_case(R"TRACE(TestGroupedDeferredAcceptanceResolvesAlreadyAcceptedIdleTransaction())TRACE", [&]() { return TestGroupedDeferredAcceptanceResolvesAlreadyAcceptedIdleTransaction(); });
+    ok &= trace_case(R"TRACE(TestGroupedDeferredAcceptanceProofCapacityFallsBackToImmediateAcceptance())TRACE", [&]() { return TestGroupedDeferredAcceptanceProofCapacityFallsBackToImmediateAcceptance(); });
+    ok &= trace_case(R"TRACE(TestGroupedDeferredAcceptanceRejectsUnrelatedAcceptedTransaction())TRACE", [&]() { return TestGroupedDeferredAcceptanceRejectsUnrelatedAcceptedTransaction(); });
+    ok &= trace_case(R"TRACE(TestGroupedDeferredAcceptanceFlushFailureHasSingleRecoveryOwner())TRACE", [&]() { return TestGroupedDeferredAcceptanceFlushFailureHasSingleRecoveryOwner(); });
+    ok &= trace_case(R"TRACE(TestShutdownUnresolvedCleanupWatermarkFailsClosed())TRACE", [&]() { return TestShutdownUnresolvedCleanupWatermarkFailsClosed(); });
+    ok &= trace_case(R"TRACE(TestAcceptedWriteRestartFailsClosedUntilReplay())TRACE", [&]() { return TestAcceptedWriteRestartFailsClosedUntilReplay(); });
+    ok &= trace_case(R"TRACE(TestBestEffortBlocksNewMutationsWhileRecoveryEvidenceIsUnresolved())TRACE", [&]() { return TestBestEffortBlocksNewMutationsWhileRecoveryEvidenceIsUnresolved(); });
+    ok &= trace_case(R"TRACE(TestBestEffortPostStageFailureBlocksWriteBackends())TRACE", [&]() { return TestBestEffortPostStageFailureBlocksWriteBackends(); });
+    ok &= trace_case(R"TRACE(TestPostStagePayloadSpoolFailureCannotExitShutdownCleanly())TRACE", [&]() { return TestPostStagePayloadSpoolFailureCannotExitShutdownCleanly(); });
+    ok &= trace_case(R"TRACE(TestInvalidWalWatermarkFailsClosed())TRACE", [&]() { return TestInvalidWalWatermarkFailsClosed(); });
+    ok &= trace_case(R"TRACE(TestHostStatusExposesWalWatermarks())TRACE", [&]() { return TestHostStatusExposesWalWatermarks(); });
+    ok &= trace_case(R"TRACE(TestAcceptedWriteReplayCommitsAndConvergesWatermarks())TRACE", [&]() { return TestAcceptedWriteReplayCommitsAndConvergesWatermarks(); });
+    ok &= trace_case(R"TRACE(TestAcceptedReplayRecognizesFinalDeleteState())TRACE", [&]() { return TestAcceptedReplayRecognizesFinalDeleteState(); });
+    ok &= trace_case(R"TRACE(TestSymbolicLinkAcceptedReplay())TRACE", [&]() { return TestSymbolicLinkAcceptedReplay(); });
+    ok &= trace_case(R"TRACE(TestExtendedAttributeAcceptedReplay())TRACE", [&]() { return TestExtendedAttributeAcceptedReplay(); });
+    ok &= trace_case(R"TRACE(TestExtendedAttributeAcceptedReplay(true))TRACE", [&]() { return TestExtendedAttributeAcceptedReplay(true); });
+    ok &= trace_case(R"TRACE(TestPersistentWindowsSecurity(false, false, 1))TRACE", [&]() { return TestPersistentWindowsSecurity(false, false, 1); });
+    ok &= trace_case(R"TRACE(TestPersistentWindowsSecurity(false, false, 2))TRACE", [&]() { return TestPersistentWindowsSecurity(false, false, 2); });
+    ok &= trace_case(R"TRACE(TestPersistentWindowsSecurity(false, false, 3))TRACE", [&]() { return TestPersistentWindowsSecurity(false, false, 3); });
+    ok &= trace_case(R"TRACE(TestPersistentWindowsSecurity(true, false, 1))TRACE", [&]() { return TestPersistentWindowsSecurity(true, false, 1); });
+    ok &= trace_case(R"TRACE(TestPersistentWindowsSecurity(true, false, 2))TRACE", [&]() { return TestPersistentWindowsSecurity(true, false, 2); });
+    ok &= trace_case(R"TRACE(TestPersistentWindowsSecurity(true, false, 3))TRACE", [&]() { return TestPersistentWindowsSecurity(true, false, 3); });
+    ok &= trace_case(R"TRACE(TestExternalAttributeRemovalAcceptedRecovery())TRACE", [&]() { return TestExternalAttributeRemovalAcceptedRecovery(); });
+    ok &= trace_case(R"TRACE(TestExternalAttributeRemovalAcceptedRecovery(true))TRACE", [&]() { return TestExternalAttributeRemovalAcceptedRecovery(true); });
+    ok &= trace_case(R"TRACE(TestExtendedAttributeForegroundJournal(false))TRACE", [&]() { return TestExtendedAttributeForegroundJournal(false); });
+    ok &= trace_case(R"TRACE(TestExtendedAttributeForegroundJournal(false, 0, true))TRACE", [&]() { return TestExtendedAttributeForegroundJournal(false, 0, true); });
+    ok &= trace_case(R"TRACE(TestExtendedAttributeForegroundJournal(true, 0, true))TRACE", [&]() { return TestExtendedAttributeForegroundJournal(true, 0, true); });
+    ok &= trace_case(R"TRACE(TestExtendedAttributeForegroundJournal(true))TRACE", [&]() { return TestExtendedAttributeForegroundJournal(true); });
+    ok &= trace_case(R"TRACE(TestExtendedAttributeForegroundJournal(true, 1))TRACE", [&]() { return TestExtendedAttributeForegroundJournal(true, 1); });
+    ok &= trace_case(R"TRACE(TestExtendedAttributeForegroundJournal(true, 2))TRACE", [&]() { return TestExtendedAttributeForegroundJournal(true, 2); });
+    ok &= trace_case(R"TRACE(TestSymbolicLinkMutationCallbacks())TRACE", [&]() { return TestSymbolicLinkMutationCallbacks(); });
+    ok &= trace_case(R"TRACE(TestCaseOnlyRenameAcceptedReplay())TRACE", [&]() { return TestCaseOnlyRenameAcceptedReplay(); });
+    ok &= trace_case(R"TRACE(TestAliasUnlinkAcceptedReplay())TRACE", [&]() { return TestAliasUnlinkAcceptedReplay(); });
+    ok &= trace_case(R"TRACE(TestAliasUnlinkAcceptedReplay(1, true))TRACE", [&]() { return TestAliasUnlinkAcceptedReplay(1, true); });
+    ok &= trace_case(R"TRACE(TestAliasUnlinkAcceptedReplay(4, true))TRACE", [&]() { return TestAliasUnlinkAcceptedReplay(4, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity())TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(false, false, false, false, false, false,
+        false, false, false, false, false, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(false, false, false, false, false, false,
+        false, false, false, false, false, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(false, true, false, false, false, false,
+        false, false, false, false, false, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(false, true, false, false, false, false,
+        false, false, false, false, false, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(false, false, false, false, false, false, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(false, false, false, false, false, false, true); });
+    ok &= trace_case(R"TRACE(TestIndependentWindowsTimestamps(false))TRACE", [&]() { return TestIndependentWindowsTimestamps(false); });
+    ok &= trace_case(R"TRACE(TestPersistentWindowsSecurity(false, false, 0, false, false, true))TRACE", [&]() { return TestPersistentWindowsSecurity(false, false, 0, false, false, true); });
+    ok &= trace_case(R"TRACE(TestPersistentWindowsSecurity(true, false, 0, false, false, true))TRACE", [&]() { return TestPersistentWindowsSecurity(true, false, 0, false, false, true); });
+    ok &= trace_case(R"TRACE(TestPersistentWindowsSecurity(false))TRACE", [&]() { return TestPersistentWindowsSecurity(false); });
+    ok &= trace_case(R"TRACE(Windows integrity labels)TRACE", [&]() { return TestWindowsIntegrityLabelEncoding() &&
+        TestPersistentWindowsSecurity(false, false, 0, false, true) && TestPersistentWindowsSecurity(true, false, 0, false, true) &&
+        TestPersistentWindowsSecurity(false, true, 0, false, true) && TestPersistentWindowsSecurity(true, true, 0, false, true); });
+    ok &= trace_case(R"TRACE(TestPersistentWindowsSecurity(true))TRACE", [&]() { return TestPersistentWindowsSecurity(true); });
+    ok &= trace_case(R"TRACE(TestPersistentWindowsSecurity(false, false, 0, true))TRACE", [&]() { return TestPersistentWindowsSecurity(false, false, 0, true); });
+    ok &= trace_case(R"TRACE(TestPersistentWindowsSecurity(true, false, 0, true))TRACE", [&]() { return TestPersistentWindowsSecurity(true, false, 0, true); });
+    ok &= trace_case(R"TRACE(TestPersistentWindowsSecurity(false, true))TRACE", [&]() { return TestPersistentWindowsSecurity(false, true); });
+    ok &= trace_case(R"TRACE(TestPersistentWindowsSecurity(true, true))TRACE", [&]() { return TestPersistentWindowsSecurity(true, true); });
+    ok &= trace_case(R"TRACE(TestIndependentWindowsTimestamps(true))TRACE", [&]() { return TestIndependentWindowsTimestamps(true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(false, true, false, false, false, false, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(false, true, false, false, false, false, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(false, false, false, false, false, false, false, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(false, false, false, false, false, false, false, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(false, true, false, false, false, false, false, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(false, true, false, false, false, false, false, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(true); });
     for (const bool manifest : {false, true})
     {
-        ok &= TestNativeOverwritePreservesAliasIdentity(true, manifest, false, false, false, false, false, false, false, true);
-        ok &= TestNativeOverwritePreservesAliasIdentity(true, manifest, false, true, true, false, false, false, false, true);
+        ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(true, manifest, false, false, false, false, false, false, false, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(true, manifest, false, false, false, false, false, false, false, true); });
+        ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(true, manifest, false, true, true, false, false, false, false, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(true, manifest, false, true, true, false, false, false, false, true); });
     }
-    ok &= TestNativeOverwritePreservesAliasIdentity(true, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(true, false, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(true, true, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(true, false, false, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(true, true, false, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(true, false, false, true, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(true, true, false, true, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(true, false, false, false, true, false, false, false, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(true, false, false, true, true, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(true, true, false, true, true, true);
-    ok &= TestRemovedPayloadCandidateRetirement();
-    ok &= TestAliasUnlinkAcceptedReplay(1);
-    ok &= TestAliasUnlinkAcceptedReplay(2);
-    ok &= TestAliasUnlinkAcceptedReplay(3);
-    ok &= TestAliasUnlinkAcceptedReplay(4);
-    ok &= TestAliasUnlinkAcceptedReplay(5);
-    ok &= TestAliasUnlinkAcceptedReplay(6);
-    ok &= TestAliasUnlinkAcceptedReplay(7);
-    ok &= TestFinalUnlinkRejectsAbsentPreimage();
-    ok &= TestHistoricalProjectionRejectsIncompleteNamespace();
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(true, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(true, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(true, false, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(true, false, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(true, true, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(true, true, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(true, false, false, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(true, false, false, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(true, true, false, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(true, true, false, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(true, false, false, true, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(true, false, false, true, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(true, true, false, true, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(true, true, false, true, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(true, false, false, false, true, false, false, false, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(true, false, false, false, true, false, false, false, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(true, false, false, true, true, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(true, false, false, true, true, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(true, true, false, true, true, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(true, true, false, true, true, true); });
+    ok &= trace_case(R"TRACE(TestRemovedPayloadCandidateRetirement())TRACE", [&]() { return TestRemovedPayloadCandidateRetirement(); });
+    ok &= trace_case(R"TRACE(TestAliasUnlinkAcceptedReplay(1))TRACE", [&]() { return TestAliasUnlinkAcceptedReplay(1); });
+    ok &= trace_case(R"TRACE(TestAliasUnlinkAcceptedReplay(2))TRACE", [&]() { return TestAliasUnlinkAcceptedReplay(2); });
+    ok &= trace_case(R"TRACE(TestAliasUnlinkAcceptedReplay(3))TRACE", [&]() { return TestAliasUnlinkAcceptedReplay(3); });
+    ok &= trace_case(R"TRACE(TestAliasUnlinkAcceptedReplay(4))TRACE", [&]() { return TestAliasUnlinkAcceptedReplay(4); });
+    ok &= trace_case(R"TRACE(TestAliasUnlinkAcceptedReplay(5))TRACE", [&]() { return TestAliasUnlinkAcceptedReplay(5); });
+    ok &= trace_case(R"TRACE(TestAliasUnlinkAcceptedReplay(6))TRACE", [&]() { return TestAliasUnlinkAcceptedReplay(6); });
+    ok &= trace_case(R"TRACE(TestAliasUnlinkAcceptedReplay(7))TRACE", [&]() { return TestAliasUnlinkAcceptedReplay(7); });
+    ok &= trace_case(R"TRACE(TestFinalUnlinkRejectsAbsentPreimage())TRACE", [&]() { return TestFinalUnlinkRejectsAbsentPreimage(); });
+    ok &= trace_case(R"TRACE(TestHistoricalProjectionRejectsIncompleteNamespace())TRACE", [&]() { return TestHistoricalProjectionRejectsIncompleteNamespace(); });
     for (const auto stage : {"", "before-apple-publish", "after-apple-publish"})
     for (const bool aliases : {false, true})
-        ok &= TestSymbolicLinkMutationCallbacks(stage, aliases, false, true);
-    ok &= TestSymbolicLinkMutationCallbacks({}, true);
+        ok &= trace_case(R"TRACE(TestSymbolicLinkMutationCallbacks(stage, aliases, false, true))TRACE", [&]() { return TestSymbolicLinkMutationCallbacks(stage, aliases, false, true); });
+    ok &= trace_case(R"TRACE(TestSymbolicLinkMutationCallbacks({}, true))TRACE", [&]() { return TestSymbolicLinkMutationCallbacks({}, true); });
     for (const auto stage : {"before-apple-publish", "after-apple-publish"})
     for (const bool removal : {false, true})
-        ok &= TestSymbolicLinkMutationCallbacks(stage, false, removal);
-    ok &= TestAcceptedReplayDeleteHidesEarlierWriteAcrossBatch();
-    ok &= TestAcceptedWriteProcessKillRecoveryMatrix();
-    ok &= TestAcceptedInlineWriteProcessKillAfterWalAcceptance();
-    ok &= TestAcceptedWriteReplayMarkerClearFailureFailsClosed();
-    ok &= TestRecoveryMarkerFinalizeFailureIsNotCached();
-    ok &= TestRecoveryMarkerCacheRecreatesMissingBackingFile();
-    ok &= TestRepeatedRecoveryMarkerUpdatesSkipUnchangedState();
-    ok &= TestRecoveryMarkerCacheRepairsCorruptedBackingFile();
-    ok &= TestRecoveryMarkerCacheRejectsReplacedPathObject();
-    ok &= TestMalformedRecoveryMarkerIsRejected();
-    ok &= TestRecoveryMarkerRejectsUnknownKey();
-    ok &= TestMalformedRecoveryMarkerFailsStartupClosed();
-    ok &= TestMalformedRecoveryMarkerCannotBeClearedByCleanBootstrap();
-    ok &= TestRecoveryMarkerBlockSkipsNativeMetadataStartup();
-    ok &= TestBlockedRecoveryEvidenceSurvivesStaleClearAndShutdownGate();
-    ok &= TestNativeMutationRequiresDurableRecoveryMarkerBeforeStaging();
-    ok &= TestRecoveryMarkerArmCannotRaceCleanCommitBoundary();
-    ok &= TestAcceptedReplayRejectsMissingIdentity();
-    ok &= TestNativeJournalRejectsIdentityLessMutation();
-    ok &= TestCloseCommitsPendingNativeMetadataAfterDirectoryCreate();
-    ok &= TestSetBasicInfoSkipsNativeMutationWhenTimestampUnchanged();
-    ok &= TestCloseStagesNativeSubtreeDeleteBottomUp();
-    ok &= TestSubtreeDeleteAcceptedRecovery();
-    ok &= TestSubtreeDeleteAcceptedRecovery(true);
-    ok &= TestUnstagedDeleteRollbackFailureKeepsJournal();
-    ok &= TestHydrationRollbackPreservesRecoveryCopies();
-    ok &= TestSubtreeDeleteAcceptedRecovery(false, true);
-    ok &= TestSubtreeDeleteAcceptedRecovery(true, true);
-    ok &= TestStatusFileIncludesNativeMutationFailureDetail();
-    ok &= TestSetBasicInfoOnStaleDeletedHandleDoesNotDowngradeNativeWrite();
-    ok &= TestSetBasicInfoOnVisibleNativeMissingDirectoryDoesNotDowngradeNativeWrite();
-    ok &= TestDeleteTargetMissingOnStaleDeletedHandleDoesNotDowngradeNativeWrite();
-    ok &= TestMutatingCallbacksFailWriteProtectedWhenWriteDisabled();
-    ok &= TestSetSecurityIsNoopWhenWriteEnabled();
-    ok &= TestDefaultSecurityDescriptorGrantsUsersWriteAccess();
-    ok &= TestOpenMutationAccessDeniedWhenWriteDisabled();
-    ok &= TestOpenDeleteAccessDeniedWhenWriteDisabled();
-    ok &= TestOpenFailsWhenDeleteIntentStateIsStale();
-    ok &= TestCleanupDeleteNoopWhenWriteDisabled();
-    ok &= TestNativeMutationDenialLatchesFailClosedRecovery();
-    ok &= TestConcurrentNativeMutationDenialsRemainFailClosedAfterDowngrade();
-    ok &= TestConcurrentNativeDenialStatusFileReflectsFailClosedState();
-    ok &= TestStatusSnapshotConcurrentRecoveryTransition();
-    ok &= TestStatusFileDerivesCanonicalGateFailureAfterNativeFailClosedDowngrade();
-    ok &= TestStatusFilePreservesExplicitCompatibilitySignalsAfterNativeFailClosedDowngrade();
-    ok &= TestNativeSafetyStateFallsBackWhenMutationUnavailable();
-    ok &= TestExternalMutationScopeTracksActiveCountAndDrainGate();
-    ok &= TestBeginMutationShutdownDrainWaitsForInFlightMutation();
-    ok &= TestBeginMutationShutdownDrainTimesOutWithStuckMutation();
-    ok &= TestFsHostShutdownExitCodeRequiresEveryDrainStageToSucceed();
-    ok &= TestCommitTimeoutBudgetScalesWithPendingPayload();
-    ok &= TestStatusFileTracksShutdownDrainAndInFlightMutations();
-    ok &= TestExternalMutationScopePublishesIdleStatusOnExit();
-    ok &= TestExternalMutationScopeCoalescesRepeatedIdleStatusOnExit();
-    ok &= TestCallbackStatusCoalescesUnchangedIdleSnapshot();
-    ok &= TestCallbackStatusRateLimitSkipsDirtySnapshot();
-    ok &= TestShutdownDrainWaitsForAdmissionMidFlight();
-    ok &= TestShutdownDrainBlocksAdmissionAfterLinearization();
-    ok &= TestAdmissionDrainConcurrentRaceLosesNoCallbacks();
-    ok &= TestRealSetBasicInfoCallbackTornDownDuringDrain();
-    ok &= TestNoOpExternalScopeExitPublishesIdleWhenLast();
-    ok &= TestRateLimitedIdleCallbackStatusQueuesRefresh();
-    ok &= TestCallbackStatusDefersWhileCallbackIsActive();
-    ok &= TestCleanRecoveryCheckpointXidPrefersSuperblockWhenCommittedTelemetryStale();
-    ok &= TestConcurrentCreateSamePathIsSerializedAndConsistent();
-    ok &= TestConcurrentRenameSameSourceDifferentTargetsIsSerialized();
-    ok &= TestConcurrentRenameAndSetDeleteOnSameSourceIsSerialized();
-    ok &= TestConcurrentRenameReplaceAndTargetSetDeleteIsFailClosed();
-    ok &= TestConcurrentRenameReplaceAndDeleteCloseInterleavingIsConsistent();
-    ok &= TestConcurrentRenameReplaceSameTargetFromTwoSourcesIsSerialized();
-    ok &= TestConcurrentRenameReplaceSameTargetWithHandleCloseTransition();
-    ok &= TestConcurrentSharedParentRenameAndSetDeleteOnSiblingIsConsistent();
-    ok &= TestConcurrentSharedParentRenameAndSiblingDeleteCloseIsConsistent();
-    ok &= TestLoadHydratedPayloadWithoutHydrationReturnsNullWhenHydrateDisabled();
-    ok &= TestLoadHydratedPayloadReadsExistingHydrationWhenHydrateDisabled();
-    ok &= TestEnsureHydratedRejectsIncompleteExistingCache();
-    ok &= TestPayloadRangeProviderReusesHydrationReadHandle();
-    ok &= TestReadOnlyOpenUsesMetadataRangeReadWithoutHydration();
-    ok &= TestMetadataFallbackPayloadMutationLazilyAcquiresHydrationHandle();
-    ok &= TestCommittedMoveSourceOpenSkipsPreOpenDrain();
-    ok &= TestCommittedInodeDeltaMergeEmptyNoOpSkipsSnapshot();
-    ok &= TestCommittedInodeDeltaMergeHandlesDirectoryRenameWithoutSnapshot();
-    ok &= TestHandleReadOverlaysPayloadSpoolWhenHydrationIsStale();
-    ok &= TestCleanHydratedReadSkipsPayloadSpoolProbe();
-    ok &= TestCommittedChunkWritesPreserveEarlierBytes(false);
-    ok &= TestCommittedChunkWritesPreserveEarlierBytes(true);
-    ok &= TestCommittedChunkBoundaries(false);
-    ok &= TestCommittedChunkBoundaries(true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(true, false, false, false, false, false,
-        false, false, false, false, false, false, false, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(true, true, false, false, false, false,
-        false, false, false, false, false, false, false, true);
-    ok &= TestHydratedRangeReadZeroFillsOnlyEofTail();
-    ok &= TestPayloadRangeProviderOverlaysSpoolWhenHydrationIsEmpty();
-    ok &= TestPayloadRangeProviderUsesNativeCommitHydrationBase();
-    ok &= TestPayloadRangeProviderUsesNativeCommitHydrationBase(true);
-    ok &= TestDeferredOverlayHydrationReusesPayloadIdentitySnapshot();
-    ok &= TestDeferredReadSkipsDuplicatePayloadIdentityOverlay();
-    ok &= TestNativeRecycleDesktopIniSpoolCommitStaysWritable();
-    ok &= TestRecoveredMarkerClearsPayloadSpoolResidue();
-    ok &= TestCleanMetadataBootstrapClearsPayloadSpoolRecovery();
-    ok &= TestPreWalCrashOrphanedPayloadRecoversCleanReadWrite();
-    ok &= TestCleanMarkerUnindexedPayloadWithEmptyWalRecoversReadWrite();
-    ok &= TestCleanMarkerUnindexedPayloadWithCleanHistoricalWalRecoversReadWrite();
-    ok &= TestDirtyMarkerUnindexedPayloadWithCleanHistoricalWalRecoversReadWrite();
-    ok &= TestDirtyRecoveryMarkerBlocksPayloadSpoolCleanup();
-    ok &= TestDirtyRecoveryMarkerAheadOfCheckpointBlocksPayloadSpoolCleanup();
-    ok &= TestPayloadSpoolQuotaDrainsAcceptedWorkAndRetriesOnce();
-    ok &= TestPayloadSpoolCapacityPressurePreservesReadWriteMount();
-    ok &= TestPayloadSpoolQuotaDrainFailureRetainsAcceptedEvidence();
-    ok &= TestCommittedSpoolWriteReopenReadsCommittedPayload();
-    ok &= TestWritableOpenHydratesSparseMetadataWithoutDenseCache();
-    ok &= TestParseArgsDefaultsStrictNonFixtureControls();
-    ok &= TestParseArgsRejectsUnownedHostLaunch();
-    ok &= TestExplicitLifetimeFilePreservesParentStopSignal();
-    ok &= TestStartupGateRequiresExactParentAuthorization();
-    ok &= TestParseArgsParsesStrictNonFixtureControlOverrides();
-    ok &= TestParseArgsPreservesDirectoryMountPath();
-    ok &= TestRecoveryRootOverrideSurvivesTempChange();
-    ok &= TestBuildWinFspMountPointUsesGlobalDriveForExplorer();
-    ok &= TestVolumeParamsUseExplorerFriendlyCleanupFlags();
-    ok &= TestVolumeParamsReflectSelectedApfsCaseMode();
-    ok &= TestPathKeysReflectSelectedApfsNamePolicy();
-    ok &= TestCallbacksRoundTripCaseSensitiveApfsNames();
-    ok &= TestNamedStreamCopyCompatibility();
-    ok &= TestNamedStreamDeleteIsolation();
-    ok &= TestNamedStreamDeleteIsolation(true);
-    ok &= TestNamedStreamCreateDoesNotCreateVisibleApfsFile();
-    ok &= TestNamedStreamCreateOnStaleSpoolBackedFileKeepsPayloadReadable();
-    ok &= TestLegacyNamedStreamArtifactsAreHidden();
-    ok &= TestMissingNamedStreamOpenFailsCleanlyWithoutBaseBytes();
-    ok &= TestDuplicateCaseNamedStreamsCoalesceMetadata();
-    ok &= TestOfficeTempRenameReplaceWorkflow();
-    ok &= TestRecycleBinMetadataPairWorkflow();
-    ok &= TestPathNormalizationMatrixRejectsRiskyWin32Names();
-    ok &= TestVisibleLookupReusesNormalizedPathWithoutExtraNormalization();
-    ok &= TestChildTraversalUsesCachedPathKeys();
-    ok &= TestOpenAndSecurityReuseNormalizedStreamPath();
-    ok &= TestDeferredDeleteAncestorSearchReusesNormalizedPath();
-    ok &= TestRecursiveReindexReusesNormalizedChildPaths();
-    ok &= TestCreateReusesNormalizedParentPath();
-    ok &= TestNormalizePathStripsDriveQualifiedRoot();
-    ok &= TestStableVolumeSerialDependsOnVolumeIdentityNotProcessUptime();
-    ok &= TestWriteAheadJournalPathIsStablePerVolume();
-    ok &= TestImmutableRecoveryIdentitySurvivesDeviceRenumbering();
-    ok &= TestImmutableRecoveryIdentitySeparatesSameLabelAndOffsetMedia();
-    ok &= TestRecoveryStorageKeyUsesImmutableDigestDirectly();
-    ok &= TestParseArgsAcceptsImmutableRecoveryIdentity();
-    ok &= TestParseArgsRejectsMalformedRecoveryIdentity();
-    ok &= TestImmutableRecoveryIdentityValidatesBackendFormat();
-    ok &= TestWrongImmutableRecoveryIdentityRejectsWalReplay();
-    ok &= TestPhysicalNativeWriteRequiresImmutableRecoveryIdentity();
-    ok &= TestRecoveryIdentityStartupPolicyFailsPhysicalNativeWriteClosed();
-    ok &= TestRecoveryIdentityStartupPolicyRejectsMalformedIdentity();
-    ok &= TestRecoveryIdentityStartupPolicyAllowsValidCleanIdentity();
-    ok &= TestRecoveryIdentityBlockCannotBeClearedByMetadataReplay();
-    ok &= TestVolumeBootstrapFailurePreservesRecoveryIdentityBlockReason();
-    ok &= TestRecoveryMarkerBlockPreservesBootstrapFailureAndReplayState();
-    ok &= TestRecoveryIdentityScannerExceptionFailsStartupClosed();
-    ok &= TestLegacyDuplicateDirtyMarkerIsAmbiguous();
-    ok &= TestLegacyContradictoryDirtyMarkerIsAmbiguous();
-    ok &= TestLegacyDirtyMarkerFromRenumberedDeviceIsNotIgnored();
-    ok &= TestLegacyCleanMarkerDoesNotBlockStableIdentity();
-    ok &= TestLegacyAcceptedWalFromRenumberedDeviceIsNotIgnored();
-    ok &= TestLegacyMixedWalScansAllIdentitiesForMatchingEvidence();
-    ok &= TestLegacyCleanWalDoesNotBlockStableIdentity();
-    ok &= TestVolumeInfoReportsOnlyKnownFreeCapacity();
-    ok &= TestVolumeInfoUsesMetadataStoreWhenAvailable();
-    ok &= TestVolumeInfoDoesNotWaitOnMetadataMutex();
-    ok &= TestMetadataOnlyRootDoesNotWaitOnCommit();
-    ok &= TestRequiresCanonicalMutationGateDefaultsToStrict();
-    ok &= TestRequiresCanonicalMutationGateNeedsAllStrictFlagsDisabled();
-    ok &= TestApplyNonFixtureCanonicalSafetyOverrides_EnforcesStrictControls();
-    ok &= TestApplyNonFixtureCanonicalSafetyOverrides_PreservesFixtureOverrides();
-    ok &= TestApplyNonFixtureCanonicalSafetyOverrides_FixtureNamedDirectoryWithoutPatternStaysStrict();
-    ok &= TestFsHostDispatcherThreadCountIsBoundedAndReported();
-    ok &= TestFsHostStatusSeparatesLockWaitCounters();
-    ok &= TestParseArgsContainerId();
+        ok &= trace_case(R"TRACE(TestSymbolicLinkMutationCallbacks(stage, false, removal))TRACE", [&]() { return TestSymbolicLinkMutationCallbacks(stage, false, removal); });
+    ok &= trace_case(R"TRACE(TestAcceptedReplayDeleteHidesEarlierWriteAcrossBatch())TRACE", [&]() { return TestAcceptedReplayDeleteHidesEarlierWriteAcrossBatch(); });
+    ok &= trace_case(R"TRACE(TestAcceptedWriteProcessKillRecoveryMatrix())TRACE", [&]() { return TestAcceptedWriteProcessKillRecoveryMatrix(); });
+    ok &= trace_case(R"TRACE(TestAcceptedInlineWriteProcessKillAfterWalAcceptance())TRACE", [&]() { return TestAcceptedInlineWriteProcessKillAfterWalAcceptance(); });
+    ok &= trace_case(R"TRACE(TestAcceptedWriteReplayMarkerClearFailureFailsClosed())TRACE", [&]() { return TestAcceptedWriteReplayMarkerClearFailureFailsClosed(); });
+    ok &= trace_case(R"TRACE(TestRecoveryMarkerFinalizeFailureIsNotCached())TRACE", [&]() { return TestRecoveryMarkerFinalizeFailureIsNotCached(); });
+    ok &= trace_case(R"TRACE(TestRecoveryMarkerCacheRecreatesMissingBackingFile())TRACE", [&]() { return TestRecoveryMarkerCacheRecreatesMissingBackingFile(); });
+    ok &= trace_case(R"TRACE(TestRepeatedRecoveryMarkerUpdatesSkipUnchangedState())TRACE", [&]() { return TestRepeatedRecoveryMarkerUpdatesSkipUnchangedState(); });
+    ok &= trace_case(R"TRACE(TestRecoveryMarkerCacheRepairsCorruptedBackingFile())TRACE", [&]() { return TestRecoveryMarkerCacheRepairsCorruptedBackingFile(); });
+    ok &= trace_case(R"TRACE(TestRecoveryMarkerCacheRejectsReplacedPathObject())TRACE", [&]() { return TestRecoveryMarkerCacheRejectsReplacedPathObject(); });
+    ok &= trace_case(R"TRACE(TestMalformedRecoveryMarkerIsRejected())TRACE", [&]() { return TestMalformedRecoveryMarkerIsRejected(); });
+    ok &= trace_case(R"TRACE(TestRecoveryMarkerRejectsUnknownKey())TRACE", [&]() { return TestRecoveryMarkerRejectsUnknownKey(); });
+    ok &= trace_case(R"TRACE(TestMalformedRecoveryMarkerFailsStartupClosed())TRACE", [&]() { return TestMalformedRecoveryMarkerFailsStartupClosed(); });
+    ok &= trace_case(R"TRACE(TestMalformedRecoveryMarkerCannotBeClearedByCleanBootstrap())TRACE", [&]() { return TestMalformedRecoveryMarkerCannotBeClearedByCleanBootstrap(); });
+    ok &= trace_case(R"TRACE(TestRecoveryMarkerBlockSkipsNativeMetadataStartup())TRACE", [&]() { return TestRecoveryMarkerBlockSkipsNativeMetadataStartup(); });
+    ok &= trace_case(R"TRACE(TestBlockedRecoveryEvidenceSurvivesStaleClearAndShutdownGate())TRACE", [&]() { return TestBlockedRecoveryEvidenceSurvivesStaleClearAndShutdownGate(); });
+    ok &= trace_case(R"TRACE(TestNativeMutationRequiresDurableRecoveryMarkerBeforeStaging())TRACE", [&]() { return TestNativeMutationRequiresDurableRecoveryMarkerBeforeStaging(); });
+    ok &= trace_case(R"TRACE(TestRecoveryMarkerArmCannotRaceCleanCommitBoundary())TRACE", [&]() { return TestRecoveryMarkerArmCannotRaceCleanCommitBoundary(); });
+    ok &= trace_case(R"TRACE(TestAcceptedReplayRejectsMissingIdentity())TRACE", [&]() { return TestAcceptedReplayRejectsMissingIdentity(); });
+    ok &= trace_case(R"TRACE(TestNativeJournalRejectsIdentityLessMutation())TRACE", [&]() { return TestNativeJournalRejectsIdentityLessMutation(); });
+    ok &= trace_case(R"TRACE(TestCloseCommitsPendingNativeMetadataAfterDirectoryCreate())TRACE", [&]() { return TestCloseCommitsPendingNativeMetadataAfterDirectoryCreate(); });
+    ok &= trace_case(R"TRACE(TestSetBasicInfoSkipsNativeMutationWhenTimestampUnchanged())TRACE", [&]() { return TestSetBasicInfoSkipsNativeMutationWhenTimestampUnchanged(); });
+    ok &= trace_case(R"TRACE(TestCloseStagesNativeSubtreeDeleteBottomUp())TRACE", [&]() { return TestCloseStagesNativeSubtreeDeleteBottomUp(); });
+    ok &= trace_case(R"TRACE(TestSubtreeDeleteAcceptedRecovery())TRACE", [&]() { return TestSubtreeDeleteAcceptedRecovery(); });
+    ok &= trace_case(R"TRACE(TestSubtreeDeleteAcceptedRecovery(true))TRACE", [&]() { return TestSubtreeDeleteAcceptedRecovery(true); });
+    ok &= trace_case(R"TRACE(TestUnstagedDeleteRollbackFailureKeepsJournal())TRACE", [&]() { return TestUnstagedDeleteRollbackFailureKeepsJournal(); });
+    ok &= trace_case(R"TRACE(TestHydrationRollbackPreservesRecoveryCopies())TRACE", [&]() { return TestHydrationRollbackPreservesRecoveryCopies(); });
+    ok &= trace_case(R"TRACE(TestSubtreeDeleteAcceptedRecovery(false, true))TRACE", [&]() { return TestSubtreeDeleteAcceptedRecovery(false, true); });
+    ok &= trace_case(R"TRACE(TestSubtreeDeleteAcceptedRecovery(true, true))TRACE", [&]() { return TestSubtreeDeleteAcceptedRecovery(true, true); });
+    ok &= trace_case(R"TRACE(TestStatusFileIncludesNativeMutationFailureDetail())TRACE", [&]() { return TestStatusFileIncludesNativeMutationFailureDetail(); });
+    ok &= trace_case(R"TRACE(TestSetBasicInfoOnStaleDeletedHandleDoesNotDowngradeNativeWrite())TRACE", [&]() { return TestSetBasicInfoOnStaleDeletedHandleDoesNotDowngradeNativeWrite(); });
+    ok &= trace_case(R"TRACE(TestSetBasicInfoOnVisibleNativeMissingDirectoryDoesNotDowngradeNativeWrite())TRACE", [&]() { return TestSetBasicInfoOnVisibleNativeMissingDirectoryDoesNotDowngradeNativeWrite(); });
+    ok &= trace_case(R"TRACE(TestDeleteTargetMissingOnStaleDeletedHandleDoesNotDowngradeNativeWrite())TRACE", [&]() { return TestDeleteTargetMissingOnStaleDeletedHandleDoesNotDowngradeNativeWrite(); });
+    ok &= trace_case(R"TRACE(TestMutatingCallbacksFailWriteProtectedWhenWriteDisabled())TRACE", [&]() { return TestMutatingCallbacksFailWriteProtectedWhenWriteDisabled(); });
+    ok &= trace_case(R"TRACE(TestSetSecurityIsNoopWhenWriteEnabled())TRACE", [&]() { return TestSetSecurityIsNoopWhenWriteEnabled(); });
+    ok &= trace_case(R"TRACE(TestDefaultSecurityDescriptorGrantsUsersWriteAccess())TRACE", [&]() { return TestDefaultSecurityDescriptorGrantsUsersWriteAccess(); });
+    ok &= trace_case(R"TRACE(TestOpenMutationAccessDeniedWhenWriteDisabled())TRACE", [&]() { return TestOpenMutationAccessDeniedWhenWriteDisabled(); });
+    ok &= trace_case(R"TRACE(TestOpenDeleteAccessDeniedWhenWriteDisabled())TRACE", [&]() { return TestOpenDeleteAccessDeniedWhenWriteDisabled(); });
+    ok &= trace_case(R"TRACE(TestOpenFailsWhenDeleteIntentStateIsStale())TRACE", [&]() { return TestOpenFailsWhenDeleteIntentStateIsStale(); });
+    ok &= trace_case(R"TRACE(TestCleanupDeleteNoopWhenWriteDisabled())TRACE", [&]() { return TestCleanupDeleteNoopWhenWriteDisabled(); });
+    ok &= trace_case(R"TRACE(TestNativeMutationDenialLatchesFailClosedRecovery())TRACE", [&]() { return TestNativeMutationDenialLatchesFailClosedRecovery(); });
+    ok &= trace_case(R"TRACE(TestConcurrentNativeMutationDenialsRemainFailClosedAfterDowngrade())TRACE", [&]() { return TestConcurrentNativeMutationDenialsRemainFailClosedAfterDowngrade(); });
+    ok &= trace_case(R"TRACE(TestConcurrentNativeDenialStatusFileReflectsFailClosedState())TRACE", [&]() { return TestConcurrentNativeDenialStatusFileReflectsFailClosedState(); });
+    ok &= trace_case(R"TRACE(TestStatusSnapshotConcurrentRecoveryTransition())TRACE", [&]() { return TestStatusSnapshotConcurrentRecoveryTransition(); });
+    ok &= trace_case(R"TRACE(TestStatusFileDerivesCanonicalGateFailureAfterNativeFailClosedDowngrade())TRACE", [&]() { return TestStatusFileDerivesCanonicalGateFailureAfterNativeFailClosedDowngrade(); });
+    ok &= trace_case(R"TRACE(TestStatusFilePreservesExplicitCompatibilitySignalsAfterNativeFailClosedDowngrade())TRACE", [&]() { return TestStatusFilePreservesExplicitCompatibilitySignalsAfterNativeFailClosedDowngrade(); });
+    ok &= trace_case(R"TRACE(TestNativeSafetyStateFallsBackWhenMutationUnavailable())TRACE", [&]() { return TestNativeSafetyStateFallsBackWhenMutationUnavailable(); });
+    ok &= trace_case(R"TRACE(TestExternalMutationScopeTracksActiveCountAndDrainGate())TRACE", [&]() { return TestExternalMutationScopeTracksActiveCountAndDrainGate(); });
+    ok &= trace_case(R"TRACE(TestBeginMutationShutdownDrainWaitsForInFlightMutation())TRACE", [&]() { return TestBeginMutationShutdownDrainWaitsForInFlightMutation(); });
+    ok &= trace_case(R"TRACE(TestBeginMutationShutdownDrainTimesOutWithStuckMutation())TRACE", [&]() { return TestBeginMutationShutdownDrainTimesOutWithStuckMutation(); });
+    ok &= trace_case(R"TRACE(TestFsHostShutdownExitCodeRequiresEveryDrainStageToSucceed())TRACE", [&]() { return TestFsHostShutdownExitCodeRequiresEveryDrainStageToSucceed(); });
+    ok &= trace_case(R"TRACE(TestCommitTimeoutBudgetScalesWithPendingPayload())TRACE", [&]() { return TestCommitTimeoutBudgetScalesWithPendingPayload(); });
+    ok &= trace_case(R"TRACE(TestStatusFileTracksShutdownDrainAndInFlightMutations())TRACE", [&]() { return TestStatusFileTracksShutdownDrainAndInFlightMutations(); });
+    ok &= trace_case(R"TRACE(TestExternalMutationScopePublishesIdleStatusOnExit())TRACE", [&]() { return TestExternalMutationScopePublishesIdleStatusOnExit(); });
+    ok &= trace_case(R"TRACE(TestExternalMutationScopeCoalescesRepeatedIdleStatusOnExit())TRACE", [&]() { return TestExternalMutationScopeCoalescesRepeatedIdleStatusOnExit(); });
+    ok &= trace_case(R"TRACE(TestCallbackStatusCoalescesUnchangedIdleSnapshot())TRACE", [&]() { return TestCallbackStatusCoalescesUnchangedIdleSnapshot(); });
+    ok &= trace_case(R"TRACE(TestCallbackStatusRateLimitSkipsDirtySnapshot())TRACE", [&]() { return TestCallbackStatusRateLimitSkipsDirtySnapshot(); });
+    ok &= trace_case(R"TRACE(TestShutdownDrainWaitsForAdmissionMidFlight())TRACE", [&]() { return TestShutdownDrainWaitsForAdmissionMidFlight(); });
+    ok &= trace_case(R"TRACE(TestShutdownDrainBlocksAdmissionAfterLinearization())TRACE", [&]() { return TestShutdownDrainBlocksAdmissionAfterLinearization(); });
+    ok &= trace_case(R"TRACE(TestAdmissionDrainConcurrentRaceLosesNoCallbacks())TRACE", [&]() { return TestAdmissionDrainConcurrentRaceLosesNoCallbacks(); });
+    ok &= trace_case(R"TRACE(TestRealSetBasicInfoCallbackTornDownDuringDrain())TRACE", [&]() { return TestRealSetBasicInfoCallbackTornDownDuringDrain(); });
+    ok &= trace_case(R"TRACE(TestNoOpExternalScopeExitPublishesIdleWhenLast())TRACE", [&]() { return TestNoOpExternalScopeExitPublishesIdleWhenLast(); });
+    ok &= trace_case(R"TRACE(TestRateLimitedIdleCallbackStatusQueuesRefresh())TRACE", [&]() { return TestRateLimitedIdleCallbackStatusQueuesRefresh(); });
+    ok &= trace_case(R"TRACE(TestCallbackStatusDefersWhileCallbackIsActive())TRACE", [&]() { return TestCallbackStatusDefersWhileCallbackIsActive(); });
+    ok &= trace_case(R"TRACE(TestCleanRecoveryCheckpointXidPrefersSuperblockWhenCommittedTelemetryStale())TRACE", [&]() { return TestCleanRecoveryCheckpointXidPrefersSuperblockWhenCommittedTelemetryStale(); });
+    ok &= trace_case(R"TRACE(TestConcurrentCreateSamePathIsSerializedAndConsistent())TRACE", [&]() { return TestConcurrentCreateSamePathIsSerializedAndConsistent(); });
+    ok &= trace_case(R"TRACE(TestConcurrentRenameSameSourceDifferentTargetsIsSerialized())TRACE", [&]() { return TestConcurrentRenameSameSourceDifferentTargetsIsSerialized(); });
+    ok &= trace_case(R"TRACE(TestConcurrentRenameAndSetDeleteOnSameSourceIsSerialized())TRACE", [&]() { return TestConcurrentRenameAndSetDeleteOnSameSourceIsSerialized(); });
+    ok &= trace_case(R"TRACE(TestConcurrentRenameReplaceAndTargetSetDeleteIsFailClosed())TRACE", [&]() { return TestConcurrentRenameReplaceAndTargetSetDeleteIsFailClosed(); });
+    ok &= trace_case(R"TRACE(TestConcurrentRenameReplaceAndDeleteCloseInterleavingIsConsistent())TRACE", [&]() { return TestConcurrentRenameReplaceAndDeleteCloseInterleavingIsConsistent(); });
+    ok &= trace_case(R"TRACE(TestConcurrentRenameReplaceSameTargetFromTwoSourcesIsSerialized())TRACE", [&]() { return TestConcurrentRenameReplaceSameTargetFromTwoSourcesIsSerialized(); });
+    ok &= trace_case(R"TRACE(TestConcurrentRenameReplaceSameTargetWithHandleCloseTransition())TRACE", [&]() { return TestConcurrentRenameReplaceSameTargetWithHandleCloseTransition(); });
+    ok &= trace_case(R"TRACE(TestConcurrentSharedParentRenameAndSetDeleteOnSiblingIsConsistent())TRACE", [&]() { return TestConcurrentSharedParentRenameAndSetDeleteOnSiblingIsConsistent(); });
+    ok &= trace_case(R"TRACE(TestConcurrentSharedParentRenameAndSiblingDeleteCloseIsConsistent())TRACE", [&]() { return TestConcurrentSharedParentRenameAndSiblingDeleteCloseIsConsistent(); });
+    ok &= trace_case(R"TRACE(TestLoadHydratedPayloadWithoutHydrationReturnsNullWhenHydrateDisabled())TRACE", [&]() { return TestLoadHydratedPayloadWithoutHydrationReturnsNullWhenHydrateDisabled(); });
+    ok &= trace_case(R"TRACE(TestLoadHydratedPayloadReadsExistingHydrationWhenHydrateDisabled())TRACE", [&]() { return TestLoadHydratedPayloadReadsExistingHydrationWhenHydrateDisabled(); });
+    ok &= trace_case(R"TRACE(TestEnsureHydratedRejectsIncompleteExistingCache())TRACE", [&]() { return TestEnsureHydratedRejectsIncompleteExistingCache(); });
+    ok &= trace_case(R"TRACE(TestPayloadRangeProviderReusesHydrationReadHandle())TRACE", [&]() { return TestPayloadRangeProviderReusesHydrationReadHandle(); });
+    ok &= trace_case(R"TRACE(TestReadOnlyOpenUsesMetadataRangeReadWithoutHydration())TRACE", [&]() { return TestReadOnlyOpenUsesMetadataRangeReadWithoutHydration(); });
+    ok &= trace_case(R"TRACE(TestMetadataFallbackPayloadMutationLazilyAcquiresHydrationHandle())TRACE", [&]() { return TestMetadataFallbackPayloadMutationLazilyAcquiresHydrationHandle(); });
+    ok &= trace_case(R"TRACE(TestCommittedMoveSourceOpenSkipsPreOpenDrain())TRACE", [&]() { return TestCommittedMoveSourceOpenSkipsPreOpenDrain(); });
+    ok &= trace_case(R"TRACE(TestCommittedInodeDeltaMergeEmptyNoOpSkipsSnapshot())TRACE", [&]() { return TestCommittedInodeDeltaMergeEmptyNoOpSkipsSnapshot(); });
+    ok &= trace_case(R"TRACE(TestCommittedInodeDeltaMergeHandlesDirectoryRenameWithoutSnapshot())TRACE", [&]() { return TestCommittedInodeDeltaMergeHandlesDirectoryRenameWithoutSnapshot(); });
+    ok &= trace_case(R"TRACE(TestHandleReadOverlaysPayloadSpoolWhenHydrationIsStale())TRACE", [&]() { return TestHandleReadOverlaysPayloadSpoolWhenHydrationIsStale(); });
+    ok &= trace_case(R"TRACE(TestCleanHydratedReadSkipsPayloadSpoolProbe())TRACE", [&]() { return TestCleanHydratedReadSkipsPayloadSpoolProbe(); });
+    ok &= trace_case(R"TRACE(TestCommittedChunkWritesPreserveEarlierBytes(false))TRACE", [&]() { return TestCommittedChunkWritesPreserveEarlierBytes(false); });
+    ok &= trace_case(R"TRACE(TestCommittedChunkWritesPreserveEarlierBytes(true))TRACE", [&]() { return TestCommittedChunkWritesPreserveEarlierBytes(true); });
+    ok &= trace_case(R"TRACE(TestCommittedChunkBoundaries(false))TRACE", [&]() { return TestCommittedChunkBoundaries(false); });
+    ok &= trace_case(R"TRACE(TestCommittedChunkBoundaries(true))TRACE", [&]() { return TestCommittedChunkBoundaries(true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(true, false, false, false, false, false,
+        false, false, false, false, false, false, false, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(true, false, false, false, false, false,
+        false, false, false, false, false, false, false, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(true, true, false, false, false, false,
+        false, false, false, false, false, false, false, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(true, true, false, false, false, false,
+        false, false, false, false, false, false, false, true); });
+    ok &= trace_case(R"TRACE(TestHydratedRangeReadZeroFillsOnlyEofTail())TRACE", [&]() { return TestHydratedRangeReadZeroFillsOnlyEofTail(); });
+    ok &= trace_case(R"TRACE(TestPayloadRangeProviderOverlaysSpoolWhenHydrationIsEmpty())TRACE", [&]() { return TestPayloadRangeProviderOverlaysSpoolWhenHydrationIsEmpty(); });
+    ok &= trace_case(R"TRACE(TestPayloadRangeProviderUsesNativeCommitHydrationBase())TRACE", [&]() { return TestPayloadRangeProviderUsesNativeCommitHydrationBase(); });
+    ok &= trace_case(R"TRACE(TestPayloadRangeProviderUsesNativeCommitHydrationBase(true))TRACE", [&]() { return TestPayloadRangeProviderUsesNativeCommitHydrationBase(true); });
+    ok &= trace_case(R"TRACE(TestDeferredOverlayHydrationReusesPayloadIdentitySnapshot())TRACE", [&]() { return TestDeferredOverlayHydrationReusesPayloadIdentitySnapshot(); });
+    ok &= trace_case(R"TRACE(TestDeferredReadSkipsDuplicatePayloadIdentityOverlay())TRACE", [&]() { return TestDeferredReadSkipsDuplicatePayloadIdentityOverlay(); });
+    ok &= trace_case(R"TRACE(TestNativeRecycleDesktopIniSpoolCommitStaysWritable())TRACE", [&]() { return TestNativeRecycleDesktopIniSpoolCommitStaysWritable(); });
+    ok &= trace_case(R"TRACE(TestRecoveredMarkerClearsPayloadSpoolResidue())TRACE", [&]() { return TestRecoveredMarkerClearsPayloadSpoolResidue(); });
+    ok &= trace_case(R"TRACE(TestCleanMetadataBootstrapClearsPayloadSpoolRecovery())TRACE", [&]() { return TestCleanMetadataBootstrapClearsPayloadSpoolRecovery(); });
+    ok &= trace_case(R"TRACE(TestPreWalCrashOrphanedPayloadRecoversCleanReadWrite())TRACE", [&]() { return TestPreWalCrashOrphanedPayloadRecoversCleanReadWrite(); });
+    ok &= trace_case(R"TRACE(TestCleanMarkerUnindexedPayloadWithEmptyWalRecoversReadWrite())TRACE", [&]() { return TestCleanMarkerUnindexedPayloadWithEmptyWalRecoversReadWrite(); });
+    ok &= trace_case(R"TRACE(TestCleanMarkerUnindexedPayloadWithCleanHistoricalWalRecoversReadWrite())TRACE", [&]() { return TestCleanMarkerUnindexedPayloadWithCleanHistoricalWalRecoversReadWrite(); });
+    ok &= trace_case(R"TRACE(TestDirtyMarkerUnindexedPayloadWithCleanHistoricalWalRecoversReadWrite())TRACE", [&]() { return TestDirtyMarkerUnindexedPayloadWithCleanHistoricalWalRecoversReadWrite(); });
+    ok &= trace_case(R"TRACE(TestDirtyRecoveryMarkerBlocksPayloadSpoolCleanup())TRACE", [&]() { return TestDirtyRecoveryMarkerBlocksPayloadSpoolCleanup(); });
+    ok &= trace_case(R"TRACE(TestDirtyRecoveryMarkerAheadOfCheckpointBlocksPayloadSpoolCleanup())TRACE", [&]() { return TestDirtyRecoveryMarkerAheadOfCheckpointBlocksPayloadSpoolCleanup(); });
+    ok &= trace_case(R"TRACE(TestPayloadSpoolQuotaDrainsAcceptedWorkAndRetriesOnce())TRACE", [&]() { return TestPayloadSpoolQuotaDrainsAcceptedWorkAndRetriesOnce(); });
+    ok &= trace_case(R"TRACE(TestPayloadSpoolCapacityPressurePreservesReadWriteMount())TRACE", [&]() { return TestPayloadSpoolCapacityPressurePreservesReadWriteMount(); });
+    ok &= trace_case(R"TRACE(TestPayloadSpoolQuotaDrainFailureRetainsAcceptedEvidence())TRACE", [&]() { return TestPayloadSpoolQuotaDrainFailureRetainsAcceptedEvidence(); });
+    ok &= trace_case(R"TRACE(TestCommittedSpoolWriteReopenReadsCommittedPayload())TRACE", [&]() { return TestCommittedSpoolWriteReopenReadsCommittedPayload(); });
+    ok &= trace_case(R"TRACE(TestWritableOpenHydratesSparseMetadataWithoutDenseCache())TRACE", [&]() { return TestWritableOpenHydratesSparseMetadataWithoutDenseCache(); });
+    ok &= trace_case(R"TRACE(TestParseArgsDefaultsStrictNonFixtureControls())TRACE", [&]() { return TestParseArgsDefaultsStrictNonFixtureControls(); });
+    ok &= trace_case(R"TRACE(TestParseArgsRejectsUnownedHostLaunch())TRACE", [&]() { return TestParseArgsRejectsUnownedHostLaunch(); });
+    ok &= trace_case(R"TRACE(TestExplicitLifetimeFilePreservesParentStopSignal())TRACE", [&]() { return TestExplicitLifetimeFilePreservesParentStopSignal(); });
+    ok &= trace_case(R"TRACE(TestStartupGateRequiresExactParentAuthorization())TRACE", [&]() { return TestStartupGateRequiresExactParentAuthorization(); });
+    ok &= trace_case(R"TRACE(TestParseArgsParsesStrictNonFixtureControlOverrides())TRACE", [&]() { return TestParseArgsParsesStrictNonFixtureControlOverrides(); });
+    ok &= trace_case(R"TRACE(TestParseArgsPreservesDirectoryMountPath())TRACE", [&]() { return TestParseArgsPreservesDirectoryMountPath(); });
+    ok &= trace_case(R"TRACE(TestRecoveryRootOverrideSurvivesTempChange())TRACE", [&]() { return TestRecoveryRootOverrideSurvivesTempChange(); });
+    ok &= trace_case(R"TRACE(TestBuildWinFspMountPointUsesGlobalDriveForExplorer())TRACE", [&]() { return TestBuildWinFspMountPointUsesGlobalDriveForExplorer(); });
+    ok &= trace_case(R"TRACE(TestShellDriveNotificationsDoNotWaitForExplorer())TRACE", [&]() { return TestShellDriveNotificationsDoNotWaitForExplorer(); });
+    ok &= trace_case(R"TRACE(TestRootDirectoryDeferredAccessTimes())TRACE", [&]() { return TestRootDirectoryDeferredAccessTimes(); });
+    ok &= trace_case(R"TRACE(TestOrdinaryDirectoryDeferredAccessTimes())TRACE", [&]() { return TestOrdinaryDirectoryDeferredAccessTimes(); });
+    ok &= trace_case(R"TRACE(TestRegularReadAccessTimeIsolation())TRACE", [&]() { return TestRegularReadAccessTimeIsolation(); });
+    ok &= trace_case(R"TRACE(FragmentedCanonicalWriteTests::Run())TRACE", [&]() { return FragmentedCanonicalWriteTests::Run(); });
+    ok &= trace_case(R"TRACE(RetainedGenerationPressureTests::Run())TRACE", [&]() { return RetainedGenerationPressureTests::Run(); });
+    ok &= trace_case(R"TRACE(RetainedGenerationPressureTests::Run(true))TRACE", [&]() { return RetainedGenerationPressureTests::Run(true); });
+    ok &= trace_case(R"TRACE(RetainedGenerationPressureTests::Run(false, true))TRACE", [&]() { return RetainedGenerationPressureTests::Run(false, true); });
+    ok &= trace_case(R"TRACE(RetainedGenerationPressureTests::Run(false, true, 1))TRACE", [&]() { return RetainedGenerationPressureTests::Run(false, true, 1); });
+    ok &= trace_case(R"TRACE(RetainedGenerationPressureTests::Run(false, true, 2))TRACE", [&]() { return RetainedGenerationPressureTests::Run(false, true, 2); });
+    ok &= trace_case(R"TRACE(RetainedGenerationPressureTests::Run(false, true, 3))TRACE", [&]() { return RetainedGenerationPressureTests::Run(false, true, 3); });
+    ok &= trace_case(R"TRACE(RetainedGenerationPressureTests::Run(true, true))TRACE", [&]() { return RetainedGenerationPressureTests::Run(true, true); });
+    ok &= trace_case(R"TRACE(RetainedGenerationPressureTests::Run(false, true, 0, true))TRACE", [&]() { return RetainedGenerationPressureTests::Run(false, true, 0, true); });
+    ok &= trace_case(R"TRACE(RetainedGenerationPressureTests::Run(false, true, 0, false, true))TRACE", [&]() { return RetainedGenerationPressureTests::Run(false, true, 0, false, true); });
+    for (const auto* fault : {"", "misbound-metadata", "misbound-unlink", "unlogged-metadata", "unlogged-payload", "corrupt-tail"})
+        ok &= trace_case(R"TRACE(RetainedGenerationPressureTests::RunGeneralized(fault))TRACE", [&]() { return RetainedGenerationPressureTests::RunGeneralized(fault); });
+    ok &= trace_case(R"TRACE(RetainedGenerationPressureTests::RunGeneralized({}, true))TRACE", [&]() { return RetainedGenerationPressureTests::RunGeneralized({}, true); });
+    ok &= trace_case(R"TRACE(RetainedExtendedMutationTests::Run())TRACE", [&]() { return RetainedExtendedMutationTests::Run(); });
+    ok &= trace_case(R"TRACE(RetainedExtendedMutationTests::RunPendingCreateAttribute())TRACE", [&]() { return RetainedExtendedMutationTests::RunPendingCreateAttribute(); });
+    ok &= trace_case(R"TRACE(RetainedExtendedMutationTests::RunReplayIdReservations())TRACE", [&]() { return RetainedExtendedMutationTests::RunReplayIdReservations(); });
+    for (const auto* profile : kRetainedSparseMutationProfiles)
+        ok &= trace_case(R"TRACE(RetainedSparseMutationTests::Run(profile))TRACE", [&]() { return RetainedSparseMutationTests::Run(profile); });
+    for (const auto* fault : kRetainedExtendedMutationFaults)
+        ok &= trace_case(R"TRACE(RetainedExtendedMutationTests::Run(fault))TRACE", [&]() { return RetainedExtendedMutationTests::Run(fault); });
+    ok &= trace_case(R"TRACE(FragmentedCanonicalWriteTests::Run(false))TRACE", [&]() { return FragmentedCanonicalWriteTests::Run(false); });
+    ok &= trace_case(R"TRACE(FragmentedCanonicalWriteTests::Run(true, 1))TRACE", [&]() { return FragmentedCanonicalWriteTests::Run(true, 1); });
+    ok &= trace_case(R"TRACE(FragmentedCanonicalWriteTests::Run(true, 2))TRACE", [&]() { return FragmentedCanonicalWriteTests::Run(true, 2); });
+    ok &= trace_case(R"TRACE(FragmentedCanonicalWriteTests::Run(true, 3))TRACE", [&]() { return FragmentedCanonicalWriteTests::Run(true, 3); });
+    ok &= trace_case(R"TRACE(TestVolumeParamsUseExplorerFriendlyCleanupFlags())TRACE", [&]() { return TestVolumeParamsUseExplorerFriendlyCleanupFlags(); });
+    ok &= trace_case(R"TRACE(TestVolumeParamsReflectSelectedApfsCaseMode())TRACE", [&]() { return TestVolumeParamsReflectSelectedApfsCaseMode(); });
+    ok &= trace_case(R"TRACE(TestPathKeysReflectSelectedApfsNamePolicy())TRACE", [&]() { return TestPathKeysReflectSelectedApfsNamePolicy(); });
+    ok &= trace_case(R"TRACE(TestCallbacksRoundTripCaseSensitiveApfsNames())TRACE", [&]() { return TestCallbacksRoundTripCaseSensitiveApfsNames(); });
+    ok &= trace_case(R"TRACE(TestCallbacksRespectApfsNamePolicyAndDirectoryMarkers())TRACE", [&]() { return TestCallbacksRespectApfsNamePolicyAndDirectoryMarkers(); });
+    ok &= trace_case(R"TRACE(TestNamedStreamCopyCompatibility())TRACE", [&]() { return TestNamedStreamCopyCompatibility(); });
+    ok &= trace_case(R"TRACE(TestNamedStreamDeleteIsolation())TRACE", [&]() { return TestNamedStreamDeleteIsolation(); });
+    ok &= trace_case(R"TRACE(TestNamedStreamDeleteIsolation(true))TRACE", [&]() { return TestNamedStreamDeleteIsolation(true); });
+    ok &= trace_case(R"TRACE(TestNamedStreamCreateDoesNotCreateVisibleApfsFile())TRACE", [&]() { return TestNamedStreamCreateDoesNotCreateVisibleApfsFile(); });
+    ok &= trace_case(R"TRACE(TestNamedStreamCreateOnStaleSpoolBackedFileKeepsPayloadReadable())TRACE", [&]() { return TestNamedStreamCreateOnStaleSpoolBackedFileKeepsPayloadReadable(); });
+    ok &= trace_case(R"TRACE(TestLegacyNamedStreamArtifactsAreHidden())TRACE", [&]() { return TestLegacyNamedStreamArtifactsAreHidden(); });
+    ok &= trace_case(R"TRACE(TestMissingNamedStreamOpenFailsCleanlyWithoutBaseBytes())TRACE", [&]() { return TestMissingNamedStreamOpenFailsCleanlyWithoutBaseBytes(); });
+    ok &= trace_case(R"TRACE(TestDuplicateCaseNamedStreamsCoalesceMetadata())TRACE", [&]() { return TestDuplicateCaseNamedStreamsCoalesceMetadata(); });
+    ok &= trace_case(R"TRACE(TestOfficeTempRenameReplaceWorkflow())TRACE", [&]() { return TestOfficeTempRenameReplaceWorkflow(); });
+    ok &= trace_case(R"TRACE(TestRecycleBinMetadataPairWorkflow())TRACE", [&]() { return TestRecycleBinMetadataPairWorkflow(); });
+    ok &= trace_case(R"TRACE(TestPathNormalizationMatrixRejectsRiskyWin32Names())TRACE", [&]() { return TestPathNormalizationMatrixRejectsRiskyWin32Names(); });
+    ok &= trace_case(R"TRACE(TestVisibleLookupReusesNormalizedPathWithoutExtraNormalization())TRACE", [&]() { return TestVisibleLookupReusesNormalizedPathWithoutExtraNormalization(); });
+    ok &= trace_case(R"TRACE(TestChildTraversalUsesCachedPathKeys())TRACE", [&]() { return TestChildTraversalUsesCachedPathKeys(); });
+    ok &= trace_case(R"TRACE(TestOpenAndSecurityReuseNormalizedStreamPath())TRACE", [&]() { return TestOpenAndSecurityReuseNormalizedStreamPath(); });
+    ok &= trace_case(R"TRACE(TestDeferredDeleteAncestorSearchReusesNormalizedPath())TRACE", [&]() { return TestDeferredDeleteAncestorSearchReusesNormalizedPath(); });
+    ok &= trace_case(R"TRACE(TestRecursiveReindexReusesNormalizedChildPaths())TRACE", [&]() { return TestRecursiveReindexReusesNormalizedChildPaths(); });
+    ok &= trace_case(R"TRACE(TestCreateReusesNormalizedParentPath())TRACE", [&]() { return TestCreateReusesNormalizedParentPath(); });
+    ok &= trace_case(R"TRACE(TestNormalizePathStripsDriveQualifiedRoot())TRACE", [&]() { return TestNormalizePathStripsDriveQualifiedRoot(); });
+    ok &= trace_case(R"TRACE(TestStableVolumeSerialDependsOnVolumeIdentityNotProcessUptime())TRACE", [&]() { return TestStableVolumeSerialDependsOnVolumeIdentityNotProcessUptime(); });
+    ok &= trace_case(R"TRACE(TestWriteAheadJournalPathIsStablePerVolume())TRACE", [&]() { return TestWriteAheadJournalPathIsStablePerVolume(); });
+    ok &= trace_case(R"TRACE(TestImmutableRecoveryIdentitySurvivesDeviceRenumbering())TRACE", [&]() { return TestImmutableRecoveryIdentitySurvivesDeviceRenumbering(); });
+    ok &= trace_case(R"TRACE(TestImmutableRecoveryIdentitySeparatesSameLabelAndOffsetMedia())TRACE", [&]() { return TestImmutableRecoveryIdentitySeparatesSameLabelAndOffsetMedia(); });
+    ok &= trace_case(R"TRACE(TestRecoveryStorageKeyUsesImmutableDigestDirectly())TRACE", [&]() { return TestRecoveryStorageKeyUsesImmutableDigestDirectly(); });
+    ok &= trace_case(R"TRACE(TestParseArgsAcceptsImmutableRecoveryIdentity())TRACE", [&]() { return TestParseArgsAcceptsImmutableRecoveryIdentity(); });
+    ok &= trace_case(R"TRACE(TestParseArgsRejectsMalformedRecoveryIdentity())TRACE", [&]() { return TestParseArgsRejectsMalformedRecoveryIdentity(); });
+    ok &= trace_case(R"TRACE(TestImmutableRecoveryIdentityValidatesBackendFormat())TRACE", [&]() { return TestImmutableRecoveryIdentityValidatesBackendFormat(); });
+    ok &= trace_case(R"TRACE(TestWrongImmutableRecoveryIdentityRejectsWalReplay())TRACE", [&]() { return TestWrongImmutableRecoveryIdentityRejectsWalReplay(); });
+    ok &= trace_case(R"TRACE(TestPhysicalNativeWriteRequiresImmutableRecoveryIdentity())TRACE", [&]() { return TestPhysicalNativeWriteRequiresImmutableRecoveryIdentity(); });
+    ok &= trace_case(R"TRACE(TestRecoveryIdentityStartupPolicyFailsPhysicalNativeWriteClosed())TRACE", [&]() { return TestRecoveryIdentityStartupPolicyFailsPhysicalNativeWriteClosed(); });
+    ok &= trace_case(R"TRACE(TestRecoveryIdentityStartupPolicyRejectsMalformedIdentity())TRACE", [&]() { return TestRecoveryIdentityStartupPolicyRejectsMalformedIdentity(); });
+    ok &= trace_case(R"TRACE(TestRecoveryIdentityStartupPolicyAllowsValidCleanIdentity())TRACE", [&]() { return TestRecoveryIdentityStartupPolicyAllowsValidCleanIdentity(); });
+    ok &= trace_case(R"TRACE(TestRecoveryIdentityPreflightUsesResolvedMarkerRoot())TRACE", [&]() { return TestRecoveryIdentityPreflightUsesResolvedMarkerRoot(); });
+    ok &= trace_case(R"TRACE(TestRecoveryIdentityBlockCannotBeClearedByMetadataReplay())TRACE", [&]() { return TestRecoveryIdentityBlockCannotBeClearedByMetadataReplay(); });
+    ok &= trace_case(R"TRACE(TestVolumeBootstrapFailurePreservesRecoveryIdentityBlockReason())TRACE", [&]() { return TestVolumeBootstrapFailurePreservesRecoveryIdentityBlockReason(); });
+    ok &= trace_case(R"TRACE(TestRecoveryMarkerBlockPreservesBootstrapFailureAndReplayState())TRACE", [&]() { return TestRecoveryMarkerBlockPreservesBootstrapFailureAndReplayState(); });
+    ok &= trace_case(R"TRACE(TestRecoveryIdentityScannerExceptionFailsStartupClosed())TRACE", [&]() { return TestRecoveryIdentityScannerExceptionFailsStartupClosed(); });
+    ok &= trace_case(R"TRACE(TestLegacyDuplicateDirtyMarkerIsAmbiguous())TRACE", [&]() { return TestLegacyDuplicateDirtyMarkerIsAmbiguous(); });
+    ok &= trace_case(R"TRACE(TestLegacyContradictoryDirtyMarkerIsAmbiguous())TRACE", [&]() { return TestLegacyContradictoryDirtyMarkerIsAmbiguous(); });
+    ok &= trace_case(R"TRACE(TestLegacyDirtyMarkerFromRenumberedDeviceIsNotIgnored())TRACE", [&]() { return TestLegacyDirtyMarkerFromRenumberedDeviceIsNotIgnored(); });
+    ok &= trace_case(R"TRACE(TestLegacyCleanMarkerDoesNotBlockStableIdentity())TRACE", [&]() { return TestLegacyCleanMarkerDoesNotBlockStableIdentity(); });
+    ok &= trace_case(R"TRACE(TestLegacyAcceptedWalFromRenumberedDeviceIsNotIgnored())TRACE", [&]() { return TestLegacyAcceptedWalFromRenumberedDeviceIsNotIgnored(); });
+    ok &= trace_case(R"TRACE(TestLegacyMixedWalScansAllIdentitiesForMatchingEvidence())TRACE", [&]() { return TestLegacyMixedWalScansAllIdentitiesForMatchingEvidence(); });
+    ok &= trace_case(R"TRACE(TestLegacyCleanWalDoesNotBlockStableIdentity())TRACE", [&]() { return TestLegacyCleanWalDoesNotBlockStableIdentity(); });
+    ok &= trace_case(R"TRACE(TestVolumeInfoReportsOnlyKnownFreeCapacity())TRACE", [&]() { return TestVolumeInfoReportsOnlyKnownFreeCapacity(); });
+    ok &= trace_case(R"TRACE(TestVolumeInfoUsesMetadataStoreWhenAvailable())TRACE", [&]() { return TestVolumeInfoUsesMetadataStoreWhenAvailable(); });
+    ok &= trace_case(R"TRACE(TestVolumeInfoDoesNotWaitOnMetadataMutex())TRACE", [&]() { return TestVolumeInfoDoesNotWaitOnMetadataMutex(); });
+    ok &= trace_case(R"TRACE(TestMetadataOnlyRootDoesNotWaitOnCommit())TRACE", [&]() { return TestMetadataOnlyRootDoesNotWaitOnCommit(); });
+    ok &= trace_case(R"TRACE(TestCachedRootObservationGuard())TRACE", [&]() { return TestCachedRootObservationGuard(); });
+    ok &= trace_case(R"TRACE(TestTraverseOnlyDirectoryCleanupDoesNotWaitOnCommit())TRACE", [&]() { return TestTraverseOnlyDirectoryCleanupDoesNotWaitOnCommit(); });
+    ok &= trace_case(R"TRACE(TestCleanupAccessTimeClassificationPolicies())TRACE", [&]() { return TestCleanupAccessTimeClassificationPolicies(); });
+    ok &= trace_case(R"TRACE(TestRequiresCanonicalMutationGateDefaultsToStrict())TRACE", [&]() { return TestRequiresCanonicalMutationGateDefaultsToStrict(); });
+    ok &= trace_case(R"TRACE(TestRequiresCanonicalMutationGateNeedsAllStrictFlagsDisabled())TRACE", [&]() { return TestRequiresCanonicalMutationGateNeedsAllStrictFlagsDisabled(); });
+    ok &= trace_case(R"TRACE(TestApplyNonFixtureCanonicalSafetyOverrides_EnforcesStrictControls())TRACE", [&]() { return TestApplyNonFixtureCanonicalSafetyOverrides_EnforcesStrictControls(); });
+    ok &= trace_case(R"TRACE(TestApplyNonFixtureCanonicalSafetyOverrides_PreservesFixtureOverrides())TRACE", [&]() { return TestApplyNonFixtureCanonicalSafetyOverrides_PreservesFixtureOverrides(); });
+    ok &= trace_case(R"TRACE(TestApplyNonFixtureCanonicalSafetyOverrides_FixtureNamedDirectoryWithoutPatternStaysStrict())TRACE", [&]() { return TestApplyNonFixtureCanonicalSafetyOverrides_FixtureNamedDirectoryWithoutPatternStaysStrict(); });
+    ok &= trace_case(R"TRACE(TestFsHostDispatcherThreadCountIsBoundedAndReported())TRACE", [&]() { return TestFsHostDispatcherThreadCountIsBoundedAndReported(); });
+    ok &= trace_case(R"TRACE(TestFsHostStatusSeparatesLockWaitCounters())TRACE", [&]() { return TestFsHostStatusSeparatesLockWaitCounters(); });
+    ok &= trace_case(R"TRACE(TestParseArgsContainerId())TRACE", [&]() { return TestParseArgsContainerId(); });
 #ifdef APFSACCESS_HAS_RW_ENGINE
-    ok &= TestResolveMountVolumeRejectsWrongNameOnSoleVolume();
-    ok &= TestResolveMountVolumeOidRequiresCatalog();
-    ok &= TestResolveMountVolumeOidContainerMismatch();
-    ok &= TestResolveMountVolumeNameContainerScoped();
-    ok &= TestResolveMountVolumeLegacyCatalogUnreadable();
-    ok &= TestManifestArgsValidation();
-    ok &= TestManifestVolumeArgsExpansion();
-    ok &= TestManifestSessionFunnel();
-    ok &= TestManifestCallbacksBindWalIdentityBeforeCanonicalPublication();
-    ok &= TestDirectorySymlinkCreateSet();
-    ok &= TestDirectorySymlinkRefusals();
-    ok &= TestDirectorySymlinkRoundTrip();
-    ok &= TestDirectorySymlinkNoFollow();
-    ok &= TestDirectorySymlinkNamespace();
-    ok &= TestDirectorySymlinkAcceptedRecovery();
-    ok &= TestDirectorySymlinkRestore();
-    ok &= TestCompressionHostAdmission();
-    ok &= TestCompressionHostReads();
-    ok &= TestNativeCompressionWriteCallbacks();
-    ok &= TestNativeCompressionWriteCallbacks(true);
+    ok &= trace_case(R"TRACE(TestResolveMountVolumeRejectsWrongNameOnSoleVolume())TRACE", [&]() { return TestResolveMountVolumeRejectsWrongNameOnSoleVolume(); });
+    ok &= trace_case(R"TRACE(TestResolveMountVolumeOidRequiresCatalog())TRACE", [&]() { return TestResolveMountVolumeOidRequiresCatalog(); });
+    ok &= trace_case(R"TRACE(TestResolveMountVolumeOidContainerMismatch())TRACE", [&]() { return TestResolveMountVolumeOidContainerMismatch(); });
+    ok &= trace_case(R"TRACE(TestResolveMountVolumeNameContainerScoped())TRACE", [&]() { return TestResolveMountVolumeNameContainerScoped(); });
+    ok &= trace_case(R"TRACE(TestResolveMountVolumeLegacyCatalogUnreadable())TRACE", [&]() { return TestResolveMountVolumeLegacyCatalogUnreadable(); });
+    ok &= trace_case(R"TRACE(TestManifestArgsValidation())TRACE", [&]() { return TestManifestArgsValidation(); });
+    ok &= trace_case(R"TRACE(TestVerificationPayloadCoalescing())TRACE", [&]() { return TestVerificationPayloadCoalescing(); });
+    ok &= trace_case(R"TRACE(TestManifestVolumeArgsExpansion())TRACE", [&]() { return TestManifestVolumeArgsExpansion(); });
+    ok &= trace_case(R"TRACE(TestManifestSessionFunnel())TRACE", [&]() { return TestManifestSessionFunnel(); });
+    ok &= trace_case(R"TRACE(TestManifestCallbacksBindWalIdentityBeforeCanonicalPublication())TRACE", [&]() { return TestManifestCallbacksBindWalIdentityBeforeCanonicalPublication(); });
+    ok &= trace_case(R"TRACE(TestManifestCallbacksBindWalIdentityBeforeCanonicalPublication(true))TRACE", [&]() { return TestManifestCallbacksBindWalIdentityBeforeCanonicalPublication(true); });
+    ok &= trace_case(R"TRACE(TestManifestSiblingAcceptedWritePressure())TRACE", [&]() { return TestManifestSiblingAcceptedWritePressure(); });
+    for (const auto* mode : {"idle", "stale", "newer", "failure", "blocked", "recovery", "unknown", "unjournaled", "unaccepted", "active"})
+        ok &= trace_case(R"TRACE(TestManifestSiblingCleanupAdmission(mode))TRACE", [&]() { return TestManifestSiblingCleanupAdmission(mode); });
+    ok &= trace_case(R"TRACE(TestDirectorySymlinkCreateSet())TRACE", [&]() { return TestDirectorySymlinkCreateSet(); });
+    ok &= trace_case(R"TRACE(TestDirectorySymlinkRefusals())TRACE", [&]() { return TestDirectorySymlinkRefusals(); });
+    ok &= trace_case(R"TRACE(TestDirectorySymlinkRoundTrip())TRACE", [&]() { return TestDirectorySymlinkRoundTrip(); });
+    ok &= trace_case(R"TRACE(TestDirectorySymlinkNoFollow())TRACE", [&]() { return TestDirectorySymlinkNoFollow(); });
+    ok &= trace_case(R"TRACE(TestDirectorySymlinkNamespace())TRACE", [&]() { return TestDirectorySymlinkNamespace(); });
+    ok &= trace_case(R"TRACE(TestDirectorySymlinkAcceptedRecovery())TRACE", [&]() { return TestDirectorySymlinkAcceptedRecovery(); });
+    ok &= trace_case(R"TRACE(TestDirectorySymlinkRestore())TRACE", [&]() { return TestDirectorySymlinkRestore(); });
+    ok &= trace_case(R"TRACE(TestCompressionHostAdmission())TRACE", [&]() { return TestCompressionHostAdmission(); });
+    ok &= trace_case(R"TRACE(TestCompressionHostReads())TRACE", [&]() { return TestCompressionHostReads(); });
+    ok &= trace_case(R"TRACE(TestNativeCompressionWriteCallbacks())TRACE", [&]() { return TestNativeCompressionWriteCallbacks(); });
+    ok &= trace_case(R"TRACE(TestNativeCompressionWriteCallbacks(true))TRACE", [&]() { return TestNativeCompressionWriteCallbacks(true); });
+    ok &= trace_case(R"TRACE(TestNativeCompressionDistinctStreamOwner())TRACE", [&]() { return TestNativeCompressionDistinctStreamOwner(); });
+    ok &= trace_case(R"TRACE(TestNativeCompressionWriteCallbacks(false, 8, 29))TRACE", [&]() { return TestNativeCompressionWriteCallbacks(false, 8, 29); });
+    ok &= trace_case(R"TRACE(TestNativeCompressionWriteCallbacks(true, 8, 29))TRACE", [&]() { return TestNativeCompressionWriteCallbacks(true, 8, 29); });
     for (const unsigned type : {7u, 8u, 11u, 12u})
     {
-        ok &= RunNativeModernCompressionTests(type, false);
-        ok &= RunNativeModernCompressionTests(type, true);
+        ok &= trace_case(R"TRACE(RunNativeModernCompressionTests(type, false))TRACE", [&]() { return RunNativeModernCompressionTests(type, false); });
+        ok &= trace_case(R"TRACE(RunNativeModernCompressionTests(type, true))TRACE", [&]() { return RunNativeModernCompressionTests(type, true); });
     }
-    ok &= TestNativeModernCompressionBeforePublishRestart();
-    ok &= TestNativeRemainingCompressionCallbacks(false);
-    ok &= TestNativeRemainingCompressionCallbacks(true);
-    ok &= TestNativeModernCompressionBeforePublishRestart(true);
-    ok &= TestNativeCompressionRestart256(true);
-    ok &= TestNativeCompressionRestart256(false);
-    ok &= TestNativeCompressionManifest266(false);
-    ok &= TestNativeCompressionManifest266(true);
-    ok &= TestNativeCompressionManifestRefusals266();
-    ok &= TestNativeCompressionManifestOlderQueueRefusal279();
-    ok &= TestNativeCompressionManifestCapacityRefusal279();
-    ok &= TestNativeCompressionManifestAcceptedCensusFailure295();
-    ok &= TestNativeCompressionManifestAcceptedPublicationFailure295();
-    ok &= TestNativeCompressionManifestExternalStagingFailure295();
+    ok &= trace_case(R"TRACE(TestNativeModernCompressionBeforePublishRestart())TRACE", [&]() { return TestNativeModernCompressionBeforePublishRestart(); });
+    ok &= trace_case(R"TRACE(TestNativeRemainingCompressionCallbacks(false))TRACE", [&]() { return TestNativeRemainingCompressionCallbacks(false); });
+    ok &= trace_case(R"TRACE(TestNativeRemainingCompressionCallbacks(true))TRACE", [&]() { return TestNativeRemainingCompressionCallbacks(true); });
+    ok &= trace_case(R"TRACE(TestNativeModernCompressionBeforePublishRestart(true))TRACE", [&]() { return TestNativeModernCompressionBeforePublishRestart(true); });
+    ok &= trace_case(R"TRACE(TestNativeCompressionRestart256(true))TRACE", [&]() { return TestNativeCompressionRestart256(true); });
+    ok &= trace_case(R"TRACE(TestNativeCompressionRestart256(false))TRACE", [&]() { return TestNativeCompressionRestart256(false); });
+    ok &= trace_case(R"TRACE(TestNativeCompressionManifest266(false))TRACE", [&]() { return TestNativeCompressionManifest266(false); });
+    ok &= trace_case(R"TRACE(TestNativeCompressionManifest266(true))TRACE", [&]() { return TestNativeCompressionManifest266(true); });
+    ok &= trace_case(R"TRACE(TestNativeCompressionManifestRefusals266())TRACE", [&]() { return TestNativeCompressionManifestRefusals266(); });
+    ok &= trace_case(R"TRACE(TestNativeCompressionManifestOlderQueueRefusal279())TRACE", [&]() { return TestNativeCompressionManifestOlderQueueRefusal279(); });
+    ok &= trace_case(R"TRACE(TestNativeCompressionManifestCapacityRefusal279())TRACE", [&]() { return TestNativeCompressionManifestCapacityRefusal279(); });
+    ok &= trace_case(R"TRACE(TestNativeCompressionManifestAcceptedCensusFailure295())TRACE", [&]() { return TestNativeCompressionManifestAcceptedCensusFailure295(); });
+    ok &= trace_case(R"TRACE(TestNativeCompressionManifestAcceptedPublicationFailure295())TRACE", [&]() { return TestNativeCompressionManifestAcceptedPublicationFailure295(); });
+    ok &= trace_case(R"TRACE(TestNativeCompressionManifestExternalStagingFailure295())TRACE", [&]() { return TestNativeCompressionManifestExternalStagingFailure295(); });
     for (const bool manifest : {false, true})
     {
-        ok &= TestDeferredAccessTimeBatch302(manifest);
-        ok &= TestDeferredAccessTimeOrdering302(manifest);
-        ok &= TestDeferredAccessTimeShutdown302(manifest);
-        ok &= TestDeferredAccessTimeWorker302(manifest);
-        ok &= TestDeferredAccessTimeStop567(manifest, false, true);
-        ok &= TestDeferredAccessTimeStop567(manifest, true, true);
+        ok &= trace_case(R"TRACE(TestDeferredAccessTimeBatch302(manifest))TRACE", [&]() { return TestDeferredAccessTimeBatch302(manifest); });
+        ok &= trace_case(R"TRACE(TestDeferredAccessTimeOrdering302(manifest))TRACE", [&]() { return TestDeferredAccessTimeOrdering302(manifest); });
+        ok &= trace_case(R"TRACE(TestDeferredAccessTimeShutdown302(manifest))TRACE", [&]() { return TestDeferredAccessTimeShutdown302(manifest); });
+        ok &= trace_case(R"TRACE(TestDeferredAccessTimeWorker302(manifest))TRACE", [&]() { return TestDeferredAccessTimeWorker302(manifest); });
+        ok &= trace_case(R"TRACE(TestDeferredAccessTimeStop567(manifest, false, true))TRACE", [&]() { return TestDeferredAccessTimeStop567(manifest, false, true); });
+        ok &= trace_case(R"TRACE(TestDeferredAccessTimeStop567(manifest, true, true))TRACE", [&]() { return TestDeferredAccessTimeStop567(manifest, true, true); });
         if (!manifest)
         {
-            ok &= TestDeferredAccessTimeStop567(false, false, false);
-            ok &= TestDeferredAccessTimeStop567(false, true, false);
-            ok &= TestDeferredAccessTimeIdleSiblingRetry582(false);
-            ok &= TestDeferredAccessTimeIdleSiblingRetry582(true);
-            ok &= TestDeferredAccessTimeIdleFullStatus582();
-            ok &= TestDeferredAccessTimeIdleTerminal582();
+            ok &= trace_case(R"TRACE(TestDeferredAccessTimeStop567(false, false, false))TRACE", [&]() { return TestDeferredAccessTimeStop567(false, false, false); });
+            ok &= trace_case(R"TRACE(TestDeferredAccessTimeStop567(false, true, false))TRACE", [&]() { return TestDeferredAccessTimeStop567(false, true, false); });
+            ok &= trace_case(R"TRACE(TestDeferredAccessTimeIdleSiblingRetry582(false))TRACE", [&]() { return TestDeferredAccessTimeIdleSiblingRetry582(false); });
+            ok &= trace_case(R"TRACE(TestDeferredAccessTimeIdleSiblingRetry582(true))TRACE", [&]() { return TestDeferredAccessTimeIdleSiblingRetry582(true); });
+            ok &= trace_case(R"TRACE(TestDeferredAccessTimeIdleFullStatus582())TRACE", [&]() { return TestDeferredAccessTimeIdleFullStatus582(); });
+            ok &= trace_case(R"TRACE(TestDeferredAccessTimeIdleTerminal582())TRACE", [&]() { return TestDeferredAccessTimeIdleTerminal582(); });
         }
-        ok &= TestDeferredAccessTimeEarlierCommitWorker562(manifest);
-        ok &= TestDeferredAccessTimeEarlierCommitRefusal568(manifest);
-        ok &= TestDeferredAccessTimeOverdue311(manifest);
-        ok &= TestDeferredAccessTimeAcceptedFailure302(manifest, false);
-        ok &= TestDeferredAccessTimeAcceptedFailure302(manifest, true);
+        ok &= trace_case(R"TRACE(TestDeferredAccessTimeEarlierCommitWorker562(manifest))TRACE", [&]() { return TestDeferredAccessTimeEarlierCommitWorker562(manifest); });
+        ok &= trace_case(R"TRACE(TestDeferredAccessTimeEarlierCommitRefusal568(manifest))TRACE", [&]() { return TestDeferredAccessTimeEarlierCommitRefusal568(manifest); });
+        ok &= trace_case(R"TRACE(TestDeferredAccessTimeOverdue311(manifest))TRACE", [&]() { return TestDeferredAccessTimeOverdue311(manifest); });
+        ok &= trace_case(R"TRACE(TestDeferredAccessTimeAcceptedFailure302(manifest, false))TRACE", [&]() { return TestDeferredAccessTimeAcceptedFailure302(manifest, false); });
+        ok &= trace_case(R"TRACE(TestDeferredAccessTimeAcceptedFailure302(manifest, true))TRACE", [&]() { return TestDeferredAccessTimeAcceptedFailure302(manifest, true); });
     }
-    ok &= TestDeferredAccessTimePressure311();
-    ok &= TestNativeLzvnReadTask5();
-    ok &= TestNativeRemainingCodecReads(false);
-    ok &= TestNativeRemainingCodecReads(true);
-    ok &= TestNativeSparseWriteCallbacks340();
-    ok &= TestNativeSparseRefusalCallbacks340();
-    ok &= TestNativeSparseCommittedCallbacks355();
-    ok &= TestNativeSparseStageFailureCallbacks355();
-    ok &= TestNativeLzvnMalformedReadTask5();
-    ok &= TestNativeLzvnResourceReadTask5();
-    ok &= TestNativeLzvnResourceMalformedReadTask5();
-    ok &= TestNativeLzfseReadTask5();
-    ok &= TestNativeLzfseMalformedReadTask5();
-    ok &= TestNativeLzfseResourceReadTask5();
-    ok &= TestNativeLzfseResourceMalformedReadTask5();
-    ok &= TestBsdMetadataAcceptedReplayMatch();
-    ok &= TestSpecialNodeAcceptedRecovery();
-    ok &= TestNativeOverwritePreservesAliasIdentity(false, false, false, false, false, false,
-        false, false, false, false, false, false, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(false, true, false, false, false, false,
-        false, false, false, false, false, false, true);
-    ok &= TestDirectorySymlinkRestoreRefusals();
-    ok &= TestDirectorySymlinkAcceptedRecovery(true);
-    ok &= TestDirectorySymlinkAcceptedRecovery(true, true);
-    ok &= TestManifestCallbackRetentionRetry();
-    ok &= TestPayloadShapeAcceptedReplay();
-    ok &= TestAllocationSizeValidationAndLegacy();
-    ok &= TestPayloadShapeAcceptedReplay(0, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(false, false, false, false, false, false,
-        false, false, false, false, true);
-    ok &= TestNativeOverwritePreservesAliasIdentity(false, true, false, false, false, false,
-        false, false, false, false, true);
-    ok &= TestPayloadShapeAcceptedReplay(1);
-    ok &= TestPayloadShapeAcceptedReplay(2);
-    ok &= TestRetentionCleanupFailureDoesNotTakeRuntimeLock();
-    ok &= TestManifestCheckpointCensusBeforeReplay();
-    ok &= TestManifestUnresolvedSiblingRecovery();
-    ok &= TestManifestSimultaneousAcceptedRecovery();
-    ok &= TestManifestSimultaneousAcceptedRecovery(1);
-    ok &= TestManifestSimultaneousAcceptedRecovery(2);
-    ok &= TestManifestSimultaneousAcceptedRecovery(3);
-    ok &= TestManifestSimultaneousAcceptedRecovery(4);
-    ok &= TestManifestPreacceptFailureReconcilesCensus();
-    ok &= TestRetentionBackpressureDoesNotDegradeMount();
-    ok &= TestManifestVolumeInfoUsesNonblockingSharedCapacity();
-    ok &= TestQuotaCallbacksPreserveWritableRetry();
-    ok &= TestDirectNativeStartupTopology();
-    ok &= TestDirectCapacityPreservesPrefix456();
-    ok &= TestDirectCompressedQuota456();
-    ok &= TestDirectCreateNoQuota456();
-    ok &= TestDirectCapacityOverwrite456();
-    ok &= TestDirectAdmissionRetainedCensus456();
-    ok &= TestDirectVolumeCheckpointPins();
-    ok &= TestManifestPayloadReplayBeforeNodeBootstrap();
-    ok &= TestManifestMetadataPolicyProjection();
-    ok &= TestManifestBackpressureCommitUsesMetadataLock();
-    ok &= TestManifestContainerStatusFile();
-    ok &= TestManifestPartialStartupDrainsStartedSibling();
-    ok &= TestManifestWorkerStartFailureTearsDownMount();
-    ok &= TestManifestControlRequestValidation();
-    ok &= TestManifestControlDetachAndAttachLifecycle();
-    ok &= TestManifestControlFileRoundTrip();
+    ok &= trace_case(R"TRACE(TestDeferredAccessTimePressure311())TRACE", [&]() { return TestDeferredAccessTimePressure311(); });
+    ok &= trace_case(R"TRACE(TestNativeLzvnReadTask5())TRACE", [&]() { return TestNativeLzvnReadTask5(); });
+    ok &= trace_case(R"TRACE(TestNativeRemainingCodecReads(false))TRACE", [&]() { return TestNativeRemainingCodecReads(false); });
+    ok &= trace_case(R"TRACE(TestNativeRemainingCodecReads(true))TRACE", [&]() { return TestNativeRemainingCodecReads(true); });
+    ok &= trace_case(R"TRACE(TestNativeSparseRangeRoundTrip())TRACE", [&]() { return TestNativeSparseRangeRoundTrip(); });
+    ok &= trace_case(R"TRACE(TestNativeSparseRangeBoundariesAndReplay())TRACE", [&]() { return TestNativeSparseRangeBoundariesAndReplay(); });
+    ok &= trace_case(R"TRACE(TestNativeSparseWriteCallbacks340())TRACE", [&]() { return TestNativeSparseWriteCallbacks340(); });
+    ok &= trace_case(R"TRACE(TestNativeSparseRefusalCallbacks340())TRACE", [&]() { return TestNativeSparseRefusalCallbacks340(); });
+    ok &= trace_case(R"TRACE(TestNativeSparseCommittedCallbacks355())TRACE", [&]() { return TestNativeSparseCommittedCallbacks355(); });
+    ok &= trace_case(R"TRACE(TestNativeSparseStageFailureCallbacks355())TRACE", [&]() { return TestNativeSparseStageFailureCallbacks355(); });
+    ok &= trace_case(R"TRACE(TestNativeLzvnMalformedReadTask5())TRACE", [&]() { return TestNativeLzvnMalformedReadTask5(); });
+    ok &= trace_case(R"TRACE(TestNativeLzvnResourceReadTask5())TRACE", [&]() { return TestNativeLzvnResourceReadTask5(); });
+    ok &= trace_case(R"TRACE(TestNativeLzvnResourceMalformedReadTask5())TRACE", [&]() { return TestNativeLzvnResourceMalformedReadTask5(); });
+    ok &= trace_case(R"TRACE(TestNativeLzfseReadTask5())TRACE", [&]() { return TestNativeLzfseReadTask5(); });
+    ok &= trace_case(R"TRACE(TestNativeLzfseMalformedReadTask5())TRACE", [&]() { return TestNativeLzfseMalformedReadTask5(); });
+    ok &= trace_case(R"TRACE(TestNativeLzfseResourceReadTask5())TRACE", [&]() { return TestNativeLzfseResourceReadTask5(); });
+    ok &= trace_case(R"TRACE(TestNativeLzfseResourceMalformedReadTask5())TRACE", [&]() { return TestNativeLzfseResourceMalformedReadTask5(); });
+    ok &= trace_case(R"TRACE(TestBsdMetadataAcceptedReplayMatch())TRACE", [&]() { return TestBsdMetadataAcceptedReplayMatch(); });
+    ok &= trace_case(R"TRACE(TestSpecialNodeAcceptedRecovery())TRACE", [&]() { return TestSpecialNodeAcceptedRecovery(); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(false, false, false, false, false, false,
+        false, false, false, false, false, false, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(false, false, false, false, false, false,
+        false, false, false, false, false, false, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(false, true, false, false, false, false,
+        false, false, false, false, false, false, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(false, true, false, false, false, false,
+        false, false, false, false, false, false, true); });
+    ok &= trace_case(R"TRACE(TestDirectorySymlinkRestoreRefusals())TRACE", [&]() { return TestDirectorySymlinkRestoreRefusals(); });
+    ok &= trace_case(R"TRACE(TestDirectorySymlinkAcceptedRecovery(true))TRACE", [&]() { return TestDirectorySymlinkAcceptedRecovery(true); });
+    ok &= trace_case(R"TRACE(TestDirectorySymlinkAcceptedRecovery(true, true))TRACE", [&]() { return TestDirectorySymlinkAcceptedRecovery(true, true); });
+    ok &= trace_case(R"TRACE(TestManifestCallbackRetentionRetry())TRACE", [&]() { return TestManifestCallbackRetentionRetry(); });
+    ok &= trace_case(R"TRACE(TestPayloadShapeAcceptedReplay())TRACE", [&]() { return TestPayloadShapeAcceptedReplay(); });
+    ok &= trace_case(R"TRACE(TestAllocationSizeValidationAndLegacy())TRACE", [&]() { return TestAllocationSizeValidationAndLegacy(); });
+    ok &= trace_case(R"TRACE(TestPayloadShapeAcceptedReplay(0, true))TRACE", [&]() { return TestPayloadShapeAcceptedReplay(0, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(false, false, false, false, false, false,
+        false, false, false, false, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(false, false, false, false, false, false,
+        false, false, false, false, true); });
+    ok &= trace_case(R"TRACE(TestNativeOverwritePreservesAliasIdentity(false, true, false, false, false, false,
+        false, false, false, false, true))TRACE", [&]() { return TestNativeOverwritePreservesAliasIdentity(false, true, false, false, false, false,
+        false, false, false, false, true); });
+    ok &= trace_case(R"TRACE(TestPayloadShapeAcceptedReplay(1))TRACE", [&]() { return TestPayloadShapeAcceptedReplay(1); });
+    ok &= trace_case(R"TRACE(TestPayloadShapeAcceptedReplay(2))TRACE", [&]() { return TestPayloadShapeAcceptedReplay(2); });
+    ok &= trace_case(R"TRACE(TestRetentionCleanupFailureDoesNotTakeRuntimeLock())TRACE", [&]() { return TestRetentionCleanupFailureDoesNotTakeRuntimeLock(); });
+    ok &= trace_case(R"TRACE(TestManifestCheckpointCensusBeforeReplay())TRACE", [&]() { return TestManifestCheckpointCensusBeforeReplay(); });
+    ok &= trace_case(R"TRACE(TestManifestUnresolvedSiblingRecovery())TRACE", [&]() { return TestManifestUnresolvedSiblingRecovery(); });
+    ok &= trace_case(R"TRACE(TestManifestSimultaneousAcceptedRecovery())TRACE", [&]() { return TestManifestSimultaneousAcceptedRecovery(); });
+    ok &= trace_case(R"TRACE(TestManifestSimultaneousAcceptedRecovery(1))TRACE", [&]() { return TestManifestSimultaneousAcceptedRecovery(1); });
+    ok &= trace_case(R"TRACE(TestManifestSimultaneousAcceptedRecovery(2))TRACE", [&]() { return TestManifestSimultaneousAcceptedRecovery(2); });
+    ok &= trace_case(R"TRACE(TestManifestSimultaneousAcceptedRecovery(3))TRACE", [&]() { return TestManifestSimultaneousAcceptedRecovery(3); });
+    ok &= trace_case(R"TRACE(TestManifestSimultaneousAcceptedRecovery(4))TRACE", [&]() { return TestManifestSimultaneousAcceptedRecovery(4); });
+    ok &= trace_case(R"TRACE(TestManifestPreacceptFailureReconcilesCensus())TRACE", [&]() { return TestManifestPreacceptFailureReconcilesCensus(); });
+    ok &= trace_case(R"TRACE(TestManifestFirstMutationFailure(false))TRACE", [&]() { return TestManifestFirstMutationFailure(false); });
+    ok &= trace_case(R"TRACE(TestManifestFirstMutationFailure(true))TRACE", [&]() { return TestManifestFirstMutationFailure(true); });
+    ok &= trace_case(R"TRACE(TestManifestFirstMutationFailure(true, true))TRACE", [&]() { return TestManifestFirstMutationFailure(true, true); });
+    ok &= trace_case(R"TRACE(TestManifestCleanRefusalCallbacks())TRACE", [&]() { return TestManifestCleanRefusalCallbacks(); });
+    for (const std::string mode : {"metadata-retention", "allocation-retention", "accepted-debt", "unsupported", "invariant"})
+        ok &= trace_case(R"TRACE(TestManifestCleanupFailureClassification(mode))TRACE", [&]() { return TestManifestCleanupFailureClassification(mode); });
+    ok &= trace_case(R"TRACE(TestManifestPlanningInvariantDisablesWrites())TRACE", [&]() { return TestManifestPlanningInvariantDisablesWrites(); });
+    ok &= trace_case(R"TRACE(TestManifestCapacityInvariantDisablesWrites())TRACE", [&]() { return TestManifestCapacityInvariantDisablesWrites(); });
+    ok &= trace_case(R"TRACE(TestRetentionBackpressureDoesNotDegradeMount())TRACE", [&]() { return TestRetentionBackpressureDoesNotDegradeMount(); });
+    ok &= trace_case(R"TRACE(TestNativeLowSpaceRefusalMapping())TRACE", [&]() { return TestNativeLowSpaceRefusalMapping(); });
+    ok &= trace_case(R"TRACE(TestNativeLowSpaceOriginalDebtLatch())TRACE", [&]() { return TestNativeLowSpaceOriginalDebtLatch(); });
+    ok &= trace_case(R"TRACE(TestManifestVolumeInfoUsesNonblockingSharedCapacity())TRACE", [&]() { return TestManifestVolumeInfoUsesNonblockingSharedCapacity(); });
+    ok &= trace_case(R"TRACE(TestQuotaCallbacksPreserveWritableRetry())TRACE", [&]() { return TestQuotaCallbacksPreserveWritableRetry(); });
+    ok &= trace_case(R"TRACE(TestDirectNativeStartupTopology())TRACE", [&]() { return TestDirectNativeStartupTopology(); });
+    ok &= trace_case(R"TRACE(TestDirectCapacityPreservesPrefix456())TRACE", [&]() { return TestDirectCapacityPreservesPrefix456(); });
+    ok &= trace_case(R"TRACE(TestDirectCompressedQuota456())TRACE", [&]() { return TestDirectCompressedQuota456(); });
+    ok &= trace_case(R"TRACE(TestDirectCreateNoQuota456())TRACE", [&]() { return TestDirectCreateNoQuota456(); });
+    ok &= trace_case(R"TRACE(TestDirectCapacityOverwrite456())TRACE", [&]() { return TestDirectCapacityOverwrite456(); });
+    ok &= trace_case(R"TRACE(TestDirectAdmissionRetainedCensus456())TRACE", [&]() { return TestDirectAdmissionRetainedCensus456(); });
+    ok &= trace_case(R"TRACE(TestDirectVolumeCheckpointPins())TRACE", [&]() { return TestDirectVolumeCheckpointPins(); });
+    ok &= trace_case(R"TRACE(TestManifestPayloadReplayBeforeNodeBootstrap())TRACE", [&]() { return TestManifestPayloadReplayBeforeNodeBootstrap(); });
+    ok &= trace_case(R"TRACE(TestManifestMetadataPolicyProjection())TRACE", [&]() { return TestManifestMetadataPolicyProjection(); });
+    ok &= trace_case(R"TRACE(TestManifestBackpressureCommitUsesMetadataLock())TRACE", [&]() { return TestManifestBackpressureCommitUsesMetadataLock(); });
+    ok &= trace_case(R"TRACE(TestManifestContainerStatusFile())TRACE", [&]() { return TestManifestContainerStatusFile(); });
+    ok &= trace_case(R"TRACE(TestManifestInitializationFailureSettlement())TRACE", [&]() { return TestManifestInitializationFailureSettlement(); });
+    ok &= trace_case(R"TRACE(TestManifestPartialStartupDrainsStartedSibling())TRACE", [&]() { return TestManifestPartialStartupDrainsStartedSibling(); });
+    ok &= trace_case(R"TRACE(TestManifestWorkerStartFailureTearsDownMount())TRACE", [&]() { return TestManifestWorkerStartFailureTearsDownMount(); });
+    ok &= trace_case(R"TRACE(TestManifestControlRequestValidation())TRACE", [&]() { return TestManifestControlRequestValidation(); });
+    ok &= trace_case(R"TRACE(TestLongRuntimeControlAndDiagnostics())TRACE", [&]() { return TestLongRuntimeControlAndDiagnostics(); });
+    ok &= trace_case(R"TRACE(TestManifestControlDetachAndAttachLifecycle())TRACE", [&]() { return TestManifestControlDetachAndAttachLifecycle(); });
+    ok &= trace_case(R"TRACE(TestManifestControlFileRoundTrip())TRACE", [&]() { return TestManifestControlFileRoundTrip(); });
 #endif
 
     if (!ok)

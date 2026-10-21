@@ -10,6 +10,8 @@ public sealed class ObserverCatalogIntegrationTests
 {
     private static string RealObserverPath()
     {
+        if (Environment.GetEnvironmentVariable("APFS_VERIFY_TEST_OBSERVER") is { Length: > 0 })
+            return StagedPackagedObserver.StableObserverPath();
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
         for (var level = 0; level < 14 && directory is not null; level++)
         {
@@ -167,8 +169,8 @@ public sealed class ObserverCatalogIntegrationTests
 
         // Duplicate APSB names are reported (not fatal); A3 keeps both rows
         // independently addressable by canonical ID.
-        var snapshot = backend.TryDiscoverTopologySnapshot(imagePath, "integration-dupname");
-        Assert.NotNull(snapshot);
+        var snapshot = backend.TryDiscoverTopologySnapshot(imagePath, "integration-dupname", out var observerError);
+        Assert.True(snapshot is not null, observerError);
         Assert.Equal(2, snapshot!.Volumes.Count);
 
         var volumes = (await backend.ProbeVolumesAsync(imagePath, CancellationToken.None))

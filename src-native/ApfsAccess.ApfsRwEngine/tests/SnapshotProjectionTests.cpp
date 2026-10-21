@@ -29,8 +29,9 @@ Record Inode(std::uint64_t id, std::uint64_t size, unsigned links, bool director
         PutU64LE(stream.data,0,size);PutU64LE(stream.data,8,4096);inode.extended_fields.push_back(stream); }
     return Encode(inode,EncodeAppleInodeRecord);
 }
-Record Drec(const std::string& name) {
+Record Drec(const std::string& name, std::uint64_t sibling_id = 0) {
     AppleDirectoryRecord d;d.parent_id=2;d.file_id=30;d.name_utf8=name;d.flags=8;d.date_added=987654300;
+    if(sibling_id){AppleExtendedField sibling{1,0,Bytes(8)};PutU64LE(sibling.data,0,sibling_id);d.extended_fields.push_back(std::move(sibling));}
     Record out;std::string error;Check(EncodeAppleDirectoryRecord(d,out,error),"drec encode");return out;
 }
 struct Fixture : SnapshotFixture {
@@ -63,11 +64,11 @@ struct Fixture : SnapshotFixture {
         fs.push_back(Encode(AppleXattrRecord{30,"com.apple.ResourceFork",kAppleXattrDataStream,descriptor},EncodeAppleXattrRecord));
         fs.push_back(Encode(AppleDataStreamIdRecord{40,1},EncodeAppleDataStreamIdRecord));
         fs.push_back(Encode(AppleFileExtentRecord{40,0,4096,222,0,4096},EncodeAppleFileExtentRecord));
-        refs.push_back(Encode(ApplePhysicalExtentRecord{222,1,1,40,1},EncodeApplePhysicalExtentRecord));
+        refs.push_back(Encode(ApplePhysicalExtentRecord{222,1,1,30,1},EncodeApplePhysicalExtentRecord));
         Bytes bytes(bs);PutBytes(bytes,0,"fork-past",9);Put(222,bytes,false);Trees();
     }
     void Hardlinks() {
-        fs[0]=Inode(2,0,2,true);fs[2]=Inode(30,8,2);fs.push_back(Drec("alias.txt"));
+        fs[0]=Inode(2,0,2,true);fs[1]=Drec("report.txt",70);fs[2]=Inode(30,8,2);fs.push_back(Drec("alias.txt",71));
         fs.push_back(Encode(AppleSiblingLinkRecord{30,70,2,"report.txt"},EncodeAppleSiblingLinkRecord));
         fs.push_back(Encode(AppleSiblingLinkRecord{30,71,2,"alias.txt"},EncodeAppleSiblingLinkRecord));
         fs.push_back(Encode(AppleSiblingMapRecord{70,30},EncodeAppleSiblingMapRecord));
@@ -115,7 +116,8 @@ void Positive() {
         Fixture f;f.External();f.Hardlinks();const auto before=f.image;
         if(offset){f.image.insert(f.image.begin(),8192,std::byte{0xEE});f.scope.store_offset_bytes=8192;}
         const auto id=f.Identity();TracedSource source(f.image);Projection result;std::string error;
-        Check(Load(source,id,result,error),"projection: "+error);const auto& v=result->View();
+        const bool loaded=Load(source,id,result,error);
+        Check(loaded,"projection: "+error);const auto& v=result->View();
         Check(result->Snapshot().identity==id&&!result->Snapshot().snapshot_uuid_hex,"exact immutable identity, absent UUID");
         Check(v.volume_object_id==101&&result->Snapshot().metadata.volume.superblock.object_id==180,"virtual volume vs physical APSB");
         Check(v.volume_superblock_block==180+(offset?2:0)&&v.root_tree_block==183+(offset?2:0),"source relative metadata blocks");
@@ -186,7 +188,211 @@ void Reject(const std::string& label,const std::function<void(Fixture&)>& change
     Check(!Load(source,id,out,error),label+" accepted");Check(!out,label+" leaked stale output");
     Check(!error.empty()&&(reason.empty()||error.find(reason)!=std::string::npos),label+" wrong error: "+error);Pass(label);
 }
+void EditDirectory(Fixture& f,const std::function<void(AppleDirectoryRecord&)>& change) {
+    AppleDirectoryRecord d;std::string error;
+    Check(ApfsExtendedRecordCodec::DecodeDirectory(f.fs[1],ApfsNamePolicy::FromIncompatibleFeatures(0),d,error),
+        "decode directory fixture: "+error);
+    change(d);Check(EncodeAppleDirectoryRecord(d,f.fs[1],error),"encode directory fixture: "+error);f.Trees();
+}
+void DirectorySiblingMetadata() {
+    for(bool hardlinks:{false,true}) for(bool hashed:{false,true}) for(bool offset:{false,true}) {
+        Fixture f;if(hardlinks)f.Hardlinks();
+        EditDirectory(f,[](auto& d){d.extended_fields.push_back({127,0x80,Bytes(3,std::byte{0x5a})});});
+        if(hashed) {
+            std::string error;const auto policy=ApfsNamePolicy::FromIncompatibleFeatures(9);
+            for(auto& record:f.fs) if((ReadU64LE(record.key,0).value()>>60)==9) {
+                AppleDirectoryRecord d;
+                Check(ApfsExtendedRecordCodec::DecodeDirectory(record,ApfsNamePolicy::FromIncompatibleFeatures(0),d,error),
+                    "decode hashed sibling fixture");
+                Check(EncodeAppleDirectoryRecord(d,policy,record,error),"encode hashed sibling fixture");
+            }
+            Check(SortAppleBtreeRecords(f.fs,AppleBtreeKeyOrder::FileSystemHashedDirectory,error),"sort hashed siblings");
+            std::vector<Bytes> keys,values;for(const auto& r:f.fs){keys.push_back(r.key);values.push_back(r.value);}
+            f.Put(183,BuildRawLeafNode(keys,values,10,4096,0,f.root_oid,2,14));
+            f.Edit(180,[](auto& b){PutU64LE(b,0x38,9);});
+        }
+        if(offset){f.image.insert(f.image.begin(),8192,std::byte{0xee});f.scope.store_offset_bytes=8192;}
+        const auto before=f.image;const auto id=f.Identity();TracedSource source(f.image);Projection out;std::string error;
+        const bool loaded=Load(source,id,out,error);Check(loaded,"directory identity positive: "+error);
+        const auto& links=out->View().directory_links;
+        Check(links.size()==(hardlinks?2u:1u),"complete directory identity count");
+        for(const auto& link:links)Check(link.child_object_id==30&&link.sibling_id==
+            (hardlinks?(link.entry_name_utf8=="report.txt"?70u:71u):0u),"exact on-disk directory sibling identity");
+        Check(before==f.image&&!source.Touched(f.scope.store_offset_bytes+220*4096,2*4096),
+            "directory identity projection changes no bytes and reads no payload");
+        Pass("directory sibling identity opaque fields hardlinks="+std::to_string(hardlinks)+
+            " hashed="+std::to_string(hashed)+" offset="+std::to_string(offset));
+    }
+    Reject("hardlink missing alias directory sibling identity",[](auto& f){f.Hardlinks();
+        const auto key=Drec("alias.txt",71).key;
+        for(auto& r:f.fs)if(r.key==key)r=Drec("alias.txt");f.Trees();});
+    Reject("hardlink foreign directory sibling identity",[](auto& f){f.Hardlinks();f.fs[1]=Drec("report.txt",999);f.Trees();});
+    Reject("single link unexpected directory sibling identity",[](auto& f){f.fs[1]=Drec("report.txt",70);f.Trees();});
+    Reject("zero directory sibling identity",[](auto& f){f.Hardlinks();EditDirectory(f,[](auto& d){
+        PutU64LE(d.extended_fields[0].data,0,0);});});
+    Reject("short directory sibling identity",[](auto& f){f.Hardlinks();EditDirectory(f,[](auto& d){
+        d.extended_fields[0].data.resize(7);});});
+    Reject("long directory sibling identity",[](auto& f){f.Hardlinks();EditDirectory(f,[](auto& d){
+        d.extended_fields[0].data.push_back(std::byte{0});});});
+    Reject("directory sibling identity flags",[](auto& f){f.Hardlinks();EditDirectory(f,[](auto& d){
+        d.extended_fields[0].flags=1;});});
+    Reject("duplicate directory sibling identity",[](auto& f){f.Hardlinks();
+        auto& value=f.fs[1].value;PutU16LE(value,18,2);PutU16LE(value,20,24);
+        const Bytes descriptor(value.begin()+22,value.begin()+26);
+        value.insert(value.begin()+26,descriptor.begin(),descriptor.end());
+        value.insert(value.end(),8,std::byte{0});PutU64LE(value,value.size()-8,70);f.Trees();});
+    Reject("truncated directory sibling framing",[](auto& f){f.Hardlinks();f.fs[1].value.pop_back();f.Trees();});
+    Reject("hardlink missing sibling map",[](auto& f){f.Hardlinks();std::erase_if(f.fs,[](const auto& r){
+        return ReadU64LE(r.key,0).value()==((12ull<<60)|70);});f.Trees();});
+    Reject("hardlink foreign-inode sibling map",[](auto& f){f.Hardlinks();for(auto& r:f.fs)
+        if(ReadU64LE(r.key,0).value()==((12ull<<60)|70))PutU64LE(r.value,0,31);f.Trees();});
+    Reject("external attribute physical owner must be header inode",[](auto& f){f.External();
+        f.refs.back()=Encode(ApplePhysicalExtentRecord{222,1,1,40,1},EncodeApplePhysicalExtentRecord);f.Trees();});
+}
+void SparseHistorical() {
+    for (unsigned layout = 0; layout < 5; ++layout) {
+        for (bool offset : {false, true}) {
+            Fixture f; std::string error; AppleInodeRecord inode;
+            constexpr std::uint64_t eof = 3 * 4096 + 17, covered = 4 * 4096;
+            Check(ApfsExtendedRecordCodec::DecodeInode(Inode(30,eof,1),inode,error),"implicit sparse inode");
+            std::vector<AppleFileExtentRecord> mappings;
+            if (layout == 0) mappings.push_back({30,0,4096,220,0,4096});
+            if (layout == 1) mappings.push_back({30,4096,4096,220,0,4096});
+            if (layout == 2 || layout == 3) {
+                mappings.push_back({30,0,4096,220,0,4096});
+                if (layout == 3) mappings.push_back({30,4096,4096,0,0,4096});
+                mappings.push_back({30,8192,4096,222,0,4096});
+            }
+            const auto allocated = (layout == 2 || layout == 3 ? 2 : layout == 4 ? 0 : 1) * 4096ULL;
+            PutU64LE(inode.extended_fields[0].data,8,allocated); inode.internal_flags |= 0x200;
+            AppleExtendedField sparse{13,0,Bytes(8)}; PutU64LE(sparse.data,0,covered-allocated);
+            inode.extended_fields.push_back(sparse); f.fs[2]=Encode(inode,EncodeAppleInodeRecord);
+            f.fs.erase(f.fs.begin()+3); f.refs.clear();
+            Bytes expected(eof,std::byte{0});
+            for (const auto& mapping : mappings) {
+                f.fs.push_back(Encode(mapping,EncodeAppleFileExtentRecord));
+                if (!mapping.physical_block) continue;
+                f.refs.push_back(Encode(ApplePhysicalExtentRecord{mapping.physical_block,1,1,30,1},EncodeApplePhysicalExtentRecord));
+                const auto value = mapping.physical_block == 220 ? std::byte{0x31} : std::byte{0xa7};
+                f.Put(mapping.physical_block,Bytes(4096,value),false);
+                std::fill_n(expected.begin()+mapping.logical_address,4096,value);
+            }
+            f.Trees();
+            if (offset) { f.image.insert(f.image.begin(),8192,std::byte{0xee}); f.scope.store_offset_bytes=8192; }
+            const auto before=f.image; const auto id=f.Identity(); TracedSource source(f.image); Projection out;
+            const bool loaded=Load(source,id,out,error);
+            Check(loaded,"declared implicit sparse projection: "+error);
+            Check(out->Snapshot().identity==id,"implicit sparse exact historical identity");
+            const auto& projected=out->View();
+            const auto found=std::find_if(projected.inodes.begin(),projected.inodes.end(),[](const auto& i){return i.object_id==30;});
+            Check(found!=projected.inodes.end()&&found->logical_size==eof&&found->allocation_size==allocated,"implicit sparse EOF and physical accounting");
+            Bytes actual(eof,std::byte{0xff}); std::uint64_t end=0,physical=0;
+            for (const auto& extent : projected.read_extents_by_inode.at(30)) {
+                Check(extent.logical_offset==end&&extent.bytes<=covered-end,"complete bounded sparse read plan");
+                const auto count=static_cast<std::size_t>((std::min)(extent.bytes,eof-(std::min)(eof,end)));
+                if (extent.physical_address) {
+                    physical+=extent.bytes; Bytes payload;
+                    Check(source.Read(extent.physical_address,count,payload),"historical sparse physical read");
+                    std::copy(payload.begin(),payload.end(),actual.begin()+end);
+                } else std::fill_n(actual.begin()+end,count,std::byte{0});
+                end+=extent.bytes;
+            }
+            Check(end==covered&&physical==allocated&&actual==expected,"historical sparse bytes and zero holes");
+            Check(!source.Touched(f.scope.store_offset_bytes+221*4096,4096),"implicit sparse does not select changed live payload");
+            Check(before==f.image,"implicit sparse projection and reads leave image unchanged");
+            Pass("implicit sparse layout "+std::to_string(layout)+(offset?" offset":""));
+        }
+    }
+    Reject("undeclared implicit trailing gap",[](auto& f){f.fs[2]=Inode(30,8192,1);f.Trees();},"Coverage");
+    Reject("declared gap wrong sparse byte count",[](auto& f){AppleInodeRecord inode;std::string error;
+        Check(ApfsExtendedRecordCodec::DecodeInode(Inode(30,12288,1),inode,error),"gap negative inode");
+        inode.internal_flags|=0x200;AppleExtendedField sparse{13,0,Bytes(8)};PutU64LE(sparse.data,0,4096);
+        inode.extended_fields.push_back(sparse);f.fs[2]=Encode(inode,EncodeAppleInodeRecord);f.Trees();},"SparseByteCount");
+    Reject("declared hole cannot hide missing physical allocation",[](auto& f){AppleInodeRecord inode;std::string error;
+        Check(ApfsExtendedRecordCodec::DecodeInode(Inode(30,8192,1),inode,error),"missing allocation inode");
+        inode.internal_flags|=0x200;PutU64LE(inode.extended_fields[0].data,8,8192);
+        AppleExtendedField sparse{13,0,Bytes(8)};inode.extended_fields.push_back(sparse);
+        f.fs[2]=Encode(inode,EncodeAppleInodeRecord);f.Trees();},"Coverage");
+    Reject("declared sparse extent past EOF",[](auto& f){AppleInodeRecord inode;std::string error;
+        Check(ApfsExtendedRecordCodec::DecodeInode(Inode(30,8192,1),inode,error),"past EOF inode");
+        inode.internal_flags|=0x200;AppleExtendedField sparse{13,0,Bytes(8)};PutU64LE(sparse.data,0,4096);
+        inode.extended_fields.push_back(sparse);f.fs[2]=Encode(inode,EncodeAppleInodeRecord);
+        f.fs[3]=Encode(AppleFileExtentRecord{30,8192,4096,220,0,4096},EncodeAppleFileExtentRecord);f.Trees();});
+    Reject("declared sparse overlapping extents",[](auto& f){AppleInodeRecord inode;std::string error;
+        Check(ApfsExtendedRecordCodec::DecodeInode(Inode(30,12288,1),inode,error),"overlap inode");
+        inode.internal_flags|=0x200;PutU64LE(inode.extended_fields[0].data,8,12288);
+        inode.extended_fields.push_back({13,0,Bytes(8)});f.fs[2]=Encode(inode,EncodeAppleInodeRecord);
+        f.fs[3]=Encode(AppleFileExtentRecord{30,0,8192,220,0,4096},EncodeAppleFileExtentRecord);
+        f.fs.push_back(Encode(AppleFileExtentRecord{30,4096,4096,222,0,4096},EncodeAppleFileExtentRecord));
+        f.refs={Encode(ApplePhysicalExtentRecord{220,2,1,30,1},EncodeApplePhysicalExtentRecord),
+            Encode(ApplePhysicalExtentRecord{222,1,1,30,1},EncodeApplePhysicalExtentRecord)};f.Trees();});
+}
+void SparseAllocationProvenance() {
+    Fixture control; const auto control_id=control.Identity(); TracedSource control_source(control.image);
+    Projection seed; std::string error;
+    Check(Load(control_source,control_id,seed,error),"seed allocation provenance output: "+error);
+    unsigned unexpected=0;
+    for (unsigned variant=0; variant<4; ++variant) {
+        for (bool offset : {false,true}) {
+            Fixture f; AppleInodeRecord inode;
+            constexpr std::uint64_t eof=8192;
+            Check(ApfsExtendedRecordCodec::DecodeInode(Inode(30,eof,1),inode,error),"allocation provenance inode");
+            inode.internal_flags|=kAppleInodeHasUncompressedSize;
+            if (variant==0 || variant==3) PutU64LE(inode.extended_fields[0].data,8,0);
+            else inode.extended_fields.clear();
+            if (variant!=2) {
+                inode.internal_flags|=0x200;
+                AppleExtendedField sparse{13,0,Bytes(8)}; PutU64LE(sparse.data,0,eof);
+                inode.extended_fields.push_back(sparse);
+            }
+            if (variant==3) std::reverse(inode.extended_fields.begin(),inode.extended_fields.end());
+            f.fs[2]=Encode(inode,EncodeAppleInodeRecord);
+            f.fs.erase(f.fs.begin()+3); f.refs.clear(); f.Trees();
+            if (offset) { f.image.insert(f.image.begin(),8192,std::byte{0xee}); f.scope.store_offset_bytes=8192; }
+            const auto before=f.image; const auto identity=f.Identity(); TracedSource source(f.image);
+            Projection out=seed;
+            const bool historical=Load(source,identity,out,error);
+            const auto historical_error=error;
+            const bool expected=variant==0 || variant==3;
+            unexpected+=historical!=expected;
+            if (historical && expected) {
+                Check(out->Snapshot().identity==identity,"all-hole exact historical identity");
+                const auto& view=out->View();
+                const auto file=std::find_if(view.inodes.begin(),view.inodes.end(),[](const auto& i){return i.object_id==30;});
+                Check(file!=view.inodes.end()&&file->logical_size==eof&&file->allocation_size==0,
+                    "explicit native zero allocation preserved");
+                const auto& extents=view.read_extents_by_inode.at(30);
+                Check(extents.size()==1&&extents[0].logical_offset==0&&extents[0].physical_address==0&&extents[0].bytes==eof,
+                    "explicit zero allocation produces bounded zero read plan");
+                Bytes actual(eof,std::byte{0xff});
+                std::fill_n(actual.begin()+extents[0].logical_offset,static_cast<std::size_t>(extents[0].bytes),std::byte{0});
+                Check(actual==Bytes(eof,std::byte{0}),"entire sparse historical bytes are zero");
+            }
+            if (!historical) Check(!out&&historical_error.find("Coverage")!=std::string::npos,
+                "missing allocation refusal clears historical output: "+historical_error);
+            ApfsSnapshotRecords records;
+            Check(ApfsSnapshotStore::LoadExactResolvedRecords(source,identity,records,error),
+                "resolve allocation provenance records: "+error);
+            auto budget=std::make_shared<ApfsReadBudget>(65536,1ull<<28,1000000,1ull<<28);
+            const bool ordinary=NativeApfsReader::ValidateOrdinaryFileSystemRecords(records.trees.filesystem,
+                records.checkpoint.container.superblock,records.snapshot.metadata.volume.superblock,budget,error);
+            unexpected+=ordinary!=expected;
+            if (!ordinary) Check(error.find("Coverage")!=std::string::npos,"missing allocation ordinary refusal: "+error);
+            Check(!budget->Failed(),"allocation provenance is semantic refusal, not budget exhaustion");
+            Check(!source.Touched(f.scope.store_offset_bytes+220*4096,2*4096),"all-hole controls read no historical or live payload");
+            Check(before==f.image,"allocation provenance checks leave image unchanged");
+            std::cout<<"allocation provenance variant="<<variant<<" offset="<<offset<<" expected="<<expected
+                <<" historical="<<historical<<" historical_error="<<historical_error
+                <<" ordinary="<<ordinary<<" ordinary_error="<<error<<'\n';
+            if (historical==expected && ordinary==expected)
+                Pass("sparse allocation provenance "+std::to_string(variant)+(offset?" offset":""));
+        }
+    }
+    Check(unexpected==0,"native allocation provenance unexpected admissions="+std::to_string(unexpected));
+}
 void Negative() {
+    Reject("hardlink missing directory sibling identity",[](auto& f){f.Hardlinks();f.fs[1]=Drec("report.txt");f.Trees();});
+    Reject("hardlink mismatched directory sibling identity",[](auto& f){f.Hardlinks();f.fs[1]=Drec("report.txt",71);f.Trees();});
     const std::vector<std::function<void(ApfsSnapshotIdentity&)>> changes={
         [](auto& x){x.scope.container_uuid_hex=std::string(32,'c');},[](auto& x){x.scope.volume_uuid_hex=std::string(32,'c');},
         [](auto& x){++x.scope.volume_oid;},[](auto& x){--x.scope.checkpoint_xid;},[](auto& x){x.name_utf8="Backup";},
@@ -260,5 +466,10 @@ void Budgets() {
       Pass("shared budget cumulative across successful and failed calls"); }
 }
 }
-int main(){try{Positive();Negative();Budgets();std::cout<<"RESULT PASS cases="<<cases<<" checks="<<checks<<"\n";return 0;}
+int main(int argc,char** argv){try{
+    const std::string selector=argc==2?argv[1]:"";
+    if(selector=="--sibling-missing")Reject("hardlink missing directory sibling identity",[](auto& f){f.Hardlinks();f.fs[1]=Drec("report.txt");f.Trees();});
+    else if(selector=="--sibling-mismatch")Reject("hardlink mismatched directory sibling identity",[](auto& f){f.Hardlinks();f.fs[1]=Drec("report.txt",71);f.Trees();});
+    else {Check(argc==1,"unknown selector");Positive();SparseHistorical();SparseAllocationProvenance();Negative();DirectorySiblingMetadata();Budgets();}
+    std::cout<<"RESULT PASS cases="<<cases<<" checks="<<checks<<"\n";return 0;}
 catch(const std::exception& e){std::cerr<<"FAIL cases="<<cases<<" checks="<<checks<<": "<<e.what()<<"\n";return 1;}}

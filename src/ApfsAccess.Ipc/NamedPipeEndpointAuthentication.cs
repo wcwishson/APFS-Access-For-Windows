@@ -205,7 +205,8 @@ internal static class NamedPipeEndpointAuthenticationPolicy
 internal static class NamedPipeEndpointAuthentication
 {
     internal static bool IsRequired(string pipeName)
-        => string.Equals(pipeName, ApfsPipeConstants.PipeName, StringComparison.OrdinalIgnoreCase);
+        => string.Equals(pipeName, ApfsPipeConstants.PipeName, StringComparison.OrdinalIgnoreCase)
+            || FusionControlEndpoint.IsPrivateInstance(pipeName);
 
     [SupportedOSPlatform("windows")]
     internal static void AuthenticateClient(NamedPipeServerStream stream)

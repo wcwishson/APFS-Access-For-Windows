@@ -59,6 +59,8 @@ struct ContainerVolumeSpaceSnapshot
 namespace apfsaccess::rw
 {
 class BlockDevice;
+class RawSnapshotRuntimeRecoveryToken;
+struct RawSnapshotRuntimeAccess;
 } // namespace apfsaccess::rw
 
 namespace apfsaccess::catalog
@@ -79,12 +81,28 @@ struct ContainerVolumeSession
     apfsaccess::rw::MetadataStore::VolumeContext metadata_context;
 };
 
+// Capture only request selectors, never inline or deferred payload bytes.
+struct ContainerMutationStagingFailure
+{
+    std::size_t mutation_index = 0;
+    apfsaccess::rw::MetadataStore::MutationOperation operation{};
+    std::wstring path;
+    std::wstring secondary_path;
+    std::uint64_t offset = 0;
+    std::uint64_t length = 0;
+    std::wstring reason;
+};
+
 struct ContainerCommitResult
 {
     // Publication occurred (or NothingToCommit). A postpublication verifier
     // failure keeps this true, with InvariantFailed and recovery required;
     // callers must check status/recovery before acknowledging durable work.
     bool committed = false;
+    // WAL acceptance completed, but APFS checkpoint publication was deliberately
+    // deferred until the close/quiet boundary. This is success for the
+    // acceptance phase only; callers must not treat it as published data.
+    bool accepted_without_publication = false;
     std::string error;
     std::uint64_t checkpoint_xid = 0;
     // Mirrors the session store outcome so hosts keep their bookkeeping
@@ -107,6 +125,9 @@ struct ContainerCommitResult
     // Preserve the staging failure separately from the legacy commit status;
     // phase-aware callers can identify capacity refusal without parsing text.
     std::optional<apfsaccess::rw::MetadataStore::MutationStatus> mutation_staging_status;
+    // First refused staged request, copied before rollback/reload. Admission
+    // and hook failures have no staging-failure packet.
+    std::optional<ContainerMutationStagingFailure> mutation_staging_failure;
     std::vector<apfsaccess::rw::MetadataStore::PayloadIdentity>
     staged_identities;
 };
@@ -121,6 +142,7 @@ struct ContainerCommitDiagnostics
     std::uint64_t commit_attempts = 0;
     std::uint64_t commit_successes = 0;
     std::uint64_t commit_noops = 0;
+    std::uint64_t commit_deferred_acceptances = 0;
     std::uint64_t commit_failures = 0;
     std::string last_failure_stage;
     std::string last_failure_detail;
@@ -130,7 +152,9 @@ struct ContainerCommitDiagnostics
     std::uint64_t commit_hold_total_us = 0;
     std::uint64_t reload_attempts = 0;
     std::uint64_t reload_failures = 0;
-    // Reserved for a proven reuse contract; currently always zero.
+    // Counted when the owner-local generation and store state epoch prove
+    // that a precommit reload can be safely reused after a successful
+    // publication. Rollback and recovery repair reloads remain conservative.
     std::uint64_t reload_reuses = 0;
     std::uint64_t reload_total_us = 0;
     std::uint64_t reload_max_us = 0;
@@ -221,6 +245,7 @@ struct ManifestVolumeEntry
     std::string mount_point;
     bool requested_write = false;
     std::string recovery_identity;
+    bool initially_active = true;
 };
 
 struct ContainerManifest
@@ -240,19 +265,57 @@ struct ContainerManifest
     ContainerManifest& out_manifest,
     std::string& out_error);
 
+// A retained reader owns the same device lease and a checkpoint pin. Keep this
+// object alive for every read; a copied descriptor alone owns no storage.
+// The coordinator must also remain alive. Destruction and successful drain close
+// readers before releasing history. Drain retains ownership on timeout.
+class SnapshotRuntimeReader final {
+public:
+    SnapshotRuntimeReader()=default;
+    SnapshotRuntimeReader(const SnapshotRuntimeReader&)=delete;
+    SnapshotRuntimeReader& operator=(const SnapshotRuntimeReader&)=delete;
+    const apfsaccess::rw::NativeApfsSnapshotProjection& Projection() const { return *projection_; }
+    bool Read(std::uint64_t inode,std::uint64_t offset,std::size_t size,std::vector<std::byte>& out) const;
+private:
+    friend class ContainerMountCoordinator;
+    mutable std::timed_mutex read_mutex_;
+    mutable bool closed_=true;
+    void Close() const {
+        std::lock_guard<std::timed_mutex> lock(read_mutex_);closed_=true;device_.reset();
+    }
+    bool CloseUntil(std::chrono::steady_clock::time_point deadline) const {
+        std::unique_lock<std::timed_mutex> lock(read_mutex_,std::defer_lock);
+        if(!lock.try_lock_until(deadline))return false;
+        closed_=true;device_.reset();return true;
+    }
+    mutable std::shared_ptr<apfsaccess::rw::BlockDevice> device_;
+    std::shared_ptr<const apfsaccess::rw::NativeApfsSnapshotProjection> projection_;
+    std::uint64_t checkpoint_=0,volume_=0;
+};
 class ContainerMountCoordinator
 {
 public:
     // Opens one raw lease on (device_path, device_offset) and loads the
     // catalog, requiring exactly one container. Fails closed otherwise.
+    // When admit_raw_device_writer is set, a non-regular source may be
+    // promoted to a deny-write bound writer (GPT/APFS binding, container
+    // clamp, NXSB revalidation) instead of failing the writable lease.
+    // Default-closed; test-only overrides never enable this path.
     [[nodiscard]] static std::unique_ptr<ContainerMountCoordinator> Open(
         const std::string& device_path,
         std::uint64_t device_offset_bytes,
         std::string& out_error,
         CatalogLoadPolicy catalog_load_policy = CatalogLoadPolicy::StrictApple,
         bool require_writable_lease = false,
-        bool require_checkpoint_census = false);
+        bool require_checkpoint_census = false,
+        bool exclusive_management_image = false,
+        bool admit_raw_device_writer = false);
 
+    // Uses the command's retained exclusive ordinary-image object, never a new path open.
+    [[nodiscard]] static std::unique_ptr<ContainerMountCoordinator> OpenRepairImage(
+        std::shared_ptr<apfsaccess::rw::BlockDevice> image, std::string& error);
+    std::vector<std::uint64_t> SnapshotRuntimeCheckpointPins() const;
+    std::shared_ptr<const SnapshotRuntimeReader> AcquireSnapshotReader(const ApfsSnapshotIdentity&,std::string&);
     ContainerMountCoordinator(const ContainerMountCoordinator&) = delete;
     ContainerMountCoordinator& operator=(const ContainerMountCoordinator&) = delete;
     ~ContainerMountCoordinator();
@@ -304,7 +367,9 @@ public:
         bool accepted_replay = false,
         std::optional<std::uint64_t> expected_replay_preimage = std::nullopt,
         const ContainerMutationPreparationHook& mutation_preparation_hook = {},
-        const ContainerPostpublicationVerifierHook& postpublication_verifier_hook = {});
+        const ContainerPostpublicationVerifierHook& postpublication_verifier_hook = {},
+        bool retain_accepted_owner_until_cleanup = false,
+        bool defer_publication = false);
 
     // Refreshes the borrowed store before startup recovery examines retained
     // history. Pending mutations are refused rather than discarded.
@@ -341,6 +406,33 @@ public:
     // Commit (direct session commits bypass serialization and the ledger).
     [[nodiscard]] apfsaccess::rw::MetadataStore* FindSessionStore(
         std::uint64_t volume_object_id) noexcept;
+    // Owner-derived canonical journal identity for a mounted session:
+    // "apfs-vol:<container_uuid_hex>:<volume_object_id>", built only from the
+    // loaded container UUID and the catalog-resolved OID. False when unmounted.
+    // Maintenance must prove ownership against this identity, never against a
+    // caller-supplied string.
+    [[nodiscard]] bool SessionCanonicalJournalIdentity(
+        std::uint64_t volume_object_id, std::string& out_identity) const;
+    // Original recovery storage identity from MountVolume, never from a
+    // mutable journal configuration or caller-supplied receipt.
+    [[nodiscard]] bool SessionRecoveryIdentity(
+        std::uint64_t volume_object_id, std::string& out_identity) const;
+    // Read-only callback under the same serializer as publication/unmount.
+    // Requires a clean complete census and an already-current canonical store.
+    // Callback must not reenter the coordinator or retain store references.
+    [[nodiscard]] bool InspectCurrentSession(std::uint64_t volume_object_id,
+        const std::function<bool(const apfsaccess::rw::MetadataStore&, std::string&)>& inspect,
+        std::string& out_error, bool accepted_replay = false);
+    // Read-only verification may inspect the newest published checkpoint while
+    // a clean sibling's namespace remains lazily loaded at an older checkpoint.
+    // Every session must be clean, canonical and on this retained device; the
+    // latest view must resolve the selected volume's unchanged UUID/OID. The
+    // callback may only read the source under the caller's full host gates. It
+    // grants no mutation/repair authority and must not retain either reference.
+    [[nodiscard]] bool InspectPublishedCheckpointForVerification(std::uint64_t volume_object_id,
+        const std::function<bool(const apfsaccess::rw::MetadataStore&,
+            const AppleCheckpointView&, std::string&)>& inspect, std::string& out_error);
+    [[nodiscard]] std::weak_ptr<const std::uint8_t> LifetimeToken() const noexcept { return lifetime_token_; }
     [[nodiscard]] bool IsRecoveryRequired() const noexcept;
     [[nodiscard]] std::optional<std::uint64_t> RecoveryVolumeObjectId() const noexcept;
     [[nodiscard]] std::string RecoveryReason() const;
@@ -376,6 +468,38 @@ public:
         std::string& out_error);
 
 private:
+    friend struct apfsaccess::rw::RawSnapshotRuntimeAccess;
+    friend struct RawSnapshotRuntimeRecoveryTestPeer;
+    struct RawSnapshotPeerObservation {
+        std::uint64_t oid = 0;
+        apfsaccess::rw::MetadataStore* store = nullptr;
+        std::string canonical_identity;
+        std::string recovery_identity;
+        VolumeCheckpointPins census;
+        bool canonical_writer = false;
+    };
+    std::vector<RawSnapshotPeerObservation> ObserveRawSnapshotPeersNoLock() const;
+    bool ReloadRawSnapshotRecoveryNoLock(std::uint64_t, std::string&);
+    void AccountRawSnapshotRecoveryNoLock(std::uint64_t);
+    ContainerCommitResult CommitRawSnapshot(std::uint64_t,
+        const std::vector<apfsaccess::rw::MetadataStore::MutationRequest>&,
+        const ContainerPrepublicationHook&, const ContainerMutationPreparationHook&,
+        const ContainerPostpublicationVerifierHook&,
+        const std::shared_ptr<const apfsaccess::rw::RawSnapshotRuntimeRecoveryToken>&);
+    ContainerCommitResult CommitNoLock(std::uint64_t,
+        const std::vector<apfsaccess::rw::MetadataStore::MutationRequest>&,
+        const ContainerPrepublicationHook&, const ContainerMutationStagingHook&,
+        const ContainerRetentionCleanupHook&, bool, std::optional<std::uint64_t>,
+        const ContainerMutationPreparationHook&, const ContainerPostpublicationVerifierHook&,
+        bool, bool,
+        const std::shared_ptr<const apfsaccess::rw::RawSnapshotRuntimeRecoveryToken>& candidate = {},
+        const std::shared_ptr<const apfsaccess::rw::RawSnapshotRuntimeRecoveryToken>& recovery = {},
+        std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now());
+    std::shared_ptr<const apfsaccess::rw::RawSnapshotRuntimeRecoveryToken> raw_snapshot_recovery_;
+    std::string raw_snapshot_recovery_reason_;
+    static std::unique_ptr<ContainerMountCoordinator> OpenHeldImage(
+        std::shared_ptr<apfsaccess::rw::BlockDevice>, std::uint64_t, std::string&,
+        CatalogLoadPolicy, bool, bool);
     ContainerMountCoordinator() = default;
 
     struct SessionState;
@@ -412,7 +536,9 @@ private:
     [[nodiscard]] std::vector<std::uint64_t>
         RequiredCheckpointXidUnionNoLock() const;
 
+    std::vector<std::weak_ptr<const SnapshotRuntimeReader>> snapshot_readers_;
     std::shared_ptr<apfsaccess::rw::BlockDevice> device_;
+    const std::shared_ptr<const std::uint8_t> lifetime_token_ = std::make_shared<const std::uint8_t>(0);
     bool writable_lease_required_ = false;
     CatalogLoadPolicy catalog_load_policy_ = CatalogLoadPolicy::StrictApple;
     std::uint64_t device_offset_bytes_ = 0;
@@ -422,6 +548,9 @@ private:
     bool checkpoint_census_initialized_ = true;
     std::vector<VolumeCheckpointPins> volume_checkpoint_pins_;
     std::atomic<std::uint64_t> checkpoint_xid_{0};
+    // Owner-local publication generation for bounded prepared-session reuse.
+    // A sibling publication advances it and invalidates every other session.
+    std::uint64_t commit_generation_ = 0;
     std::uint64_t owner_process_id_ = 0;
     mutable std::mutex mutex_;
     mutable std::timed_mutex commit_mutex_;

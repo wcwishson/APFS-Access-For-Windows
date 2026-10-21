@@ -16,6 +16,11 @@
 
   <ItemGroup>
     <Using Include="Xunit" />
+    <Compile Include="..\fixtures\PhysicalWritePermissionFixture.cs" Link="PhysicalWritePermissionFixture.cs" />
+    <EmbeddedResource Include="TestData\RetainedOwnership\*.json" LogicalName="RetainedOwnershipNativeReports.%(Filename)%(Extension)" />
+    <Compile Include="..\fixtures\LiveVerificationFixture.cs" Link="LiveVerificationFixture.cs" />
+    <Compile Include="..\fixtures\SnapshotRecoveryFixture.cs" Link="SnapshotRecoveryFixture.cs" />
+    <Compile Include="..\fixtures\PhysicalTopologyBindingFixture.cs" Link="PhysicalTopologyBindingFixture.cs" />
   </ItemGroup>
 
   <ItemGroup>

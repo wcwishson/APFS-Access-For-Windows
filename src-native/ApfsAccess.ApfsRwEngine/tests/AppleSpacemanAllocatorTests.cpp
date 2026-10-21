@@ -869,6 +869,46 @@ bool TestPartitionsFreeQueuesAtRetentionFloorAndReleasesThemLater()
     return ok;
 }
 
+bool TestInternalOnlyReclamationAndHistoricalPrefix()
+{
+    auto fixture = BuildDirectCibFixture();
+    VectorRandomAccessSource source(fixture.image);
+    AppleSpacemanView view;
+    std::string error;
+    bool ok = Require(LoadAppleSpacemanOwnershipView(source, fixture.checkpoint, view, error), error);
+    if (!ok) return false;
+    SetBit(view.chunks[0].allocation_bitmap, 5);
+    --view.chunks[0].free_count; --view.devices[0].free_count;
+    view.free_queues[1].entries = {{kCheckpointXid - 1, 5, 1}};
+    view.free_queues[1].block_count = 1; view.free_queues[1].oldest_xid = kCheckpointXid - 1;
+    apfsaccess::rw::AppleSpacemanAllocationRequest request;
+    request.expected_checkpoint_xid = kCheckpointXid; request.transaction_xid = kCheckpointXid + 1;
+    request.first_ephemeral_object_id = 5000; request.main_block_count = 1;
+    request.reclaim_internal_pool_only = true;
+    apfsaccess::rw::AppleSpacemanAllocationPlan plan;
+    ok &= Require(apfsaccess::rw::PlanAppleSpacemanAllocation(view, request, plan, error), error);
+    ok &= Require(plan.allocated_main_blocks == std::vector<std::uint64_t>{6} &&
+        SameQueueEntries(plan.updated_spaceman.free_queues[1].entries, view.free_queues[1].entries) &&
+        plan.updated_spaceman.free_queues[1].block_count == 1 &&
+        plan.updated_spaceman.free_queues[1].oldest_xid == kCheckpointXid - 1,
+        "internal-only reclamation must preserve every main-pool queue field");
+    ok &= Require(std::find(plan.allocated_internal_pool_blocks.begin(), plan.allocated_internal_pool_blocks.end(),
+        kQueuedIpBlock) != plan.allocated_internal_pool_blocks.end(), "mature internal block remains usable");
+    MutateChecksummedBlock(fixture.image, kCibBlock, [](auto& bytes) { PutU64LE(bytes, 16, kCheckpointXid + 1); });
+    VectorRandomAccessSource future(fixture.image);
+    AppleSpacemanInternalPoolView pins;
+    ok &= Require(!LoadAppleSpacemanOwnershipView(future, fixture.checkpoint, view, error) &&
+        error == "AppleSpacemanCibFutureXid" && view.bytes.empty(), "future CIB never becomes allocator state");
+    ok &= Require(LoadAppleSpacemanRetentionBitmaps(future, fixture.checkpoint, pins, error) &&
+        pins.active_bitmaps.size() == 1 && pins.active_bitmaps.front().rotation_index == 0,
+        "validated historical prefix supplies rotation pins only");
+    MutateChecksummedBlock(fixture.image, kSpacemanBlock, [](auto& bytes) { PutU32LE(bytes, 0x144, 0xFFFFFFF0u); });
+    VectorRandomAccessSource incomplete(fixture.image);
+    ok &= Require(!LoadAppleSpacemanRetentionBitmaps(incomplete, fixture.checkpoint, pins, error) &&
+        pins.active_bitmaps.empty(), "invalid prefix returns no partial pins");
+    return ok;
+}
+
 bool TestRetentionFloorUsesXidBoundaryAcrossGaps()
 {
     const auto fixture = BuildDirectCibFixture();
@@ -1346,6 +1386,7 @@ int main()
     ok &= TestPlansMainAllocationAndAllocatorMetadataCow();
     ok &= TestPartitionsFreeQueuesAtRetentionFloorAndReleasesThemLater();
     ok &= TestRetentionFloorUsesXidBoundaryAcrossGaps();
+    ok &= TestInternalOnlyReclamationAndHistoricalPrefix();
     ok &= TestProtectedBitmapHeadIsSkippedAndRemainsSerialized();
     ok &= TestBitmapRetentionExhaustionIsAtomic();
     ok &= TestMultipleActiveBitmapsCannotReuseOriginalSlotDuringPlan();

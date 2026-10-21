@@ -1,5 +1,119 @@
 #pragma once
 
+bool TestTraverseOnlyDirectoryCleanupDoesNotWaitOnCommit()
+{
+    bool ok = true;
+    for (const bool hold_mutation_gate : {false, true})
+    {
+        MountContext c{};
+        c.native_write_enabled = true;
+        SeedRoot(c);
+        c.owned_metadata_store = std::make_unique<apfsaccess::rw::MetadataStore>(
+            apfsaccess::rw::MetadataStore::VolumeContext{});
+        c.metadata_store = c.owned_metadata_store.get();
+        // Exercise both gates independently; this existing unit seam admits
+        // Cleanup to the mutation gate without requiring a mounted volume.
+        c.test_force_native_mutation_staging_success = hold_mutation_gate;
+        OpenContext opened{};
+        opened.node = c.nodes.at(Key(&c, L"\\"));
+        InitializeOpenAccess(&opened, FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE);
+        if (!Require(opened.node->node_kind == NodeKind::Directory && opened.allow_read_data &&
+                !opened.allow_list_directory && !opened.allow_write_data && !opened.allow_append_data,
+                "traverse cleanup: actual access initializer exposes the directory execute/list distinction")) return false;
+        const auto before = VisibleInodeTimes(*opened.node);
+        auto fs = BuildFileSystem(&c);
+        std::unique_lock<std::mutex> held(hold_mutation_gate ? c.mutation_callback_mutex : c.metadata_mutex);
+        std::promise<void> entered;
+        auto ready = entered.get_future();
+        auto cleanup = std::async(std::launch::async, [&] {
+            entered.set_value();
+            CB_Cleanup(&fs, &opened, nullptr, FspCleanupSetLastAccessTime);
+        });
+        ready.wait();
+        const bool responsive = cleanup.wait_for(std::chrono::milliseconds(400)) == std::future_status::ready;
+        held.unlock();
+        cleanup.get();
+        std::cout << "TRAVERSE_CLEANUP gate=" << (hold_mutation_gate ? "mutation" : "metadata")
+                  << " responsive=" << responsive << '\n';
+        ok &= Require(responsive, "traverse-only directory automatic-atime Cleanup never enters native commit/mutation gates");
+        ok &= Require(VisibleInodeTimes(*opened.node) == before && !opened.mutation_observed.load() &&
+                c.metadata_store->PendingMutationCount() == 0 && c.deferred_access_times.empty(),
+            "traverse cleanup leaves timestamps and native/deferred staging unchanged");
+    }
+    return ok;
+}
+
+bool TestCleanupAccessTimeClassificationPolicies()
+{
+    struct Case { const char* name; bool directory; UINT32 access; bool stream; bool changes_atime; };
+    const Case cases[] = {
+        {"directory-traverse", true, FILE_TRAVERSE, false, false},
+        {"directory-attributes", true, FILE_READ_ATTRIBUTES, false, false},
+        {"directory-list", true, FILE_LIST_DIRECTORY, false, true},
+        {"directory-list-and-traverse", true, FILE_LIST_DIRECTORY | FILE_TRAVERSE, false, true},
+        {"directory-write", true, FILE_ADD_FILE, false, true},
+        {"directory-append", true, FILE_ADD_SUBDIRECTORY, false, true},
+        {"regular-execute", false, FILE_EXECUTE, false, true},
+        {"named-stream-execute", false, FILE_EXECUTE, true, true},
+        {"directory-stream-execute", true, FILE_EXECUTE, true, true},
+    };
+    bool ok = true;
+    for (const auto& test : cases)
+    {
+        MountContext c{};
+        c.overlay_write_enabled = true;
+        SeedRoot(c);
+        OpenContext opened{};
+        opened.node = test.directory ? c.nodes.at(Key(&c, L"\\")) : MakeNode(L"\\policy.bin", false, false);
+        if (!test.directory) c.nodes.emplace(Key(&c, opened.node->path), opened.node);
+        opened.named_stream = test.stream;
+        if (test.stream) opened.stream_name = L"policy";
+        InitializeOpenAccess(&opened, test.access);
+        constexpr auto stamp = apfsaccess::rw::InodeMetadataPatch::UnixEpochTicks + 10000000;
+        const InodeTimes before{stamp, stamp, stamp, stamp};
+        SetVisiblePayloadMetadataLocked(opened.node, 0, before);
+        auto fs = BuildFileSystem(&c);
+        CB_Cleanup(&fs, &opened, nullptr, FspCleanupSetLastAccessTime);
+        const auto after = VisibleInodeTimes(*opened.node);
+        const bool changed = after.access_time_utc != before.access_time_utc;
+        std::cout << "CLEANUP_POLICY case=" << test.name << " atime_changed=" << changed << '\n';
+        ok &= Require(changed == test.changes_atime &&
+                opened.mutation_observed.load() == test.changes_atime,
+            "automatic atime preserves listing/write/file-execute/stream policy and excludes directory traversal");
+        ok &= Require(after.create_time_utc == before.create_time_utc &&
+                after.modification_time_utc == before.modification_time_utc &&
+                after.change_time_utc == before.change_time_utc,
+            "automatic atime classification does not change other timestamps");
+    }
+    {
+        MountContext c{};
+        c.overlay_write_enabled = true;
+        SeedRoot(c);
+        OpenContext opened{};
+        opened.node = c.nodes.at(Key(&c, L"\\"));
+        InitializeOpenAccess(&opened, FILE_TRAVERSE | FILE_WRITE_ATTRIBUTES);
+        constexpr auto stamp = apfsaccess::rw::InodeMetadataPatch::UnixEpochTicks + 10000000;
+        const InodeTimes before{stamp, stamp, stamp, stamp};
+        SetVisiblePayloadMetadataLocked(opened.node, 0, before);
+        auto fs = BuildFileSystem(&c);
+        FSP_FSCTL_FILE_INFO info{};
+        const auto requested_atime = stamp + 10000000;
+        const auto status = CB_SetBasicInfo(&fs, &opened, INVALID_FILE_ATTRIBUTES,
+            0, requested_atime, 0, 0, &info);
+        std::cout << "CLEANUP_POLICY case=explicit-directory-atime status=" << status << '\n';
+        ok &= Require(status == STATUS_SUCCESS &&
+                VisibleInodeTimes(*opened.node).access_time_utc == requested_atime &&
+                opened.explicit_basic_info_completed.load() && opened.mutation_observed.load(),
+            "explicit SetBasicInfo access time remains effective on a traverse-only directory handle");
+        CB_Cleanup(&fs, &opened, nullptr, FspCleanupSetLastWriteTime | FspCleanupSetChangeTime);
+        const auto after = VisibleInodeTimes(*opened.node);
+        ok &= Require(after.access_time_utc == requested_atime && after.create_time_utc == before.create_time_utc &&
+                after.modification_time_utc != before.modification_time_utc && after.change_time_utc != before.change_time_utc,
+            "traverse classification preserves requested cleanup modification/change times");
+    }
+    return ok;
+}
+
 bool TestMetadataOnlyRegularFileDoesNotWaitOnCommit()
 {
     MountContext c{};

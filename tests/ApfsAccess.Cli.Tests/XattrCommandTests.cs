@@ -49,14 +49,17 @@ public sealed class XattrCommandTests
     public void MalformedAttributeStreamIsNotSilentlyIgnored(string name)
         => Assert.Throws<InvalidDataException>(() => XattrCommand.AttributeName(name));
 
-    [Fact]
-    public async Task NonApfsWriteRefusesWithoutCreatingAnAdsOrChangingTheBase()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task NonApfsWriteRefusesWithoutCreatingAnAdsOrChangingTheBase(bool directory)
     {
         var root = Path.Combine(Path.GetTempPath(), "ApfsXattrCli-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
         var path = Path.Combine(root, "owner.txt");
         var input = Path.Combine(root, "input.bin");
-        File.WriteAllText(path, "preserve this file");
+        if (directory) Directory.CreateDirectory(path);
+        else File.WriteAllText(path, "preserve this file");
         File.WriteAllBytes(input, [1, 2, 3, 4]);
         try
         {
@@ -74,13 +77,15 @@ public sealed class XattrCommandTests
             using var result = JsonDocument.Parse(output.ToString());
             Assert.False(result.RootElement.GetProperty("success").GetBoolean());
             Assert.Contains("mounted APFS", result.RootElement.GetProperty("error").GetString());
-            Assert.Equal("preserve this file", File.ReadAllText(path));
+            if (directory) Assert.Empty(Directory.EnumerateFileSystemEntries(path));
+            else Assert.Equal("preserve this file", File.ReadAllText(path));
             Assert.False(File.Exists(path + XattrCommand.StreamName("user.probe")));
         }
         finally
         {
             File.Delete(input);
-            File.Delete(path);
+            if (directory) Directory.Delete(path);
+            else File.Delete(path);
             Directory.Delete(root);
         }
     }

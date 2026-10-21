@@ -33,7 +33,7 @@ public sealed class DriveLetterDiscoveryRepairTests(ITestOutputHelper output)
         var timestamp = File.GetLastWriteTimeUtc(image);
         var observer = Path.Combine(root, "fixture-observer.exe");
         File.WriteAllBytes(observer, [0x4d, 0x5a]); // Evidence runner only: never executed.
-        var runner = new CatalogRunner(Evidence(A));
+        var runner = new CatalogRunner(Evidence(A, image));
         using var native = Native(image, observer, runner);
         var first = Assert.Single(await native.ProbeVolumesAsync(image, CancellationToken.None));
         Assert.Equal(A.ToString("N"), first.CatalogVolumeUuid);
@@ -45,7 +45,7 @@ public sealed class DriveLetterDiscoveryRepairTests(ITestOutputHelper output)
         using var worker = Worker(native, policy);
         await worker.GetInventoryAsync(CancellationToken.None);
         var calls = runner.Calls;
-        runner.Json = duplicate ? Evidence(A, duplicate: true) : Evidence(B);
+        runner.Json = duplicate ? Evidence(A, image, duplicate: true) : Evidence(B, image);
 
         // The unchanged-layout/metadata cache really contains A. This ordinary
         // probe must hit it; only the production authoritative API defeats it.
@@ -64,7 +64,7 @@ public sealed class DriveLetterDiscoveryRepairTests(ITestOutputHelper output)
         Assert.Equal((duplicate ? A : B).ToString("N"), refreshed[0].CatalogVolumeUuid);
 
         // A normal background cycle must also refresh identity without an edit.
-        runner.Json = Evidence(B);
+        runner.Json = Evidence(B, image);
         await Cycle(worker);
         Assert.False(policy.GetDriveLetterPreference(first, null).CanEdit);
         Assert.Equal(original, SHA256.HashData(File.ReadAllBytes(image)));
@@ -77,13 +77,13 @@ public sealed class DriveLetterDiscoveryRepairTests(ITestOutputHelper output)
     {
         var root = Root();
         var child = Environment.GetEnvironmentVariable("APFS_TEST_OBSERVER_CHILD");
-        Assert.False(string.IsNullOrWhiteSpace(child));
+        Assert.False(string.IsNullOrWhiteSpace(child), "Build the observer child harness (scripts/build_observer_child.ps1) before this focused test.");
         Assert.StartsWith("D:\\", Path.GetFullPath(child!), StringComparison.OrdinalIgnoreCase);
         Assert.True(File.Exists(child));
         var image = Path.Combine(root, "safe.apfs.img");
         SyntheticApfsTestImage.Create(image, 4);
         var owner = Path.Combine(root, "child-owner.json");
-        var runner = new ChildRunner(child!, owner, Evidence(A));
+        var runner = new ChildRunner(child!, owner, Evidence(A, image));
         using var native = Native(image, child!, runner);
         var path = Path.Combine(root, "letters.json");
         using var worker = Worker(native, new FirstFreeMountPolicy(["R", "S", "T"], new(path)));
@@ -92,9 +92,23 @@ public sealed class DriveLetterDiscoveryRepairTests(ITestOutputHelper output)
         try
         {
             var ready = Stopwatch.StartNew();
-            while (!File.Exists(owner) && ready.Elapsed < TimeSpan.FromSeconds(5)) await Task.Delay(20);
-            Assert.True(File.Exists(owner), "Owned child did not emit its identity proof.");
-            using var identity = JsonDocument.Parse(File.ReadAllBytes(owner));
+            byte[]? ownerBytes = null;
+            while (ownerBytes is null && ready.Elapsed < TimeSpan.FromSeconds(5))
+            {
+                if (File.Exists(owner))
+                {
+                    try
+                    {
+                        ownerBytes = File.ReadAllBytes(owner);
+                    }
+                    catch (IOException ex) when ((ex.HResult & 0xffff) == 32)
+                    {
+                    }
+                }
+                if (ownerBytes is null) await Task.Delay(20);
+            }
+            Assert.True(ownerBytes is not null, "Owned child did not publish a readable identity proof.");
+            using var identity = JsonDocument.Parse(ownerBytes);
             var pid = identity.RootElement.GetProperty("processId").GetInt32();
             using var exactChild = Process.GetProcessById(pid);
             Assert.Equal(Path.GetFullPath(child!), identity.RootElement.GetProperty("imagePath").GetString(), ignoreCase: true);
@@ -133,10 +147,10 @@ public sealed class DriveLetterDiscoveryRepairTests(ITestOutputHelper output)
         return root;
     }
 
-    private static string Evidence(Guid uuid, bool duplicate = false)
+    private static string Evidence(Guid uuid, string imagePath, bool duplicate = false)
     {
         var node = JsonNode.Parse(ObserverEvidenceJson.BuildSingleContainer(Container,
-            duplicate ? [new("Same name", 201), new("Other", 202)] : [new("Same name", 201)]))!;
+            duplicate ? [new("Same name", 201), new("Other", 202)] : [new("Same name", 201)], devicePath: imagePath))!;
         foreach (var volume in node["topology"]!["volumes"]!.AsArray()) volume!["uuid"] = uuid.ToString("N");
         var json = node.ToJsonString();
         Assert.NotNull(NativeApfsObserver.ParseAndValidateEvidence(json));

@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <AssemblyName>SMBLibrary</AssemblyName>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <Nullable>disable</Nullable>
+    <DefineConstants>$(DefineConstants);ENABLE_NTLMV1</DefineConstants>
+    <PowerShellExecutable Condition="'$(PowerShellExecutable)' == '' and Exists('$(ProgramW6432)/PowerShell/7/pwsh.exe')">$(ProgramW6432)/PowerShell/7/pwsh.exe</PowerShellExecutable>
+    <PowerShellExecutable Condition="'$(PowerShellExecutable)' == ''">pwsh</PowerShellExecutable>
+  </PropertyGroup>
+  <Target Name="PreparePinnedSource" BeforeTargets="CoreCompile">
+    <PropertyGroup>
+      <PinnedPatchRoot>$(IntermediateOutputPath)pinned</PinnedPatchRoot>
+    </PropertyGroup>
+    <Error Condition="'$(SMBLibrarySourceRoot)' == ''" Text="Set SMBLibrarySourceRoot to the verified official source checkout described in BUILD.md." />
+    <Exec Command="&quot;$(PowerShellExecutable)&quot; -NoLogo -NoProfile -NonInteractive -File &quot;$(MSBuildThisFileDirectory)PrepareSource.ps1&quot; -SourceRoot &quot;$(SMBLibrarySourceRoot)&quot; -Destination &quot;$(PinnedPatchRoot)&quot;" />
+    <ItemGroup>
+      <Compile Include="$(SMBLibrarySourceRoot)/SMBLibrary/**/*.cs;$(SMBLibrarySourceRoot)/Utilities/**/*.cs"
+        Exclude="$(SMBLibrarySourceRoot)/SMBLibrary/Server/SMBServer.cs;$(SMBLibrarySourceRoot)/SMBLibrary/Server/SMBServer.SMB2.cs;$(SMBLibrarySourceRoot)/SMBLibrary/Server/SMB2/NegotiateHelper.cs;$(SMBLibrarySourceRoot)/SMBLibrary/Server/SMB2/SessionSetupHelper.cs;$(SMBLibrarySourceRoot)/SMBLibrary/Server/SMB2/IOCtlHelper.cs;$(SMBLibrarySourceRoot)/SMBLibrary/SMB2/Commands/LockRequest.cs;$(SMBLibrarySourceRoot)/SMBLibrary/SMB2/Structures/LockElement.cs" />
+      <Compile Include="$(PinnedPatchRoot)/**/*.cs;$(MSBuildThisFileDirectory)Extensions/*.cs" />
+    </ItemGroup>
+  </Target>
+</Project>

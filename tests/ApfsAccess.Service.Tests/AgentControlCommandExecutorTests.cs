@@ -6,7 +6,7 @@ using Microsoft.Extensions.Options;
 
 namespace ApfsAccess.Service.Tests;
 
-public sealed class AgentControlCommandExecutorTests
+public sealed partial class AgentControlCommandExecutorTests
 {
     private const string DeviceId = "device-1";
     private const string VolumeId = "device-1|Main";
@@ -36,6 +36,35 @@ public sealed class AgentControlCommandExecutorTests
 
         Assert.False(result.HostOwnershipReleased);
         Assert.False(result.PendingDurabilityCleared);
+        Assert.False(result.ContainerMemberDetached);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Eject_UsesVerifiedMemberDetachWithoutClaimingSharedHostExit(bool detached)
+    {
+        var first = HealthyMount() with { HostProcessId = 42, HostProcessCreationTimeFileTimeUtc = 12345,
+            CatalogContainerUuid = new string('a', 32), MountReady = true };
+        var sibling = first with { VolumeId = "device-1|Archive", MountPoint = "F:\\", VolumeName = "Archive",
+            RecoveryIdentity = "apfs-recovery-v1-archive" };
+        var backend = new ScenarioBackend
+        {
+            UnmountResponse = new UnmountResult(true, "E:\\", null, true, false, true)
+            { ContainerMemberDetached = detached },
+        };
+        backend.SetMounted(first); backend.SetMounted(sibling);
+        using var worker = CreateWorker(backend);
+
+        var result = await CreateExecutor(worker).ExecuteAsync(CreateRequest(ApfsControlCommands.Eject,
+            new ApfsControlTarget(DeviceId, VolumeId, RecoveryIdentity)), CancellationToken.None);
+
+        Assert.Equal(detached, result.Success);
+        Assert.Equal(detached ? "proven" : "not-proven", result.OwnershipProof);
+        Assert.Equal("proven", result.DurabilityProof);
+        Assert.Equal("absent", result.MountProof);
+        Assert.Equal(sibling, Assert.Single(await backend.GetMountStateAsync(CancellationToken.None)));
+        Assert.Equal(1, backend.UnmountCalls);
     }
 
     private static readonly string[] DeleteIdentity =
@@ -258,7 +287,8 @@ public sealed class AgentControlCommandExecutorTests
         Assert.DoesNotContain(backend.SnapshotCalls, call => call.Action == SnapshotControlAction.Delete);
     }
 
-    private const string TestImagePath = @"D:\keeper-test\image.apfs";
+    // The scripted keeper operates on the same mock source selected in inventory.
+    private const string TestImagePath = DeviceId;
 
     private static ControlOperationRequestPayload ManagementRequest(
         string command,
@@ -606,7 +636,8 @@ public sealed class AgentControlCommandExecutorTests
         Assert.Empty(backend.QuotaCalls);
     }
 
-    private const string TestJournalRoot = @"D:\keeper-journals";
+    private static readonly string TestJournalRoot = Directory.CreateDirectory(
+        Path.Combine(Path.GetTempPath(), "keeper-journals-" + Guid.NewGuid().ToString("N"))).FullName;
 
     [Fact]
     public async Task ManagementApply_RenameMissingImagePath_RefusedWithTokenLive()
@@ -718,6 +749,31 @@ public sealed class AgentControlCommandExecutorTests
         Assert.Equal(ApfsOperationCodes.OperationFailed, apply.Code);
         Assert.Equal("keeper-refused", apply.FinalStatus);
         Assert.Contains("nope", apply.Diagnostic, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ManagementApply_RenameUnprovenDispatchPreservesRecoveryUncertainty()
+    {
+        var backend = new KeeperBackend(new ScenarioBackend { TopologyCheckpointXid = "90" });
+        backend.Enqueue(new ManagementKeeperRenameResult(false, 0, ManagementKeeperCodes.Unproven, "Original dispatch boundary unknown"));
+        using var worker = CreateWorker(backend);
+        var executor = new AgentControlCommandExecutor(worker, managementJournalRoot: TestJournalRoot);
+        var plan = await executor.ExecuteAsync(ManagementRequest(ApfsControlCommands.ManagementPlan), CancellationToken.None);
+        Assert.True(plan.Success, plan.Diagnostic);
+        var request = ManagementRequest(ApfsControlCommands.ManagementApply, token: plan.ManagementToken,
+            name: "Renamed", imagePath: TestImagePath);
+        var apply = await executor.ExecuteAsync(request, CancellationToken.None);
+        Assert.False(apply.Success);
+        Assert.Equal(ApfsOperationCodes.BlockedRecovery, apply.Code);
+        Assert.Equal("management-outcome-unproven", apply.FinalStatus);
+        Assert.True(apply.PendingDurability);
+        Assert.Equal("not-proven", apply.OwnershipProof);
+        Assert.Equal("not-proven", apply.DurabilityProof);
+        Assert.Single(backend.KeeperCalls);
+        Assert.True(PipeMessageCodec.Validate(PipeMessageCodec.Create(ApfsMessageTypes.OperationResult,
+            apply, apply.OperationId, PipeSchemaVersions.Schema2)).IsValid);
+        var spent = await executor.ExecuteAsync(request with { OperationId = Guid.NewGuid().ToString("D") }, CancellationToken.None);
+        Assert.False(spent.Success);Assert.Single(backend.KeeperCalls);
     }
 
     [Fact]
@@ -1356,8 +1412,8 @@ public sealed class AgentControlCommandExecutorTests
     public async Task Fix_VerifyCompleteHealthyMount_SucceedsWithVerifyNote()
     {
         // Task 10 Step 5: verify-first runs the read-only verifier on the
-        // exact derived scope before the mount-health retry. A clean report
-        // plus a healthy remount succeeds with a verify:complete token.
+        // exact derived scope. Success also requires a fresh retained-image
+        // owner and its complete live verification after the remount.
         const string imageDevice = @"D:\verify-image.apfs";
         const string imageVolume = @"D:\verify-image.apfs|Main";
         var inner = new ScenarioBackend
@@ -1368,17 +1424,24 @@ public sealed class AgentControlCommandExecutorTests
         };
         var backend = new VerifyBackend(inner);
         backend.Enqueue(new ImageVerifyResult(true, "Complete", 0, 0, null));
-        inner.SetMounted(DegradedMount() with { DeviceId = imageDevice, VolumeId = imageVolume });
-        var worker = CreateWorker(backend);
+        var original = DegradedMount() with { DeviceId = imageDevice, VolumeId = imageVolume,
+            HostProcessId = 6201, HostProcessCreationTimeFileTimeUtc = LiveFixOwnerCreationTime };
+        inner.SetMounted(original);
+        var liveBackend = new ImageFixBackend(inner, backend, advanceCheckpoints: false);
+        var journalRoot = Path.Combine(Environment.GetEnvironmentVariable("APFSACCESS_TEST_ROOT")!, "fix-root-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(journalRoot);
+        var worker = CreateWorker(liveBackend, journalRoot);
         var request = CreateRequest(
             ApfsControlCommands.Fix,
             new ApfsControlTarget(imageDevice, imageVolume));
 
         try
         {
+            var volume = (await worker.GetInventoryAsync(default)).Single(d => d.Device.DeviceId == imageDevice).Volumes.Single();
+            liveBackend.FinalOwner = ImageFixProofOwner(volume, "90");
             var result = await CreateExecutor(worker).ExecuteAsync(request, CancellationToken.None);
 
-            Assert.True(result.Success);
+            Assert.True(result.Success, result.Diagnostic);
             Assert.Equal(ApfsOperationCodes.OperationSucceeded, result.Code);
             Assert.Equal("healthy-rw", result.FinalStatus);
             Assert.Contains("verify:complete", result.Diagnostic);
@@ -1390,6 +1453,29 @@ public sealed class AgentControlCommandExecutorTests
             Assert.Equal("90", call.CheckpointXid);
             Assert.Equal("0", call.StoreOffsetBytes);
             Assert.Equal("100000000000", call.StoreSizeBytes);
+            var live = Assert.Single(liveBackend.LiveCalls);
+            Assert.Equal("retained-image", live.SourceKind);
+            Assert.Equal(liveBackend.FinalOwner.VolumeVerificationScope, live);
+            Assert.Equal(call.CheckpointXid, live.CheckpointXid);
+            Assert.True(Assert.Single(liveBackend.Reports).Complete);
+            Assert.True(liveBackend.FinalOwner.HostProcessCreationTimeFileTimeUtc > 0);
+            Assert.NotEqual(original.HostProcessId, liveBackend.FinalOwner.HostProcessId);
+            Assert.NotEqual(original.HostProcessCreationTimeFileTimeUtc, liveBackend.FinalOwner.HostProcessCreationTimeFileTimeUtc);
+            Assert.Equal(new[] { "unmount", "offline", "mount", "live" }, liveBackend.Events);
+            AssertWireResult(result);
+
+            liveBackend.FinalOwner = liveBackend.FinalOwner with { HostProcessCreationTimeFileTimeUtc = 0 };
+            backend.Enqueue(new ImageVerifyResult(true, "Complete", 0, 0, null));
+            var missingIncarnation = await CreateExecutor(worker).ExecuteAsync(
+                CreateRequest(ApfsControlCommands.Fix, request.Target), CancellationToken.None);
+            Assert.False(missingIncarnation.Success);
+            Assert.Equal(ApfsOperationCodes.BlockedRecovery, missingIncarnation.Code);
+            Assert.Equal("verification-not-complete", missingIncarnation.FinalStatus);
+            Assert.Equal("present", missingIncarnation.MountProof);
+            Assert.Equal(ApfsControlModes.ReadWrite, missingIncarnation.EffectiveMode);
+            Assert.Equal(2, backend.VerifyCalls.Count);
+            Assert.Single(liveBackend.LiveCalls);
+            AssertWireResult(missingIncarnation);
         }
         finally
         {
@@ -1438,10 +1524,9 @@ public sealed class AgentControlCommandExecutorTests
     }
 
     [Fact]
-    public async Task Fix_VerifyFindingsHealthyMount_SucceedsWithPointer()
+    public async Task Fix_VerifyFindings_BlockWithoutRemount()
     {
-        // A healthy mount still succeeds, but verification-named damage
-        // that mount-health cannot see must carry the offline pointer.
+        // A retry that could mount healthily must not conceal verified damage.
         const string imageDevice = @"D:\verify-image.apfs";
         const string imageVolume = @"D:\verify-image.apfs|Main";
         var inner = new ScenarioBackend
@@ -1462,8 +1547,10 @@ public sealed class AgentControlCommandExecutorTests
         {
             var result = await CreateExecutor(worker).ExecuteAsync(request, CancellationToken.None);
 
-            Assert.True(result.Success);
-            Assert.Equal("healthy-rw", result.FinalStatus);
+            Assert.False(result.Success);
+            Assert.Equal("verification-not-complete", result.FinalStatus);
+            Assert.Equal(0, inner.MountCalls);
+            Assert.Empty(await inner.GetMountStateAsync(default));
             Assert.Contains("verify:findings:1", result.Diagnostic);
             Assert.Contains("APFSAccess.Cli.exe verify --help", result.Diagnostic);
         }
@@ -1508,10 +1595,9 @@ public sealed class AgentControlCommandExecutorTests
     }
 
     [Fact]
-    public async Task Fix_VerifySkippedIdentityIncomplete_KeepsLegacyBehavior()
+    public async Task Fix_VerifySkippedIdentityIncompleteCannotWriteWithoutInspectedRoot()
     {
-        // Without catalog identity no scope can derive; fix keeps its
-        // legacy mount-health behavior and says exactly why verify sat out.
+        // Missing scope cannot turn an uninspected image into RW access.
         const string imageDevice = @"D:\verify-image.apfs";
         const string imageVolume = @"D:\verify-image.apfs|Main";
         var inner = new ScenarioBackend
@@ -1530,8 +1616,9 @@ public sealed class AgentControlCommandExecutorTests
         {
             var result = await CreateExecutor(worker).ExecuteAsync(request, CancellationToken.None);
 
-            Assert.True(result.Success);
-            Assert.Equal("healthy-rw", result.FinalStatus);
+            Assert.False(result.Success);
+            Assert.Equal(ApfsOperationCodes.BlockedRecovery, result.Code);
+            Assert.NotEqual(MountAccessMode.ReadWrite, inner.LastMountMode);
             Assert.Contains("verify:skipped:IdentityIncomplete", result.Diagnostic);
             Assert.Empty(backend.VerifyCalls);
         }
@@ -1573,7 +1660,7 @@ public sealed class AgentControlCommandExecutorTests
     }
 
     [Fact]
-    public async Task Fix_VerifyUnsupportedBackend_Skips()
+    public async Task Fix_VerifyUnsupportedBackend_BlocksWithoutDisturbingMount()
     {
         var inner = new ScenarioBackend
         {
@@ -1592,7 +1679,9 @@ public sealed class AgentControlCommandExecutorTests
         {
             var result = await CreateExecutor(worker).ExecuteAsync(request, CancellationToken.None);
 
-            Assert.True(result.Success);
+            Assert.False(result.Success);
+            Assert.Equal(0, inner.UnmountCalls);
+            Assert.Equal(0, inner.MountCalls);
             Assert.Contains("verify:unsupported", result.Diagnostic);
         }
         finally
@@ -1602,10 +1691,9 @@ public sealed class AgentControlCommandExecutorTests
     }
 
     [Fact]
-    public async Task Fix_VerifyBackendError_ReportsMountTruthWithErrorNote()
+    public async Task Fix_VerifyBackendError_BlocksWithoutRemount()
     {
-        // A failing verifier must not fail the mount-health gate it
-        // advises: the mount truth stands, with the error disclosed.
+        // Tool failure cannot authorize a mount-health retry for a covered image.
         const string imageDevice = @"D:\verify-image.apfs";
         const string imageVolume = @"D:\verify-image.apfs|Main";
         var inner = new ScenarioBackend
@@ -1626,8 +1714,9 @@ public sealed class AgentControlCommandExecutorTests
         {
             var result = await CreateExecutor(worker).ExecuteAsync(request, CancellationToken.None);
 
-            Assert.True(result.Success);
-            Assert.Equal("healthy-rw", result.FinalStatus);
+            Assert.False(result.Success);
+            Assert.Equal("verification-not-complete", result.FinalStatus);
+            Assert.Equal(0, inner.MountCalls);
             Assert.Contains("verify:error:IOException", result.Diagnostic);
         }
         finally
@@ -1947,6 +2036,36 @@ public sealed class AgentControlCommandExecutorTests
         }
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Quit_SharedHostReproofReportsOwnershipAndDurabilityIndependently(bool terminalOwnershipReleased)
+    {
+        var backend = new ScenarioBackend();
+        var owner = HealthyMount() with { HostProcessId = 1234, HostProcessCreationTimeFileTimeUtc = 134048736000000000 };
+        backend.SetMounted(owner);
+        backend.SetMounted(owner with { VolumeId = "device-1|Archive", MountPoint = "F:\\" });
+        var safe = backend.UnmountResponse;
+        backend.UnmountResponses.Enqueue(safe with { HostOwnershipReleased = false });
+        backend.UnmountResponses.Enqueue(safe);
+        backend.TerminalResponses.Enqueue(safe with { HostOwnershipReleased = terminalOwnershipReleased });
+        using var worker = CreateWorker(backend);
+
+        var result = await CreateExecutor(worker, _ => true).ExecuteAsync(
+            CreateRequest(ApfsControlCommands.Quit, target: null), CancellationToken.None);
+
+        Assert.Equal(2, backend.UnmountCalls);
+        Assert.Equal(owner, Assert.Single(backend.TerminalQueries));
+        Assert.Equal(terminalOwnershipReleased, result.Success);
+        Assert.Equal(terminalOwnershipReleased ? "shutdown-complete" : "shutdown-incomplete", result.FinalStatus);
+        Assert.Equal("no-mounts", result.MountProof);
+        Assert.Equal(terminalOwnershipReleased ? "proven" : "not-proven", result.OwnershipProof);
+        Assert.Equal("proven", result.DurabilityProof);
+        Assert.False(result.PendingDurability);
+        if (terminalOwnershipReleased) Assert.True(string.IsNullOrWhiteSpace(result.Diagnostic));
+        else Assert.Contains("terminal proof", result.Diagnostic, StringComparison.OrdinalIgnoreCase);
+    }
+
     [Fact]
     public async Task Quit_MarkerFailureStillRunsShutdownButCannotSucceed()
     {
@@ -2204,7 +2323,422 @@ public sealed class AgentControlCommandExecutorTests
         Func<DateTime, bool>? markerWriter = null)
         => new(worker, markerWriter);
 
-    private static ApfsMountWorker CreateWorker(IApfsBackend backend)
+    private static readonly ApfsControlTarget ContainerTarget =
+        new(DeviceId, string.Empty, null, null, new string('a', 32));
+
+    private static readonly ApfsControlTarget DeviceTarget =
+        new(DeviceId, string.Empty);
+
+    [Theory]
+    [InlineData(ApfsControlModes.ReadWrite, MountAccessMode.ReadWrite, false)]
+    [InlineData(ApfsControlModes.ReadOnly, MountAccessMode.ReadOnly, false)]
+    [InlineData(ApfsControlModes.ReadWrite, MountAccessMode.ReadWrite, true)]
+    [InlineData(ApfsControlModes.ReadOnly, MountAccessMode.ReadOnly, true)]
+    public async Task ContainerMount_ExplicitBatch_DispatchesOnlyExactContainerInRequestedMode(
+        string mode, MountAccessMode expectedMode, bool autoMountEnabled)
+    {
+        var inner = new ScenarioBackend
+        {
+            TopologyCheckpointXid = "7",
+            ImageDeviceId = "foreign-device",
+            ImageVolumeId = "foreign-volume",
+        };
+        var backend = new BatchScenarioBackend(inner);
+        using var worker = CreateWorker(backend, autoMountEnabled: autoMountEnabled);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var result = await CreateExecutor(worker).ExecuteAsync(
+            CreateRequest(ApfsControlCommands.ContainerMount, ContainerTarget, mode), timeout.Token);
+
+        Assert.True(result.Success, result.Diagnostic);
+        var batch = Assert.Single(backend.Batches);
+        Assert.Equal(2, batch.Count);
+        Assert.Equal(new[] { "device-1|Archive", VolumeId }, batch.Select(x => x.VolumeId).Order());
+        Assert.All(batch, request => Assert.Equal(expectedMode, request.AccessMode));
+        Assert.Equal(2, batch.Select(x => x.DriveLetter).Distinct().Count());
+        Assert.DoesNotContain(await inner.GetMountStateAsync(CancellationToken.None), x => x.DeviceId == "foreign-device");
+
+        if (!autoMountEnabled)
+        {
+            await worker.RefreshAsync(false, CancellationToken.None);
+            Assert.Single(backend.Batches);
+            Assert.Equal(2, inner.MountCalls);
+        }
+    }
+
+    [Fact]
+    public async Task ContainerMount_ReobservedIdentityChanged_RefusesBeforeBatch()
+    {
+        var inner = new ScenarioBackend { TopologyCheckpointXid = "7" };
+        var backend = new BatchScenarioBackend(inner)
+        {
+            BeforeInventory = call => { if (call == 3) inner.CurrentRecoveryIdentity = "changed-identity"; },
+        };
+        using var worker = CreateWorker(backend, autoMountEnabled: false);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var result = await CreateExecutor(worker).ExecuteAsync(
+            CreateRequest(ApfsControlCommands.ContainerMount, ContainerTarget, ApfsControlModes.ReadWrite), timeout.Token);
+        Assert.False(result.Success);
+        Assert.Equal(ApfsOperationCodes.OperationFailed, result.Code);
+        Assert.Contains("identity changed", result.Diagnostic);
+        Assert.Empty(backend.Batches);
+        Assert.Equal(0, inner.MountCalls);
+    }
+
+    [Fact]
+    public async Task ContainerMount_CancelledAfterFirstMember_PreservesCommittedMount()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var inner = new ScenarioBackend { TopologyCheckpointXid = "7", CancelAfterMount = cancellation };
+        var backend = new BatchScenarioBackend(inner);
+        using var worker = CreateWorker(backend, autoMountEnabled: false);
+        var result = await CreateExecutor(worker).ExecuteAsync(
+            CreateRequest(ApfsControlCommands.ContainerMount, ContainerTarget, ApfsControlModes.ReadOnly), cancellation.Token);
+        Assert.False(result.Success);
+        Assert.Equal(ApfsOperationStates.Cancelled, result.State);
+        Assert.Equal(1, inner.MountCalls);
+        Assert.Equal(0, inner.UnmountCalls);
+        var retained = Assert.Single(await inner.GetMountStateAsync(CancellationToken.None));
+        Assert.Equal("device-1|Archive", retained.VolumeId);
+        Assert.Equal(MountAccessMode.ReadOnly, retained.AccessMode);
+        await worker.RefreshAsync(false, CancellationToken.None);
+        Assert.Single(backend.Batches);
+        Assert.Equal(1, inner.MountCalls);
+        Assert.Single(await inner.GetMountStateAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ContainerMount_ExplicitRemountBypassesAutoReconnectPolicyAndPreservesForeignMount()
+    {
+        var inner = new ScenarioBackend { TopologyCheckpointXid = "7", ImageDeviceId = "foreign-device", ImageVolumeId = "foreign-volume" };
+        inner.SetMounted(HealthyMount() with { DeviceId = "foreign-device", VolumeId = "foreign-volume", MountPoint = "Z:\\" });
+        var backend = new BatchScenarioBackend(inner);
+        using var worker = CreateWorker(backend, autoMountEnabled: false, autoRemount: false);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        for (var attempt = 0; attempt < 2; ++attempt)
+        {
+            var result = await CreateExecutor(worker).ExecuteAsync(
+                CreateRequest(ApfsControlCommands.ContainerMount, ContainerTarget,
+                    attempt == 0 ? ApfsControlModes.ReadWrite : ApfsControlModes.ReadOnly), timeout.Token);
+            Assert.True(result.Success, result.Diagnostic);
+        }
+        Assert.Equal(2, backend.Batches.Count);
+        Assert.Equal(4, inner.MountCalls);
+        Assert.Equal(2, inner.UnmountCalls);
+        Assert.Contains(await inner.GetMountStateAsync(CancellationToken.None), x => x.DeviceId == "foreign-device" && x.MountPoint == "Z:\\");
+    }
+
+    [Fact]
+    public async Task ContainerMount_CancelledBatch_ReleasesWorkerAndDoesNotMountForeignVolume()
+    {
+        var inner = new ScenarioBackend { TopologyCheckpointXid = "7" };
+        var backend = new BatchScenarioBackend(inner) { StallBatch = true };
+        using var worker = CreateWorker(backend, autoMountEnabled: false);
+        using var cancellation = new CancellationTokenSource();
+        var pending = CreateExecutor(worker).ExecuteAsync(
+            CreateRequest(ApfsControlCommands.ContainerMount, ContainerTarget, ApfsControlModes.ReadOnly), cancellation.Token);
+        try
+        {
+            await backend.BatchStarted.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            cancellation.Cancel();
+            var cancelled = await pending;
+            Assert.False(cancelled.Success);
+            Assert.Equal(ApfsOperationStates.Cancelled, cancelled.State);
+            Assert.Equal(0, inner.MountCalls);
+            backend.StallBatch = false;
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            var retry = await CreateExecutor(worker).ExecuteAsync(
+                CreateRequest(ApfsControlCommands.ContainerMount, ContainerTarget, ApfsControlModes.ReadOnly), timeout.Token);
+            Assert.True(retry.Success, retry.Diagnostic);
+            Assert.Equal(2, inner.MountCalls);
+        }
+        finally
+        {
+            cancellation.Cancel();
+            await pending;
+        }
+    }
+
+    [Fact]
+    public async Task ContainerMount_MountsEligibleMembersWithPerVolumeTokens()
+    {
+        // Idempotency fast path: the eligible member is already mounted in
+        // the requested mode, so no worker mount call runs. The eject +
+        // scoped batch + poll convergence path has separate regression
+        // coverage above without requiring a background worker cycle.
+        var backend = new ScenarioBackend();
+        backend.SetMounted(HealthyMount());
+        using var worker = CreateWorker(backend);
+        var result = await CreateExecutor(worker).ExecuteAsync(CreateRequest(
+            ApfsControlCommands.ContainerMount, ContainerTarget, ApfsControlModes.ReadWrite),
+            CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Equal(ApfsOperationCodes.OperationSucceeded, result.Code);
+        Assert.Equal("container-mounted", result.FinalStatus);
+        Assert.Equal(ApfsControlModes.ReadWrite, result.RequestedMode);
+        Assert.Equal(ApfsControlModes.ReadWrite, result.EffectiveMode);
+        Assert.Equal("present", result.MountProof);
+        Assert.Contains("vol:device-1|Main=mounted", result.Diagnostic);
+        Assert.Equal(0, backend.MountCalls);
+    }
+
+    [Fact]
+    public async Task ContainerMount_SkipsIneligibleMemberButSucceeds()
+    {
+        var backend = new ScenarioBackend { IncludeBackupSameContainerMember = true };
+        backend.SetMounted(HealthyMount());
+        using var worker = CreateWorker(backend);
+        var result = await CreateExecutor(worker).ExecuteAsync(CreateRequest(
+            ApfsControlCommands.ContainerMount, ContainerTarget, ApfsControlModes.ReadWrite),
+            CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Equal("container-mounted", result.FinalStatus);
+        Assert.Contains("skipped:device-1|Backup:ineligible", result.Diagnostic);
+        Assert.Contains("vol:device-1|Main=mounted", result.Diagnostic);
+        Assert.Equal(0, backend.MountCalls);
+    }
+
+    [Fact]
+    public async Task ContainerMount_ReadOnlyVerifiesInspectableMembers()
+    {
+        var backend = new ScenarioBackend { IncludeBackupSameContainerMember = true };
+        backend.SetMounted(HealthyMount() with { AccessMode = MountAccessMode.ReadOnly });
+        backend.SetMounted(HealthyMount() with
+        {
+            VolumeId = "device-1|Backup",
+            MountPoint = "F:\\",
+            VolumeName = "Backup",
+            AccessMode = MountAccessMode.ReadOnly,
+        });
+        using var worker = CreateWorker(backend);
+        var result = await CreateExecutor(worker).ExecuteAsync(CreateRequest(
+            ApfsControlCommands.ContainerMount, ContainerTarget, ApfsControlModes.ReadOnly),
+            CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Equal("container-mounted", result.FinalStatus);
+        Assert.Equal(ApfsControlModes.ReadOnly, result.EffectiveMode);
+        Assert.Equal(0, backend.MountCalls);
+    }
+
+    [Fact]
+    public async Task ContainerMount_NoEligibleMembers_IsInvalidArgumentsWithoutAttempt()
+    {
+        var backend = new ScenarioBackend { ProtectedCatalog = true };
+        using var worker = CreateWorker(backend);
+        var result = await CreateExecutor(worker).ExecuteAsync(CreateRequest(
+            ApfsControlCommands.ContainerMount, ContainerTarget, ApfsControlModes.ReadWrite),
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal(ApfsOperationCodes.InvalidArguments, result.Code);
+        Assert.Equal(0, backend.MountCalls);
+    }
+
+    [Fact]
+    public async Task ContainerMount_UnknownContainer_IsMissingVolumeWithoutAttempt()
+    {
+        var backend = new ScenarioBackend();
+        using var worker = CreateWorker(backend);
+        var unknown = ContainerTarget with { ContainerUuid = new string('b', 32) };
+        var result = await CreateExecutor(worker).ExecuteAsync(CreateRequest(
+            ApfsControlCommands.ContainerMount, unknown, ApfsControlModes.ReadWrite),
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal(ApfsOperationCodes.MissingVolume, result.Code);
+        Assert.Equal(0, backend.MountCalls);
+    }
+
+    [Fact]
+    public async Task ContainerMount_VolumeIdPresent_IsAmbiguousTarget()
+    {
+        var backend = new ScenarioBackend();
+        using var worker = CreateWorker(backend);
+        var mixed = new ApfsControlTarget(DeviceId, VolumeId, null, null, new string('a', 32));
+        var result = await CreateExecutor(worker).ExecuteAsync(CreateRequest(
+            ApfsControlCommands.ContainerMount, mixed, ApfsControlModes.ReadWrite),
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal(ApfsOperationCodes.AmbiguousTarget, result.Code);
+        Assert.Equal(0, backend.MountCalls);
+    }
+
+    [Fact]
+    public async Task ContainerMount_MissingMode_IsInvalidArguments()
+    {
+        var backend = new ScenarioBackend();
+        using var worker = CreateWorker(backend);
+        var result = await CreateExecutor(worker).ExecuteAsync(
+            CreateRequest(ApfsControlCommands.ContainerMount, ContainerTarget),
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal(ApfsOperationCodes.InvalidArguments, result.Code);
+        Assert.Equal(0, backend.MountCalls);
+    }
+
+    [Fact]
+    public async Task ContainerUnmount_ReleasesMountedMembersAndKeepsOthers()
+    {
+        var backend = new ScenarioBackend();
+        backend.SetMounted(HealthyMount());
+        backend.SetMounted(HealthyMount() with
+        {
+            VolumeId = "device-1|Archive",
+            MountPoint = "F:\\",
+            VolumeName = "Archive",
+        });
+        using var worker = CreateWorker(backend);
+        var result = await CreateExecutor(worker).ExecuteAsync(
+            CreateRequest(ApfsControlCommands.ContainerUnmount, ContainerTarget),
+            CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Equal(ApfsOperationCodes.OperationSucceeded, result.Code);
+        Assert.Equal("container-unmounted", result.FinalStatus);
+        Assert.Equal("absent", result.MountProof);
+        Assert.Equal("proven", result.OwnershipProof);
+        Assert.Equal("proven", result.DurabilityProof);
+        Assert.Contains("vol:device-1|Main=detached", result.Diagnostic);
+        Assert.Equal(1, backend.UnmountCalls);
+        var remaining = await backend.GetMountStateAsync(CancellationToken.None);
+        var leftover = Assert.Single(remaining);
+        Assert.Equal("device-1|Archive", leftover.VolumeId);
+    }
+
+    [Fact]
+    public async Task ContainerUnmount_NothingMounted_IsAlreadyAchieved()
+    {
+        var backend = new ScenarioBackend();
+        using var worker = CreateWorker(backend);
+        var result = await CreateExecutor(worker).ExecuteAsync(
+            CreateRequest(ApfsControlCommands.ContainerUnmount, ContainerTarget),
+            CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Equal(ApfsOperationCodes.AlreadyAchieved, result.Code);
+        Assert.Equal("container-unmounted", result.FinalStatus);
+        Assert.Equal("absent", result.MountProof);
+        Assert.Equal(0, backend.UnmountCalls);
+    }
+
+    [Fact]
+    public async Task ContainerUnmount_MemberRefuses_IsUnsafeOwnership()
+    {
+        var backend = new ScenarioBackend
+        {
+            UnmountResponse = new UnmountResult(
+                Success: true,
+                MountPoint: "",
+                Error: "busy",
+                MountRemoved: false,
+                HostOwnershipReleased: false,
+                PendingDurabilityCleared: false),
+        };
+        backend.SetMounted(HealthyMount());
+        using var worker = CreateWorker(backend);
+        var result = await CreateExecutor(worker).ExecuteAsync(
+            CreateRequest(ApfsControlCommands.ContainerUnmount, ContainerTarget),
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal(ApfsOperationCodes.UnsafeOwnership, result.Code);
+        var remaining = await backend.GetMountStateAsync(CancellationToken.None);
+        Assert.Single(remaining);
+    }
+
+    [Fact]
+    public async Task DeviceEject_UnmountsContainerAndReportsTokens()
+    {
+        var backend = new ScenarioBackend();
+        backend.SetMounted(HealthyMount());
+        using var worker = CreateWorker(backend);
+        var result = await CreateExecutor(worker).ExecuteAsync(
+            CreateRequest(ApfsControlCommands.DeviceEject, DeviceTarget),
+            CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Equal(ApfsOperationCodes.OperationSucceeded, result.Code);
+        Assert.Equal("device-ejected", result.FinalStatus);
+        Assert.Equal("absent", result.MountProof);
+        Assert.Equal("proven", result.OwnershipProof);
+        Assert.Equal("proven", result.DurabilityProof);
+        Assert.Contains("vol:device-1|Main=detached", result.Diagnostic);
+        Assert.Equal(1, backend.UnmountCalls);
+        Assert.Empty(await backend.GetMountStateAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task DeviceEject_NothingMounted_IsAlreadyAchieved()
+    {
+        var backend = new ScenarioBackend();
+        using var worker = CreateWorker(backend);
+        var result = await CreateExecutor(worker).ExecuteAsync(
+            CreateRequest(ApfsControlCommands.DeviceEject, DeviceTarget),
+            CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Equal(ApfsOperationCodes.AlreadyAchieved, result.Code);
+        Assert.Equal("device-ejected", result.FinalStatus);
+        Assert.Equal(0, backend.UnmountCalls);
+    }
+
+    [Fact]
+    public async Task DeviceEject_MountedUnattributedVolume_FailsClosed()
+    {
+        var backend = new ScenarioBackend();
+        backend.SetMounted(HealthyMount() with
+        {
+            VolumeId = "device-1|Archive",
+            MountPoint = "F:\\",
+            VolumeName = "Archive",
+        });
+        using var worker = CreateWorker(backend);
+        var result = await CreateExecutor(worker).ExecuteAsync(
+            CreateRequest(ApfsControlCommands.DeviceEject, DeviceTarget),
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal(ApfsOperationCodes.AmbiguousTarget, result.Code);
+        Assert.Contains("device-1|Archive", result.Diagnostic);
+        Assert.Equal(0, backend.UnmountCalls);
+    }
+
+    [Fact]
+    public async Task DeviceEject_UnknownDevice_IsMissingVolume()
+    {
+        var backend = new ScenarioBackend();
+        using var worker = CreateWorker(backend);
+        var unknown = DeviceTarget with { DeviceId = "device-9" };
+        var result = await CreateExecutor(worker).ExecuteAsync(
+            CreateRequest(ApfsControlCommands.DeviceEject, unknown),
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal(ApfsOperationCodes.MissingVolume, result.Code);
+        Assert.Equal(0, backend.UnmountCalls);
+    }
+
+    [Fact]
+    public async Task DeviceEject_ScopedTarget_IsAmbiguousTarget()
+    {
+        var backend = new ScenarioBackend();
+        using var worker = CreateWorker(backend);
+        var scoped = new ApfsControlTarget(DeviceId, "device-1|Main", null, null, new string('a', 32));
+        var result = await CreateExecutor(worker).ExecuteAsync(
+            CreateRequest(ApfsControlCommands.DeviceEject, scoped),
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal(ApfsOperationCodes.AmbiguousTarget, result.Code);
+        Assert.Equal(0, backend.UnmountCalls);
+    }
+
+    private static ApfsMountWorker CreateWorker(IApfsBackend backend, string? managementJournalRoot = null, bool enableImageResizeFormat = false,
+        bool? enableImageManagementMutations = null, bool autoMountEnabled = true, bool autoRemount = true)
         => new(
             NullLogger<ApfsMountWorker>.Instance,
             backend,
@@ -2212,13 +2746,17 @@ public sealed class AgentControlCommandExecutorTests
             new RuntimeStatusPublisher(),
             new FixedOptionsMonitor(new ServiceHostOptions
             {
-                AutoMountEnabled = true,
+                AutoMountEnabled = autoMountEnabled,
+                NativeAutoRemountOnReconnect = autoRemount,
                 EnableNativeWrite = true,
                 WriteRolloutChannel = "Enabled",
                 WriteBackendMode = "Native",
                 NativeWritePromotionPolicy = "ScaffoldOnly",
                 ReadWriteMode = "RwWithRoFallback",
                 NativeHostStopTimeoutSeconds = 1,
+                ManagementJournalRoot = managementJournalRoot,
+                EnableImageResizeFormat = enableImageResizeFormat,
+                EnableImageManagementMutations = enableImageManagementMutations ?? managementJournalRoot is not null,
             }));
 
     private static ControlOperationRequestPayload CreateRequest(
@@ -2247,7 +2785,8 @@ public sealed class AgentControlCommandExecutorTests
             DirtyTransactionCount: 0,
             ShutdownDrainActive: false,
             InFlightMutationCallbacks: 0,
-            RecoveryIdentity: RecoveryIdentity);
+            RecoveryIdentity: RecoveryIdentity,
+            SnapshotInventorySupported: true, SnapshotMutationSupported: true, SnapshotRecoverySupported: true);
 
     private static MountedVolumeState DegradedMount()
         => HealthyMount() with
@@ -2258,6 +2797,8 @@ public sealed class AgentControlCommandExecutorTests
             NativeWriteSafetyState = NativeWriteSafetyState.ReadOnlyFallback,
             RecoveryActive = true,
             RecoveryReason = "CommitInvariantFailed",
+            // Legacy offline/remount scenarios do not model a retained native owner.
+            SnapshotRecoverySupported = false,
         };
 
     private sealed class FixedMountPolicy : IMountPolicy
@@ -2265,7 +2806,15 @@ public sealed class AgentControlCommandExecutorTests
         public char SelectDriveLetter(VolumeInfo volume, IReadOnlySet<char> usedLetters)
         {
             _ = volume;
-            _ = usedLetters;
+            // First free letter from E onward (E stays the single-mount
+            // letter, so every existing single-mount scenario is unchanged;
+            // container-wide tests need distinct letters per member).
+            for (var letter = 'E'; letter <= 'Z'; letter++)
+            {
+                if (!usedLetters.Contains(letter))
+                    return letter;
+            }
+
             return 'E';
         }
 
@@ -2299,7 +2848,37 @@ public sealed class AgentControlCommandExecutorTests
         }
     }
 
-    private sealed class ScenarioBackend : IApfsBackend, ISnapshotControlBackend
+    private sealed class BatchScenarioBackend(ScenarioBackend inner) : IApfsBackend, IContainerMountBackend
+    {
+        public List<IReadOnlyList<MountRequest>> Batches { get; } = [];
+        public bool StallBatch { get; set; }
+        public Action<int>? BeforeInventory { get; init; }
+        private int _inventoryCalls;
+        public TaskCompletionSource BatchStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task<IReadOnlyList<DeviceInfo>> ProbeDevicesAsync(CancellationToken token) => inner.ProbeDevicesAsync(token);
+        public Task<IReadOnlyList<VolumeInfo>> ProbeVolumesAsync(string device, CancellationToken token) => inner.ProbeVolumesAsync(device, token);
+        public Task<IReadOnlyList<DeviceInventory>> ProbeInventoryAsync(bool authoritative, CancellationToken token)
+        {
+            BeforeInventory?.Invoke(++_inventoryCalls);
+            return inner.ProbeInventoryAsync(authoritative, token);
+        }
+        public Task<MountResult> MountAsync(MountRequest request, CancellationToken token) => inner.MountAsync(request, token);
+        public Task<UnmountResult> UnmountAsync(string point, CancellationToken token) => inner.UnmountAsync(point, token);
+        public Task<IReadOnlyList<MountedVolumeState>> GetMountStateAsync(CancellationToken token) => inner.GetMountStateAsync(token);
+        public async Task<IReadOnlyList<MountResult>> MountContainerAsync(IReadOnlyList<MountRequest> requests, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            Batches.Add(requests.ToArray());
+            BatchStarted.TrySetResult();
+            if (StallBatch) await Task.Delay(Timeout.Infinite, token);
+            var results = new List<MountResult>();
+            foreach (var request in requests) results.Add(await inner.MountAsync(request, token));
+            return results;
+        }
+    }
+
+    private sealed class ScenarioBackend : IApfsBackend, ISnapshotControlBackend, ILiveVolumeVerificationBackend,
+        ApfsAccess.Backend.Native.IUnmountTerminalStateBackend
     {
         private readonly Dictionary<string, MountedVolumeState> _mounts = new(StringComparer.OrdinalIgnoreCase);
         private readonly IReadOnlyList<DeviceInfo> _devices =
@@ -2344,6 +2923,7 @@ public sealed class AgentControlCommandExecutorTests
         public TaskCompletionSource AllowMount { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool ReturnReadOnlyForReadWrite { get; init; }
         public bool ProtectedCatalog { get; init; }
+        public bool IncludeBackupSameContainerMember { get; init; }
         public bool KeepDegradedAfterMount { get; init; }
         public bool ReturnMismatchedVolumeDeviceId { get; init; }
         // Optional second device shaped like an image file (or any custom
@@ -2353,6 +2933,7 @@ public sealed class AgentControlCommandExecutorTests
         public string? ImageVolumeId { get; init; }
         public CancellationTokenSource? CancelAfterMount { get; init; }
         public CancellationTokenSource? CancelAfterUnmount { get; init; }
+        public Action? AfterUnmountAction { get; init; }
         public UnmountResult UnmountResponse { get; init; } = new(
             Success: true,
             MountPoint: "",
@@ -2360,6 +2941,19 @@ public sealed class AgentControlCommandExecutorTests
             MountRemoved: true,
             HostOwnershipReleased: true,
             PendingDurabilityCleared: true);
+
+        public Queue<UnmountResult> UnmountResponses { get; } = new();
+        public Queue<UnmountResult> TerminalResponses { get; } = new();
+        public List<MountedVolumeState> TerminalQueries { get; } = [];
+
+        public Task<UnmountResult> GetUnmountTerminalStateAsync(MountedVolumeState selected, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            TerminalQueries.Add(selected);
+            return Task.FromResult(TerminalResponses.Count > 0
+                ? TerminalResponses.Dequeue() with { MountPoint = selected.MountPoint }
+                : new UnmountResult(false, selected.MountPoint, "No terminal proof was supplied.", false, false, false));
+        }
 
         public Task WaitForSecondVolumeProbeAsync() => _secondVolumeProbe.Task;
 
@@ -2423,6 +3017,7 @@ public sealed class AgentControlCommandExecutorTests
                         CatalogContainerUuid = TopologyContainerHex,
                         CatalogVolumeUuid = TopologyMainUuid,
                         CatalogVolumeObjectId = 101,
+                        RecoveryIdentity = CurrentRecoveryIdentity,
                         CatalogDecision = ApfsCapabilityDecision.Writable,
                         CatalogReasons = [],
                         CatalogAutoMountAllowed = true,
@@ -2451,6 +3046,24 @@ public sealed class AgentControlCommandExecutorTests
                     ? volume with { RecoveryIdentity = CurrentRecoveryIdentity }
                     : volume)
                 .ToArray();
+
+            // Opt-in second member of the fixed container for Task 12
+            // container-wide tests: readable special-role, so read-write
+            // requests skip it while read-only requests attempt it. False by
+            // default, so every existing scenario is byte-identical.
+            if (IncludeBackupSameContainerMember)
+            {
+                volumes = [.. volumes, new VolumeInfo(
+                    "device-1|Backup",
+                    DeviceId,
+                    "Backup",
+                    SupportsReadWrite: true,
+                    RecoveryIdentity: CurrentRecoveryIdentity,
+                    CatalogDecision: ApfsCapabilityDecision.Readable,
+                    CatalogReasons: ["special-role:backup"],
+                    CatalogAutoMountAllowed: false,
+                    CatalogContainerUuid: new string('a', 32))];
+            }
 
             if (ProtectedCatalog)
                 volumes = volumes.Select(volume => volume with
@@ -2562,6 +3175,7 @@ public sealed class AgentControlCommandExecutorTests
             bool authoritative,
             CancellationToken cancellationToken)
         {
+            SnapshotInventoryProbeCalls++;
             var devices = await ProbeDevicesAsync(cancellationToken).ConfigureAwait(false);
             var inventory = new List<DeviceInventory>();
             foreach (var device in devices.Where(d => d.IsConnected))
@@ -2618,6 +3232,7 @@ public sealed class AgentControlCommandExecutorTests
             // is device-qualified, and a hardcoded device would make every
             // non-default device unmatchable after a successful remount.
             var deviceId = DeviceId;
+            var recoveryIdentity = CurrentRecoveryIdentity;
             var deviceDisplayName = "Test APFS Device";
             if (ImageVolumeId is not null && ImageDeviceId is not null &&
                 string.Equals(request.VolumeId, ImageVolumeId, StringComparison.OrdinalIgnoreCase))
@@ -2634,6 +3249,7 @@ public sealed class AgentControlCommandExecutorTests
                     if (match is not null)
                     {
                         deviceId = match.DeviceId;
+                        recoveryIdentity = match.RecoveryIdentity;
                         break;
                     }
                 }
@@ -2657,7 +3273,7 @@ public sealed class AgentControlCommandExecutorTests
                 DirtyTransactionCount: 0,
                 ShutdownDrainActive: false,
                 InFlightMutationCallbacks: 0,
-                RecoveryIdentity: CurrentRecoveryIdentity);
+                RecoveryIdentity: recoveryIdentity);
             CancelAfterMount?.Cancel();
 
             return new MountResult(
@@ -2687,12 +3303,13 @@ public sealed class AgentControlCommandExecutorTests
                 await _unmountRelease.Task.WaitAsync(cancellationToken);
             }
 
-            var result = UnmountResponse with { MountPoint = mountPoint };
+            var result = (UnmountResponses.TryDequeue(out var response) ? response : UnmountResponse) with { MountPoint = mountPoint };
             if (result.MountRemoved)
             {
                 _mounts.Remove(mountPoint);
             }
             CancelAfterUnmount?.Cancel();
+            AfterUnmountAction?.Invoke();
 
             return result;
         }
@@ -2705,7 +3322,18 @@ public sealed class AgentControlCommandExecutorTests
 
         public List<(string ContainerUuid, ulong VolumeObjectId, SnapshotControlAction Action, IReadOnlyList<string>? Extras)> SnapshotCalls { get; } = [];
         public Queue<SnapshotControlResult> SnapshotResults { get; } = new();
+        public Queue<LiveVolumeVerificationResult> LiveVerificationResults { get; } = new();
+        public List<LiveVolumeVerificationScope> LiveVerificationCalls { get; } = [];
+        public TaskCompletionSource? LiveVerificationGate { get; set; }
+        public async Task<LiveVolumeVerificationResult> VerifyLiveVolumeAsync(LiveVolumeVerificationScope scope, CancellationToken token)
+        {
+            LiveVerificationCalls.Add(scope);
+            if (LiveVerificationGate is not null) await LiveVerificationGate.Task.WaitAsync(token);
+            return LiveVerificationResults.Count > 0 ? LiveVerificationResults.Dequeue() : new(false, "VolumeVerificationBusy");
+        }
         public bool NeverCompleteSnapshot { get; set; }
+        public TaskCompletionSource? SnapshotGate { get; set; }
+        public int SnapshotInventoryProbeCalls { get; private set; }
 
         public async Task<SnapshotControlResult> SendSnapshotControlAsync(
             string containerUuid,
@@ -2715,6 +3343,7 @@ public sealed class AgentControlCommandExecutorTests
             CancellationToken cancellationToken)
         {
             SnapshotCalls.Add((containerUuid, volumeObjectId, action, extraLines));
+            if (SnapshotGate is not null) await SnapshotGate.Task.WaitAsync(cancellationToken);
             if (NeverCompleteSnapshot)
             {
                 await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
@@ -2761,8 +3390,16 @@ public sealed class AgentControlCommandExecutorTests
 
     // Scripted management keeper: forwards discovery to the scenario
     // backend (topology included) and answers keeper calls from a queue.
-    private sealed class KeeperBackend(ScenarioBackend inner) : IApfsBackend, IManagementRenameKeeper, IManagementQuotaKeeper
+    private sealed class KeeperBackend(ScenarioBackend inner) : IApfsBackend, IManagementRenameKeeper, IManagementQuotaKeeper, IVerifyBackend
     {
+        public Queue<ImageVerifyResult> VerifyResults { get; } = new();
+        public List<VerifyScope> VerifyCalls { get; } = [];
+        public async Task<ImageVerifyResult> VerifyImageAsync(VerifyScope scope, CancellationToken token)
+        {
+            Assert.Empty(await inner.GetMountStateAsync(token));
+            VerifyCalls.Add(scope);
+            return VerifyResults.Dequeue();
+        }
         private readonly Queue<ManagementKeeperRenameResult> results = new();
 
         public void Enqueue(ManagementKeeperRenameResult result) => results.Enqueue(result);
@@ -2839,10 +3476,11 @@ public sealed class AgentControlCommandExecutorTests
         public Task<IReadOnlyList<MountedVolumeState>> GetMountStateAsync(CancellationToken cancellationToken)
             => inner.GetMountStateAsync(cancellationToken);
 
-        public Task<ImageVerifyResult> VerifyImageAsync(VerifyScope scope, CancellationToken cancellationToken)
+        public async Task<ImageVerifyResult> VerifyImageAsync(VerifyScope scope, CancellationToken cancellationToken)
         {
+            Assert.Empty(await inner.GetMountStateAsync(cancellationToken));
             VerifyCalls.Add(scope);
-            return Task.FromResult(results.Dequeue()(scope));
+            return results.Dequeue()(scope);
         }
     }
 

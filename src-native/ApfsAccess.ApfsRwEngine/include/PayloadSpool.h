@@ -1,17 +1,22 @@
 #pragma once
 
+#include "ProtectedJournalEpoch.h"
+
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <iosfwd>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <unordered_set>
 #include <unordered_map>
@@ -20,6 +25,24 @@
 namespace apfsaccess::rw
 {
 struct PayloadReadHandleState;
+
+#ifdef APFSACCESS_PROTECTED_SPOOL_TESTING
+namespace protected_spool_testing
+{
+enum class Fault { None, DataWrite, DataFlush, IndexWrite, IndexFlush,
+    AnchorWrite, AnchorFlush, AnchorReadback, AfterAnchorPublication };
+struct Hooks
+{
+    Fault fault = Fault::None;
+    bool triggered = false;
+    std::vector<unsigned> events; // data write/flush, index write/flush = 1/2/3/4.
+    std::string maintenance_fault;
+    std::vector<std::string> maintenance_events;
+    std::function<void(std::string_view)> maintenance_observer;
+};
+extern thread_local Hooks hooks;
+}
+#endif
 
 class PayloadSpool
 {
@@ -33,6 +56,26 @@ public:
         std::uint64_t max_bytes = 512ull * 1024ull * 1024ull;
         std::uint64_t durable_flush_bytes = 64ull * 1024ull * 1024ull;
         std::uint64_t durable_flush_appends = 1024;
+        // Startup decoding only; zero preserves unbounded legacy loading.
+        std::uint64_t startup_index_max_bytes = 0;
+        // Aggregate checksum-read bytes across indexed ranges, including overlaps.
+        std::uint64_t startup_payload_read_max_bytes = 0;
+        // Explicit dependency mode, not encrypted runtime admission. The caller
+        // approves existing ordinary fixed-local roots outside the APFS provider
+        // and supplies its exact trusted source/container/volume/generation digest.
+        // Protected records use real physical offsets (logical bytes + 80).
+        // Bounds: 4096 immutable ranges, 1 MiB/frame, 16 MiB index history,
+        // finite max_bytes <= 512 MiB, 4096 key-directory entries at admission.
+        // SecureBytes allocation/lock failures can refuse below these maxima.
+        // No coalescing/relocation; explicit WAL-authorized maintenance can reset
+        // all-clean data and rebuild the advisory index. No key-slot deletion.
+        // Overlay
+        // composes immutable records, including same-sequence overlapping writes.
+        // A durable authenticated no-replace marker identifies protected stores;
+        // existing nonempty unmarked stores are not adopted or migrated.
+        bool protected_persistence = false;
+        journal::JournalDigest protected_binding{};
+        std::filesystem::path protected_key_directory;
     };
 
     struct WriteRequest
@@ -85,6 +128,43 @@ public:
         std::uint64_t wal_sequence = 0;
         std::array<std::uint8_t, 32> payload_sha256{};
     };
+
+    // Caller-owned authority, never inferred from an advisory spool index. The
+    // caller authenticates the exact original WAL head outside the rollback
+    // domain and supplies ALL original references, including discarded ranges.
+    // cleanup_sequence <= durable_sequence <= wal_last_sequence must be proved
+    // by that caller. No boolean or locally captured head grants cleanup rights.
+    struct ProtectedCleanupProof
+    {
+        journal::JournalDigest source_binding{};
+        std::array<std::uint8_t, 32> wal_sha256{};
+        std::uint64_t wal_bytes = 0, wal_records = 0, wal_last_sequence = 0;
+        std::uint64_t durable_sequence = 0, cleanup_sequence = 0;
+    };
+    enum class ProtectedMaintenanceResult { Succeeded, RejectedBeforeWrite, RecoveryRequired };
+
+    // Reconciles every physical frame with complete authenticated WAL refs,
+    // durably retires ranges through cleanup_sequence, and resets data to zero
+    // only when ALL current ranges are retired. Live offsets/identities do not
+    // move. Reopen with maintenance evidence requires this API again; pending
+    // intents require the SAME retained proof/ref set. No plaintext fallback or
+    // key deletion. Partial cleanup does not reclaim physical data holes.
+    // The 104-byte encrypted index guard precedes data reset and makes older
+    // protected readers refuse maintained stores. Generated paths must fit 210
+    // characters. Missing canonical files and unknown payload tails are refused.
+    // Bounds: 1024 intent/commit pairs, 4096 maintenance directory entries and
+    // 4096 supplied references per call; unknown evidence is never auto-deleted.
+    // Complete flushed receipts remain pinned against writes/deletion until this
+    // owner closes (at most 2048 handles). Every call still authenticates their
+    // bytes/key slots; only repeated flushes of these immutable files are skipped.
+    // A fresh owner must authenticate and flush the entire chain again.
+    [[nodiscard]] ProtectedMaintenanceResult ReconcileProtectedHistory(
+        const ProtectedCleanupProof&, std::span<const PersistedRangeReference> complete_original_references);
+    // Read-only configuration check for the original-TM bridge. A WAL and spool
+    // cannot share the directory-wide protected epoch writer lease.
+    // Preflights all bounded generated maintenance paths without I/O.
+    [[nodiscard]] bool MatchesProtectedMaintenanceAuthority(const journal::JournalDigest& source_binding,
+        std::string_view volume_identity, const std::filesystem::path& original_key_directory) const noexcept;
 
     struct Counters
     {
@@ -168,6 +248,13 @@ public:
     [[nodiscard]] bool ReadPersistedRange(
         const PersistedRangeReference& reference,
         std::vector<std::byte>& payload) const;
+    // Protected-only synchronous borrow. Reconcile complete original history
+    // first; the exact indexed reference and AEAD/SHA256 must authenticate.
+    // The consumer runs under the spool lock with locked plaintext. It must
+    // not reenter this spool or retain the span after returning.
+    [[nodiscard]] bool WithProtectedPersistedRange(
+        const PersistedRangeReference& reference, std::uint64_t max_payload_bytes,
+        const std::function<bool(std::span<const std::byte>)>& consumer, std::string& error) const;
     [[nodiscard]] bool OverlayDirtyRanges(const ReadRequest& request, std::size_t& bytes_overlayed) const;
     // Overlay dirty bytes and return the same object's logical dirty tail
     // while holding the spool lock once.
@@ -198,6 +285,34 @@ public:
     [[nodiscard]] static std::filesystem::path ResolveDefaultRoot();
 
 private:
+    friend class TransactionManager;
+    friend class ProtectedJournalContinuation;
+    struct ContinuationBaseline
+    {
+        std::uint64_t floor = 0, generation = 0;
+        std::array<std::uint8_t, 32> certificate{}, tip{};
+        std::shared_ptr<void> authority;
+    };
+    struct ContinuationLease
+    {
+        std::unique_lock<std::mutex> lock;
+        std::uint64_t floor = 0;
+        std::array<std::uint8_t, 32> tip{};
+        std::vector<std::pair<std::filesystem::path, std::uintptr_t>> receipts;
+    };
+    [[nodiscard]] bool CaptureContinuationSpool(ContinuationLease&, std::string&);
+    [[nodiscard]] bool SuspendContinuationSpool(ContinuationLease&, std::string&, bool require_empty = true);
+    [[nodiscard]] bool SealContinuationSpool(const ContinuationBaseline&, std::vector<std::byte>&, std::string&);
+    [[nodiscard]] bool InstallContinuationSpool(ContinuationLease&, ContinuationBaseline, std::string&);
+    void ReleaseContinuationReceipts(ContinuationLease&);
+    [[nodiscard]] journal::JournalRecordContext ContinuationSpoolContext(const ContinuationBaseline&) const;
+    std::optional<ContinuationBaseline> continuation_baseline_;
+    // Only the TM derives optional roles from complete authenticated inline
+    // original records, with its original durability/head barrier held.
+    [[nodiscard]] ProtectedMaintenanceResult ReconcileProtectedOriginalHistory(
+        const ProtectedCleanupProof&, std::span<const PersistedRangeReference>,
+        std::span<const std::uint64_t> optional_inline_sequences);
+    struct ProtectedState;
     struct DirtyRange
     {
         std::uint64_t object_id = 0;
@@ -216,6 +331,23 @@ private:
         std::shared_ptr<const std::vector<std::byte>> payload;
         std::uint64_t last_use = 0;
     };
+
+    [[nodiscard]] bool InitializeProtected();
+    [[nodiscard]] bool ProtectedStoreMarkerPresent() const noexcept;
+    [[nodiscard]] bool MutationRefused() const noexcept;
+    [[nodiscard]] bool ProtectedAuthority() const;
+    [[nodiscard]] journal::JournalRecordContext ProtectedCleanupContext(std::uint64_t serial, bool commit) const;
+    [[nodiscard]] journal::JournalRecordContext ProtectedContext(
+        const DirtyRange* range, std::uint64_t offset, bool anchor = false) const;
+    [[nodiscard]] journal::JournalRecordResult ReadProtectedRange(const DirtyRange& range) const;
+    [[nodiscard]] AppendStatus AppendProtected(const WriteRequest& request, AppendResult* result);
+    [[nodiscard]] bool PersistProtectedIndex();
+    [[nodiscard]] bool RebuildProtectedIndex(std::span<const PersistedRangeReference> references,
+        std::uint64_t safe_discard_sequence,
+        std::span<const PersistedRangeReference> discardable_references);
+    [[nodiscard]] bool OverlayProtected(const ReadRequest& request, std::size_t& bytes_overlayed,
+        bool require_full_coverage, std::uint64_t* logical_end) const;
+    std::unique_ptr<ProtectedState> protected_;
 
     [[nodiscard]] bool IsVolumeMatch(std::string_view volume_identity) const noexcept;
     [[nodiscard]] bool OpenPayloadReadStream(std::ifstream& input) const;
@@ -356,6 +488,7 @@ private:
     bool perf_counters_enabled_ = false;
     std::filesystem::path spool_file_;
     std::filesystem::path index_file_;
+    std::filesystem::path protected_marker_file_;
     std::vector<DirtyRange> ranges_;
     std::unordered_set<std::uint64_t> range_sequences_;
     std::uint64_t min_dirty_wal_sequence_ = 0;
@@ -414,6 +547,8 @@ private:
     bool root_ready_ = false;
     bool index_dirty_ = false;
     bool recovery_required_ = false;
+    bool protected_format_refused_ = false;
+    bool ordinary_layout_unproven_ = false;
     bool index_delta_enabled_ = true;
     bool index_journal_initialized_ = false;
     bool index_requires_snapshot_ = false;

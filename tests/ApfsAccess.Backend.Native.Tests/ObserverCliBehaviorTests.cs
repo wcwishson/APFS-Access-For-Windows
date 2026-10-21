@@ -11,6 +11,8 @@ public sealed class ObserverCliBehaviorTests
 {
     private static string RealObserverPath()
     {
+        if (Environment.GetEnvironmentVariable("APFS_VERIFY_TEST_OBSERVER") is { Length: > 0 })
+            return StagedPackagedObserver.StableObserverPath();
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
         for (var level = 0; level < 14 && directory is not null; level++)
         {

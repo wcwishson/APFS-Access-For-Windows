@@ -1,11 +1,20 @@
 #define main ApfsObserverEntryForTest
 #include "../tools/ApfsObserver.cpp"
 #undef main
+#define main VerifierFixtureEntryForConsumerTests
+#include "ApfsVerifierTests.cpp"
+#undef main
+#include "Task10ImageConsumerTests.h"
 #include <stdexcept>
 int main(int argc, char** argv)
 {
 #ifdef _WIN32
     try {
+        if (argc == 3 && std::string(argv[1]) == "--task10-payload") {
+            Task10ImageConsumers(std::filesystem::path(argv[2]));
+            std::cout << "PASS image consumer: " << cases << " cases, " << checks << " checks\n";
+            return 0;
+        }
         if (argc == 3 && std::string(argv[2]) == "--writer-admission") {
             const auto path = ToWide(argv[1]);
             HANDLE writer = CreateFileW(path.c_str(), GENERIC_WRITE,

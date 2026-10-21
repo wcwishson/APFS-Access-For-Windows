@@ -46,7 +46,10 @@ void NativeInodePaddingCases()
             if (id != 2 && id != 17 && id != target->object_id) continue;
             AppleInodeRecord inode;
             Check(ApfsExtendedRecordCodec::DecodeInode(record, inode, error), error);
-            const auto expected = id == target->object_id || (id == 17 && flagged) ? 0 : padding;
+            // Directories normalize to zero size on commit (APFS requires zero
+            // uncompressed_size on directory inodes); file padding without the
+            // size-validity flag is preserved verbatim.
+            const auto expected = (id == 2 || id == target->object_id || (id == 17 && flagged)) ? 0 : padding;
             Check(inode.uncompressed_size == expected,
                 "new padding is zero, existing padding preserved, flagged size updated");
             ++inspected;

@@ -1,4 +1,5 @@
 #include "EncryptedReadTransport.h"
+#include "ApfsFormat.h"
 #include <charconv>
 #include <iostream>
 #include <map>
@@ -60,6 +61,7 @@ const char* ReadError(catalog::EncryptedReadError error)
     NAME(None); NAME(InvalidArgument); NAME(UnlockFailed); NAME(UnsupportedEncryptionLayout);
     NAME(SourceIdentityMismatch); NAME(ResourceLimit); NAME(ReadFailure); NAME(CryptoFailure);
     NAME(MetadataIntegrityFailure); NAME(Closed); NAME(Cancelled); NAME(FileNotFound);
+    NAME(NotDirectory); NAME(XattrNotFound); NAME(NamespaceUnavailable);
 #undef NAME
     }
     return "ReadFailure";
@@ -162,7 +164,7 @@ int Run(int argc, wchar_t** argv, Operation& operation)
     const std::set<std::wstring> allowed{L"--mode",L"--image",L"--source-id",L"--store-offset",L"--store-size",
         L"--container-uuid",L"--volume-uuid",L"--volume-oid",L"--checkpoint-xid",L"--user-uuid",
         L"--container-bag-oid",L"--container-bag-xid",L"--volume-bag-oid",L"--volume-bag-xid",L"--bag-length",
-        L"--inode",L"--offset",L"--length",L"--credential-timeout-ms",L"--operation-timeout-ms",L"--cancel-handle"};
+        L"--inode",L"--offset",L"--length",L"--xattr",L"--credential-timeout-ms",L"--operation-timeout-ms",L"--cancel-handle"};
     bool binary = false;
     for (int i = 1; i < argc; ++i)
     {
@@ -176,9 +178,13 @@ int Run(int argc, wchar_t** argv, Operation& operation)
         auto it = options.find(key); if (it == options.end()) throw PublicFailure{"MissingExactSelector",2}; return it->second;
     };
     const auto mode = get(L"--mode");
-    if (mode != L"source" && mode != L"inspect" && mode != L"read") throw PublicFailure{"InvalidMode",2};
-    if ((mode == L"read") != binary) throw PublicFailure{"ExplicitBinaryOutputRequired",2};
-    if (mode != L"read" && (options.contains(L"--inode") || options.contains(L"--offset") || options.contains(L"--length")))
+    if (mode != L"source" && mode != L"selectors" && mode != L"inspect" && mode != L"read" && mode != L"metadata" && mode != L"xattr")
+        throw PublicFailure{"InvalidMode",2};
+    const bool bytes_output = mode == L"read" || mode == L"xattr";
+    if (bytes_output != binary) throw PublicFailure{"ExplicitBinaryOutputRequired",2};
+    if ((mode != L"read" && (options.contains(L"--offset") || options.contains(L"--length"))) ||
+        (mode != L"read" && mode != L"metadata" && mode != L"xattr" && options.contains(L"--inode")) ||
+        (mode != L"xattr" && options.contains(L"--xattr")))
         throw PublicFailure{"ReadSelectorsRequireReadMode",2};
     const auto store_offset = Number(get(L"--store-offset")), store_size = Number(get(L"--store-size"));
     const auto receive_ms = options.contains(L"--credential-timeout-ms") ? Number(get(L"--credential-timeout-ms")) : 5000;
@@ -203,6 +209,40 @@ int Run(int argc, wchar_t** argv, Operation& operation)
         operation.Output(output.str());
         return 0;
     }
+    if (mode == L"selectors")
+    {
+        const auto profile = get(L"--bag-length");
+        catalog::KeybagLength convention;
+        if (profile == L"includes-header") convention = catalog::KeybagLength::IncludesHeader;
+        else if (profile == L"entries-only") convention = catalog::KeybagLength::EntriesOnly;
+        else throw PublicFailure{"UnsupportedBagLengthProfile",2};
+        catalog::UnlockError error;
+        auto metadata = catalog::InspectPasswordKeybagMetadata(*source,Number(get(L"--volume-oid")),convention,error);
+        if (!metadata)
+        {
+            operation.Status(std::string("{\"state\":\"Locked\",\"unlockError\":\"")+UnlockError(error)+"\"}\n");
+            return 5;
+        }
+        if (!source->VerifyUnchanged()) throw PublicFailure{"SourceIdentityMismatch",3};
+        const auto& r = metadata->selection;
+        std::ostringstream output;
+        output << "{\"mode\":\"locked-keybag-selectors\",\"state\":\"Locked\",\"sourceId\":\"" << source->SourceIdentity()
+            << "\",\"storeOffset\":" << store_offset << ",\"storeSize\":" << store_size
+            << ",\"containerUuid\":\"" << catalog::BytesToHexLower(r.container_uuid.data(),16)
+            << "\",\"volumeUuid\":\"" << catalog::BytesToHexLower(r.volume_uuid.data(),16)
+            << "\",\"volumeOid\":" << r.volume_oid << ",\"checkpointXid\":" << r.checkpoint_xid
+            << ",\"containerBagOid\":" << r.container_bag.oid << ",\"containerBagXid\":" << r.container_bag.xid
+            << ",\"volumeBagOid\":" << r.volume_bag.oid << ",\"volumeBagXid\":" << r.volume_bag.xid
+            << ",\"bagLength\":\"" << Ascii(profile) << "\",\"users\":[";
+        for (std::size_t i=0;i<metadata->users.size();++i)
+        {
+            if (i) output << ',';
+            output << '"' << catalog::BytesToHexLower(metadata->users[i].data(),16) << '"';
+        }
+        output << "],\"persistentUnlockedMount\":false,\"writeAuthorization\":false}\n";
+        operation.Output(output.str());
+        return 0;
+    }
     const auto expected_source = Ascii(get(L"--source-id"));
     if (expected_source != source->SourceIdentity()) throw PublicFailure{"SourceIdentityMismatch",3};
     catalog::PasswordUnlockRequest request;
@@ -216,10 +256,20 @@ int Run(int argc, wchar_t** argv, Operation& operation)
     else if (length_profile == L"entries-only") request.length = catalog::KeybagLength::EntriesOnly;
     else throw PublicFailure{"UnsupportedBagLengthProfile",2};
     std::uint64_t inode = 0, offset = 0, length = 0;
+    std::string xattr;
+    if (mode == L"read" || mode == L"metadata" || mode == L"xattr")
+    {
+        inode = Number(get(L"--inode"));
+        if (!inode) throw PublicFailure{"InvalidReadRange",2};
+    }
+    if (mode == L"xattr") xattr = Ascii(get(L"--xattr"));
     if (mode == L"read")
     {
-        inode = Number(get(L"--inode")); offset = Number(get(L"--offset")); length = Number(get(L"--length"));
+        offset = Number(get(L"--offset")); length = Number(get(L"--length"));
         if (!inode || length > crypto::SecureBytes::kMaxBytes) throw PublicFailure{"InvalidReadRange",2};
+    }
+    if (bytes_output)
+    {
         const auto type = GetFileType(GetStdHandle(STD_OUTPUT_HANDLE));
         if (type != FILE_TYPE_PIPE && type != FILE_TYPE_DISK) throw PublicFailure{"RedirectedBinaryOutputRequired",2};
     }
@@ -244,7 +294,11 @@ int Run(int argc, wchar_t** argv, Operation& operation)
     }
     Plaintext plaintext;
     std::vector<catalog::EncryptedFileInfo> files;
-    error = mode == L"read" ? session->ReadFile(inode,offset,static_cast<std::size_t>(length),plaintext.bytes) : session->ListFiles(files);
+    catalog::EncryptedNodeInfo metadata;
+    if (mode == L"read") error = session->ReadFile(inode,offset,static_cast<std::size_t>(length),plaintext.bytes);
+    else if (mode == L"xattr") error = session->ReadXattr(inode,xattr,plaintext.bytes);
+    else if (mode == L"metadata") error = session->GetMetadata(inode,metadata);
+    else error = session->ListFiles(files);
     session->Close(); session.reset(); // VEK closes before any success plaintext publication.
     if (error != catalog::EncryptedReadError::None) throw PublicFailure{ReadError(error),error == catalog::EncryptedReadError::Cancelled ? 6 : 7};
     if (cancellation->load()) throw PublicFailure{"Cancelled",6};
@@ -262,13 +316,21 @@ int Run(int argc, wchar_t** argv, Operation& operation)
         output << "]}\n";
         operation.Output(output.str());
     }
+    else if (mode == L"metadata")
+    {
+        std::ostringstream output;
+        output << "{\"mode\":\"node-metadata\",\"inode\":" << metadata.inode_id << ",\"parent\":" << metadata.parent_id
+            << ",\"posixMode\":" << metadata.mode << ",\"size\":" << metadata.size << ",\"internalFlags\":" << metadata.internal_flags
+            << ",\"persistentUnlockedMount\":false,\"writeAuthorization\":false,\"symlinkFollowed\":false}\n";
+        operation.Output(output.str());
+    }
     else
     {
         operation.Output(GetStdHandle(STD_OUTPUT_HANDLE),plaintext.bytes.data(),plaintext.bytes.size());
     }
     source.reset();
     { std::ostringstream status; status << "{\"state\":\"Locked\",\"phase\":\"Closed\",\"leaseHeld\":false,\"output\":\""
-        << (mode == L"read" ? "binary-file-data" : "inode-metadata") << "\"}\n"; operation.Status(status.str()); }
+        << (mode == L"read" ? "binary-file-data" : mode == L"xattr" ? "embedded-xattr-data" : "inode-metadata") << "\"}\n"; operation.Status(status.str()); }
     if (cancellation->load()) throw PublicFailure{"Cancelled",6};
     return 0;
 }

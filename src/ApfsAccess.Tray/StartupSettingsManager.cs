@@ -5,7 +5,7 @@ using Microsoft.Win32;
 
 namespace ApfsAccess.Tray;
 
-public sealed record StartupPreferences(bool StartWithWindows, bool StartMinimized);
+public sealed record StartupPreferences(bool StartWithWindows, bool StartMinimized, AppThemeMode ThemeMode = AppThemeMode.System);
 
 public interface IStartupRegistry
 {
@@ -159,9 +159,13 @@ public sealed class StartupSettingsManager
     {
         var persisted = LoadPersistedSettings();
         var startupCommand = TryGetStartupCommand();
+        var themeMode = Enum.TryParse<AppThemeMode>(persisted.ThemeMode, true, out var parsedTheme)
+            ? parsedTheme
+            : AppThemeMode.System;
         return new StartupPreferences(
             StartWithWindows: !string.IsNullOrWhiteSpace(startupCommand) || SafeShortcutExists(),
-            StartMinimized: persisted.StartMinimized);
+            StartMinimized: persisted.StartMinimized,
+            ThemeMode: themeMode);
     }
 
     public void SetStartWithWindows(bool enabled)
@@ -191,6 +195,40 @@ public sealed class StartupSettingsManager
         var settings = LoadPersistedSettings() with
         {
             StartMinimized = enabled,
+        };
+        SavePersistedSettings(settings);
+    }
+
+    public void SetThemeMode(AppThemeMode themeMode)
+    {
+        var settings = LoadPersistedSettings() with
+        {
+            ThemeMode = themeMode.ToString(),
+        };
+        SavePersistedSettings(settings);
+    }
+
+    public DateTimeOffset? GetLastAutoUpdateCheckUtc()
+    {
+        var persisted = LoadPersistedSettings();
+        if (!string.IsNullOrWhiteSpace(persisted.LastAutoUpdateCheckUtc) &&
+            DateTimeOffset.TryParse(
+                persisted.LastAutoUpdateCheckUtc,
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal,
+                out var parsed))
+        {
+            return parsed;
+        }
+
+        return null;
+    }
+
+    public void SetLastAutoUpdateCheckUtc(DateTimeOffset timestampUtc)
+    {
+        var settings = LoadPersistedSettings() with
+        {
+            LastAutoUpdateCheckUtc = timestampUtc.ToUniversalTime().ToString("O", System.Globalization.CultureInfo.InvariantCulture),
         };
         SavePersistedSettings(settings);
     }
@@ -294,6 +332,8 @@ public sealed class StartupSettingsManager
     private sealed record PersistedStartupSettings
     {
         public bool StartMinimized { get; init; }
+        public string ThemeMode { get; init; } = "System";
+        public string? LastAutoUpdateCheckUtc { get; init; }
     }
 
     private sealed class NoopStartupShortcut : IStartupShortcut

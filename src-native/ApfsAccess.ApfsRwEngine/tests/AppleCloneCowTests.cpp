@@ -144,7 +144,7 @@ void SeedCloneExternalAttribute(BuilderStore& spec, const std::string& name) {
     Check(EncodeAppleXattrRecord(a,rec,error),error);v.filesystem_records.push_back(rec);
     Check(EncodeAppleDataStreamIdRecord({777,1},rec,error),error);v.filesystem_records.push_back(rec);
     Check(EncodeAppleFileExtentRecord({777,0,kBlockSize,160,0,kBlockSize},rec,error),error);v.filesystem_records.push_back(rec);
-    Check(EncodeApplePhysicalExtentRecord({160,1,kApplePhysicalExtentKindNew,777,1},rec,error),error);v.extentref_records.push_back(rec);
+    Check(EncodeApplePhysicalExtentRecord({160,1,kApplePhysicalExtentKindNew,17,1},rec,error),error);v.extentref_records.push_back(rec);
     ++v.additional_file_system_allocated_blocks;bytes.resize(kBlockSize);
     spec.authoritative_seeded_main_blocks.push_back({160,std::move(bytes)});
 }
@@ -324,6 +324,15 @@ void CloneQuotaAccounting(){
     Check(!ok&&error=="AppleVolumeQuotaExceeded"&&Empty(plan),"clone COW metadata still obeys quota: "+error);
 }
 void Refusals(){
+    {
+        auto spec=CloneSpec(1);SeedCloneExternalAttribute(spec,"user.external-owner");
+        PutU64LE(spec.volumes[0].extentref_records.back().value,8,777);
+        Fixture f(spec);const auto before=f.image;const auto request=CloneRequest(f,17);
+        VectorRandomAccessSource source(f.image);AppleVolumeTransactionPlan plan;std::string error;
+        const bool planned=PlanAppleVolumeTransaction(source,f.checkpoint,request,plan,error);
+        Check(!planned&&error=="AppleVolumePhysicalExtentOwnerMismatch"&&Empty(plan)&&f.image==before,
+            "external stream ID cannot replace the owning inode in physical ownership: "+error);
+    }
     for(unsigned fault=0;fault<6;++fault){auto spec=CloneSpec();auto& v=spec.volumes[0];
         if(fault==0)PutU32LE(v.extentref_records[0].value,16,1);
         if(fault==1)PutU64LE(v.extentref_records[0].value,0,(2ull<<60)|4);

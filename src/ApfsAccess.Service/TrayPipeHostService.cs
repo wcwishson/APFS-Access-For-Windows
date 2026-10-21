@@ -37,8 +37,22 @@ public sealed class TrayPipeHostService : BackgroundService
         ApfsMountWorker mountWorker,
         IHostApplicationLifetime applicationLifetime,
         AgentControlOperationService? operationService
+    ) : this(logger, statusPublisher, mountWorker, applicationLifetime, operationService, ApfsPipeConstants.PipeName)
+    {
+    }
+
+    internal TrayPipeHostService(
+        ILogger<TrayPipeHostService> logger,
+        RuntimeStatusPublisher statusPublisher,
+        ApfsMountWorker mountWorker,
+        IHostApplicationLifetime applicationLifetime,
+        AgentControlOperationService? operationService,
+        string authenticatedPipeName
     )
     {
+        if (!string.Equals(authenticatedPipeName, ApfsPipeConstants.PipeName, StringComparison.OrdinalIgnoreCase)
+            && !FusionControlEndpoint.IsPrivateInstance(authenticatedPipeName))
+            throw new ArgumentException("An authenticated APFS Access endpoint is required.", nameof(authenticatedPipeName));
         _logger = logger;
         _statusPublisher = statusPublisher;
         _mountWorker = mountWorker;
@@ -47,7 +61,7 @@ public sealed class TrayPipeHostService : BackgroundService
         _legacyOperations = operationService is null
             ? null
             : new LegacyTrayOperationAdapter(operationService, mountWorker);
-        _server = new NamedPipeMessageServer(ApfsPipeConstants.PipeName);
+        _server = new NamedPipeMessageServer(authenticatedPipeName);
     }
 
     public override Task StartAsync(CancellationToken cancellationToken)
@@ -420,7 +434,7 @@ public sealed class TrayPipeHostService : BackgroundService
             {
                 ApfsMessageTypes.ControlOperationRequest
                     when PipeMessageCodec.TryGetPayload<ControlOperationRequestPayload>(message, out var request) && request is not null
-                    => await _operationService.ExecuteOrReplayAsync(request).ConfigureAwait(false),
+                    => await _operationService.ExecuteOrReplayAsync(request with { CredentialClientProcessId = peer.AuthenticatedClientProcessId, CredentialClientStartTimeUtcTicks = peer.AuthenticatedClientStartTimeUtcTicks }).ConfigureAwait(false),
                 ApfsMessageTypes.OperationResultQuery
                     when PipeMessageCodec.TryGetPayload<OperationResultQueryPayload>(message, out var query) && query is not null
                     => _operationService.Query(query.OperationId)
@@ -699,19 +713,21 @@ public sealed class TrayPipeHostService : BackgroundService
     }
 
     private static bool HasSuccessfulTerminalEvidence(OperationResultPayload result)
-        => result.Success &&
+        => result.Command == ApfsControlCommands.Quit &&
+           result.Success &&
            result.State == ApfsOperationStates.Succeeded &&
            result.CompletedAtUtc.HasValue &&
+           result.FinalStatus == "shutdown-complete" &&
+           result.OwnershipProof == "proven" &&
+           result.DurabilityProof == "proven" &&
+           !result.PendingDurability &&
            !string.IsNullOrWhiteSpace(result.EvidencePath) &&
            File.Exists(result.EvidencePath);
 
     private static bool HasTerminalQuitEvidence(OperationResultPayload result)
         => result.Command == ApfsControlCommands.Quit &&
-           result.State is ApfsOperationStates.Succeeded or ApfsOperationStates.Failed or ApfsOperationStates.Cancelled &&
-           result.CompletedAtUtc.HasValue &&
-           result.FinalStatus is "shutdown-complete" or "shutdown-incomplete" &&
-           !string.IsNullOrWhiteSpace(result.EvidencePath) &&
-           File.Exists(result.EvidencePath);
+           HasSuccessfulTerminalEvidence(result) &&
+           result.FinalStatus == "shutdown-complete";
 
     private static bool IsAgentControlMessage(string type)
         => type is ApfsMessageTypes.ControlOperationRequest

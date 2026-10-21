@@ -2,10 +2,12 @@
 #include "InodeMetadataPatch.h"
 #include "WriteAheadLog.h"
 #include "PayloadSpool.h"
+#include "NativeSnapshotIntent.h"
 
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -15,6 +17,11 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <windows.h>
+#include <bcrypt.h>
+
+#undef CreateFile
+#undef CreateDirectory
 
 namespace
 {
@@ -1330,6 +1337,611 @@ bool TestLegacyCommittedPreimageCensus(const std::filesystem::path& run_root)
     return ok;
 }
 
+bool TestCleanPreimageCensusRetainsValidatedOwnership(const std::filesystem::path& run_root)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    const auto path = run_root / "clean-preimage-owned.wal";
+    Tx tx(L"DeferredContent");
+    tx.SetVolumeIdentity(L"clean-preimage-owned");
+    tx.SetJournalPath(path.wstring());
+    if (!Require(tx.Begin() && tx.RecordMutation(MakeMetadataMutation(L"\\clean.txt")) &&
+        tx.Accept(700), "clean census fixture accepts a bound transaction")) return false;
+    const auto accepted = tx.Watermarks().accepted_sequence;
+    if (!Require(tx.MarkApfsDurableThrough(accepted) && tx.MarkCleanedThrough(accepted),
+        "clean census fixture proves durable cleanup")) return false;
+    unsigned scans = 0;
+    tx.SetJournalFaultInjectionHook([&](std::string_view stage) {
+        if (stage == "read-all-exclusive-revalidate") { ++scans; return true; }
+        return false;
+    });
+    std::vector<std::uint64_t> pins{999};
+    std::string error = "stale error";
+    if (!Require(tx.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins.empty() &&
+        error.empty() && scans == 0, "validated clean census avoids full historical WAL reads")) return false;
+    tx.SetJournalFaultInjectionHook({});
+    if (!Require(tx.Begin() && tx.RecordMutation(MakeMetadataMutation(L"\\pending.txt")) &&
+        tx.Accept(701), "next accepted transaction keeps its real preimage")) return false;
+    if (!Require(tx.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) &&
+        pins == std::vector<std::uint64_t>{701}, "unresolved transaction takes full validated census")) return false;
+    const auto next = tx.Watermarks().accepted_sequence;
+    if (!Require(tx.MarkApfsDurableThrough(next) && tx.MarkCleanedThrough(next) && tx.Begin(),
+        "clean state may have only unaccepted buffered work")) return false;
+    Wal successor({path, "clean-preimage-owned", 1024 * 1024});
+    if (!Require(successor.AcquireExclusiveWriterLease(), "successor takes exact WAL ownership")) return false;
+    pins = {999};
+    return Require(!tx.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins.empty() &&
+        !error.empty() && !tx.RecoveryStateValid(), "lost ownership cannot reuse clean census proof");
+}
+
+bool TestMixedCheckpointedBoundaryRejectsCleanShortcut(const std::filesystem::path& run_root)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    for (const bool empty_commit : {false, true})
+    {
+        const auto identity = empty_commit ? L"mixed-empty-census" : L"mixed-content-census";
+        const auto path = run_root / (empty_commit ? "mixed-empty.wal" : "mixed-content.wal");
+        Tx tx(L"DeferredContent");
+        tx.SetVolumeIdentity(identity);
+        tx.SetJournalPath(path.wstring());
+        if (!Require(tx.Begin() && tx.RecordMutation(MakeMetadataMutation(L"\\accepted.txt")) &&
+            tx.Accept(700), "mixed census accepts its earlier boundary")) return false;
+        const auto earlier = tx.Watermarks().accepted_sequence;
+        if (!Require(tx.Begin() && (empty_commit || tx.RecordMutation(MakeMetadataMutation(L"\\committed.txt"))) &&
+            tx.Commit(701) && tx.LastCommittedSequence() > earlier,
+            "mixed census persists a later direct Commit")) return false;
+        if (!Require(tx.MarkApfsDurableThrough(earlier) && tx.MarkCleanedThrough(earlier),
+            "mixed census reproduces the earlier watermark update")) return false;
+        unsigned scans = 0;
+        tx.SetJournalFaultInjectionHook([&](std::string_view stage) {
+            if (stage == "read-all-exclusive-revalidate") ++scans;
+            return false;
+        });
+        std::vector<std::uint64_t> pins{999};
+        std::string error;
+        if (!Require(!tx.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins.empty() &&
+            !error.empty() && scans != 0 && !tx.RecoveryStateValid(),
+            "later persisted Commit cannot be hidden by earlier cleaned watermarks")) return false;
+    }
+    return true;
+}
+
+bool TestDirectCommitSurvivesBudgetCompaction(const std::filesystem::path& run_root)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    const auto path = run_root / "direct-compaction-floor.wal";
+    const std::string identity = "review-late-commit-compaction";
+    Tx tx(L"Conservative");
+    tx.SetJournalMaxBytesForTest(700);
+    tx.SetVolumeIdentity(L"review-late-commit-compaction");
+    tx.SetJournalPath(path.wstring());
+    if (!Require(tx.Begin() && tx.RecordMutation(MakeMetadataMutation(L"\\retention.txt")) && tx.Commit(710),
+        "bounded WAL persists its direct Commit")) return false;
+    const auto committed = tx.LastCommittedSequence();
+    if (!Require(committed != 0 && tx.Watermarks().cleanup_sequence == 0 && tx.Begin() &&
+        tx.RecordMutation(MakeMetadataMutation(L"\\retention.txt")), "later acceptance starts without a masking census")) return false;
+    const bool accepted = tx.Accept(711);
+    const auto physical = Wal::ReadAll(path, identity);
+    if (!Require(physical.status == Wal::ReadStatus::Ok &&
+        std::any_of(physical.records.begin(), physical.records.end(), [](const auto& r) {
+            return r.operation == Wal::OperationKind::CompactionIndex;
+        }), "budget actually exercised persisted compaction")) return false;
+    if (!Require(std::any_of(physical.records.begin(), physical.records.end(), [&](const auto& r) {
+        return r.sequence == committed && r.operation == Wal::OperationKind::TransactionMarker &&
+            r.state == Wal::RecordState::Checkpointed;
+    }) && std::any_of(physical.records.begin(), physical.records.end(), [&](const auto& r) {
+        return r.sequence < committed && r.state == Wal::RecordState::Prepared;
+    }), "unclean direct Commit and its mutation survive budget compaction")) return false;
+    if (!accepted) return true;
+    std::vector<std::uint64_t> pins;
+    std::string error;
+    return Require(tx.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) &&
+        pins == std::vector<std::uint64_t>{710, 711}, "successful later acceptance preserves both preimages: " + error);
+}
+
+bool TestAcceptedPinCensusAvoidsHistoryReads(const std::filesystem::path& run_root)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    for (const bool deferred : {false, true})
+    {
+        const auto path = run_root / (deferred ? "pin-deferred.wal" : "pin-ordinary.wal");
+        const auto identity = deferred ? L"pin-deferred" : L"pin-ordinary";
+        {
+            Tx tx(L"DeferredContent");
+            tx.SetVolumeIdentity(identity);
+            tx.SetJournalPath(path.wstring());
+            if (!Require(tx.Begin() && tx.RecordMutation(MakeMetadataMutation(L"\\first.txt")) &&
+                tx.FlushPreparedRecords() && tx.RecordMutation(MakeMetadataMutation(L"\\second.txt")) &&
+                (deferred ? tx.AcceptForDeferredCommit(nullptr, 901) : tx.Accept(901)),
+                "pin census accepts a transaction with previously flushed preparation")) return false;
+            unsigned scans = 0;
+            tx.SetJournalFaultInjectionHook([&](std::string_view stage) {
+                if (stage == "read-all-exclusive") { ++scans; return true; }
+                return false;
+            });
+            std::vector<std::uint64_t> pins{999};
+            std::string error;
+            for (unsigned i = 0; i < 3; ++i)
+                if (!Require(tx.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) &&
+                    pins == std::vector<std::uint64_t>{901} && error.empty() && scans == 0,
+                    "true acceptance retains the exact unresolved pin without historical reads: " + error)) return false;
+            if (!Require(tx.Begin() && tx.RecordMutation(MakeMetadataMutation(L"\\unaccepted.txt")) &&
+                tx.FlushPreparedRecords() && tx.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) &&
+                pins == std::vector<std::uint64_t>{901} && scans == 0 && tx.Abort(),
+                "active prepared work cannot change accepted pins")) return false;
+            std::vector<Tx::AcceptedTransaction> replay;
+            if (!Require(!tx.LoadAcceptedTransactionsSinceCleanup(replay, &error) && scans != 0,
+                "pin cache never bypasses complete replay collection")) return false;
+        }
+        Tx cold(L"DeferredContent");
+        cold.SetVolumeIdentity(identity);
+        cold.SetJournalPath(path.wstring());
+        std::vector<std::uint64_t> pins;
+        std::string error;
+        if (!Require(cold.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) &&
+            pins == std::vector<std::uint64_t>{901}, "complete cold reseed returns identical pins")) return false;
+        unsigned scans = 0;
+        cold.SetJournalFaultInjectionHook([&](std::string_view stage) {
+            if (stage == "read-all-exclusive") { ++scans; return true; }
+            return false;
+        });
+        if (!Require(cold.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && scans == 0 &&
+            pins == std::vector<std::uint64_t>{901}, "cold validated seed supports subsequent bounded census")) return false;
+        cold.SetJournalFaultInjectionHook({});
+        std::vector<Tx::AcceptedTransaction> limited;
+        if (!Require(!cold.LoadAcceptedTransactionsSinceCleanup(limited, &error, {1, 1}) &&
+            limited.empty() && error == "WAL read resource budget exceeded",
+            "replay caller budgets remain enforced after a cached pin census")) return false;
+    }
+    return true;
+}
+
+bool MakePinSnapshotMutation(bool create, std::uint64_t checkpoint,
+    std::vector<std::uint64_t> pins, apfsaccess::rw::TransactionManager::MutationIntent& mutation)
+{
+    using namespace apfsaccess::rw;
+    NativeSnapshotIntent intent;
+    intent.create = create;
+    intent.scope.store_size_bytes = 64ull * 1024 * 1024;
+    intent.scope.container_uuid_hex = "0123456789abcdef0123456789abcdef";
+    intent.scope.volume_uuid_hex = "fedcba9876543210fedcba9876543210";
+    intent.scope.volume_oid = 42;
+    intent.scope.checkpoint_xid = checkpoint;
+    intent.snapshot_xid = create ? checkpoint + 1 : 30;
+    intent.time_ns = 123456789;
+    intent.name = "pin-snapshot";
+    auto& target = intent.expected_identity;
+    target.scope = intent.scope;
+    if (create) ++target.scope.checkpoint_xid;
+    target.snapshot_xid = intent.snapshot_xid;
+    target.name_utf8 = intent.name;
+    target.superblock_physical_block = 10;
+    target.omap_physical_block = 11;
+    target.omap_tree_physical_block = 12;
+    target.root_oid = 13;
+    target.root_physical_block = 14;
+    target.extentref_physical_block = 15;
+    if (!create) intent.inventory.push_back(target);
+    intent.pins = std::move(pins);
+    mutation = {};
+    mutation.kind = create ? TransactionManager::MutationKind::CreateSnapshot : TransactionManager::MutationKind::DeleteSnapshot;
+    mutation.path = L"\\";
+    mutation.object_id = intent.scope.volume_oid;
+    mutation.generation = checkpoint + 1;
+    mutation.inline_payload = EncodeNativeSnapshotIntent(intent);
+    mutation.payload_length = mutation.inline_payload.size();
+    mutation.length = mutation.inline_payload.size();
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0) return false;
+    const auto status = BCryptHash(algorithm, nullptr, 0,
+        reinterpret_cast<PUCHAR>(mutation.inline_payload.data()), static_cast<ULONG>(mutation.inline_payload.size()),
+        mutation.payload_checksum.data(), static_cast<ULONG>(mutation.payload_checksum.size()));
+    const auto closed = BCryptCloseAlgorithmProvider(algorithm, 0);
+    NativeSnapshotIntent decoded;
+    return status >= 0 && closed >= 0 && DecodeNativeSnapshotIntent(mutation.inline_payload, decoded);
+}
+
+bool TestAcceptedSnapshotPinsRetireAtExactCleanup(const std::filesystem::path& run_root)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    const auto path = run_root / "pin-snapshot-boundaries.wal";
+    Tx::MutationIntent create, remove;
+    if (!Require(MakePinSnapshotMutation(true, 1000, {20, 50, 1000}, create) &&
+        MakePinSnapshotMutation(false, 1100, {30, 1100}, remove), "valid snapshot pin payloads")) return false;
+    std::uint64_t first = 0, second = 0;
+    {
+        Tx tx(L"DeferredContent");
+        tx.SetVolumeIdentity(L"pin-snapshot-boundaries");
+        tx.SetJournalPath(path.wstring());
+        if (!Require(tx.Begin() && tx.RecordMutation(MakeMetadataMutation(L"\\earlier.txt")) && tx.Accept(900),
+            "earlier acceptance precedes snapshot pin boundaries")) return false;
+        first = tx.Watermarks().accepted_sequence;
+        if (!Require(tx.Begin() && tx.RecordMutation(create) && tx.Accept(1000), "create snapshot acceptance")) return false;
+        second = tx.Watermarks().accepted_sequence;
+        if (!Require(tx.Begin() && tx.RecordMutation(remove) && tx.AcceptForDeferredCommit(nullptr, 1100),
+            "delete snapshot deferred acceptance")) return false;
+        unsigned scans = 0;
+        tx.SetJournalFaultInjectionHook([&](std::string_view stage) {
+            if (stage == "read-all-exclusive") { ++scans; return true; }
+            return false;
+        });
+        std::vector<std::uint64_t> actual;
+        std::string error;
+        const auto expect = [&](std::vector<std::uint64_t> wanted) {
+            return Require(tx.LoadRequiredCheckpointXidsSinceCleanup(actual, &error) && actual == wanted && scans == 0,
+                "snapshot pins match exact unresolved accepted boundaries: " + error);
+        };
+        if (!expect({20, 30, 50, 900, 1000, 1100}) || !tx.MarkApfsDurableThrough(first) ||
+            !expect({20, 30, 50, 900, 1000, 1100}) || !tx.MarkCleanedThrough(first) ||
+            !expect({20, 30, 50, 1000, 1100})) return false;
+    }
+    Tx cold(L"DeferredContent");
+    cold.SetVolumeIdentity(L"pin-snapshot-boundaries");
+    cold.SetJournalPath(path.wstring());
+    std::vector<std::uint64_t> pins;
+    std::string error;
+    if (!Require(cold.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) &&
+        pins == std::vector<std::uint64_t>{20, 30, 50, 1000, 1100}, "cold snapshot census matches partial cleanup")) return false;
+    cold.SetJournalFaultInjectionHook([](std::string_view stage) { return stage == "read-all-exclusive"; });
+    if (!Require(cold.MarkApfsDurableThrough(second) && cold.MarkCleanedThrough(second) &&
+        cold.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins == std::vector<std::uint64_t>{30, 1100},
+        "earlier snapshot cleanup retains every later delete snapshot pin")) return false;
+    const auto latest = cold.Watermarks().accepted_sequence;
+    return Require(cold.MarkApfsDurableThrough(latest) && cold.MarkCleanedThrough(latest) &&
+        cold.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins.empty(), "only durable cleanup retires final pins");
+}
+
+bool TestUntrustedAcceptedPinCensusFallsBack(const std::filesystem::path& run_root)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    const auto path = run_root / "pin-untrusted.wal";
+    {
+        Tx tx(L"DeferredContent");
+        tx.SetVolumeIdentity(L"pin-untrusted");
+        tx.SetJournalPath(path.wstring());
+        if (!Require(tx.Begin() && tx.RecordMutation(MakeMetadataMutation(L"\\zero.txt")) && tx.Accept(),
+            "legacy zero XID remains a successful acceptance")) return false;
+        unsigned scans = 0;
+        tx.SetJournalFaultInjectionHook([&](std::string_view stage) {
+            if (stage == "read-all-exclusive") ++scans;
+            return false;
+        });
+        std::vector<std::uint64_t> pins{999};
+        std::string error;
+        if (!Require(!tx.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins.empty() && scans != 0 &&
+            tx.RecoveryStateValid(), "zero XID falls back and refuses an incomplete pin set")) return false;
+        const auto accepted = tx.Watermarks().accepted_sequence;
+        if (!Require(tx.MarkApfsDurableThrough(accepted) && tx.MarkCleanedThrough(accepted), "zero XID cleanup")) return false;
+    }
+    {
+        Wal wal({path, "pin-untrusted", 1024 * 1024});
+        if (!Require(wal.Compact(1), "completed receipt fixture")) return false;
+    }
+    Tx tx(L"DeferredContent");
+    tx.SetVolumeIdentity(L"pin-untrusted");
+    tx.SetJournalPath(path.wstring());
+    if (!Require(tx.Begin() && tx.RecordMutation(MakeMetadataMutation(L"\\owned.txt")) && tx.Accept(910),
+        "accepted cache over a completed compaction receipt")) return false;
+    unsigned scans = 0;
+    tx.SetJournalFaultInjectionHook([&](std::string_view stage) {
+        if (stage == "read-all-exclusive") { ++scans; return true; }
+        return false;
+    });
+    std::vector<std::uint64_t> pins;
+    std::string error;
+    if (!Require(tx.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins == std::vector<std::uint64_t>{910} &&
+        scans == 0, "valid receipt permits unresolved accepted census")) return false;
+    auto receipt = path;
+    receipt += L".compact.intent";
+    { std::ofstream torn(receipt, std::ios::binary | std::ios::app); torn.put('!'); }
+    return Require(!tx.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins.empty() && scans != 0,
+        "malformed owned receipt cannot reuse accepted pin cache");
+}
+
+bool TestAcceptedPinCensusOwnershipAndAmbiguousAppend(const std::filesystem::path& run_root)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    for (const bool active : {false, true})
+    {
+        const auto path = run_root / (active ? "pin-active-transfer.wal" : "pin-idle-transfer.wal");
+        Tx owner(L"DeferredContent");
+        owner.SetVolumeIdentity(L"pin-transfer");
+        owner.SetJournalPath(path.wstring());
+        if (!Require(owner.Begin() && owner.RecordMutation(MakeMetadataMutation(L"\\old.txt")) && owner.Accept(920),
+            "old owner accepts its pin")) return false;
+        if (active && !owner.Begin()) return false;
+        Tx successor(L"DeferredContent");
+        successor.SetVolumeIdentity(L"pin-transfer");
+        successor.SetJournalPath(path.wstring());
+        if (!Require(successor.Begin() && successor.RecordMutation(MakeMetadataMutation(L"\\new.txt")) && successor.Accept(921),
+            "successor accepts after actual handle transfer")) return false;
+        unsigned scans = 0;
+        owner.SetJournalFaultInjectionHook([&](std::string_view stage) {
+            if (stage == "read-all-exclusive") ++scans;
+            return false;
+        });
+        std::vector<std::uint64_t> pins{999};
+        std::string error;
+        const auto loaded = owner.LoadRequiredCheckpointXidsSinceCleanup(pins, &error);
+        if (!Require(active ? (!loaded && pins.empty() && !owner.RecoveryStateValid()) :
+            (loaded && pins == std::vector<std::uint64_t>{920, 921} && scans != 0),
+            "transferred ownership requires complete reseed or active refusal")) return false;
+    }
+    Tx tx(L"DeferredContent");
+    tx.SetVolumeIdentity(L"pin-ambiguous");
+    tx.SetJournalPath((run_root / "pin-ambiguous.wal").wstring());
+    if (!Require(tx.Begin() && tx.RecordMutation(MakeMetadataMutation(L"\\known.txt")) && tx.Accept(930) &&
+        tx.Begin() && tx.RecordMutation(MakeMetadataMutation(L"\\ambiguous.txt")), "ambiguous acceptance fixture")) return false;
+    tx.SetJournalFaultInjectionHook([](std::string_view stage) { return stage == "durable-flush"; });
+    if (!Require(!tx.Accept(931) && !tx.RecoveryStateValid(), "persisted bytes with failed flush poison acceptance")) return false;
+    tx.SetJournalFaultInjectionHook({});
+    std::vector<std::uint64_t> pins{999};
+    std::string error;
+    return Require(!tx.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins.empty() && !error.empty(),
+        "ambiguous append cannot return its older cached pin set");
+}
+
+bool TestBoundedAcceptedPinCensus(const std::filesystem::path& run_root)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    for (const bool snapshot_limit : {false, true})
+    {
+        const auto path = run_root / (snapshot_limit ? "pin-entry-cap.wal" : "pin-boundary-cap.wal");
+        const auto count = snapshot_limit ? Tx::MaxCachedCheckpointPinEntries() / 64 + 1 :
+            Tx::MaxCachedCheckpointPinBoundaries() + 1;
+        std::vector<Wal::Record> records;
+        std::vector<std::uint64_t> expected;
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const std::uint64_t xid = 10000 + i;
+            Wal::Record prepared;
+            prepared.volume_identity = "pin-cap";
+            prepared.transaction_id = i + 1;
+            prepared.sequence = 2 * i + 1;
+            prepared.state = Wal::RecordState::Prepared;
+            prepared.operation = Wal::OperationKind::SetBasicInfo;
+            prepared.path_utf8 = "\\cap.txt";
+            if (snapshot_limit)
+            {
+                std::vector<std::uint64_t> snapshot_pins;
+                for (std::uint64_t pin = 1; pin <= 63; ++pin) snapshot_pins.push_back(pin);
+                snapshot_pins.push_back(xid);
+                Tx::MutationIntent mutation;
+                if (!MakePinSnapshotMutation(true, xid, snapshot_pins, mutation)) return false;
+                prepared.operation = Wal::OperationKind::CreateSnapshot;
+                prepared.object_id = mutation.object_id;
+                prepared.parent_object_id = mutation.generation;
+                prepared.path_utf8 = "\\";
+                prepared.payload_length = mutation.payload_length;
+                prepared.payload_sha256 = mutation.payload_checksum;
+                prepared.inline_payload = std::move(mutation.inline_payload);
+            }
+            records.push_back(std::move(prepared));
+            Wal::Record marker;
+            marker.volume_identity = "pin-cap";
+            marker.transaction_id = i + 1;
+            marker.sequence = 2 * i + 2;
+            marker.operation = Wal::OperationKind::TransactionMarker;
+            marker.state = Wal::RecordState::Accepted;
+            marker.flags = 8;
+            marker.object_id = xid;
+            marker.logical_length = 1;
+            records.push_back(std::move(marker));
+            expected.push_back(xid);
+        }
+        if (snapshot_limit) for (std::uint64_t pin = 1; pin <= 63; ++pin) expected.push_back(pin);
+        std::sort(expected.begin(), expected.end());
+        { Wal wal({path, "pin-cap", 8 * 1024 * 1024}); if (!wal.AppendBatch(records)) return false; }
+        Tx tx(L"DeferredContent");
+        tx.SetVolumeIdentity(L"pin-cap");
+        tx.SetJournalPath(path.wstring());
+        std::vector<std::uint64_t> pins;
+        std::string error;
+        if (!Require(tx.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins == expected,
+            "complete fallback preserves every pin beyond the cache cap")) return false;
+        unsigned scans = 0;
+        tx.SetJournalFaultInjectionHook([&](std::string_view stage) {
+            if (stage == "read-all-exclusive") { ++scans; return true; }
+            return false;
+        });
+        if (!Require(!tx.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins.empty() && scans != 0,
+            "cache cap never permits a truncated pin result")) return false;
+    }
+    return true;
+}
+
+bool TestIncompleteCompactedPinHistoryFallsBack(const std::filesystem::path& run_root)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    const auto path = run_root / "pin-incomplete-compacted.wal";
+    {
+        Tx tx(L"DeferredContent");
+        tx.SetVolumeIdentity(L"pin-incomplete");
+        tx.SetJournalPath(path.wstring());
+        Tx::MutationIntent snapshot;
+        if (!MakePinSnapshotMutation(true, 1000, {20, 1000}, snapshot) || !tx.Begin()) return false;
+        auto malformed = snapshot;
+        malformed.inline_payload.front() = std::byte{0};
+        if (!Require(!tx.RecordMutation(malformed) && tx.RecordMutation(snapshot) && tx.Accept(1000),
+            "invalid snapshot payload refuses before a successful valid acceptance")) return false;
+    }
+    {
+        Wal wal({path, "pin-incomplete", 1024 * 1024});
+        if (!Require(wal.Compact(2), "fixture removes unresolved preparation at its marker floor")) return false;
+    }
+    Tx cold(L"DeferredContent");
+    cold.SetVolumeIdentity(L"pin-incomplete");
+    cold.SetJournalPath(path.wstring());
+    std::vector<std::uint64_t> pins{999};
+    std::string error;
+    unsigned scans = 0;
+    cold.SetJournalFaultInjectionHook([&](std::string_view stage) {
+        if (stage == "read-all-exclusive") ++scans;
+        return false;
+    });
+    return Require(!cold.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins.empty() && scans != 0,
+        "a valid compacted envelope without unresolved snapshot preparation cannot seed pins");
+}
+
+bool TestAcceptedPinsSurvivePreparationCompaction(const std::filesystem::path& run_root)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    for (const bool deferred : {false, true})
+    {
+        const std::string identity = "review-accepted-partial-deferred";
+        const auto path = run_root / (deferred ? "pin-prepared-deferred.wal" : "pin-prepared-ordinary.wal");
+        Wal::Record prototype;
+        prototype.volume_identity = identity;
+        prototype.operation = Wal::OperationKind::SetBasicInfo;
+        prototype.state = Wal::RecordState::Prepared;
+        prototype.path_utf8 = "\\retention.txt";
+        const auto prepared_size = Wal::EncodeForTest(prototype).size();
+        prototype.operation = Wal::OperationKind::TransactionMarker;
+        prototype.state = Wal::RecordState::Accepted;
+        prototype.path_utf8 = "DeferredContent";
+        const auto marker_size = Wal::EncodeForTest(prototype).size();
+        prototype.operation = Wal::OperationKind::DurabilityWatermark;
+        prototype.path_utf8.clear();
+        const auto watermark_size = Wal::EncodeForTest(prototype).size();
+        Tx tx(L"DeferredContent");
+        tx.SetJournalMaxBytesForTest(7 * prepared_size + 2 * marker_size + 2 * watermark_size + prepared_size / 2);
+        tx.SetVolumeIdentity(L"review-accepted-partial-deferred");
+        tx.SetJournalPath(path.wstring());
+        const auto mutation = MakeMetadataMutation(L"\\retention.txt");
+        if (!Require(tx.Begin() && tx.RecordMutation(mutation) && tx.RecordMutation(mutation) &&
+            tx.RecordMutation(mutation) && tx.RecordMutation(mutation) && tx.RecordMutation(mutation) &&
+            tx.Accept(940), "cleaned prefix fills bounded preparation fixture")) return false;
+        const auto cleaned = tx.Watermarks().accepted_sequence;
+        if (!Require(tx.MarkApfsDurableThrough(cleaned) && tx.MarkCleanedThrough(cleaned) && tx.Begin() &&
+            tx.RecordMutation(mutation) && (deferred ? tx.AcceptForDeferredCommit(nullptr, 941) : tx.Accept(941)),
+            "bounded fixture retains later unresolved acceptance")) return false;
+        const auto earlier = tx.Watermarks().accepted_sequence;
+        if (!Require(tx.Begin() && tx.RecordMutation(mutation) && tx.FlushPreparedRecords() &&
+            tx.RecordMutation(mutation) && tx.FlushPreparedRecords() && tx.Accept(942),
+            "actual compaction permits a split prepared transaction to complete")) return false;
+        const auto physical = Wal::ReadAll(path, identity);
+        if (!Require(physical.status == Wal::ReadStatus::Ok &&
+            std::any_of(physical.records.begin(), physical.records.end(), [](const auto& r) {
+                return r.operation == Wal::OperationKind::CompactionIndex;
+            }) && std::count_if(physical.records.begin(), physical.records.end(), [](const auto& r) {
+                return r.state == Wal::RecordState::Prepared;
+            }) == 3, "persisted compaction retains unresolved preparation and both split records")) return false;
+        unsigned scans = 0;
+        tx.SetJournalFaultInjectionHook([&](std::string_view stage) {
+            if (stage == "read-all-exclusive") { ++scans; return true; }
+            return false;
+        });
+        std::vector<std::uint64_t> pins;
+        std::string error;
+        if (!Require(tx.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) &&
+            pins == std::vector<std::uint64_t>{941, 942} && scans == 0,
+            "known compaction transfers exact pin cache to its replacement generation")) return false;
+        if (!Require(tx.MarkApfsDurableThrough(earlier) && tx.MarkCleanedThrough(earlier) &&
+            tx.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) &&
+            pins == std::vector<std::uint64_t>{942} && scans == 0,
+            "partial cleanup after compaction preserves the later accepted group")) return false;
+    }
+    return true;
+}
+
+bool TestIncrementalPinCensusCapAndReseed(const std::filesystem::path& run_root)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    const auto path = run_root / "pin-incremental-cap.wal";
+    std::vector<std::uint64_t> expected;
+    {
+        Tx tx(L"DeferredContent");
+        tx.SetVolumeIdentity(L"pin-incremental-cap");
+        tx.SetJournalPath(path.wstring());
+        for (std::size_t i = 0; i < Tx::MaxCachedCheckpointPinBoundaries(); ++i)
+        {
+            if (!tx.Begin() || !tx.RecordMutation(MakeMetadataMutation(L"\\cap.txt")) ||
+                !tx.AcceptForDeferredCommit(nullptr, 10000 + i)) return false;
+            expected.push_back(10000 + i);
+        }
+        unsigned scans = 0;
+        tx.SetJournalFaultInjectionHook([&](std::string_view stage) {
+            if (stage == "read-all-exclusive") { ++scans; return true; }
+            return false;
+        });
+        std::vector<std::uint64_t> pins;
+        std::string error;
+        if (!Require(tx.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins == expected && scans == 0,
+            "incremental census retains exactly the bounded maximum")) return false;
+        const auto extra = 10000 + Tx::MaxCachedCheckpointPinBoundaries();
+        if (!Require(tx.Begin() && tx.RecordMutation(MakeMetadataMutation(L"\\extra.txt")) &&
+            tx.AcceptForDeferredCommit(nullptr, extra), "cache overflow cannot reject valid WAL acceptance")) return false;
+        expected.push_back(extra);
+        if (!Require(!tx.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins.empty() && scans != 0,
+            "overflow invalidates the whole incremental cache and requires history")) return false;
+    }
+    Tx cold(L"DeferredContent");
+    cold.SetVolumeIdentity(L"pin-incremental-cap");
+    cold.SetJournalPath(path.wstring());
+    std::vector<std::uint64_t> pins;
+    std::string error;
+    if (!Require(cold.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins == expected,
+        "cold scan preserves the overflow boundary")) return false;
+    const auto accepted = cold.Watermarks().accepted_sequence;
+    if (!Require(cold.MarkApfsDurableThrough(accepted) && cold.MarkCleanedThrough(accepted) && cold.Begin() &&
+        cold.RecordMutation(MakeMetadataMutation(L"\\after-cleanup.txt")) && cold.Accept(20000) &&
+        cold.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins == std::vector<std::uint64_t>{20000},
+        "full validated reseed after cleanup restores a small exact pin cache")) return false;
+    cold.SetJournalFaultInjectionHook([](std::string_view stage) { return stage == "read-all-exclusive"; });
+    return Require(cold.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) &&
+        pins == std::vector<std::uint64_t>{20000}, "reseeded cache resumes avoiding history reads");
+}
+
+bool TestCompletedCompactionRetainsCleanCensusProof(const std::filesystem::path& run_root)
+{
+    using Tx = apfsaccess::rw::TransactionManager;
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    const auto path = run_root / "compacted-clean-census.wal";
+    {
+        Tx tx(L"DeferredContent");
+        tx.SetVolumeIdentity(L"compacted-clean-census");
+        tx.SetJournalPath(path.wstring());
+        if (!Require(tx.Begin() && tx.RecordMutation(MakeMetadataMutation(L"\\clean.txt")) && tx.Accept(800),
+            "compaction census accepts its checkpoint")) return false;
+        const auto accepted = tx.Watermarks().accepted_sequence;
+        if (!Require(tx.MarkApfsDurableThrough(accepted) && tx.MarkCleanedThrough(accepted),
+            "compaction census cleans its checkpoint")) return false;
+    }
+    {
+        Wal wal({path, "compacted-clean-census", 1024 * 1024});
+        if (!Require(wal.Compact(1), "clean census compaction preserves validated history")) return false;
+    }
+    auto intent = path;
+    intent += L".compact.intent";
+    if (!Require(std::filesystem::exists(intent), "completed compaction retains its durable receipt")) return false;
+    Tx recovered(L"DeferredContent");
+    recovered.SetVolumeIdentity(L"compacted-clean-census");
+    recovered.SetJournalPath(path.wstring());
+    unsigned scans = 0;
+    recovered.SetJournalFaultInjectionHook([&](std::string_view stage) {
+        if (stage == "read-all-exclusive-revalidate") { ++scans; return true; }
+        return false;
+    });
+    std::vector<std::uint64_t> pins{999};
+    std::string error;
+    for (unsigned i = 0; i < 3; ++i)
+        if (!Require(recovered.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) &&
+            pins.empty() && error.empty() && scans == 0,
+            "complete identity-bound receipt permits clean census reuse")) return false;
+    {
+        std::ofstream tamper(intent, std::ios::binary | std::ios::app);
+        tamper.put('!');
+        if (!Require(static_cast<bool>(tamper), "receipt tamper probe appended a torn byte")) return false;
+    }
+    return Require(!recovered.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins.empty() &&
+        !error.empty() && scans != 0, "changed receipt refuses cached proof and requires complete validation");
+}
+
 bool TestEmptyCommittedPreimageCensus(const std::filesystem::path& run_root)
 {
     using Tx = apfsaccess::rw::TransactionManager;
@@ -1764,6 +2376,18 @@ int main()
     ok &= TestCommittedPreimageCensusAfterRestart(run_root, true);
     ok &= TestLegacyCommittedPreimageCensus(run_root);
     ok &= TestEmptyCommittedPreimageCensus(run_root);
+    ok &= TestCleanPreimageCensusRetainsValidatedOwnership(run_root);
+    ok &= TestMixedCheckpointedBoundaryRejectsCleanShortcut(run_root);
+    ok &= TestDirectCommitSurvivesBudgetCompaction(run_root);
+    ok &= TestAcceptedPinCensusAvoidsHistoryReads(run_root);
+    ok &= TestAcceptedSnapshotPinsRetireAtExactCleanup(run_root);
+    ok &= TestUntrustedAcceptedPinCensusFallsBack(run_root);
+    ok &= TestAcceptedPinCensusOwnershipAndAmbiguousAppend(run_root);
+    ok &= TestBoundedAcceptedPinCensus(run_root);
+    ok &= TestIncompleteCompactedPinHistoryFallsBack(run_root);
+    ok &= TestAcceptedPinsSurvivePreparationCompaction(run_root);
+    ok &= TestIncrementalPinCensusCapAndReseed(run_root);
+    ok &= TestCompletedCompactionRetainsCleanCensusProof(run_root);
     ok &= Require(tx.CurrentState() == apfsaccess::rw::TransactionManager::State::Idle, "Initial state should be idle");
     ok &= Require(tx.Begin(), "Begin should succeed from idle state");
     ok &= Require(tx.CurrentState() == apfsaccess::rw::TransactionManager::State::Active, "State should be active after begin");

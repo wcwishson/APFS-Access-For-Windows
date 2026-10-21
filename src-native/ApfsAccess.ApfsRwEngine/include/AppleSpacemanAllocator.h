@@ -51,6 +51,10 @@ struct AppleSpacemanAllocationRequest
     bool search_from_end = false;
     std::uint64_t first_ephemeral_object_id = 0;
     std::vector<AppleSpacemanReleaseRequest> released_blocks;
+    // Explicit private-image profile: mature internal-pool entries may be
+    // reclaimed, while every main-pool queue entry remains allocated/queued.
+    // The caller still proves all required recovered owners before allocation.
+    bool reclaim_internal_pool_only = false;
 };
 
 struct AppleSpacemanAllocationPlan

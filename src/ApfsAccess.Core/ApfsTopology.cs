@@ -40,7 +40,8 @@ public sealed record ApfsStoreRecord(
     [property: JsonPropertyName("offsetBytes")] long OffsetBytes,
     [property: JsonPropertyName("sizeBytes")] long SizeBytes,
     [property: JsonPropertyName("blockSizeBytes"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] long? BlockSizeBytes = null,
-    [property: JsonPropertyName("totalBlocks"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] ulong? TotalBlocks = null);
+    [property: JsonPropertyName("totalBlocks"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] ulong? TotalBlocks = null,
+    [property: JsonPropertyName("diskId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? DiskId = null);
 
 public sealed record ApfsContainerRecord(
     [property: JsonPropertyName("id")] string Id,
@@ -277,6 +278,25 @@ public static class ApfsTopology
 
         containerHex32 = tail;
         return true;
+    }
+
+    // Container-membership match shared by service, worker, and CLI surfaces.
+    // Accepts the canonical apfs-container:hex32 shape, bare hex32/Guid text,
+    // and case variants; the live inventory row stays authoritative and this
+    // helper only compares spellings, never admits a container by itself.
+    public static bool MatchesContainerUuid(string? requested, string? member)
+    {
+        if (string.IsNullOrWhiteSpace(requested) || string.IsNullOrWhiteSpace(member)) return false;
+        var normalized = CanonicalizeContainerUuid(requested);
+        var candidate = member.Trim();
+        return string.Equals(normalized, candidate, StringComparison.OrdinalIgnoreCase) ||
+            TopologyAdmission.SameUuid(normalized, candidate);
+    }
+
+    public static string CanonicalizeContainerUuid(string value)
+    {
+        var trimmed = value.Trim();
+        return TryParseContainerId(trimmed, out var hex) ? hex : trimmed;
     }
 
     public static string BuildVolumeId(string containerHex32, ulong objectId)

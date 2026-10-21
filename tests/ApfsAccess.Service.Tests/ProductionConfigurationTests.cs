@@ -5,13 +5,14 @@ namespace ApfsAccess.Service.Tests;
 public sealed class ProductionConfigurationTests
 {
     [Fact]
-    public void ProductionConfig_UsesCanonicalSafetyGateWithoutPrivatePilotHistory()
+    public void ProductionConfig_BlocksPhysicalWritesUntilIndependentWriterAcceptance()
     {
         using var document = JsonDocument.Parse(File.ReadAllText(FindProductionConfig()));
         var service = document.RootElement.GetProperty("Service");
 
         Assert.Equal("CanonicalImage", service.GetProperty("NativeWritePromotionPolicy").GetString());
-        Assert.True(service.GetProperty("NativeWriteAllowRawPhysicalDevices").GetBoolean());
+        Assert.False(service.GetProperty("NativeWriteAllowRawPhysicalDevices").GetBoolean());
+        Assert.Empty(service.GetProperty("NativeWriteHardwarePilotDeviceAllowList").EnumerateArray());
         Assert.True(service.GetProperty("NativeWriteStrictMode").GetBoolean());
         Assert.True(service.GetProperty("NativeWriteIntegrityCheckOnMount").GetBoolean());
         Assert.True(service.GetProperty("NativeWriteRequireCanonicalCommit").GetBoolean());

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -21,6 +22,11 @@ enum class AppleCheckpointWriteKind
     CheckpointData,
     CheckpointMap,
     CheckpointSuperblock,
+    // Fusion tier-2 anchor mirror: same new NXSB with the tier role bit,
+    // published to the second member between the prepublication flush and
+    // the main switch. Never part of before_superblock_writes; the executor
+    // emits it at its own ordered stage only when present.
+    FusionTier2Anchor,
 };
 
 struct AppleCheckpointPhysicalWrite
@@ -56,6 +62,21 @@ struct AppleCheckpointPublicationRequest
     std::vector<std::uint64_t> retired_ephemeral_object_ids;
 };
 
+// Maintenance callers supply complete authenticated bag/retained-owner proof
+// and reserve the relocated blocks. This generic publisher checks staging,
+// bounds and protected-range exclusion. Both zero preserve nx_keylocker.
+struct AppleCheckpointKeylockerReplacement
+{
+    std::uint64_t start_block = 0, block_count = 0;
+};
+
+// Initial encryption must prove the absent source bag and reserve new blocks
+// before calling. Unlike replacement, this requires an empty current NX range.
+struct AppleCheckpointKeylockerInitialization
+{
+    std::uint64_t start_block = 0, block_count = 0;
+};
+
 struct AppleCheckpointPlannedWrite
 {
     AppleCheckpointWriteKind kind = AppleCheckpointWriteKind::AllocatorOwned;
@@ -79,6 +100,11 @@ struct AppleCheckpointPublicationPlan
     std::vector<AppleCheckpointGuardBlock> guard_blocks;
     std::vector<AppleCheckpointPlannedWrite> before_superblock_writes;
     AppleCheckpointPlannedWrite superblock_write;
+    // Absent for single-store containers. When present, the executor writes
+    // and verifies it after the prepublication flush and flushes again
+    // before the main checkpoint switch, keeping tier-2 ahead by at most one
+    // generation that the bind layer tolerates by selecting the main anchor.
+    std::optional<AppleCheckpointPlannedWrite> fusion_tier2_anchor_write;
     catalog::ContainerCheckpointView published_checkpoint;
 };
 
@@ -90,6 +116,22 @@ bool PlanAppleCheckpointPublication(
     const AppleCheckpointPublicationRequest& request,
     AppleCheckpointPublicationPlan& out_plan,
     std::string& out_error);
+
+bool PlanAppleCheckpointPublication(
+    const catalog::RandomAccessSource& source,
+    const catalog::ContainerCheckpointView& checkpoint,
+    const AppleCheckpointPublicationRequest& request,
+    AppleCheckpointPublicationPlan& out_plan,
+    std::string& out_error,
+    const AppleCheckpointKeylockerReplacement& keylocker);
+
+bool PlanAppleCheckpointKeylockerInitialization(
+    const catalog::RandomAccessSource& source,
+    const catalog::ContainerCheckpointView& checkpoint,
+    const AppleCheckpointPublicationRequest& request,
+    AppleCheckpointPublicationPlan& out_plan,
+    std::string& out_error,
+    const AppleCheckpointKeylockerInitialization& keylocker);
 
 class AppleCheckpointWriteTarget
 {
@@ -116,6 +158,14 @@ public:
     virtual bool WriteBlock(
         std::uint64_t physical_block,
         std::span<const std::byte> bytes) = 0;
+    // Re-read after a completed flush. Targets that cache ReadBlock/Range must
+    // override this to observe their backing source without that cache.
+    virtual bool ReadBlockRangeForVerification(
+        std::uint64_t physical_block, std::uint32_t block_size,
+        std::size_t max_blocks, std::vector<std::byte>& out_bytes)
+    {
+        return ReadBlockRange(physical_block, block_size, max_blocks, out_bytes);
+    }
     virtual bool WriteBlocks(
         std::span<const AppleCheckpointPlannedWrite> writes)
     {
@@ -135,7 +185,8 @@ using AppleCheckpointStageHook =
     std::function<bool(std::string_view stage)>;
 
 // Rechecks the selected checkpoint, writes and verifies every non-publishing
-// block, flushes, writes the new NXSB last, verifies it, and flushes again.
+// block after the first flush, writes the new NXSB last, then rechecks the
+// complete publication after the final flush. Verification bypasses target caches.
 bool ExecuteAppleCheckpointPublication(
     AppleCheckpointWriteTarget& target,
     const AppleCheckpointPublicationPlan& plan,

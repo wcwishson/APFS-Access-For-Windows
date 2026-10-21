@@ -111,6 +111,16 @@ public:
         AppleInodeRecord& out_inode,
         std::string& out_error);
 
+    // Observational entry point; both entry points require complete, bounded
+    // extended fields, including older descriptor-excluding length encodings.
+    [[nodiscard]] static bool DecodeInodeReadOnly(const catalog::BtreeRecord& record,
+        AppleInodeRecord& out_inode, std::string& out_error);
+
+    // Canonical directory envelope and xfields; name/hash use the selected APSB policy.
+    [[nodiscard]] static bool DecodeDirectory(
+        const catalog::BtreeRecord& record, const ApfsNamePolicy& policy,
+        AppleDirectoryRecord& out_directory, std::string& out_error);
+
     [[nodiscard]] static bool DecodeSiblingLink(
         const catalog::BtreeRecord& record,
         AppleSiblingLinkRecord& out_link,

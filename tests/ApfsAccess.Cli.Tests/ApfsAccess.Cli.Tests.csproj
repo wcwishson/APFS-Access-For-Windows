@@ -5,6 +5,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
+    <EnableStandardMount Condition="'$(EnableStandardMount)' == ''">true</EnableStandardMount>
+    <DefineConstants Condition="'$(EnableStandardMount)' == 'true'">$(DefineConstants);APFSACCESS_STANDARD_MOUNT</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
@@ -16,18 +18,15 @@
 
   <ItemGroup>
     <Using Include="Xunit" />
+    <Compile Include="..\ApfsAccess.Backend.Native.Tests\RetainedOwnershipNativeReports.cs" Link="RetainedOwnershipNativeReports.cs" />
+    <EmbeddedResource Include="..\ApfsAccess.Backend.Native.Tests\TestData\RetainedOwnership\*.json" LogicalName="RetainedOwnershipNativeReports.%(Filename)%(Extension)" />
+    <Compile Include="..\ApfsAccess.Core.Tests\ExpectedPayloadTestData.cs" Link="ExpectedPayloadTestData.cs" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\ApfsAccess.Cli\ApfsAccess.Cli.csproj" />
+    <ProjectReference Include="..\ApfsAccess.Cli.TestChild\ApfsAccess.Cli.TestChild.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
-
-  <Target Name="BuildCliTestChildArtifacts" BeforeTargets="CopyCliTestChildArtifacts">
-    <MSBuild
-      Projects="$(MSBuildProjectDirectory)\..\ApfsAccess.Cli.TestChild\ApfsAccess.Cli.TestChild.csproj"
-      Targets="Build"
-      Properties="Configuration=$(Configuration);TargetFramework=$(TargetFramework)" />
-  </Target>
 
   <Target Name="CopyCliTestChildArtifacts" AfterTargets="Build">
     <ItemGroup>
@@ -39,4 +38,7 @@
       SkipUnchangedFiles="true" />
   </Target>
 
+  <ItemGroup>
+    <Compile Include="..\ApfsAccess.Backend.Native.Tests\SnapshotAttributionTestData.cs" Link="SnapshotAttributionTestData.cs" />
+  </ItemGroup>
 </Project>

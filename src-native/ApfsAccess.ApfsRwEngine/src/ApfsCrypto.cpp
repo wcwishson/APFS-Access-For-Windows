@@ -72,14 +72,15 @@ public:
     Aes& operator=(const Aes&) = delete;
     ~Aes() noexcept { if (key_) BCryptDestroyKey(key_); }
 
-    CryptoResult Init(std::span<const std::byte> key) noexcept
+    CryptoResult Init(std::span<const std::byte> key, bool gcm = false) noexcept
     {
         auto status = Cng([&] { return BCryptOpenAlgorithmProvider(&algorithm_.handle,
             BCRYPT_AES_ALGORITHM, MS_PRIMITIVE_PROVIDER, 0); });
         if (status < 0) return Fail(CryptoError::ProviderFailure, status);
+        const auto* mode = gcm ? BCRYPT_CHAIN_MODE_GCM : BCRYPT_CHAIN_MODE_ECB;
         status = Cng([&] { return BCryptSetProperty(algorithm_.handle, BCRYPT_CHAINING_MODE,
-            reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_ECB)),
-            sizeof(BCRYPT_CHAIN_MODE_ECB), 0); });
+            reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(mode)),
+            gcm ? sizeof(BCRYPT_CHAIN_MODE_GCM) : sizeof(BCRYPT_CHAIN_MODE_ECB), 0); });
         if (status < 0) return Fail(CryptoError::ProviderFailure, status);
         DWORD object_bytes = 0, received = 0;
         status = Cng([&] { return BCryptGetProperty(algorithm_.handle, BCRYPT_OBJECT_LENGTH,
@@ -110,12 +111,68 @@ public:
         if (status >= 0 && written != 16) status = static_cast<NTSTATUS>(0xC0000001UL);
         return status;
     }
+
+    NTSTATUS Gcm(std::span<const std::byte> input, std::span<const std::byte> nonce,
+        std::span<const std::byte> aad, PUCHAR tag, std::span<std::byte> output,
+        bool encrypt) noexcept
+    {
+        // Microsoft BCryptEncrypt/Decrypt: one authenticated call, no chaining or
+        // padding. Both data pointers MUST be null for actual zero-length auth,
+        // rather than a buffer-size query (even for non-null empty input spans).
+        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO auth;
+        BCRYPT_INIT_AUTH_MODE_INFO(auth);
+        auth.pbNonce = Input(nonce);
+        auth.cbNonce = static_cast<ULONG>(nonce.size());
+        auth.pbAuthData = aad.empty() ? nullptr : Input(aad);
+        auth.cbAuthData = static_cast<ULONG>(aad.size());
+        auth.pbTag = tag;
+        auth.cbTag = static_cast<ULONG>(kGcmTagBytes);
+        ULONG written = 0;
+        const auto source = input.empty() ? nullptr : Input(input);
+        const auto destination = output.empty() ? nullptr : Output(output);
+        auto status = Cng([&] {
+            return encrypt
+                ? BCryptEncrypt(key_, source, static_cast<ULONG>(input.size()), &auth,
+                    nullptr, 0, destination, static_cast<ULONG>(output.size()), &written, 0)
+                : BCryptDecrypt(key_, source, static_cast<ULONG>(input.size()), &auth,
+                    nullptr, 0, destination, static_cast<ULONG>(output.size()), &written, 0);
+        });
+        if (status >= 0 && written != input.size()) status = static_cast<NTSTATUS>(0xC0000001UL);
+        return status;
+    }
 private:
     // Destruction order: key handle, owned object bytes, algorithm handle.
     Algorithm algorithm_;
     SecureBytes object_;
     BCRYPT_KEY_HANDLE key_ = nullptr;
 };
+
+CryptoResult GcmTransform(std::span<const std::byte> key, std::span<const std::byte> nonce,
+    std::span<const std::byte> input, std::span<const std::byte> aad, bool seal) noexcept
+{
+    if (key.size() != 32 || nonce.size() != 12 || (!seal && input.size() < kGcmTagBytes))
+        return Fail(CryptoError::InvalidArgument);
+    // Check before addition/subtraction, allocation, narrowing or provider use.
+    if (input.size() > (seal ? kMaxGcmRecordBytes - kGcmTagBytes : kMaxGcmRecordBytes) ||
+        aad.size() > kMaxGcmAadBytes)
+        return Fail(CryptoError::ResourceLimit);
+    const auto data_size = seal ? input.size() : input.size() - kGcmTagBytes;
+    Aes aes;
+    auto init = aes.Init(key, true);
+    if (!init) return init;
+    auto result = SecureBytes::Allocate(seal ? data_size + kGcmTagBytes : data_size);
+    if (!result) return result;
+    const auto data = seal ? input : input.first(data_size);
+    const auto tag = seal ? Output(result.bytes.Bytes().subspan(data_size))
+                          : Input(input.last(kGcmTagBytes));
+    const auto status = aes.Gcm(data, nonce, aad, tag, result.bytes.Bytes().first(data_size), seal);
+    // STATUS_AUTH_TAG_MISMATCH from the Windows SDK ntstatus.h. All other CNG
+    // errors stay ProviderFailure. The local locked result is wiped on failure;
+    // no plaintext owner can leave this function before authentication succeeds.
+    if (status < 0) return Fail(!seal && status == static_cast<NTSTATUS>(0xC000A002UL)
+        ? CryptoError::IntegrityFailure : CryptoError::ProviderFailure, status);
+    return result;
+}
 
 void Release(std::byte* data, std::size_t size, bool locked) noexcept
 {
@@ -260,6 +317,18 @@ CryptoResult Rfc3394Unwrap(std::span<const std::byte> kek,
     if (!result) return result;
     std::memcpy(result.bytes.Bytes().data(), buffer.data() + 8, result.bytes.Size());
     return result;
+}
+
+CryptoResult Aes256GcmSeal(std::span<const std::byte> key, std::span<const std::byte> nonce,
+    std::span<const std::byte> plaintext, std::span<const std::byte> aad) noexcept
+{
+    return GcmTransform(key, nonce, plaintext, aad, true);
+}
+
+CryptoResult Aes256GcmOpen(std::span<const std::byte> key, std::span<const std::byte> nonce,
+    std::span<const std::byte> record, std::span<const std::byte> aad) noexcept
+{
+    return GcmTransform(key, nonce, record, aad, false);
 }
 
 CryptoResult XtsTransform(std::span<const std::byte> combined_key,

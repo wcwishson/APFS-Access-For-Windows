@@ -48,6 +48,15 @@ public sealed class FsHostSupervisorEvidence
     public string? LaunchRecordPath { get; init; }
     public string EvidenceFile { get; init; } = string.Empty;
     public string? MountPoint { get; init; }
+    public FsHostContainerManifestAuthority? ContainerManifestAuthority { get; set; }
+    public IReadOnlyList<FsHostCohortMountProof> MountProofs { get; set; } = Array.Empty<FsHostCohortMountProof>();
+    public bool JobMembersAbsent { get; set; }
+    public bool CohortKeeperActive { get; set; }
+    public int? CohortKeeperPid { get; set; }
+    public string? CohortKeeperReason { get; set; }
+    public DateTime? CohortKeeperStartedUtc { get; set; }
+    public DateTime? CohortKeeperCompletedUtc { get; set; }
+    public bool FailedQuarantineChildAbsent { get; set; }
     public string? StatusFile { get; init; }
     public DateTime StartedUtc { get; init; }
     public DateTime? LaunchProvenUtc { get; set; }
@@ -79,6 +88,14 @@ public sealed class FsHostSupervisorEvidence
     public string MountDirectProbeResult { get; set; } = "not-probed";
     public string MountStatusProbeResult { get; set; } = "not-requested";
     public bool MountAbsenceProven { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool StaleReadyStatusDischarged { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? StaleReadyStatusSha256 { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public FsHostCohortCrashBinding? CohortCrashBinding { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public FsHostCohortCrashProof? CohortCrashProof { get; set; }
     public string? MountProbeFailure { get; set; }
     public bool ExactProcessTerminationAttempted { get; set; }
     public string ExactProcessTerminationResult { get; set; } = "not-needed";
@@ -102,6 +119,28 @@ public sealed class FsHostSupervisorEvidence
     public string? FailureDetails { get; set; }
 }
 
+public sealed record FsHostContainerManifestVolume(
+    string ObjectId, string ContainerUuid, string Name, string MountPoint,
+    bool RequestedWrite, string RecoveryIdentity);
+
+public sealed record FsHostContainerManifestAuthority(
+    string ManifestPath, string ContentSha256, string ManifestSha256,
+    string ContainerUuid, string DeviceId, string DeviceOffsetBytes,
+    IReadOnlyList<FsHostContainerManifestVolume> Volumes);
+
+public sealed record FsHostCohortMountProof(
+    string ObjectId, string MountPoint, string RecoveryIdentity, string DirectState, string Detail);
+
+public sealed record FsHostCohortCrashBinding(string RunNonce, string NativeSha256);
+
+public sealed record FsHostCohortAliasProof(string ObjectId, string MountPoint, string LocalState, string GlobalState);
+
+public sealed record FsHostCohortCrashProof(
+    string Contract, string RunNonce, string NativeSha256, string SupervisorSha256,
+    string SupervisorPayloadSha256, string ManifestContentSha256, string StatusSha256,
+    string StatusVolumeSerial, string StatusFileId, bool OriginalLeaseReleased,
+    IReadOnlyList<FsHostCohortAliasProof> Aliases);
+
 public sealed record FsHostSupervisorResult(int ExitCode, FsHostSupervisorEvidence Evidence)
 {
     public bool Success => ExitCode == 0;
@@ -111,9 +150,15 @@ internal sealed class FsHostSupervisorTestHooks
 {
     public Func<bool>? AssignProcessToJobObjectOverride { get; init; }
     public Func<bool>? StartQuarantineOwnerOverride { get; init; }
+    public SafeHandle? FailedQuarantineChildHandle { get; init; }
+    public Action<FsHostSupervisorEvidence, SafeHandle, SafeHandle, FileStream, SafeHandle?>? CohortKeeperEntered { get; init; }
     public Func<uint, uint, uint>? WaitForSingleObjectOverride { get; init; }
+    public Func<SafeHandle, uint, uint, uint?>? WaitForHandleOverride { get; init; }
     public Func<string, FsHostMountProbeResult>? MountPointProbeOverride { get; init; }
+    public Func<string, FsHostMountProbeResult>? CohortAliasProbeOverride { get; init; }
+    public Func<string?>? CohortNonceOverride { get; init; }
     public Func<uint, long, string>? ObserveProcessIdentityOverride { get; init; }
+    public Action<FsHostSupervisorEvidence>? BeforeEvidencePublication { get; init; }
     public nint? ExcludedInheritableHandle { get; init; }
 }
 
@@ -143,13 +188,12 @@ internal sealed record QuarantineOptions(
     string HandoffToken,
     nint? TestExcludedHandle);
 
-internal sealed record QuarantineOwnerStartResult(
-    bool OwnershipTransferred,
-    bool ChildTerminationProven,
-    Exception? Failure);
-
 public static class FsHostSupervisor
 {
+    private sealed record QuarantineOwnerStartResult(
+        bool OwnershipTransferred, bool ChildTerminationProven, Exception? Failure,
+        SafeNativeHandle? FailedChildHandle = null);
+
     private const uint CreateSuspended = 0x00000004;
     private const uint CreateUnicodeEnvironment = 0x00000400;
     private const uint CreateNoWindow = 0x08000000;
@@ -176,6 +220,8 @@ public static class FsHostSupervisor
     private const uint WaitKindProcess = 1;
     private const uint WaitKindOwner = 2;
     private const uint WaitKindQuarantine = 3;
+    private const int MaxManifestBytes = 1024 * 1024;
+    private const int MaxCohortVolumes = 100;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -244,7 +290,7 @@ public static class FsHostSupervisor
             SupervisorPayloadSha256 = ComputeSha256(supervisorPayloadPath),
             OwnerPid = ownerPid,
             HostExecutable = hostPath,
-            HostArguments = options.HostArguments.ToArray(),
+            HostArguments = Array.AsReadOnly(options.HostArguments.ToArray()),
             WorkingDirectory = workingDirectory,
             LifetimeFile = Path.GetFullPath(options.LifetimeFile),
             StartupGateFile = NormalizeOptionalPath(options.StartupGateFile),
@@ -260,6 +306,8 @@ public static class FsHostSupervisor
         SafeNativeHandle? jobHandle = null;
         SafeNativeHandle? processHandle = null;
         SafeNativeHandle? threadHandle = null;
+        FileStream? manifestLease = null;
+        SafeNativeHandle? failedQuarantineChildHandle = null;
         SupervisedCredential? credential = null;
         var finalExitCode = 1;
         var ownershipTransferredToQuarantine = false;
@@ -268,6 +316,21 @@ public static class FsHostSupervisor
         {
             PrepareEvidencePath(evidence.EvidenceFile);
             WriteEvidence(evidence);
+            if (evidence.HostArguments.Contains("--container-manifest") || evidence.HostArguments.Contains("--container-manifest-sha256"))
+            {
+                var manifestPath = ExactManifestArgument(evidence.HostArguments, "--container-manifest");
+                RequireNoReparsePath(manifestPath);
+                manifestLease = new FileStream(manifestPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                evidence.ContainerManifestAuthority = ReadContainerManifestAuthority(evidence.HostArguments);
+                var nonce = TestHooks.Value?.CohortNonceOverride is { } readNonce ? readNonce() :
+                    Environment.GetEnvironmentVariable("APFSACCESS_SUPERVISOR_COHORT_NONCE");
+                if (nonce is not null)
+                {
+                    if (nonce.Length != 32 || nonce.Any(c => !(c is >= '0' and <= '9' or >= 'a' and <= 'f')))
+                        throw new InvalidOperationException("Invalid cohort supervisor nonce.");
+                    evidence.CohortCrashBinding = new(nonce, ComputeSha256(hostPath));
+                }
+            }
             ValidateOptions(options, hostPath, workingDirectory, evidence);
 
             ownerHandle = OpenOwner(ownerPid);
@@ -291,7 +354,7 @@ public static class FsHostSupervisor
             jobHandle = CreateKillOnCloseJob();
             evidence.JobCreated = true;
 
-            var launch = CreateSuspendedChild(hostPath, options.HostArguments, workingDirectory, credential?.Reader);
+            var launch = CreateSuspendedChild(hostPath, evidence.HostArguments, workingDirectory, credential?.Reader);
             processHandle = launch.ProcessHandle;
             threadHandle = launch.ThreadHandle;
             credential?.ReleaseLocalReader();
@@ -310,6 +373,7 @@ public static class FsHostSupervisor
             }
 
             evidence.JobAssigned = true;
+            ValidateManifestAuthority(evidence);
             cancellationToken.ThrowIfCancellationRequested();
             if (WaitForObject(ownerHandle, 0, WaitKindOwner, "WaitForSingleObject(owner)") == WaitObject0)
             {
@@ -337,6 +401,7 @@ public static class FsHostSupervisor
                     throw new InvalidOperationException("A startup-gate file requires a startup-gate token.");
                 }
 
+                ValidateManifestAuthority(evidence);
                 WriteAtomicText(evidence.StartupGateFile, options.StartupGateToken);
                 evidence.StartupGateAuthorized = true;
             }
@@ -459,16 +524,16 @@ public static class FsHostSupervisor
 
             try
             {
-                var mountProof = WaitForMountAbsence(
-                    evidence.MountPoint,
-                    evidence.StatusFile,
-                    options.ProcessAbsenceTimeoutMs);
+                var mountProof = WaitForEvidenceMountAbsence(evidence, options.ProcessAbsenceTimeoutMs);
                 evidence.MountAbsentFromDirectProbe = mountProof.DirectAbsent;
                 evidence.MountAbsentFromStatus = mountProof.StatusAbsent;
                 evidence.MountDirectProbeResult = mountProof.DirectResult;
                 evidence.MountStatusProbeResult = mountProof.StatusResult;
-                evidence.MountAbsenceProven = mountProof.DirectAbsent &&
-                    mountProof.StatusResult is not ("ready" or "error");
+                evidence.StaleReadyStatusDischarged = TryProveExitedDirectoryStaleReady(
+                    evidence, mountProof, processHandle, jobHandle);
+                evidence.CohortCrashProof = TryProveExitedCohortStaleReady(evidence, mountProof, processHandle, jobHandle);
+                evidence.MountAbsenceProven = IsMountSettlementProven(evidence, mountProof) ||
+                    evidence.StaleReadyStatusDischarged || evidence.CohortCrashProof is not null;
                 if (mountProof.Failure is not null)
                 {
                     evidence.MountProbeFailure = mountProof.Failure;
@@ -490,7 +555,7 @@ public static class FsHostSupervisor
             {
                 evidence.Failure ??= "The FsHost mount was not proven absent by a direct Windows mount-point probe.";
             }
-            else if (evidence.MountStatusProbeResult is "ready" or "error")
+            else if (!evidence.StaleReadyStatusDischarged && evidence.CohortCrashProof is null && evidence.MountStatusProbeResult is ("ready" or "error"))
             {
                 evidence.Failure ??= evidence.MountStatusProbeResult == "ready"
                     ? "The FsHost status file still reports the mount as ready."
@@ -504,8 +569,7 @@ public static class FsHostSupervisor
                 evidence.Failure ??= "Forced Job Object termination was not proven.";
             }
 
-            var ownershipProven = evidence.OriginalHostIdentityAbsent &&
-                evidence.MountAbsentFromDirectProbe;
+            var ownershipProven = IsOwnershipProven(evidence, jobHandle);
             var quarantineChildTerminationProven = true;
             if (!ownershipProven && jobHandle is not null && processHandle is not null)
             {
@@ -522,6 +586,7 @@ public static class FsHostSupervisor
                         processHandle);
                     ownershipTransferredToQuarantine = quarantineStart.OwnershipTransferred;
                     quarantineChildTerminationProven = quarantineStart.ChildTerminationProven;
+                    failedQuarantineChildHandle = quarantineStart.FailedChildHandle;
                     if (quarantineStart.Failure is not null)
                     {
                         RecordFailure(
@@ -560,8 +625,19 @@ public static class FsHostSupervisor
                 }
             }
 
+            if (evidence.ContainerManifestAuthority is not null && !ownershipProven &&
+                !ownershipTransferredToQuarantine && jobHandle is not null && processHandle is not null)
+            {
+                evidence = await KeepCohortOwnershipUntilProvenAsync(evidence, jobHandle, processHandle, manifestLease,
+                    failedQuarantineChildHandle, null, quarantineChildTerminationProven
+                        ? "inline-deadline-or-cancellation" : "failed-child-termination-uncertain").ConfigureAwait(false);
+                ownershipProven = true;
+            }
+
             threadHandle?.Dispose();
             ownerHandle?.Dispose();
+            failedQuarantineChildHandle?.Dispose();
+            manifestLease?.Dispose();
             if (ownershipTransferredToQuarantine)
             {
                 processHandle?.Dispose();
@@ -1057,7 +1133,8 @@ public static class FsHostSupervisor
         uint waitKind,
         string operation)
     {
-        var result = TestHooks.Value?.WaitForSingleObjectOverride?.Invoke(milliseconds, waitKind) ??
+        var result = TestHooks.Value?.WaitForHandleOverride?.Invoke(handle, milliseconds, waitKind) ??
+            TestHooks.Value?.WaitForSingleObjectOverride?.Invoke(milliseconds, waitKind) ??
             NativeMethods.WaitForSingleObject(handle, milliseconds);
         return EnsureWaitResult(result, operation);
     }
@@ -1131,6 +1208,428 @@ public static class FsHostSupervisor
         bool IsAbsent,
         string Result,
         string? Failure);
+
+    internal static FsHostContainerManifestAuthority? ReadContainerManifestAuthorityForTests(IReadOnlyList<string> args)
+        => ReadContainerManifestAuthority(args);
+
+    internal static FsHostMountAbsenceResult WaitForCohortMountAbsenceForTests(FsHostSupervisorEvidence evidence, int timeoutMs)
+        => WaitForEvidenceMountAbsence(evidence, timeoutMs);
+
+    internal static string ReadContainerStatusForTests(FsHostSupervisorEvidence evidence)
+        => ReadContainerStatus(evidence).Result;
+
+    internal static bool CanReleaseCohortForTests(FsHostSupervisorEvidence evidence, uint activeProcesses)
+        => IsCohortOwnershipProven(evidence, activeProcesses);
+
+    internal static string SealCohortHandoffForTests(FsHostSupervisorEvidence evidence)
+        => SealCohortHandoff(evidence)!;
+
+    private static string ExactManifestArgument(IReadOnlyList<string> args, string flag)
+    {
+        if (args.Count(value => value == flag) != 1) throw new InvalidOperationException($"Manifest requires exactly one {flag}.");
+        var index = args.ToList().IndexOf(flag);
+        if (index + 1 >= args.Count || string.IsNullOrEmpty(args[index + 1]) || args[index + 1].StartsWith("--") || args[index + 1].Contains('\0'))
+            throw new InvalidOperationException($"Invalid manifest selector {flag}.");
+        return args[index + 1];
+    }
+
+    private static void RequireNoReparsePath(string path)
+    {
+        if (!Path.IsPathFullyQualified(path) || path[Path.GetPathRoot(path)!.Length..].Contains(':'))
+            throw new InvalidOperationException("Manifest authority requires an absolute path without alternate streams.");
+        for (var current = Path.GetFullPath(path); ; current = Path.GetDirectoryName(current)!)
+        {
+            if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidOperationException("Manifest authority path contains a reparse point.");
+            if (Path.GetDirectoryName(current) is null) break;
+        }
+    }
+
+    private static void ValidateUniqueJsonProperties(JsonElement element, int depth = 0)
+    {
+        if (depth > 32) throw new InvalidOperationException("Authority JSON nesting exceeds bound.");
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var property in element.EnumerateObject())
+            {
+                if (!names.Add(property.Name)) throw new InvalidOperationException("Duplicate authority JSON property.");
+                ValidateUniqueJsonProperties(property.Value, depth + 1);
+            }
+        }
+        else if (element.ValueKind == JsonValueKind.Array)
+            foreach (var item in element.EnumerateArray()) ValidateUniqueJsonProperties(item, depth + 1);
+    }
+
+    private static string ManifestText(JsonElement root, string key, bool optional = false)
+    {
+        if (optional && !root.TryGetProperty(key, out _)) return string.Empty;
+        var property = root.GetProperty(key);
+        if (property.ValueKind != JsonValueKind.String) throw new InvalidOperationException($"Invalid manifest {key}.");
+        var value = property.GetString()!;
+        if ((!optional && value.Length == 0) || value.IndexOfAny(['\0', '\r', '\n']) >= 0 || Encoding.UTF8.GetByteCount(value) > 32768)
+            throw new InvalidOperationException($"Invalid manifest {key}.");
+        return value;
+    }
+
+    private static string AuthorityDecimal(JsonElement value, bool zero = false)
+    {
+        var text = value.ValueKind == JsonValueKind.String ? value.GetString()! : value.GetRawText();
+        if (!ulong.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var number) ||
+            (!zero && number == 0) || text != number.ToString(CultureInfo.InvariantCulture))
+            throw new InvalidOperationException("Invalid authority unsigned integer.");
+        return text;
+    }
+
+    private static string NormalizeCohortMountPoint(string mount)
+    {
+        if (IsDriveMountPoint(mount) && char.IsAsciiLetter(mount[0])) return mount[..2].ToUpperInvariant();
+        if (!Path.IsPathFullyQualified(mount) || mount[Path.GetPathRoot(mount)!.Length..].Contains(':'))
+            throw new InvalidOperationException("Manifest mount must be absolute or an exact drive root.");
+        var full = Path.GetFullPath(mount);
+        return full == Path.GetPathRoot(full) ? full : full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    }
+
+    private static FsHostContainerManifestAuthority? ReadContainerManifestAuthority(IReadOnlyList<string> args)
+    {
+        if (!args.Contains("--container-manifest") && !args.Contains("--container-manifest-sha256")) return null;
+        string[] scalarFlags = ["--device", "--volume", "--volume-oid", "--mount", "--mount-identity", "--recovery-identity",
+            "--snapshot-xid", "--encrypted-image", "--fusion-images", "--manifest"];
+        if (scalarFlags.Any(args.Contains)) throw new InvalidOperationException("Container manifest cannot mix scalar target selectors.");
+        var manifestPath = ExactManifestArgument(args, "--container-manifest");
+        RequireNoReparsePath(manifestPath);
+        manifestPath = Path.GetFullPath(manifestPath);
+        var launchHash = ExactManifestArgument(args, "--container-manifest-sha256").ToUpperInvariant();
+        if (launchHash.Length != 64 || launchHash.Any(c => !Uri.IsHexDigit(c))) throw new InvalidOperationException("Invalid launch-bound manifest checksum.");
+        using var stream = new FileStream(manifestPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        if (stream.Length <= 0 || stream.Length > MaxManifestBytes) throw new InvalidOperationException("Manifest byte bound exceeded.");
+        var bytes = new byte[checked((int)stream.Length)];
+        stream.ReadExactly(bytes);
+        RequireNoReparsePath(manifestPath);
+        using var document = JsonDocument.Parse(bytes, new JsonDocumentOptions { MaxDepth = 32 });
+        var raw = document.RootElement;
+        ValidateUniqueJsonProperties(raw);
+        var container = ManifestText(raw, "containerUuid");
+        if (ManifestText(raw, "format") != "apfs-access-container-manifest" || raw.GetProperty("version").GetInt32() != 1 ||
+            container.Length != 32 || container.Any(c => !(c is >= '0' and <= '9' or >= 'a' and <= 'f')))
+            throw new InvalidOperationException("Invalid container manifest schema.");
+        var device = ManifestText(raw, "device");
+        var offset = AuthorityDecimal(raw.GetProperty("deviceOffsetBytes"), zero: true);
+        var rawVolumes = raw.GetProperty("volumes");
+        if (rawVolumes.ValueKind != JsonValueKind.Array || rawVolumes.GetArrayLength() is < 1 or > MaxCohortVolumes)
+            throw new InvalidOperationException("Invalid container manifest cohort bound.");
+        var lines = new List<string> { "manifest-check-v1", container, device, offset };
+        var volumes = new List<FsHostContainerManifestVolume>();
+        var oids = new HashSet<string>();
+        var mounts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var recoveries = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var volume in rawVolumes.EnumerateArray())
+        {
+            var oid = AuthorityDecimal(volume.GetProperty("objectId"));
+            var mount = ManifestText(volume, "mount");
+            var mountPoint = NormalizeCohortMountPoint(mount);
+            var recovery = ManifestText(volume, "recoveryIdentity", optional: true);
+            var name = ManifestText(volume, "name", optional: true);
+            var requestedWrite = volume.GetProperty("requestedWrite").GetBoolean();
+            if (ManifestText(volume, "containerUuid") != container || (requestedWrite && recovery.Length == 0) ||
+                !oids.Add(oid) || !mounts.Add(mountPoint) || (recovery.Length != 0 && !recoveries.Add(recovery)))
+                throw new InvalidOperationException("Manifest cohort has duplicate or incomplete peer authority.");
+            lines.AddRange([oid, container, name, mount, requestedWrite ? "W" : "R", recovery]);
+            volumes.Add(new(oid, container, name, mountPoint, requestedWrite, recovery));
+        }
+        foreach (var a in volumes) foreach (var b in volumes)
+            if (a != b && b.MountPoint.StartsWith(a.MountPoint.TrimEnd('\\', '/') + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Manifest cohort mounts overlap.");
+        var checksum = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join('\n', lines) + "\n")));
+        if (checksum != launchHash || ManifestText(raw, "manifestSha256").ToUpperInvariant() != checksum)
+            throw new InvalidOperationException("Manifest launch-bound checksum mismatch.");
+        return new(manifestPath, Convert.ToHexString(SHA256.HashData(bytes)), checksum, container, device, offset, volumes.AsReadOnly());
+    }
+
+    private static void ValidateManifestAuthority(FsHostSupervisorEvidence evidence)
+    {
+        if (evidence.ContainerManifestAuthority is not { } authority) return;
+        var actual = ReadContainerManifestAuthority(evidence.HostArguments);
+        if (JsonSerializer.Serialize(actual, JsonOptions) != JsonSerializer.Serialize(authority, JsonOptions))
+            throw new InvalidOperationException("Container manifest content/path authority changed.");
+    }
+
+    private static MountStatusObservation ReadContainerStatus(FsHostSupervisorEvidence evidence)
+    {
+        try
+        {
+            using var stream = new FileStream(evidence.StatusFile!, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            if (stream.Length <= 0 || stream.Length > MaxManifestBytes) throw new InvalidOperationException("Container status byte bound exceeded.");
+            var bytes = new byte[checked((int)stream.Length)];
+            stream.ReadExactly(bytes);
+            return ParseContainerStatus(evidence, bytes);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException or KeyNotFoundException or FormatException)
+        {
+            return new(false, "error", ex.Message);
+        }
+    }
+
+    private static MountStatusObservation ParseContainerStatus(FsHostSupervisorEvidence evidence, byte[] bytes)
+    {
+            var authority = evidence.ContainerManifestAuthority ?? throw new InvalidOperationException("Container authority is missing.");
+            using var document = JsonDocument.Parse(bytes, new JsonDocumentOptions { MaxDepth = 32 });
+            var status = document.RootElement;
+            ValidateUniqueJsonProperties(status);
+            if (ManifestText(status, "containerUuid") != authority.ContainerUuid ||
+                status.GetProperty("ownerPid").GetInt32() != evidence.HostPid ||
+                AuthorityDecimal(status.GetProperty("ownerStartFileTimeUtc")) != evidence.HostCreationTimeFileTime?.ToString(CultureInfo.InvariantCulture))
+                throw new InvalidOperationException("Container status does not bind the original worker identity.");
+            var leaseHeld = status.GetProperty("leaseHeld").GetBoolean();
+            var volumes = status.GetProperty("volumes");
+            if (volumes.ValueKind != JsonValueKind.Array || volumes.GetArrayLength() > MaxCohortVolumes)
+                throw new InvalidOperationException("Invalid container status volume bound.");
+            if (volumes.GetArrayLength() == 0) return new(!leaseHeld, leaseHeld ? "pending" : "absent", null);
+            if (!leaseHeld || volumes.GetArrayLength() != authority.Volumes.Count)
+                throw new InvalidOperationException("Container status omitted an original peer.");
+            var seen = new HashSet<string>();
+            var ready = true;
+            foreach (var volume in volumes.EnumerateArray())
+            {
+                var oid = AuthorityDecimal(volume.GetProperty("objectId"));
+                var original = authority.Volumes.SingleOrDefault(v => v.ObjectId == oid);
+                var mounted = volume.GetProperty("mounted").GetBoolean();
+                var peerReady = volume.GetProperty("ready").GetBoolean();
+                if (original is null || !seen.Add(oid) || ManifestText(volume, "canonicalId") != $"apfs-vol:{authority.ContainerUuid}:{oid}" ||
+                    ManifestText(volume, "recoveryIdentity", optional: true) != original.RecoveryIdentity ||
+                    !string.Equals(NormalizeCohortMountPoint(ManifestText(volume, "mountPoint")), original.MountPoint, StringComparison.OrdinalIgnoreCase) ||
+                    (peerReady && !mounted))
+                    throw new InvalidOperationException("Container status peer authority mismatch.");
+                ready &= mounted && peerReady;
+            }
+            return new(false, ready ? "ready" : "pending", null);
+    }
+
+    private static bool IsMountSettlementProven(FsHostSupervisorEvidence evidence, FsHostMountAbsenceResult proof)
+        => proof.DirectAbsent && (evidence.ContainerManifestAuthority is null
+            ? proof.StatusResult is not ("ready" or "error") : proof.StatusAbsent && proof.StatusResult == "absent");
+
+    private static bool TryProveExitedDirectoryStaleReady(
+        FsHostSupervisorEvidence evidence, FsHostMountAbsenceResult proof,
+        SafeNativeHandle? processHandle, SafeNativeHandle? jobHandle)
+    {
+        evidence.StaleReadyStatusSha256 = null;
+        if (evidence.ContainerManifestAuthority is not null || !proof.DirectAbsent || proof.StatusResult != "ready" ||
+            proof.DirectResult is not ("directory-absent" or "directory-no-reparse") ||
+            evidence.MountPoint is not { } mount || !Path.IsPathFullyQualified(mount) ||
+            mount.StartsWith(@"\\", StringComparison.Ordinal) ||
+            string.Equals(Path.TrimEndingDirectorySeparator(mount), Path.TrimEndingDirectorySeparator(Path.GetPathRoot(mount)!), StringComparison.OrdinalIgnoreCase) ||
+            evidence.StopReason != "host-exited" || evidence.ForcedJobTermination || evidence.ExactProcessTerminationAttempted ||
+            !evidence.SupervisionProven || !evidence.JobCreated || !evidence.JobAssigned ||
+            !evidence.HostIdentityCaptured || evidence.HostPid is not > 0 || evidence.HostCreationTimeFileTime is not > 0 ||
+            evidence.HostExitCode is null || processHandle is null || processHandle.IsInvalid || processHandle.IsClosed ||
+            jobHandle is null || jobHandle.IsInvalid || jobHandle.IsClosed || string.IsNullOrWhiteSpace(evidence.StatusFile))
+            return false;
+
+        // A saved status bit is never ownership authority. Re-prove the original
+        // process and its entire assigned Job before accepting its stale record.
+        if (!WaitForOriginalProcessAbsence((uint)evidence.HostPid.Value, evidence.HostCreationTimeFileTime.Value,
+                processHandle, 0, evidence) || !evidence.HostPidAbsentFromProcessEnumeration || evidence.HostPidReused ||
+            !NativeMethods.QueryInformationJobObject(jobHandle, 1, out var accounting,
+                (uint)Marshal.SizeOf<JobBasicAccountingInformation>(), out _))
+            return false;
+        evidence.JobMembersAbsent = accounting.ActiveProcesses == 0;
+        if (!evidence.JobMembersAbsent) return false;
+
+        try
+        {
+            var info = new FileInfo(evidence.StatusFile);
+            if (!info.Exists || info.Length is <= 0 or > 1024 * 1024 ||
+                (info.Attributes & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0 ||
+                info.LastWriteTimeUtc.ToFileTimeUtc() < evidence.HostCreationTimeFileTime.Value)
+                return false;
+            var length = info.Length;
+            var modified = info.LastWriteTimeUtc;
+            using var stream = new FileStream(evidence.StatusFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            if (stream.Length != length) return false;
+            var bytes = new byte[(int)length];
+            stream.ReadExactly(bytes);
+            if (stream.ReadByte() != -1) return false;
+            info.Refresh();
+            if (bytes.Length != length || info.Length != length || info.LastWriteTimeUtc != modified) return false;
+            using var document = JsonDocument.Parse(bytes, new JsonDocumentOptions { MaxDepth = 32 });
+            if (document.RootElement.ValueKind != JsonValueKind.Object) return false;
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var property in document.RootElement.EnumerateObject())
+                if (!names.Add(property.Name)) return false;
+            if (!document.RootElement.TryGetProperty("mountReady", out var ready) || ready.ValueKind != JsonValueKind.True ||
+                !document.RootElement.TryGetProperty("hostPid", out var pid) || !pid.TryGetInt32(out var owner) || owner != evidence.HostPid)
+                return false;
+            evidence.StaleReadyStatusSha256 = Convert.ToHexString(SHA256.HashData(bytes));
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    private static bool HasCohortCrashProof(FsHostSupervisorEvidence evidence)
+    {
+        var authority = evidence.ContainerManifestAuthority;
+        var binding = evidence.CohortCrashBinding;
+        var proof = evidence.CohortCrashProof;
+        return authority is not null && binding is not null && proof is not null &&
+            proof.Contract == "container-manifest-crash-retirement-v1" && proof.OriginalLeaseReleased &&
+            binding.RunNonce.Length == 32 && binding.RunNonce.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f') &&
+            proof.RunNonce == binding.RunNonce && proof.NativeSha256 == binding.NativeSha256 && IsProofHash(proof.NativeSha256) &&
+            proof.SupervisorSha256 == evidence.SupervisorSha256 && IsProofHash(proof.SupervisorSha256) &&
+            proof.SupervisorPayloadSha256 == evidence.SupervisorPayloadSha256 && IsProofHash(proof.SupervisorPayloadSha256) &&
+            proof.ManifestContentSha256 == authority.ContentSha256 && IsProofHash(proof.StatusSha256) &&
+            ulong.TryParse(proof.StatusVolumeSerial, NumberStyles.None, CultureInfo.InvariantCulture, out _) &&
+            ulong.TryParse(proof.StatusFileId, NumberStyles.None, CultureInfo.InvariantCulture, out var fileId) && fileId != 0 &&
+            evidence.StopReason == "host-exited" && evidence.SupervisionProven && evidence.JobCreated && evidence.JobAssigned &&
+            evidence.OriginalHostIdentityAbsent && evidence.HostIdentityCaptured && evidence.HostIdentityState == "absent" &&
+            evidence.HostPid is > 0 && evidence.HostCreationTimeFileTime is > 0 && evidence.Failure is null &&
+            evidence.HostPidAbsentFromProcessEnumeration && !evidence.HostPidReused && evidence.HostExitCode is not null &&
+            !evidence.ForcedJobTermination && !evidence.ExactProcessTerminationAttempted &&
+            !evidence.MountAbsentFromStatus && evidence.MountStatusProbeResult == "ready" &&
+            proof.Aliases.Count == authority.Volumes.Count && authority.Volumes.All(v =>
+                IsDriveMountPoint(v.MountPoint) && proof.Aliases.Count(a => a.ObjectId == v.ObjectId &&
+                    a.MountPoint == v.MountPoint && a.LocalState == "absent" && a.GlobalState == "absent") == 1);
+    }
+
+    private static bool IsProofHash(string value)
+        => value.Length == 64 && value.All(c => c is >= '0' and <= '9' or >= 'A' and <= 'F');
+
+    private static FsHostMountProbeResult ProbeCohortDosAlias(string name)
+    {
+        if (TestHooks.Value?.CohortAliasProbeOverride is { } hook) return hook(name);
+        var buffer = new StringBuilder(32768);
+        if (NativeMethods.QueryDosDeviceW(name, buffer, buffer.Capacity) != 0)
+            return new(false, "drive-assigned", buffer.ToString());
+        var error = Marshal.GetLastWin32Error();
+        if (error == ErrorFileNotFound) return new(true, "drive-absent", "No DOS alias exists.");
+        throw new Win32Exception(error, "Unable to prove original cohort alias absence: " + name);
+    }
+
+    private static FsHostCohortCrashProof? TryProveExitedCohortStaleReady(
+        FsHostSupervisorEvidence evidence, FsHostMountAbsenceResult proof,
+        SafeNativeHandle? processHandle, SafeNativeHandle? jobHandle)
+    {
+        var authority = evidence.ContainerManifestAuthority;
+        var binding = evidence.CohortCrashBinding;
+        if (authority is null || binding is null || authority.Volumes.Any(v => !IsDriveMountPoint(v.MountPoint)) ||
+            !proof.DirectAbsent || proof.StatusResult != "ready" || proof.Failure is not null ||
+            evidence.StopReason != "host-exited" || evidence.Failure is not null ||
+            evidence.ForcedJobTermination || evidence.ExactProcessTerminationAttempted ||
+            !evidence.SupervisionProven || !evidence.JobCreated || !evidence.JobAssigned ||
+            !evidence.HostIdentityCaptured || evidence.HostPid is not > 0 || evidence.HostCreationTimeFileTime is not > 0 ||
+            evidence.HostExitCode is null || processHandle is null || processHandle.IsInvalid || processHandle.IsClosed ||
+            jobHandle is null || jobHandle.IsInvalid || jobHandle.IsClosed || string.IsNullOrWhiteSpace(evidence.StatusFile)) return null;
+        if (!WaitForOriginalProcessAbsence((uint)evidence.HostPid.Value, evidence.HostCreationTimeFileTime.Value,
+                processHandle, 0, evidence) || !evidence.HostPidAbsentFromProcessEnumeration || evidence.HostPidReused ||
+            !NativeMethods.QueryInformationJobObject(jobHandle, 1, out var accounting,
+                (uint)Marshal.SizeOf<JobBasicAccountingInformation>(), out _) || accounting.ActiveProcesses != 0) return null;
+        evidence.JobMembersAbsent = true;
+        try
+        {
+            ValidateManifestAuthority(evidence);
+            if (ComputeSha256(evidence.HostExecutable) != binding.NativeSha256 ||
+                ComputeSha256(evidence.SupervisorExecutable) != evidence.SupervisorSha256 ||
+                ComputeSha256(evidence.SupervisorPayloadPath) != evidence.SupervisorPayloadSha256) return null;
+            var aliases = new List<FsHostCohortAliasProof>();
+            foreach (var volume in authority.Volumes)
+            {
+                if (!ProbeCohortDosAlias(volume.MountPoint).IsAbsent || !ProbeCohortDosAlias(@"Global\" + volume.MountPoint).IsAbsent)
+                    return null;
+                aliases.Add(new(volume.ObjectId, volume.MountPoint, "absent", "absent"));
+            }
+            RequireNoReparsePath(evidence.StatusFile);
+            using var stream = new FileStream(evidence.StatusFile, FileMode.Open, FileAccess.Read, FileShare.Read);
+            if (stream.Length is <= 0 or > MaxManifestBytes ||
+                !NativeMethods.GetFileInformationByHandle(stream.SafeFileHandle, out var before) ||
+                (before.Attributes & (uint)(FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0 ||
+                before.LastWrite.ToInt64() < evidence.HostCreationTimeFileTime.Value) return null;
+            var bytes = new byte[checked((int)stream.Length)];
+            stream.ReadExactly(bytes);
+            if (stream.ReadByte() != -1 || ParseContainerStatus(evidence, bytes).Result != "ready" ||
+                !NativeMethods.GetFileInformationByHandle(stream.SafeFileHandle, out var after) ||
+                before.VolumeSerial != after.VolumeSerial || before.FileIndexHigh != after.FileIndexHigh || before.FileIndexLow != after.FileIndexLow ||
+                before.SizeHigh != after.SizeHigh || before.SizeLow != after.SizeLow || before.LastWrite.ToInt64() != after.LastWrite.ToInt64()) return null;
+            RequireNoReparsePath(evidence.StatusFile);
+            // The retained process and its complete Job are gone. These are the
+            // original generation's noninherited handles, not future admission.
+            var result = new FsHostCohortCrashProof("container-manifest-crash-retirement-v1", binding.RunNonce,
+                binding.NativeSha256, evidence.SupervisorSha256, evidence.SupervisorPayloadSha256, authority.ContentSha256,
+                Convert.ToHexString(SHA256.HashData(bytes)), before.VolumeSerial.ToString(CultureInfo.InvariantCulture),
+                (((ulong)before.FileIndexHigh << 32) | before.FileIndexLow).ToString(CultureInfo.InvariantCulture), true, aliases.AsReadOnly());
+            evidence.CohortCrashProof = result;
+            if (!HasCohortCrashProof(evidence)) { evidence.CohortCrashProof = null; return null; }
+            return result;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException or KeyNotFoundException or FormatException or Win32Exception)
+        {
+            evidence.CohortCrashProof = null;
+            return null;
+        }
+    }
+
+    private static FsHostMountAbsenceResult WaitForEvidenceMountAbsence(FsHostSupervisorEvidence evidence, int timeoutMs,
+        CancellationToken cancellationToken = default, DateTime? sharedDeadlineUtc = null)
+    {
+        if (evidence.ContainerManifestAuthority is not { } authority)
+            return WaitForMountAbsence(evidence.MountPoint, evidence.StatusFile, timeoutMs, cancellationToken, sharedDeadlineUtc);
+        evidence.MountProofs = Array.Empty<FsHostCohortMountProof>();
+        evidence.MountAbsenceProven = false;
+        evidence.MountAbsentFromDirectProbe = false;
+        evidence.MountAbsentFromStatus = false;
+        evidence.MountStatusProbeResult = "error";
+        evidence.CohortCrashProof = null;
+        var deadline = DateTime.UtcNow.AddMilliseconds(Math.Max(0, timeoutMs));
+        if (sharedDeadlineUtc is { } shared && shared < deadline) deadline = shared;
+        FsHostMountAbsenceResult result;
+        do
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            ValidateManifestAuthority(evidence);
+            var proofs = new List<FsHostCohortMountProof>();
+            foreach (var volume in authority.Volumes)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                FsHostMountProbeResult probe;
+                try { probe = TestHooks.Value?.MountPointProbeOverride?.Invoke(volume.MountPoint) ?? ProbeMountPointDirect(NormalizeMountPoint(volume.MountPoint)!); }
+                catch (Exception ex) { probe = new(false, "error", ex.Message); }
+                proofs.Add(new(volume.ObjectId, volume.MountPoint, volume.RecoveryIdentity, probe.IsAbsent ? "absent" : "present", probe.Detail));
+            }
+            evidence.MountProofs = proofs.AsReadOnly();
+            var status = ReadContainerStatus(evidence);
+            result = new(proofs.All(p => p.DirectState == "absent"), status.IsAbsent, "cohort-all-mounts", status.Result, status.Failure);
+            if (result.DirectAbsent && result.StatusAbsent) return result;
+            if (GetRemainingMilliseconds(deadline) > 0) WaitForCancellationOrTimeout(cancellationToken, deadline, 50);
+        } while (GetRemainingMilliseconds(deadline) > 0);
+        return result;
+    }
+
+    private static bool IsCohortOwnershipProven(FsHostSupervisorEvidence evidence, uint activeProcesses)
+    {
+        evidence.JobMembersAbsent = activeProcesses == 0;
+        var authority = evidence.ContainerManifestAuthority!;
+        return evidence.OriginalHostIdentityAbsent && evidence.JobMembersAbsent && evidence.MountAbsenceProven &&
+            (evidence.MountAbsentFromStatus && evidence.MountStatusProbeResult == "absent" ||
+                HasCohortCrashProof(evidence)) &&
+            evidence.MountProofs.Count == authority.Volumes.Count && authority.Volumes.All(v =>
+                evidence.MountProofs.Count(p => p.ObjectId == v.ObjectId && p.MountPoint == v.MountPoint &&
+                    p.RecoveryIdentity == v.RecoveryIdentity && p.DirectState == "absent") == 1);
+    }
+
+    private static bool IsOwnershipProven(FsHostSupervisorEvidence evidence, SafeNativeHandle? jobHandle)
+    {
+        if (evidence.ContainerManifestAuthority is null) return evidence.OriginalHostIdentityAbsent && evidence.MountAbsentFromDirectProbe;
+        if (jobHandle is null || jobHandle.IsClosed || jobHandle.IsInvalid) return false;
+        if (!NativeMethods.QueryInformationJobObject(jobHandle, 1, out var accounting,
+            (uint)Marshal.SizeOf<JobBasicAccountingInformation>(), out _))
+        {
+            evidence.JobMembersAbsent = false;
+            return false;
+        }
+        return IsCohortOwnershipProven(evidence, accounting.ActiveProcesses);
+    }
 
     private static FsHostMountAbsenceResult WaitForMountAbsence(
         string? mountPoint,
@@ -1300,7 +1799,7 @@ public static class FsHostSupervisor
 
         try
         {
-            using var stream = File.OpenRead(statusPath);
+            using var stream = new FileStream(statusPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             using var document = JsonDocument.Parse(stream);
             if (document.RootElement.TryGetProperty("mountReady", out var mountReady) &&
                 mountReady.ValueKind == JsonValueKind.True)
@@ -1332,7 +1831,9 @@ public static class FsHostSupervisor
     {
         if (TestHooks.Value?.StartQuarantineOwnerOverride is { } startOverride)
         {
-            return new QuarantineOwnerStartResult(startOverride(), true, null);
+            var failedChild = TestHooks.Value.FailedQuarantineChildHandle;
+            return new QuarantineOwnerStartResult(startOverride(), failedChild is null, null,
+                failedChild is null ? null : DuplicateInheritedHandle(failedChild));
         }
 
         SafeNativeHandle? inheritedJob = null;
@@ -1437,6 +1938,7 @@ public static class FsHostSupervisor
         catch (Exception exception)
         {
             var childTerminationProven = true;
+            SafeNativeHandle? retainedChild = null;
             if (quarantine is not null)
             {
                 try
@@ -1454,14 +1956,18 @@ public static class FsHostSupervisor
                         cleanupException);
                 }
 
-                try { quarantine.ProcessHandle.Dispose(); } catch { }
+                if (!childTerminationProven && evidence.ContainerManifestAuthority is not null)
+                    retainedChild = quarantine.ProcessHandle;
+                else
+                    try { quarantine.ProcessHandle.Dispose(); } catch { }
                 try { quarantine.ThreadHandle.Dispose(); } catch { }
             }
 
             return new QuarantineOwnerStartResult(
                 OwnershipTransferred: false,
                 ChildTerminationProven: childTerminationProven,
-                Failure: exception);
+                Failure: exception,
+                FailedChildHandle: retainedChild);
         }
         finally
         {
@@ -1527,7 +2033,7 @@ public static class FsHostSupervisor
         return processExited;
     }
 
-    private static SafeNativeHandle DuplicateInheritedHandle(SafeNativeHandle source)
+    private static SafeNativeHandle DuplicateInheritedHandle(SafeHandle source)
     {
         if (!NativeMethods.DuplicateHandle(
                 NativeMethods.GetCurrentProcess(),
@@ -1578,7 +2084,7 @@ public static class FsHostSupervisor
         AppendArgument(commandLine, "--host-pid", (evidence.HostPid ?? 0).ToString(CultureInfo.InvariantCulture));
         AppendArgument(commandLine, "--host-creation-time", (evidence.HostCreationTimeFileTime ?? 0).ToString(CultureInfo.InvariantCulture));
         AppendArgument(commandLine, "--job-assigned", evidence.JobAssigned ? "true" : "false");
-        AppendArgument(commandLine, "--mount-point", evidence.MountPoint ?? string.Empty);
+        AppendArgument(commandLine, "--mount-point", SealCohortHandoff(evidence) ?? evidence.MountPoint ?? string.Empty);
         AppendArgument(commandLine, "--status-file", evidence.StatusFile ?? string.Empty);
         AppendArgument(commandLine, "--evidence-file", evidence.EvidenceFile);
         AppendArgument(commandLine, "--ready-file", readyPath);
@@ -1593,6 +2099,57 @@ public static class FsHostSupervisor
                 testExcludedHandle.Value.ToInt64().ToString(CultureInfo.InvariantCulture));
         }
         return commandLine;
+    }
+
+    private sealed record CohortHandoff(FsHostContainerManifestAuthority Authority, IReadOnlyList<string> HostArguments);
+    private const string CohortHandoffPrefix = "cohort-sha256:";
+
+    private static string? SealCohortHandoff(FsHostSupervisorEvidence evidence)
+    {
+        if (evidence.ContainerManifestAuthority is not { } authority) return null;
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(new CohortHandoff(authority, evidence.HostArguments), JsonOptions);
+        if (bytes.Length > MaxManifestBytes) throw new InvalidOperationException("Cohort handoff byte bound exceeded.");
+        var file = evidence.EvidenceFile + ".cohort.json";
+        if (!File.Exists(file))
+        {
+            using var stream = new FileStream(file, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+            stream.Write(bytes);
+            stream.Flush(flushToDisk: true);
+        }
+        RequireNoReparsePath(file);
+        var digest = Convert.ToHexString(SHA256.HashData(bytes));
+        if (ComputeSha256(file) != digest) throw new InvalidOperationException("Cohort handoff snapshot changed.");
+        return CohortHandoffPrefix + digest;
+    }
+
+    private static CohortHandoff? ReadCohortHandoff(QuarantineOptions options)
+    {
+        if (!options.MountPoint.StartsWith(CohortHandoffPrefix, StringComparison.Ordinal)) return null;
+        var file = options.EvidenceFile + ".cohort.json";
+        RequireNoReparsePath(file);
+        if (new FileInfo(file).Length > MaxManifestBytes || ComputeSha256(file) != options.MountPoint[CohortHandoffPrefix.Length..])
+            throw new InvalidOperationException("Quarantine cohort handoff digest mismatch.");
+        var handoff = JsonSerializer.Deserialize<CohortHandoff>(File.ReadAllBytes(file), JsonOptions)
+            ?? throw new InvalidOperationException("Quarantine cohort handoff is missing.");
+        var actual = ReadContainerManifestAuthority(handoff.HostArguments);
+        if (actual is null || JsonSerializer.Serialize(actual, JsonOptions) != JsonSerializer.Serialize(handoff.Authority, JsonOptions))
+            throw new InvalidOperationException("Quarantine manifest authority changed.");
+        return handoff;
+    }
+
+    private static void RestoreCohortHandoff(FsHostSupervisorEvidence evidence, QuarantineOptions options)
+    {
+        var handoff = ReadCohortHandoff(options);
+        if (handoff is null)
+        {
+            if (evidence.ContainerManifestAuthority is not null) throw new InvalidOperationException("Quarantine cohort lost its immutable authority.");
+            return;
+        }
+        if (evidence.MountPoint is not null || evidence.StatusFile != options.StatusFile ||
+            !evidence.HostArguments.SequenceEqual(handoff.HostArguments) ||
+            JsonSerializer.Serialize(evidence.ContainerManifestAuthority, JsonOptions) != JsonSerializer.Serialize(handoff.Authority, JsonOptions))
+            throw new InvalidOperationException("Quarantine cohort evidence differs from the inherited authority.");
+        evidence.ContainerManifestAuthority = handoff.Authority;
     }
 
     private static ChildLaunch CreateRestrictedHandleChild(
@@ -1794,10 +2351,8 @@ public static class FsHostSupervisor
         SafeNativeHandle processHandle,
         CancellationToken cancellationToken)
     {
-        // This is reached only if a separate quarantine owner could not be
-        // started. Keep the enforcement handles alive rather than returning
-        // with an unowned host; the bounded loop ends as soon as both proofs
-        // succeed.
+        // Scalar cancellation stays bounded. Unsettled cohorts continue in
+        // the awaited enforcement keeper after this diagnostic deadline.
         evidence.Status = "quarantined";
         var deadline = DateTime.UtcNow.AddMilliseconds(Math.Max(250, processAbsenceTimeoutMs));
         try
@@ -1835,9 +2390,8 @@ public static class FsHostSupervisor
 
                 cancellationToken.ThrowIfCancellationRequested();
                 if (GetRemainingMilliseconds(deadline) <= 0) break;
-                var mountProof = WaitForMountAbsence(
-                    evidence.MountPoint,
-                    evidence.StatusFile,
+                var mountProof = WaitForEvidenceMountAbsence(
+                    evidence,
                     Math.Min(1000, GetRemainingMilliseconds(deadline)),
                     cancellationToken,
                     deadline);
@@ -1845,10 +2399,8 @@ public static class FsHostSupervisor
                 evidence.MountAbsentFromStatus = mountProof.StatusAbsent;
                 evidence.MountDirectProbeResult = mountProof.DirectResult;
                 evidence.MountStatusProbeResult = mountProof.StatusResult;
-                evidence.MountAbsenceProven = mountProof.DirectAbsent &&
-                    mountProof.StatusResult is not ("ready" or "error");
-                if (evidence.OriginalHostIdentityAbsent &&
-                    evidence.MountAbsentFromDirectProbe)
+                evidence.MountAbsenceProven = IsMountSettlementProven(evidence, mountProof);
+                if (IsOwnershipProven(evidence, jobHandle))
                 {
                     return true;
                 }
@@ -1897,12 +2449,114 @@ public static class FsHostSupervisor
         return false;
     }
 
+    private static async Task<FsHostSupervisorEvidence> KeepCohortOwnershipUntilProvenAsync(
+        FsHostSupervisorEvidence? evidence,
+        SafeNativeHandle jobHandle,
+        SafeNativeHandle processHandle,
+        FileStream? manifestLease,
+        SafeNativeHandle? failedChildHandle,
+        QuarantineOptions? recoveryOptions,
+        string reason)
+    {
+        var recovered = recoveryOptions is null;
+        var entered = false;
+        var leaseOwnedHere = manifestLease is null;
+        while (true)
+        {
+            try
+            {
+                if (!recovered)
+                {
+                    var failure = evidence?.Failure;
+                    var details = evidence?.FailureDetails;
+                    evidence = CreateQuarantineRecoveryEvidence(recoveryOptions!, evidence?.EvidenceRevision ?? 0);
+                    evidence.Failure = failure ?? "The durable quarantine owner failed.";
+                    evidence.FailureDetails = details;
+                    recovered = true;
+                }
+                var authority = evidence!.ContainerManifestAuthority ??
+                    throw new InvalidOperationException("Cohort enforcement authority is unavailable.");
+                manifestLease ??= new FileStream(authority.ManifestPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                if (!entered)
+                {
+                    evidence.CohortKeeperActive = true;
+                    evidence.CohortKeeperPid = Environment.ProcessId;
+                    evidence.CohortKeeperReason = reason;
+                    evidence.CohortKeeperStartedUtc = DateTime.UtcNow;
+                    evidence.CompletedUtc = null;
+                    evidence.QuarantineRequired = true;
+                    evidence.Status = "quarantined";
+                    evidence.SupervisorExitCode = 1;
+                    entered = true;
+                    TestHooks.Value?.CohortKeeperEntered?.Invoke(evidence, jobHandle, processHandle, manifestLease, failedChildHandle);
+                }
+
+                evidence.FailedQuarantineChildAbsent = failedChildHandle is null ||
+                    WaitForObject(failedChildHandle, 0, WaitKindQuarantine, "WaitForSingleObject(retained failed quarantine child)") == WaitObject0;
+                evidence.OriginalHostIdentityAbsent = false;
+                evidence.MountAbsenceProven = false;
+                evidence.JobMembersAbsent = false;
+                ForceTerminateHost(evidence, jobHandle, processHandle, 250);
+                if (evidence.HostPid is not null && evidence.HostIdentityCaptured && evidence.HostCreationTimeFileTime is not null)
+                    evidence.OriginalHostIdentityAbsent = WaitForOriginalProcessAbsence(
+                        checked((uint)evidence.HostPid.Value), evidence.HostCreationTimeFileTime.Value,
+                        processHandle, 250, evidence);
+                var mountProof = WaitForEvidenceMountAbsence(evidence, 0);
+                evidence.MountAbsentFromDirectProbe = mountProof.DirectAbsent;
+                evidence.MountAbsentFromStatus = mountProof.StatusAbsent;
+                evidence.MountDirectProbeResult = mountProof.DirectResult;
+                evidence.MountStatusProbeResult = mountProof.StatusResult;
+                evidence.MountAbsenceProven = IsMountSettlementProven(evidence, mountProof);
+                if (IsOwnershipProven(evidence, jobHandle) && evidence.FailedQuarantineChildAbsent)
+                {
+                    evidence.CohortKeeperActive = false;
+                    evidence.CohortKeeperCompletedUtc = DateTime.UtcNow;
+                    evidence.CompletedUtc = evidence.CohortKeeperCompletedUtc;
+                    evidence.Status = "failed";
+                    if (leaseOwnedHere) manifestLease.Dispose();
+                    return evidence;
+                }
+            }
+            catch (Exception ex)
+            {
+                if (evidence is not null)
+                {
+                    evidence.OriginalHostIdentityAbsent = false;
+                    evidence.MountAbsenceProven = false;
+                    evidence.JobMembersAbsent = false;
+                    RecordFailure(evidence, "Cohort enforcement proof remains unavailable; ownership is retained.", ex);
+                }
+            }
+
+            if (evidence is not null)
+            {
+                try
+                {
+                    // An unacknowledged child may still write the main evidence.
+                    if (failedChildHandle is not null && !evidence.FailedQuarantineChildAbsent)
+                        WriteAtomicJson(evidence.EvidenceFile + ".retained-owner.json", evidence);
+                    else WriteEvidence(evidence);
+                }
+                catch (Exception ex) { RecordFailure(evidence, "Unable to persist retained cohort ownership.", ex); }
+            }
+            // This awaited state keeps the CLI, original handles and manifest
+            // lease rooted. Caller cancellation cannot authorize their release.
+            await Task.Delay(250).ConfigureAwait(false);
+            GC.KeepAlive(jobHandle);
+            GC.KeepAlive(processHandle);
+            GC.KeepAlive(manifestLease);
+            GC.KeepAlive(failedChildHandle);
+        }
+    }
+
     internal static async Task<int> RunQuarantineAsync(QuarantineOptions options)
     {
         SafeNativeHandle? jobHandle = null;
         SafeNativeHandle? processHandle = null;
+        FileStream? manifestLease = null;
         var ownershipProven = false;
         var terminalEvidencePublished = false;
+        var evidenceAuthenticated = false;
         FsHostSupervisorEvidence? evidence = null;
         try
         {
@@ -1917,6 +2571,12 @@ public static class FsHostSupervisor
                 throw new InvalidOperationException("The quarantine ownership handoff token or state is invalid.");
             }
             ValidateCurrentSupervisorIdentity(evidence);
+            RestoreCohortHandoff(evidence, options);
+            if (evidence.ContainerManifestAuthority is { } authority)
+            {
+                manifestLease = new FileStream(authority.ManifestPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                ValidateManifestAuthority(evidence);
+            }
             ValidateInheritedHandle(jobHandle, "GetHandleInformation(quarantine job)");
             ValidateInheritedHandle(processHandle, "GetHandleInformation(quarantine process)");
             _ = WaitForObject(
@@ -1938,6 +2598,7 @@ public static class FsHostSupervisor
             evidence.EvidenceWriterPid = Environment.ProcessId;
             evidence.EvidenceWriterRole = "quarantine";
             evidence.OwnershipHandoffState = "accepted";
+            evidenceAuthenticated = true;
             WriteEvidence(evidence);
             WriteAtomicText(options.ReadyFile, options.ReadyToken);
 
@@ -1965,24 +2626,21 @@ public static class FsHostSupervisor
 
                 try
                 {
-                    var mountProof = WaitForMountAbsence(
-                        evidence.MountPoint,
-                        evidence.StatusFile,
+                    var mountProof = WaitForEvidenceMountAbsence(
+                        evidence,
                         Math.Min(1000, options.ProcessAbsenceTimeoutMs));
                     evidence.MountAbsentFromDirectProbe = mountProof.DirectAbsent;
                     evidence.MountAbsentFromStatus = mountProof.StatusAbsent;
                     evidence.MountDirectProbeResult = mountProof.DirectResult;
                     evidence.MountStatusProbeResult = mountProof.StatusResult;
-                    evidence.MountAbsenceProven = mountProof.DirectAbsent &&
-                        mountProof.StatusResult is not ("ready" or "error");
+                    evidence.MountAbsenceProven = IsMountSettlementProven(evidence, mountProof);
                 }
                 catch (Exception ex)
                 {
                     RecordFailure(evidence, "Quarantine could not prove mount absence.", ex);
                 }
 
-                if (evidence.OriginalHostIdentityAbsent &&
-                    evidence.MountAbsentFromDirectProbe)
+                if (IsOwnershipProven(evidence, jobHandle))
                 {
                     ownershipProven = true;
                     processHandle.Dispose();
@@ -2046,7 +2704,8 @@ public static class FsHostSupervisor
                 {
                 }
 
-                if ((evidence is null || !HasCurrentSupervisorIdentity(evidence)) &&
+                if (!evidenceAuthenticated &&
+                    (evidence is null || !HasCurrentSupervisorIdentity(evidence)) &&
                     processHandle is not null &&
                     !processHandle.IsInvalid)
                 {
@@ -2092,10 +2751,28 @@ public static class FsHostSupervisor
         }
         finally
         {
+            if (!ownershipProven && jobHandle is not null && processHandle is not null &&
+                (options.MountPoint.StartsWith(CohortHandoffPrefix, StringComparison.Ordinal) || evidence?.ContainerManifestAuthority is not null))
+            {
+                // Publication failure cannot erase already validated lineage.
+                // The keeper still refreshes every ownership-release proof.
+                evidence = await KeepCohortOwnershipUntilProvenAsync(evidence, jobHandle, processHandle,
+                    manifestLease, null, evidenceAuthenticated ? null : options, "quarantine-owner-recovery").ConfigureAwait(false);
+                ownershipProven = true;
+            }
             if (ownershipProven)
             {
                 processHandle?.Dispose();
                 jobHandle?.Dispose();
+                manifestLease?.Dispose();
+                if (evidence?.CohortKeeperCompletedUtc is not null)
+                {
+                    evidence.JobClosed = true;
+                    evidence.QuarantineCompletedUtc = DateTime.UtcNow;
+                    evidence.OwnershipHandoffState = "completed";
+                    try { WriteEvidence(evidence); }
+                    catch (Exception ex) { RecordFailure(evidence, "Unable to persist recovered cohort terminal evidence.", ex); }
+                }
             }
         }
     }
@@ -2119,7 +2796,12 @@ public static class FsHostSupervisor
             throw new InvalidOperationException("The lifetime file must exist before the supervised host is launched.");
         }
 
-        if (string.IsNullOrWhiteSpace(evidence.MountPoint))
+        if (evidence.ContainerManifestAuthority is not null)
+        {
+            if (evidence.MountPoint is not null || evidence.StatusFile is null)
+                throw new InvalidOperationException("Manifest cohort requires native status and no scalar mount point.");
+        }
+        else if (string.IsNullOrWhiteSpace(evidence.MountPoint))
         {
             throw new InvalidOperationException(
                 "The supervised host must provide an exact drive-letter or directory mount point for direct absence proof.");
@@ -2173,6 +2855,7 @@ public static class FsHostSupervisor
 
         evidence.EvidenceWriterPid = Environment.ProcessId;
         evidence.EvidenceRevision++;
+        TestHooks.Value?.BeforeEvidencePublication?.Invoke(evidence);
         WriteAtomicJson(evidence.EvidenceFile, evidence);
     }
 
@@ -2181,6 +2864,8 @@ public static class FsHostSupervisor
             evidence.SupervisionProven &&
             evidence.OriginalHostIdentityAbsent &&
             evidence.MountAbsenceProven &&
+            (!evidence.StaleReadyStatusDischarged || evidence.JobMembersAbsent) &&
+            (evidence.ContainerManifestAuthority is null || evidence.JobMembersAbsent) &&
             evidence.JobClosed;
 
     internal static FsHostSupervisorIdentityPaths ResolveSupervisorIdentityForTests(
@@ -2214,6 +2899,7 @@ public static class FsHostSupervisor
         long evidenceRevision)
     {
         var identity = ResolveSupervisorIdentity(supervisorExecutable);
+        var cohort = ReadCohortHandoff(options);
         return new FsHostSupervisorEvidence
         {
             SupervisorPid = Environment.ProcessId,
@@ -2226,7 +2912,9 @@ public static class FsHostSupervisor
             HostCreationTimeFileTime = options.HostCreationTimeFileTime,
             HostIdentityCaptured = options.HostCreationTimeFileTime > 0,
             HostIdentityState = "unknown",
-            MountPoint = options.MountPoint,
+            MountPoint = cohort is null ? options.MountPoint : null,
+            HostArguments = cohort?.HostArguments ?? Array.Empty<string>(),
+            ContainerManifestAuthority = cohort?.Authority,
             StatusFile = options.StatusFile,
             EvidenceFile = Path.GetFullPath(options.EvidenceFile),
             StartedUtc = DateTime.UtcNow,
@@ -2489,6 +3177,19 @@ public static class FsHostSupervisor
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    private struct JobBasicAccountingInformation
+    {
+        public long TotalUserTime;
+        public long TotalKernelTime;
+        public long ThisPeriodTotalUserTime;
+        public long ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount;
+        public uint TotalProcesses;
+        public uint ActiveProcesses;
+        public uint TotalTerminatedProcesses;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     private struct JobObjectExtendedLimitInformation
     {
         public JobObjectBasicLimitInformation BasicLimitInformation;
@@ -2534,6 +3235,14 @@ public static class FsHostSupervisor
             => ((long)HighDateTime << 32) | LowDateTime;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct StatusFileInformation
+    {
+        public uint Attributes;
+        public FileTime Creation, LastAccess, LastWrite;
+        public uint VolumeSerial, SizeHigh, SizeLow, Links, FileIndexHigh, FileIndexLow;
+    }
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct ProcessEntry32
     {
@@ -2552,6 +3261,11 @@ public static class FsHostSupervisor
 
     private static class NativeMethods
     {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool QueryInformationJobObject(SafeNativeHandle job, uint informationClass,
+            out JobBasicAccountingInformation information, uint length, out uint returnedLength);
+
         [DllImport("kernel32.dll", EntryPoint = "CreateProcessW", SetLastError = true, CharSet = CharSet.Unicode)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool CreateProcessW(
@@ -2694,6 +3408,10 @@ public static class FsHostSupervisor
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool CloseHandle(nint handle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetFileInformationByHandle(SafeFileHandle handle, out StatusFileInformation information);
     }
 
     private sealed class TestHookScope(FsHostSupervisorTestHooks? previous) : IDisposable

@@ -97,7 +97,6 @@ internal static class XattrCommand
                 ? value : throw new ArgumentException($"Missing {key}.");
             var path = ValidateFilePath(Required("--path"));
             var name = action == "list" ? null : Required("--name");
-            var stream = name is null ? null : path + StreamName(name);
             var allowed = action switch
             {
                 "list" => new[] { "--path" },
@@ -118,7 +117,8 @@ internal static class XattrCommand
                 input.ReadExactly(payload);
                 if (input.ReadByte() != -1) throw new IOException("Input changed while reading.");
             }
-            using var owner = OpenApfsOwner(path);
+            using var owner = OpenApfsOwner(path, out var streamOwnerPath);
+            var stream = name is null ? null : streamOwnerPath + StreamName(name);
             long? bytes = null;
             IReadOnlyList<AttributeInfo>? attributes = null;
             switch (action)
@@ -175,11 +175,11 @@ internal static class XattrCommand
         return fullPath;
     }
 
-    private static FileStream OpenApfsOwner(string path)
+    private static FileStream OpenApfsOwner(string path, out string streamOwnerPath)
     {
         // A live data-read stream open participates in base-file delete sharing.
         // Metadata-only opens would allow the pathname to be replaced during the operation.
-        var owner = OpenProtocol(path);
+        var owner = OpenProtocol(path, out streamOwnerPath);
         try
         {
             var name = new StringBuilder(64);
@@ -218,18 +218,31 @@ internal static class XattrCommand
 
     internal static void VerifyProviderProtocol(string path)
     {
-        using var protocol = OpenProtocol(path);
+        using var protocol = OpenProtocol(path, out _);
         ReadProviderProtocol(protocol);
     }
 
-    private static FileStream OpenProtocol(string path)
+    private static FileStream OpenProtocol(string path, out string streamOwnerPath)
     {
+        streamOwnerPath = path;
         try
         {
             return new FileStream(path + ProtocolStream, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         }
         catch (FileNotFoundException e)
         {
+            // A directory mount's root streams use the explicit dot component.
+            // Retain the successful protocol handle while accessing that spelling.
+            if (Directory.Exists(path))
+            {
+                streamOwnerPath = path.TrimEnd('\\', '/') + @"\.";
+                try
+                {
+                    return new FileStream(streamOwnerPath + ProtocolStream, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                }
+                catch (FileNotFoundException) { }
+                catch (IOException fallback) when ((fallback.HResult & 0xffff) == 123) { }
+            }
             throw new NotSupportedException("The path must belong to a mounted APFS volume providing durable attributes. Remount with the updated app.", e);
         }
     }

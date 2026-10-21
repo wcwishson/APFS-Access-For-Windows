@@ -24,7 +24,7 @@ public sealed class AdversarialDiscoveryTests
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
             ContainerHexA,
             [new ObserverEvidenceJson.VolumeJson("Data", 201),
-             new ObserverEvidenceJson.VolumeJson("Data", 202)]);
+             new ObserverEvidenceJson.VolumeJson("Data", 202)], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp);
 
         var volumes = (await backend.ProbeVolumesAsync(imagePath, CancellationToken.None))
@@ -57,7 +57,7 @@ public sealed class AdversarialDiscoveryTests
                 "P", Volumes: [new CatalogVolumeSpec("Data")])]));
         var evidence = ObserverEvidenceJson.BuildContainers(
             [(ContainerHexA, [new ObserverEvidenceJson.VolumeJson("Alpha", 101)]),
-             (ContainerHexB, [new ObserverEvidenceJson.VolumeJson("Beta", 101)])]);
+             (ContainerHexB, [new ObserverEvidenceJson.VolumeJson("Beta", 101)])], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp);
 
         var volumes = (await backend.ProbeVolumesAsync(imagePath, CancellationToken.None))
@@ -98,7 +98,7 @@ public sealed class AdversarialDiscoveryTests
                 "P", Volumes: [new CatalogVolumeSpec("Data")])]));
         var containerHex = ContainerHexOf(Assert.Single(fixture.Partitions).ContainerUuid);
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
-            containerHex, [new ObserverEvidenceJson.VolumeJson("Snap", 201)]);
+            containerHex, [new ObserverEvidenceJson.VolumeJson("Snap", 201)], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp);
         var attached = Assert.Single(
             await backend.ProbeVolumesAsync(imagePath, CancellationToken.None));
@@ -142,7 +142,7 @@ public sealed class AdversarialDiscoveryTests
             new CatalogFixtureSpec(16, [new CatalogPartitionSpec(
                 "P", Volumes: [new CatalogVolumeSpec("Data")])]));
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
-            ContainerHexA, [new ObserverEvidenceJson.VolumeJson("Snap", 201)]);
+            ContainerHexA, [new ObserverEvidenceJson.VolumeJson("Snap", 201)], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp);
 
         var volume = Assert.Single(

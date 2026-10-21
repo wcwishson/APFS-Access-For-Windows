@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -21,7 +22,9 @@
 
 #include "ContainerMountCoordinator.h"
 #include "MetadataStore.h"
+#include "TransactionManager.h"
 #include "AppleTransactionCommit.h"
+#include "AppleVolumeTransaction.h"
 #include "ApfsExtendedRecordCodec.h"
 #include "CompressionRewrite.h"
 #include "InodeMetadataPatch.h"
@@ -34,11 +37,13 @@ namespace
 namespace testfixture = apfsaccess::testfixture;
 
 int g_failures = 0;
+std::atomic<std::uint64_t> g_checks{0};
 std::mutex g_run_dirs_mutex;
 std::vector<std::filesystem::path> g_run_dirs;
 
 bool Require(bool condition, const char* message)
 {
+    g_checks.fetch_add(1, std::memory_order_relaxed);
     if (!condition)
     {
         ++g_failures;
@@ -1944,8 +1949,8 @@ bool RequireDiagnosticTotals(const apfsaccess::catalog::ContainerCommitDiagnosti
         counters.reload_attempts == counters.precommit_reload_attempts +
             counters.rollback_reload_attempts + counters.recovery_reload_attempts &&
         counters.reload_failures <= counters.reload_attempts &&
-        counters.reload_max_us <= counters.reload_total_us && counters.reload_reuses == 0,
-        "diagnostics: consistent outcome/phase totals and conservative zero reuse");
+        counters.reload_max_us <= counters.reload_total_us,
+        "diagnostics: consistent outcome and phase totals");
 }
 
 bool TestCoordinatorDiagnosticsCountsAndReloads()
@@ -1967,8 +1972,9 @@ bool TestCoordinatorDiagnosticsCountsAndReloads()
             // Sampling while Commit holds its mutex must remain safe. Only
             // completed scopes appear; the current precommit reload is done.
             const auto sample = coordinator->DiagnosticsSnapshot(101);
-            ok &= Require(sample.precommit_reload_attempts > sample.commit_attempts,
-                "diagnostics: hook observes reload before active commit is counted");
+            if (hook_calls == 0)
+                ok &= Require(sample.precommit_reload_attempts > sample.commit_attempts,
+                    "diagnostics: first hook observes reload before active commit is counted");
             ++hook_calls;
         }
         return true;
@@ -1999,8 +2005,10 @@ bool TestCoordinatorDiagnosticsCountsAndReloads()
     const auto b = coordinator->DiagnosticsSnapshot(102);
     ok &= Require(total.commit_attempts == 5 && total.commit_successes == 4 &&
             total.commit_noops == 1 && total.commit_failures == 0 &&
-            total.precommit_reload_attempts == 5 && total.reload_attempts == 5 &&
+            total.precommit_reload_attempts == 3 && total.reload_attempts == 3 &&
+            total.reload_reuses == 2 &&
             a.commit_attempts == 4 && a.commit_successes == 3 && a.commit_noops == 1 &&
+            a.precommit_reload_attempts == 2 && a.reload_reuses == 2 &&
             b.commit_attempts == 1 && b.commit_successes == 1 && hook_calls == 3 &&
             total.reload_total_us == a.reload_total_us + b.reload_total_us &&
             total.commit_total_us == a.commit_total_us + b.commit_total_us,
@@ -2015,7 +2023,8 @@ bool TestCoordinatorDiagnosticsCountsAndReloads()
     remount.use_canonical_transaction = true;
     if (!Require(coordinator->MountVolume(remount, error), "diagnostics: remount counted volume")) return false;
     ok &= Require(coordinator->Commit(101, {}).committed &&
-            coordinator->DiagnosticsSnapshot(101).precommit_reload_attempts == 5,
+            coordinator->DiagnosticsSnapshot(101).precommit_reload_attempts == 3 &&
+            coordinator->DiagnosticsSnapshot(101).reload_reuses == 2,
         "diagnostics: remount retains counters and next commit reloads");
     ok &= Require(!coordinator->Commit(999, {}).committed &&
             coordinator->DiagnosticsSnapshot(999).commit_attempts == 0 &&
@@ -2025,7 +2034,7 @@ bool TestCoordinatorDiagnosticsCountsAndReloads()
             !coordinator->Commit(101, {}).committed &&
             coordinator->DiagnosticsSnapshot(101).commit_attempts == 6 &&
             coordinator->DiagnosticsSnapshot(101).commit_failures == 1 &&
-            coordinator->DiagnosticsSnapshot(101).reload_attempts == 5,
+            coordinator->DiagnosticsSnapshot(101).reload_attempts == 3,
         "diagnostics: counters survive drain and count rejection without reloading");
     return RequireDiagnosticTotals(coordinator->DiagnosticsSnapshot()) && ok;
 }
@@ -2053,7 +2062,8 @@ bool TestCoordinatorDiagnosticsFailureAndBorrowedStore()
     if (!Require(coordinator->Commit(101, {create}).committed, "diagnostics: clean retry succeeds")) return false;
     counters = coordinator->DiagnosticsSnapshot(101);
     ok &= Require(counters.commit_successes == 1 && counters.precommit_reload_attempts == 2 &&
-            counters.reload_attempts == 3, "diagnostics: retry performs full reload");
+            counters.reload_attempts == 3 && counters.reload_reuses == 0,
+        "diagnostics: retry reloads after rollback instead of reusing repaired state");
 
     create.path = L"\\borrowed-unpublished";
     if (!Require(store->StageMutation(create) == Store::MutationStatus::Applied,
@@ -2089,10 +2099,11 @@ bool TestCoordinatorDiagnosticsFailureAndBorrowedStore()
     ok &= Require(coordinator->RefreshCheckpointFromSession(101, error) &&
             coordinator->RefreshSessionForRecovery(102, error) &&
             coordinator->Commit(102, {}).committed &&
-            coordinator->DiagnosticsSnapshot().precommit_reload_attempts == before_sync.precommit_reload_attempts + 1 &&
+            coordinator->DiagnosticsSnapshot().precommit_reload_attempts == before_sync.precommit_reload_attempts &&
             coordinator->DiagnosticsSnapshot().recovery_reload_attempts == 1 &&
+            coordinator->DiagnosticsSnapshot(102).reload_reuses >= 1 &&
             coordinator->FindSessionStore(102)->CheckpointXid() == store->CheckpointXid(),
-        "diagnostics: checkpoint sync and recovery refresh cannot elide next reload");
+        "diagnostics: checkpoint sync forces recovery reload, then permits validated reuse");
     ok &= RequireDiagnosticTotals(coordinator->DiagnosticsSnapshot());
 
     // Existing regular-image sharing permits an external in-place change.
@@ -2110,6 +2121,133 @@ bool TestCoordinatorDiagnosticsFailureAndBorrowedStore()
             counters.commit_failures == before_reload_failure.commit_failures + 1,
         "diagnostics: detected external damage counts failed reload and commit");
     return RequireDiagnosticTotals(counters) && ok;
+}
+
+bool TestCoordinatorDiagnosticsEarlyCapacityRefusal()
+{
+    using apfsaccess::catalog::ContainerMountCoordinator;
+    using apfsaccess::catalog::ContainerVolumeSession;
+    using Store = apfsaccess::rw::MetadataStore;
+    const auto image = MakeRunDir("diagnostics-capacity-refusal") / "two.raw";
+    if (!Require(WriteAuthoritativeTwoVolumeImage(image),
+            "diagnostics-capacity: build bounded internal-pool fixture")) return false;
+    std::string error;
+    auto coordinator = ContainerMountCoordinator::Open(image.string(), 0, error,
+        apfsaccess::catalog::CatalogLoadPolicy::StrictApple, false, true);
+    if (!Require(coordinator != nullptr, "diagnostics-capacity: open owner")) return false;
+    const auto pinned_xid = coordinator->CheckpointXid();
+    if (!Require(coordinator->InitializeRequiredCheckpointCensus(
+            {{101, {}}, {102, {pinned_xid}}}, error),
+            "diagnostics-capacity: pin sibling's original generation")) return false;
+    ContainerVolumeSession session;
+    session.volume_object_id = 101;
+    session.container_uuid_hex = coordinator->ContainerUuidHex();
+    session.requested_write = true;
+    session.use_canonical_transaction = true;
+    if (!Require(coordinator->MountVolume(session, error), "diagnostics-capacity: mount writer")) return false;
+    Store::MutationRequest create;
+    create.operation = Store::MutationOperation::CreateDirectory;
+    create.path = L"\\diagnostics-first";
+    if (!Require(coordinator->Commit(101, {create}).committed,
+            "diagnostics-capacity: publish first pinned generation")) return false;
+    create.path = L"\\diagnostics-capacity-refused";
+    const auto before_bytes = ReadFileBytes(image);
+    const auto before_xid = coordinator->CheckpointXid();
+    unsigned wal_calls = 0;
+    const auto refusal = coordinator->Commit(101, {create},
+        [&](const auto&, const auto&, std::uint64_t, auto&, auto&) {
+            ++wal_calls;
+            return true;
+        });
+    const auto counters = coordinator->DiagnosticsSnapshot(101);
+    const auto total = coordinator->DiagnosticsSnapshot();
+    auto* store = coordinator->FindSessionStore(101);
+    bool ok = Require(!refusal.committed && refusal.commit_status_code ==
+            static_cast<int>(Store::CommitStatus::RetentionBlocked) &&
+            refusal.commit_stage == "before-wal-capacity-admission" &&
+            refusal.error.find("CommitCapacityAdmissionRefused: ") == 0 &&
+            refusal.error.find("AppleSpacemanInternalPoolRetentionExhausted") != std::string::npos &&
+            refusal.clean_prepublication_refusal && !refusal.commit_recovery_required &&
+            wal_calls == 0 && store != nullptr && store->PendingMutationCount() == 0 &&
+            coordinator->CheckpointXid() == before_xid && ReadFileBytes(image) == before_bytes,
+        "diagnostics-capacity: real pre-WAL refusal rolls back with image and checkpoint unchanged");
+    ok &= Require(counters.commit_attempts == 2 && counters.commit_failures == 1 &&
+            counters.last_failure_stage == refusal.commit_stage &&
+            counters.last_failure_detail == refusal.error &&
+            total.last_failure_stage == refusal.commit_stage &&
+            total.last_failure_detail == refusal.error &&
+            coordinator->DiagnosticsSnapshot(102).commit_failures == 0,
+        "diagnostics-capacity: container and selected-volume diagnostics retain the actual early reason");
+    if (!Require(coordinator->UpdateRequiredCheckpointXids(102, {}, error) &&
+            coordinator->Commit(101, {create}).committed,
+            "diagnostics-capacity: release pin and retry the same mutation")) return false;
+    const auto recovered = coordinator->DiagnosticsSnapshot(101);
+    ok &= Require(recovered.commit_failures == 1 && recovered.commit_successes == 2 &&
+            recovered.last_failure_stage == refusal.commit_stage &&
+            recovered.last_failure_detail == refusal.error,
+        "diagnostics-capacity: successful retry preserves the last failure evidence");
+    return RequireDiagnosticTotals(recovered) && RequireDiagnosticTotals(total) && ok;
+}
+
+bool TestCoordinatorDiagnosticsEarlyStagingAndBoundedDetails()
+{
+    using Store = apfsaccess::rw::MetadataStore;
+    std::filesystem::path image;
+    auto coordinator = OpenDiagnosticsCoordinator("diagnostics-early-staging", image);
+    if (!coordinator) return false;
+    const auto before_bytes = ReadFileBytes(image);
+    const auto before_xid = coordinator->CheckpointXid();
+    unsigned wal_calls = 0;
+    const auto wal_hook = [&](const auto&, const auto&, std::uint64_t, auto&, auto&) {
+        ++wal_calls;
+        return true;
+    };
+    Store::MutationRequest create;
+    create.operation = Store::MutationOperation::CreateFile;
+    create.path = L"\\missing-parent\\refused";
+    const auto refused = coordinator->Commit(101, {create}, wal_hook);
+    auto counters = coordinator->DiagnosticsSnapshot(101);
+    bool ok = Require(!refused.committed && refused.commit_stage == "mutation-staging" &&
+            refused.mutation_staging_failure.has_value() &&
+            refused.error.find("CreateParentMissingOrNotDirectory") != std::string::npos &&
+            refused.clean_prepublication_refusal && wal_calls == 0 &&
+            coordinator->CheckpointXid() == before_xid && ReadFileBytes(image) == before_bytes &&
+            coordinator->FindSessionStore(101)->PendingMutationCount() == 0,
+        "diagnostics-staging: missing parent refuses actual Create before WAL without source changes");
+    ok &= Require(counters.commit_failures == 1 &&
+            counters.last_failure_stage == refused.commit_stage &&
+            counters.last_failure_detail == refused.error &&
+            coordinator->DiagnosticsSnapshot().last_failure_detail == refused.error,
+        "diagnostics-staging: real staging reason survives result return and rollback");
+    create.path = L"\\bounded-staging-refused";
+    const auto oversized = coordinator->Commit(101, {create}, wal_hook,
+        [](std::size_t, const auto&, const auto&, std::string& error) {
+            error = "DiagnosticPrefix:" + std::string(8192, 'x') + ":DiagnosticTail";
+            return false;
+        });
+    counters = coordinator->DiagnosticsSnapshot(101);
+    const auto total = coordinator->DiagnosticsSnapshot();
+    ok &= Require(!oversized.committed && oversized.commit_stage == "mutation-staging-hook" &&
+            oversized.error.size() > 8192 && counters.commit_failures == 2 &&
+            counters.last_failure_stage == oversized.commit_stage &&
+            counters.last_failure_detail.size() == 2048 &&
+            counters.last_failure_detail == oversized.error.substr(0, 2048) &&
+            total.last_failure_stage == counters.last_failure_stage &&
+            total.last_failure_detail == counters.last_failure_detail &&
+            wal_calls == 0 && ReadFileBytes(image) == before_bytes &&
+            coordinator->CheckpointXid() == before_xid &&
+            coordinator->FindSessionStore(101)->PendingMutationCount() == 0,
+        "diagnostics-staging: oversized caller reason is bounded only in diagnostics and preserves its prefix");
+    const auto absent = coordinator->Commit(999, {});
+    ok &= Require(!absent.committed && absent.error == "VolumeNotMounted" &&
+            coordinator->DiagnosticsSnapshot().last_failure_stage == "commit-admission" &&
+            coordinator->DiagnosticsSnapshot().last_failure_detail == absent.error &&
+            coordinator->DiagnosticsSnapshot(101).last_failure_detail == counters.last_failure_detail &&
+            coordinator->DiagnosticsSnapshot(999).commit_attempts == 0 &&
+            coordinator->DiagnosticsSnapshot(102).commit_failures == 0,
+        "diagnostics-staging: unmounted early admission failure updates only container diagnostics");
+    return RequireDiagnosticTotals(counters) &&
+        RequireDiagnosticTotals(coordinator->DiagnosticsSnapshot()) && ok;
 }
 
 bool TestAcceptedSiblingRecoveryAdmissionPreservesPins()
@@ -2258,10 +2396,9 @@ bool TestAcceptedSiblingRecoveryAdmissionPreservesPins()
         "accepted-sibling: one pending target remains authorized across replay chunks");
     const auto after_replay_diagnostics = coordinator->DiagnosticsSnapshot(101);
     ok &= Require(after_replay_diagnostics.commit_successes == before_replay_diagnostics.commit_successes + 2 &&
-            after_replay_diagnostics.precommit_reload_attempts == before_replay_diagnostics.precommit_reload_attempts + 2 &&
-            after_replay_diagnostics.reload_attempts == before_replay_diagnostics.reload_attempts + 2 &&
-            after_replay_diagnostics.reload_reuses == 0,
-        "accepted-sibling: each accepted replay chunk retains full precommit reload");
+            (after_replay_diagnostics.precommit_reload_attempts - before_replay_diagnostics.precommit_reload_attempts) +
+                (after_replay_diagnostics.reload_reuses - before_replay_diagnostics.reload_reuses) == 2,
+        "accepted-sibling: each accepted replay chunk uses a reload or a validated reuse");
     ok &= RequireDiagnosticTotals(after_replay_diagnostics);
     const auto alpha_pending_after_publish = coordinator->Commit(101, {fresh});
     ok &= Require(
@@ -2441,11 +2578,13 @@ bool TestVolumeReplayBoundaryFollowsOnlyUnchangedSiblings()
             ReadFileBytes(image) == before_stale && coordinator->FindSessionStore(101)->PendingMutationCount() == 0,
         "replay boundary: container lock rejects a stale replay boundary before staging or writes");
     const auto after_stale_diagnostics = coordinator->DiagnosticsSnapshot(101);
-    ok &= Require(after_stale_diagnostics.precommit_reload_attempts ==
-            after_refresh_diagnostics.precommit_reload_attempts + 1 &&
+    ok &= Require((after_stale_diagnostics.precommit_reload_attempts -
+                after_refresh_diagnostics.precommit_reload_attempts) +
+            (after_stale_diagnostics.reload_reuses -
+                after_refresh_diagnostics.reload_reuses) == 1 &&
             after_stale_diagnostics.commit_failures == after_refresh_diagnostics.commit_failures + 1 &&
-            after_stale_diagnostics.reload_reuses == 0,
-        "replay boundary: prior recovery refresh cannot skip stale-replay reload");
+            after_stale_diagnostics.reload_attempts >= after_refresh_diagnostics.reload_attempts,
+        "replay boundary: prior recovery refresh permits only a validated reload or reuse");
     ok &= RequireDiagnosticTotals(after_stale_diagnostics);
     auto bytes = ReadFileBytes(image);
     catalog::VectorRandomAccessSource source(bytes);
@@ -2539,17 +2678,17 @@ bool TestRequiredCheckpointPinsSurviveUnmountAndRetryLifecycle()
     const auto internal_pool_blocked =
         internal_pool->Commit(101, {internal_pool_blocked_request});
     auto* internal_pool_store = internal_pool->FindSessionStore(101);
+    std::fprintf(stderr, "[DIAG] internal status=%d stage=%s error=%s unchanged=%d recovery=%d\n", internal_pool_blocked.commit_status_code, internal_pool_blocked.commit_stage.c_str(), internal_pool_blocked.error.c_str(), ReadFileBytes(internal_pool_image) == internal_pool_before, internal_pool->IsRecoveryRequired());
     ok &= Require(
         !internal_pool_blocked.committed &&
             internal_pool_blocked.commit_status_code ==
                 static_cast<int>(Store::CommitStatus::RetentionBlocked) &&
             internal_pool_blocked.commit_stage ==
-                "apple-plan-retention-blocked" &&
+                "before-wal-capacity-admission" &&
             !internal_pool_blocked.commit_recovery_required &&
             !internal_pool->IsRecoveryRequired() &&
             internal_pool_store != nullptr &&
-            internal_pool_store->LastCommitFailureDetail() ==
-                L"AppleSpacemanInternalPoolRetentionExhausted" &&
+            internal_pool_blocked.error.find("AppleSpacemanInternalPoolRetentionExhausted") != std::string::npos &&
             ReadFileBytes(internal_pool_image) == internal_pool_before,
         "required-internal-pool-retention: pin-caused exhaustion is retryable and no-I/O");
     std::string internal_pool_update_error;
@@ -2626,6 +2765,7 @@ bool TestRequiredCheckpointPinsSurviveUnmountAndRetryLifecycle()
     const auto before_block = ReadFileBytes(sibling_image);
     const auto blocked = sibling->Commit(101, {blocked_request});
     auto* alpha_store = sibling->FindSessionStore(101);
+    std::fprintf(stderr, "[DIAG] sibling status=%d stage=%s error=%s recovery=%d\n", blocked.commit_status_code, blocked.commit_stage.c_str(), blocked.error.c_str(), sibling->IsRecoveryRequired());
     const bool blocked_image_unchanged =
         ReadFileBytes(sibling_image) == before_block;
     if (blocked.commit_status_code !=
@@ -2653,7 +2793,7 @@ bool TestRequiredCheckpointPinsSurviveUnmountAndRetryLifecycle()
         !blocked.committed &&
             blocked.commit_status_code ==
                 static_cast<int>(Store::CommitStatus::RetentionBlocked) &&
-            blocked.error.find("CommitRetentionBlocked") == 0 &&
+            blocked.error.find("CommitCapacityAdmissionRefused: CheckpointRetentionExhausted") == 0 &&
             !blocked.commit_recovery_required &&
             !sibling->IsRecoveryRequired() &&
             alpha_store != nullptr && alpha_store->PendingMutationCount() == 0 &&
@@ -2864,14 +3004,91 @@ bool TestRequiredCheckpointPinsSurviveUnmountAndRetryLifecycle()
 // A host must bind the staged APFS identity to durable recovery evidence
 // before any checkpoint bytes are published. Rejecting that boundary must
 // leave both the raw image and the reusable session unchanged.
-bool TestRetentionCleanupRetryOwnsOnePublication()
+bool TestRetentionCleanupWithDurableWal()
+{
+    using namespace apfsaccess::rw;
+    using namespace apfsaccess::catalog;
+    bool ok = true;
+    const auto root = MakeRunDir("retention-real-wal");
+    const auto image = root / "two.raw";
+    if (!Require(WriteAuthoritativeTwoVolumeImage(image), "real cleanup: image")) return false;
+    std::string error;
+    auto owner = ContainerMountCoordinator::Open(image.string(), 0, error, CatalogLoadPolicy::StrictApple, false, true);
+    if (!Require(owner && owner->InitializeRequiredCheckpointCensus({{101,{}},{102,{}}}, error),
+            "real cleanup: complete census")) return false;
+    ContainerVolumeSession session;
+    session.volume_object_id = 101; session.container_uuid_hex = owner->ContainerUuidHex();
+    session.requested_write = true; session.use_canonical_transaction = true;
+    if (!Require(owner->MountVolume(session, error), "real cleanup: session")) return false;
+    TransactionManager journal(L"Strict");
+    const auto identity = "apfs-vol:" + owner->ContainerUuidHex() + ":101";
+    journal.SetVolumeIdentity(std::wstring(identity.begin(), identity.end()));
+    journal.SetJournalPath((root / "canonical.wal").wstring());
+    unsigned accepted = 0, cleaned = 0;
+    std::uint64_t source = 0, object = 0, generation = 0;
+    const auto accept = [&](const auto& requests, const auto& identities, auto xid, auto& pins, std::string& why) {
+        ++accepted;
+        if (requests.size() != 1 || identities.size() != 1) return false;
+        source = xid; object = identities[0].object_id; generation = identities[0].generation;
+        TransactionManager::MutationIntent intent;
+        intent.kind = TransactionManager::MutationKind::CreateDirectory;
+        intent.path = requests[0].path; intent.object_id = object; intent.generation = generation;
+        return journal.Begin() && journal.RecordMutation(intent) && journal.Accept(xid) &&
+            journal.LoadRequiredCheckpointXidsSinceCleanup(pins, &why);
+    };
+    MetadataStore::MutationRequest first;
+    first.operation = MetadataStore::MutationOperation::CreateDirectory; first.path = L"\\first";
+    if (!Require(owner->Commit(101, {first}, accept).committed, "real cleanup: accepted prefix publishes")) return false;
+    const auto old_sequence = journal.Watermarks().accepted_sequence;
+    if (!Require(journal.MarkApfsDurableThrough(old_sequence), "real cleanup: prefix is durable but not cleaned")) return false;
+    const auto before = ReadFileBytes(image);
+    const auto xid = owner->CheckpointXid();
+    MetadataStore::MutationRequest next = first; next.path = L"\\next";
+    const auto result = owner->Commit(101, {next}, accept, {},
+        [&](auto& pins, std::string& why) {
+            ++cleaned;
+            ok &= Require(accepted == 1 && ReadFileBytes(image) == before &&
+                    owner->FindSessionStore(101)->PendingMutationCount() == 1,
+                "real cleanup: no new acceptance or image I/O before old durable WAL cleanup");
+            return journal.MarkCleanedThrough(old_sequence) && journal.LoadRequiredCheckpointXidsSinceCleanup(pins, &why);
+        }, false, {}, {}, {}, true);
+    std::fprintf(stderr, "[DIAG] real cleanup status=%d stage=%s error=%s accepted=%u cleaned=%u\n",
+        result.commit_status_code, result.commit_stage.c_str(), result.error.c_str(), accepted, cleaned);
+    ok &= Require(result.committed && cleaned == 1 && accepted == 2 && owner->CheckpointXid() == xid + 1,
+        "real cleanup: one cleanup admits exactly one new accepted publication");
+    std::vector<TransactionManager::AcceptedTransaction> retained;
+    ok &= Require(journal.LoadAcceptedTransactionsSinceCleanup(retained) && retained.size() == 1 &&
+            retained[0].preimage_checkpoint_xid == xid && source == xid && retained[0].mutations.size() == 1 &&
+            retained[0].mutations[0].object_id == object && retained[0].mutations[0].parent_object_id == generation,
+        "real cleanup: durable WAL keeps the original staged callback and source identity");
+    const auto census = owner->CheckpointCensusSnapshot();
+    ok &= Require(census[0].unapplied_accepted_work && census[0].required_checkpoint_xids == std::vector<std::uint64_t>{xid} &&
+            journal.Watermarks().cleanup_sequence == old_sequence && journal.HasUnappliedAcceptedWork(),
+        "real cleanup: new accepted allocation proof remains owned until its own finalization");
+    if (!result.committed) return false;
+    std::vector<std::uint64_t> pins;
+    const auto sequence = journal.Watermarks().accepted_sequence;
+    ok &= Require(journal.MarkApfsDurableThrough(sequence) && journal.MarkCleanedThrough(sequence) &&
+            journal.LoadRequiredCheckpointXidsSinceCleanup(pins, &error) && pins.empty() &&
+            owner->UpdateRequiredCheckpointXids(101, pins, error, journal.HasUnappliedAcceptedWork()),
+        "real cleanup: only explicit durable cleanup releases the newly accepted owner");
+    return ok;
+}
+
+bool TestRetentionCleanupRetryOwnsOnePublication(bool late_pins = false)
 {
     using Store = apfsaccess::rw::MetadataStore;
     bool ok = true;
-    for (const std::string mode : {"release", "unchanged", "foreign-pin", "pending-pin",
-            "throw", "refuse", "success-with-error", "sibling-pin", "retry-failure", "serialize"})
+    // Missing an accepted source is invalid only after acceptance. Before
+    // acceptance, cleaning all historical debt is a valid success case.
+    const std::vector<std::string> modes = late_pins
+        ? std::vector<std::string>{"release", "unchanged", "foreign-pin", "pending-pin",
+            "throw", "refuse", "success-with-error", "retry-failure", "serialize"}
+        : std::vector<std::string>{"release", "unchanged", "foreign-pin", "clear-all",
+            "throw", "refuse", "success-with-error", "sibling-pin", "retry-failure", "serialize"};
+    for (const auto& mode : modes)
     {
-        const auto image = MakeRunDir(("retention-cleanup-" + mode).c_str()) / "two.raw";
+        const auto image = MakeRunDir(("retention-cleanup-" + mode + (late_pins ? "-late" : "-early")).c_str()) / "two.raw";
         if (!Require(WriteAuthoritativeTwoVolumeImage(image), "cleanup retry: build strict image")) return false;
         std::string error;
         auto coordinator = apfsaccess::catalog::ContainerMountCoordinator::Open(image.string(), 0, error,
@@ -2886,6 +3103,13 @@ bool TestRetentionCleanupRetryOwnsOnePublication()
         Store::MutationRequest first;
         first.operation = Store::MutationOperation::CreateDirectory; first.path = L"\\first";
         if (!Require(coordinator->Commit(101, {first}).committed, "cleanup retry: publish retained prefix")) return false;
+        if (late_pins) {
+            // No outstanding debt at admission. The later acceptance rescan
+            // conservatively retains an available older proof as well as its
+            // newly accepted source, exercising postacceptance pressure.
+            if (!Require(coordinator->UpdateRequiredCheckpointXids(101, {}, error),
+                    "cleanup retry: initialize debt-free admission before late rescan")) return false;
+        }
         const auto before = ReadFileBytes(image);
         const auto source_xid = coordinator->CheckpointXid();
         auto* store = coordinator->FindSessionStore(101);
@@ -2894,7 +3118,7 @@ bool TestRetentionCleanupRetryOwnsOnePublication()
             if (stage == "before-apple-plan")
             {
                 ++plans;
-                if (mode == "retry-failure" && plans == 2) return false;
+                if (mode == "retry-failure" && plans == (late_pins ? 2u : 1u)) return false;
             }
             if (stage == "before-apple-publish") ++publications;
             return true;
@@ -2906,7 +3130,9 @@ bool TestRetentionCleanupRetryOwnsOnePublication()
         const auto result = coordinator->Commit(101, {},
             [&](const auto&, const auto&, auto source, auto& pins, auto&) {
                 ++acceptances;
-                pins.push_back(source);
+                ok &= Require(source == source_xid, "cleanup retry: acceptance retains exact prepared source XID");
+                if (late_pins) pins.push_back(20);
+                if (std::find(pins.begin(), pins.end(), source) == pins.end()) pins.push_back(source);
                 return true;
             },
             [&](auto, const auto&, const auto&, auto&) { ++stages; return true; },
@@ -2931,7 +3157,7 @@ bool TestRetentionCleanupRetryOwnsOnePublication()
                 if (mode == "refuse") { failure = "test-cleanup-refused"; return false; }
                 if (mode == "success-with-error") failure = "test-ambiguous-cleanup";
                 if (mode == "unchanged") return true;
-                if (mode == "pending-pin") pins.clear();
+                if (mode == "pending-pin" || mode == "clear-all") pins.clear();
                 else if (mode == "foreign-pin") pins = {19, source_xid};
                 else pins = {source_xid};
                 return true;
@@ -2950,19 +3176,25 @@ bool TestRetentionCleanupRetryOwnsOnePublication()
                     "cleanup retry: verifier sees the single published successor after retry");
                 return true;
             });
+        std::fprintf(stderr, "[DIAG] cleanup late=%d mode=%s status=%d stage=%s error=%s prep=%u accept=%u stageCount=%u cleanup=%u plan=%u publish=%u verify=%u\n", late_pins ? 1 : 0, mode.c_str(), result.commit_status_code, result.commit_stage.c_str(), result.error.c_str(), preparations, acceptances, stages, cleanups, plans, publications, verifications);
         if (competitor.valid())
             ok &= Require(competitor.get(), "cleanup retry: sibling resumes after publication returns");
         store->SetCommitStageHook({});
-        const bool success = mode == "release" || mode == "serialize";
+        const bool success = mode == "release" || mode == "serialize" || mode == "clear-all";
         ok &= Require(verifications == (success ? 1u : 0u),
             "cleanup retry: verifier runs once only after successful publication");
         const auto after_diagnostics = coordinator->DiagnosticsSnapshot(101);
         ok &= Require(after_diagnostics.commit_attempts == before_diagnostics.commit_attempts + 1 &&
-                after_diagnostics.precommit_reload_attempts == before_diagnostics.precommit_reload_attempts + 1,
-            "cleanup retry: internal retry counts as one coordinator commit and one precommit reload");
+                (after_diagnostics.precommit_reload_attempts - before_diagnostics.precommit_reload_attempts) +
+                    (after_diagnostics.reload_reuses - before_diagnostics.reload_reuses) == 1,
+            "cleanup retry: internal retry counts as one coordinator commit and one validated reload or reuse");
         ok &= RequireDiagnosticTotals(after_diagnostics);
-        const bool retry = success || mode == "sibling-pin" || mode == "retry-failure";
-        ok &= Require(preparations == 1 && acceptances == 1 && stages == 1 && cleanups == 1 && plans == (retry ? 2u : 1u),
+        // Existing pressure is cleaned and rechecked before acceptance. The
+        // real planner runs only after that admission; previews do no I/O.
+        const bool admitted = late_pins || success || mode == "retry-failure";
+        const auto expected_plans = late_pins ? (success || mode == "retry-failure" ? 2u : 1u) : (admitted ? 1u : 0u);
+        ok &= Require(preparations == 1 && acceptances == (admitted ? 1u : 0u) && stages == 1 &&
+                cleanups == 1 && plans == expected_plans,
             "cleanup retry: bounded attempt without repeated staging or WAL acceptance");
         if (success)
         {
@@ -2974,24 +3206,206 @@ bool TestRetentionCleanupRetryOwnsOnePublication()
         else
         {
             ok &= Require(!result.committed && publications == 0 && ReadFileBytes(image) == before &&
-                    coordinator->CheckpointXid() == source_xid && store->PendingMutationCount() == 0 &&
+                    coordinator->CheckpointXid() == source_xid && store->PendingMutationCount() == (admitted ? 1u : 0u) &&
                     !store->LookupCommittedInodeByPath(next.path).has_value(),
-                "cleanup retry: failed cleanup or retry cannot publish or keep scratch staging");
+                "cleanup retry: failed publication preserves accepted staging and rolls back only unaccepted work");
+            ok &= Require(coordinator->IsRecoveryRequired() == admitted && result.commit_recovery_required == admitted &&
+                    (!admitted || (coordinator->RecoveryVolumeObjectId() == 101 &&
+                        coordinator->RecoveryReason() == "AcceptedWorkPublicationFailed")),
+                "cleanup retry: accepted failure retains its exact recovery owner");
             const bool capacity = mode == "unchanged" || mode == "sibling-pin";
             ok &= Require(result.commit_status_code == static_cast<int>(capacity
                         ? Store::CommitStatus::RetentionBlocked : Store::CommitStatus::InvariantFailed),
                 "cleanup retry: unchanged pressure remains distinct from invalid cleanup");
+            if (late_pins && mode == "unchanged") {
+                ok &= Require(coordinator->UpdateRequiredCheckpointXids(101, {source_xid}, error, true),
+                    "cleanup retry: release old proof while preserving accepted source and owner");
+                const auto fresh_attempt = coordinator->Commit(101, {next});
+                const auto generic_replay = coordinator->Commit(101, {next}, {}, {}, {}, true, source_xid);
+                ok &= Require(!fresh_attempt.committed && !generic_replay.committed &&
+                        fresh_attempt.error == "ContainerRecoveryRequired: AcceptedWorkPublicationFailed" &&
+                        generic_replay.error == fresh_attempt.error && ReadFileBytes(image) == before &&
+                        store->PendingMutationCount() == 1,
+                    "cleanup retry: a replay boolean cannot bypass the latched accepted owner");
+                coordinator.reset(); store = nullptr;
+                coordinator = apfsaccess::catalog::ContainerMountCoordinator::Open(image.string(), 0, error,
+                    apfsaccess::catalog::CatalogLoadPolicy::StrictApple, false, true);
+                if (!Require(coordinator && coordinator->InitializeRequiredCheckpointCensus(
+                        {{101, {source_xid}, true}, {102, {}}}, error) && coordinator->MountVolume(alpha, error),
+                        "cleanup retry: fresh owner reopens the original accepted source census")) return false;
+                store = coordinator->FindSessionStore(101);
+                const auto replay = coordinator->Commit(101, {next}, {}, {}, {}, true, source_xid);
+                ok &= Require(replay.committed && replay.committed_xid == source_xid + 1 &&
+                        store->LookupCommittedInodeByPath(next.path).has_value(),
+                    "cleanup retry: fresh validated owner replays the original source once");
+            }
             if (mode == "sibling-pin")
             {
                 ok &= Require(coordinator->UpdateRequiredCheckpointXids(102, {}, error),
                     "cleanup retry: explicit sibling cleanup releases only its historical pin");
                 const auto fresh_attempt = coordinator->Commit(101, {next});
-                ok &= Require(!fresh_attempt.committed && fresh_attempt.error == "VolumeAcceptedRecoveryPending: oid=101" &&
-                        ReadFileBytes(image) == before && coordinator->Commit(101, {next}, {}, {}, {}, true).committed,
-                    "cleanup retry: after sibling cleanup the original accepted batch needs explicit replay");
+                ok &= Require(fresh_attempt.committed && acceptances == 0 &&
+                        store->LookupCommittedInodeByPath(next.path).has_value(),
+                    "cleanup retry: preacceptance sibling pressure creates no WAL debt and restaging succeeds");
             }
         }
     }
+    return ok;
+}
+
+bool TestSnapshotSiblingCleanupAdmission(const std::string& mode)
+{
+    using namespace apfsaccess::catalog;
+    using namespace apfsaccess::rw;
+    using Store = MetadataStore;
+    const bool snapshot_cohort = mode != "ordinary-cohort";
+    const bool current_pin = mode == "current-pin";
+    const bool accepted_owner = mode == "accepted-owner";
+    const auto image = MakeRunDir(("snapshot-sibling-cleanup-" + mode).c_str()) / "two.raw";
+    if (!Require(WriteAuthoritativeTwoVolumeImage(image, 0, 32, 32),
+            "snapshot cleanup: build native two-volume fixture")) return false;
+    std::string error;
+    if (snapshot_cohort)
+    {
+        auto bytes = ReadFileBytes(image);
+        VectorRandomAccessSource source(bytes);
+        const auto checkpoint = LoadAppleCheckpointView(source, 0, source.SizeBytes(), error);
+        if (!Require(checkpoint.has_value(), "snapshot cleanup: load native fixture checkpoint")) return false;
+        AppleSnapshotCreateRequest request{101, "cleanup-history", 1700000000000000000ull};
+        AppleSnapshotCreatePlan plan;
+        if (!Require(PlanAppleSnapshotCreate(source, *checkpoint, request, plan, error),
+                "snapshot cleanup: plan real snapshot inventory")) return false;
+        // Populate only the synthetic fixture, keeping snapshot setup in memory.
+        const auto apply = [&](const auto& write) {
+            const auto offset = write.physical_block * checkpoint->container.superblock.block_size;
+            if (!Require(offset <= bytes.size() && write.bytes.size() <= bytes.size() - offset,
+                    "snapshot cleanup: fixture publication is bounded")) return false;
+            std::copy(write.bytes.begin(), write.bytes.end(), bytes.begin() + offset);
+            return true;
+        };
+        for (const auto& write : plan.commit.publication.before_superblock_writes)
+            if (!apply(write)) return false;
+        if (!apply(plan.commit.publication.superblock_write) ||
+            !Require(WriteFileBytes(image, bytes), "snapshot cleanup: save synthetic snapshot fixture")) return false;
+    }
+    auto owner = ContainerMountCoordinator::Open(image.string(), 0, error, CatalogLoadPolicy::StrictApple, true, true);
+    if (!Require(owner && owner->InitializeRequiredCheckpointCensus({{101, {}}, {102, {}}}, error),
+            "snapshot cleanup: open owner and complete census")) return false;
+    for (const auto oid : {101ull, 102ull})
+    {
+        ContainerVolumeSession session;
+        session.volume_object_id = oid;
+        session.container_uuid_hex = owner->ContainerUuidHex();
+        session.requested_write = true;
+        session.use_canonical_transaction = true;
+        session.metadata_context.allow_legacy_scaffold_for_fixtures = false;
+        session.metadata_context.allow_native_snapshot_runtime = true;
+        if (!Require(owner->MountVolume(session, error), "snapshot cleanup: mount native volume")) return false;
+    }
+    const auto atime = [&](Store& store, Store::MutationRequest& request) {
+        const auto root = store.LookupCommittedInodeByPath(L"\\");
+        if (!Require(root.has_value(), "snapshot cleanup: root inode exists")) return false;
+        InodeMetadataPatch patch;
+        patch.mask = InodeMetadataPatch::AccessTime;
+        patch.access_time_utc = (std::max)(root->access_time_utc, InodeMetadataPatch::UnixEpochTicks) + 1;
+        request.operation = Store::MutationOperation::SetInodeMetadata;
+        request.path = L"\\";
+        if (!Require(EncodeInodeMetadataPatch(patch, request.inline_payload),
+                "snapshot cleanup: encode root atime only")) return false;
+        request.length = request.inline_payload.size();
+        return true;
+    };
+    const auto source_xid = owner->CheckpointXid();
+    Store::MutationRequest alpha_atime;
+    if (!atime(*owner->FindSessionStore(101), alpha_atime)) return false;
+    const auto published = owner->Commit(101, {alpha_atime},
+        [&](const auto&, const auto&, auto source, auto& pins, std::string&) {
+            pins = {source};
+            return source == source_xid;
+        });
+    if (!Require(published.committed && owner->CheckpointXid() == source_xid + 1,
+            "snapshot cleanup: Alpha publishes with its source pin retained")) return false;
+    const auto current_xid = owner->CheckpointXid();
+    if (current_pin || accepted_owner)
+        if (!Require(owner->UpdateRequiredCheckpointXids(101,
+                {current_pin ? current_xid : source_xid}, error, accepted_owner),
+                "snapshot cleanup: install current-pin or accepted-owner control")) return false;
+    const auto before = ReadFileBytes(image);
+    const auto before_census = owner->CheckpointCensusSnapshot();
+    auto* beta = owner->FindSessionStore(102);
+    Store::MutationRequest beta_atime;
+    if (!atime(*beta, beta_atime)) return false;
+    InodeMetadataPatch expected_beta;
+    if (!Require(DecodeInodeMetadataPatch(beta_atime.inline_payload, expected_beta),
+            "snapshot cleanup: retain exact expected Beta atime")) return false;
+    unsigned preparations = 0, stages = 0, acceptances = 0, cleanups = 0, plan_hooks = 0, publications = 0;
+    beta->SetCommitStageHook([&](std::string_view stage) {
+        ++plan_hooks;
+        if (stage == "before-apple-publish") ++publications;
+        return true;
+    });
+    const auto result = owner->Commit(102, {},
+        [&](const auto&, const auto&, auto source, auto& pins, std::string&) {
+            ++acceptances;
+            pins = {source};
+            return source == current_xid;
+        },
+        [&](auto, const auto&, const auto&, std::string&) { ++stages; return true; },
+        [&](auto&, std::string&) { ++cleanups; return true; }, false, {},
+        [&](const Store&, auto& requests, std::string&) {
+            ++preparations;
+            requests = {beta_atime};
+            return true;
+        });
+    std::fprintf(stderr, "[DIAG] snapshot cleanup mode=%s status=%d stage=%s clean=%d prep=%u stageCount=%u accept=%u cleanup=%u publish=%u error=%s\n",
+        mode.c_str(), result.commit_status_code, result.commit_stage.c_str(), result.clean_prepublication_refusal,
+        preparations, stages, acceptances, cleanups, publications, result.error.c_str());
+    bool ok = true;
+    const bool admitted = current_pin || !snapshot_cohort;
+    const auto census = owner->CheckpointCensusSnapshot();
+    ok &= Require(before_census.size() == 2 && census.size() == 2 &&
+            before_census[0].required_checkpoint_xids == std::vector<std::uint64_t>{current_pin ? current_xid : source_xid} &&
+            before_census[0].unapplied_accepted_work == accepted_owner &&
+            census[0].required_checkpoint_xids == before_census[0].required_checkpoint_xids &&
+            census[0].unapplied_accepted_work == accepted_owner &&
+            census[1].required_checkpoint_xids == (admitted ? std::vector<std::uint64_t>{current_xid} :
+                std::vector<std::uint64_t>{}) && !census[1].unapplied_accepted_work,
+        "snapshot cleanup: peer ownership stays exact and only admitted Beta acquires a source pin");
+    if (admitted)
+    {
+        ok &= Require(result.committed && !result.commit_recovery_required &&
+                owner->CheckpointXid() == current_xid + 1 && preparations == 1 && stages == 1 &&
+                acceptances == 1 && cleanups == 0 && publications == 1 && beta->IsCanonicalCommitReady(),
+            "snapshot cleanup: current peer pin and snapshot-free cohort remain admitted");
+    }
+    else
+    {
+        ok &= Require(!result.committed && !result.commit_recovery_required && result.clean_prepublication_refusal &&
+                result.commit_status_code == static_cast<int>(Store::CommitStatus::RetentionBlocked) &&
+                result.commit_stage == (accepted_owner ? "awaiting-accepted-recovery" : "awaiting-checkpoint-cleanup") &&
+                result.error == (accepted_owner ? "SiblingAcceptedRecoveryPending: oid=101" : "SiblingCheckpointCleanupPending: oid=101"),
+            "snapshot cleanup: old or accepted sibling ownership returns the exact clean retention wait");
+        ok &= Require(preparations == 0 && stages == 0 && acceptances == 0 && cleanups == 0 && plan_hooks == 0,
+            "snapshot cleanup: wait precedes preparation, staging, WAL acceptance, cleanup and planning");
+        ok &= Require(ReadFileBytes(image) == before && owner->CheckpointXid() == current_xid &&
+                beta->PendingMutationCount() == 0 && beta->PendingAllocationCount() == 0 &&
+                beta->PendingDeallocationCount() == 0 && beta->PendingObjectMapUpdateCount() == 0 &&
+                beta->PendingBtreeRecordCount() == 0 && beta->PendingPayloadByteEstimate() == 0 &&
+                !beta->HasUncommittedAllocatorState() && !beta->IsRecoveryRequired() && beta->IsCanonicalCommitReady(),
+            "snapshot cleanup: wait preserves source bytes, clean staging and writable readiness");
+        if (!accepted_owner)
+        {
+            ok &= Require(owner->UpdateRequiredCheckpointXids(101, {}, error, false),
+                "snapshot cleanup: only Alpha's cleanup refresh releases its old pin");
+            const auto retried = owner->Commit(102, {beta_atime});
+            const auto beta_root = beta->LookupCommittedInodeByPath(L"\\");
+            ok &= Require(retried.committed && !retried.commit_recovery_required &&
+                    owner->CheckpointXid() == current_xid + 1 && publications == 1 && beta->IsCanonicalCommitReady() &&
+                    beta_root && beta_root->access_time_utc == expected_beta.access_time_utc,
+                "snapshot cleanup: unchanged Beta request retries with exactly one writable publication");
+        }
+    }
+    beta->SetCommitStageHook({});
     return ok;
 }
 
@@ -3420,7 +3834,10 @@ bool TestPostpublicationVerifierSkipsUnpublishedOperations()
             stages == (reached_staging ? 1u : 0u) && acceptances == (reached_acceptance ? 1u : 0u) &&
             plans == (mode == "plan" ? 1u : 0u) && publications == 0 &&
             result.commit_status_code == static_cast<int>(expected_status) && result.commit_stage == expected_stage &&
-            !result.commit_recovery_required && !coordinator->IsRecoveryRequired();
+            result.commit_recovery_required == (mode == "plan") &&
+            coordinator->IsRecoveryRequired() == (mode == "plan") &&
+            (mode != "plan" || (coordinator->RecoveryVolumeObjectId() == 101 &&
+                coordinator->RecoveryReason() == "AcceptedWorkPublicationFailed" && store->PendingMutationCount() == 1));
         if (!expected_boundary || result.committed != noop)
             std::fprintf(stderr, "[INFO] postpublication skip %s: committed=%d status=%d stage=%s error=%s\n",
                 mode.c_str(), result.committed ? 1 : 0, result.commit_status_code,
@@ -5024,20 +5441,162 @@ bool TestManifestRejectsOversizedInput()
         "manifest-oversized: bounded parser refuses oversized input");
 }
 
+#if defined(_WIN32)
+bool TestManifestWindowsLongPaths()
+{
+    namespace fs = std::filesystem;
+    const auto dir = MakeRunDir("manifest-long-path");
+    const auto io_path = [](const fs::path& path) {
+        return fs::path(L"\\\\?\\" + path.wstring());
+    };
+    const auto utf8_path = [](const fs::path& path) {
+        const auto text = path.u8string();
+        return std::string(text.begin(), text.end());
+    };
+    const std::string uuid(32, 'a');
+    const std::string device = "D:\\fixture\\two.apfs.img";
+    const auto checksum = PortableSha256Hex(
+        "manifest-check-v1\n" + uuid + "\n" + device +
+        "\n0\n101\n" + uuid + "\nAlpha\nA:\\mnt\\Alpha\nR\nalpha\n");
+    const std::string document =
+        "{\"format\":\"apfs-access-container-manifest\",\"version\":1,"
+        "\"containerUuid\":\"" + uuid + "\",\"device\":\"D:\\\\fixture\\\\two.apfs.img\","
+        "\"deviceOffsetBytes\":0,\"manifestSha256\":\"" + checksum + "\",\"volumes\":["
+        "{\"objectId\":101,\"containerUuid\":\"" + uuid + "\",\"name\":\"Alpha\","
+        "\"mount\":\"A:\\\\mnt\\\\Alpha\",\"requestedWrite\":false,\"recoveryIdentity\":\"alpha\"}]}";
+    const auto document_hash = PortableSha256Hex(document);
+    bool ok = Require(!checksum.empty() && !document_hash.empty(), "manifest-long: independent hashes");
+    const auto write = [&](const fs::path& path, const std::string& text) {
+        std::error_code ec;
+        fs::create_directories(io_path(path.parent_path()), ec);
+        if (!Require(!ec, "manifest-long: create fixture directory")) return false;
+        std::ofstream output(io_path(path), std::ios::binary | std::ios::trunc);
+        output.write(text.data(), static_cast<std::streamsize>(text.size()));
+        return Require(static_cast<bool>(output), "manifest-long: write fixture");
+    };
+    const auto unchanged = [&](const fs::path& path, const std::string& expected) {
+        const auto bytes = ReadFileBytes(io_path(path));
+        const std::string text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        return Require(text == expected && PortableSha256Hex(text) == PortableSha256Hex(expected),
+            "manifest-long: parsing and refusal leave file bytes and hash unchanged");
+    };
+    const auto parse = [&](const std::string& path, const char* expected_error) {
+        apfsaccess::catalog::ContainerManifest parsed;
+        std::string error;
+        const bool accepted = apfsaccess::catalog::ParseContainerManifest(path, parsed, error);
+        if (expected_error)
+            return Require(!accepted && error == expected_error, "manifest-long: typed refusal guard");
+        if (!accepted) std::fprintf(stderr, "[INFO] manifest-long: %s\n", error.c_str());
+        return Require(accepted && error.empty(), "manifest-long: ordinary absolute manifest loads") &&
+            Require(parsed.container_uuid_hex == uuid && parsed.manifest_sha256 == checksum &&
+                parsed.device_path == device && parsed.device_offset_bytes == 0 &&
+                parsed.volumes.size() == 1 && parsed.volumes[0].object_id == 101 &&
+                parsed.volumes[0].mount_point == "A:\\mnt\\Alpha" && !parsed.volumes[0].requested_write &&
+                parsed.volumes[0].recovery_identity == "alpha",
+                "manifest-long: checksum, source binding and public spelling preserved");
+    };
+    const auto short_path = dir / "short.json";
+    if (!write(short_path, document)) return false;
+    ok &= Require(short_path.wstring().size() < 260, "manifest-long: short ASCII control below MAX_PATH");
+    ok &= parse(utf8_path(short_path), nullptr);
+    ok &= unchanged(short_path, document);
+
+    for (const auto length : {std::size_t{263}, std::size_t{360}})
+    {
+        const fs::path filename = length == 263 ? L"manifest.json" : L"manifest-\u6d4b\u8bd5.json";
+        auto parent = dir;
+        if (!Require((parent / filename).wstring().size() + 2 < length,
+                "manifest-long: temp root leaves room for exact path length")) return false;
+        while ((parent / filename).wstring().size() + 101 < length) parent /= std::wstring(100, L'p');
+        const auto padding = length - (parent / filename).wstring().size() - 1;
+        parent /= std::wstring(padding, L'q');
+        const auto path = parent / filename;
+        if (!write(path, document)) return false;
+        ok &= Require(path.wstring().size() == length, "manifest-long: exact conventional path length");
+        std::fprintf(stdout, "manifest-long: UTF-16 path length=%zu UTF-8 bytes=%zu\n", length, utf8_path(path).size());
+        ok &= parse(utf8_path(path), nullptr);
+        auto slashes = utf8_path(path);
+        std::replace(slashes.begin(), slashes.end(), '\\', '/');
+        ok &= parse(slashes, nullptr);
+        ok &= unchanged(path, document);
+
+        const auto link = parent / "link.json";
+        std::error_code ec;
+        fs::create_symlink(io_path(path), io_path(link), ec);
+        if (!Require(!ec, "manifest-long: create actual file symlink refusal control")) return false;
+        ok &= parse(utf8_path(link), "ManifestSymlinkRefused");
+        const auto linked_parent = parent / "linked-parent";
+        fs::create_directory_symlink(io_path(parent), io_path(linked_parent), ec);
+        if (!Require(!ec, "manifest-long: create actual parent reparse refusal control")) return false;
+        ok &= parse(utf8_path(linked_parent / filename), "ManifestSymlinkedParentRefused");
+        fs::remove(io_path(linked_parent), ec);
+        if (!Require(!ec, "manifest-long: remove parent link before later controls")) return false;
+        ok &= unchanged(path, document);
+
+        auto tampered = document;
+        tampered.replace(tampered.find("Alpha"), 5, "Bravo");
+        const auto bad_hash = parent / "bad-hash.json";
+        if (!write(bad_hash, tampered)) return false;
+        ok &= parse(utf8_path(bad_hash), "ManifestChecksumMismatch");
+        ok &= unchanged(bad_hash, tampered);
+        const auto too_large = parent / "oversized.json";
+        const std::string oversized(1024u * 1024u + 1u, ' ');
+        if (!write(too_large, oversized)) return false;
+        ok &= parse(utf8_path(too_large), "ManifestTooLarge");
+        ok &= unchanged(too_large, oversized);
+        ok &= parse(utf8_path(parent), "ManifestNotRegularFile");
+
+        for (const auto& alias : std::vector<fs::path>{parent / L"." / filename,
+                 parent / L".." / parent.filename() / filename,
+                 parent / (filename.wstring() + L"."), parent / (filename.wstring() + L" "),
+                 parent / (filename.wstring() + L":stream"), parent / L"NUL.json"})
+            ok &= parse(utf8_path(alias), "ManifestPathInvalid");
+        ok &= parse(utf8_path(io_path(path)), "ManifestPathInvalid");
+        ok &= unchanged(path, document);
+    }
+    for (const auto& path : {std::string("\\\\.\\NUL"), std::string("\\\\server\\share\\manifest.json"),
+             std::string("D:manifest.json"), std::string("relative.json"),
+             utf8_path(short_path) + std::string("\0extra", 6), std::string("D:\\\xc0\xaf.json")})
+        ok &= parse(path, "ManifestPathInvalid");
+    return ok;
+}
+#endif
+
 } // namespace
 
 #include "ContainerMountCoordinatorSharedSpaceTests.h"
+#include "ContainerMountCoordinatorDeferredTests.h"
+#include "ContainerMountCoordinatorPreparedPlanTests.h"
 
 int main(int argc, char** argv)
 {
     bool ok = true;
+    const bool retention_wal_only = argc == 2 && std::string(argv[1]) == "--test-coordinator-retention-wal";
     const bool diagnostics_only = argc == 2 && std::string(argv[1]) == "--test-coordinator-diagnostics";
     const bool reload_boundaries_only = argc == 2 && std::string(argv[1]) == "--test-coordinator-reload-boundaries";
     const bool shared_space_only = argc == 2 && std::string(argv[1]) == "--test-coordinator-shared-space";
-    if (argc != 1 && !diagnostics_only && !reload_boundaries_only && !shared_space_only)
+    const bool deferred_only = argc == 2 && std::string(argv[1]) == "--test-coordinator-deferred";
+    const bool prepared_only = argc == 2 && std::string(argv[1]) == "--test-coordinator-prepared-plan";
+    const bool accepted_worker_only = argc == 2 && std::string(argv[1]) == "--test-coordinator-accepted-worker";
+    const bool snapshot_cleanup_only = argc == 2 && std::string(argv[1]) == "--test-coordinator-snapshot-cleanup";
+    const bool manifest_paths_only = argc == 2 && std::string(argv[1]) == "--test-coordinator-manifest-paths";
+    if (argc != 1 && !diagnostics_only && !reload_boundaries_only && !shared_space_only && !retention_wal_only && !deferred_only && !prepared_only && !accepted_worker_only && !snapshot_cleanup_only && !manifest_paths_only)
     {
         std::fprintf(stderr, "unknown coordinator test selector\n");
         return 2;
+    }
+    if (argc == 1 || prepared_only) ok &= prepared_plan_tests::Run();
+    if (accepted_worker_only) ok &= prepared_plan_tests::RunAcceptedSnapshotWorker();
+    if (argc == 1 || retention_wal_only) ok &= TestRetentionCleanupWithDurableWal();
+    if (argc == 1 || snapshot_cleanup_only)
+        for (const auto* mode : {"cleanup-race", "current-pin", "accepted-owner", "ordinary-cohort"})
+            ok &= TestSnapshotSiblingCleanupAdmission(mode);
+    if (argc == 1 || deferred_only)
+    {
+        ok &= deferred_tests::TestBatchesPublishOnceAndReopen();
+        ok &= deferred_tests::TestFailuresPreserveAcceptedWork();
+        ok &= deferred_tests::TestUnstagedAcceptedDebtIsNotDeferredWorkingState();
+        ok &= deferred_tests::TestFirstPreacceptanceRefusalRemainsRetryable();
     }
     if (argc == 1 || shared_space_only)
     {
@@ -5054,6 +5613,22 @@ int main(int argc, char** argv)
     {
         ok &= TestCoordinatorDiagnosticsCountsAndReloads();
         ok &= TestCoordinatorDiagnosticsFailureAndBorrowedStore();
+        ok &= TestCoordinatorDiagnosticsEarlyCapacityRefusal();
+        ok &= TestCoordinatorDiagnosticsEarlyStagingAndBoundedDetails();
+    }
+    if (argc == 1 || manifest_paths_only)
+    {
+        ok &= TestManifestChecksumRoundtrip();
+        ok &= TestManifestRejectsSharedRecoveryIdentity();
+        ok &= TestManifestRejectsMissingWritableRecoveryIdentity();
+        ok &= TestManifestRejectsDuplicateJsonKeys();
+        ok &= TestManifestRejectsDuplicateMountTargets();
+        ok &= TestManifestRejectsOversizedInput();
+        ok &= TestManifestProtected();
+        ok &= TestManifestRejectsSymlinkedParent();
+#if defined(_WIN32)
+        ok &= TestManifestWindowsLongPaths();
+#endif
     }
     if (reload_boundaries_only)
     {
@@ -5068,6 +5643,7 @@ int main(int argc, char** argv)
         ok &= TestCoordinatorMutationStagingHookRejectsWithoutMediaChange();
         ok &= TestCoordinatorIsolatesPreWriteFailureAcrossVolumes();
         ok &= TestRetentionCleanupRetryOwnsOnePublication();
+        ok &= TestRetentionCleanupRetryOwnsOnePublication(true);
     }
     if (argc == 1)
     {
@@ -5099,6 +5675,7 @@ int main(int argc, char** argv)
         ok &= TestVolumeReplayBoundaryFollowsOnlyUnchangedSiblings();
         ok &= TestRequiredCheckpointPinsSurviveUnmountAndRetryLifecycle();
         ok &= TestRetentionCleanupRetryOwnsOnePublication();
+        ok &= TestRetentionCleanupRetryOwnsOnePublication(true);
         ok &= TestCoordinatorPrepublicationHookRejectsWithoutMediaChange();
         ok &= TestCoordinatorSerializesSessionTransitionsWithCommit();
         ok &= TestCoordinatorIsolatesPreWriteFailureAcrossVolumes();
@@ -5109,27 +5686,21 @@ int main(int argc, char** argv)
         ok &= TestCoordinatorDrainAndStop();
         ok &= TestLedgerOverlapPredicate();
         ok &= TestLedgerAppliesDeallocationBeforeReuse();
-        ok &= TestManifestChecksumRoundtrip();
-        ok &= TestManifestRejectsSharedRecoveryIdentity();
-        ok &= TestManifestRejectsMissingWritableRecoveryIdentity();
-        ok &= TestManifestRejectsDuplicateJsonKeys();
-        ok &= TestManifestRejectsDuplicateMountTargets();
-        ok &= TestManifestRejectsOversizedInput();
-        ok &= TestManifestProtected();
-        ok &= TestManifestRejectsSymlinkedParent();
     }
     {
         std::lock_guard<std::mutex> lock(g_run_dirs_mutex);
-        for (const auto& dir : g_run_dirs)
-        {
-            std::error_code ec;
-            std::filesystem::remove_all(dir, ec);
-        }
+        if (std::getenv("APFSACCESS_KEEP_TEST_ARTIFACTS") == nullptr)
+            for (const auto& dir : g_run_dirs)
+            {
+                std::error_code ec;
+                std::filesystem::remove_all(dir, ec);
+            }
         g_run_dirs.clear();
     }
     if (ok && g_failures == 0)
     {
-        std::printf("container-coordinator: %s green\n", argc == 1 ? "all" : argv[1]);
+        std::printf("container-coordinator: %s green (%llu checks, 0 failures)\n", argc == 1 ? "all" : argv[1],
+            static_cast<unsigned long long>(g_checks.load(std::memory_order_relaxed)));
         return 0;
     }
     std::fprintf(

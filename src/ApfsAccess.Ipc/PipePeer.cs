@@ -19,6 +19,9 @@ public sealed class PipePeer : IAsyncDisposable
     private int _readOffset;
     private int _readCount;
 
+    public int AuthenticatedClientProcessId { get; internal set; }
+    public long AuthenticatedClientStartTimeUtcTicks { get; internal set; }
+
     public PipePeer(Stream stream)
     {
         _stream = stream ?? throw new ArgumentNullException(nameof(stream));

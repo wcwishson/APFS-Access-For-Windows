@@ -714,10 +714,10 @@ public sealed class CliElevationTests
             $evidence = [ordered]@{
                 childPid = $PID
                 childStartTimeUtcTicks = $self.StartTime.ToUniversalTime().Ticks
-                childPath = $self.MainModule.FileName
+                childPath = '{{PowerShellLiteral(pwshPath)}}'
                 descendantPid = $descendant.Id
                 descendantStartTimeUtcTicks = $descendant.StartTime.ToUniversalTime().Ticks
-                descendantPath = $descendant.MainModule.FileName
+                descendantPath = '{{PowerShellLiteral(pwshPath)}}'
             }
             $temporary = '{{PowerShellLiteral(readyPath)}}.tmp'
             [IO.File]::WriteAllText($temporary, ($evidence | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))

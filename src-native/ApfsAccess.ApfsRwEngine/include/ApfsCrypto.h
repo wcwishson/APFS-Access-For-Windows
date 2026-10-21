@@ -69,6 +69,24 @@ inline constexpr std::size_t kMaxDerivedBytes = 64;
 [[nodiscard]] CryptoResult Rfc3394Unwrap(std::span<const std::byte> kek,
     std::span<const std::byte> ciphertext) noexcept;
 
+inline constexpr std::size_t kGcmTagBytes = 16;
+inline constexpr std::size_t kMaxGcmRecordBytes = SecureBytes::kMaxBytes;
+inline constexpr std::size_t kMaxGcmAadBytes = SecureBytes::kMaxBytes;
+// AES-256-GCM, exactly 32 key bytes and 12 nonce bytes. Record = ciphertext ||
+// 16-byte tag; nonce and AAD are external. Records INCLUDING the tag and AAD are
+// each capped independently above; plaintext is at most kMaxGcmRecordBytes - 16.
+// Empty plaintext seals to a tag-only record; authenticated empty opens succeed
+// with an empty, unlocked owner. Every failure has empty output; authentication
+// failure is IntegrityFailure. Other errors follow the CryptoResult contract.
+// Caller MUST ensure nonce uniqueness per key. This primitive does NOT manage
+// epochs, nonces, recovery or source/AAD policy and cannot enable a writer alone.
+[[nodiscard]] CryptoResult Aes256GcmSeal(std::span<const std::byte> key,
+    std::span<const std::byte> nonce, std::span<const std::byte> plaintext,
+    std::span<const std::byte> aad) noexcept;
+[[nodiscard]] CryptoResult Aes256GcmOpen(std::span<const std::byte> key,
+    std::span<const std::byte> nonce, std::span<const std::byte> record,
+    std::span<const std::byte> aad) noexcept;
+
 enum class XtsDirection { Encrypt, Decrypt };
 inline constexpr std::size_t kMaxXtsDataUnitBytes = 65536;
 // One complete data unit, 16..65536 bytes, multiple of 16; no ciphertext stealing.

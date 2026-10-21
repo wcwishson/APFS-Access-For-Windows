@@ -116,7 +116,16 @@ public sealed class DriveLetterUpgradePreparationTests : IDisposable
         }
         Assert.False((await refresh!).Success);
         AssertConsistentMount(original);
-        Assert.Same(originalStatus, _publisher.Latest);
+        // Status must stay semantically stable across the failed refresh: same
+        // state, mount points, and mounted volumes. Reference identity cannot be
+        // required: every newer-generation discovery admission installs a fresh
+        // payload instance carrying the current generation (the publisher
+        // installs on admit and only suppresses subscriber notification when the
+        // content is equal), so this flow's own three observations legitimately
+        // refresh the instance while changing nothing observable.
+        Assert.Equal(originalStatus.State, _publisher.Latest.State);
+        Assert.Equal(originalStatus.MountPoints, _publisher.Latest.MountPoints);
+        Assert.Equal(originalStatus.MountedVolumes, _publisher.Latest.MountedVolumes);
         Assert.Equal(0, _backend.Unmounts);
         Assert.Single(_backend.Requests);
         Assert.True(_store.TryGetPreference(Uuid, out var saved));

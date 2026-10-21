@@ -31,6 +31,7 @@ bool RestartNativeClone513(NativeCloneHost500Fixture& f, std::uint64_t sequence,
                 r.tx_manager->LoadRequiredCheckpointXidsSinceCleanup(pins) &&
                 f.fixture.coordinator->InitializeRequiredCheckpointCensus({{101, pins, true}, {102, {}, false}}, error),
                 "513 restarted shared owner binds exact accepted census")) return false;
+        r.container_session_contexts = {&r};
     }
     else
     {
@@ -202,7 +203,7 @@ bool TestNativeCloneManifest513()
     using Reply = apfsaccess::fshost::clone_control::ExportReply;
     using Store = apfsaccess::rw::MetadataStore;
     std::cerr << "[clone513] manifest success, quota, accepted replay and namespace failure\n";
-    for (unsigned scenario = 0; scenario != 5; ++scenario)
+    for (unsigned scenario = 0; scenario != 6; ++scenario)
     {
         F f; Reply ticket;
         if (!Require(f.Initialize(scenario == 1, false, scenario == 4 ? 16384 : 0, false, scenario == 4, true) && f.Open() &&
@@ -214,6 +215,12 @@ bool TestNativeCloneManifest513()
             c.metadata_store->SetCommitStageHook([](std::string_view stage) { return stage != "before-apple-checkpoint-switch"; });
         if (scenario == 3)
             g_clone_namespace_allocation_scope = [](bool begin) { g_clone_allocation_fail_after = begin ? 40 : -1; };
+        if (scenario == 5)
+            c.metadata_store->SetCommitStageHook([](std::string_view stage) {
+                if (stage == "before-apple-checkpoint-switch")
+                    throw std::runtime_error("CloneManifestPreparationUnsupported");
+                return true;
+            });
         const auto status = f.Import(ticket);
         g_clone_namespace_allocation_scope = {};
         if (scenario == 1 || scenario == 4)
@@ -246,6 +253,26 @@ bool TestNativeCloneManifest513()
         if (!Require(selected != census.end() && selected->required_checkpoint_xids == std::vector<std::uint64_t>{checkpoint},
                 "513 shared owner retains exact failed-clone checkpoint pin")) return false;
         if (!RestartNativeClone513(f, accepted, checkpoint + 1)) return false;
+    }
+    std::cerr << "[clone513] unclassified preparation exception retains recovery latch\n";
+    {
+        F f;
+        if (!Require(f.Initialize(false, false, 0, false, false, true), "513 exception fixture initializes")) return false;
+        auto& c = *f.fixture.context;
+        const auto original = ReadFileBytes(f.fixture.image.path);
+        const auto checkpoint = f.fixture.coordinator->CheckpointXid();
+        std::optional<Store::MutationStatus> classification;
+        ManifestCommitOutcome outcome;
+        const auto status = CommitNativeMutationsBestEffort(&c, L"ClonePreparationExceptionTest", {}, {},
+            [](const Store&, auto&, std::string&) -> bool {
+                throw std::runtime_error("CloneManifestPreparationUnsupported");
+            }, {}, &outcome, false, {}, &classification);
+        if (!Require(!NT_SUCCESS(status) && !classification && outcome.clean_prepublication_refusal &&
+                !IsMutationWriteEnabled(&c) && c.recovery_active &&
+                c.tx_manager->Watermarks().accepted_sequence == 0 && c.metadata_store->PendingMutationCount() == 0 &&
+                f.fixture.coordinator->CheckpointXid() == checkpoint &&
+                ReadFileBytes(f.fixture.image.path) == original,
+                "513 exception text cannot mint retryable admission; unchanged unaccepted source keeps host latch")) return false;
     }
     std::cerr << "[clone513] shared-owner sibling isolation\n";
     {

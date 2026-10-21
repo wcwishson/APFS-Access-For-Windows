@@ -14,6 +14,11 @@ internal sealed class ServiceInstanceLease : IDisposable
         _semaphore = semaphore;
     }
 
+    internal static string? ConfiguredLeaseName(Guid? instance)
+        => instance is null ? null : instance == Guid.Empty
+            ? throw new ArgumentException("A private service instance must be nonempty.", nameof(instance))
+            : DefaultLeaseName + ".fusion." + instance.Value.ToString("N");
+
     internal static ServiceInstanceLease? TryAcquire(string runtimeRoot, string? leaseName = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(runtimeRoot);

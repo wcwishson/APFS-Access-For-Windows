@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Text.Json;
 using ApfsAccess.Core;
 
 namespace ApfsAccess.Backend.Native.Tests;
@@ -28,7 +29,7 @@ public sealed class ObserverPrimaryDiscoveryTests
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
             containerHex,
             [new ObserverEvidenceJson.VolumeJson("SnapA", 201),
-             new ObserverEvidenceJson.VolumeJson("SnapB", 202)]);
+             new ObserverEvidenceJson.VolumeJson("SnapB", 202)], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp);
 
         var volumes = (await backend.ProbeVolumesAsync(imagePath, CancellationToken.None))
@@ -124,6 +125,72 @@ public sealed class ObserverPrimaryDiscoveryTests
     }
 
     [Fact]
+    public async Task RawDiscoveryFailure_EvidenceSurvivesRecoveryAndDeduplicatesRepeatedFailure()
+    {
+        using var temp = DTempDirectory.Create("primary-failure-evidence");
+        const string deviceId = @"\\.\PhysicalDrive31";
+        var runner = new StubRunner(new ObserverRunResult(5, string.Empty, "error: checkpoint read refused"));
+        using var backend = CreateBackendWithRunner(runner, temp);
+        typeof(NativeApfsBackend).GetField("_writeDiagnosticsRoot", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(backend, temp.Path);
+
+        Assert.Empty(await backend.ProbeVolumesAsync(deviceId, CancellationToken.None));
+        Assert.Empty(await backend.ProbeVolumesAsync(deviceId, CancellationToken.None));
+        var evidencePath = Assert.Single(Directory.GetFiles(temp.Path, "backend-observer-discovery-failed-*.json"));
+        using var evidence = JsonDocument.Parse(await File.ReadAllTextAsync(evidencePath));
+        var detail = evidence.RootElement.GetProperty("detail").GetString()!;
+        Assert.Contains(deviceId, detail);
+        Assert.Contains("managed-discovery", detail);
+        Assert.Contains("exit code 5", detail);
+        Assert.Contains("error: checkpoint read refused", detail);
+        Assert.Contains("failing closed", detail);
+        Assert.Equal(Environment.ProcessId, evidence.RootElement.GetProperty("processId").GetInt32());
+        Assert.Equal(JsonValueKind.String, evidence.RootElement.GetProperty("timestampUtc").ValueKind);
+
+        runner.Result = new(0, ObserverEvidenceJson.BuildSingleContainer(
+            new string('a', 32), [new ObserverEvidenceJson.VolumeJson("Data", 101)], devicePath: deviceId), string.Empty);
+        Assert.NotEmpty(await backend.ProbeVolumesAsync(deviceId, CancellationToken.None));
+        Assert.False(backend.TryGetLastDiscoveryDiagnostic(deviceId, out _));
+        Assert.Equal(evidencePath, Assert.Single(Directory.GetFiles(temp.Path, "backend-observer-discovery-failed-*.json")));
+        using var recoveredEvidence = JsonDocument.Parse(await File.ReadAllTextAsync(evidencePath));
+        Assert.Equal(detail, recoveredEvidence.RootElement.GetProperty("detail").GetString());
+    }
+
+    [Fact]
+    public async Task RejectedObserverSource_EvidenceNamesExactRequestedDevice()
+    {
+        using var temp = DTempDirectory.Create("primary-source-evidence");
+        const string requestedDevice = @"\\.\PhysicalDrive31";
+        var evidence = ObserverEvidenceJson.BuildSingleContainer(new string('a', 32),
+            [new ObserverEvidenceJson.VolumeJson("Data", 101)], devicePath: @"\\.\PhysicalDrive32");
+        using var backend = CreateBackend(evidence, temp);
+        typeof(NativeApfsBackend).GetField("_writeDiagnosticsRoot", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(backend, temp.Path);
+        Assert.Empty(await backend.ProbeVolumesAsync(requestedDevice, CancellationToken.None));
+        var path = Assert.Single(Directory.GetFiles(temp.Path, "backend-observer-discovery-failed-*.json"));
+        using var saved = JsonDocument.Parse(await File.ReadAllTextAsync(path));
+        var detail = saved.RootElement.GetProperty("detail").GetString()!;
+        Assert.Contains(requestedDevice, detail);
+        Assert.Contains("source identity could not be verified", detail);
+    }
+
+    [Fact]
+    public async Task DiagnosticWriteFailure_DoesNotChangeRawDiscoveryRefusal()
+    {
+        using var temp = DTempDirectory.Create("primary-evidence-unwritable");
+        var blocker = Path.Combine(temp.Path, "file-not-directory");
+        await File.WriteAllTextAsync(blocker, "blocked");
+        using var backend = CreateBackendWithRunner(new StubRunner(new(5, string.Empty, "catalog unreadable")), temp);
+        typeof(NativeApfsBackend).GetField("_writeDiagnosticsRoot", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(backend, blocker);
+        const string deviceId = @"\\.\PhysicalDrive31";
+        Assert.Empty(await backend.ProbeVolumesAsync(deviceId, CancellationToken.None));
+        Assert.True(backend.TryGetLastDiscoveryDiagnostic(deviceId, out var diagnostic));
+        Assert.Contains("exit code 5", diagnostic);
+        Assert.Contains("catalog unreadable", diagnostic);
+    }
+
+    [Fact]
     public async Task MalformedGptImage_ObserverFails_YieldsEmptyWithoutThrow()
     {
         using var temp = DTempDirectory.Create("primary-malformed");
@@ -158,6 +225,7 @@ public sealed class ObserverPrimaryDiscoveryTests
 
     private sealed class StubRunner(ObserverRunResult result) : IObserverRunner
     {
+        public ObserverRunResult Result { get; set; } = result;
         public int CallCount { get; private set; }
 
         public IReadOnlyList<string>? LastArguments { get; private set; }
@@ -166,7 +234,7 @@ public sealed class ObserverPrimaryDiscoveryTests
         {
             CallCount++;
             LastArguments = arguments.ToArray();
-            return result;
+            return Result;
         }
     }
 

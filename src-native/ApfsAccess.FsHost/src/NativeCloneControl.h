@@ -1,5 +1,6 @@
 #pragma once
 #include "NativeCloneProtocol.h"
+#include "NativeSparseRangeControl.h"
 // Deliberately unadvertised until the parent passes its consistent build and
 // mounted gate. Software tests enable the exact same dispatcher body.
 #ifndef APFSACCESS_ENABLE_NATIVE_CLONE_CONTROL
@@ -40,6 +41,7 @@ bool NativeCloneOpenSupportedLocked(MountContext& c, OpenContext& o, bool source
 }
 #include "NativeCloneManifest.h"
 #endif
+#include "NativeHardLinkControl.h"
 
 NTSTATUS CB_Control(FSP_FILE_SYSTEM* fs, PVOID context, UINT32 code,
     PVOID input, ULONG input_size, PVOID output, ULONG output_size, PULONG transferred)
@@ -48,6 +50,13 @@ NTSTATUS CB_Control(FSP_FILE_SYSTEM* fs, PVOID context, UINT32 code,
     auto* c = Ctx(fs);
     ScopedCallbackActivity callback(c, "Control");
     if (transferred) *transferred = 0;
+    if (code == apfsaccess::fshost::hardlink_control::Export || code == apfsaccess::fshost::hardlink_control::Import)
+        return DispatchNativeHardLinkControl(fs, context, code, input, input_size, output, output_size, transferred);
+    if (code == apfsaccess::fshost::allocated_ranges_control::Query)
+        return DispatchNativeAllocatedRangesControl(fs, context, input, input_size, output, output_size, transferred);
+    if (code == apfsaccess::fshost::sparse_control::Query ||
+        code == apfsaccess::fshost::sparse_control::Zero)
+        return DispatchNativeSparseControl(fs, context, code, input, input_size, output, output_size, transferred);
     if (code != Export && code != Import) return STATUS_INVALID_DEVICE_REQUEST;
     if (!c || !context || !transferred) return STATUS_INVALID_PARAMETER;
     ExternalMutationRequestScope admission(c);
@@ -156,14 +165,23 @@ NTSTATUS CB_Control(FSP_FILE_SYSTEM* fs, PVOID context, UINT32 code,
                 return STATUS_NOT_SUPPORTED;
             Store::MutationRequest preview;
             std::vector<std::uint64_t> pins; std::string error;
-            if (!LoadDirectCheckpointPinsLocked(*c, pins, error) || !c->metadata_store->PrepareNativeClone(source, target, preview))
+            const auto* held = c->backup_held ? c->backup_held->source.get() : nullptr;
+            if (!LoadDirectCheckpointPinsLocked(*c, pins, error) || !(held
+                ? c->metadata_store->PrepareBackupRetainedClone(*held, source, target, preview, error)
+                : c->metadata_store->PrepareNativeClone(source, target, preview)))
                 return STATUS_NOT_SUPPORTED;
-            const auto capacity = c->metadata_store->PreflightNativeCapacityMutation(preview, pins);
+            const auto capacity = held
+                ? c->metadata_store->PreflightBackupRetainedCapacityMutations(*held, std::span(&preview, 1), pins)
+                : c->metadata_store->PreflightNativeCapacityMutation(preview, pins);
             if (capacity != Store::MutationStatus::Applied)
                 return capacity == Store::MutationStatus::CapacityBlocked ? STATUS_DISK_FULL : STATUS_NOT_SUPPORTED;
             std::lock_guard journal(c->tx_mutex);
+            if (held && (!c->backup_held->census ||
+                !c->backup_held->census->BeforeMutation(c->metadata_store->CheckpointXid().value_or(0), error)))
+                return STATUS_IO_DEVICE_ERROR;
             acceptance_started = true;
-            accepted = c->metadata_store->AcceptNativeClone(*c->tx_manager, source, target, receipt);
+            accepted = held ? c->metadata_store->AcceptBackupRetainedClone(*held, *c->tx_manager, source, target, receipt, error)
+                : c->metadata_store->AcceptNativeClone(*c->tx_manager, source, target, receipt);
         }
         if (accepted == Store::CloneAcceptance::Refused) { acceptance_started = false; return STATUS_NOT_SUPPORTED; }
         if (accepted != Store::CloneAcceptance::Accepted)
@@ -182,7 +200,9 @@ NTSTATUS CB_Control(FSP_FILE_SYSTEM* fs, PVOID context, UINT32 code,
             std::vector<apfsaccess::rw::TransactionManager::AcceptedTransaction> transactions;
             verified = c->tx_manager->LoadAcceptedTransactionsSinceCleanup(transactions) && transactions.size() == 1 &&
                 transactions.front().mutations.size() == 1 &&
-                c->metadata_store->ReplayNativeClone(transactions.front().mutations.front(), receipt.checkpoint) ==
+                (c->backup_held && c->backup_held->source
+                    ? c->metadata_store->ReplayBackupRetainedClone(*c->backup_held->source, transactions.front().mutations.front(), receipt.checkpoint)
+                    : c->metadata_store->ReplayNativeClone(transactions.front().mutations.front(), receipt.checkpoint)) ==
                     Store::CloneReplay::AlreadyPublished;
 #ifdef APFSACCESS_FSHOST_UNIT_TEST
             if (!verified) std::wcerr << L"[clone500] verification txs=" << transactions.size()

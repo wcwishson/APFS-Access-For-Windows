@@ -658,6 +658,234 @@ public sealed class AgentControlPipeIntegrationTests
         }
     }
 
+    [Fact]
+    public async Task Schema2SnapshotCreate_ExecutesThroughLiveOwnerWithProof()
+    {
+        var evidenceRoot = TestEvidenceRoot();
+        var backend = new SnapshotBackend();
+        backend.SetMounted(new MountedVolumeState(
+            VolumeId, "E:\\", MountAccessMode.ReadWrite, VolumeName: "Main",
+            DeviceId: DeviceId, DeviceDisplayName: "Test APFS Device", SnapshotInventorySupported: true, SnapshotMutationSupported: true, SnapshotRecoverySupported: true));
+        using var worker = SnapshotWorker(backend);
+        var executor = new AgentControlCommandExecutor(worker, _ => true);
+        var operationService = new AgentControlOperationService(
+            (request, token) => executor.ExecuteAsync(request, token), evidenceRoot);
+        var service = new TrayPipeHostService(
+            NullLogger<TrayPipeHostService>.Instance,
+            new RuntimeStatusPublisher(),
+            worker,
+            new RecordingApplicationLifetime(),
+            operationService);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var operationId = Guid.NewGuid().ToString("D");
+        var payload = new ControlOperationRequestPayload(
+            operationId,
+            ApfsControlCommands.SnapshotCreate,
+            new ApfsControlTarget(DeviceId, VolumeId),
+            ExpiresAtUtc: OperationExpiry(),
+            SnapshotName: "backup");
+        var request = PipeMessageCodec.Create(
+            ApfsMessageTypes.ControlOperationRequest,
+            payload,
+            requestId: operationId,
+            schemaVersion: PipeSchemaVersions.Schema2);
+
+        try
+        {
+            var first = await ExchangeAsync(service, request, cancellation.Token);
+            var replay = await ExchangeAsync(service, request, cancellation.Token);
+
+            Assert.True(PipeMessageCodec.TryGetPayload<OperationResultPayload>(first, out var firstResult));
+            Assert.True(PipeMessageCodec.TryGetPayload<OperationResultPayload>(replay, out var replayResult));
+            Assert.True(firstResult!.Success, firstResult.Diagnostic);
+            Assert.Equal(ApfsOperationStates.Succeeded, firstResult.State);
+            Assert.Equal(ApfsOperationCodes.OperationSucceeded, firstResult.Code);
+            Assert.Equal("snapshot-created", firstResult.FinalStatus);
+            Assert.Equal("present", firstResult.MountProof);
+            Assert.Equal("proven", firstResult.OwnershipProof);
+            Assert.Equal("not-applicable", firstResult.DurabilityProof);
+            Assert.Equal("backup", firstResult.SnapshotName);
+            Assert.Equal(ApfsOperationFingerprint.Compute(payload), firstResult.Fingerprint);
+            Assert.Equal(firstResult, replayResult);
+            var call = Assert.Single(backend.SnapshotCalls);
+            Assert.Equal(new string('a', 32), call.ContainerUuid);
+            Assert.Equal(101UL, call.VolumeObjectId);
+            var validation = PipeMessageCodec.Validate(first);
+            Assert.True(validation.IsValid, validation.Diagnostic);
+            Assert.True(File.Exists(firstResult.EvidencePath));
+        }
+        finally
+        {
+            await operationService.StopAsync(CancellationToken.None);
+            TryDelete(evidenceRoot);
+        }
+    }
+
+    [Fact]
+    public async Task Schema2SnapshotCreate_MissingName_IsRejectedBeforeExecution()
+    {
+        var evidenceRoot = TestEvidenceRoot();
+        var backend = new SnapshotBackend();
+        using var worker = SnapshotWorker(backend);
+        var executor = new AgentControlCommandExecutor(worker, _ => true);
+        var operationService = new AgentControlOperationService(
+            (request, token) => executor.ExecuteAsync(request, token), evidenceRoot);
+        var service = new TrayPipeHostService(
+            NullLogger<TrayPipeHostService>.Instance,
+            new RuntimeStatusPublisher(),
+            worker,
+            new RecordingApplicationLifetime(),
+            operationService);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var operationId = Guid.NewGuid().ToString("D");
+        var malformed = PipeMessageCodec.Create(
+            ApfsMessageTypes.ControlOperationRequest,
+            new ControlOperationRequestPayload(
+                operationId,
+                ApfsControlCommands.SnapshotCreate,
+                new ApfsControlTarget(DeviceId, VolumeId),
+                ExpiresAtUtc: OperationExpiry()),
+            requestId: operationId,
+            schemaVersion: PipeSchemaVersions.Schema2);
+
+        try
+        {
+            var response = await ExchangeAsync(service, malformed, cancellation.Token);
+
+            Assert.Equal(ApfsMessageTypes.OperationResult, response.Type);
+            Assert.True(PipeMessageCodec.TryGetPayload<OperationResultPayload>(response, out var result));
+            Assert.False(result!.Success);
+            Assert.Equal(ApfsOperationStates.Failed, result.State);
+            Assert.Equal(ApfsOperationCodes.InvalidArguments, result.Code);
+            Assert.Empty(backend.SnapshotCalls);
+            Assert.Empty(Directory.GetFileSystemEntries(evidenceRoot));
+        }
+        finally
+        {
+            await operationService.StopAsync(CancellationToken.None);
+            TryDelete(evidenceRoot);
+        }
+    }
+
+    [Fact]
+    public async Task Schema2SnapshotRecover_LatchedOwner_MapsBlockedRecovery()
+    {
+        var evidenceRoot = TestEvidenceRoot();
+        var backend = new SnapshotBackend();
+        backend.SetMounted(new MountedVolumeState(
+            VolumeId, "E:\\", MountAccessMode.ReadWrite, VolumeName: "Main",
+            DeviceId: DeviceId, DeviceDisplayName: "Test APFS Device"));
+        backend.SnapshotResults.Enqueue(new SnapshotControlResult(false, "SnapshotMaintenanceOwnerNotReady"));
+        backend.SetMounted(new MountedVolumeState(VolumeId, "E:\\", MountAccessMode.ReadWrite, VolumeName: "Main",
+            DeviceId: DeviceId, DeviceDisplayName: "Test APFS Device", SnapshotInventorySupported: true, SnapshotMutationSupported: true, SnapshotRecoverySupported: true));
+        using var worker = SnapshotWorker(backend);
+        var executor = new AgentControlCommandExecutor(worker, _ => true);
+        var operationService = new AgentControlOperationService(
+            (request, token) => executor.ExecuteAsync(request, token), evidenceRoot);
+        var service = new TrayPipeHostService(
+            NullLogger<TrayPipeHostService>.Instance,
+            new RuntimeStatusPublisher(),
+            worker,
+            new RecordingApplicationLifetime(),
+            operationService);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var operationId = Guid.NewGuid().ToString("D");
+        var request = PipeMessageCodec.Create(
+            ApfsMessageTypes.ControlOperationRequest,
+            new ControlOperationRequestPayload(
+                operationId,
+                ApfsControlCommands.SnapshotRecover,
+                new ApfsControlTarget(DeviceId, VolumeId),
+                ExpiresAtUtc: OperationExpiry()),
+            requestId: operationId,
+            schemaVersion: PipeSchemaVersions.Schema2);
+
+        try
+        {
+            var response = await ExchangeAsync(service, request, cancellation.Token);
+
+            Assert.True(PipeMessageCodec.TryGetPayload<OperationResultPayload>(response, out var result));
+            Assert.False(result!.Success);
+            Assert.Equal(ApfsOperationStates.Failed, result.State);
+            Assert.Equal(ApfsOperationCodes.BlockedRecovery, result.Code);
+            var validation = PipeMessageCodec.Validate(response);
+            Assert.True(validation.IsValid, validation.Diagnostic);
+            Assert.Single(backend.SnapshotCalls);
+        }
+        finally
+        {
+            await operationService.StopAsync(CancellationToken.None);
+            TryDelete(evidenceRoot);
+        }
+    }
+
+    private static ApfsMountWorker SnapshotWorker(SnapshotBackend backend)
+        => new(
+            NullLogger<ApfsMountWorker>.Instance,
+            backend,
+            new NoopMountPolicy(),
+            new RuntimeStatusPublisher(),
+            new FixedOptionsMonitor(new ServiceHostOptions()));
+
+    private sealed class SnapshotBackend : IApfsBackend, ISnapshotControlBackend
+    {
+        private readonly Dictionary<string, MountedVolumeState> _mounts = new(StringComparer.OrdinalIgnoreCase);
+
+        public List<(string ContainerUuid, ulong VolumeObjectId, SnapshotControlAction Action)> SnapshotCalls { get; } = [];
+        public Queue<SnapshotControlResult> SnapshotResults { get; } = new();
+
+        public void SetMounted(MountedVolumeState state) => _mounts[state.MountPoint] = state;
+
+        public Task<IReadOnlyList<DeviceInfo>> ProbeDevicesAsync(CancellationToken cancellationToken)
+            => Task.FromResult<IReadOnlyList<DeviceInfo>>([new(DeviceId, "Test APFS Device", true)]);
+
+        public Task<IReadOnlyList<VolumeInfo>> ProbeVolumesAsync(
+            string deviceId,
+            CancellationToken cancellationToken)
+            => Task.FromResult<IReadOnlyList<VolumeInfo>>(
+            [
+                new VolumeInfo(
+                    VolumeId,
+                    DeviceId,
+                    "Main",
+                    SupportsReadWrite: true,
+                    SupportsNativeWrite: true,
+                    CatalogContainerUuid: new string('a', 32),
+                    CatalogVolumeObjectId: 101,
+                    CatalogVolumeUuid: new string('b', 32)),
+            ]);
+
+        public Task<MountResult> MountAsync(MountRequest request, CancellationToken cancellationToken)
+            => throw new NotSupportedException();
+
+        public Task<UnmountResult> UnmountAsync(string mountPoint, CancellationToken cancellationToken)
+            => throw new NotSupportedException();
+
+        public Task<IReadOnlyList<MountedVolumeState>> GetMountStateAsync(CancellationToken cancellationToken)
+            => Task.FromResult<IReadOnlyList<MountedVolumeState>>(_mounts.Values.ToArray());
+
+        public Task<SnapshotControlResult> SendSnapshotControlAsync(
+            string containerUuid,
+            ulong volumeObjectId,
+            SnapshotControlAction action,
+            IReadOnlyList<string>? extraLines,
+            CancellationToken cancellationToken)
+        {
+            SnapshotCalls.Add((containerUuid, volumeObjectId, action));
+            if (SnapshotResults.Count > 0)
+            {
+                return Task.FromResult(SnapshotResults.Dequeue());
+            }
+
+            return Task.FromResult(new SnapshotControlResult(true, action switch
+            {
+                SnapshotControlAction.Create => "SnapshotCreated",
+                SnapshotControlAction.Delete => "SnapshotDeleted",
+                _ => "SnapshotRecovered",
+            }));
+        }
+    }
+
     private static void AssertCodecValidOperationResult(PipeEnvelope response, string expectedCommand)
     {
         Assert.Equal(ApfsMessageTypes.OperationResult, response.Type);

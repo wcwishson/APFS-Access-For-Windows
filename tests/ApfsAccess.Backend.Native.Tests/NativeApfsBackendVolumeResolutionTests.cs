@@ -155,7 +155,8 @@ public sealed class NativeApfsBackendVolumeResolutionTests
             BindingFlags.NonPublic | BindingFlags.Instance);
         Assert.NotNull(method);
 
-        var task = Assert.IsType<Task<VolumeInfo?>>(method!.Invoke(backend, [volumeId, cancellationToken]));
+        var raw = method!.Invoke(backend, [volumeId, cancellationToken]);
+        var task = Assert.IsAssignableFrom<Task<VolumeInfo?>>(raw);
         return await task;
     }
 

@@ -100,17 +100,26 @@ public:
             if (!inode || inode->object_id != source_identity.object_id ||
                 (inode->xid ? inode->xid : inode->object_id) != source_identity.generation)
                 return refuse(Failure::IdentityMismatch);
-            if (!length || offset > inode->logical_size || length > inode->logical_size - offset)
-                return refuse(Failure::RangeUnsupported);
+            // Budget arithmetic precedes device I/O so over-budget requests
+            // refuse cheaply, exactly as before. Source-kind validation runs
+            // next: an undecodable source poisons every range (even an empty
+            // file's), so its own failure must win over incidental range
+            // arithmetic. The engine authenticates all blocks and owns
+            // CRW1/decmpfs parsing. PrepareCompressionRewrite is a
+            // side-effect-free const probe filling the local request, so an
+            // early refusal still leaves zero pending mutations, allocations,
+            // and journal intents. Range checks come last and only govern
+            // decodable sources.
             NativeCompressionRewrite prepared;
             const auto block_size = store.BlockSizeBytes();
             if (!block_size || !PublicationBytes(inode->logical_size, *block_size, prepared.publication_bytes_) ||
                 admission.reserved_publication_bytes > admission.publication_budget_bytes ||
                 prepared.publication_bytes_ > admission.publication_budget_bytes - admission.reserved_publication_bytes)
                 return refuse(Failure::BudgetExceeded);
-            // The engine authenticates all blocks and owns CRW1/decmpfs parsing.
             if (!store.PrepareCompressionRewrite(path, prepared.request_))
                 return refuse(Failure::SourceUnsupported);
+            if (!length || offset > inode->logical_size || length > inode->logical_size - offset)
+                return refuse(Failure::RangeUnsupported);
             rw::CompressionRewrite proof;
             if (!rw::DecodeCompressionRewrite(prepared.request_.inline_payload, proof) ||
                 proof.object != source_identity.object_id || proof.generation != source_identity.generation ||

@@ -107,8 +107,10 @@ bool SeedAcceptedSibling(Fixture& f, const std::wstring& path = L"\\accepted-sib
     std::filesystem::create_directories(s.cache_root);
     s.recovery_marker_file = s.session_root / "recovery.marker";
     s.native_write_enabled = true; s.args.write_backend = L"Native";
+    s.args.write_crash_replay_mode = L"ReplayIfSafe";
     SeedRoot(s); std::array<std::byte, 16> security{}; SeedSecurity(s, security);
-    s.payload_spool_volume_identity = "compression-refusal-sibling-279";
+    s.payload_spool_volume_identity = "compression-refusal-sibling-279:" +
+        std::to_string(GetCurrentProcessId()) + ":" + Tx::WideToUtf8(s.session_root.wstring());
     s.tx_manager = std::make_unique<Tx>(L"Conservative");
     s.tx_manager->SetVolumeIdentity(Utf8ToWide(s.payload_spool_volume_identity));
     s.tx_manager->SetJournalPath((s.session_root / "accepted.wal").wstring());
@@ -143,6 +145,28 @@ bool SeedAcceptedSibling(Fixture& f, const std::wstring& path = L"\\accepted-sib
         !s.metadata_store->LookupCommittedInodeByPath(create.path) && NativeScratchEmpty(*s.metadata_store),
         "refusal279: sibling census represents real unpublished accepted WAL and its exact source pin");
 }
+
+struct OriginalSiblingRecoveryPeers
+{
+    MountContext& selected;
+    MountContext& sibling;
+    std::vector<MountContext*> selected_before, sibling_before;
+    template<typename Fixture>
+    explicit OriginalSiblingRecoveryPeers(Fixture& f)
+        : selected(*f.fixture.context), sibling(f.sibling),
+          selected_before(selected.container_session_contexts), sibling_before(sibling.container_session_contexts)
+    {
+        // Coordinator pressure is isolated from host sibling draining. Explicit
+        // bootstrap still takes the complete original peer set's real gates.
+        selected.container_session_contexts = {&selected, &sibling};
+        sibling.container_session_contexts = selected.container_session_contexts;
+    }
+    ~OriginalSiblingRecoveryPeers()
+    {
+        selected.container_session_contexts = std::move(selected_before);
+        sibling.container_session_contexts = std::move(sibling_before);
+    }
+};
 
 // Separate local builder: reuse the existing compression encoder and canonical
 // image builder, never a private parser. The external fork may span many blocks.
@@ -193,7 +217,7 @@ struct CapacityFixture : NativeCompressionManifest266Fixture
         if (!add(EncodeAppleXattrRecord({17, "com.apple.ResourceFork", kAppleXattrDataStream, descriptor}, encoded, error)) ||
             !add(EncodeAppleDataStreamIdRecord({777, 1}, encoded, error)) ||
             !add(EncodeAppleFileExtentRecord({777, 0, allocation, 200, 0, 4096}, encoded, error)) ||
-            !EncodeApplePhysicalExtentRecord({200, allocation / 4096, kApplePhysicalExtentKindNew, 777, 1}, encoded, error)) return false;
+            !EncodeApplePhysicalExtentRecord({200, allocation / 4096, kApplePhysicalExtentKindNew, 17, 1}, encoded, error)) return false;
         volume.extentref_records.push_back(encoded); volume.additional_file_system_allocated_blocks += allocation / 4096;
         resource.resize(allocation);
         for (std::size_t at = 0; at < resource.size(); at += 4096)
@@ -239,6 +263,11 @@ bool TestNativeCompressionManifestOlderQueueRefusal279()
         std::byte value{'Z'}; ULONG done = 999;
         const auto status = CB_Write(&fs, writer, &value, 1, 1, FALSE, FALSE, &done, &info);
         const auto after_diagnostics = f.fixture.coordinator->DiagnosticsSnapshot(101);
+        std::wcerr << L"[refusal279] policy=" << policy << L" status=" << status << L" done=" << done
+            << L" queue=" << SameQueue(c, queue) << L" siblingWal=" << sibling_wal.Unchanged()
+            << L" coordinatorAttempts=" << after_diagnostics.commit_attempts - diagnostics.commit_attempts
+            << L" coordinatorFailures=" << after_diagnostics.commit_failures - diagnostics.commit_failures
+            << L" reloads=" << after_diagnostics.reload_attempts - diagnostics.reload_attempts << L'\n';
         if (!Require(status == STATUS_DEVICE_BUSY && done == 0 && SameQueue(c, queue) && sibling_wal.Unchanged() &&
                 f.sibling.tx_manager->Watermarks().accepted_sequence == sibling_marks.accepted_sequence &&
                 f.sibling.tx_manager->Watermarks().apfs_durable_sequence == sibling_marks.apfs_durable_sequence &&
@@ -248,11 +277,14 @@ bool TestNativeCompressionManifestOlderQueueRefusal279()
                 after_diagnostics.reload_attempts == diagnostics.reload_attempts,
                 "refusal279: actual pre-reload census refusal retains BOTH requests exactly in order and writes zero bytes") ||
             !before.Unchanged(f)) return false;
-        if (!Require(ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(f.sibling) &&
-                f.sibling.metadata_store->LookupCommittedInodeByPath(L"\\accepted-sibling-279") &&
-                !f.sibling.tx_manager->HasUnappliedAcceptedWork() &&
-                f.sibling.tx_manager->Watermarks().cleanup_sequence == sibling_marks.accepted_sequence && SameQueue(c, queue),
-                "refusal279: real sibling replay/cleanup resolves its census while the SAME selected queue remains intact")) return false;
+        {
+            OriginalSiblingRecoveryPeers recovery_peers(f);
+            if (!Require(ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(f.sibling) &&
+                    f.sibling.metadata_store->LookupCommittedInodeByPath(L"\\accepted-sibling-279") &&
+                    !f.sibling.tx_manager->HasUnappliedAcceptedWork() &&
+                    f.sibling.tx_manager->Watermarks().cleanup_sequence == sibling_marks.accepted_sequence && SameQueue(c, queue),
+                    "refusal279: real sibling replay/cleanup resolves its census while the SAME selected queue remains intact")) return false;
+        }
         unsigned proof_calls = 0; bool proof_ok = false;
         const auto conversion_source = f.fixture.coordinator->CheckpointXid() + 1;
         g_compressed_manifest_before_verification_hook = [&](const Store& live) {

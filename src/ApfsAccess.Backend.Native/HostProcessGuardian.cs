@@ -1,7 +1,9 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Text;
+using ApfsAccess.Core;
 using Microsoft.Win32.SafeHandles;
 
 namespace ApfsAccess.Backend.Native;
@@ -9,7 +11,7 @@ namespace ApfsAccess.Backend.Native;
 // The service owns one guardian for every FsHost. Closing the job handle is an
 // OS-level fallback that terminates the child if the service itself exits while
 // the host is stuck in WinFsp teardown.
-internal sealed class HostProcessGuardian : IDisposable
+internal sealed partial class HostProcessGuardian : IDisposable
 {
     private const uint JobObjectBasicAccountingInformationClass = 1;
     private const uint JobObjectExtendedLimitInformation = 9;
@@ -24,10 +26,17 @@ internal sealed class HostProcessGuardian : IDisposable
     private SafeProcessHandle? _processHandle;
     private SafeThreadHandle? _suspendedThread;
     private readonly uint _processId;
-    private readonly long _creationTimeFileTimeUtc;
+    private long _creationTimeFileTimeUtc;
+    private readonly object _ownershipSync = new();
+    private readonly HostGuardianCleanupTestHooks? _cleanupHooks = CleanupTestHooks.Value;
+    private readonly TaskCompletionSource _ownershipReleased = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private bool _disposeRequested;
+    private bool _keeperRunning;
+    private uint _terminationExitCode = StartupFailureExitCode;
+    internal static readonly AsyncLocal<HostGuardianCleanupTestHooks?> CleanupTestHooks = new();
 
     private HostProcessGuardian(
-        SafeKernelHandle job,
+        SafeKernelHandle? job,
         SafeProcessHandle? processHandle = null,
         SafeThreadHandle? suspendedThread = null,
         uint processId = 0,
@@ -44,15 +53,27 @@ internal sealed class HostProcessGuardian : IDisposable
 
     internal long CreationTimeFileTimeUtc => _creationTimeFileTimeUtc;
 
+    internal Task OwnershipReleased => _ownershipReleased.Task;
+
     internal bool TryGetActiveProcessCount(out uint activeProcesses)
     {
-        activeProcesses = 0;
-        var job = Volatile.Read(ref _job);
-        if (job is null || job.IsInvalid || job.IsClosed)
+        lock (_ownershipSync)
         {
-            return false;
+            return TryReadActiveProcessCount(out activeProcesses);
         }
+    }
 
+    private bool TryReadActiveProcessCount(out uint activeProcesses)
+    {
+        activeProcesses = 0;
+        var job = _job;
+        if (job is null || job.IsInvalid || job.IsClosed) return false;
+        if (_cleanupHooks?.ActiveProcessCount is { } query)
+        {
+            var count = query(job);
+            activeProcesses = count.GetValueOrDefault();
+            return count.HasValue;
+        }
         var accounting = default(JobObjectBasicAccountingInformationStruct);
         if (!QueryInformationJobObject(
                 job,
@@ -70,15 +91,34 @@ internal sealed class HostProcessGuardian : IDisposable
 
     internal sealed class LaunchResult
     {
-        public LaunchResult(Process process, HostProcessGuardian? guardian)
+        public LaunchResult(Process process, HostProcessGuardian? guardian, HostStartupStderr? startupStderr = null)
         {
             Process = process;
             Guardian = guardian;
+            StartupStderr = startupStderr;
         }
 
         public Process Process { get; }
 
         public HostProcessGuardian? Guardian { get; }
+
+        public HostStartupStderr? StartupStderr { get; }
+    }
+
+    internal static LaunchResult StartWithCredential(ProcessStartInfo startInfo, HostStartupGate startupGate, SafeFileHandle? input)
+        => StartCore(startInfo, startupGate, null, input);
+
+    internal static LaunchResult StartWithStreams(ProcessStartInfo startInfo, HostStartupGate startupGate,
+        SafeHandle input, SafeHandle output)
+    {
+        if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException();
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(output);
+        if (input.IsInvalid || input.IsClosed || output.IsInvalid || output.IsClosed)
+            throw new ArgumentException("Open native byte-pipe endpoints are required.");
+        if (GetNativeStreamFileType(input) != 3 || GetNativeStreamFileType(output) != 3)
+            throw new ArgumentException("Native standard transport requires byte pipes.");
+        return StartCore(startInfo, startupGate, null, input, output);
     }
 
     public static LaunchResult Start(ProcessStartInfo startInfo, HostStartupGate startupGate)
@@ -93,7 +133,7 @@ internal sealed class HostProcessGuardian : IDisposable
     private static LaunchResult StartCore(
         ProcessStartInfo startInfo,
         HostStartupGate startupGate,
-        Action<uint>? processCreated)
+        Action<uint>? processCreated, SafeHandle? credentialInput = null, SafeHandle? standardOutput = null)
     {
         ArgumentNullException.ThrowIfNull(startInfo);
         ArgumentNullException.ThrowIfNull(startupGate);
@@ -131,7 +171,7 @@ internal sealed class HostProcessGuardian : IDisposable
             }
         }
 
-        using var suspended = SuspendedProcess.Create(startInfo);
+        using var suspended = SuspendedProcess.Create(startInfo, credentialInput, standardOutput);
         Process? processObject = null;
         HostProcessGuardian? guardian = null;
         try
@@ -141,9 +181,11 @@ internal sealed class HostProcessGuardian : IDisposable
             // The process is still suspended here, so resolving the public
             // Process wrapper by PID cannot race with PID reuse or child code.
             processObject = Process.GetProcessById(checked((int)suspended.ProcessId));
+            // Retain the wrapper handle before an immediately exiting child runs.
+            _ = processObject.SafeHandle;
             guardian = Create(suspended, startupGate);
             guardian.ResumeSuspendedProcess();
-            return new LaunchResult(processObject, guardian);
+            return new LaunchResult(processObject, guardian, suspended.DetachStartupStderr());
         }
         catch (Exception error)
         {
@@ -184,33 +226,32 @@ internal sealed class HostProcessGuardian : IDisposable
     {
         ArgumentNullException.ThrowIfNull(process);
 
-        SafeKernelHandle? job = null;
+        if (!DuplicateHandle(-1, process.SafeHandle, -1, out var originalHandle, 0, false, 2))
+        {
+            throw LastWin32Error("DuplicateHandle(original process)");
+        }
+        var guardian = new HostProcessGuardian(null, originalHandle, processId: GetProcessId(originalHandle));
         try
         {
-            job = CreateConfiguredJob();
+            if (guardian.ProcessId == 0 ||
+                !TryGetProcessCreationTime(originalHandle, out guardian._creationTimeFileTimeUtc))
+            {
+                throw LastWin32Error("Capture original process identity");
+            }
+            guardian._job = CreateConfiguredJob();
             // Use the handle returned for this exact Process.Start instance.
             // Reopening by PID would allow PID reuse between launch and job
             // assignment to target an unrelated process.
-            if (!AssignProcessToJobObject(job, process.SafeHandle))
+            if (!AssignProcessToJobObject(guardian._job, originalHandle))
             {
                 throw LastWin32Error("AssignProcessToJobObject");
             }
 
-            var guardian = new HostProcessGuardian(job);
-            job = null;
             return guardian;
         }
-        catch
+        catch (Exception error)
         {
-            try
-            {
-                TryTerminateAndProveExit(job, process.SafeHandle);
-            }
-            finally
-            {
-                job?.Dispose();
-            }
-
+            guardian.AbortFailedStartup(error);
             throw;
         }
     }
@@ -224,9 +265,9 @@ internal sealed class HostProcessGuardian : IDisposable
             startupGate.Authorize();
             return guardian;
         }
-        catch
+        catch (Exception error)
         {
-            guardian.AbortStartup();
+            guardian.AbortFailedStartup(error);
             throw;
         }
     }
@@ -235,54 +276,34 @@ internal sealed class HostProcessGuardian : IDisposable
         SuspendedProcess suspended,
         HostStartupGate startupGate)
     {
-        SafeKernelHandle? job = null;
-        HostProcessGuardian? guardian = null;
+        var guardian = new HostProcessGuardian(
+            null,
+            suspended.DetachProcessHandle(),
+            suspended.DetachThreadHandle(),
+            suspended.ProcessId);
         try
         {
-            job = CreateConfiguredJob();
-            if (!AssignProcessToJobObject(job, suspended.ProcessHandle))
-            {
-                throw LastWin32Error("AssignProcessToJobObject");
-            }
-
             if (!TryGetProcessCreationTime(
-                    suspended.ProcessHandle,
-                    out var creationTimeFileTimeUtc))
+                    guardian._processHandle!,
+                    out guardian._creationTimeFileTimeUtc))
             {
                 throw LastWin32Error("GetProcessTimes");
             }
 
-            guardian = new HostProcessGuardian(
-                job,
-                suspended.DetachProcessHandle(),
-                suspended.DetachThreadHandle(),
-                suspended.ProcessId,
-                creationTimeFileTimeUtc);
-            job = null;
+            guardian._job = CreateConfiguredJob();
+            if (!AssignProcessToJobObject(guardian._job, guardian._processHandle!))
+            {
+                throw LastWin32Error("AssignProcessToJobObject");
+            }
 
             // Authorization is still part of the suspended transaction. The
             // host cannot observe or consume this gate until ResumeThread.
             startupGate.Authorize();
             return guardian;
         }
-        catch
+        catch (Exception error)
         {
-            if (guardian is not null)
-            {
-                guardian.AbortStartup();
-            }
-            else
-            {
-                try
-                {
-                    TryTerminateAndProveExit(job, suspended.ProcessHandle);
-                }
-                finally
-                {
-                    job?.Dispose();
-                }
-            }
-
+            guardian.AbortFailedStartup(error);
             throw;
         }
     }
@@ -340,116 +361,117 @@ internal sealed class HostProcessGuardian : IDisposable
         Interlocked.Exchange(ref _suspendedThread, null)?.Dispose();
     }
 
+    private void AbortFailedStartup(Exception error)
+    {
+        try
+        {
+            AbortStartup();
+        }
+        catch (Exception cleanup)
+        {
+            throw new AggregateException(
+                "Native mount host startup failed and exact process cleanup could not be proven.", error, cleanup);
+        }
+    }
+
     private void AbortStartup()
     {
-        var job = Volatile.Read(ref _job);
-        var process = Volatile.Read(ref _processHandle);
-        if (job is not null && !job.IsInvalid && !job.IsClosed)
+        var proven = false;
+        try
         {
-            TerminateJobObject(job, StartupFailureExitCode);
+            TryTerminate(StartupFailureExitCode);
+            var started = Stopwatch.StartNew();
+            do
+            {
+                lock (_ownershipSync)
+                {
+                    proven = TryProveOwnershipReleased();
+                }
+                if (proven) break;
+                Thread.Sleep(10);
+            }
+            while (started.Elapsed < (_cleanupHooks?.StartupCleanupTimeout ?? StartupCleanupTimeout));
         }
-
-        if (process is not null && !process.IsInvalid && !process.IsClosed)
+        finally
         {
-            TerminateProcess(process, StartupFailureExitCode);
+            Dispose();
         }
-
-        var processExited = process is null || WaitForSingleObject(
-            process,
-            (uint)StartupCleanupTimeout.TotalMilliseconds) == WaitObject;
-        var jobEmpty = job is null || WaitForJobEmpty(job, StartupCleanupTimeout);
-
-        Interlocked.Exchange(ref _suspendedThread, null)?.Dispose();
-        Interlocked.Exchange(ref _job, null)?.Dispose();
-        Interlocked.Exchange(ref _processHandle, null)?.Dispose();
-
-        if (!processExited || !jobEmpty)
+        if (!proven)
         {
             throw new InvalidOperationException(
                 "Native mount host startup cleanup could not prove the exact process and job were empty.");
         }
     }
 
-    private static void TryTerminateAndProveExit(
-        SafeKernelHandle? job,
-        SafeProcessHandle process)
-    {
-        if (job is not null && !job.IsInvalid && !job.IsClosed)
-        {
-            TerminateJobObject(job, StartupFailureExitCode);
-        }
+    private int? _observedExitCode;
 
-        TerminateProcess(process, StartupFailureExitCode);
-        var processExited = WaitForSingleObject(
-            process,
-            (uint)StartupCleanupTimeout.TotalMilliseconds) == WaitObject;
-        var jobEmpty = job is null || WaitForJobEmpty(job, StartupCleanupTimeout);
-        if (!processExited || !jobEmpty)
+    internal bool TryObserveProcessExit(out int? exitCode)
+    {
+        lock (_ownershipSync)
         {
-            throw new InvalidOperationException(
-                "Native mount host startup cleanup could not prove the exact process and job were empty.");
+            exitCode = _observedExitCode;
+            if (_ownershipReleased.Task.IsCompleted) return true;
+            try
+            {
+                var process = _processHandle;
+                if (process is null || process.IsClosed || process.IsInvalid || _processId == 0 ||
+                    !(_cleanupHooks?.OriginalHandleSignaled?.Invoke(process) ?? WaitForSingleObject(process, 0) == WaitObject))
+                    return false;
+                if (GetExitCodeProcess(process, out var nativeCode))
+                    exitCode = _observedExitCode = unchecked((int)nativeCode);
+                var absent = _cleanupHooks?.OriginalIdentityAbsent is { } probe
+                    ? probe(_processId, _creationTimeFileTimeUtc)
+                    : TryObserveOriginalPidAbsence(_processId);
+                if (absent == true) return true;
+                if (absent != false || _creationTimeFileTimeUtc <= 0) return false;
+                var currentCreation = _cleanupHooks?.CurrentProcessCreationTime is { } currentProbe
+                    ? currentProbe(_processId)
+                    : ObserveCurrentProcessCreationTime(_processId);
+                return currentCreation > 0 && currentCreation != _creationTimeFileTimeUtc;
+            }
+            catch { return false; }
         }
     }
 
-    private static bool WaitForJobEmpty(SafeKernelHandle job, TimeSpan timeout)
+    internal bool IsSettled
     {
-        var started = Stopwatch.StartNew();
-        while (true)
-        {
-            var accounting = default(JobObjectBasicAccountingInformationStruct);
-            if (!QueryInformationJobObject(
-                    job,
-                    JobObjectBasicAccountingInformationClass,
-                    ref accounting,
-                    (uint)Marshal.SizeOf<JobObjectBasicAccountingInformationStruct>(),
-                    out _))
-            {
-                return false;
-            }
+        get { lock (_ownershipSync) return _ownershipReleased.Task.IsCompleted || TryProveOwnershipReleased(); }
+    }
 
-            if (accounting.ActiveProcesses == 0)
-            {
-                return true;
-            }
-
-            if (started.Elapsed >= timeout)
-            {
-                return false;
-            }
-
-            Thread.Sleep(10);
-        }
+    private static long? ObserveCurrentProcessCreationTime(uint processId)
+    {
+        // Query-only observation of a reused row. Enforcement never uses this handle.
+        using var current = OpenProcess(0x1000, false, processId);
+        return !current.IsInvalid && TryGetProcessCreationTime(current, out var creation) ? creation : null;
     }
 
     public bool TryTerminate(uint exitCode)
     {
-        var job = Volatile.Read(ref _job);
-        if (job is not null && !job.IsInvalid && !job.IsClosed)
+        lock (_ownershipSync)
         {
-            try
-            {
-                return TerminateJobObject(job, exitCode);
-            }
-            catch
-            {
-                return false;
-            }
+            _terminationExitCode = exitCode;
+            var terminated = TryTerminateOnce(exitCode);
+            if (!_ownershipReleased.Task.IsCompleted && !TryProveOwnershipReleased()) StartKeeper();
+            return terminated;
         }
+    }
 
-        var process = Volatile.Read(ref _processHandle);
-        if (process is null || process.IsInvalid || process.IsClosed)
-        {
-            return false;
-        }
-
+    private bool TryTerminateOnce(uint exitCode)
+    {
+        var terminated = false;
         try
         {
-            return TerminateProcess(process, exitCode);
+            if (_job is { IsInvalid: false, IsClosed: false } job)
+                terminated = _cleanupHooks?.TerminateJob?.Invoke(job, exitCode) ?? TerminateJobObject(job, exitCode);
         }
-        catch
+        catch { }
+        try
         {
-            return false;
+            if (_processHandle is { IsInvalid: false, IsClosed: false } process)
+                terminated |= _cleanupHooks?.TerminateProcess?.Invoke(process, exitCode) ?? TerminateProcess(process, exitCode);
         }
+        catch { }
+        return terminated;
     }
 
     public bool WaitForEmpty(TimeSpan timeout)
@@ -459,30 +481,14 @@ internal sealed class HostProcessGuardian : IDisposable
             throw new ArgumentOutOfRangeException(nameof(timeout));
         }
 
-        var job = Volatile.Read(ref _job);
-        if (job is null || job.IsInvalid || job.IsClosed)
-        {
-            return false;
-        }
-
         var stopwatch = Stopwatch.StartNew();
         var observedEmpty = false;
         while (true)
         {
-            try
+            lock (_ownershipSync)
             {
-                var accounting = default(JobObjectBasicAccountingInformationStruct);
-                if (!QueryInformationJobObject(
-                        job,
-                        JobObjectBasicAccountingInformationClass,
-                        ref accounting,
-                        (uint)Marshal.SizeOf<JobObjectBasicAccountingInformationStruct>(),
-                        out _))
-                {
-                    return false;
-                }
-
-                if (accounting.ActiveProcesses == 0)
+                if (_job is null || _job.IsClosed || _job.IsInvalid) return false;
+                if (TryProveOwnershipReleased())
                 {
                     if (observedEmpty)
                     {
@@ -496,11 +502,6 @@ internal sealed class HostProcessGuardian : IDisposable
                     observedEmpty = false;
                 }
             }
-            catch (ObjectDisposedException)
-            {
-                return false;
-            }
-
             if (timeout != Timeout.InfiniteTimeSpan && stopwatch.Elapsed >= timeout)
             {
                 return false;
@@ -512,9 +513,105 @@ internal sealed class HostProcessGuardian : IDisposable
 
     public void Dispose()
     {
+        lock (_ownershipSync)
+        {
+            if (_disposeRequested) return;
+            _disposeRequested = true;
+            if (TryProveOwnershipReleased())
+            {
+                ReleaseProvenOwnership();
+                return;
+            }
+            TryTerminateOnce(_terminationExitCode);
+            if (TryProveOwnershipReleased())
+            {
+                ReleaseProvenOwnership();
+                return;
+            }
+            StartKeeper();
+        }
+    }
+
+    private void StartKeeper()
+    {
+        if (_keeperRunning) return;
+        _keeperRunning = true;
+        // Keep the service process and the original handles alive while
+        // enforcement is unresolved. Only original handles can terminate; PID
+        // row queries above are observation-only. There is no lease process.
+        try
+        {
+            new Thread(KeepOwnershipUntilProven)
+            {
+                IsBackground = false,
+                Name = "APFS host ownership keeper",
+            }.Start();
+        }
+        catch
+        {
+            // If a thread cannot be created, this owner must keep enforcing.
+            KeepOwnershipUntilProven();
+        }
+    }
+
+    private void KeepOwnershipUntilProven()
+    {
+        while (true)
+        {
+            lock (_ownershipSync)
+            {
+                if (_ownershipReleased.Task.IsCompleted)
+                {
+                    _keeperRunning = false;
+                    return;
+                }
+                TryTerminateOnce(_terminationExitCode);
+                if (TryProveOwnershipReleased())
+                {
+                    _keeperRunning = false;
+                    if (_disposeRequested) ReleaseProvenOwnership();
+                    return;
+                }
+            }
+            Thread.Sleep(100);
+        }
+    }
+
+    private bool TryProveOwnershipReleased()
+    {
+        try
+        {
+            if (!TryObserveProcessExit(out _)) return false;
+            return _job is null || (TryReadActiveProcessCount(out var count) && count == 0);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void ReleaseProvenOwnership()
+    {
         Interlocked.Exchange(ref _job, null)?.Dispose();
         Interlocked.Exchange(ref _suspendedThread, null)?.Dispose();
         Interlocked.Exchange(ref _processHandle, null)?.Dispose();
+        _ownershipReleased.TrySetResult();
+    }
+
+    private static bool? TryObserveOriginalPidAbsence(uint processId)
+    {
+        // PID absence is a conservative identity proof. Enumeration never
+        // opens a process handle, including when a PID row remains visible.
+        for (var capacity = 1024; capacity <= 1_048_576; capacity *= 2)
+        {
+            var ids = new uint[capacity];
+            var bytes = checked((uint)(ids.Length * sizeof(uint)));
+            if (!EnumProcesses(ids, bytes, out var needed)) return null;
+            if (needed >= bytes) continue;
+            if (needed % sizeof(uint) != 0) return null;
+            return !ids.AsSpan(0, checked((int)(needed / sizeof(uint)))).Contains(processId);
+        }
+        return null;
     }
 
     private static Win32Exception LastWin32Error(string operation)
@@ -547,6 +644,25 @@ internal sealed class HostProcessGuardian : IDisposable
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool TerminateProcess(SafeProcessHandle process, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DuplicateHandle(nint sourceProcess, SafeProcessHandle source, nint targetProcess,
+        out SafeProcessHandle target, uint access, [MarshalAs(UnmanagedType.Bool)] bool inherit, uint options);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint GetProcessId(SafeProcessHandle process);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern SafeProcessHandle OpenProcess(uint access, [MarshalAs(UnmanagedType.Bool)] bool inherit, uint processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetExitCodeProcess(SafeProcessHandle process, out uint exitCode);
+
+    [DllImport("psapi.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumProcesses([Out] uint[] processIds, uint bytes, out uint needed);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern uint ResumeThread(SafeThreadHandle thread);
@@ -625,15 +741,18 @@ internal sealed class HostProcessGuardian : IDisposable
     {
         private SafeProcessHandle? _processHandle;
         private SafeThreadHandle? _threadHandle;
+        private HostStartupStderr? _startupStderr;
 
         private SuspendedProcess(
             SafeProcessHandle processHandle,
             SafeThreadHandle threadHandle,
-            uint processId)
+            uint processId,
+            HostStartupStderr? startupStderr)
         {
             _processHandle = processHandle;
             _threadHandle = threadHandle;
             ProcessId = processId;
+            _startupStderr = startupStderr;
         }
 
         public uint ProcessId { get; }
@@ -641,7 +760,11 @@ internal sealed class HostProcessGuardian : IDisposable
         public SafeProcessHandle ProcessHandle
             => _processHandle ?? throw new ObjectDisposedException(nameof(SuspendedProcess));
 
-        public static SuspendedProcess Create(ProcessStartInfo startInfo)
+        public HostStartupStderr? DetachStartupStderr()
+            => Interlocked.Exchange(ref _startupStderr, null);
+
+        public static SuspendedProcess Create(ProcessStartInfo startInfo, SafeHandle? credentialInput = null,
+            SafeHandle? standardOutput = null)
         {
             if (startInfo.UseShellExecute)
             {
@@ -660,31 +783,24 @@ internal sealed class HostProcessGuardian : IDisposable
             var commandLine = BuildCommandLine(startInfo);
             var environmentBlock = BuildEnvironmentBlock(startInfo.Environment);
             var environmentPointer = Marshal.StringToHGlobalUni(environmentBlock);
+            AnonymousPipeServerStream? stderrPipe = null;
             try
             {
-                var startupInfo = new StartupInfo
+                if (credentialInput is null || standardOutput is not null)
                 {
-                    Size = Marshal.SizeOf<StartupInfo>(),
-                };
+                    stderrPipe = new AnonymousPipeServerStream(PipeDirection.In, HandleInheritability.Inheritable);
+                }
                 var creationFlags = CreateSuspended | CreateUnicodeEnvironment;
                 if (startInfo.CreateNoWindow)
                 {
                     creationFlags |= CreateNoWindow;
                 }
 
-                if (!CreateProcessW(
-                        startInfo.FileName,
-                        commandLine,
-                        nint.Zero,
-                        nint.Zero,
-                        inheritHandles: false,
-                        creationFlags,
-                        environmentPointer,
-                        string.IsNullOrWhiteSpace(startInfo.WorkingDirectory)
-                            ? null
-                            : startInfo.WorkingDirectory,
-                        ref startupInfo,
-                        out var processInformation))
+                ProcessInformation processInformation;
+                var created = CreateRestrictedProcess(
+                    startInfo, commandLine, environmentPointer, creationFlags,
+                    credentialInput, stderrPipe?.ClientSafePipeHandle, out processInformation, standardOutput);
+                if (!created)
                 {
                     throw LastWin32Error("CreateProcessW");
                 }
@@ -706,10 +822,27 @@ internal sealed class HostProcessGuardian : IDisposable
                         "CreateProcessW returned incomplete process handles.");
                 }
 
-                return new SuspendedProcess(
+                var suspended = new SuspendedProcess(
                     new SafeProcessHandle(processInformation.ProcessHandle, ownsHandle: true),
                     new SafeThreadHandle(processInformation.ThreadHandle),
-                    processInformation.ProcessId);
+                    processInformation.ProcessId,
+                    startupStderr: null);
+                try
+                {
+                    stderrPipe?.DisposeLocalCopyOfClientHandle();
+                    suspended._startupStderr = stderrPipe is null ? null : HostStartupStderr.Start(stderrPipe);
+                    return suspended;
+                }
+                catch
+                {
+                    suspended.AbortStartup();
+                    throw;
+                }
+            }
+            catch
+            {
+                stderrPipe?.Dispose();
+                throw;
             }
             finally
             {
@@ -733,22 +866,21 @@ internal sealed class HostProcessGuardian : IDisposable
                 return;
             }
 
-            TerminateProcess(process, StartupFailureExitCode);
-            var processExited = WaitForSingleObject(
-                process,
-                (uint)StartupCleanupTimeout.TotalMilliseconds) == WaitObject;
-            Dispose();
-            if (!processExited)
-            {
-                throw new InvalidOperationException(
-                    "Native mount host startup cleanup could not prove the exact process exited.");
-            }
+            var guardian = new HostProcessGuardian(null, DetachProcessHandle(), DetachThreadHandle(), ProcessId);
+            TryGetProcessCreationTime(process, out guardian._creationTimeFileTimeUtc);
+            guardian.AbortStartup();
         }
 
         public void Dispose()
         {
-            Interlocked.Exchange(ref _threadHandle, null)?.Dispose();
-            Interlocked.Exchange(ref _processHandle, null)?.Dispose();
+            try
+            {
+                AbortStartup();
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _startupStderr, null)?.Dispose();
+            }
         }
 
         private static StringBuilder BuildCommandLine(ProcessStartInfo startInfo)
@@ -935,13 +1067,28 @@ internal sealed class HostProcessGuardian : IDisposable
     }
 }
 
+internal sealed class HostGuardianCleanupTestHooks
+{
+    public Func<SafeHandle, uint, bool>? TerminateJob { get; init; }
+    public Func<SafeProcessHandle, uint, bool>? TerminateProcess { get; init; }
+    public Func<SafeProcessHandle, bool>? OriginalHandleSignaled { get; init; }
+    public Func<uint, long, bool?>? OriginalIdentityAbsent { get; init; }
+    public Func<uint, long?>? CurrentProcessCreationTime { get; init; }
+    public Func<SafeHandle, uint?>? ActiveProcessCount { get; init; }
+    public TimeSpan? StartupCleanupTimeout { get; init; }
+}
+
 internal sealed class HostProcessLifecycleTestHooks
 {
+    public Func<string, ServiceHostOptions, string?>? SourceAdmission { get; set; }
+
     public Func<ProcessStartInfo, Process?>? StartProcess { get; set; }
 
     public Func<Process, HostStartupGate, HostProcessGuardian>? CreateGuardian { get; set; }
 
     public Func<Process, TimeSpan, bool>? WaitForExit { get; set; }
+
+    public Func<Process, CancellationToken, Task>? WaitForExitAsync { get; set; }
 
     public Func<Process, bool>? KillProcess { get; set; }
 
@@ -958,4 +1105,61 @@ internal sealed class HostProcessLifecycleTestHooks
     public Action<string>? OnLifecycleDiagnostic { get; set; }
 
     public Func<string, bool>? IsMountVisible { get; set; }
+
+    public Func<string, int, (uint Length, int Error)>? QueryDosDevice { get; set; }
+
+    public Func<string, (uint Attributes, int Error)>? QueryMountAttributes { get; set; }
+}
+
+internal sealed class HostStartupStderr : IDisposable
+{
+    private const int MaxTailCharacters = 8192;
+    private readonly Stream _stream;
+    private readonly StringBuilder _tail = new();
+    private readonly object _sync = new();
+    private readonly Task _drain;
+
+    private HostStartupStderr(Stream stream)
+    {
+        _stream = stream;
+        _drain = DrainAsync();
+    }
+
+    public static HostStartupStderr Start(Stream stream) => new(stream);
+
+    public async Task<string?> GetLastLineAsync()
+    {
+        await Task.WhenAny(_drain, Task.Delay(250)).ConfigureAwait(false);
+        lock (_sync)
+        {
+            var lines = _tail.ToString().Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
+            return lines.LastOrDefault(static line => !string.IsNullOrWhiteSpace(line))?.Trim();
+        }
+    }
+
+    private async Task DrainAsync()
+    {
+        try
+        {
+            using var reader = new StreamReader(_stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true,
+                bufferSize: 1024, leaveOpen: true);
+            var buffer = new char[1024];
+            int read;
+            while ((read = await reader.ReadAsync(buffer).ConfigureAwait(false)) > 0)
+            {
+                lock (_sync)
+                {
+                    _tail.Append(buffer, 0, read);
+                    if (_tail.Length > MaxTailCharacters)
+                    {
+                        _tail.Remove(0, _tail.Length - MaxTailCharacters);
+                    }
+                }
+            }
+        }
+        catch (IOException) { }
+        catch (ObjectDisposedException) { }
+    }
+
+    public void Dispose() => _stream.Dispose();
 }

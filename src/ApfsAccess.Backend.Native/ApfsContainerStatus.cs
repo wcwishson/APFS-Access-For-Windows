@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
+using ApfsAccess.Core;
 
 namespace ApfsAccess.Backend.Native;
 
@@ -17,7 +18,19 @@ public sealed record ContainerVolumeStatus(
     string RecoveryIdentity,
     bool RecoveryActive = false,
     bool WriteDegraded = false,
-    string RecoveryReason = "");
+    string RecoveryReason = "",
+    bool SnapshotInventorySupported = false,
+    bool SnapshotMutationSupported = false,
+    bool VolumeVerificationSupported = false,
+    LiveVolumeVerificationScope? VolumeVerificationScope = null,
+    ContainerVolumeDrainStatus? Drain = null,
+    bool SnapshotRecoverySupported = false)
+{
+    public string SnapshotControlRefusal { get; init; } = string.Empty;
+}
+
+public sealed record ContainerVolumeDrainStatus(int DirtyTransactions, int InFlightCallbacks, bool ShutdownDrain,
+    ulong Accepted, ulong Durable, ulong Cleanup, bool Pending);
 
 public sealed record ContainerMountStatus(
     string ContainerUuid,
@@ -209,6 +222,26 @@ public static class ContainerStatusReader
             var writable = GetRequiredBoolean(element, "writable");
             var volumeRecoveryActive = GetRequiredBoolean(element, "recoveryActive");
             var writeDegraded = GetRequiredBoolean(element, "writeDegraded");
+            var snapshotInventory = element.TryGetProperty("snapshotInventorySupported", out _)
+                && GetRequiredBoolean(element, "snapshotInventorySupported");
+            var snapshotMutation = element.TryGetProperty("snapshotMutationSupported", out _)
+                && GetRequiredBoolean(element, "snapshotMutationSupported");
+            var snapshotRecovery = element.TryGetProperty("snapshotRecoverySupported", out _)
+                && GetRequiredBoolean(element, "snapshotRecoverySupported");
+            var snapshotRefusal = element.TryGetProperty("snapshotControlRefusal", out _)
+                ? GetRequiredStringAllowEmpty(element, "snapshotControlRefusal") : string.Empty;
+            if (snapshotRefusal.Length > 256 ||
+                snapshotRefusal == "SnapshotControlBusy" && (snapshotInventory || snapshotMutation))
+                throw new ContainerManifestException("Container snapshot refusal is inconsistent.");
+            var verification = element.TryGetProperty("volumeVerificationSupported", out _)
+                && GetRequiredBoolean(element, "volumeVerificationSupported");
+            var verificationScope = element.TryGetProperty("volumeVerificationScope", out var scopeElement)
+                && scopeElement.ValueKind != JsonValueKind.Null ? LiveVolumeVerificationScope.Parse(scopeElement) : null;
+            if (verification != (verificationScope is not null) || verification &&
+                (!leaseHeld.GetBoolean() || recoveryRequired || volumeRecoveryActive || writeDegraded ||
+                verificationScope!.ContainerUuid != containerUuid || verificationScope.VolumeOid != objectId.ToString(CultureInfo.InvariantCulture) ||
+                verificationScope.CheckpointXid != checkpointXid.ToString(CultureInfo.InvariantCulture)))
+                throw new ContainerManifestException("Container verification scope is inconsistent.");
             var volumeRecoveryReason = GetRequiredStringAllowEmpty(
                 element, "recoveryReason");
             if (objectId == 0 || !seenObjectIds.Add(objectId) ||
@@ -219,7 +252,10 @@ public static class ContainerStatusReader
                 (ready && !mounted) ||
                 (writable && (!ready || !mounted || volumeRecoveryActive ||
                     writeDegraded || recoveryRequired)) ||
-                (volumeRecoveryActive && string.IsNullOrWhiteSpace(volumeRecoveryReason)))
+                (volumeRecoveryActive && string.IsNullOrWhiteSpace(volumeRecoveryReason)) ||
+                (snapshotInventory && (!mounted || !ready || !leaseHeld.GetBoolean() || checkpointXid == 0)) ||
+                (snapshotMutation && (!snapshotInventory || !writable || recoveryRequired || volumeRecoveryActive || writeDegraded)) ||
+                (snapshotRecovery && (!mounted || !ready || !leaseHeld.GetBoolean() || checkpointXid == 0 || recoveryRequired)))
             {
                 throw new ContainerManifestException(
                     "Container status volume state is inconsistent.");
@@ -234,7 +270,13 @@ public static class ContainerStatusReader
                 RecoveryIdentity: GetOptionalString(element, "recoveryIdentity") ?? string.Empty,
                 RecoveryActive: volumeRecoveryActive,
                 WriteDegraded: writeDegraded,
-                RecoveryReason: volumeRecoveryReason));
+                RecoveryReason: volumeRecoveryReason,
+                SnapshotInventorySupported: snapshotInventory,
+                SnapshotMutationSupported: snapshotMutation,
+                SnapshotRecoverySupported: snapshotRecovery,
+                VolumeVerificationSupported: verification,
+                VolumeVerificationScope: verificationScope,
+                Drain: ReadDrain(element)) { SnapshotControlRefusal = snapshotRefusal });
         }
 
         return new ContainerMountStatus(
@@ -276,6 +318,25 @@ public static class ContainerStatusReader
         {
             return false;
         }
+    }
+    private static ContainerVolumeDrainStatus? ReadDrain(JsonElement e)
+    {
+        string[] fields = ["dirtyTransactionCount", "inFlightMutationCallbacks", "closeCommitDeferred", "deferredCommitRequested",
+            "deferredCommitInFlight", "shutdownDrainActive", "walAcceptedSequence", "walApfsDurableSequence", "walCleanupSequence",
+            "walRecoveryStateValid", "payloadSpoolDirtyRangeCount", "payloadSpoolIndexDirty", "payloadSpoolRecoveryRequired"];
+        var count = fields.Count(f => e.TryGetProperty(f, out _));
+        if (count == 0) return null;
+        if (count != fields.Length) throw new ContainerManifestException("Incomplete container child durability status.");
+        var dirty = GetRequiredInt32(e, "dirtyTransactionCount"); var callbacks = GetRequiredInt32(e, "inFlightMutationCallbacks");
+        var accepted = GetRequiredUInt64Flexible(e, "walAcceptedSequence"); var durable = GetRequiredUInt64Flexible(e, "walApfsDurableSequence");
+        var cleanup = GetRequiredUInt64Flexible(e, "walCleanupSequence");
+        if (dirty < 0 || callbacks < 0 || cleanup > durable || durable > accepted)
+            throw new ContainerManifestException("Invalid container child durability watermarks.");
+        var shutdown = GetRequiredBoolean(e, "shutdownDrainActive");
+        var pending = !GetRequiredBoolean(e, "walRecoveryStateValid") || dirty > 0 || callbacks > 0 || shutdown || cleanup < accepted ||
+            GetRequiredBoolean(e, "closeCommitDeferred") || GetRequiredBoolean(e, "deferredCommitRequested") || GetRequiredBoolean(e, "deferredCommitInFlight") ||
+            GetRequiredUInt64Flexible(e, "payloadSpoolDirtyRangeCount") > 0 || GetRequiredBoolean(e, "payloadSpoolIndexDirty") || GetRequiredBoolean(e, "payloadSpoolRecoveryRequired");
+        return new(dirty, callbacks, shutdown, accepted, durable, cleanup, pending);
     }
 
     internal static bool IsOwnerIdentityCurrent(

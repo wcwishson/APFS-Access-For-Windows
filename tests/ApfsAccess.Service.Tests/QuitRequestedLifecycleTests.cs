@@ -495,7 +495,7 @@ public sealed class QuitRequestedLifecycleTests
     }
 
     [Fact]
-    public async Task QuitRequested_UnwritableMarkerReportsFailureButStillStops()
+    public async Task QuitRequested_UnwritableMarkerRetainsServiceUntilSuccessfulRetry()
     {
         var runtimeRoot = Path.Combine(
             Path.GetTempPath(),
@@ -533,23 +533,50 @@ public sealed class QuitRequestedLifecycleTests
                 ApfsMessageTypes.StatusChanged,
                 (await controlClientPeer.ReadMessageAsync(cancellation.Token))!.Type);
 
+            var operationId = Guid.NewGuid().ToString("D");
             var quit = PipeMessageCodec.Create(
                 ApfsMessageTypes.QuitRequested,
                 new QuitRequestedPayload("test", DateTime.UtcNow),
-                requestId: "quit-marker-fail-1");
+                requestId: operationId);
             await controlClientPeer.SendAsync(quit, cancellation.Token);
 
             var ack = await controlClientPeer.ReadMessageAsync(cancellation.Token);
             Assert.NotNull(ack);
             Assert.Equal(ApfsMessageTypes.Ack, ack!.Type);
-            Assert.Equal("quit-marker-fail-1", ack.RequestId);
+            Assert.Equal(operationId, ack.RequestId);
             Assert.True(PipeMessageCodec.TryGetPayload<AckPayload>(ack, out var ackPayload));
             Assert.False(ackPayload!.Success, "An unwritable quit marker must never be acknowledged as success.");
             Assert.Contains("marker", ackPayload.Message ?? string.Empty, StringComparison.OrdinalIgnoreCase);
             Assert.Null(QuitRequestMarker.TryReadMarkerTimestampUtc());
 
+            var failed = durableHost.Query(operationId)!;
+            Assert.False(failed.Success);
+            Assert.Equal(ApfsOperationStates.Failed, failed.State);
+            Assert.False(failed.QuitMarkerWritten);
+            Assert.True(File.Exists(failed.EvidencePath));
+            var failedEvidence = File.ReadAllBytes(failed.EvidencePath!);
+            var nextResponse = controlClientPeer.ReadMessageAsync(cancellation.Token);
+            await Task.Delay(150, cancellation.Token);
+            Assert.False(nextResponse.IsCompleted, "A failed Quit must not send ServiceStopping.");
+            Assert.False(lifetime.StopRequested);
+
+            File.Delete(Path.Combine(runtimeRoot, "temp"));
+            var retryId = Guid.NewGuid().ToString("D");
+            await controlClientPeer.SendAsync(PipeMessageCodec.Create(
+                ApfsMessageTypes.QuitRequested,
+                new QuitRequestedPayload("marker-writable-retry", DateTime.UtcNow),
+                requestId: retryId), cancellation.Token);
+            var retryAck = await nextResponse;
+            Assert.Equal(retryId, retryAck!.RequestId);
+            Assert.True(IsSuccessAck(retryAck));
+            var stopping = await controlClientPeer.ReadMessageAsync(cancellation.Token);
+            Assert.True(PipeMessageCodec.TryGetPayload<ServiceStoppingPayload>(stopping!, out var stopProof));
+            Assert.True(stopProof!.CleanupCompleted && stopProof.HostOwnershipReleased && stopProof.PendingDurabilityCleared);
             await lifetime.StopRequestedSignal.Task.WaitAsync(cancellation.Token);
             Assert.True(lifetime.StopRequested);
+            Assert.Equal(failedEvidence, File.ReadAllBytes(failed.EvidencePath!));
+            var succeeded = durableHost.Query(retryId)!;
+            Assert.True(succeeded.Success && succeeded.QuitMarkerWritten);
 
             await cancellation.CancelAsync();
             await controlClientPeer.DisposeAsync();
@@ -616,6 +643,7 @@ public sealed class QuitRequestedLifecycleTests
         }
 
         internal TrayPipeHostService Service { get; }
+        internal OperationResultPayload? Query(string operationId) => _operationService.Query(operationId);
 
         internal static DurableTrayPipeHost Create(
             RuntimeStatusPublisher statusPublisher,

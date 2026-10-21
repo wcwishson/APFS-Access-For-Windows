@@ -22,9 +22,68 @@ public sealed class RoleMountPolicyTests
         Assert.Empty(backend.Requests);
     }
 
-    private static ApfsMountWorker Worker(Backend backend, RuntimeStatusPublisher? publisher = null) => new(
+    private static ApfsMountWorker Worker(Backend backend, RuntimeStatusPublisher? publisher = null,
+        ServiceHostOptions? options = null) => new(
         NullLogger<ApfsMountWorker>.Instance, backend, new FirstFreeMountPolicy(["R", "S", "T"]),
-        publisher ?? new RuntimeStatusPublisher(), new Options());
+        publisher ?? new RuntimeStatusPublisher(), new Options(options));
+
+    [Fact]
+    public async Task BackupImageAppRouteRequiresOptInAndExplicitModeWithoutAutomountOrRolePromotion()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "backup-service-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var image = Path.Combine(root, "backup.apfs");
+            const string uuid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", volumeUuid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+            var containerId = "apfs-container:" + uuid; var volumeId = ApfsTopology.BuildVolumeId(uuid, 101);
+            var diskId = ApfsTopology.BuildDiskId("backup-service"); var storeId = ApfsTopology.BuildRawStoreId();
+            var row = new VolumeInfo(volumeId, image, "Backup", true, SupportsNativeWrite: true,
+                RecoveryIdentity: "backup-original", CatalogVolumeId: volumeId, CatalogContainerUuid: uuid,
+                CatalogVolumeObjectId: 101, CatalogDecision: ApfsCapabilityDecision.Readable,
+                CatalogReasons: ["special-role:backup"], CatalogAutoMountAllowed: false, CatalogVolumeUuid: volumeUuid);
+            var graph = new ApfsTopologySnapshot([new(diskId, image, null, 8192)], [],
+                [new(storeId, "", "", containerId, 0, 8192, 4096, 2, diskId)],
+                [new(containerId, uuid, 4096, [storeId], [volumeId], false, "20", [], [], [], [])],
+                [new(volumeId, volumeUuid, "101", containerId, "Backup", true, ["backup"], 384, null,
+                    "sensitive", "none", false, [], [], [], "1", "20", [])], []);
+            var observation = new ApfsDiscoveryTopology(1, image, [diskId], graph);
+            row = row with { BackupImageWrite = BackupImageMountPolicy.Observe(row, observation) };
+            Assert.NotNull(row.BackupImageWrite);
+            var backend = new Backend([row]) { Topology = observation };
+            var options = new ServiceHostOptions { EnableBackupImageWrites = true, EnableNativeWrite = true,
+                WriteRolloutChannel = "Enabled", WriteBackendMode = "Native", WriteSafetyLevel = "Strict",
+                NativeWriteMaxDirtyTransactions = 1, NativeWriteAllowLegacyScaffoldForFixtures = false,
+                NativeWriteCrashReplayMode = "ReplayIfSafe", ManagementJournalRoot = root };
+            using var worker = Worker(backend, options: options);
+            await Cycle(worker);
+            await worker.RefreshAsync(true, CancellationToken.None);
+            Assert.Empty(backend.Requests);
+            var defaultRequest = await worker.EnsureMountedExactAsync(image, volumeId, null, CancellationToken.None);
+            Assert.False(defaultRequest.Success); Assert.Empty(backend.Requests);
+            options.EnableBackupImageWrites = false;
+            Assert.False((await worker.EnsureMountedExactAsync(image, volumeId, MountAccessMode.ReadWrite, CancellationToken.None)).Success);
+            Assert.Empty(backend.Requests);
+            options.EnableBackupImageWrites = true;
+            var result = await worker.EnsureMountedExactAsync(image, volumeId, MountAccessMode.ReadWrite, CancellationToken.None);
+            Assert.True(result.Success, result.Message);
+            Assert.Equal(MountAccessMode.ReadWrite, Assert.Single(backend.Requests).AccessMode);
+            Assert.Equal(ApfsCapabilityDecision.Readable, row.CatalogDecision);
+            Assert.False(CatalogMountPolicy.AllowsOrdinaryMount(row));
+            backend.Topology = observation with { Snapshot = graph with {
+                Volumes = [graph.Volumes[0] with { ReadonlyFeatureBits = ["0x1"] }] } };
+            Assert.False((await worker.EnsureMountedExactAsync(image, volumeId, MountAccessMode.ReadOnly, CancellationToken.None)).Success);
+            Assert.Equal(0, backend.Unmounts);
+            backend.Topology = observation;
+            var readOnly = await worker.EnsureMountedExactAsync(image, volumeId, MountAccessMode.ReadOnly, CancellationToken.None);
+            Assert.True(readOnly.Success, readOnly.Message);
+            Assert.Equal(1, backend.Unmounts);
+            Assert.Equal(new[] { MountAccessMode.ReadWrite, MountAccessMode.ReadOnly }, backend.Requests.Select(r => r.AccessMode));
+            await Cycle(worker);
+            Assert.Equal(2, backend.Requests.Count);
+        }
+        finally { Directory.Delete(root, true); }
+    }
 
     [Fact]
     public async Task AdmittedStatusInventoryClearsOnDisconnectAndCannotAuthorizeStaleInspection()
@@ -170,9 +229,9 @@ public sealed class RoleMountPolicyTests
         .GetMethod("RunCycleAsync", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
         .Invoke(worker, [CancellationToken.None])!;
 
-    private sealed class Options : IOptionsMonitor<ServiceHostOptions>
+    private sealed class Options(ServiceHostOptions? options = null) : IOptionsMonitor<ServiceHostOptions>
     {
-        public ServiceHostOptions CurrentValue { get; } = new()
+        public ServiceHostOptions CurrentValue { get; } = options ?? new()
         {
             AutoMountEnabled = true, EnableNativeWrite = true, WriteRolloutChannel = "Enabled",
             AllowWriteOnUnsupportedFeatures = true, ReadWriteMode = "RwWithRoFallback",
@@ -189,7 +248,10 @@ public sealed class RoleMountPolicyTests
         public int Batches { get; private set; }
         public int Unmounts { get; private set; }
         public bool Connected { get; set; } = true;
-        public Task<IReadOnlyList<DeviceInfo>> ProbeDevicesAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<DeviceInfo>>(Connected ? [new("d", "Disk", true)] : []);
+        public ApfsDiscoveryTopology? Topology { get; set; }
+        public Task<IReadOnlyList<DeviceInfo>> ProbeDevicesAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<DeviceInfo>>(Connected ? [new(Volumes[0].DeviceId, "Disk", true)] : []);
+        public Task<IReadOnlyList<DeviceInventory>> ProbeInventoryAsync(bool authoritative, CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<DeviceInventory>>(Connected ? [new(new(Volumes[0].DeviceId, "Disk", true), Volumes, Topology)] : []);
         public Task<IReadOnlyList<VolumeInfo>> ProbeVolumesAsync(string id, CancellationToken ct) => Task.FromResult(Volumes);
         public Task<IReadOnlyList<MountedVolumeState>> GetMountStateAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<MountedVolumeState>>(Mounts.ToArray());
         public Task<MountResult> MountAsync(MountRequest request, CancellationToken ct)
@@ -197,7 +259,12 @@ public sealed class RoleMountPolicyTests
             ct.ThrowIfCancellationRequested();
             Requests.Add(request);
             var point = $"{request.DriveLetter}:\\";
-            Mounts.Add(new(request.VolumeId, point, request.AccessMode, DeviceId: "d"));
+            var volume = Volumes.Single(v => v.VolumeId == request.VolumeId);
+            Mounts.Add(new(request.VolumeId, point, request.AccessMode, DeviceId: volume.DeviceId,
+                RecoveryIdentity: volume.RecoveryIdentity, CatalogVolumeId: volume.CatalogVolumeId,
+                CatalogContainerUuid: volume.CatalogContainerUuid, CatalogVolumeObjectId: volume.CatalogVolumeObjectId,
+                CatalogDecision: volume.CatalogDecision, CatalogReasons: volume.CatalogReasons,
+                CatalogAutoMountAllowed: volume.CatalogAutoMountAllowed, CatalogVolumeUuid: volume.CatalogVolumeUuid));
             return Task.FromResult(new MountResult(true, point, null, request.AccessMode));
         }
         public async Task<IReadOnlyList<MountResult>> MountContainerAsync(IReadOnlyList<MountRequest> requests, CancellationToken ct)
@@ -211,7 +278,8 @@ public sealed class RoleMountPolicyTests
         {
             Unmounts++;
             Mounts.RemoveAll(m => m.MountPoint == point);
-            return Task.FromResult(new UnmountResult(true, point, null));
+            return Task.FromResult(new UnmountResult(true, point, null,
+                MountRemoved: true, HostOwnershipReleased: true, PendingDurabilityCleared: true));
         }
     }
 }

@@ -44,6 +44,7 @@ internal sealed class AgentControlOperationService
     private readonly CancellationTokenSource _shutdownCts = new();
     private Task? _shutdownCancellationTask;
     private bool _stopping;
+    private AgentOperationRecord<OperationResultPayload>? _lastQuit;
 
     internal AgentControlOperationService(
         Func<ControlOperationRequestPayload, CancellationToken, Task<OperationResultPayload>> executor,
@@ -96,7 +97,8 @@ internal sealed class AgentControlOperationService
                     : Done(Conflict(normalized, payload.Fingerprint));
             }
             if (evidence.Status == EvidenceStatus.Corrupt) return Done(CorruptResponse(normalized.OperationId, evidence.Diagnostic!, normalized));
-            if (_stopping) return Done(Failure(normalized, ApfsOperationCodes.ServiceUnavailable, "The operation service is stopping and is not accepting new work."));
+            if (_stopping && (normalized.Command != ApfsControlCommands.Quit || !CanReconcileQuit_NoLock()))
+                return Done(Failure(normalized, ApfsOperationCodes.ServiceUnavailable, "The operation service is stopping and is not accepting new work."));
             var path = EvidencePath(normalized.OperationId);
             if (normalized.ExpiresAtUtc <= UtcNow())
             {
@@ -127,6 +129,7 @@ internal sealed class AgentControlOperationService
                 normalized.Command == ApfsControlCommands.Quit)
             {
                 _stopping = true;
+                _lastQuit = admission.Record;
             }
             if (admission.Record is not null)
             {
@@ -162,6 +165,20 @@ internal sealed class AgentControlOperationService
             return NonterminalFallback(current, id);
         }
         return ResolveDurable(id);
+    }
+
+    private bool CanReconcileQuit_NoLock()
+    {
+        // Admission remains latched. Only a distinct Quit can follow the actual
+        // terminal executor/reconciliation, never a published pending receipt.
+        if (_shutdownCancellationTask is not null || _lastQuit is null ||
+            !_lastQuit.Completion.IsCompletedSuccessfully) return false;
+        if (_reconciliations.TryGetValue(_lastQuit.OperationId, out var ownership) &&
+            !ownership.Completion.IsCompletedSuccessfully) return false;
+        var evidence = ReadEvidence(_lastQuit.OperationId);
+        return evidence.Status == EvidenceStatus.Valid &&
+               evidence.Payload is { Success: false } terminal && IsTerminal(terminal.State) &&
+               StringComparer.Ordinal.Equals(terminal.Fingerprint, _lastQuit.NormalizedFingerprint);
     }
 
     public OperationResultPayload Cancel(string operationId)
@@ -247,7 +264,11 @@ internal sealed class AgentControlOperationService
         if (!TryPersist(inProgress, path, out _, out var inProgressError)) return PersistTerminal(Failure(normalized, ApfsOperationCodes.OperationFailed, Append("The in-progress operation record could not be written.", inProgressError?.Message), started), path);
         if (token.IsCancellationRequested) return PersistTerminal(Cancelled(normalized, started, "The operation was cancelled before execution began."), path);
         var deadlineCts = CreateDeadlineCancellationSource(normalized.ExpiresAtUtc);
-        var operationCts = CancellationTokenSource.CreateLinkedTokenSource(token, deadlineCts.Token);
+        var admittedGracefulQuit = normalized.Command == ApfsControlCommands.Quit;
+        // Expiry still bounds admission. It cannot cancel a drain already owned by Quit.
+        var operationCts = admittedGracefulQuit
+            ? CancellationTokenSource.CreateLinkedTokenSource(token)
+            : CancellationTokenSource.CreateLinkedTokenSource(token, deadlineCts.Token);
         if (deadlineCts.IsCancellationRequested)
         {
             operationCts.Dispose();
@@ -278,10 +299,9 @@ internal sealed class AgentControlOperationService
                    static state => ((TaskCompletionSource)state!).TrySetResult(),
                    shutdownSignal))
         {
-            firstCompletion = await Task.WhenAny(
-                executorTask,
-                deadlineSignal.Task,
-                shutdownSignal.Task).ConfigureAwait(false);
+            firstCompletion = admittedGracefulQuit
+                ? await Task.WhenAny(executorTask, shutdownSignal.Task).ConfigureAwait(false)
+                : await Task.WhenAny(executorTask, deadlineSignal.Task, shutdownSignal.Task).ConfigureAwait(false);
         }
         if (ReferenceEquals(firstCompletion, executorTask))
         {
@@ -672,7 +692,15 @@ internal sealed class AgentControlOperationService
             IsTerminal(state) ? AtOrAfter(UtcNow(), effectiveStarted!.Value) : null,
             RequestedMode: n.RequestedMode,
             Diagnostic: diagnostic,
-            ExpiresAtUtc: n.ExpiresAtUtc);
+            ExpiresAtUtc: n.ExpiresAtUtc,
+            SnapshotName: n.SnapshotName,
+            ManagementOperation: n.ManagementOperation,
+            ManagementToken: n.ManagementToken,
+            ManagementName: n.ManagementName,
+            ManagementQuotaBytes: n.ManagementQuotaBytes,
+            ManagementReserveBytes: n.ManagementReserveBytes,
+            ManagementImagePath: n.ManagementImagePath,
+            SnapshotIdentity: n.SnapshotIdentity, VolumeManagement: n.VolumeManagement, ApprovedImageRepairPlanId: n.ApprovedImageRepairPlanId, KeyManagement: n.KeyManagement);
         return !IsTerminal(state) || code == ApfsOperationCodes.Timeout
             ? WithConservativePendingProof(result)
             : result;
@@ -707,7 +735,7 @@ internal sealed class AgentControlOperationService
             CompletedAtUtc: now,
             RequestedMode: context?.RequestedMode,
             Diagnostic: $"Corrupt operation evidence was preserved and was not overwritten: {diagnostic}",
-            ExpiresAtUtc: context?.ExpiresAtUtc);
+            ExpiresAtUtc: context?.ExpiresAtUtc, VolumeManagement: context?.VolumeManagement, ApprovedImageRepairPlanId: context?.ApprovedImageRepairPlanId, KeyManagement: context?.KeyManagement);
     }
 
     private OperationResultPayload NormalizeExecutorResult(NormalizedRequest n, OperationResultPayload result, DateTime started)
@@ -735,6 +763,27 @@ internal sealed class AgentControlOperationService
             RequestedMode = n.RequestedMode,
             EffectiveMode = NormalizeEffectiveMode(result.EffectiveMode),
             ExpiresAtUtc = n.ExpiresAtUtc,
+            SnapshotName = n.SnapshotName,
+            // Request-bound echoes are enforced from the normalized
+            // request (an executor cannot smuggle different parameters
+            // into evidence). Server-issued plan outputs survive instead:
+            // the plan request carries no token by envelope rule, so the
+            // issued token, plan ID, and observed generation must persist
+            // or the caller could never confirm. Evidence fingerprint
+            // recompute ignores the plan token by design, and a spoofed
+            // token fails closed at apply (unknown) or read (mismatch).
+            ManagementOperation = n.ManagementOperation,
+            ManagementToken = n.ManagementToken ?? result.ManagementToken,
+            ManagementName = n.ManagementName,
+            ManagementQuotaBytes = n.ManagementQuotaBytes,
+            ManagementReserveBytes = n.ManagementReserveBytes,
+            ManagementImagePath = n.ManagementImagePath,
+            ManagementPlanId = result.ManagementPlanId,
+            ManagementObservedXid = result.ManagementObservedXid,
+            SnapshotIdentity = n.SnapshotIdentity,
+            VolumeManagement = n.VolumeManagement,
+            ApprovedImageRepairPlanId = n.ApprovedImageRepairPlanId,
+            KeyManagement = n.KeyManagement,
         };
     }
 
@@ -912,10 +961,11 @@ internal sealed class AgentControlOperationService
         try
         {
             var info = new FileInfo(path);
-            if (info.Length <= 0 || info.Length > _storeLimits.MaximumRecordBytes) return Corrupt(path, "The evidence file size is invalid.");
+            if (info.Length <= 0 || info.Length > MaximumReadBytes) return Corrupt(path, "The evidence file size is invalid.");
             using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             var payload = JsonSerializer.Deserialize<OperationResultPayload>(stream, JsonOptions);
             if (payload is null) return Corrupt(path, "The evidence payload is empty.");
+            if (info.Length > RecordSizeLimit(payload)) return Corrupt(path, "The evidence exceeds its command size limit.");
             return IsValidEvidence(payload, id, path, out var diagnostic)
                 ? new(EvidenceStatus.Valid, path, payload with { EvidencePath = path }, null)
                 : Corrupt(path, diagnostic ?? "The evidence payload is invalid.");
@@ -932,7 +982,13 @@ internal sealed class AgentControlOperationService
         if (!TryCanonicalId(payload.OperationId, out var payloadId) || !StringComparer.Ordinal.Equals(payloadId, id) || !StringComparer.Ordinal.Equals(payload.OperationId, payloadId)) return Invalid(out diagnostic, "The evidence operationId is not the canonical GUID for its filename.");
         if (!IsKnownCommand(payload.Command) || !StringComparer.Ordinal.Equals(payload.Command, NormalizeToken(payload.Command))) return Invalid(out diagnostic, "The evidence command is unknown or not normalized.");
         if (!TryNormalizeMode(payload.RequestedMode, out var mode) || !StringComparer.Ordinal.Equals(payload.RequestedMode, mode)) return Invalid(out diagnostic, "The evidence requested mode is unknown or not normalized.");
-        if (!TargetsEqual(payload.Target, NormalizeTarget(payload.Target)) || !HasValidTarget(payload.Command, payload.Target)) return Invalid(out diagnostic, "The evidence target is missing, not normalized, or has an invalid volume identity.");
+        if (!TargetsEqual(payload.Target, NormalizeTarget(payload.Target)) || !HasValidTarget(payload.Command, payload.Target, payload.VolumeManagement) || !VolumeManagementParameters.Valid(payload.Command, payload.VolumeManagement)) return Invalid(out diagnostic, "The evidence target is missing, not normalized, or has an invalid volume identity.");
+        if ((payload.ApprovedImageRepairPlanId is not null || payload.ImageRepairOffer is not null || payload.ImageRepairReceipt is not null) &&
+            !PipeMessageCodec.Validate(PipeMessageCodec.Create(ApfsMessageTypes.OperationResult, payload, payload.OperationId, 2)).IsValid)
+            return Invalid(out diagnostic, "The image repair evidence or approved fingerprint is invalid.");
+        if ((payload.Command == ApfsControlCommands.ImageKeyManagement || payload.KeyManagement is not null || payload.KeyManagementReceipt is not null) &&
+            !PipeMessageCodec.Validate(PipeMessageCodec.Create(ApfsMessageTypes.OperationResult, payload, payload.OperationId, 2)).IsValid)
+            return Invalid(out diagnostic, "The key-management evidence or exact endpoint fingerprint is invalid.");
         if (string.IsNullOrWhiteSpace(payload.Fingerprint) || string.IsNullOrWhiteSpace(payload.Code) || payload.RequestedAtUtc == default || !payload.ExpiresAtUtc.HasValue) return Invalid(out diagnostic, "The evidence is missing required operation identity fields.");
         if (payload.ExpiresAtUtc.Value <= payload.RequestedAtUtc &&
             !(payload.State == ApfsOperationStates.Failed && IsCode(payload.Code, ApfsOperationCodes.Timeout)))
@@ -941,11 +997,7 @@ internal sealed class AgentControlOperationService
         }
         if (!StringComparer.Ordinal.Equals(
                 payload.Fingerprint,
-                ApfsOperationFingerprint.Compute(
-                    payload.Command,
-                    payload.Target,
-                    payload.RequestedMode,
-                    payload.ExpiresAtUtc.Value)))
+                ApfsOperationFingerprint.ComputeForResult(payload)))
         {
             return Invalid(out diagnostic, "The evidence fingerprint does not match its command, target, mode, and expiry.");
         }
@@ -971,6 +1023,11 @@ internal sealed class AgentControlOperationService
         }
 
         if (!payload.StartedAtUtc.HasValue || !payload.CompletedAtUtc.HasValue) return Invalid(out diagnostic, "Terminal evidence must have start and completion timestamps.");
+        if (payload.VolumeVerificationReport is not null)
+        {
+            var validation = PipeMessageCodec.Validate(PipeMessageCodec.Create(ApfsMessageTypes.OperationResult, payload, payload.OperationId, 2));
+            if (!validation.IsValid) return Invalid(out diagnostic, "Invalid typed live verification evidence.");
+        }
         if (payload.State == ApfsOperationStates.Succeeded)
         {
             return !payload.Success || !IsSuccessCode(payload.Code)
@@ -1042,15 +1099,24 @@ internal sealed class AgentControlOperationService
             return false;
         }
 
-        if (bytes.LongLength > _storeLimits.MaximumRecordBytes)
+        if (bytes.LongLength > RecordSizeLimit(candidate))
         {
-            diagnostic = $"The evidence record exceeds the {_storeLimits.MaximumRecordBytes}-byte limit.";
+            diagnostic = $"The evidence record exceeds the {RecordSizeLimit(candidate)}-byte command limit.";
             return false;
         }
+        if (candidate.VolumeVerificationReport is not null && System.Text.Encoding.UTF8.GetByteCount(PipeMessageCodec.Serialize(
+            PipeMessageCodec.Create(ApfsMessageTypes.OperationResult, candidate, candidate.OperationId, 2))) > PipePeer.MaximumFrameBytes)
+        { diagnostic = "Live verification evidence exceeds the managed pipe frame bound."; return false; }
 
         diagnostic = string.Empty;
         return true;
     }
+
+    private long MaximumReadBytes => _storeLimits == AgentControlOperationStoreLimits.Default
+        ? Math.Max(_storeLimits.MaximumRecordBytes, PipePeer.MaximumFrameBytes) : _storeLimits.MaximumRecordBytes;
+    private long RecordSizeLimit(OperationResultPayload payload) => payload.Command == ApfsControlCommands.VolumeVerify &&
+        payload.VolumeVerificationReport is not null && _storeLimits == AgentControlOperationStoreLimits.Default
+        ? PipePeer.MaximumFrameBytes : _storeLimits.MaximumRecordBytes;
 
     private void WriteEvidenceAtomically(string path, OperationResultPayload payload, byte[] bytes)
     {
@@ -1088,6 +1154,12 @@ internal sealed class AgentControlOperationService
         var modeValid = TryNormalizeMode(request.RequestedMode, out var mode);
         var requestedAtUtc = UtcNow();
         var expiresAtUtc = request.ExpiresAtUtc?.ToUniversalTime();
+        var snapshotParameters = NormalizeSnapshotParameters(command, request.SnapshotName, request.SnapshotIdentity);
+        var managementParameters = NormalizeManagementParameters(command, request.ManagementOperation, request.ManagementToken, request.ManagementName, request.ManagementQuotaBytes, request.ManagementReserveBytes, request.ManagementImagePath);
+        var repairValid = request.ApprovedImageRepairPlanId is null || command == ApfsControlCommands.Fix &&
+            ImageRepairPersistence.Hex(request.ApprovedImageRepairPlanId) && ImageRepairPersistence.LocalPath(target?.DeviceId) &&
+            target?.RegisteredImage is null && mode != ApfsControlModes.ReadOnly;
+        var approvedRepair = repairValid ? request.ApprovedImageRepairPlanId : null;
         var normalized = new NormalizedRequest(
             id,
             command,
@@ -1095,21 +1167,29 @@ internal sealed class AgentControlOperationService
             mode,
             expiresAtUtc ?? default,
             expiresAtUtc.HasValue && !string.IsNullOrWhiteSpace(command)
-                ? ApfsOperationFingerprint.Compute(command, target, mode, expiresAtUtc.Value)
+                ? ApfsOperationFingerprint.Compute(command, target, mode, expiresAtUtc.Value, snapshotParameters.Name, snapshotParameters.Identity, managementParameters.Operation, managementParameters.Token, managementParameters.Name, managementParameters.QuotaBytes, managementParameters.ReserveBytes, managementParameters.ImagePath, request.VolumeManagement, approvedRepair, request.KeyManagement)
                 : null,
             requestedAtUtc,
             null,
-            null);
+            null, request.CredentialClientProcessId, request.CredentialClientStartTimeUtcTicks,
+            snapshotParameters.Name, snapshotParameters.Identity, managementParameters.Operation, managementParameters.Token, managementParameters.Name, managementParameters.QuotaBytes, managementParameters.ReserveBytes, managementParameters.ImagePath, request.VolumeManagement, approvedRepair, request.KeyManagement);
         if (!TryCanonicalId(rawId, out _)) return normalized with { ValidationCode = ApfsOperationCodes.InvalidOperationId, ValidationDiagnostic = "The operationId is blank or is not a valid GUID." };
         if (!IsKnownCommand(command)) return normalized with { ValidationCode = ApfsOperationCodes.UnknownCommand, ValidationDiagnostic = "The operation command is missing or unknown." };
         if (!modeValid) return normalized with { ValidationCode = ApfsOperationCodes.InvalidArguments, ValidationDiagnostic = "RequestedMode must be null, read-only, or read-write." };
-        if (!HasValidTarget(command, target)) return normalized with { ValidationCode = command == ApfsControlCommands.Quit ? ApfsOperationCodes.InvalidArguments : ApfsOperationCodes.AmbiguousTarget, ValidationDiagnostic = command == ApfsControlCommands.Quit ? "The quit command must not include a target." : "Mount, fix, and eject require a nonblank device and a canonical APFS or matching legacy volume ID." };
+        if (command == ApfsControlCommands.ImageKeyManagement ? request.KeyManagement is not { } key || !key.IsValid() || key.OperationId != id ||
+            target is not null || mode is not null : request.KeyManagement is not null)
+            return normalized with { ValidationCode = ApfsOperationCodes.InvalidArguments, ValidationDiagnostic = "Invalid key-management endpoint or action." };
+        if (!repairValid) return normalized with { ValidationCode = ApfsOperationCodes.InvalidArguments, ValidationDiagnostic = "Only ordinary image Fix accepts an exact opaque repair plan ID." };
+        if (!HasValidTarget(command, target, request.VolumeManagement)) return normalized with { ValidationCode = command == ApfsControlCommands.Quit ? ApfsOperationCodes.InvalidArguments : ApfsOperationCodes.AmbiguousTarget, ValidationDiagnostic = "The command requires an exact selected volume or container target." };
+        if (!VolumeManagementParameters.Valid(command, request.VolumeManagement)) return normalized with { ValidationCode = ApfsOperationCodes.InvalidArguments, ValidationDiagnostic = "Invalid volume management parameters." };
+        if (!snapshotParameters.IsValid) return normalized with { ValidationCode = ApfsOperationCodes.InvalidArguments, ValidationDiagnostic = snapshotParameters.Diagnostic ?? "Snapshot parameters are invalid." };
+        if (!managementParameters.IsValid) return normalized with { ValidationCode = ApfsOperationCodes.InvalidArguments, ValidationDiagnostic = managementParameters.Diagnostic ?? "Management parameters are invalid." };
         if (!expiresAtUtc.HasValue) return normalized with { ValidationCode = ApfsOperationCodes.InvalidArguments, ValidationDiagnostic = "ExpiresAtUtc is required for every mutating operation." };
         if (expiresAtUtc.Value > requestedAtUtc + MaximumOperationLifetime) return normalized with { ValidationCode = ApfsOperationCodes.InvalidArguments, ValidationDiagnostic = $"ExpiresAtUtc cannot be more than {MaximumOperationLifetime.TotalMinutes:n0} minutes in the future." };
         return normalized;
     }
 
-    private static ApfsControlTarget? NormalizeTarget(ApfsControlTarget? target) => target is null ? null : new ApfsControlTarget(NormalizeToken(target.DeviceId) ?? string.Empty, NormalizeToken(target.VolumeId) ?? string.Empty, NormalizeOpaque(target.RecoveryIdentity));
+    private static ApfsControlTarget? NormalizeTarget(ApfsControlTarget? target) => target is null ? null : target with { DeviceId = NormalizeToken(target.DeviceId) ?? string.Empty, VolumeId = NormalizeToken(target.VolumeId) ?? string.Empty, RecoveryIdentity = NormalizeOpaque(target.RecoveryIdentity), ContainerUuid = NormalizeToken(target.ContainerUuid) };
     private static string? NormalizeToken(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim().ToLowerInvariant();
     private static string? NormalizeOpaque(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
@@ -1122,11 +1202,35 @@ internal sealed class AgentControlOperationService
     }
 
     private static string? NormalizeEffectiveMode(string? value) => TryNormalizeMode(value, out var normalized) ? normalized : NormalizeOpaque(value);
-    private static bool HasValidTarget(string command, ApfsControlTarget? target)
+    private static bool HasValidTarget(string command, ApfsControlTarget? target, VolumeManagementParameters? topology = null)
     {
+        if (command == ApfsControlCommands.ImageKeyManagement) return target is null;
         if (command == ApfsControlCommands.Quit)
         {
             return target is null;
+        }
+        if (command is ApfsControlCommands.ContainerMount or ApfsControlCommands.ContainerUnmount ||
+            VolumeManagementParameters.IsCommand(command) && topology?.Kind == "create")
+        {
+            // Container-wide commands address a whole APFS container: a
+            // nonblank device plus a nonblank container UUID, and no volume.
+            // Membership is resolved against live inventory downstream; the
+            // gate here only enforces shape so a container request can never
+            // be mistaken for a single-volume request.
+            return target is not null &&
+                !string.IsNullOrWhiteSpace(target.DeviceId) &&
+                !string.IsNullOrWhiteSpace(target.ContainerUuid) &&
+                string.IsNullOrWhiteSpace(target.VolumeId);
+        }
+        if (command == ApfsControlCommands.DeviceEject)
+        {
+            // Device-wide eject addresses a whole physical device: a nonblank
+            // device with no container or volume identity. Every container on
+            // the device is resolved against live inventory downstream.
+            return target is not null &&
+                !string.IsNullOrWhiteSpace(target.DeviceId) &&
+                string.IsNullOrWhiteSpace(target.ContainerUuid) &&
+                string.IsNullOrWhiteSpace(target.VolumeId);
         }
         if (target is null ||
             string.IsNullOrWhiteSpace(target.DeviceId) ||
@@ -1134,11 +1238,12 @@ internal sealed class AgentControlOperationService
         {
             return false;
         }
+        if (!SelectedControlTarget.IsWellFormed(target)) return false;
         return ApfsTopology.TryParseVolumeId(target.VolumeId, out _, out _) ||
             target.VolumeId.StartsWith(
                 target.DeviceId + "|", StringComparison.OrdinalIgnoreCase);
     }
-    private static bool TargetsEqual(ApfsControlTarget? first, ApfsControlTarget? second) => first is null || second is null ? first is null && second is null : StringComparer.Ordinal.Equals(first.DeviceId, second.DeviceId) && StringComparer.Ordinal.Equals(first.VolumeId, second.VolumeId) && StringComparer.Ordinal.Equals(first.RecoveryIdentity, second.RecoveryIdentity);
+    private static bool TargetsEqual(ApfsControlTarget? first, ApfsControlTarget? second) => first is null || second is null ? first is null && second is null : StringComparer.Ordinal.Equals(first.DeviceId, second.DeviceId) && StringComparer.Ordinal.Equals(first.VolumeId, second.VolumeId) && StringComparer.Ordinal.Equals(first.RecoveryIdentity, second.RecoveryIdentity) && first.VolumeUuid == second.VolumeUuid && first.ContainerUuid == second.ContainerUuid && first.VolumeObjectId == second.VolumeObjectId && first.ObservationContract == second.ObservationContract;
     private string EvidencePath(string id) => Path.Combine(_root, $"{id}.json");
     private DateTime UtcNow() => _clock.GetUtcNow().UtcDateTime;
 
@@ -1164,7 +1269,7 @@ internal sealed class AgentControlOperationService
         canonical = guid.ToString("D").ToLowerInvariant();
         return true;
     }
-    private static bool IsKnownCommand(string? command) => command is ApfsControlCommands.Mount or ApfsControlCommands.Fix or ApfsControlCommands.Eject or ApfsControlCommands.Quit;
+    private static bool IsKnownCommand(string? command) => VolumeManagementParameters.IsCommand(command ?? "") || command is ApfsControlCommands.ImageKeyManagement or ApfsControlCommands.RegisterFusion or ApfsControlCommands.RegisterImage or ApfsControlCommands.Unlock or ApfsControlCommands.Lock or ApfsControlCommands.Mount or ApfsControlCommands.ContainerMount or ApfsControlCommands.ContainerUnmount or ApfsControlCommands.DeviceEject or ApfsControlCommands.Fix or ApfsControlCommands.Eject or ApfsControlCommands.Quit or ApfsControlCommands.SnapshotCreate or ApfsControlCommands.SnapshotDelete or ApfsControlCommands.SnapshotRecover or ApfsControlCommands.SnapshotList or ApfsControlCommands.ManagementPlan or ApfsControlCommands.ManagementApply or ApfsControlCommands.VolumeVerify;
     private static bool IsKnownState(string? state) => state is ApfsOperationStates.Accepted or ApfsOperationStates.InProgress or ApfsOperationStates.Succeeded or ApfsOperationStates.Failed or ApfsOperationStates.Cancelled;
     private static bool IsTerminal(string? state) => state is ApfsOperationStates.Succeeded or ApfsOperationStates.Failed or ApfsOperationStates.Cancelled;
     private static bool IsUnreconciledCompletion(AgentOperationRecord<OperationResultPayload> record)
@@ -1190,14 +1295,149 @@ internal sealed class AgentControlOperationService
     private static bool IsPathEqual(string? stored, string expected) { if (string.IsNullOrWhiteSpace(stored)) return false; try { return StringComparer.OrdinalIgnoreCase.Equals(Path.GetFullPath(stored), Path.GetFullPath(expected)); } catch (ArgumentException) { return false; } }
     private static EvidenceReadResult Corrupt(string path, string diagnostic) => new(EvidenceStatus.Corrupt, path, null, diagnostic);
     private NormalizedRequest RecoveryContext(string id) { var normalized = TryCanonicalId(id, out var canonical) ? canonical : id.Trim().ToLowerInvariant(); var now = UtcNow(); return new NormalizedRequest(normalized, ApfsControlCommands.Unknown, null, null, now, null, now, null, null); }
-    private static ControlOperationRequestPayload ToRequest(NormalizedRequest n) => new(n.OperationId, n.Command, n.Target, n.RequestedMode, n.ExpiresAtUtc);
+    private static ControlOperationRequestPayload ToRequest(NormalizedRequest n) => new(n.OperationId, n.Command, n.Target, n.RequestedMode, n.ExpiresAtUtc, n.SnapshotName, n.SnapshotIdentity, n.ManagementOperation, n.ManagementToken, n.ManagementName, n.ManagementQuotaBytes, n.ManagementReserveBytes, n.ManagementImagePath, n.VolumeManagement, n.ApprovedImageRepairPlanId, n.KeyManagement) { CredentialClientProcessId = n.CredentialClientProcessId, CredentialClientStartTimeUtcTicks = n.CredentialClientStartTimeUtcTicks };
     private static Task<OperationResultPayload> Done(OperationResultPayload result) => Task.FromResult(result);
     private static string Append(string? first, string? second) => string.IsNullOrWhiteSpace(first) ? second ?? string.Empty : string.IsNullOrWhiteSpace(second) ? first : $"{first} {second}";
 
     [DllImport("kernel32.dll", EntryPoint = "MoveFileExW", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool MoveFileExW(string existingFileName, string newFileName, uint flags);
-    private sealed record NormalizedRequest(string OperationId, string Command, ApfsControlTarget? Target, string? RequestedMode, DateTime ExpiresAtUtc, string? Fingerprint, DateTime RequestedAtUtc, string? ValidationCode, string? ValidationDiagnostic);
+    private sealed record NormalizedRequest(string OperationId, string Command, ApfsControlTarget? Target, string? RequestedMode, DateTime ExpiresAtUtc, string? Fingerprint, DateTime RequestedAtUtc, string? ValidationCode, string? ValidationDiagnostic, int CredentialClientProcessId = 0, long CredentialClientStartTimeUtcTicks = 0, string? SnapshotName = null, IReadOnlyList<string>? SnapshotIdentity = null, string? ManagementOperation = null, string? ManagementToken = null, string? ManagementName = null, string? ManagementQuotaBytes = null, string? ManagementReserveBytes = null, string? ManagementImagePath = null, VolumeManagementParameters? VolumeManagement = null, string? ApprovedImageRepairPlanId = null, ImageKeyManagementRequest? KeyManagement = null);
+
+    private sealed record NormalizedSnapshotParameters(string? Name, IReadOnlyList<string>? Identity, bool IsValid, string? Diagnostic);
+
+    // Snapshot parameters ride the normalized request exactly as issued (no
+    // trimming or case folding: names are byte-exact, identity numbers are
+    // canonical). Anything the host envelope would refuse is rejected here.
+    private static NormalizedSnapshotParameters NormalizeSnapshotParameters(string command, string? snapshotName, IReadOnlyList<string>? snapshotIdentity)
+    {
+        var isCreate = string.Equals(command, ApfsControlCommands.SnapshotCreate, StringComparison.Ordinal);
+        var isDelete = string.Equals(command, ApfsControlCommands.SnapshotDelete, StringComparison.Ordinal);
+        var isRecover = string.Equals(command, ApfsControlCommands.SnapshotRecover, StringComparison.Ordinal);
+        if (isCreate)
+        {
+            return IsSnapshotParameterName(snapshotName) && snapshotIdentity is not { Count: > 0 }
+                ? new NormalizedSnapshotParameters(snapshotName, null, true, null)
+                : new NormalizedSnapshotParameters(null, null, false, "Snapshot create requires exactly one valid name and no identity.");
+        }
+
+        if (isDelete)
+        {
+            return snapshotName is null && IsSnapshotParameterIdentity(snapshotIdentity)
+                ? new NormalizedSnapshotParameters(null, snapshotIdentity, true, null)
+                : new NormalizedSnapshotParameters(null, null, false, "Snapshot delete requires the nine-line exact identity and no separate name.");
+        }
+
+        if (isRecover)
+        {
+            return snapshotName is null && snapshotIdentity is not { Count: > 0 }
+                ? new NormalizedSnapshotParameters(null, null, true, null)
+                : new NormalizedSnapshotParameters(null, null, false, "Snapshot recover carries no snapshot parameters.");
+        }
+
+        return snapshotName is null && snapshotIdentity is not { Count: > 0 }
+            ? new NormalizedSnapshotParameters(null, null, true, null)
+            : new NormalizedSnapshotParameters(null, null, false, $"The {command} command must not include snapshot parameters.");
+    }
+
+    private static bool IsSnapshotParameterName(string? value)
+        => value is not null && value.Length is > 0 and <= 255 &&
+            value.All(static ch => ch != '\0' && ch != '\r' && ch != '\n');
+
+    private static bool IsSnapshotParameterIdentity(IReadOnlyList<string>? identity)
+    {
+        if (identity is not { Count: 9 } || !IsSnapshotParameterName(identity[1]))
+        {
+            return false;
+        }
+
+        foreach (var index in new[] { 0, 2, 3, 4, 5, 6, 7, 8 })
+        {
+            var text = identity[index];
+            if (string.IsNullOrEmpty(text) ||
+                !ulong.TryParse(text, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var parsed) ||
+                parsed == 0 ||
+                parsed.ToString(System.Globalization.CultureInfo.InvariantCulture) != text)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+    private sealed record NormalizedManagementParameters(string? Operation, string? Token, string? Name, string? QuotaBytes, string? ReserveBytes, string? ImagePath, bool IsValid, string? Diagnostic);
+
+    // Management parameters ride the normalized request exactly as issued
+    // (operation spelling is contract-normalized to lowercase; token, name,
+    // quota values, and the image path stay byte-exact). Anything the
+    // executor would refuse is rejected here, mirroring snapshot parameter
+    // normalization.
+    private static NormalizedManagementParameters NormalizeManagementParameters(string command, string? operation, string? token, string? name, string? quotaBytes, string? reserveBytes, string? imagePath)
+    {
+        var normalizedOperation = NormalizeToken(operation);
+        var isPlan = string.Equals(command, ApfsControlCommands.ManagementPlan, StringComparison.Ordinal);
+        var isApply = string.Equals(command, ApfsControlCommands.ManagementApply, StringComparison.Ordinal);
+        var operationValid = normalizedOperation is ApfsManagementOperations.RenameVolume or ApfsManagementOperations.SetQuotaReserve;
+        if (isPlan)
+        {
+            return operationValid && token is null && name is null && quotaBytes is null && reserveBytes is null && imagePath is null
+                ? new NormalizedManagementParameters(normalizedOperation, null, null, null, null, null, true, null)
+                : new NormalizedManagementParameters(null, null, null, null, null, null, false, "Management plan requires exactly one supported operation and no token, path, or mutation values.");
+        }
+
+        if (isApply)
+        {
+            if (!operationValid || string.IsNullOrWhiteSpace(token) || token.Length > 256)
+                return new NormalizedManagementParameters(null, null, null, null, null, null, false, "Management apply requires a supported operation and a confirmation token.");
+            if (!operationValid)
+                return new NormalizedManagementParameters(null, null, null, null, null, null, false, "The management operation is unknown.");
+            if (string.IsNullOrWhiteSpace(imagePath) || imagePath.Length > 1024)
+                return new NormalizedManagementParameters(null, null, null, null, null, null, false, "Management apply requires an image path.");
+            return ManagementApplyParametersValid(normalizedOperation!, name, quotaBytes, reserveBytes, out var diagnostic)
+                ? new NormalizedManagementParameters(normalizedOperation, token, name, quotaBytes, reserveBytes, imagePath, true, null)
+                : new NormalizedManagementParameters(null, null, null, null, null, null, false, diagnostic);
+        }
+
+        return operation is null && token is null && name is null && quotaBytes is null && reserveBytes is null && imagePath is null
+            ? new NormalizedManagementParameters(null, null, null, null, null, null, true, null)
+            : new NormalizedManagementParameters(null, null, null, null, null, null, false, $"The {command} command must not include management parameters.");
+    }
+
+    private static bool ManagementApplyParametersValid(string operation, string? name, string? quotaBytes, string? reserveBytes, out string? diagnostic)
+    {
+        diagnostic = null;
+        if (string.Equals(operation, ApfsManagementOperations.RenameVolume, StringComparison.Ordinal))
+        {
+            // Mirror the native rename planner shape: one non-empty name up to
+            // 255 chars with no embedded NUL/CR/LF; strict UTF-8 and no-op
+            // rejection belong to the keeper planner, not the service gate.
+            if (name is not null && name.Length is > 0 and <= 255 && name.All(static ch => ch != (char)0 && ch != (char)13 && ch != (char)10) && quotaBytes is null && reserveBytes is null)
+                return true;
+            diagnostic = "Management rename requires exactly one valid name and no quota values.";
+            return false;
+        }
+
+        if (string.Equals(operation, ApfsManagementOperations.SetQuotaReserve, StringComparison.Ordinal))
+        {
+            // Mirror the native quota planner shape: both canonical u64
+            // quota/reserve values are required (zero clears a limit);
+            // limit semantics belong to the keeper planner, not the
+            // service gate.
+            if (name is null && IsCanonicalU64(quotaBytes) && IsCanonicalU64(reserveBytes))
+                return true;
+            diagnostic = "Management quota requires canonical quota and reserve values and no name.";
+            return false;
+        }
+
+        diagnostic = "The management operation is unknown.";
+        return false;
+    }
+
+    private static bool IsCanonicalU64(string? value)
+        => value is not null &&
+            ulong.TryParse(value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var parsed) &&
+            parsed.ToString(System.Globalization.CultureInfo.InvariantCulture) == value;
+
     private sealed record ReconciliationOwnership(string Fingerprint, Task<OperationResultPayload> Completion);
     private sealed record ReconciliationCompletion(AgentControlOperationService Service, string OperationId, ReconciliationOwnership Ownership);
     private sealed record OperationContextCompletion(AgentControlOperationService Service, string OperationId, string Fingerprint);

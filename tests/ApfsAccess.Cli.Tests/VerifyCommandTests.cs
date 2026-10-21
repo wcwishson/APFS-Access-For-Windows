@@ -72,8 +72,10 @@ public sealed class VerifyCommandTests : IDisposable
         using var cancellation = new CancellationTokenSource(); cancellation.Cancel();
         Assert.Equal(12, Run(Args, token: cancellation.Token).Exit);
         var help = Run(["--help"]); Assert.Equal(0, help.Exit);
-        Assert.Contains("covered current metadata subset", help.Json.GetProperty("description").GetString());
+        Assert.Contains("Complete verifies the requested covered scope", help.Json.GetProperty("description").GetString());
         Assert.Contains("--checkpoint-xid", help.Json.GetProperty("usage").GetString());
+        Assert.Contains("allocationCensus", help.Json.GetProperty("description").GetString());
+        Assert.Contains("unattributed, never reclaimable", help.Json.GetProperty("description").GetString());
     }
     [Theory]
     [InlineData(1, 0, "CurrentMetadataSubsetVerified")]
@@ -85,7 +87,8 @@ public sealed class VerifyCommandTests : IDisposable
         try
         {
             Console.SetOut(output);
-            var report = JsonSerializer.SerializeToElement(new { wholeVolumeVerified = false, sourceReads = "18446744073709551615" });
+            var report = JsonSerializer.SerializeToElement(new { version = 2, wholeVolumeVerified = false, sourceReads = "18446744073709551615",
+                allocationCensus = outcome == 1 ? new { unattributedMainBlocks = "9007199254740993", unattributedMainRanges = new[] { new { physicalBlock = "9007199254740993", blockCount = "1" } } } : null });
             Assert.Equal(exit, VerifyCommand.Run([..Args, "--json"], (_, _) => new ApfsImageVerificationResult(exit, (ApfsVerificationOutcome)outcome, report)));
             using var json = JsonDocument.Parse(output.ToString());
             Assert.Equal(exit, json.RootElement.GetProperty("nativeExitCode").GetInt32());
@@ -93,6 +96,9 @@ public sealed class VerifyCommandTests : IDisposable
             Assert.Equal(exit == 0, json.RootElement.GetProperty("success").GetBoolean());
             Assert.Equal("18446744073709551615", json.RootElement.GetProperty("verification").GetProperty("sourceReads").GetString());
             Assert.False(json.RootElement.GetProperty("verification").GetProperty("wholeVolumeVerified").GetBoolean());
+            var census = json.RootElement.GetProperty("verification").GetProperty("allocationCensus");
+            Assert.Equal(outcome == 1 ? JsonValueKind.Object : JsonValueKind.Null, census.ValueKind);
+            if (outcome == 1) Assert.Equal("9007199254740993", census.GetProperty("unattributedMainRanges")[0].GetProperty("physicalBlock").GetString());
         }
         finally { Console.SetOut(previous); }
     }
@@ -105,7 +111,7 @@ public sealed class VerifyCommandTests : IDisposable
             Console.SetOut(output); Assert.Equal(0, await Program.RunForTestAsync(["capabilities"]));
             using var json = JsonDocument.Parse(output.ToString());
             Assert.Contains(json.RootElement.GetProperty("commands").EnumerateArray(), x => x.GetString() == "verify");
-            Assert.Contains("covered current metadata subset", json.RootElement.GetProperty("verificationScope").GetString());
+            Assert.Contains("Complete verifies the requested covered scope", json.RootElement.GetProperty("verificationScope").GetString());
             output.GetStringBuilder().Clear();
             Assert.Equal(2, await Program.RunForTestAsync(["verify", "--elevate"]));
             using var invalid = JsonDocument.Parse(output.ToString());

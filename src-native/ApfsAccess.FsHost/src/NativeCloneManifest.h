@@ -13,11 +13,21 @@ NTSTATUS ImportManifestNativeClone(MountContext& c, NativeCloneTicketState& tick
     Store::MutationRequest prepared;
     NTSTATUS refusal = STATUS_INSUFFICIENT_RESOURCES;
     bool accepted = false, verified = false, preparation_completed = false;
+    std::optional<Store::MutationStatus> preparation_refusal;
     const apfsaccess::catalog::ContainerMutationPreparationHook prepare =
         [&](const Store& live, auto& requests, std::string& error) {
             const auto inode = live.LookupCommittedInodeByPath(source);
             if (!requests.empty() || !inode || inode->object_id != ticket.object_id || inode->xid != ticket.generation)
             { refusal = STATUS_INVALID_HANDLE; error = "CloneSourceGenerationChanged"; return false; }
+            if (inode->internal_flags & ~0x400ULL)
+            {
+                refusal = STATUS_NOT_SUPPORTED;
+                error = "CloneManifestPreparationUnsupported";
+                // Publish the classification after the fallible diagnostic.
+                static_assert(noexcept(preparation_refusal = Store::MutationStatus::UnsupportedOperation));
+                preparation_refusal = Store::MutationStatus::UnsupportedOperation;
+                return false;
+            }
             if (!NativeCloneAncestrySupportedLocked(c, source) || !NativeCloneAncestrySupportedLocked(c, parent) ||
                 !live.PrepareNativeClone(source, target, prepared))
             { refusal = STATUS_NOT_SUPPORTED; error = "CloneManifestPreparationUnsupported"; return false; }
@@ -77,7 +87,8 @@ NTSTATUS ImportManifestNativeClone(MountContext& c, NativeCloneTicketState& tick
         };
     ManifestCommitOutcome outcome;
     const auto status = CommitNativeMutationsBestEffort(&c, L"CloneManifestImport", bind, {}, prepare, verify,
-        &outcome, false, [&] { return verified && PublishNativeCloneNamespace(c, target, receipt.target); });
+        &outcome, false, [&] { return verified && PublishNativeCloneNamespace(c, target, receipt.target); },
+        &preparation_refusal);
     if (!NT_SUCCESS(status) || !accepted || !verified)
     {
         if (!acceptance_started && outcome.clean_prepublication_refusal)

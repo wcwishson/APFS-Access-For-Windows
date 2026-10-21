@@ -16,6 +16,7 @@
 
   <ItemGroup>
     <Using Include="Xunit" />
+    <Compile Include="..\fixtures\PhysicalWritePermissionFixture.cs" Link="PhysicalWritePermissionFixture.cs" />
   </ItemGroup>
 
   <ItemGroup>

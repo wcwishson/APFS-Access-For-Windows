@@ -230,7 +230,7 @@ public sealed class VolumeDriveLetterAssignments
         return (Guid.TryParseExact(text, "D", out uuid) || Guid.TryParseExact(text, "N", out uuid)) && uuid != Guid.Empty;
     }
 
-    private static SafeFileHandle OpenChecked(string path, bool directory)
+    internal static SafeFileHandle OpenChecked(string path, bool directory)
     {
         var handle = CreateFileW(path, directory ? 0u : 0x80000000u, directory ? 3u : 1u, IntPtr.Zero, 3,
             0x00200000u | (directory ? 0x02000000u : 0), IntPtr.Zero);

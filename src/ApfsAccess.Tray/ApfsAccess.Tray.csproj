@@ -4,13 +4,13 @@
     <TargetFramework>net9.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <ApplicationIcon>..\..\assets\icons\tray_idle.ico</ApplicationIcon>
-    <AssemblyVersion>1.0.5.1</AssemblyVersion>
-    <FileVersion>1.0.5.1</FileVersion>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\ApfsAccess.Core\ApfsAccess.Core.csproj" />
     <ProjectReference Include="..\ApfsAccess.Ipc\ApfsAccess.Ipc.csproj" />
+    <ProjectReference Include="..\ApfsAccess.Backend.Native\ApfsAccess.Backend.Native.csproj" />
   </ItemGroup>
 
   <ItemGroup>

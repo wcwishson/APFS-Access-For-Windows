@@ -1,12 +1,22 @@
 #include "TransactionManager.h"
+#include "FusionOriginalContinuation.h"
 #include "NativeClone.h"
+#include "NativeHardLink.h"
+#include "NativeSparse.h"
+#include "NativeSparseV2.h"
+#include "NativeCloneRange.h"
+#include "NativeVolumeRename.h"
+#include "NativeSnapshotIntent.h"
+#include "NativeCountRepair.h"
 
 #include "WriteAheadLog.h"
 #include "InodeMetadataPatch.h"
+#include "ProtectedJournalEpoch.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cwchar>
+#include <cstring>
 #include <filesystem>
 #include <limits>
 #include <unordered_map>
@@ -78,6 +88,20 @@ WriteAheadLog::OperationKind ToWalOperation(TransactionManager::MutationKind kin
         return WriteAheadLog::OperationKind::RestoreDirectoryFromSymbolicLink;
     case TransactionManager::MutationKind::CloneFile:
         return WriteAheadLog::OperationKind::CloneFile;
+    case TransactionManager::MutationKind::HardLink:
+        return WriteAheadLog::OperationKind::HardLink;
+    case TransactionManager::MutationKind::NativeSparse:
+        return WriteAheadLog::OperationKind::NativeSparse;
+    case TransactionManager::MutationKind::CloneRange:
+        return WriteAheadLog::OperationKind::CloneRange;
+    case TransactionManager::MutationKind::CreateSnapshot: return WriteAheadLog::OperationKind::CreateSnapshot;
+    case TransactionManager::MutationKind::DeleteSnapshot: return WriteAheadLog::OperationKind::DeleteSnapshot;
+    case TransactionManager::MutationKind::SetVolumeQuotaReserve:
+        return WriteAheadLog::OperationKind::SetVolumeQuotaReserve;
+    case TransactionManager::MutationKind::RenameVolume:
+        return WriteAheadLog::OperationKind::RenameVolume;
+    case TransactionManager::MutationKind::RepairVolumeFileCount:
+        return WriteAheadLog::OperationKind::RepairVolumeFileCount;
     case TransactionManager::MutationKind::RewriteCompressedContent:
         return WriteAheadLog::OperationKind::RewriteCompressedContent;
     default:
@@ -112,6 +136,14 @@ bool IsMutationOperation(WriteAheadLog::OperationKind operation)
     case WriteAheadLog::OperationKind::SetAllocationSize:
     case WriteAheadLog::OperationKind::RestoreDirectoryFromSymbolicLink:
     case WriteAheadLog::OperationKind::CloneFile:
+    case WriteAheadLog::OperationKind::HardLink:
+    case WriteAheadLog::OperationKind::NativeSparse:
+    case WriteAheadLog::OperationKind::CloneRange:
+    case WriteAheadLog::OperationKind::CreateSnapshot:
+    case WriteAheadLog::OperationKind::DeleteSnapshot:
+    case WriteAheadLog::OperationKind::SetVolumeQuotaReserve:
+    case WriteAheadLog::OperationKind::RenameVolume:
+    case WriteAheadLog::OperationKind::RepairVolumeFileCount:
     case WriteAheadLog::OperationKind::RewriteCompressedContent:
         return true;
     default:
@@ -260,11 +292,101 @@ bool ValidateWalSemantics(const std::vector<WriteAheadLog::Record>& records)
             if(!WriteAheadLog::NativeCloneIsConsistent(record) || !DecodeNativeClone(record.inline_payload,p) ||
                 !clone_checkpoints.emplace(record.transaction_id,p.checkpoint).second)return false;
         }
+        if (record.operation == WriteAheadLog::OperationKind::HardLink) {
+            NativeHardLinkProof proof;
+            if (!WriteAheadLog::NativeHardLinkIsConsistent(record) ||
+                !DecodeNativeHardLink(record.inline_payload, proof) ||
+                !clone_checkpoints.emplace(record.transaction_id, proof.checkpoint).second) return false;
+        }
+        if (record.operation == WriteAheadLog::OperationKind::CloneRange) {
+            NativeCloneRangeProof proof;
+            if (!WriteAheadLog::NativeCloneRangeIsConsistent(record) || !DecodeNativeCloneRange(record.inline_payload, proof) ||
+                !clone_checkpoints.emplace(record.transaction_id, proof.checkpoint).second) return false;
+        }
+        if (record.operation == WriteAheadLog::OperationKind::NativeSparse) {
+            std::uint64_t checkpoint=0;
+            if (!WriteAheadLog::NativeSparseIsConsistent(record) ||
+                !DecodeNativeSparseOriginalCheckpoint(record.inline_payload, checkpoint) ||
+                !clone_checkpoints.emplace(record.transaction_id, checkpoint).second) return false;
+        }
+        if (record.operation == WriteAheadLog::OperationKind::SetVolumeQuotaReserve) {
+            NativeVolumeQuotaReserve rename;
+            if (!WriteAheadLog::VolumeQuotaReserveIsConsistent(record) ||
+                !DecodeNativeVolumeQuotaReserve(record.inline_payload, rename) ||
+                !clone_checkpoints.emplace(record.transaction_id, rename.checkpoint).second) return false;
+        }
+        if (record.operation == WriteAheadLog::OperationKind::RenameVolume) {
+            NativeVolumeRename rename;
+            if (!WriteAheadLog::SnapshotIntentIsConsistent(record) || !WriteAheadLog::CountRepairIsConsistent(record) || !WriteAheadLog::VolumeQuotaReserveIsConsistent(record) || !WriteAheadLog::VolumeRenameIsConsistent(record) ||
+                !DecodeNativeVolumeRename(record.inline_payload, rename) ||
+                !clone_checkpoints.emplace(record.transaction_id, rename.checkpoint).second) return false;
+        }
+        if (record.operation == WriteAheadLog::OperationKind::CreateSnapshot || record.operation == WriteAheadLog::OperationKind::DeleteSnapshot) {
+            NativeSnapshotIntent intent;
+            if (!WriteAheadLog::SnapshotIntentIsConsistent(record) || !DecodeNativeSnapshotIntent(record.inline_payload,intent) ||
+                !clone_checkpoints.emplace(record.transaction_id,intent.scope.checkpoint_xid).second) return false;
+        }
         active_transaction_id = record.transaction_id;
+        if (record.operation == WriteAheadLog::OperationKind::RepairVolumeFileCount) {
+            NativeCountRepair repair;
+            if (!WriteAheadLog::CountRepairIsConsistent(record) ||
+                !DecodeNativeCountRepair(record.inline_payload, repair) ||
+                !clone_checkpoints.emplace(record.transaction_id, repair.checkpoint).second) return false;
+        }
         ++prepared_counts[record.transaction_id];
     }
 
     return active_transaction_id == 0 && prepared_counts.empty();
+}
+
+bool AppendSnapshotCheckpointPins(const WriteAheadLog::Record& record, std::vector<std::uint64_t>& pins)
+{
+    if (record.operation != WriteAheadLog::OperationKind::CreateSnapshot &&
+        record.operation != WriteAheadLog::OperationKind::DeleteSnapshot) return true;
+    NativeSnapshotIntent intent;
+    if (!WriteAheadLog::SnapshotIntentIsConsistent(record) ||
+        !DecodeNativeSnapshotIntent(record.inline_payload, intent) ||
+        pins.size() > TransactionManager::MaxCachedCheckpointPinEntries() ||
+        intent.pins.size() > TransactionManager::MaxCachedCheckpointPinEntries() - pins.size()) return false;
+    pins.insert(pins.end(), intent.pins.begin(), intent.pins.end());
+    return true;
+}
+
+struct OriginalHistoryCleanup
+{
+    std::vector<WriteAheadLog::Record>& records;
+    void Clear()
+    {
+        for (auto& r : records) {
+            for (auto* text : {&r.volume_identity, &r.path_utf8, &r.secondary_path_utf8})
+                if (!text->empty()) SecureZeroMemory(text->data(), text->size());
+            if (!r.inline_payload.empty()) SecureZeroMemory(r.inline_payload.data(), r.inline_payload.size());
+            SecureZeroMemory(r.payload_sha256.data(), r.payload_sha256.size());
+        }
+        std::vector<WriteAheadLog::Record>().swap(records);
+    }
+    ~OriginalHistoryCleanup() { Clear(); }
+};
+
+bool HasOriginalProtectedAnchor(const std::filesystem::path& path, std::uint64_t expected_bytes)
+{
+    // The existing authenticated reader validates the anchor plaintext. This
+    // header-only check refuses its larger retained-checkpoint variant, even
+    // when compaction happened to retain sequences 1..N without any gaps.
+    constexpr std::array<std::uint8_t, 40> normal{
+        0xe4, 'A', 'P', 'F', 'S', 'W', 'A', 'L', 1, 0, 0, 0, 16, 0, 0, 0,
+        'A', 'P', 'F', 'S', 'R', 'E', 'C', '1', 1, 0, 0, 0, 64, 0, 0, 0, 88, 0, 0, 0, 24, 0, 0, 0};
+    struct Handle { HANDLE h; ~Handle() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); } } file{
+        CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT, nullptr)};
+    BY_HANDLE_FILE_INFORMATION info{}; LARGE_INTEGER size{}; wchar_t resolved[1024]{};
+    if (file.h == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(file.h, &info) || info.nNumberOfLinks != 1 ||
+        (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) ||
+        !GetFileSizeEx(file.h, &size) || size.QuadPart < 0 || static_cast<std::uint64_t>(size.QuadPart) != expected_bytes) return false;
+    const auto n = GetFinalPathNameByHandleW(file.h, resolved, 1024, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (!n || n >= 1024 || CompareStringOrdinal(resolved, -1, (L"\\\\?\\" + path.wstring()).c_str(), -1, TRUE) != CSTR_EQUAL) return false;
+    std::array<std::uint8_t, normal.size()> header{}; DWORD read = 0;
+    return ReadFile(file.h, header.data(), static_cast<DWORD>(header.size()), &read, nullptr) && read == header.size() && header == normal;
 }
 }
 
@@ -298,6 +420,9 @@ bool TransactionManager::Begin()
             return false;
         }
     }
+
+    if (preserve_startup_evidence_ && journal_.ValidatedAppendLeaseGeneration(true) == 0)
+        return false;
 
     current_transaction_id_ = next_transaction_id_++;
     pending_mutations_.clear();
@@ -413,6 +538,331 @@ bool TransactionManager::WaitForDeferredAcceptanceDurability(std::uint64_t accep
 bool TransactionManager::FlushDeferredAcceptanceDurabilityNow(std::uint64_t accepted_sequence)
 {
     return EnsureDeferredAcceptanceDurability(accepted_sequence, false);
+}
+
+bool TransactionManager::FlushAcceptedEvidenceDurability(std::uint64_t accepted_sequence)
+{
+    if (!recovery_state_valid_ || state_ != State::Idle || journal_path_.empty() ||
+        !accepted_sequence || accepted_sequence > watermarks_.accepted_sequence ||
+        accepted_sequence <= watermarks_.cleanup_sequence || !IsAcceptedBoundary(accepted_sequence) ||
+        !JournalStateMatchesWriterLease()) return false;
+    // The external journal gate prevents a new acceptance during this barrier.
+    // The append mutex also excludes an already scheduled deferred flusher.
+    bool flushed = false;
+    {
+        std::lock_guard append_lock(deferred_wal_append_mutex_);
+        flushed = journal_.FlushPendingAppends();
+        if (flushed) {
+            std::lock_guard state_lock(deferred_wal_state_mutex_);
+            deferred_wal_durable_sequence_ = (std::max)(deferred_wal_durable_sequence_, accepted_sequence);
+        }
+    }
+    deferred_wal_state_cv_.notify_all();
+    if (!flushed) MarkDeferredAcceptanceDurabilityFailure();
+    return flushed;
+}
+
+bool TransactionManager::FlushRetainedOriginalEvidenceDurability()
+try
+{
+    if (!recovery_state_valid_ || state_ != State::Idle || journal_path_.empty() || volume_identity_.empty() ||
+        current_transaction_id_ || journal_append_ambiguous_ || !pending_mutations_.empty() ||
+        !buffered_prepared_records_.empty() || !watermarks_.accepted_sequence ||
+        watermarks_.cleanup_sequence > watermarks_.apfs_durable_sequence ||
+        watermarks_.apfs_durable_sequence > watermarks_.accepted_sequence || !JournalStateMatchesWriterLease()) return false;
+    const auto lease = journal_state_writer_generation_;
+    bool flushed = false;
+    {
+        std::lock_guard append_lock(deferred_wal_append_mutex_);
+        {
+            std::lock_guard state_lock(deferred_wal_state_mutex_);
+            if (deferred_wal_flush_failed_) return false;
+        }
+        // Validate the retained append handle without opening, repair or reseed.
+        flushed = journal_.ValidatedAppendLeaseGeneration(true) == lease &&
+            journal_.FlushPendingAppends() && journal_.ValidatedAppendLeaseGeneration(true) == lease &&
+            JournalStateMatchesWriterLease();
+        if (flushed) {
+            std::lock_guard state_lock(deferred_wal_state_mutex_);
+            deferred_wal_durable_sequence_ = (std::max)(deferred_wal_durable_sequence_, watermarks_.accepted_sequence);
+        }
+    }
+    deferred_wal_state_cv_.notify_all();
+    if (!flushed) MarkDeferredAcceptanceDurabilityFailure();
+    return flushed;
+}
+catch (...) { MarkDeferredAcceptanceDurabilityFailure(); return false; }
+
+bool TransactionManager::ProtectedSpoolOwnerValid() const
+{
+    if (!journal_protection_ || journal_path_.empty() || volume_identity_.empty() ||
+        !recovery_state_valid_ || state_ != State::Idle || current_transaction_id_ || journal_append_ambiguous_ ||
+        !pending_mutations_.empty() || !buffered_prepared_records_.empty() ||
+        !journal_.HasExclusiveWriterLease() || !JournalStateMatchesWriterLease()) return false;
+    std::lock_guard state_lock(deferred_wal_state_mutex_);
+    return !deferred_wal_flush_failed_ && !deferred_wal_flush_in_progress_;
+}
+
+bool TransactionManager::ReadProtectedOriginalHistory(WriteAheadLog::ProtectedHistoryHead& head,
+    std::vector<WriteAheadLog::Record>& records, std::string& error)
+{
+    head = {}; error.clear();
+    const auto fail = [&](const char* reason) { head = {}; error = reason; return false; };
+    if (!ProtectedSpoolOwnerValid()) return fail("ProtectedSpoolOriginalOwnerInvalid");
+    const auto retired = continuation_seed_ ? continuation_seed_->last_sequence : 0;
+    if (!journal_.CaptureProtectedHistoryHead(head) || head.records > 65536 ||
+        head.records > UINT64_MAX - retired || head.last_sequence != retired + head.records ||
+        (!continuation_seed_ && !HasOriginalProtectedAnchor(journal_path_, head.bytes))) return fail("ProtectedSpoolOriginalHistoryUnavailable");
+    const auto budget = journal_protection_->max_allocation_bytes;
+    if (head.bytes > budget / 8 || head.records > (budget - head.bytes * 8) / (3 * sizeof(WriteAheadLog::Record) + 256))
+        return fail("ProtectedSpoolOriginalResourceLimit");
+    auto read = journal_.ReadAllAtProtectedHead(head); OriginalHistoryCleanup cleanup{read.records};
+    if (read.status != WriteAheadLog::ReadStatus::Ok || read.recovered_torn_tail || read.records.size() != head.records)
+        return fail("ProtectedSpoolOriginalHistoryUnavailable");
+    const auto identity = EffectiveVolumeIdentity(volume_identity_);
+    for (std::size_t n = 0; n < read.records.size(); ++n)
+        if (read.records[n].sequence != retired + n + 1 || read.records[n].volume_identity != identity ||
+            read.records[n].operation == WriteAheadLog::OperationKind::CompactionIndex)
+            return fail("ProtectedSpoolOriginalHistoryIncomplete");
+    TransactionManager verifier(safety_level_);
+    verifier.continuation_seed_ = continuation_seed_;
+    if (continuation_seed_) verifier.journal_protection_ = journal_protection_;
+    if (!verifier.SeedIdsFromJournalRecords(read.records, 0) || !verifier.RecoveryStateValid() ||
+        verifier.watermarks_.accepted_sequence != watermarks_.accepted_sequence ||
+        verifier.watermarks_.apfs_durable_sequence != watermarks_.apfs_durable_sequence ||
+        verifier.watermarks_.cleanup_sequence != watermarks_.cleanup_sequence || next_sequence_ != head.last_sequence + 1 ||
+        !ProtectedSpoolOwnerValid()) return fail("ProtectedSpoolOriginalStateMismatch");
+    records = std::move(read.records);
+    return true;
+}
+
+bool TransactionManager::ReadAuthorizationDispositionHistory(WriteAheadLog::ProtectedHistoryHead& head,
+    std::vector<WriteAheadLog::Record>& records, std::string& error)
+{
+    records.clear(); head = {};
+    const bool begun = recovery_state_valid_ && state_ == State::Active && current_transaction_id_ &&
+        pending_mutations_.empty() && buffered_prepared_records_.empty() && !journal_append_ambiguous_ &&
+        journal_protection_ && journal_.HasExclusiveWriterLease() && JournalStateMatchesWriterLease();
+    const bool prepared_recovery = !recovery_state_valid_ && state_ == State::Idle && !current_transaction_id_ &&
+        journal_protection_ && !journal_path_.empty() && !volume_identity_.empty() && journal_.HasExclusiveWriterLease() &&
+        !journal_append_ambiguous_ && pending_mutations_.empty() && buffered_prepared_records_.empty();
+    if (!begun && !prepared_recovery && !ProtectedSpoolOwnerValid()) { error = "AuthorizationDispositionOriginalOwnerInvalid"; return false; }
+    if (begun || prepared_recovery) {
+        std::lock_guard lock(deferred_wal_state_mutex_);
+        if (deferred_wal_flush_failed_ || deferred_wal_flush_in_progress_) {
+            error = "AuthorizationDispositionOriginalOwnerInvalid"; return false;
+        }
+    }
+    const auto attributes = GetFileAttributesW(journal_path_.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        const auto code = GetLastError();
+        if (code != ERROR_FILE_NOT_FOUND || continuation_seed_ || next_sequence_ != 1 ||
+            (begun ? current_transaction_id_ != 1 : next_transaction_id_ != 1) ||
+            watermarks_.accepted_sequence || watermarks_.apfs_durable_sequence || watermarks_.cleanup_sequence) {
+            error = "AuthorizationDispositionOriginalMissing"; return false;
+        }
+        auto read = journal_.ReadAllWithExclusiveWriterLease(journal_protection_->read_limits);
+        if (read.status != WriteAheadLog::ReadStatus::Ok || read.recovered_torn_tail || !read.records.empty()) {
+            error = "AuthorizationDispositionOriginalUnreadable"; return false;
+        }
+        return true;
+    }
+    if (!begun && !prepared_recovery) return ReadProtectedOriginalHistory(head, records, error);
+    if (!journal_.CaptureProtectedHistoryHead(head)) { error = "AuthorizationDispositionOriginalUnreadable"; return false; }
+    const auto budget = journal_protection_->max_allocation_bytes;
+    if (head.records > 65536 || head.bytes > budget / 8 ||
+        head.records > (budget - head.bytes * 8) / (3 * sizeof(WriteAheadLog::Record) + 256)) {
+        error = "AuthorizationDispositionOriginalResourceLimit"; return false;
+    }
+    auto read = journal_.ReadAllAtProtectedHead(head); OriginalHistoryCleanup clear{read.records};
+    const auto retired = continuation_seed_ ? continuation_seed_->last_sequence : 0;
+    if (read.status != WriteAheadLog::ReadStatus::Ok || read.recovered_torn_tail || head.records != read.records.size() ||
+        head.last_sequence != retired + head.records ||
+        (!continuation_seed_ && !HasOriginalProtectedAnchor(journal_path_, head.bytes))) {
+        error = "AuthorizationDispositionOriginalIncomplete"; return false;
+    }
+    for (std::size_t n = 0; n < read.records.size(); ++n)
+        if (read.records[n].sequence != retired + n + 1 || read.records[n].volume_identity != EffectiveVolumeIdentity(volume_identity_) ||
+            read.records[n].operation == WriteAheadLog::OperationKind::CompactionIndex) {
+            error = "AuthorizationDispositionOriginalIncomplete"; return false;
+        }
+    if (prepared_recovery) {
+        if (!SeedAuthorizationPreparedPrefix(read.records, journal_.ExclusiveWriterLeaseGeneration())) {
+            error = "AuthorizationDispositionPreparedPrefixInvalid"; return false;
+        }
+        records = std::move(read.records); return true;
+    }
+    TransactionManager verifier(safety_level_); verifier.continuation_seed_ = continuation_seed_;
+    if (continuation_seed_) verifier.journal_protection_ = journal_protection_;
+    if (!verifier.SeedIdsFromJournalRecords(read.records, 0) || current_transaction_id_ != verifier.next_transaction_id_ ||
+        next_sequence_ != verifier.next_sequence_ || watermarks_.accepted_sequence != verifier.watermarks_.accepted_sequence ||
+        watermarks_.apfs_durable_sequence != verifier.watermarks_.apfs_durable_sequence ||
+        watermarks_.cleanup_sequence != verifier.watermarks_.cleanup_sequence) {
+        error = "AuthorizationDispositionOriginalStateMismatch"; return false;
+    }
+    records = std::move(read.records); return true;
+}
+
+bool TransactionManager::SeedAuthorizationPreparedPrefix(
+    const std::vector<WriteAheadLog::Record>& records, std::uint64_t writer_generation)
+{
+    if (state_ != State::Idle || records.empty() || records.back().sequence >= UINT64_MAX - 1 ||
+        records.back().transaction_id >= UINT64_MAX - 1 || !records.back().transaction_id ||
+        journal_append_ambiguous_ || !pending_mutations_.empty() || !buffered_prepared_records_.empty()) return false;
+    const auto transaction = records.back().transaction_id;
+    const auto& path = records.back().path_utf8;
+    if (path != "\\$apfs-keybag-rewrap-v2" && path != "\\$apfs-software-transition-v1" &&
+        path != "\\$apfs-software-key-rotation-v1") return false;
+    std::uint64_t count = 0;
+    for (auto it = records.rbegin(); it != records.rend() && it->transaction_id == transaction; ++it) {
+        if (it->operation != WriteAheadLog::OperationKind::Write || it->state != WriteAheadLog::RecordState::Prepared ||
+            it->path_utf8 != path || !WriteAheadLog::InlinePayloadIsConsistent(*it) || it->inline_payload.empty() ||
+            it->inline_payload.size() > 4096) return false;
+        ++count;
+    }
+    // Seed only the actual closed predecessor, without inventing a terminal
+    // record for the prepared suffix. The suffix burns its own real IDs but
+    // cannot make recovery valid until Journal appends its exact durable abort.
+    std::vector<WriteAheadLog::Record> closed(records.begin(), records.end() - static_cast<std::ptrdiff_t>(count));
+    OriginalHistoryCleanup clear{closed};
+    TransactionManager verifier(safety_level_); verifier.continuation_seed_ = continuation_seed_;
+    if (continuation_seed_) verifier.journal_protection_ = journal_protection_;
+    if (!verifier.SeedIdsFromJournalRecords(closed, 0) || transaction != verifier.next_transaction_id_ ||
+        records[closed.size()].sequence != verifier.next_sequence_ ||
+        verifier.watermarks_.accepted_sequence != verifier.watermarks_.cleanup_sequence ||
+        verifier.watermarks_.apfs_durable_sequence != verifier.watermarks_.cleanup_sequence) return false;
+    next_sequence_ = records.back().sequence + 1; next_transaction_id_ = transaction + 1;
+    watermarks_ = verifier.watermarks_; journal_state_writer_generation_ = writer_generation;
+    recovery_state_valid_ = false;
+    return true;
+}
+
+bool TransactionManager::AppendAuthorizationAbort(const WriteAheadLog::ProtectedHistoryHead& expected,
+    const WriteAheadLog::Record& marker, std::string& error)
+{
+    std::unique_lock append_lock(deferred_wal_append_mutex_);
+    WriteAheadLog::ProtectedHistoryHead head;
+    std::vector<WriteAheadLog::Record> records; OriginalHistoryCleanup cleanup{records};
+    if (!ReadAuthorizationDispositionHistory(head, records, error) || head != expected ||
+        marker.sequence != next_sequence_ || marker.sequence == UINT64_MAX || !marker.transaction_id ||
+        marker.transaction_id == UINT64_MAX || marker.operation != WriteAheadLog::OperationKind::TransactionMarker ||
+        marker.state != WriteAheadLog::RecordState::Cleaned || marker.flags != kWalFlagAborted ||
+        marker.object_id || marker.parent_object_id || marker.payload_spool_id || marker.payload_offset ||
+        marker.payload_length || marker.logical_offset || marker.payload_sha256 != decltype(marker.payload_sha256){} ||
+        !marker.inline_payload.empty() || marker.unlink_outcome || !marker.secondary_path_utf8.empty() ||
+        marker.volume_identity != EffectiveVolumeIdentity(volume_identity_)) {
+        error = "AuthorizationDispositionAbortMismatch"; return false;
+    }
+    records.push_back(marker);
+    if (!ValidateWalSemantics(records) || (expected.bytes && !journal_.FlushPendingAppends())) {
+        error = "AuthorizationDispositionOriginalBarrierFailed"; return false;
+    }
+    if (expected.bytes) {
+        WriteAheadLog::ProtectedHistoryHead checked;
+        if (!journal_.CaptureProtectedHistoryHead(checked) || checked != expected) {
+            error = "AuthorizationDispositionOriginalChanged"; return false;
+        }
+    }
+    const auto result = journal_.AppendWithResult(marker, true, journal_.ExclusiveWriterLeaseGeneration());
+    if (result != WriteAheadLog::AppendResult::Succeeded) {
+        if (result == WriteAheadLog::AppendResult::BytesMayHavePersisted) {
+            recovery_state_valid_ = false; journal_append_ambiguous_ = true; state_ = State::Failed;
+        }
+        error = "AuthorizationDispositionAbortAppendFailed"; return false;
+    }
+    if (!SeedIdsFromJournalRecords(records, journal_.ExclusiveWriterLeaseGeneration())) {
+        state_ = State::Failed; error = "AuthorizationDispositionAbortReseedFailed"; return false;
+    }
+    return true;
+}
+
+bool TransactionManager::CaptureProtectedOriginalHistoryHead(WriteAheadLog::ProtectedHistoryHead& head, std::string& error)
+{
+    std::lock_guard append_lock(deferred_wal_append_mutex_);
+    std::vector<WriteAheadLog::Record> records; OriginalHistoryCleanup cleanup{records};
+    try { return ReadProtectedOriginalHistory(head, records, error); }
+    catch (...) { head = {}; error = "ProtectedSpoolOriginalHistoryUnavailable"; return false; }
+}
+
+PayloadSpool::ProtectedMaintenanceResult TransactionManager::ReconcileProtectedPayloadSpool(PayloadSpool& spool,
+    const WriteAheadLog::ProtectedHistoryHead& expected, std::string& error)
+{
+    std::lock_guard append_lock(deferred_wal_append_mutex_);
+    error.clear();
+    const auto fail = [&](const char* reason) { error = reason; return PayloadSpool::ProtectedMaintenanceResult::RejectedBeforeWrite; };
+    bool entered_spool = false;
+    std::vector<WriteAheadLog::Record> records; OriginalHistoryCleanup cleanup{records};
+    try {
+        if (!ProtectedSpoolOwnerValid() || !spool.MatchesProtectedMaintenanceAuthority(journal_protection_->source_binding,
+            EffectiveVolumeIdentity(volume_identity_), journal_protection_->key_directory)) return fail("ProtectedSpoolAuthorityMismatch");
+        WriteAheadLog::ProtectedHistoryHead head;
+        if (!ReadProtectedOriginalHistory(head, records, error)) return PayloadSpool::ProtectedMaintenanceResult::RejectedBeforeWrite;
+        if (head != expected) return fail("ProtectedSpoolOriginalHeadMismatch");
+        PayloadSpool::ProtectedCleanupProof proof;
+        proof.source_binding = journal_protection_->source_binding; proof.wal_sha256 = head.sha256;
+        proof.wal_bytes = head.bytes;
+        // The private continuation baseline certifies the retired prefix. The
+        // bounded active count must not be confused with a global sequence.
+        proof.wal_records = head.records;
+        proof.wal_last_sequence = head.last_sequence;
+        proof.durable_sequence = watermarks_.apfs_durable_sequence; proof.cleanup_sequence = watermarks_.cleanup_sequence;
+        std::vector<PayloadSpool::PersistedRangeReference> refs;
+        std::vector<std::uint64_t> optional_inline_sequences;
+        for (const auto& r : records) {
+            if (r.operation != WriteAheadLog::OperationKind::Write &&
+                r.operation != WriteAheadLog::OperationKind::CreateFile) continue;
+            if (!r.payload_length) {
+                if (r.payload_spool_id || r.payload_offset || !r.inline_payload.empty()) return fail("ProtectedSpoolOriginalReferenceInvalid");
+                continue;
+            }
+            const bool complete_inline = !r.inline_payload.empty() && WriteAheadLog::InlinePayloadIsConsistent(r);
+            if (!r.inline_payload.empty() && !complete_inline) return fail("ProtectedSpoolOriginalReferenceInvalid");
+            if (complete_inline) {
+                if (r.payload_spool_id && r.payload_spool_id != r.sequence) return fail("ProtectedSpoolOriginalReferenceInvalid");
+                if (!r.parent_object_id) {
+                    if (r.payload_offset) return fail("ProtectedSpoolOriginalReferenceInvalid");
+                    continue; // A zero generation cannot authenticate a physical frame.
+                }
+                optional_inline_sequences.push_back(r.sequence);
+            } else if (!r.parent_object_id) {
+                return fail("ProtectedSpoolOriginalReferenceInvalid");
+            }
+            if (refs.size() >= 4096 || !r.object_id || !r.parent_object_id || r.payload_spool_id != r.sequence ||
+                r.payload_length > journal::kMaxJournalPlaintextBytes || r.logical_length != r.payload_length ||
+                r.logical_offset > UINT64_MAX - r.payload_length ||
+                std::all_of(r.payload_sha256.begin(), r.payload_sha256.end(), [](auto b) { return b == 0; }) ||
+                (!r.inline_payload.empty() && !WriteAheadLog::InlinePayloadIsConsistent(r))) return fail("ProtectedSpoolOriginalReferenceInvalid");
+            refs.push_back({r.volume_identity, r.object_id, r.parent_object_id, r.logical_offset,
+                r.payload_length, r.payload_offset, r.sequence, r.payload_sha256});
+        }
+        cleanup.Clear();
+        const auto generation = journal_.ExclusiveWriterLeaseGeneration();
+        NotifyStage("protected-spool-before-original-barrier");
+        if (!ProtectedSpoolOwnerValid() || !journal_.FlushPendingAppends()) {
+            MarkDeferredAcceptanceDurabilityFailure(); return fail("ProtectedSpoolOriginalFlushFailed");
+        }
+        NotifyStage("protected-spool-after-original-barrier");
+        std::vector<WriteAheadLog::Record> rechecked; OriginalHistoryCleanup recheck_cleanup{rechecked};
+        WriteAheadLog::ProtectedHistoryHead after;
+        if (!ReadProtectedOriginalHistory(after, rechecked, error) || after != expected ||
+            generation != journal_.ExclusiveWriterLeaseGeneration()) {
+            MarkDeferredAcceptanceDurabilityFailure(); return fail("ProtectedSpoolOriginalChanged");
+        }
+        recheck_cleanup.Clear();
+        {
+            std::lock_guard state_lock(deferred_wal_state_mutex_);
+            deferred_wal_durable_sequence_ = (std::max)(deferred_wal_durable_sequence_, watermarks_.accepted_sequence);
+        }
+        deferred_wal_state_cv_.notify_all();
+        entered_spool = true;
+        const auto result = spool.ReconcileProtectedOriginalHistory(proof, refs, optional_inline_sequences);
+        if (result != PayloadSpool::ProtectedMaintenanceResult::Succeeded)
+            error = result == PayloadSpool::ProtectedMaintenanceResult::RecoveryRequired ? "ProtectedSpoolRecoveryRequired" : "ProtectedSpoolReconciliationRefused";
+        return result;
+    } catch (...) {
+        try { error = entered_spool ? "ProtectedSpoolRecoveryRequired" : "ProtectedSpoolOriginalHistoryUnavailable"; } catch (...) {}
+        return entered_spool ? PayloadSpool::ProtectedMaintenanceResult::RecoveryRequired : PayloadSpool::ProtectedMaintenanceResult::RejectedBeforeWrite;
+    }
 }
 
 void TransactionManager::MarkDeferredAcceptanceDurabilityFailure() noexcept
@@ -694,8 +1144,32 @@ void TransactionManager::ClearBufferedPreparedRecords() noexcept
     buffered_prepared_records_have_incomplete_inline_payload_ = false;
 }
 
-void TransactionManager::SetJournalPath(std::wstring journal_path)
+bool TransactionManager::OpenExistingRepairJournal(std::wstring path, std::wstring identity, std::string& error)
 {
+    if (state_ != State::Idle || !journal_path_.empty() || !volume_identity_.empty()) {
+        error = "Fresh transaction owner required"; return false;
+    }
+    journal_path_ = std::move(path); volume_identity_ = std::move(identity);
+    ConfigureJournal();
+    if (!journal_.AcquireExistingRepairLease(error)) return false;
+    // No second parser/collector: bytes are now protected by the actual writer lease.
+    if (!SeedIdsFromExistingJournal(true)) {
+        error = "Canonical journal semantic validation failed; evidence retained"; return false;
+    }
+    return true;
+}
+
+void TransactionManager::SetJournalPath(std::wstring journal_path, bool acquire_writer_lease)
+{
+    if (journal_protection_)
+    {
+        if (journal_path != journal_path_)
+        {
+            recovery_state_valid_ = false;
+            InvalidateFinalizationCoverage(true);
+        }
+        return;
+    }
     journal_path_ = std::move(journal_path);
     {
         std::lock_guard<std::mutex> lock(deferred_wal_state_mutex_);
@@ -709,12 +1183,372 @@ void TransactionManager::SetJournalPath(std::wstring journal_path)
     InvalidateFinalizationCoverage(false);
     if (!journal_path_.empty() && !volume_identity_.empty())
     {
-        (void)SeedIdsFromExistingJournal(true);
+        (void)SeedIdsFromExistingJournal(acquire_writer_lease);
     }
+}
+
+bool TransactionManager::OpenStartupJournal(std::wstring path, std::wstring identity, std::string& error)
+{
+    error.clear();
+    if (state_ != State::Idle || !journal_path_.empty() || !volume_identity_.empty() ||
+        path.empty() || identity.empty() || !std::filesystem::path(path).is_absolute())
+    {
+        error = "StartupJournalFreshOwnerRequired";
+        return false;
+    }
+    journal_path_ = std::move(path);
+    volume_identity_ = std::move(identity);
+    preserve_startup_evidence_ = true;
+    ConfigureJournal();
+    if (!SeedIdsFromExistingJournal(true))
+    {
+        error = "StartupJournalEvidenceInvalid";
+        return false;
+    }
+    return true;
+}
+
+bool TransactionManager::MaterializeAbsentStartupJournal(std::string& error)
+{
+    error.clear();
+    if (!preserve_startup_evidence_ || !recovery_state_valid_ || state_ != State::Idle ||
+        journal_path_.empty() || volume_identity_.empty() || !JournalStateMatchesWriterLease() ||
+        current_transaction_id_ != 0 || next_transaction_id_ != 1 || next_sequence_ != 1 ||
+        !pending_mutations_.empty() || !buffered_prepared_records_.empty() || journal_append_ambiguous_ ||
+        watermarks_.accepted_sequence != 0 || watermarks_.apfs_durable_sequence != 0 ||
+        watermarks_.cleanup_sequence != 0 || last_committed_sequence_ != 0 ||
+        highest_checkpointed_marker_sequence_ != 0 || !accepted_boundaries_.empty())
+    {
+        error = "AbsentStartupJournalStateInvalid";
+        return false;
+    }
+    if (!journal_.MaterializeAbsentStartupJournal())
+    {
+        error = "AbsentStartupJournalMaterializationRefused";
+        return false;
+    }
+    if (!SeedIdsFromExistingJournal(true))
+    {
+        error = "MaterializedStartupJournalEvidenceInvalid";
+        return false;
+    }
+    return true;
+}
+
+bool TransactionManager::SnapshotEvidenceCapacityAvailable(const MutationIntent& intent, std::string& error) const
+{
+    error.clear();
+    if (state_ != State::Idle || !recovery_state_valid_ || !pending_mutations_.empty() ||
+        watermarks_.accepted_sequence != watermarks_.apfs_durable_sequence ||
+        watermarks_.accepted_sequence != watermarks_.cleanup_sequence ||
+        (intent.kind != MutationKind::CreateSnapshot && intent.kind != MutationKind::DeleteSnapshot) ||
+        intent.length != intent.inline_payload.size() || intent.payload_length != intent.inline_payload.size() ||
+        intent.offset || intent.timestamp_utc || intent.replace_if_exists || !intent.secondary_path.empty() ||
+        intent.payload_spool_offset || intent.unlink_outcome ||
+        next_sequence_ > (std::numeric_limits<std::uint64_t>::max)() - 8)
+    {
+        error = "SnapshotRuntimeEvidenceCapacityAdmissionInvalid";
+        return false;
+    }
+    WriteAheadLog::Record mutation{};
+    mutation.volume_identity = EffectiveVolumeIdentity(volume_identity_);
+    mutation.transaction_id = next_transaction_id_;
+    mutation.sequence = next_sequence_;
+    mutation.operation = ToWalOperation(intent.kind);
+    mutation.object_id = intent.object_id;
+    mutation.parent_object_id = intent.generation;
+    mutation.payload_length = intent.payload_length;
+    mutation.payload_sha256 = intent.payload_checksum;
+    mutation.inline_payload = intent.inline_payload;
+    mutation.path_utf8 = WideToUtf8(intent.path);
+    if (!WriteAheadLog::SnapshotIntentIsConsistent(mutation))
+    {
+        error = "SnapshotRuntimeEvidenceCapacityAdmissionInvalid";
+        return false;
+    }
+    std::vector<WriteAheadLog::Record> records{std::move(mutation)};
+    // Include the actual acceptance label plus durability and terminal records
+    // before accepting bytes. Extra fixed records conservatively cover cleanup.
+    for (unsigned i = 0; i < 7; ++i)
+    {
+        WriteAheadLog::Record terminal{};
+        terminal.volume_identity = EffectiveVolumeIdentity(volume_identity_);
+        terminal.sequence = next_sequence_ + i;
+        terminal.transaction_id = next_transaction_id_;
+        terminal.operation = WriteAheadLog::OperationKind::TransactionMarker;
+        terminal.state = WriteAheadLog::RecordState::Accepted;
+        terminal.flags = kWalFlagAccepted;
+        terminal.logical_length = 1;
+        if (i == 0) terminal.path_utf8 = WideToUtf8(safety_level_);
+        records.push_back(std::move(terminal));
+    }
+    if (!journal_.EvidenceAppendCapacityAvailable(records, {64ull << 20, 1000000}, 256ull << 20))
+    {
+        error = "SnapshotRuntimeEvidenceCapacityExceeded";
+        return false;
+    }
+    return true;
+}
+
+bool TransactionManager::NativeSparseEvidenceCapacityAvailable(const MutationIntent& intent, std::string& error) const
+{
+    error.clear();
+    const auto fail=[&](const char* text){error=text;return false;};
+    if(journal_protection_ || state_!=State::Idle || !recovery_state_valid_ || !pending_mutations_.empty() ||
+        !buffered_prepared_records_.empty() || watermarks_.accepted_sequence!=watermarks_.apfs_durable_sequence ||
+        watermarks_.accepted_sequence!=watermarks_.cleanup_sequence || intent.kind!=MutationKind::NativeSparse ||
+        intent.length!=intent.inline_payload.size() || intent.payload_length!=intent.inline_payload.size() ||
+        intent.offset || intent.timestamp_utc || intent.replace_if_exists || !intent.secondary_path.empty() ||
+        intent.payload_spool_offset || intent.unlink_outcome || next_sequence_>UINT64_MAX-8)
+        return fail("SparseEvidenceCapacityAdmissionInvalid");
+    WriteAheadLog::Record mutation{};mutation.volume_identity=EffectiveVolumeIdentity(volume_identity_);
+    mutation.transaction_id=next_transaction_id_;mutation.sequence=next_sequence_;mutation.operation=WriteAheadLog::OperationKind::NativeSparse;
+    mutation.object_id=intent.object_id;mutation.parent_object_id=intent.generation;
+    mutation.logical_length=intent.length;mutation.payload_length=intent.payload_length;
+    mutation.inline_payload=intent.inline_payload;mutation.payload_sha256=intent.payload_checksum;mutation.path_utf8=WideToUtf8(intent.path);
+    if(!NativeSparseV2WalIsConsistent(mutation))return fail("SparseEvidenceCapacityAdmissionInvalid");
+    std::vector<WriteAheadLog::Record> records{std::move(mutation)};
+    for(unsigned i=0;i<7;++i){WriteAheadLog::Record marker{};
+        marker.volume_identity=EffectiveVolumeIdentity(volume_identity_);marker.sequence=next_sequence_+i;marker.transaction_id=next_transaction_id_;
+        marker.operation=WriteAheadLog::OperationKind::TransactionMarker;marker.state=WriteAheadLog::RecordState::Accepted;
+        marker.flags=kWalFlagAccepted;marker.logical_length=1;if(!i)marker.path_utf8=WideToUtf8(safety_level_);records.push_back(std::move(marker));}
+    if(!journal_.EvidenceAppendCapacityAvailable(records,{(std::min)(journal_max_bytes_,64ull<<20),1000000},256ull<<20))
+        return fail("SparseEvidenceCapacityExceeded");
+    return true;
+}
+
+bool TransactionManager::NativeCloneRangeEvidenceCapacityAvailable(const MutationIntent& intent, std::string& error) const
+{
+    error.clear(); const auto fail = [&](const char* text) { error = text; return false; };
+    if (journal_protection_ || state_ != State::Idle || !recovery_state_valid_ || !pending_mutations_.empty() ||
+        !buffered_prepared_records_.empty() || watermarks_.accepted_sequence != watermarks_.apfs_durable_sequence ||
+        watermarks_.accepted_sequence != watermarks_.cleanup_sequence || intent.kind != MutationKind::CloneRange ||
+        intent.length != intent.inline_payload.size() || intent.payload_length != intent.inline_payload.size() ||
+        intent.offset || intent.timestamp_utc || intent.replace_if_exists || intent.payload_spool_offset ||
+        intent.unlink_outcome || next_sequence_ > UINT64_MAX - 8) return fail("CloneRangeEvidenceCapacityAdmissionInvalid");
+    WriteAheadLog::Record mutation{}; mutation.volume_identity = EffectiveVolumeIdentity(volume_identity_);
+    mutation.transaction_id = next_transaction_id_; mutation.sequence = next_sequence_; mutation.operation = WriteAheadLog::OperationKind::CloneRange;
+    mutation.object_id = intent.object_id; mutation.parent_object_id = intent.generation;
+    mutation.logical_length = intent.length; mutation.payload_length = intent.payload_length; mutation.inline_payload = intent.inline_payload;
+    mutation.payload_sha256 = intent.payload_checksum; mutation.path_utf8 = WideToUtf8(intent.path); mutation.secondary_path_utf8 = WideToUtf8(intent.secondary_path);
+    if (!NativeCloneRangeWalIsConsistent(mutation)) return fail("CloneRangeEvidenceCapacityAdmissionInvalid");
+    std::vector<WriteAheadLog::Record> records{std::move(mutation)};
+    for (unsigned i = 0; i < 7; ++i) {
+        WriteAheadLog::Record marker{}; marker.volume_identity = EffectiveVolumeIdentity(volume_identity_);
+        marker.sequence = next_sequence_ + i; marker.transaction_id = next_transaction_id_;
+        marker.operation = WriteAheadLog::OperationKind::TransactionMarker; marker.state = WriteAheadLog::RecordState::Accepted;
+        marker.flags = kWalFlagAccepted; marker.logical_length = 1; if (!i) marker.path_utf8 = WideToUtf8(safety_level_);
+        records.push_back(std::move(marker));
+    }
+    if (!journal_.EvidenceAppendCapacityAvailable(records, {(std::min)(journal_max_bytes_, 64ull << 20), 1000000}, 256ull << 20))
+        return fail("CloneRangeEvidenceCapacityExceeded");
+    return true;
+}
+
+bool TransactionManager::ProtectedAcceptanceCapacityAvailable(
+    std::span<const MutationIntent> mutations, std::string& error) const
+{
+    error.clear();
+    const auto fail = [&](const char* reason) { error = reason; return false; };
+    if (!journal_protection_ || !recovery_state_valid_ || state_ != State::Idle ||
+        !pending_mutations_.empty() || !buffered_prepared_records_.empty() || mutations.empty() ||
+        mutations.size() > 256 || next_sequence_ > UINT64_MAX - mutations.size() - 8)
+        return fail("ProtectedAcceptanceCapacityAdmissionInvalid");
+    try {
+        const auto& protection = *journal_protection_;
+        WriteAheadLog::ProtectedHistoryHead head;
+        std::error_code ec;
+        const auto exists = std::filesystem::exists(journal_path_, ec);
+        if (ec || (exists && !journal_.CaptureProtectedHistoryHead(head)))
+            return fail("ProtectedAcceptanceCapacityEvidenceUnavailable");
+        // The initial protected anchor is smaller than this reserve. Existing
+        // files use their authenticated exact byte/record counts instead.
+        std::uint64_t bytes = exists ? head.bytes : 512, count = exists ? head.records : 0;
+        const auto capacity = (std::min)({journal_max_bytes_, protection.read_limits.bytes,
+            protection.max_allocation_bytes / 4});
+        const auto account = [&](const WriteAheadLog::Record& record) {
+            const auto encoded = WriteAheadLog::EncodeForTest(record);
+            const auto extra = encoded.size() + journal::kJournalRecordHeaderBytes + crypto::kGcmTagBytes;
+            if (encoded.empty() || bytes > capacity || extra > capacity - bytes) return false;
+            bytes += extra; ++count;
+            return count <= protection.read_limits.records &&
+                count <= (protection.max_allocation_bytes - bytes * 4) / (2 * sizeof(WriteAheadLog::Record) + 4);
+        };
+        const auto identity = EffectiveVolumeIdentity(volume_identity_);
+        auto sequence = next_sequence_;
+        for (const auto& intent : mutations) {
+            if (intent.kind != MutationKind::Write || intent.inline_payload.empty() || intent.inline_payload.size() > 4096 ||
+                intent.length != intent.inline_payload.size() || intent.payload_length != intent.inline_payload.size() ||
+                intent.replace_if_exists || intent.unlink_outcome || !intent.secondary_path.empty() || intent.payload_spool_offset)
+                return fail("ProtectedAcceptanceCapacityAdmissionInvalid");
+            WriteAheadLog::Record record;
+            record.volume_identity = identity; record.transaction_id = next_transaction_id_; record.sequence = sequence++;
+            record.operation = WriteAheadLog::OperationKind::Write; record.state = WriteAheadLog::RecordState::Prepared;
+            record.object_id = intent.object_id; record.parent_object_id = intent.generation;
+            record.logical_offset = intent.offset; record.logical_length = intent.length;
+            record.payload_length = intent.payload_length; record.payload_sha256 = intent.payload_checksum;
+            record.inline_payload = intent.inline_payload; record.path_utf8 = WideToUtf8(intent.path);
+            if (!account(record)) return fail("ProtectedAcceptanceCapacityExceeded");
+        }
+        for (unsigned index = 0; index < 7; ++index) {
+            WriteAheadLog::Record marker;
+            marker.volume_identity = identity; marker.transaction_id = next_transaction_id_; marker.sequence = sequence++;
+            marker.operation = WriteAheadLog::OperationKind::TransactionMarker; marker.state = WriteAheadLog::RecordState::Accepted;
+            marker.flags = kWalFlagAccepted; marker.logical_length = mutations.size(); marker.path_utf8 = WideToUtf8(safety_level_);
+            if (!account(marker)) return fail("ProtectedAcceptanceCapacityExceeded");
+        }
+        return true;
+    } catch (...) { return fail("ProtectedAcceptanceCapacityEvidenceUnavailable"); }
+}
+
+bool TransactionManager::ProtectedMutationCapacityAvailable(const MutationIntent& intent, std::string& error)
+{
+    std::lock_guard append_lock(deferred_wal_append_mutex_);
+    error.clear();
+    const auto fail = [&](const char* reason) { error = reason; return false; };
+    const auto valid_path = [](const std::wstring& p) {
+        return !p.empty() && p.size() <= 65536 && p.find(L'\0') == std::wstring::npos;
+    };
+    if (!ProtectedSpoolOwnerValid() || !next_sequence_ || next_sequence_ > UINT64_MAX - 9 ||
+        !next_transaction_id_ || next_transaction_id_ == UINT64_MAX || !intent.object_id ||
+        !valid_path(intent.path) || intent.secondary_path.size() > 65536 || intent.timestamp_utc ||
+        (intent.unlink_outcome && intent.unlink_outcome->path_utf8.size() > 65536) ||
+        (intent.wal_sequence && intent.wal_sequence != next_sequence_))
+        return fail("ProtectedMutationCapacityAdmissionInvalid");
+    const bool data = intent.kind == MutationKind::Write || intent.kind == MutationKind::CreateFile;
+    const bool inode_metadata = intent.kind == MutationKind::SetInodeMetadata;
+    const bool hard_link = intent.kind == MutationKind::HardLink;
+    const bool attribute = intent.kind == MutationKind::SetExtendedAttribute ||
+        intent.kind == MutationKind::RemoveExtendedAttribute;
+    const bool zero_hash = std::all_of(intent.payload_checksum.begin(), intent.payload_checksum.end(), [](auto b) { return b == 0; });
+    if (inode_metadata) {
+        if ((intent.inline_payload.size() != InodeMetadataPatch::EncodedSize &&
+                intent.inline_payload.size() != InodeMetadataPatch::BsdEncodedSize) ||
+            intent.length != intent.inline_payload.size() || intent.payload_length != intent.inline_payload.size() ||
+            intent.offset || intent.payload_spool_offset || !intent.secondary_path.empty() ||
+            intent.replace_if_exists || intent.unlink_outcome)
+            return fail("ProtectedMutationCapacityAdmissionInvalid");
+    } else if (hard_link) {
+        if (!intent.generation || intent.offset || intent.payload_spool_offset || intent.wal_sequence ||
+            intent.replace_if_exists || intent.unlink_outcome || !valid_path(intent.secondary_path) ||
+            intent.inline_payload.empty() || intent.inline_payload.size() > MaxNativeHardLinkProofBytes ||
+            intent.length != intent.inline_payload.size() || intent.payload_length != intent.inline_payload.size())
+            return fail("ProtectedMutationCapacityAdmissionInvalid");
+    } else if (attribute) {
+        const bool set = intent.kind == MutationKind::SetExtendedAttribute;
+        if (!intent.generation || intent.offset || intent.length || intent.payload_spool_offset ||
+            intent.wal_sequence || intent.replace_if_exists || intent.unlink_outcome ||
+            intent.payload_length != intent.inline_payload.size() ||
+            intent.inline_payload.size() > WriteAheadLog::MaxExtendedAttributePayloadBytes ||
+            (!set && (intent.payload_length || !zero_hash)))
+            return fail("ProtectedMutationCapacityAdmissionInvalid");
+    } else if (data) {
+        const auto limit = intent.kind == MutationKind::CreateFile ? 4096ull : 256ull * 1024;
+        if (intent.length != intent.payload_length || intent.payload_length > limit ||
+            intent.inline_payload.size() > limit || intent.offset > UINT64_MAX - intent.length ||
+            !intent.secondary_path.empty() || intent.replace_if_exists || intent.unlink_outcome ||
+            (!intent.payload_length && (intent.payload_spool_offset || !intent.inline_payload.empty())) ||
+            (intent.payload_length && intent.inline_payload.empty() &&
+                (!intent.generation || intent.wal_sequence != next_sequence_ || zero_hash ||
+                    intent.payload_spool_offset > UINT64_MAX - intent.payload_length - 80)) ||
+            (!intent.inline_payload.empty() && intent.payload_spool_offset))
+            return fail("ProtectedMutationCapacityAdmissionInvalid");
+    } else {
+        if (intent.payload_length || intent.payload_spool_offset || !intent.inline_payload.empty() || !zero_hash)
+            return fail("ProtectedMutationCapacityAdmissionInvalid");
+        switch (intent.kind) {
+        case MutationKind::CreateDirectory:
+            if (!intent.generation || intent.length || !intent.secondary_path.empty() || intent.replace_if_exists || intent.unlink_outcome)
+                return fail("ProtectedMutationCapacityAdmissionInvalid");
+            break;
+        case MutationKind::SetFileSize:
+            if (intent.offset || !intent.secondary_path.empty() || intent.replace_if_exists || intent.unlink_outcome)
+                return fail("ProtectedMutationCapacityAdmissionInvalid");
+            break;
+        case MutationKind::Rename:
+            if (!valid_path(intent.secondary_path) || !intent.generation || !intent.offset || intent.length || intent.unlink_outcome)
+                return fail("ProtectedMutationCapacityAdmissionInvalid");
+            break;
+        case MutationKind::Delete:
+            if (!intent.secondary_path.empty() || intent.offset || intent.length || intent.replace_if_exists)
+                return fail("ProtectedMutationCapacityAdmissionInvalid");
+            break;
+        default: return fail("ProtectedMutationCapacityAdmissionInvalid");
+        }
+    }
+    try {
+        const auto& protection = *journal_protection_;
+        WriteAheadLog::ProtectedHistoryHead head;
+        std::error_code ec;
+        const auto exists = std::filesystem::exists(journal_path_, ec);
+        if (ec) return fail("ProtectedMutationCapacityEvidenceUnavailable");
+        if (exists) {
+            if (!journal_.CaptureProtectedHistoryHead(head) || head.last_sequence != next_sequence_ - 1)
+                return fail("ProtectedMutationCapacityEvidenceUnavailable");
+        } else {
+            auto read = journal_.ReadAllWithExclusiveWriterLease(protection.read_limits);
+            OriginalHistoryCleanup cleanup{read.records};
+            if (read.status != WriteAheadLog::ReadStatus::Ok || read.recovered_torn_tail ||
+                !read.records.empty() || next_sequence_ != 1)
+                return fail("ProtectedMutationCapacityEvidenceUnavailable");
+        }
+        std::uint64_t bytes = exists ? head.bytes : 512, count = exists ? head.records : 0;
+        const auto capacity = (std::min)({journal_max_bytes_, protection.read_limits.bytes,
+            protection.max_allocation_bytes / 4});
+        const auto account = [&](const WriteAheadLog::Record& record) {
+            auto encoded = WriteAheadLog::EncodeForTest(record);
+            const auto size = encoded.size();
+            if (size) SecureZeroMemory(encoded.data(), size);
+            const auto extra = size + journal::kJournalRecordHeaderBytes + crypto::kGcmTagBytes;
+            if (!size || size > journal::kMaxJournalPlaintextBytes || bytes > capacity || extra > capacity - bytes) return false;
+            bytes += extra; ++count;
+            return count <= protection.read_limits.records &&
+                count <= (protection.max_allocation_bytes - bytes * 4) / (2 * sizeof(WriteAheadLog::Record) + 4);
+        };
+        std::vector<WriteAheadLog::Record> projected(1); OriginalHistoryCleanup cleanup{projected};
+        auto& record = projected.front();
+        record.volume_identity = EffectiveVolumeIdentity(volume_identity_);
+        record.transaction_id = next_transaction_id_; record.sequence = next_sequence_;
+        record.operation = ToWalOperation(intent.kind); record.state = WriteAheadLog::RecordState::Prepared;
+        record.object_id = intent.object_id; record.parent_object_id = intent.generation;
+        record.payload_spool_id = !inode_metadata && !attribute && !hard_link && intent.payload_length ? next_sequence_ : 0;
+        record.payload_offset = intent.payload_spool_offset; record.payload_length = intent.payload_length;
+        record.logical_offset = intent.offset; record.logical_length = inode_metadata || attribute ? 0 : intent.length;
+        record.flags = intent.replace_if_exists ? kWalFlagReplaceIfExists : 0;
+        record.path_utf8 = WideToUtf8(intent.path); record.secondary_path_utf8 = WideToUtf8(intent.secondary_path);
+        record.payload_sha256 = intent.payload_checksum; record.inline_payload = intent.inline_payload;
+        record.unlink_outcome = intent.unlink_outcome;
+        if (record.path_utf8.size() > 65536 || record.secondary_path_utf8.size() > 65536 ||
+            !WriteAheadLog::InlinePayloadIsConsistent(record) || !WriteAheadLog::UnlinkOutcomeIsConsistent(record) ||
+            (hard_link && !WriteAheadLog::NativeHardLinkIsConsistent(record)) ||
+            (inode_metadata && !WriteAheadLog::InodeMetadataMutationIsConsistent(record)) ||
+            (attribute && !WriteAheadLog::ExtendedAttributeMutationIsConsistent(record)))
+            return fail("ProtectedMutationCapacityAdmissionInvalid");
+        if (!account(record)) return fail("ProtectedMutationCapacityExceeded");
+        cleanup.Clear(); projected.resize(1);
+        auto& marker = projected.front();
+        marker.volume_identity = EffectiveVolumeIdentity(volume_identity_); marker.transaction_id = next_transaction_id_;
+        marker.operation = WriteAheadLog::OperationKind::TransactionMarker; marker.state = WriteAheadLog::RecordState::Accepted;
+        marker.flags = kWalFlagAccepted; marker.logical_length = 1; marker.path_utf8 = WideToUtf8(safety_level_);
+        for (unsigned n = 0; n < 7; ++n) {
+            marker.sequence = next_sequence_ + n + 1;
+            if (!account(marker)) return fail("ProtectedMutationCapacityExceeded");
+        }
+        return ProtectedSpoolOwnerValid() || fail("ProtectedMutationCapacityEvidenceUnavailable");
+    } catch (...) { return fail("ProtectedMutationCapacityEvidenceUnavailable"); }
 }
 
 void TransactionManager::SetVolumeIdentity(std::wstring volume_identity)
 {
+    if (journal_protection_)
+    {
+        if (volume_identity != volume_identity_)
+        {
+            recovery_state_valid_ = false;
+            InvalidateFinalizationCoverage(true);
+        }
+        return;
+    }
     volume_identity_ = std::move(volume_identity);
     {
         std::lock_guard<std::mutex> lock(deferred_wal_state_mutex_);
@@ -732,14 +1566,99 @@ void TransactionManager::SetVolumeIdentity(std::wstring volume_identity)
     }
 }
 
+bool TransactionManager::OpenProtectedJournal(std::wstring path, std::wstring identity,
+    WriteAheadLog::ProtectedPersistence protection, std::string& error)
+{
+    return OpenProtectedJournalImpl(std::move(path), std::move(identity), std::move(protection), false, error);
+}
+
+bool TransactionManager::OpenProtectedStartupJournal(std::wstring path, std::wstring identity,
+    WriteAheadLog::ProtectedPersistence protection, std::string& error)
+{
+    return OpenProtectedJournalImpl(std::move(path), std::move(identity), std::move(protection), true, error);
+}
+
+bool TransactionManager::OpenProtectedJournalImpl(std::wstring path, std::wstring identity,
+    WriteAheadLog::ProtectedPersistence protection, bool preserve_evidence, std::string& error)
+{
+    error.clear();
+    if (state_ != State::Idle || journal_protection_ || !journal_path_.empty() ||
+        !volume_identity_.empty() || current_transaction_id_ || next_transaction_id_ != 1 ||
+        next_sequence_ != 1 || !recovery_state_valid_ ||
+        path.empty() || identity.empty() || !std::filesystem::path(path).is_absolute())
+    {
+        error = "ProtectedJournalFreshOwnerRequired";
+        return false;
+    }
+    journal_protection_ = std::move(protection);
+    journal_path_ = std::move(path);
+    volume_identity_ = std::move(identity);
+    preserve_startup_evidence_ = preserve_evidence;
+    ConfigureJournal();
+    if (!SeedIdsFromExistingJournal(true))
+    {
+        error = "ProtectedJournalEvidenceInvalid";
+        return false;
+    }
+    return true;
+}
+
+bool TransactionManager::EnrollCanonicalJournalIdentity(std::wstring canonical_identity)
+{
+    if (canonical_identity.empty())
+    {
+        return false;
+    }
+    if (!canonical_journal_identity_.empty())
+    {
+        return canonical_journal_identity_ == canonical_identity;
+    }
+    canonical_journal_identity_ = std::move(canonical_identity);
+    return true;
+}
+
+bool TransactionManager::AcquireJournalOwnership(std::string& error)
+{
+    if (journal_.HasExclusiveWriterLease())
+    {
+        return true;
+    }
+    if (journal_path_.empty())
+    {
+        error = "SnapshotJournalPathMissing";
+        return false;
+    }
+    if (!journal_.AcquireWriterLeaseOnly())
+    {
+        error = "SnapshotJournalOwnerActive";
+        return false;
+    }
+    return true;
+}
+
 void TransactionManager::SetJournalMaxBytesForTest(std::uint64_t max_bytes)
 {
+    if (journal_protection_)
+    {
+        if (max_bytes != journal_max_bytes_)
+        {
+            recovery_state_valid_ = false;
+            InvalidateFinalizationCoverage(true);
+        }
+        return;
+    }
     journal_max_bytes_ = max_bytes;
 }
 
 void TransactionManager::SetJournalFaultInjectionHook(WriteAheadLog::FaultInjectionHook hook)
 {
     journal_.SetFaultInjectionHook(std::move(hook));
+}
+
+void TransactionManager::InvalidateJournalReadCacheForTest() noexcept
+{
+    // Exercise a real history read without changing the held journal or its owner.
+    InvalidateFinalizationCoverage(false);
 }
 
 std::uint64_t TransactionManager::CurrentTransactionId() const noexcept
@@ -862,6 +1781,24 @@ bool TransactionManager::CanClearRecoveryState() const
            watermarks_.apfs_durable_sequence <= watermarks_.cleanup_sequence;
 }
 
+std::uint64_t TransactionManager::ValidatedCleanJournalGeneration() const
+{
+    if (journal_path_.empty() || !recovery_state_valid_ || state_ != State::Idle ||
+        !pending_mutations_.empty() || !accepted_boundaries_.empty() ||
+        watermarks_.accepted_sequence != watermarks_.apfs_durable_sequence ||
+        watermarks_.apfs_durable_sequence != watermarks_.cleanup_sequence ||
+        last_committed_sequence_ > watermarks_.cleanup_sequence ||
+        highest_checkpointed_marker_sequence_ > watermarks_.cleanup_sequence ||
+        finalization_coverage_trust_ != FinalizationCoverageTrust::Trusted ||
+        journal_state_writer_generation_ == 0 ||
+        finalization_coverage_writer_generation_ != journal_state_writer_generation_)
+    {
+        return 0;
+    }
+    const auto generation = journal_.ValidatedAppendLeaseGeneration();
+    return generation == journal_state_writer_generation_ ? generation : 0;
+}
+
 bool TransactionManager::LoadUnappliedAcceptedTransactions(
     std::vector<AcceptedTransaction>& transactions,
     std::string* failure_reason)
@@ -888,6 +1825,43 @@ bool TransactionManager::LoadRequiredCheckpointXidsSinceCleanup(
     std::string* failure_reason)
 {
     checkpoint_xids.clear();
+    if (failure_reason) failure_reason->clear();
+    if (checkpoint_pin_census_trusted_ && recovery_state_valid_ &&
+        (state_ == State::Idle || state_ == State::Active) &&
+        watermarks_.cleanup_sequence <= watermarks_.apfs_durable_sequence &&
+        watermarks_.apfs_durable_sequence <= watermarks_.accepted_sequence &&
+        highest_checkpointed_marker_sequence_ <= watermarks_.cleanup_sequence &&
+        finalization_coverage_trust_ == FinalizationCoverageTrust::Trusted &&
+        accepted_checkpoint_pins_.size() == accepted_boundaries_.size())
+    {
+        const auto generation = journal_.ValidatedAppendLeaseGeneration();
+        if (generation != 0 && generation == journal_state_writer_generation_ &&
+            generation == finalization_coverage_writer_generation_ &&
+            generation == checkpoint_pin_census_writer_generation_)
+        {
+            checkpoint_xids.reserve(cached_checkpoint_pin_entries_);
+            for (const auto& [sequence, pins] : accepted_checkpoint_pins_)
+                checkpoint_xids.insert(checkpoint_xids.end(), pins.begin(), pins.end());
+            std::sort(checkpoint_xids.begin(), checkpoint_xids.end());
+            checkpoint_xids.erase(std::unique(checkpoint_xids.begin(), checkpoint_xids.end()), checkpoint_xids.end());
+            return true;
+        }
+    }
+    InvalidateCheckpointPinCensus();
+    if (recovery_state_valid_ && (state_ == State::Idle || state_ == State::Active) &&
+        watermarks_.accepted_sequence == watermarks_.apfs_durable_sequence &&
+        watermarks_.apfs_durable_sequence == watermarks_.cleanup_sequence &&
+        last_committed_sequence_ <= watermarks_.cleanup_sequence &&
+        highest_checkpointed_marker_sequence_ <= watermarks_.cleanup_sequence &&
+        finalization_coverage_trust_ == FinalizationCoverageTrust::Trusted &&
+        JournalStateMatchesWriterLease())
+    {
+        // The owner validated this history and durably cleaned every accepted boundary.
+        // Retain that proof only while the same exclusive, unchanged file is still held.
+        const auto generation = journal_.ValidatedAppendLeaseGeneration();
+        if (generation != 0 && generation == journal_state_writer_generation_ &&
+            generation == finalization_coverage_writer_generation_) return true;
+    }
     std::vector<AcceptedTransaction> transactions;
     if (!LoadAcceptedTransactionsSinceCleanup(transactions, failure_reason))
     {
@@ -907,6 +1881,10 @@ bool TransactionManager::LoadRequiredCheckpointXidsSinceCleanup(
             return false;
         }
         checkpoint_xids.push_back(transaction.preimage_checkpoint_xid);
+        for(const auto& record:transaction.mutations)if(record.operation==WriteAheadLog::OperationKind::CreateSnapshot||record.operation==WriteAheadLog::OperationKind::DeleteSnapshot){
+            NativeSnapshotIntent intent;if(!DecodeNativeSnapshotIntent(record.inline_payload,intent)){checkpoint_xids.clear();if(failure_reason)*failure_reason="Snapshot WAL pin payload invalid";return false;}
+            checkpoint_xids.insert(checkpoint_xids.end(),intent.pins.begin(),intent.pins.end());
+        }
     }
 
     std::sort(checkpoint_xids.begin(), checkpoint_xids.end());
@@ -964,7 +1942,9 @@ bool TransactionManager::LoadAcceptedTransactionsAfter(
         return fail("Active transaction lost exclusive WAL ownership");
     }
 
-    const auto existing = journal_.ReadAllWithExclusiveWriterLease(limits);
+    const auto existing = preserve_startup_evidence_
+        ? journal_.ReadStartupEvidence(limits, 256ull << 20)
+        : journal_.ReadAllWithExclusiveWriterLease(limits);
     if (existing.status == WriteAheadLog::ReadStatus::ResourceLimit)
         return fail("WAL read resource budget exceeded");
     if (existing.status != WriteAheadLog::ReadStatus::Ok)
@@ -995,6 +1975,15 @@ bool TransactionManager::LoadAcceptedTransactionsAfter(
         return fail("Active transaction changed WAL ownership during validation");
     }
 
+    return CollectAcceptedTransactions(existing.records, include_checkpointed_transactions, transactions, failure_reason);
+}
+
+bool TransactionManager::CollectAcceptedTransactions(const std::vector<WriteAheadLog::Record>& records,
+    bool include_checkpointed_transactions, std::vector<AcceptedTransaction>& transactions, std::string* failure_reason)
+{
+    transactions.clear();
+    if(failure_reason) failure_reason->clear();
+    const auto fail=[&](const char* reason){transactions.clear();if(failure_reason)*failure_reason=reason;return false;};
     const auto lower_sequence_exclusive = include_checkpointed_transactions
         ? watermarks_.cleanup_sequence
         : watermarks_.apfs_durable_sequence;
@@ -1002,7 +1991,7 @@ bool TransactionManager::LoadAcceptedTransactionsAfter(
     std::unordered_map<std::uint64_t, std::vector<WriteAheadLog::Record>> prepared_by_transaction;
     std::unordered_set<std::uint64_t> terminal_transactions;
     std::uint64_t previous_sequence = 0;
-    for (const auto& record : existing.records)
+    for (const auto& record : records)
     {
         if (record.operation == WriteAheadLog::OperationKind::CompactionIndex)
         {
@@ -1080,6 +2069,26 @@ bool TransactionManager::LoadAcceptedTransactionsAfter(
     return true;
 }
 
+#include "TransactionManagerRetainedHistory.inc"
+#include "TransactionManagerFusionContinuation.inc"
+
+bool TransactionManager::InspectAcceptedTransactionsReadOnly(const std::filesystem::path& path,
+    const std::string& identity, std::vector<AcceptedTransaction>& transactions,
+    DurabilityWatermarks& watermarks, std::string& error)
+{
+    transactions.clear();watermarks={};error.clear();
+    const auto existing=WriteAheadLog::ReadAll(path,identity);
+    if(existing.status!=WriteAheadLog::ReadStatus::Ok || existing.recovered_torn_tail) {
+        error="VolumeManagementWalReadOnlyInspectionFailed";return false;
+    }
+    TransactionManager inspector(L"Strict");
+    if(!inspector.SeedIdsFromJournalRecords(existing.records,0) ||
+        !inspector.CollectAcceptedTransactions(existing.records,true,transactions,&error)) {
+        error="VolumeManagementWalSemanticsInvalid:"+error;return false;
+    }
+    watermarks=inspector.Watermarks();return true;
+}
+
 std::size_t TransactionManager::PendingMutationCount() const noexcept
 {
     return pending_mutations_.size();
@@ -1139,7 +2148,7 @@ std::uint64_t TransactionManager::FinalizationCoverageWalScanMicroseconds() cons
 
 bool TransactionManager::FlushPreparedRecords()
 {
-    if(std::any_of(pending_mutations_.begin(),pending_mutations_.end(),[](const auto& m){return m.kind==MutationKind::CloneFile;}))return false;
+    if(std::any_of(pending_mutations_.begin(),pending_mutations_.end(),[](const auto& m){return m.kind==MutationKind::CloneFile || m.kind==MutationKind::HardLink || m.kind==MutationKind::NativeSparse || m.kind==MutationKind::CloneRange || m.kind==MutationKind::RenameVolume || m.kind==MutationKind::SetVolumeQuotaReserve || m.kind==MutationKind::CreateSnapshot || m.kind==MutationKind::DeleteSnapshot || m.kind==MutationKind::RepairVolumeFileCount;}))return false;
     if (!recovery_state_valid_)
     {
         return false;
@@ -1267,6 +2276,7 @@ bool TransactionManager::FlushPreparedRecords()
         InvalidateFinalizationCoverage(false);
     }
     ObserveDurableJournalAppend(ElapsedMicroseconds(append_started));
+    AdvanceCheckpointPinCensusGeneration(coverage_generation_before_append, coverage_generation_after_append, compacted_for_retry);
     ClearBufferedPreparedRecords();
     return true;
 }
@@ -1402,6 +2412,58 @@ bool TransactionManager::PersistTransactionBatchLocked(
         if(journal_path_.empty() || pending_mutations_.size()!=1 || it==buffered_prepared_records_.end() ||
             !DecodeNativeClone(it->inline_payload,p) || p.checkpoint!=preimage_checkpoint_xid) return false;
     }
+    for (const auto& mutation : pending_mutations_) if (mutation.kind == MutationKind::HardLink && outcome && wcscmp(outcome, L"aborted") != 0) {
+        NativeHardLinkProof proof;
+        const auto it = std::find_if(buffered_prepared_records_.begin(), buffered_prepared_records_.end(),
+            [](const auto& record) { return record.operation == WriteAheadLog::OperationKind::HardLink; });
+        if (journal_path_.empty() || pending_mutations_.size() != 1 || it == buffered_prepared_records_.end() ||
+            !WriteAheadLog::NativeHardLinkIsConsistent(*it) || !DecodeNativeHardLink(it->inline_payload, proof) ||
+            proof.checkpoint != preimage_checkpoint_xid) return false;
+    }
+    for (const auto& mutation : pending_mutations_) if (mutation.kind == MutationKind::CloneRange && outcome && wcscmp(outcome, L"aborted") != 0) {
+        NativeCloneRangeProof proof;
+        const auto it = std::find_if(buffered_prepared_records_.begin(), buffered_prepared_records_.end(),
+            [](const auto& record) { return record.operation == WriteAheadLog::OperationKind::CloneRange; });
+        if (journal_path_.empty() || pending_mutations_.size() != 1 || it == buffered_prepared_records_.end() ||
+            !WriteAheadLog::NativeCloneRangeIsConsistent(*it) || !DecodeNativeCloneRange(it->inline_payload, proof) ||
+            proof.checkpoint != preimage_checkpoint_xid) return false;
+    }
+    for (const auto& mutation : pending_mutations_) if (mutation.kind == MutationKind::NativeSparse && outcome && wcscmp(outcome, L"aborted") != 0) {
+        std::uint64_t checkpoint=0;
+        const auto it = std::find_if(buffered_prepared_records_.begin(), buffered_prepared_records_.end(),
+            [](const auto& record) { return record.operation == WriteAheadLog::OperationKind::NativeSparse; });
+        if (journal_path_.empty() || pending_mutations_.size() != 1 || it == buffered_prepared_records_.end() ||
+            !WriteAheadLog::NativeSparseIsConsistent(*it) || !DecodeNativeSparseOriginalCheckpoint(it->inline_payload, checkpoint) ||
+            checkpoint != preimage_checkpoint_xid) return false;
+    }
+    for (const auto& mutation : pending_mutations_) if (mutation.kind == MutationKind::SetVolumeQuotaReserve && outcome && wcscmp(outcome, L"aborted") != 0) {
+        NativeVolumeQuotaReserve rename;
+        const auto it = std::find_if(buffered_prepared_records_.begin(), buffered_prepared_records_.end(),
+            [](const auto& r) { return r.operation == WriteAheadLog::OperationKind::SetVolumeQuotaReserve; });
+        if (journal_path_.empty() || pending_mutations_.size() != 1 || it == buffered_prepared_records_.end() ||
+            !DecodeNativeVolumeQuotaReserve(it->inline_payload, rename) || rename.checkpoint != preimage_checkpoint_xid) return false;
+    }
+    for (const auto& mutation : pending_mutations_) if ((mutation.kind == MutationKind::CreateSnapshot || mutation.kind == MutationKind::DeleteSnapshot) && outcome && wcscmp(outcome,L"aborted") != 0) {
+        NativeSnapshotIntent intent;
+        const auto it = std::find_if(buffered_prepared_records_.begin(),buffered_prepared_records_.end(),
+            [](const auto& r){return r.operation == WriteAheadLog::OperationKind::CreateSnapshot || r.operation == WriteAheadLog::OperationKind::DeleteSnapshot;});
+        if (journal_path_.empty() || pending_mutations_.size()!=1 || it==buffered_prepared_records_.end() ||
+            !DecodeNativeSnapshotIntent(it->inline_payload,intent) || intent.scope.checkpoint_xid != preimage_checkpoint_xid) return false;
+    }
+    for (const auto& mutation : pending_mutations_) if (mutation.kind == MutationKind::RepairVolumeFileCount && outcome && wcscmp(outcome, L"aborted") != 0) {
+        NativeCountRepair repair;
+        const auto it = std::find_if(buffered_prepared_records_.begin(), buffered_prepared_records_.end(),
+            [](const auto& r) { return r.operation == WriteAheadLog::OperationKind::RepairVolumeFileCount; });
+        if (journal_path_.empty() || pending_mutations_.size() != 1 || it == buffered_prepared_records_.end() ||
+            !DecodeNativeCountRepair(it->inline_payload, repair) || repair.checkpoint != preimage_checkpoint_xid) return false;
+    }
+    for (const auto& mutation : pending_mutations_) if (mutation.kind == MutationKind::RenameVolume && outcome && wcscmp(outcome, L"aborted") != 0) {
+        NativeVolumeRename rename;
+        const auto it = std::find_if(buffered_prepared_records_.begin(), buffered_prepared_records_.end(),
+            [](const auto& r) { return r.operation == WriteAheadLog::OperationKind::RenameVolume; });
+        if (journal_path_.empty() || pending_mutations_.size() != 1 || it == buffered_prepared_records_.end() ||
+            !DecodeNativeVolumeRename(it->inline_payload, rename) || rename.checkpoint != preimage_checkpoint_xid) return false;
+    }
     if (journal_path_.empty())
     {
         ClearBufferedPreparedRecords();
@@ -1459,6 +2521,15 @@ bool TransactionManager::PersistTransactionBatchLocked(
         preimage_checkpoint_xid);
     marker.sequence = next_sequence_;
     records.push_back(marker);
+
+    std::vector<std::uint64_t> accepted_pins;
+    bool accepted_pins_valid = accepted_outcome && preimage_checkpoint_xid != 0;
+    if (accepted_pins_valid)
+    {
+        accepted_pins.push_back(preimage_checkpoint_xid);
+        for (const auto& record : records)
+            if (!AppendSnapshotCheckpointPins(record, accepted_pins)) { accepted_pins_valid = false; break; }
+    }
 
     const auto coverage_generation_before_append = journal_state_writer_generation_;
     const bool coverage_trusted_before_append =
@@ -1552,14 +2623,20 @@ bool TransactionManager::PersistTransactionBatchLocked(
         ObserveDurableJournalAppend(ElapsedMicroseconds(append_started));
     }
     ++next_sequence_;
+    AdvanceCheckpointPinCensusGeneration(coverage_generation_before_append, coverage_generation_after_append, compacted_for_retry);
     if (outcome && wcscmp(outcome, L"committed") == 0)
     {
+        InvalidateCheckpointPinCensus();
         last_committed_sequence_ = marker.sequence;
+        highest_checkpointed_marker_sequence_ = (std::max)(
+            highest_checkpointed_marker_sequence_, marker.sequence);
     }
     else if (accepted_outcome)
     {
         watermarks_.accepted_sequence = marker.sequence;
         accepted_boundaries_.insert(marker.sequence);
+        if (accepted_pins_valid) CacheAcceptedCheckpointPins(marker.sequence, std::move(accepted_pins));
+        else InvalidateCheckpointPinCensus();
         if (coverage_remains_trusted &&
             accepted_requires_payload_spool_flush)
         {
@@ -1710,6 +2787,7 @@ bool TransactionManager::AppendWalRecordWithCleanup(
         InvalidateFinalizationCoverage(false);
     }
     ++next_sequence_;
+    AdvanceCheckpointPinCensusGeneration(generation_before_append, generation_after_append, compacted_for_retry);
     if (durable_flush)
     {
         ObserveDurableJournalAppend(ElapsedMicroseconds(append_started));
@@ -1731,6 +2809,7 @@ void TransactionManager::ConfigureJournal()
         std::filesystem::path(journal_path_),
         EffectiveVolumeIdentity(volume_identity_),
         journal_max_bytes_,
+        journal_protection_,
     });
 }
 
@@ -1766,6 +2845,12 @@ bool TransactionManager::IsAcceptedBoundary(std::uint64_t sequence) const noexce
 
 std::uint64_t TransactionManager::SafeCompactionFloor(std::uint64_t preferred_floor) const noexcept
 {
+    // Direct Commit can precede watermark reseeding. Keep its whole mutation
+    // group until cleanup proves the committed boundary is no longer needed.
+    if (highest_checkpointed_marker_sequence_ > watermarks_.cleanup_sequence)
+    {
+        return 1;
+    }
     if (watermarks_.accepted_sequence <= watermarks_.cleanup_sequence)
     {
         return preferred_floor;
@@ -1788,8 +2873,10 @@ bool TransactionManager::AppendPreparedMutationLocked(MutationIntent& mutation)
     const bool extended_attribute_mutation =
         mutation.kind == MutationKind::SetExtendedAttribute ||
         mutation.kind == MutationKind::RemoveExtendedAttribute;
+    const bool hard_link_mutation = mutation.kind == MutationKind::HardLink || mutation.kind == MutationKind::NativeSparse || mutation.kind == MutationKind::CloneRange;
     const bool inode_metadata_mutation = mutation.kind == MutationKind::SetInodeMetadata ||
-        mutation.kind == MutationKind::RewriteCompressedContent || mutation.kind == MutationKind::CloneFile;
+        mutation.kind == MutationKind::RewriteCompressedContent || mutation.kind == MutationKind::CloneFile ||
+        mutation.kind == MutationKind::RenameVolume || mutation.kind == MutationKind::SetVolumeQuotaReserve || mutation.kind == MutationKind::CreateSnapshot || mutation.kind == MutationKind::DeleteSnapshot || mutation.kind == MutationKind::RepairVolumeFileCount;
     const bool allocation_size_mutation = mutation.kind == MutationKind::SetAllocationSize;
     const bool directory_restore_mutation = mutation.kind == MutationKind::RestoreDirectoryFromSymbolicLink;
     if (directory_restore_mutation && !mutation.secondary_path.empty())
@@ -1806,9 +2893,13 @@ bool TransactionManager::AppendPreparedMutationLocked(MutationIntent& mutation)
     {
         return false;
     }
-    if (extended_attribute_mutation || inode_metadata_mutation || allocation_size_mutation || directory_restore_mutation)
+    if (hard_link_mutation && (mutation.length != mutation.inline_payload.size() ||
+        mutation.payload_length != mutation.inline_payload.size() || mutation.timestamp_utc || mutation.offset ||
+        mutation.payload_spool_offset || mutation.replace_if_exists || mutation.unlink_outcome)) return false;
+    if (extended_attribute_mutation || inode_metadata_mutation || hard_link_mutation || allocation_size_mutation || directory_restore_mutation)
     {
         WriteAheadLog::Record validation_record{};
+        validation_record.volume_identity = EffectiveVolumeIdentity(volume_identity_);
         validation_record.operation = ToWalOperation(mutation.kind);
         validation_record.object_id = mutation.object_id;
         validation_record.parent_object_id = mutation.generation;
@@ -1822,7 +2913,7 @@ bool TransactionManager::AppendPreparedMutationLocked(MutationIntent& mutation)
         validation_record.path_utf8 = WideToUtf8(mutation.path);
         validation_record.secondary_path_utf8 = WideToUtf8(mutation.secondary_path);
         validation_record.unlink_outcome = mutation.unlink_outcome;
-        if (!WriteAheadLog::NativeCloneIsConsistent(validation_record) || !WriteAheadLog::CompressionRewriteIsConsistent(validation_record) ||
+        if (!WriteAheadLog::NativeCloneRangeIsConsistent(validation_record) || !WriteAheadLog::NativeSparseIsConsistent(validation_record) || !WriteAheadLog::NativeHardLinkIsConsistent(validation_record) || !WriteAheadLog::SnapshotIntentIsConsistent(validation_record) || !WriteAheadLog::CountRepairIsConsistent(validation_record) || !WriteAheadLog::VolumeQuotaReserveIsConsistent(validation_record) || !WriteAheadLog::VolumeRenameIsConsistent(validation_record) || !WriteAheadLog::NativeCloneIsConsistent(validation_record) || !WriteAheadLog::CompressionRewriteIsConsistent(validation_record) ||
             !WriteAheadLog::ExtendedAttributeMutationIsConsistent(validation_record) ||
             !WriteAheadLog::AllocationSizeMutationIsConsistent(validation_record) ||
             !WriteAheadLog::DirectoryRestoreMutationIsConsistent(validation_record) ||
@@ -1864,7 +2955,7 @@ bool TransactionManager::AppendPreparedMutationLocked(MutationIntent& mutation)
     record.state = WriteAheadLog::RecordState::Prepared;
     record.object_id = mutation.object_id;
     record.parent_object_id = mutation.generation;
-    record.payload_spool_id = extended_attribute_mutation || inode_metadata_mutation || mutation.payload_length == 0
+    record.payload_spool_id = extended_attribute_mutation || inode_metadata_mutation || hard_link_mutation || mutation.payload_length == 0
         ? 0
         : mutation.wal_sequence;
     record.payload_offset = mutation.payload_spool_offset;
@@ -1879,7 +2970,7 @@ bool TransactionManager::AppendPreparedMutationLocked(MutationIntent& mutation)
     record.payload_sha256 = mutation.payload_checksum;
     record.inline_payload = std::move(mutation.inline_payload);
     record.unlink_outcome = std::move(mutation.unlink_outcome);
-    if (!WriteAheadLog::NativeCloneIsConsistent(record) || !WriteAheadLog::CompressionRewriteIsConsistent(record) ||
+    if (!WriteAheadLog::NativeCloneRangeIsConsistent(record) || !WriteAheadLog::NativeSparseIsConsistent(record) || !WriteAheadLog::NativeHardLinkIsConsistent(record) || !WriteAheadLog::SnapshotIntentIsConsistent(record) || !WriteAheadLog::CountRepairIsConsistent(record) || !WriteAheadLog::VolumeQuotaReserveIsConsistent(record) || !WriteAheadLog::VolumeRenameIsConsistent(record) || !WriteAheadLog::NativeCloneIsConsistent(record) || !WriteAheadLog::CompressionRewriteIsConsistent(record) ||
         !WriteAheadLog::ExtendedAttributeMutationIsConsistent(record) ||
         !WriteAheadLog::AllocationSizeMutationIsConsistent(record) ||
         !WriteAheadLog::DirectoryRestoreMutationIsConsistent(record) ||
@@ -1906,8 +2997,22 @@ bool TransactionManager::AppendPreparedMutationLocked(MutationIntent& mutation)
         buffered_record.operation == WriteAheadLog::OperationKind::Write
             ? !buffered_record.inline_payload.empty() &&
                 WriteAheadLog::InlinePayloadIsConsistent(buffered_record)
+            : (buffered_record.operation == WriteAheadLog::OperationKind::CreateSnapshot || buffered_record.operation == WriteAheadLog::OperationKind::DeleteSnapshot)
+                ? WriteAheadLog::SnapshotIntentIsConsistent(buffered_record)
+            : buffered_record.operation == WriteAheadLog::OperationKind::RepairVolumeFileCount
+                ? WriteAheadLog::CountRepairIsConsistent(buffered_record)
+            : buffered_record.operation == WriteAheadLog::OperationKind::SetVolumeQuotaReserve
+                ? WriteAheadLog::VolumeQuotaReserveIsConsistent(buffered_record)
+            : buffered_record.operation == WriteAheadLog::OperationKind::RenameVolume
+                ? WriteAheadLog::VolumeRenameIsConsistent(buffered_record)
             : buffered_record.operation == WriteAheadLog::OperationKind::CloneFile
                 ? WriteAheadLog::NativeCloneIsConsistent(buffered_record)
+            : buffered_record.operation == WriteAheadLog::OperationKind::HardLink
+                ? WriteAheadLog::NativeHardLinkIsConsistent(buffered_record)
+            : buffered_record.operation == WriteAheadLog::OperationKind::NativeSparse
+                ? WriteAheadLog::NativeSparseIsConsistent(buffered_record)
+            : buffered_record.operation == WriteAheadLog::OperationKind::CloneRange
+                ? WriteAheadLog::NativeCloneRangeIsConsistent(buffered_record)
             : buffered_record.operation == WriteAheadLog::OperationKind::RewriteCompressedContent
                 ? WriteAheadLog::CompressionRewriteIsConsistent(buffered_record)
             : buffered_record.operation == WriteAheadLog::OperationKind::SetInodeMetadata
@@ -1943,9 +3048,9 @@ bool TransactionManager::SeedIdsFromExistingJournal(bool acquire_writer_lease)
         return true;
     }
 
-    const auto existing = acquire_writer_lease
-        ? journal_.ReadAllWithExclusiveWriterLease()
-        : journal_.ReadAll();
+    const auto existing = preserve_startup_evidence_
+        ? journal_.ReadStartupEvidence({64ull << 20, 1000000}, 256ull << 20)
+        : acquire_writer_lease ? journal_.ReadAllWithExclusiveWriterLease() : journal_.ReadAll();
     if (existing.status != WriteAheadLog::ReadStatus::Ok ||
         !ValidateWalSemantics(existing.records))
     {
@@ -1976,13 +3081,34 @@ bool TransactionManager::SeedIdsFromJournalRecords(
         return false;
     }
 
+    if (continuation_seed_)
+    {
+        const auto& seed = *continuation_seed_;
+        if (!journal_protection_ || !seed.last_sequence || seed.last_sequence == UINT64_MAX ||
+            !seed.next_transaction_id || seed.next_transaction_id == UINT64_MAX ||
+            !seed.watermarks.accepted_sequence || seed.watermarks.accepted_sequence > seed.last_sequence ||
+            seed.watermarks.accepted_sequence != seed.watermarks.apfs_durable_sequence ||
+            seed.watermarks.accepted_sequence != seed.watermarks.cleanup_sequence ||
+            std::any_of(records.begin(), records.end(), [&](const auto& record) {
+                return record.sequence <= seed.last_sequence ||
+                    (record.transaction_id && record.transaction_id < seed.next_transaction_id) ||
+                    record.operation == WriteAheadLog::OperationKind::CompactionIndex;
+            }))
+        {
+            recovery_state_valid_ = false; journal_state_writer_generation_ = 0;
+            InvalidateFinalizationCoverage(true); return false;
+        }
+    }
+
     std::unordered_set<std::uint64_t> recovered_boundaries;
     std::unordered_map<std::uint64_t, std::uint64_t> recovered_transaction_sequences;
     std::unordered_map<std::uint64_t, bool> transaction_requires_spool_flush;
     std::vector<std::pair<std::uint64_t, bool>> accepted_recovery_requirements;
-    std::uint64_t max_transaction_id = 0;
-    std::uint64_t max_sequence = 0;
-    DurabilityWatermarks recovered_watermarks{};
+    std::uint64_t max_transaction_id = continuation_seed_ ? continuation_seed_->next_transaction_id - 1 : 0;
+    std::uint64_t max_sequence = continuation_seed_ ? continuation_seed_->last_sequence : 0;
+    std::uint64_t highest_checkpointed_marker = 0;
+    DurabilityWatermarks recovered_watermarks = continuation_seed_ ? continuation_seed_->watermarks : DurabilityWatermarks{};
+    if (continuation_seed_) recovered_boundaries.insert(recovered_watermarks.cleanup_sequence);
     bool recovered_state_valid = true;
 
     for (const auto& record : records)
@@ -2022,8 +3148,9 @@ bool TransactionManager::SeedIdsFromJournalRecords(
                     requires_spool_flush);
             }
             else if (record.state == WriteAheadLog::RecordState::Checkpointed &&
-                     (record.flags & kWalFlagCommitted) != 0)
+                      (record.flags & kWalFlagCommitted) != 0)
             {
+                highest_checkpointed_marker = (std::max)(highest_checkpointed_marker, record.sequence);
                 recovered_boundaries.insert(record.sequence);
                 recovered_transaction_sequences[record.transaction_id] = record.sequence;
                 recovered_watermarks.accepted_sequence = (std::max)(
@@ -2089,6 +3216,7 @@ bool TransactionManager::SeedIdsFromJournalRecords(
     }
     watermarks_ = recovered_watermarks;
     last_committed_sequence_ = recovered_watermarks.apfs_durable_sequence;
+    highest_checkpointed_marker_sequence_ = highest_checkpointed_marker;
     recovery_state_valid_ = recovered_state_valid && !journal_append_ambiguous_;
     for (auto proof = accepted_transaction_sequences_.begin();
          proof != accepted_transaction_sequences_.end();)
@@ -2129,6 +3257,7 @@ bool TransactionManager::SeedIdsFromJournalRecords(
     {
         InvalidateFinalizationCoverage(false);
     }
+    SeedCheckpointPinCensus(records, writer_generation);
     return true;
 }
 
@@ -2144,6 +3273,7 @@ bool TransactionManager::JournalStateMatchesWriterLease() const
 
 void TransactionManager::InvalidateFinalizationCoverage(bool poison) noexcept
 {
+    InvalidateCheckpointPinCensus();
     if (poison)
     {
         finalization_coverage_trust_ = FinalizationCoverageTrust::Poisoned;
@@ -2158,6 +3288,15 @@ void TransactionManager::InvalidateFinalizationCoverage(bool poison) noexcept
 void TransactionManager::PruneAcceptedBoundariesThrough(
     std::uint64_t cleanup_sequence) noexcept
 {
+    for (auto it = accepted_checkpoint_pins_.begin(); it != accepted_checkpoint_pins_.end();)
+    {
+        if (it->first <= cleanup_sequence)
+        {
+            cached_checkpoint_pin_entries_ -= it->second.size();
+            it = accepted_checkpoint_pins_.erase(it);
+        }
+        else ++it;
+    }
     for (auto it = accepted_boundaries_.begin(); it != accepted_boundaries_.end();)
     {
         if (*it <= cleanup_sequence)
@@ -2169,6 +3308,88 @@ void TransactionManager::PruneAcceptedBoundariesThrough(
             ++it;
         }
     }
+}
+
+void TransactionManager::InvalidateCheckpointPinCensus() noexcept
+{
+    accepted_checkpoint_pins_.clear();
+    cached_checkpoint_pin_entries_ = 0;
+    checkpoint_pin_census_writer_generation_ = 0;
+    checkpoint_pin_census_trusted_ = false;
+}
+
+void TransactionManager::AdvanceCheckpointPinCensusGeneration(
+    std::uint64_t before, std::uint64_t after, bool compacted) noexcept
+{
+    if (!checkpoint_pin_census_trusted_ || before == 0 || after == 0 ||
+        checkpoint_pin_census_writer_generation_ != before || (before != after && !compacted))
+    {
+        InvalidateCheckpointPinCensus();
+        return;
+    }
+    checkpoint_pin_census_writer_generation_ = after;
+}
+
+void TransactionManager::CacheAcceptedCheckpointPins(std::uint64_t sequence, std::vector<std::uint64_t> pins)
+{
+    if (!checkpoint_pin_census_trusted_) return;
+    std::sort(pins.begin(), pins.end());
+    pins.erase(std::unique(pins.begin(), pins.end()), pins.end());
+    if (pins.empty() || pins.front() == 0 || sequence <= watermarks_.cleanup_sequence ||
+        accepted_checkpoint_pins_.size() >= MaxCachedCheckpointPinBoundaries() ||
+        pins.size() > MaxCachedCheckpointPinEntries() - cached_checkpoint_pin_entries_ ||
+        accepted_checkpoint_pins_.contains(sequence))
+    {
+        InvalidateCheckpointPinCensus();
+        return;
+    }
+    cached_checkpoint_pin_entries_ += pins.size();
+    accepted_checkpoint_pins_.emplace(sequence, std::move(pins));
+}
+
+void TransactionManager::SeedCheckpointPinCensus(
+    const std::vector<WriteAheadLog::Record>& records, std::uint64_t writer_generation)
+{
+    InvalidateCheckpointPinCensus();
+    if (!recovery_state_valid_ || writer_generation == 0 ||
+        writer_generation != journal_state_writer_generation_ ||
+        finalization_coverage_trust_ != FinalizationCoverageTrust::Trusted ||
+        highest_checkpointed_marker_sequence_ > watermarks_.cleanup_sequence) return;
+    checkpoint_pin_census_trusted_ = true;
+    checkpoint_pin_census_writer_generation_ = writer_generation;
+    std::vector<std::uint64_t> snapshot_pins;
+    std::size_t prepared_count = 0;
+    for (const auto& record : records)
+    {
+        if (record.state == WriteAheadLog::RecordState::Prepared)
+        {
+            ++prepared_count;
+            if (!AppendSnapshotCheckpointPins(record, snapshot_pins))
+            {
+                InvalidateCheckpointPinCensus();
+                return;
+            }
+        }
+        else if (record.operation == WriteAheadLog::OperationKind::TransactionMarker)
+        {
+            if (record.state == WriteAheadLog::RecordState::Accepted && record.sequence > watermarks_.cleanup_sequence)
+            {
+                // A compaction floor may omit a cleaned group's preparation,
+                // but unresolved pin evidence must still contain the whole group.
+                if (prepared_count == 0 || prepared_count != record.logical_length)
+                {
+                    InvalidateCheckpointPinCensus();
+                    return;
+                }
+                snapshot_pins.push_back(record.object_id);
+                CacheAcceptedCheckpointPins(record.sequence, std::move(snapshot_pins));
+                if (!checkpoint_pin_census_trusted_) return;
+            }
+            snapshot_pins.clear();
+            prepared_count = 0;
+        }
+    }
+    if (accepted_checkpoint_pins_.size() != accepted_boundaries_.size()) InvalidateCheckpointPinCensus();
 }
 
 std::string TransactionManager::WideToUtf8(const std::wstring& value)
@@ -2211,3 +3432,5 @@ std::string TransactionManager::WideToUtf8(const std::wstring& value)
 }
 
 } // namespace apfsaccess::rw
+
+#include "TransactionManagerBackup.inc"

@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <string_view>
 #include <vector>
@@ -415,6 +417,135 @@ bool TestEphemeralFileAllocationIsRemovedFromFreeLedger()
            Require(next_ephemeral == kFailureFreeExtentAddress + kAllocationBytes, "ephemeral cursor should advance past the file allocation");
 }
 
+bool TestAllocateFileExtentsSubSlicesPartiallyUnavailableExtent()
+{
+    std::vector<ExtentAllocator::Extent> free_extents
+    {
+        { 4096, 32768 },
+    };
+    auto policy = BasicPolicy();
+    policy.overlaps_unavailable = [](const void*, std::uint64_t physical_address, std::uint64_t bytes)
+    {
+        const auto end = physical_address + bytes;
+        return physical_address < 12288 && 8192 < end;
+    };
+    policy.advance_past_unavailable = [](const void*, std::uint64_t, std::uint64_t)
+        -> std::optional<std::uint64_t>
+    {
+        return 12288;
+    };
+
+    std::uint64_t next_ephemeral = 65536;
+    const auto file_extents = ExtentAllocator::AllocateFileExtents(
+        free_extents,
+        next_ephemeral,
+        8192,
+        8192,
+        4096,
+        policy);
+
+    return Require(file_extents.has_value(), "sub-sliced file allocation should succeed") &&
+           Require(file_extents->size() == 2, "sub-sliced file allocation should use two extents") &&
+           Require((*file_extents)[0] == ExtentAllocator::FileExtent{ 0, 4096, 4096 }, "first file extent should use pre-unavailable run") &&
+           Require((*file_extents)[1] == ExtentAllocator::FileExtent{ 4096, 12288, 4096 }, "second file extent should use post-unavailable run") &&
+           Require(free_extents == std::vector<ExtentAllocator::Extent>{ { 8192, 4096 }, { 16384, 20480 } },
+               "sub-sliced allocation should preserve unallocated free blocks") &&
+           Require(next_ephemeral == 65536, "sub-sliced file allocation should not advance ephemeral cursor");
+}
+
+bool TestCanAllocateFromFragmentedFreeExtentsSubSlices()
+{
+    std::vector<ExtentAllocator::Extent> free_extents
+    {
+        { 4096, 32768 },
+    };
+    auto policy = BasicPolicy();
+    policy.overlaps_unavailable = [](const void*, std::uint64_t physical_address, std::uint64_t bytes)
+    {
+        const auto end = physical_address + bytes;
+        return physical_address < 12288 && 8192 < end;
+    };
+    policy.advance_past_unavailable = [](const void*, std::uint64_t, std::uint64_t)
+        -> std::optional<std::uint64_t>
+    {
+        return 12288;
+    };
+
+    return Require(ExtentAllocator::CanAllocateFromFragmentedFreeExtents(free_extents, 28672, policy, 4096),
+        "should recognize available space from sub-sliced clean extents");
+}
+
+bool TestFragmentedAllocationRejectsInvalidAdvanceWithoutChangingLedger()
+{
+    const std::vector<ExtentAllocator::Extent> original_free_extents{ { 4096, 32768 } };
+    auto policy = BasicPolicy();
+    policy.overlaps_unavailable = [](const void*, std::uint64_t address, std::uint64_t bytes)
+    {
+        return address < 8192 && 4096 < address + bytes;
+    };
+
+    for (const auto invalid_address : { 12289ull, 40960ull })
+    {
+        auto free_extents = original_free_extents;
+        std::uint64_t next_ephemeral = 0;
+        policy.context = &invalid_address;
+        policy.advance_past_unavailable = [](const void* context, std::uint64_t, std::uint64_t)
+            -> std::optional<std::uint64_t>
+        {
+            return *static_cast<const std::uint64_t*>(context);
+        };
+        const auto result = ExtentAllocator::AllocateFileExtents(
+            free_extents, next_ephemeral, 4096, 4096, 4096, policy);
+        if (!Require(!result.has_value(), "invalid advance should not allocate file blocks") ||
+            !Require(free_extents == original_free_extents, "invalid advance should preserve free ledger") ||
+            !Require(next_ephemeral == 0, "invalid advance should preserve ephemeral cursor"))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool TestContiguousAllocationRejectsStillUnavailableAdvance()
+{
+    std::vector<ExtentAllocator::Extent> free_extents{ { 4096, 16384 } };
+    const auto original_free_extents = free_extents;
+    auto policy = BasicPolicy();
+    policy.overlaps_unavailable = [](const void*, std::uint64_t address, std::uint64_t bytes)
+    {
+        return address < 12288 && 4096 < address + bytes;
+    };
+    policy.advance_past_unavailable = [](const void*, std::uint64_t, std::uint64_t)
+        -> std::optional<std::uint64_t>
+    {
+        return 8192;
+    };
+
+    const auto result = ExtentAllocator::AllocateContiguousFromFree(free_extents, 4096, policy);
+    return Require(!result.has_value(), "advance into an unavailable block should fail") &&
+           Require(free_extents == original_free_extents, "failed contiguous allocation should preserve free ledger");
+}
+
+bool TestFragmentedCapacityHandlesLargeRangeWithoutMidpointOverflow()
+{
+    constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+    const std::vector<ExtentAllocator::Extent> free_extents{ { 1, maximum - 2 } };
+    auto policy = BasicPolicy();
+    policy.overlaps_unavailable = [](const void*, std::uint64_t address, std::uint64_t bytes)
+    {
+        return address <= maximum - 2 && maximum - 2 < address + bytes;
+    };
+    policy.advance_past_unavailable = [](const void*, std::uint64_t, std::uint64_t)
+        -> std::optional<std::uint64_t>
+    {
+        return maximum - 1;
+    };
+
+    return Require(ExtentAllocator::CanAllocateFromFragmentedFreeExtents(
+        free_extents, maximum - 3, policy, 1),
+        "large fragmented range should count its clean prefix without overflowing");
+}
+
 template <typename Work>
 void ReportBenchmark(const char* workload, std::size_t operations, Work&& work)
 {
@@ -535,6 +666,11 @@ int main(int argc, char** argv)
     ok &= TestAllocateFileExtentsUsesFragmentedFreeSpaceBeforeEphemeral();
     ok &= TestAllocateFileExtentsRollsBackOnInvalidFragmentedCoverage();
     ok &= TestEphemeralFileAllocationIsRemovedFromFreeLedger();
+    ok &= TestAllocateFileExtentsSubSlicesPartiallyUnavailableExtent();
+    ok &= TestCanAllocateFromFragmentedFreeExtentsSubSlices();
+    ok &= TestFragmentedAllocationRejectsInvalidAdvanceWithoutChangingLedger();
+    ok &= TestContiguousAllocationRejectsStillUnavailableAdvance();
+    ok &= TestFragmentedCapacityHandlesLargeRangeWithoutMidpointOverflow();
 
     if (!ok)
     {

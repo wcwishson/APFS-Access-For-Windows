@@ -1,12 +1,46 @@
 param(
     [string]$Configuration = "Release",
     [string]$Runtime = "win-x64",
-    [bool]$SelfContained = $false
+    [bool]$SelfContained = $false,
+    [string]$SMBLibrarySourceRoot = $env:SMBLibrarySourceRoot
 )
 
 $ErrorActionPreference = "Stop"
+function Invoke-DotNet {
+    & dotnet @args "-p:SMBLibrarySourceRoot=$SMBLibrarySourceRoot" "-p:DebugType=None" "-p:DebugSymbols=false"
+    if ($LASTEXITCODE -ne 0) {
+        throw "dotnet $($args -join ' ') failed with exit code $LASTEXITCODE."
+    }
+}
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot ".." )).Path
 Set-Location -LiteralPath $repoRoot
+if ([string]::IsNullOrWhiteSpace($SMBLibrarySourceRoot)) {
+    throw 'Supply -SMBLibrarySourceRoot with the pinned source described in third_party/SMBLibrary/BUILD.md.'
+}
+$SMBLibrarySourceRoot = (Resolve-Path -LiteralPath $SMBLibrarySourceRoot).Path
+foreach ($name in @('SMBLibrary', 'Utilities')) {
+    if (!(Test-Path -LiteralPath (Join-Path $SMBLibrarySourceRoot $name) -PathType Container)) {
+        throw 'SMBLibrarySourceRoot must contain the pinned SMBLibrary and Utilities source directories.'
+    }
+}
+if ($Runtime -ne 'win-x64') {
+    throw 'The normal native package supports win-x64 only.'
+}
+
+function Assert-WorkspaceOutputPath {
+    param([string]$Path)
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not $fullPath.StartsWith($repoRoot + [System.IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to clear output outside the workspace: $fullPath"
+    }
+    $entry = Get-Item -LiteralPath $fullPath -Force -ErrorAction SilentlyContinue
+    while ($null -ne $entry -and $entry.FullName -ne $repoRoot) {
+        if ($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw "Refusing to clear linked output: $($entry.FullName)"
+        }
+        $entry = $entry.Parent
+    }
+}
 
 $serviceOut = Join-Path $repoRoot "artifacts/publish/service"
 $trayOut = Join-Path $repoRoot "artifacts/publish/tray"
@@ -31,62 +65,86 @@ $nativeBuildRoot = if ([string]::IsNullOrWhiteSpace($env:APFSACCESS_NATIVE_BUILD
 
 $publishOutputDirs = @($serviceOut, $trayOut, $probeOut, $cliOut, $updaterOut, $bundleOut, $portableOut)
 foreach ($publishOutputDir in $publishOutputDirs) {
+    Assert-WorkspaceOutputPath $publishOutputDir
     if (Test-Path -LiteralPath $publishOutputDir) {
         Get-ChildItem -LiteralPath $publishOutputDir -Force |
             Remove-Item -Recurse -Force
     }
 }
 if (Test-Path -LiteralPath $probeDebugSmokeOut) {
+    Assert-WorkspaceOutputPath $probeDebugSmokeOut
     Remove-Item -LiteralPath $probeDebugSmokeOut -Recurse -Force
 }
 New-Item -ItemType Directory -Force -Path $serviceOut, $trayOut, $probeOut, $cliOut, $bundleOut, $portableOut | Out-Null
 
 Write-Host "[publish] generating tray icons..."
 pwsh -NoProfile -File (Join-Path $repoRoot "scripts/create_tray_icons.ps1")
+if ($LASTEXITCODE -ne 0) {
+    throw "Tray icon generation failed with exit code $LASTEXITCODE."
+}
 
+Assert-WorkspaceOutputPath $nativeOut
 if (Test-Path -LiteralPath $nativeHostExe) {
     Remove-Item -LiteralPath $nativeHostExe -Force
 }
 if (Test-Path -LiteralPath $nativeObserverExe) {
     Remove-Item -LiteralPath $nativeObserverExe -Force
 }
+$nativeToolNames = @(
+    "ApfsVolumeRepairTool.exe", "VolumeRenameImage.exe", "SnapshotImage.exe",
+    "ApfsEncryptedReadTool.exe", "ApfsFusionReadTool.exe", "ApfsAccess.ApfsImageKeyManagementTool.exe",
+    "VolumeQuotaReserveImageTool.exe", "VolumeManagementImage.exe", "VolumeResizeImage.exe", "VolumeFormatImage.exe", "VolumePhysicalObserve.exe", "VolumeKeeperInspect.exe"
+)
+foreach ($toolName in $nativeToolNames) {
+    $toolPath = Join-Path $nativeOut $toolName
+    if (Test-Path -LiteralPath $toolPath) {
+        Remove-Item -LiteralPath $toolPath -Force
+    }
+}
 
 Write-Host "[publish] building native fs host..."
-$nativeGenerator = "Visual Studio 17 2022"
+$nativeGenerator = if (Test-Path "C:\Program Files (x86)\Microsoft Visual Studio\18") {
+    "Visual Studio 18 2026"
+} else {
+    "Visual Studio 17 2022"
+}
 pwsh -NoProfile -File (Join-Path $repoRoot "scripts/build_native_host.ps1") `
     -Configuration $Configuration `
     -BuildDir (Join-Path $nativeBuildRoot "publish_host_vs/$Configuration") `
     -Generator $nativeGenerator
+if ($LASTEXITCODE -ne 0) {
+    throw "Native build failed with exit code $LASTEXITCODE. Refusing to reuse old native files."
+}
 
 Write-Host "[publish] publishing service (split output)..."
-dotnet publish .\src\ApfsAccess.Service\ApfsAccess.Service.csproj -c $Configuration -r $Runtime --self-contained $SelfContained -o $serviceOut
+Invoke-DotNet publish .\src\ApfsAccess.Service\ApfsAccess.Service.csproj -c $Configuration -r $Runtime --self-contained $SelfContained -o $serviceOut
 
 Write-Host "[publish] publishing tray (split output)..."
-dotnet publish .\src\ApfsAccess.Tray\ApfsAccess.Tray.csproj -c $Configuration -r $Runtime --self-contained $SelfContained -o $trayOut
+Invoke-DotNet publish .\src\ApfsAccess.Tray\ApfsAccess.Tray.csproj -c $Configuration -r $Runtime --self-contained $SelfContained -o $trayOut
 
 Write-Host "[publish] publishing native probe (split output)..."
-dotnet publish .\src\ApfsAccess.NativeProbe\ApfsAccess.NativeProbe.csproj -c $Configuration -r $Runtime --self-contained $SelfContained -o $probeOut
+Invoke-DotNet publish .\src\ApfsAccess.NativeProbe\ApfsAccess.NativeProbe.csproj -c $Configuration -r $Runtime --self-contained $SelfContained -o $probeOut
 
 Write-Host "[publish] publishing CLI (split output)..."
-dotnet publish .\src\ApfsAccess.Cli\ApfsAccess.Cli.csproj -c $Configuration -r $Runtime --self-contained $SelfContained -o $cliOut
+Invoke-DotNet publish .\src\ApfsAccess.Cli\ApfsAccess.Cli.csproj -c $Configuration -r $Runtime --self-contained $SelfContained -o $cliOut
 
 Write-Host "[publish] publishing updater (split output)..."
-dotnet publish .\src\ApfsAccess.Updater\ApfsAccess.Updater.csproj -c $Configuration -r $Runtime --self-contained $SelfContained -o $updaterOut
+Invoke-DotNet publish .\src\ApfsAccess.Updater\ApfsAccess.Updater.csproj -c $Configuration -r $Runtime --self-contained $SelfContained -o $updaterOut
 
 Write-Host "[publish] publishing service (click-run bundle)..."
-dotnet publish .\src\ApfsAccess.Service\ApfsAccess.Service.csproj -c $Configuration -r $Runtime --self-contained $bundleSelfContained -o $bundleOut
+Invoke-DotNet publish .\src\ApfsAccess.Service\ApfsAccess.Service.csproj -c $Configuration -r $Runtime --self-contained $bundleSelfContained -o $bundleOut
 
 Write-Host "[publish] publishing tray (click-run bundle)..."
-dotnet publish .\src\ApfsAccess.Tray\ApfsAccess.Tray.csproj -c $Configuration -r $Runtime --self-contained $bundleSelfContained -o $bundleOut
+Invoke-DotNet publish .\src\ApfsAccess.Tray\ApfsAccess.Tray.csproj -c $Configuration -r $Runtime --self-contained $bundleSelfContained -o $bundleOut
 
 Write-Host "[publish] publishing native probe (click-run bundle)..."
-dotnet publish .\src\ApfsAccess.NativeProbe\ApfsAccess.NativeProbe.csproj -c $Configuration -r $Runtime --self-contained $bundleSelfContained -o $bundleOut
+Invoke-DotNet publish .\src\ApfsAccess.NativeProbe\ApfsAccess.NativeProbe.csproj -c $Configuration -r $Runtime --self-contained $bundleSelfContained -o $bundleOut
 
 Write-Host "[publish] publishing CLI (click-run bundle)..."
-dotnet publish .\src\ApfsAccess.Cli\ApfsAccess.Cli.csproj -c $Configuration -r $Runtime --self-contained $bundleSelfContained -o $bundleOut
+Invoke-DotNet publish .\src\ApfsAccess.Cli\ApfsAccess.Cli.csproj -c $Configuration -r $Runtime --self-contained $bundleSelfContained -o $bundleOut
 
 Write-Host "[publish] publishing updater (click-run bundle)..."
-dotnet publish .\src\ApfsAccess.Updater\ApfsAccess.Updater.csproj -c $Configuration -r $Runtime --self-contained $bundleSelfContained -o $bundleOut
+Invoke-DotNet publish .\src\ApfsAccess.Updater\ApfsAccess.Updater.csproj -c $Configuration -r $Runtime --self-contained $bundleSelfContained -o $bundleOut
 
 foreach ($publishOutputDir in @($serviceOut, $trayOut, $probeOut, $cliOut, $updaterOut, $bundleOut)) {
     $developmentSettings = Join-Path $publishOutputDir "appsettings.Development.json"
@@ -103,12 +161,26 @@ if (-not (Test-Path -LiteralPath $nativeObserverExe)) {
 }
 
 Write-Host "[publish] including native fs host and APFS observer..."
-Copy-Item -LiteralPath $nativeHostExe -Destination (Join-Path $serviceOut "ApfsAccess.FsHost.exe") -Force
-Copy-Item -LiteralPath $nativeHostExe -Destination (Join-Path $bundleOut "ApfsAccess.FsHost.exe") -Force
-Copy-Item -LiteralPath $nativeObserverExe -Destination (Join-Path $serviceOut "ApfsObserver.exe") -Force
-Copy-Item -LiteralPath $nativeObserverExe -Destination (Join-Path $bundleOut "ApfsObserver.exe") -Force
+foreach ($destination in @($serviceOut, $probeOut, $cliOut, $bundleOut)) {
+    Copy-Item -LiteralPath $nativeHostExe -Destination (Join-Path $destination "ApfsAccess.FsHost.exe") -Force
+    Copy-Item -LiteralPath $nativeObserverExe -Destination (Join-Path $destination "ApfsObserver.exe") -Force
+}
+foreach ($toolName in $nativeToolNames) {
+    $toolPath = Join-Path $nativeOut $toolName
+    if (-not (Test-Path -LiteralPath $toolPath -PathType Leaf)) {
+        throw "Native runtime helper is missing: $toolPath. Refusing to create an incomplete package."
+    }
+    foreach ($destination in @($serviceOut, $cliOut, $bundleOut)) {
+        Copy-Item -LiteralPath $toolPath -Destination (Join-Path $destination $toolName) -Force
+    }
+}
 
 $winfspDoc = Join-Path $repoRoot "docs/winfsp-setup.md"
+foreach ($destination in @($serviceOut, $trayOut, $probeOut, $cliOut, $updaterOut, $bundleOut)) {
+    & (Join-Path $PSScriptRoot 'copy_package_notices.ps1') -OutputDirectory $destination `
+        -RepositoryDirectory $repoRoot -SMBLibrarySourceRoot $SMBLibrarySourceRoot -Runtime $Runtime `
+        -AssetsFiles (Join-Path $repoRoot 'src/ApfsAccess.Service/obj/project.assets.json')
+}
 if (Test-Path -LiteralPath $winfspDoc) {
     Copy-Item -LiteralPath $winfspDoc -Destination (Join-Path $bundleOut "WINFSP_SETUP.md") -Force
 }
@@ -175,6 +247,12 @@ start "" /min "ApfsAccess.Tray.exe"
 @'
 APFS Access click-run package
 
+New physical volumes start read-only. For a supported ordinary, unencrypted
+APFS data volume, choose Fix or request read/write from the command line to
+enable writes. The app remembers permission for that exact volume. Existing
+administrator restrictions and safety checks still apply; unsupported volumes
+remain read-only.
+
 How to run
 1) Double-click Run_APFS_Access.bat.
 2) Approve the administrator prompt if Windows asks.
@@ -202,6 +280,7 @@ if (Test-Path -LiteralPath $portablePayloadZip) {
 Write-Host "[publish] creating portable payload zip..."
 $portablePayloadStaging = Join-Path $repoRoot "artifacts/publish/click-run-portable-payload"
 if (Test-Path -LiteralPath $portablePayloadStaging) {
+    Assert-WorkspaceOutputPath $portablePayloadStaging
     Remove-Item -LiteralPath $portablePayloadStaging -Recurse -Force
 }
 New-Item -ItemType Directory -Force -Path $portablePayloadStaging | Out-Null
@@ -234,17 +313,18 @@ $bootstrapCacheDirs = @(
 )
 foreach ($cacheDir in $bootstrapCacheDirs) {
     if (Test-Path -LiteralPath $cacheDir) {
+        Assert-WorkspaceOutputPath $cacheDir
         Remove-Item -LiteralPath $cacheDir -Recurse -Force
     }
 }
 
-dotnet publish .\src\ApfsAccess.Bootstrap\ApfsAccess.Bootstrap.csproj `
+Invoke-DotNet publish .\src\ApfsAccess.Bootstrap\ApfsAccess.Bootstrap.csproj `
     -c $Configuration `
     -r $Runtime `
     --self-contained true `
-    -p:PublishSingleFile=true `
-    -p:IncludeNativeLibrariesForSelfExtract=true `
-    -p:PortablePayloadZip="$portablePayloadZip" `
+    "-p:PublishSingleFile=true" `
+    "-p:IncludeNativeLibrariesForSelfExtract=true" `
+    "-p:PortablePayloadZip=$portablePayloadZip" `
     -o $portableOut
 
 $portableExe = Join-Path $portableOut $portableExeName

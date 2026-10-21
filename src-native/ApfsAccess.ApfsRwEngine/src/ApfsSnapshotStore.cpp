@@ -1,4 +1,6 @@
 #include "ApfsSnapshotStore.h"
+#include "ApfsTransactionWriter.h"
+#include "ApfsReadOnlyMetadataAdmission.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -38,7 +40,8 @@ bool UuidValid(const std::string& uuid)
 static bool EnumerateRecords(const RandomAccessSource& source,
     const ApfsSnapshotScope& scope, std::vector<ApfsSnapshotInfo>& out_snapshots,
     std::string& out_error, std::uint64_t selected_xid = 0,
-    ApfsSnapshotRecords* selected_records = nullptr)
+    ApfsSnapshotRecords* selected_records = nullptr,
+    AppleSnapshotCatalogRecords* owned_catalog = nullptr)
 {
     out_snapshots.clear();
     out_error.clear();
@@ -80,7 +83,26 @@ static bool EnumerateRecords(const RandomAccessSource& source,
     }
     std::vector<AppleSnapshotRecord> raw;
     AppleSnapshotTreeRecords trees;
-    if (!LoadAppleSnapshotRecords(store, *checkpoint, scope.volume_oid, raw,
+    AppleSnapshotCatalogRecords catalog;
+    const bool physical_metadata = selected->snapshot_metadata_tree &&
+        selected->superblock.snap_meta_tree_type == (kObjectPhysical | kObjectTypeBtree) &&
+        selected->snapshot_metadata_tree->type == selected->superblock.snap_meta_tree_type &&
+        selected->snapshot_metadata_tree->subtype == kObjectTypeSnapMetaTree &&
+        selected->snapshot_metadata_tree->object_id == selected->superblock.snap_meta_tree_oid &&
+        selected->snapshot_metadata_tree->physical_block == selected->superblock.snap_meta_tree_oid;
+    if (owned_catalog || physical_metadata)
+    {
+        if (!(physical_metadata ?
+                LoadAppleReadOnlySnapshotCatalog(store, *checkpoint, scope.volume_oid, catalog, out_error) :
+                LoadAppleSnapshotCatalog(store, *checkpoint, scope.volume_oid, catalog, out_error))) return false;
+        if (selected_xid) {
+            const auto found = std::find_if(catalog.inventory.begin(), catalog.inventory.end(),
+                [&](const auto& snapshot) { return snapshot.xid == selected_xid; });
+            if (found != catalog.inventory.end()) trees = std::move(catalog.snapshots.at(found - catalog.inventory.begin()));
+        }
+        raw = std::move(catalog.inventory);
+    }
+    else if (!LoadAppleSnapshotRecords(store, *checkpoint, scope.volume_oid, raw,
         out_error, selected_xid, trees)) return false;
     std::vector<ApfsSnapshotInfo> result;
     for (auto& snapshot : raw)
@@ -110,6 +132,7 @@ static bool EnumerateRecords(const RandomAccessSource& source,
         selected_records->checkpoint = std::move(*checkpoint);
         selected_records->trees = std::move(trees);
     }
+    if (owned_catalog) *owned_catalog = std::move(catalog);
     return true;
 }
 
@@ -163,6 +186,83 @@ bool ApfsSnapshotStore::LoadExactRecords(const RandomAccessSource& source,
         if (const auto budget = source.ReadBudget()) (void)budget->Refuse("ApfsReadBudgetAllocationFailed");
         out_error = "ApfsReadBudgetAllocationFailed";
         return false;
+    }
+}
+
+bool ApfsSnapshotStore::LoadExactProjectionRecords(const RandomAccessSource& source,
+    const ApfsSnapshotIdentity& expected, ApfsSnapshotRecords& out_records,
+    std::vector<rw::ApplePhysicalExtentRecord>& out_geometry, std::string& out_error)
+{
+    const auto identity = expected;
+    out_records = {}; out_geometry.clear(); out_error.clear();
+    auto budget = source.ReadBudget();
+    if (!budget) budget = std::make_shared<ApfsReadBudget>(65536, 256ull << 20, 1000000, 256ull << 20);
+    BudgetedRandomAccessSource bounded(source, budget);
+    try {
+        std::vector<ApfsSnapshotInfo> inventory;
+        ApfsSnapshotRecords raw;
+        AppleSnapshotCatalogRecords catalog;
+        if (!EnumerateRecords(bounded, identity.scope, inventory, out_error, 0, &raw, &catalog)) return false;
+        const auto exact = std::find_if(inventory.begin(), inventory.end(),
+            [&](const auto& item) {return item.identity == identity;});
+        if (exact == inventory.end()) {
+            out_error = "SnapshotExactIdentityMismatchOrMissing"; return false;
+        }
+        if (catalog.snapshots.size() != inventory.size()) {
+            out_error = "SnapshotInventoryCountMismatch"; return false;
+        }
+        std::vector<rw::ApplePhysicalExtentRecord> prior, historical;
+        for (std::size_t i = 0; i < inventory.size(); ++i) {
+            auto& item = inventory[i];
+            if (item.identity.snapshot_xid > identity.snapshot_xid) break;
+            auto& trees = catalog.snapshots[i];
+            const auto& nx = raw.checkpoint.container.superblock;
+            // Charge the interval sweep, its normalized records, validation and
+            // accumulated ownership. No payload bytes or per-block expansion.
+            const auto count = prior.size() + historical.size() + trees.filesystem.size() + trees.extentref.size();
+            if (!budget->Materialize(count, count * 2048ull)) {out_error=budget->Failure();return false;}
+            std::vector<rw::ApplePhysicalExtentRecord> resolved;
+            if (!rw::ResolveAppleSnapshotExtentLayer(prior, historical, trees.filesystem,
+                trees.extentref, nx.block_size, nx.block_count, resolved, out_error)) return false;
+            if (item.identity == identity) {
+                raw.snapshot = std::move(item);
+                raw.trees = std::move(trees);
+                raw.trees.metadata_blocks = std::move(catalog.metadata_blocks);
+                out_geometry=std::move(resolved);
+                out_records=std::move(raw);return true;
+            }
+            historical.insert(historical.end(), resolved.begin(), resolved.end());
+            prior=std::move(resolved);
+        }
+        out_error="SnapshotExactIdentityMismatchOrMissing";return false;
+    } catch (const std::bad_alloc&) {
+        (void)budget->Refuse("ApfsReadBudgetAllocationFailed");out_error=budget->Failure();return false;
+    } catch (const std::length_error&) {
+        (void)budget->Refuse("ApfsReadBudgetAllocationFailed");out_error=budget->Failure();return false;
+    }
+}
+
+bool ApfsSnapshotStore::LoadExactResolvedRecords(const RandomAccessSource& source,
+    const ApfsSnapshotIdentity& expected, ApfsSnapshotRecords& out_records, std::string& out_error) {
+    const auto identity=expected;
+    out_records={};
+    ApfsSnapshotRecords records;
+    std::vector<rw::ApplePhysicalExtentRecord> geometry;
+    if (!LoadExactProjectionRecords(source,identity,records,geometry,out_error)) return false;
+    try {
+        records.trees.extentref.clear();
+        for (const auto& extent : geometry) {
+            BtreeRecord encoded;
+            if (!rw::EncodeApplePhysicalExtentRecord(extent,encoded,out_error)) return false;
+            records.trees.extentref.push_back(std::move(encoded));
+        }
+        out_records=std::move(records);return true;
+    } catch (const std::bad_alloc&) {
+        if (const auto budget=source.ReadBudget()) (void)budget->Refuse("ApfsReadBudgetAllocationFailed");
+        out_error="ApfsReadBudgetAllocationFailed";return false;
+    } catch (const std::length_error&) {
+        if (const auto budget=source.ReadBudget()) (void)budget->Refuse("ApfsReadBudgetAllocationFailed");
+        out_error="ApfsReadBudgetAllocationFailed";return false;
     }
 }
 

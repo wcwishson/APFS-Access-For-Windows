@@ -44,6 +44,11 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        if (args.Length > 0 && string.Equals(args[0], "--cli", StringComparison.OrdinalIgnoreCase))
+        {
+            return RunCli(args[1..]);
+        }
+
         ApplicationConfiguration.Initialize();
 
         try
@@ -77,6 +82,44 @@ internal static class Program
             return 1;
         }
     }
+
+    private static int RunCli(string[] args)
+    {
+        // WinExe terminal launches need a console; redirected standard handles remain inherited.
+        AttachConsole(uint.MaxValue);
+        try
+        {
+            var directory = ShouldUseAdjacentClickRunDirectory() ? ResolveAdjacentClickRunDirectory() : null;
+            directory ??= ExtractPayload(LoadPayloadBytes());
+            ConfigureRuntimeScratchEnvironment();
+
+            var start = new ProcessStartInfo
+            {
+                FileName = Path.Combine(directory, "ApfsAccess.Cli.exe"),
+                WorkingDirectory = Environment.CurrentDirectory,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            foreach (var argument in args) start.ArgumentList.Add(argument);
+            using var child = Process.Start(start) ?? throw new InvalidOperationException("CLI process did not start.");
+            var output = child.StandardOutput.BaseStream.CopyToAsync(Console.OpenStandardOutput());
+            var error = child.StandardError.BaseStream.CopyToAsync(Console.OpenStandardError());
+            child.WaitForExit();
+            Task.WhenAll(output, error).GetAwaiter().GetResult();
+            return child.ExitCode;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"APFS Access CLI startup failed: {ex.Message}");
+            return 1;
+        }
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AttachConsole(uint processId);
 
     private static int RunInstallerMode()
     {
@@ -749,12 +792,35 @@ internal static class Program
             var finalPath = Directory.Exists(targetPath)
                 ? Path.Combine(rootPath, $"payload-{payloadHash}-{Guid.NewGuid():N}")
                 : targetPath;
-            Directory.Move(stagingPath, finalPath);
+            MovePortablePayload(stagingPath, finalPath);
             return finalPath;
         }
         finally
         {
             DeleteDirectoryBestEffort(stagingPath);
+        }
+    }
+
+    private static void MovePortablePayload(string stagingPath, string finalPath)
+    {
+        // Fresh executable scans can briefly hold files without delete sharing.
+        var deadline = Environment.TickCount64 + 2000;
+        while (true)
+        {
+            try
+            {
+                Directory.Move(stagingPath, finalPath);
+                return;
+            }
+            catch (IOException ex) when (
+                (ex.HResult & 0xffff) is 5 or 32 or 33 && Environment.TickCount64 < deadline)
+            {
+                Thread.Sleep(50);
+            }
+            catch (UnauthorizedAccessException) when (Environment.TickCount64 < deadline)
+            {
+                Thread.Sleep(50);
+            }
         }
     }
 
@@ -881,6 +947,7 @@ internal static class Program
         psi.Environment["TEMP"] = Environment.GetEnvironmentVariable("TEMP") ?? Path.GetTempPath();
         psi.Environment["TMP"] = Environment.GetEnvironmentVariable("TMP") ?? Path.GetTempPath();
         psi.Environment["APFSACCESS_SPOOL_ROOT"] = Environment.GetEnvironmentVariable("APFSACCESS_SPOOL_ROOT") ?? string.Empty;
+        psi.Environment["APFSACCESS_RECOVERY_ROOT"] = Environment.GetEnvironmentVariable("APFSACCESS_RECOVERY_ROOT") ?? string.Empty;
         psi.Environment["APFSACCESS_RUNTIME_ROOT"] = Environment.GetEnvironmentVariable("APFSACCESS_RUNTIME_ROOT") ?? string.Empty;
         psi.Environment["APFSACCESS_TRACE_MOVES"] = Environment.GetEnvironmentVariable("APFSACCESS_TRACE_MOVES") ?? string.Empty;
         psi.Environment["APFSACCESS_PERF_COUNTERS"] = Environment.GetEnvironmentVariable("APFSACCESS_PERF_COUNTERS") ?? string.Empty;
@@ -914,7 +981,10 @@ internal static class Program
     {
         var runtimeRoot = ResolveRuntimeRoot();
         var tempRoot = Path.Combine(runtimeRoot, "temp");
-        var spoolRoot = Path.Combine(runtimeRoot, "payload-spool");
+        var configuredSpoolRoot = Environment.GetEnvironmentVariable("APFSACCESS_SPOOL_ROOT");
+        var spoolRoot = string.IsNullOrWhiteSpace(configuredSpoolRoot)
+            ? Path.Combine(runtimeRoot, "payload-spool")
+            : Path.GetFullPath(configuredSpoolRoot);
 
         Directory.CreateDirectory(tempRoot);
         Directory.CreateDirectory(spoolRoot);

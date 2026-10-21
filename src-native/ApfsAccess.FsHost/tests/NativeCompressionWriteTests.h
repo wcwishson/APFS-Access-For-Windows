@@ -108,7 +108,7 @@ bool HostCompressionWriteRecoverAccepted(HostCompressionRewrite211Fixture& fixtu
     return true;
 }
 
-bool TestNativeCompressionWriteCallbacks(bool interrupted = false, unsigned only_type = 0)
+bool TestNativeCompressionWriteCallbacks(bool interrupted = false, unsigned only_type = 0, std::uint64_t private_id = 17)
 {
     using Store = apfsaccess::rw::MetadataStore;
     using Tx = apfsaccess::rw::TransactionManager;
@@ -120,14 +120,15 @@ bool TestNativeCompressionWriteCallbacks(bool interrupted = false, unsigned only
         const bool archive_refusal = !interrupted && variant == 1;
         HostCompressionRewrite211Fixture fixture;
         const bool modern = type >= 7 && type <= 14;
-        if (!Require(fixture.Initialize(type, false, false, modern, archive_refusal),
+        if (!Require(fixture.Initialize(type, false, false, modern, archive_refusal, 0, private_id),
                 "foreground rewrite fixture initializes")) return false;
         auto& c = *fixture.fixture.context;
         c.args.write_recovery_policy = interrupted && (variant & 1) ? L"BestEffort" : L"FailClosed";
         auto fs = BuildFileSystem(&c);
         const auto initial = c.metadata_store->LookupCommittedInodeByPath(L"\\compressed");
         std::vector<std::byte> expected;
-        if (!Require(initial && c.metadata_store->ReadCommittedFileRange(L"\\compressed", 0,
+        if (!Require(initial && initial->object_id == 17 && initial->private_id == private_id &&
+                c.metadata_store->ReadCommittedFileRange(L"\\compressed", 0,
                 fixture.eof, expected) && expected == fixture.expected_source,
                 "complete original compressed bytes match an independent expected vector")) return false;
         const auto finder = c.metadata_store->LookupCommittedExtendedAttribute(initial->object_id, "com.apple.FinderInfo");
@@ -291,6 +292,10 @@ bool TestNativeCompressionWriteCallbacks(bool interrupted = false, unsigned only
         }
         else
         {
+            if (status != STATUS_SUCCESS)
+                std::fwprintf(stderr, L"[compression] type=%u status=%lx stage=%hs reason=%ls detail=%ls\n", type,
+                    static_cast<unsigned long>(status), c.metadata_store->LastCommitStage().c_str(),
+                    c.metadata_store->LastCommitFailureReason().c_str(), c.metadata_store->LastCommitFailureDetail().c_str());
             if (!Require(status == STATUS_SUCCESS && done == 1 && !c.write_degraded && transition_checked,
                     "one-byte callback edit publishes and verifies the full conversion")) return false;
             const auto first_marks = c.tx_manager->Watermarks();
@@ -330,7 +335,7 @@ bool TestNativeCompressionWriteCallbacks(bool interrupted = false, unsigned only
             if (!Require(fresh.ReadCommittedFileRange(path, 0, expected.size(), actual) && actual == expected,
                     "independent native reload reads every accepted edit through both aliases")) return false;
         const auto after = fresh.LookupCommittedInodeByPath(L"\\compressed");
-        if (!Require(after && after->object_id == initial->object_id && after->mode == initial->mode &&
+        if (!Require(after && after->object_id == initial->object_id && after->private_id == private_id && after->mode == initial->mode &&
                 after->owner == initial->owner && after->group == initial->group &&
                 after->create_time_utc == initial->create_time_utc && after->access_time_utc == initial->access_time_utc &&
                 !(after->bsd_flags & apfsaccess::rw::kAppleBsdCompressedFlag) &&

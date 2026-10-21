@@ -11,7 +11,7 @@ internal sealed class DTempDirectory : IDisposable
 
     public static DTempDirectory Create(string? prefix = null)
     {
-        var root = System.IO.Path.Combine("D:\\Temp", "ApfsAccessTests");
+        var root = Environment.GetEnvironmentVariable("APFSACCESS_TEST_ROOT") ?? System.IO.Path.Combine("D:\\Temp", "ApfsAccessTests");
         Directory.CreateDirectory(root);
         var path = System.IO.Path.Combine(
             root, (prefix ?? "case") + "-" + Guid.NewGuid().ToString("N"));

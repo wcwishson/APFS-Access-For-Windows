@@ -65,6 +65,16 @@ public sealed class NamedPipeMessageServer
 
                 var clientId = Interlocked.Increment(ref clientCounter);
                 var peer = new PipePeer(serverStream);
+                if (_requiresEndpointAuthentication && OperatingSystem.IsWindows())
+                    {
+                    try
+                    {
+                        peer.AuthenticatedClientProcessId = WindowsPipeEndpointIdentitySource.Instance.GetClientProcessId(serverStream);
+                        using var process=System.Diagnostics.Process.GetProcessById(peer.AuthenticatedClientProcessId);
+                        peer.AuthenticatedClientStartTimeUtcTicks=process.StartTime.ToUniversalTime().Ticks;
+                    }
+                    catch { await peer.DisposeAsync().ConfigureAwait(false); continue; }
+                }
                 var task = AcceptedPipeClientOwner.Start(
                     peer,
                     clientHandler,

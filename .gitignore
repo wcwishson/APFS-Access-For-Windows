@@ -36,6 +36,18 @@ src-native/**/*.exe
 *.userosscache
 
 # Logs, crash dumps, and local validation media
+tmp/
+/HANDOFF-*.md
+/bridge-gate-*.apfs
+/bridge-gate-*.wal
+/lifecycle.apfs
+/lifecycle.wal
+/1/
+scripts/fshost_fusion_identity_selftest.js
+scripts/fshost_supervisor_ancestry_selftest.js
+scripts/invoke_fshost_ancestry_selftest.ps1
+scripts/shell_provider_evidence.js
+scripts/shell_provider_evidence_selftest.js
 *.log
 *.dmp
 *.dump
@@ -61,3 +73,10 @@ scripts/build_fshost_credential_probe.ps1
 scripts/test_fshost_credential_transport.ps1
 scripts/fshost_credential_selftest.js
 third_party/lzfse/*PROVENANCE.md
+
+NuGet/
+live-snapshot-*/
+live-verification-*/
+snapshot-runtime-run-*/
+scripts/*_selftest.*
+scripts/build_observer_child.ps1

@@ -33,7 +33,12 @@ internal static class Program
     private static readonly string[] ReportedCommands =
     [
         "status", "list", "mount", "fix", "eject", "quit", "query", "cancel",
-        "version", "capabilities", "supervise-fshost", "xattr", "drive-letter", "snapshots", "verify",
+        "register-image", "unlock", "lock", "version", "capabilities", "supervise-fshost", "xattr", "drive-letter", "snapshots", "snapshot-list", "container-mount", "container-unmount", "container-verify", "container-fix", "container-manage", "device-eject", "rescan", "management-plan", "management-apply", "volume-verify", "verify", "repair",
+        "volume-create-plan", "volume-delete-plan", "volume-management-apply", "volume-management-cancel", "volume-management-recover",
+        "system-data", "verify-profile", "verify-profile-history", "verify-profile-snapshots", "marked-reference-space", "marked-owner-space", "fusion", "backup-image", "image-keys",
+#if APFSACCESS_STANDARD_MOUNT
+        "standard-share",
+#endif
     ];
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -127,11 +132,65 @@ internal static class Program
         DateTimeOffset? operationDeadlineUtc,
         bool allowInProcessTestPipeMutations)
     {
+        if (args.Length > 0 && string.Equals(args[0], "standard-share", StringComparison.OrdinalIgnoreCase))
+        {
+#if APFSACCESS_STANDARD_MOUNT
+            return await StandardShareCommand.RunAsync(args[1..]).ConfigureAwait(false);
+#else
+            Console.Error.WriteLine("The optional standard-share provider is not included in this CLI package.");
+            return InvalidArguments;
+#endif
+        }
+        if (args.Length > 0 && args[0] == "image-keys")
+            return await ImageKeyManagementCommand.RunAsync(args[1..]).ConfigureAwait(false);
+        if (args.Length > 0 && string.Equals(args[0], "backup-image", StringComparison.OrdinalIgnoreCase))
+            return await BackupImageMountCommand.RunAsync(args[1..]).ConfigureAwait(false);
+
+        if (args.Length > 0 && string.Equals(args[0], "fusion", StringComparison.OrdinalIgnoreCase))
+            return await FusionMountCommand.RunAsync(args[1..]).ConfigureAwait(false);
+
+        if (args.Length > 0 && string.Equals(args[0], "system-data", StringComparison.OrdinalIgnoreCase))
+            return await SystemDataBrowseCommand.RunAsync(args[1..]).ConfigureAwait(false);
+
         if (args.Length > 0 && string.Equals(args[0], "verify", StringComparison.OrdinalIgnoreCase))
             return VerifyCommand.Run(args[1..]);
 
+        if (args.Length > 0 && string.Equals(args[0], "verify-profile", StringComparison.OrdinalIgnoreCase))
+            return VerifyProfileCommand.Run(args[1..]);
+        if (args.Length > 0 && string.Equals(args[0], "verify-profile-history", StringComparison.OrdinalIgnoreCase))
+            return VerifyProfileHistoryCommand.Run(args[1..]);
+        if (args.Length > 0 && string.Equals(args[0], "marked-owner-space", StringComparison.OrdinalIgnoreCase))
+            return MarkedOwnerSpaceCommand.Run(args.Skip(1).ToArray());
+        if (args.Length > 0 && string.Equals(args[0], "marked-reference-space", StringComparison.OrdinalIgnoreCase))
+            return MarkedReferenceSpaceCommand.Run(args[1..]);
+        if (args.Length > 0 && string.Equals(args[0], "verify-profile-snapshots", StringComparison.OrdinalIgnoreCase))
+            return VerifyProfileSnapshotsCommand.Run(args[1..]);
+
+        if (args.Length > 0 && string.Equals(args[0], "repair", StringComparison.OrdinalIgnoreCase))
+            return RepairCommand.Run(args[1..]);
+
+        if (args.Length > 0 && args[0] is "register-image" or "unlock" or "lock")
+            return await EncryptedImageCommand.RunAsync(args).ConfigureAwait(false);
+
         if (args.Length > 0 && string.Equals(args[0], "snapshots", StringComparison.OrdinalIgnoreCase))
+        {
+            if (args.Length > 1 && args[1] == "space")
+                return SnapshotSpaceCommand.Run(args[1..]);
+            if (args.Length > 1 && args[1] == "browse")
+                return await SnapshotBrowseCommand.RunAsync(args[1..]).ConfigureAwait(false);
+            if (args.Length > 1 && args[1] is "create" or "delete" or "recover")
+                return await SnapshotControlCommand.RunAsync(args[1..]).ConfigureAwait(false);
             return SnapshotCommand.Run(args[1..]);
+        }
+
+        if (args.Length > 0 && args[0] is "container-mount" or "container-unmount" or "container-verify" or "container-fix" or "container-manage")
+            return await ContainerCommand.RunAsync(args, operationDeadlineUtc: operationDeadlineUtc).ConfigureAwait(false);
+
+        if (args.Length > 0 && (VolumeManagementParameters.IsCommand(args[0]) || args[0] is "management-plan" or "management-apply" or "volume-verify" or "snapshot-list"))
+            return await ManagementCommand.RunAsync(args).ConfigureAwait(false);
+
+        if (args.Length > 0 && args[0] is "device-eject" or "rescan" or "device-rescan")
+            return await DeviceCommand.RunAsync(args).ConfigureAwait(false);
 
         if (args.Length > 0 && string.Equals(args[0], "drive-letter", StringComparison.OrdinalIgnoreCase))
             return await DriveLetterCommand.RunAsync(args[1..]).ConfigureAwait(false);
@@ -301,8 +360,22 @@ internal static class Program
         Add(response, "dryRunBehavior", "service-backed-inspection-only");
         Add(response, "automaticServiceStartup", "packaged-exe-only");
         Add(response, "snapshotInventory", "read-only-local-image");
+        Add(response, "systemDataBrowse", ApfsAccess.Backend.Native.NativeSystemDataBrowseLaunch.Capability);
+        Add(response, "systemDataBrowseUsage", SystemDataBrowseCommand.Usage);
+        Add(response, "snapshotControlUsage", SnapshotControlCommand.Usage);
+        Add(response, "containerControlUsage", ContainerCommand.Usage);
+        Add(response, "deviceControlUsage", DeviceCommand.Usage);
+        Add(response, "containerVerifyAvailability", ContainerVerificationBatch.Availability);
+        Add(response, "containerFixAvailability", ContainerFixBatch.Availability);
+        Add(response, "containerManageAvailability", "unavailable: " + ContainerCommand.ManageRefusal);
+        Add(response, "managementControlUsage", ManagementCommand.Usage);
+        Add(response, "volumeTopologyManagementUsage", VolumeTopologyCommand.Usage);
+        Add(response, "volumeTopologyManagementAvailability", "Requires native authoritative image observation, complete registry WAL census and an explicitly configured stable ManagementJournalRoot. Create/delete support regular offline images up to 256 MiB; whole-file Format/Erase/Grow/Shrink use bounded streamed evidence up to 1 TiB, subject to native geometry, ownership and retention proof.");
         Add(response, "verificationScope", VerifyCommand.Description);
         Add(response, "verificationUsage", VerifyCommand.Usage);
+        Add(response, "repairScope", RepairCommand.Description);
+        Add(response, "currentProfileVerificationUsage", VerifyProfileCommand.Usage);
+        Add(response, "repairUsage", RepairCommand.Usage);
         Add(response, "pipeName", options.PipeName);
         Add(response, "exitCodes", new Dictionary<string, int>(StringComparer.Ordinal)
         {
@@ -333,13 +406,24 @@ internal static class Program
         var response = CreateResponse(options, success: true, Success, ApfsOperationCodes.OperationSucceeded, null);
         Add(response, "usage", "ApfsAccess.Cli.exe <command> [options]");
         Add(response, "snapshotUsage", SnapshotCommand.Usage);
+        Add(response, "snapshotControlUsage", SnapshotControlCommand.Usage);
+        Add(response, "containerControlUsage", ContainerCommand.Usage);
+        Add(response, "deviceControlUsage", DeviceCommand.Usage);
+        Add(response, "containerVerifyAvailability", ContainerVerificationBatch.Availability);
+        Add(response, "containerFixAvailability", ContainerFixBatch.Availability);
+        Add(response, "containerManageAvailability", "unavailable: " + ContainerCommand.ManageRefusal);
+        Add(response, "managementControlUsage", ManagementCommand.Usage);
+        Add(response, "volumeTopologyManagementUsage", VolumeTopologyCommand.Usage);
+        Add(response, "volumeTopologyManagementAvailability", "Requires native authoritative image observation, complete registry WAL census and an explicitly configured stable ManagementJournalRoot. Create/delete support regular offline images up to 256 MiB; whole-file Format/Erase/Grow/Shrink use bounded streamed evidence up to 1 TiB, subject to native geometry, ownership and retention proof.");
         Add(response, "verificationUsage", VerifyCommand.Usage);
         Add(response, "verificationScope", VerifyCommand.Description);
+        Add(response, "repairUsage", RepairCommand.Usage);
+        Add(response, "repairScope", RepairCommand.Description);
         Add(response, "commands", ReportedCommands);
         Add(response, "options", new[]
         {
             "--device-id ID", "--volume-id ID", "--operation-id GUID", "--recovery-identity VALUE",
-            "--mode read-write|read-only", "--timeout-ms N", "--pipe-name NAME", "--dry-run",
+            "--mode read-write|read-only", "--approve-image-repair PLAN_ID", "--timeout-ms N", "--pipe-name NAME", "--dry-run",
             "--no-start-service", "--require-admin", "--elevate", "--human",
         });
         Add(response, "notes", new[]
@@ -425,6 +509,15 @@ internal static class Program
         try
         {
             connection = await ConnectAsync(options, deadlineTimestamp: deadline.Timestamp).ConfigureAwait(false);
+            var registered = (connection.Status.ConnectedInventory ?? []).SelectMany(d => d.Volumes).Where(v =>
+                v.RegisteredImage is not null && string.Equals(v.DeviceId,options.DeviceId,StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(v.VolumeId,options.VolumeId,StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (registered.Length == 1)
+            {
+                var target=SelectedControlTarget.ForImage(registered[0].RegisteredImage!);
+                if (!SelectedControlTarget.Matches(connection.Status.ConnectedInventory!,target)) throw new IOException("Registered image identity is ambiguous.");
+                issuedRequest=issuedRequest with { Target=target };
+            }
             var request = CreateControlOperationRequest(issuedRequest);
             await connection.Peer.SendAsync(request, connection.Token).ConfigureAwait(false);
             var result = await WaitForOperationResultAsync(
@@ -854,7 +947,8 @@ internal static class Program
             options.Command,
             target,
             options.Command == ApfsControlCommands.Mount ? options.RequestedMode : null,
-            expiresAtUtc);
+            expiresAtUtc,
+            ApprovedImageRepairPlanId: options.ApprovedImageRepairPlanId);
     }
 
     private static PipeEnvelope CreateControlOperationRequest(ControlOperationRequestPayload payload)
@@ -902,6 +996,12 @@ internal static class Program
             return false;
         }
 
+        if (expected.ApprovedImageRepairPlanId != actual.ApprovedImageRepairPlanId)
+        {
+            diagnostic = "The APFS service result repair approval does not match the issued request.";
+            return false;
+        }
+
         if (!string.Equals(
                 ApfsOperationFingerprint.Compute(expected),
                 actual.Fingerprint,
@@ -939,11 +1039,7 @@ internal static class Program
         string expected;
         try
         {
-            expected = ApfsOperationFingerprint.Compute(
-                result.Command,
-                result.Target,
-                result.RequestedMode,
-                result.ExpiresAtUtc.Value);
+            expected = ApfsOperationFingerprint.ComputeForResult(result);
         }
         catch (ArgumentException exception)
         {
@@ -1020,6 +1116,8 @@ internal static class Program
 
         return result.Command switch
         {
+            ApfsControlCommands.RegisterImage or ApfsControlCommands.Unlock or ApfsControlCommands.Lock =>
+                PipeMessageCodec.Validate(PipeMessageCodec.Create(ApfsMessageTypes.OperationResult,result,result.OperationId,PipeSchemaVersions.Schema2)).IsValid,
             ApfsControlCommands.Mount =>
                 result.RequestedMode is ApfsControlModes.ReadOnly or ApfsControlModes.ReadWrite &&
                 result.RequestedMode == result.EffectiveMode &&
@@ -1047,6 +1145,37 @@ internal static class Program
                 result.QuitMarkerWritten &&
                 !result.RecoveryActive &&
                 result.DirtyTransactionCount == 0,
+            ApfsControlCommands.SnapshotCreate =>
+                result.FinalStatus == "snapshot-created" &&
+                result.MountProof == "present" &&
+                result.OwnershipProof == "proven" &&
+                result.DurabilityProof == "not-applicable",
+            ApfsControlCommands.SnapshotDelete =>
+                result.FinalStatus == "snapshot-deleted" &&
+                result.MountProof == "present" &&
+                result.OwnershipProof == "proven" &&
+                result.DurabilityProof == "not-applicable",
+            ApfsControlCommands.SnapshotRecover =>
+                (result.FinalStatus == "snapshot-recovered" || result.FinalStatus == "snapshot-recover-noop") &&
+                result.MountProof == "present" &&
+                result.OwnershipProof == "proven" &&
+                result.DurabilityProof == "not-applicable",
+            ApfsControlCommands.ContainerMount =>
+                result.FinalStatus == "container-mounted" &&
+                result.RequestedMode == result.EffectiveMode &&
+                result.MountProof == "present" &&
+                result.OwnershipProof == "not-applicable" &&
+                result.DurabilityProof == "not-applicable",
+            ApfsControlCommands.ContainerUnmount =>
+                result.FinalStatus == "container-unmounted" &&
+                result.MountProof == "absent" &&
+                result.OwnershipProof == "proven" &&
+                result.DurabilityProof == "proven",
+            ApfsControlCommands.DeviceEject =>
+                result.FinalStatus == "device-ejected" &&
+                result.MountProof == "absent" &&
+                result.OwnershipProof == "proven" &&
+                result.DurabilityProof == "proven",
             _ => false,
         };
     }
@@ -1105,10 +1234,19 @@ internal static class Program
                 }
                 catch (UnauthorizedAccessException ex)
                 {
+                    var packagePathMismatch = ex.Message.Contains(
+                        "The service executable path is not part of this package.",
+                        StringComparison.OrdinalIgnoreCase);
+                    var message = $"Access to APFS service pipe '{options.PipeName}' was denied. {ex.Message}";
+                    if (packagePathMismatch)
+                    {
+                        message += " Use the CLI bundled with the running APFS Access app.";
+                    }
+
                     throw new CliException(
                         ElevationFailed,
                         ApfsOperationCodes.ElevationFailed,
-                        $"Access to APFS service pipe '{options.PipeName}' was denied.",
+                        message,
                         ex);
                 }
                 catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
@@ -1310,6 +1448,7 @@ internal static class Program
         string? recoveryIdentity = null;
         string? requestedMode = null;
         string? operationIdInput = null;
+        string? approvedImageRepairPlanId = null;
         var operationIdProvided = false;
         var timeout = TimeSpan.FromSeconds(30);
         var human = false;
@@ -1374,6 +1513,9 @@ internal static class Program
                     break;
                 case "--recovery-identity":
                     recoveryIdentity = RequireValue(args, ref index, token);
+                    break;
+                case "--approve-image-repair":
+                    approvedImageRepairPlanId = RequireValue(args, ref index, token);
                     break;
                 case "--operation-id":
                     operationIdInput = RequireValue(args, ref index, token);
@@ -1459,7 +1601,10 @@ internal static class Program
             pipeName,
             false,
             operationId,
-            operationIdProvided);
+            operationIdProvided)
+        {
+            ApprovedImageRepairPlanId = approvedImageRepairPlanId,
+        };
         ValidateOptions(options);
         return options;
     }
@@ -1468,6 +1613,16 @@ internal static class Program
     {
         var command = args.FirstOrDefault(argument =>
             KnownCommands.Contains(argument, StringComparer.OrdinalIgnoreCase));
+        if (command is null)
+        {
+            if (args.Length > 0 &&
+                !args[0].StartsWith("--", StringComparison.Ordinal) &&
+                !string.Equals(args[0], "-h", StringComparison.OrdinalIgnoreCase))
+            {
+                command = args[0];
+            }
+        }
+
         if (command is null && args.Contains("--version", StringComparer.OrdinalIgnoreCase))
         {
             command = "version";
@@ -1482,11 +1637,36 @@ internal static class Program
         return CliOptions.Default with
         {
             Command = command?.ToLowerInvariant() ?? CliOptions.Default.Command,
+            OperationId = TryExtractCallerOperationId(args) ?? NewOperationId(),
+            OperationIdProvided = TryExtractCallerOperationId(args) is not null,
         };
+    }
+
+    private static string? TryExtractCallerOperationId(string[] args)
+    {
+        for (var i = 0; i + 1 < args.Length; i++)
+        {
+            if (!string.Equals(args[i], "--operation-id", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (TryCanonicalizeOperationId(args[i + 1], out var canonical))
+            {
+                return canonical;
+            }
+
+            return null;
+        }
+
+        return null;
     }
 
     private static void ValidateOptions(CliOptions options)
     {
+        if (options.ApprovedImageRepairPlanId is { } approved &&
+            (options.Command != ApfsControlCommands.Fix || options.DryRun || !ImageRepairPersistence.Hex(approved)))
+            throw new CliArgumentException("--approve-image-repair requires fix and the exact displayed lowercase 64-character plan ID; it cannot be combined with --dry-run.");
         var hasDevice = !string.IsNullOrWhiteSpace(options.DeviceId);
         var hasVolume = !string.IsNullOrWhiteSpace(options.VolumeId);
         var hasRecoveryIdentity = options.RecoveryIdentity is not null;
@@ -1595,6 +1775,11 @@ internal static class Program
             throw new CliArgumentException("A custom --pipe-name cannot be combined with --elevate or --require-admin.");
         }
 
+        // This existing private namespace requires the same mutual Windows
+        // endpoint authentication as the fixed production pipe. Arbitrary
+        // custom pipes remain observation-only outside the in-process tests.
+        if (FusionControlEndpoint.IsPrivateInstance(options.PipeName)) return;
+
         if (!options.DryRun &&
             options.Command is "mount" or "fix" or "eject" or "quit" or "cancel")
         {
@@ -1637,7 +1822,18 @@ internal static class Program
     }
 
     private static bool IsDriveLetterPath(string value)
-        => value.Length >= 2 && char.IsLetter(value[0]) && value[1] == ':';
+    {
+        // Bare drive-letter mount points only (E:, E:\). Absolute image-file
+        // device IDs (D:\dir\file.apfs.img) are legitimate exact IDs and must
+        // not be rejected here.
+        if (value.Length < 2 || !char.IsLetter(value[0]) || value[1] != ':')
+        {
+            return false;
+        }
+
+        return value.Length == 2 ||
+               (value.Length == 3 && (value[2] == '\\' || value[2] == '/'));
+    }
 
     private static string NormalizeRequestedMode(string value)
         => value.ToLowerInvariant() switch
@@ -1834,6 +2030,9 @@ internal static class Program
         Add(response, "durabilityProof", result.DurabilityProof);
         Add(response, "expiresAtUtc", result.ExpiresAtUtc);
         Add(response, "diagnostic", result.Diagnostic);
+        if (result.ApprovedImageRepairPlanId is not null) Add(response, "approvedImageRepairPlanId", result.ApprovedImageRepairPlanId);
+        if (result.ImageRepairOffer is not null) Add(response, "imageRepairOffer", result.ImageRepairOffer);
+        if (result.ImageRepairReceipt is not null) Add(response, "imageRepairReceipt", result.ImageRepairReceipt);
     }
 
     private static int EmitFailure(CliOptions options, int exitCode, string code, string message)
@@ -1872,14 +2071,19 @@ internal static class Program
     {
         Console.WriteLine("APFS Access CLI");
         Console.WriteLine(VerifyCommand.Usage + " (covered current metadata subset)");
+        Console.WriteLine(RepairCommand.Usage + " (bounded offline count repair)");
         Console.WriteLine(SnapshotCommand.Usage + " (read-only image inventory)");
+        Console.WriteLine(SystemDataBrowseCommand.Usage + " (read-only paired image; native table admission required; Mac corpus unverified)");
         Console.WriteLine("Usage: ApfsAccess.Cli.exe <command> [options]");
         Console.WriteLine();
-        Console.WriteLine("Commands: status, list, mount, fix, eject, quit, query, cancel, version, capabilities, xattr");
+        Console.WriteLine("Commands: status, list, mount, fix, eject, quit, query, cancel, register-image, unlock, lock, version, capabilities, supervise-fshost, xattr, drive-letter, snapshots, snapshot-list, container-mount, container-unmount, container-verify, container-fix, container-manage, device-eject, rescan, management-plan, management-apply, volume-verify, verify, repair");
+        Console.WriteLine("Encrypted images: register-image --profile <selectors.json>; unlock --device-id <image> --volume-id <id> --credential-stdin; lock --device-id <image> --volume-id <id>.");
+        Console.WriteLine("Encrypted unlock accepts APC1 bytes through stdin only. Encrypted writes are unavailable. Optional --operation-id GUID supports querying the result.");
         Console.WriteLine("Use drive-letter --help to save a preferred letter for the next clean mount.");
         Console.WriteLine("Use xattr help for Mac file attributes and resource forks on a mounted APFS volume.");
         Console.WriteLine("Target options: --device-id ID --volume-id ID");
         Console.WriteLine("Operation options: --operation-id GUID --mode read-write|read-only --recovery-identity VALUE");
+        Console.WriteLine("Fix can offer a bounded image repair. Review it, then repeat fix with --approve-image-repair PLAN_ID to confirm that exact plan.");
         Console.WriteLine("General options: --timeout-ms N --pipe-name NAME --dry-run --no-start-service --require-admin --elevate --human");
         Console.WriteLine("JSON output is the default; use --human for this format.");
         Console.WriteLine("Dry-run performs bounded service inspection and never issues a mutation or claims feasibility.");
@@ -1903,6 +2107,7 @@ internal static class Program
         string OperationId,
         bool OperationIdProvided)
     {
+        public string? ApprovedImageRepairPlanId { get; init; }
         public static CliOptions Default { get; } = new(
             "status", null, null, null, null, TimeSpan.FromSeconds(30), false, false, false, false,
             ApfsPipeConstants.PipeName, false, NewOperationId(), false);

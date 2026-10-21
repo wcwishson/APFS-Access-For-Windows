@@ -212,6 +212,34 @@ struct DeferredAccessTimeFixture302
         return MergeCommittedInodeStateIntoNodeIndex(&c);
     }
 
+    bool ReplaySibling(const std::wstring& path = L"\\accepted-sibling-279")
+    {
+        // An idle worker may be retrying the selected volume. Hold its callback
+        // gate while bootstrap tries the complete peer set's publication gates.
+        auto& c = *fixture.context;
+        std::lock_guard<std::mutex> mutation(c.mutation_callback_mutex);
+        CompressionManifestRefusal279::OriginalSiblingRecoveryPeers recovery_peers(*this);
+        const auto* owner = sibling.tx_manager.get();
+        const auto identity = sibling.payload_spool_volume_identity;
+        const auto journal = sibling.session_root / "accepted.wal";
+        const auto marker = sibling.recovery_marker_file;
+        const auto before = sibling.tx_manager->Watermarks();
+        if (!ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(sibling)) return false;
+        const auto after = sibling.tx_manager->Watermarks();
+        const auto census = fixture.coordinator->CheckpointCensusSnapshot();
+        const auto peer = std::find_if(census.begin(), census.end(), [](const auto& entry) {
+            return entry.volume_object_id == 102;
+        });
+        return Require(sibling.tx_manager.get() == owner && sibling.payload_spool_volume_identity == identity &&
+            sibling.session_root / "accepted.wal" == journal && sibling.recovery_marker_file == marker &&
+            sibling.metadata_store->LookupCommittedInodeByPath(path) && sibling.tx_manager->RecoveryStateValid() &&
+            before.accepted_sequence != 0 && after.accepted_sequence == before.accepted_sequence &&
+            after.apfs_durable_sequence == before.accepted_sequence && after.cleanup_sequence == before.accepted_sequence &&
+            !sibling.tx_manager->HasUnappliedAcceptedWork() && peer != census.end() &&
+            !peer->unapplied_accepted_work && peer->required_checkpoint_xids.empty(),
+            "atime sibling replay retains original owner/storage and resolves exact durable/cleanup receipts and census");
+    }
+
     bool ReadCleanup(std::wstring path, std::uint64_t& access_time)
     {
         auto fs = BuildFileSystem(fixture.context.get());
@@ -438,6 +466,54 @@ bool TestDeferredAccessTimeAcceptedFailure302(bool manifest, bool after_publicat
             "failed shutdown cannot erase accepted access-time recovery evidence");
 }
 
+struct DeferredAccessTimeWorkerTimes302
+{
+    ULONGLONG worker_start = 0, wait_start = 0, wait_end = 0, stop_end = 0;
+    std::atomic<ULONGLONG> publication{0};
+};
+
+void ReportDeferredAccessTimeWorkerFailure302(const char* test, bool manifest, MountContext& c,
+    bool completed, bool stopped, unsigned publications, const DeferredAccessTimeWorkerTimes302& times)
+{
+    const auto published = times.publication.load();
+    std::cerr << "[atime302-failure] test=" << test << " manifest=" << manifest
+        << " completed=" << completed << " stopped=" << stopped << " publications=" << publications
+        << " degraded=" << c.write_degraded.load() << " worker_age_ms=" << times.stop_end - times.worker_start
+        << " wait_ms=" << times.wait_end - times.wait_start << " stop_ms=" << times.stop_end - times.wait_end
+        << " published=" << (published != 0) << " publication_after_start_ms="
+        << (published ? published - times.worker_start : 0)
+        << " admission=" << c.mutation_admission_state.load()
+        << " foreground=" << c.active_foreground_mutation_callbacks.load();
+    // The worker owns the queue until it has joined. Diagnostics must not race it.
+    if (stopped) std::cerr << " queue=" << c.deferred_access_times.size()
+        << " overflow=" << c.deferred_access_time_overflow;
+    else std::cerr << " queue=unread-worker-active";
+    {
+        std::unique_lock<std::mutex> schedule(c.deferred_commit_mutex, std::try_to_lock);
+        if (schedule.owns_lock()) std::cerr << " worker_done=" << c.deferred_commit_worker_done
+            << " atime_requested=" << c.deferred_access_time_requested
+            << " close_requested=" << c.deferred_commit_requested << " in_flight=" << c.deferred_commit_in_flight
+            << " requested_target=" << c.deferred_commit_requested_target
+            << " in_flight_target=" << c.deferred_commit_in_flight_target
+            << " completed_target=" << c.deferred_commit_completed_target
+            << " failed_target=" << c.deferred_commit_failed_target;
+        else std::cerr << " scheduler=busy";
+    }
+    std::cerr << " hooks=" << (g_mutation_admission_pause_hook != nullptr)
+        << (g_hydration_read_before_io_hook != nullptr)
+        << (g_hydration_materialization_before_publish_hook != nullptr)
+        << (g_lazy_payload_handle_published_hook != nullptr);
+    for (const auto* name : {L"APFSACCESS_DISABLE_CONTENT_WRITEBACK", L"APFSACCESS_DEFER_CLOSE_COMMITS",
+            L"APFSACCESS_DISABLE_MANIFEST_WRITE_BATCHING", L"APFSACCESS_PERF_COUNTERS"})
+    {
+        wchar_t value[128]{};
+        const auto length = GetEnvironmentVariableW(name, value, static_cast<DWORD>(std::size(value)));
+        std::cerr << ' ' << WideToUtf8(name) << '=' << (length == 0 ? "<unset>" :
+            length >= std::size(value) ? "<long>" : WideToUtf8(value));
+    }
+    std::cerr << '\n';
+}
+
 bool TestDeferredAccessTimeWorker302(bool manifest)
 {
     if (!DeferredAccessTimeScratch302()) return false;
@@ -449,16 +525,27 @@ bool TestDeferredAccessTimeWorker302(bool manifest)
     std::promise<void> published;
     auto publication = published.get_future();
     std::atomic<unsigned> count{0};
+    DeferredAccessTimeWorkerTimes302 times;
     c.metadata_store->SetCommitStageHook([&](std::string_view stage) {
-        if (stage == "after-apple-publish" && count.fetch_add(1) == 0) published.set_value();
+        if (stage == "after-apple-publish" && count.fetch_add(1) == 0)
+        {
+            times.publication.store(GetTickCount64());
+            published.set_value();
+        }
         return true;
     });
     ScopeExit stop{[&] { StopDeferredCommitWorker(&c); c.metadata_store->SetCommitStageHook({}); }};
+    times.worker_start = times.wait_start = GetTickCount64();
     StartDeferredCommitWorker(&c);
     const bool completed = publication.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    times.wait_end = GetTickCount64();
     // Join before reopening: observing the publication hook alone does not
     // prove WAL finalization or worker/context lifetime has completed.
-    if (!Require(StopDeferredCommitWorker(&c) && completed && count.load() == 1,
+    const bool stopped = StopDeferredCommitWorker(&c);
+    times.stop_end = GetTickCount64();
+    const bool passed = stopped && completed && count.load() == 1;
+    if (!passed) ReportDeferredAccessTimeWorkerFailure302("worker", manifest, c, completed, stopped, count.load(), times);
+    if (!Require(passed,
             "existing deferred worker persists idle read atime without a flush callback")) return false;
     return owned.CheckFresh({{L"\\read17", time}, {L"\\alias", time}});
 }
@@ -512,8 +599,13 @@ bool TestDeferredAccessTimeEarlierCommitRefusal568(bool retryable)
     std::promise<void> published;
     auto publication = published.get_future();
     std::atomic<unsigned> count{0};
+    DeferredAccessTimeWorkerTimes302 times;
     c.metadata_store->SetCommitStageHook([&](std::string_view stage) {
-        if (stage == "after-apple-publish" && count.fetch_add(1) == 0) published.set_value();
+        if (stage == "after-apple-publish" && count.fetch_add(1) == 0)
+        {
+            times.publication.store(GetTickCount64());
+            published.set_value();
+        }
         return true;
     });
     ScopeExit stop{[&] { StopDeferredCommitWorker(&c); c.metadata_store->SetCommitStageHook({}); }};
@@ -524,6 +616,7 @@ bool TestDeferredAccessTimeEarlierCommitRefusal568(bool retryable)
         c.deferred_commit_deadline_tick_ms = GetTickCount64();
         c.deferred_access_time_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     }
+    times.worker_start = GetTickCount64();
     StartDeferredCommitWorker(&c);
     const auto first_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (c.deferred_commit_worker_claim_attempt_count.load() == 0 &&
@@ -553,11 +646,16 @@ bool TestDeferredAccessTimeEarlierCommitRefusal568(bool retryable)
                 c.deferred_access_times.size() == 1 && std::filesystem::exists(c.recovery_marker_file),
                 "terminal preclaim failure settles the worker and retains recovery diagnostics");
     }
-    if (!Require(!c.write_degraded && ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(owned.sibling),
+    if (!Require(!c.write_degraded && owned.ReplaySibling(),
             "real sibling recovery releases retryable atime backpressure")) return false;
+    times.wait_start = GetTickCount64();
     const bool completed = publication.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
-    if (!Require(StopDeferredCommitWorker(&c) && completed && count.load() == 1 && !c.write_degraded &&
-            c.deferred_access_times.empty(), "worker eventually publishes after sibling refusal clears")) return false;
+    times.wait_end = GetTickCount64();
+    const bool stopped = StopDeferredCommitWorker(&c);
+    times.stop_end = GetTickCount64();
+    const bool passed = stopped && completed && count.load() == 1 && !c.write_degraded && c.deferred_access_times.empty();
+    if (!passed) ReportDeferredAccessTimeWorkerFailure302("sibling-retry", retryable, c, completed, stopped, count.load(), times);
+    if (!Require(passed, "worker eventually publishes after sibling refusal clears")) return false;
     return owned.CheckFresh({{L"\\read17", time}, {L"\\alias", time}});
 }
 
@@ -629,7 +727,7 @@ bool TestDeferredAccessTimePressure311()
             !c.write_degraded && IsNativeWriteEnabled(&c) && image == ReadFileBytes(owned.fixture.image.path) &&
             wal == ReadFileBytes(c.session_root / "accepted.wal"),
             "514 successful reads retain all times through repeated real sibling-census refusal with a bounded queue")) return false;
-    if (!Require(ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(owned.sibling), "first sibling replay resolves refusal"))
+    if (!Require(owned.ReplaySibling(), "first sibling replay resolves refusal"))
     {
         const auto* store = owned.sibling.metadata_store;
         std::wcerr << L"[atime311] sibling oid=" << owned.sibling.args.volume_object_id
@@ -651,7 +749,7 @@ bool TestDeferredAccessTimePressure311()
     if (!CompressionManifestRefusal279::SeedAcceptedSibling(owned, L"\\accepted-sibling-second-314")) return false;
     if (!Require(CB_Flush(&fs, nullptr, nullptr) == STATUS_DEVICE_BUSY && c.deferred_access_time_requested &&
             c.deferred_access_times.size() == 2, "new refusal between batches keeps both remaining times scheduled")) return false;
-    if (!Require(ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(owned.sibling),
+    if (!Require(owned.ReplaySibling(L"\\accepted-sibling-second-314"),
             "second sibling replay uses the generation after first timestamp batch")) return false;
     std::promise<void> published; auto publication = published.get_future();
     std::atomic<unsigned> count_published{0};
@@ -746,7 +844,7 @@ bool TestDeferredAccessTimeIdleSiblingRetry582(bool stop_before_recovery)
                 "idle582: real refused coordinator attempts are spaced, unaccepted and preserve exact queued time")) return false;
     }
     if (stop_before_recovery && !Require(StopDeferredCommitWorker(&c), "idle582: refused idle worker joins")) return false;
-    if (!Require(ReplayAcceptedWriteAheadLogAfterMetadataBootstrap(owned.sibling),
+    if (!Require(owned.ReplaySibling(),
             "idle582: real sibling WAL recovery releases admission without a selected-context callback")) return false;
     if (stop_before_recovery)
     {

@@ -98,8 +98,14 @@ public sealed record DeviceInfo(string DeviceId, string DisplayName, bool IsConn
 
 public sealed record DeviceInventory(
     DeviceInfo Device,
-    IReadOnlyList<VolumeInfo> Volumes
+    IReadOnlyList<VolumeInfo> Volumes,
+    ApfsDiscoveryTopology? Topology = null
 );
+
+// Published with the rows built by this observation, never fetched from a latest-value cache.
+// DiskIds are explicit observer source bindings; IDs in Snapshot retain their catalog spelling.
+public sealed record ApfsDiscoveryTopology(
+    long Generation, string DeviceId, IReadOnlyList<string> DiskIds, ApfsTopologySnapshot Snapshot);
 
 public sealed record VolumeInfo(
     string VolumeId,
@@ -124,7 +130,11 @@ public sealed record VolumeInfo(
     string? NativeWriteAdmissionBlockReason = null,
     string? CatalogVolumeUuid = null,
     DriveLetterPreference? DriveLetterPreference = null,
-    ApfsVolumeSpaceObservation? CatalogSpace = null
+    ApfsVolumeSpaceObservation? CatalogSpace = null,
+    EncryptedImageProfile? RegisteredImage = null,
+    EncryptedVolumeState? EncryptionState = null,
+    FusionImageProfile? RegisteredFusion = null,
+    BackupImageWriteCandidate? BackupImageWrite = null
 );
 
 public sealed record MountRequest(string VolumeId, char DriveLetter, MountAccessMode AccessMode);
@@ -168,7 +178,10 @@ public sealed record UnmountResult(
     string? Error,
     bool MountRemoved = false,
     bool HostOwnershipReleased = false,
-    bool PendingDurabilityCleared = false);
+    bool PendingDurabilityCleared = false)
+{
+    public bool ContainerMemberDetached { get; init; }
+}
 
 public sealed record MountedVolumeState(
     string VolumeId,
@@ -206,5 +219,18 @@ public sealed record MountedVolumeState(
     ApfsCapabilityDecision? CatalogDecision = null,
     IReadOnlyList<string>? CatalogReasons = null,
     bool? CatalogAutoMountAllowed = null,
-    ApfsVolumeSpaceObservation? CatalogSpace = null
+    ApfsVolumeSpaceObservation? CatalogSpace = null,
+    string? CatalogVolumeUuid = null,
+    bool SnapshotInventorySupported = false,
+    bool SnapshotMutationSupported = false,
+    bool VolumeVerificationSupported = false,
+    LiveVolumeVerificationScope? VolumeVerificationScope = null,
+    bool? RuntimeWatermarksKnown = null,
+    bool RuntimeMutationPending = false,
+    bool SnapshotRecoverySupported = false,
+    long HostProcessCreationTimeFileTimeUtc = 0
 );
+
+// Selection pins copied from runtime status; native capability remains the authority.
+public sealed record SnapshotRuntimeAuthority(int HostProcessId,
+    long HostProcessCreationTimeFileTimeUtc, LiveVolumeVerificationScope Scope);

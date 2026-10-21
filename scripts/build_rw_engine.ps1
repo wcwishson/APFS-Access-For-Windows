@@ -70,7 +70,11 @@ if ([string]::IsNullOrWhiteSpace($cmakeExe)) {
 
 if ($Generator -eq "NMake Makefiles" -and -not (Get-Command nmake -ErrorAction SilentlyContinue)) {
     Write-Warning "nmake was not found in PATH. Falling back to Visual Studio generator."
-    $Generator = "Visual Studio 17 2022"
+    $Generator = if (Test-Path "C:\Program Files (x86)\Microsoft Visual Studio\18") {
+        "Visual Studio 18 2026"
+    } else {
+        "Visual Studio 17 2022"
+    }
 }
 
 New-Item -ItemType Directory -Force -Path $BuildDir, $OutputDir | Out-Null

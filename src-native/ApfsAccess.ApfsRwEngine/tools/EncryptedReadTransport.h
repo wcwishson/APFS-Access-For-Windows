@@ -37,6 +37,9 @@ public:
     std::uint64_t Revision() const override { return revision_; }
     std::shared_ptr<catalog::ApfsReadBudget> ReadBudget() const override { return budget_; }
     bool Read(std::uint64_t offset, std::size_t size, std::vector<std::byte>& out) const override;
+    std::optional<catalog::EncryptedRuntimeReadLimits> RuntimeReadLimits() const override
+    { return catalog::EncryptedRuntimeReadLimits{}; }
+    bool ReadRuntime(const RuntimeRead& request, std::vector<std::byte>& out) const override;
     bool VerifyUnchanged() const { return lease_->VerifyUnchanged(); }
 private:
     std::shared_ptr<WindowsImageLease> lease_;

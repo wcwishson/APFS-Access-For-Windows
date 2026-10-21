@@ -43,6 +43,43 @@ private:
     const apfsaccess::rw::BlockDevice& device_;
 };
 
+// Pure name-to-XID resolution over a loaded inventory. Exactly one entry must
+// carry the name; ambiguity and absence refuse. Unit-testable without I/O.
+bool ResolveSnapshotXidByName(
+    const std::vector<apfsaccess::catalog::ApfsSnapshotInfo>& inventory,
+    const std::string& wanted_name,
+    std::uint64_t& out_xid,
+    std::string& error)
+{
+    out_xid = 0;
+    error.clear();
+    if (wanted_name.empty())
+    {
+        error = "SnapshotNameNotFound";
+        return false;
+    }
+    const apfsaccess::catalog::ApfsSnapshotInfo* named = nullptr;
+    for (const auto& snapshot : inventory)
+    {
+        if (snapshot.identity.name_utf8 == wanted_name)
+        {
+            if (named)
+            {
+                error = "SnapshotNameAmbiguous";
+                return false;
+            }
+            named = &snapshot;
+        }
+    }
+    if (!named)
+    {
+        error = "SnapshotNameNotFound";
+        return false;
+    }
+    out_xid = named->identity.snapshot_xid;
+    return true;
+}
+
 bool PrepareExplicitSnapshotMount(MountContext& ctx, std::string& error)
 {
     using namespace apfsaccess::catalog;
@@ -88,9 +125,20 @@ bool PrepareExplicitSnapshotMount(MountContext& ctx, std::string& error)
         volume.volume_uuid_hex, volume.object_id, container->checkpoint_xid};
     std::vector<ApfsSnapshotInfo> inventory;
     if (!ApfsSnapshotStore::Enumerate(source, scope, inventory, error)) return false;
+    std::uint64_t selected_xid = ctx.args.snapshot_xid;
+    if (selected_xid == 0)
+    {
+        // Name selection: exactly one inventory entry must carry the
+        // requested name. The resolved XID flows through the identical
+        // single-XID path below, so ambiguity can never select silently.
+        // Conversion failure maps to not-found (fail closed).
+        const std::string wanted = WideToUtf8(ctx.args.snapshot_name);
+        if (!ResolveSnapshotXidByName(inventory, wanted, selected_xid, error)) return false;
+        arguments.snapshot_xid = selected_xid;
+    }
     const ApfsSnapshotInfo* selected = nullptr;
     for (const auto& snapshot : inventory)
-        if (snapshot.identity.snapshot_xid == ctx.args.snapshot_xid)
+        if (snapshot.identity.snapshot_xid == selected_xid)
         {
             if (selected) { error = "SnapshotXidAmbiguous"; return false; }
             selected = &snapshot;

@@ -9,6 +9,7 @@
 
 #include "ApfsContainerCatalog.h"
 #include "ApfsReadBudgetTests.h"
+#include "ApfsOmapLookupTests.h"
 #include "ApfsRecoveryBudgetTests.h"
 #include "ApfsFormat.h"
 #include "ApfsExtendedRecordCodec.h"
@@ -492,7 +493,7 @@ struct AuthoritativeCheckpointFixture
 };
 
 AuthoritativeCheckpointFixture BuildAuthoritativeCheckpointFixture(
-    bool map_free_queue = true)
+    bool map_free_queue = true, bool include_fext = true)
 {
     constexpr std::uint32_t kBlockSize = 4096;
     constexpr std::uint64_t kContainerOmapBlock = 2;
@@ -537,12 +538,11 @@ AuthoritativeCheckpointFixture BuildAuthoritativeCheckpointFixture(
     volume.extentref_tree_oid = kExtentrefRootBlock;
     volume.snap_meta_tree_type = 0x00000002;
     volume.snap_meta_tree_oid = fixture.snapshot_root_oid;
-    volume.fext_tree_type = 0x40000002;
-    volume.fext_tree_oid = kFextRootBlock;
-    // Root, extent-reference, snapshot, and fext trees plus the volume object
-    // map object and its tree are all allocated to this volume.
-    volume.file_system_allocated_blocks = 6;
-    volume.total_blocks_allocated = 6;
+    volume.fext_tree_type = include_fext ? 0x40000002 : 0;
+    volume.fext_tree_oid = include_fext ? kFextRootBlock : 0;
+    // Include the APSB, matching canonical builder and writer accounting.
+    volume.file_system_allocated_blocks = include_fext ? 7 : 6;
+    volume.total_blocks_allocated = volume.file_system_allocated_blocks;
     volume.next_object_id = 0x6000;
     store.volumes.push_back(volume);
     fixture.image = BuildStoreImage(store);
@@ -598,10 +598,11 @@ AuthoritativeCheckpointFixture BuildAuthoritativeCheckpointFixture(
     };
     std::vector<std::byte> chunk_zero_bitmap(kBlockSize, std::byte{0});
     for (const std::uint64_t block : {0ull, 1ull, 2ull, 3ull, 4ull, 32ull,
-             33ull, 34ull, 35ull, 40ull, 41ull})
+             33ull, 34ull, 35ull, 40ull})
     {
         set_bit(chunk_zero_bitmap, block);
     }
+    if (include_fext) set_bit(chunk_zero_bitmap, kFextRootBlock);
     std::vector<std::byte> chunk_one_bitmap(kBlockSize, std::byte{0});
     for (std::uint64_t block = 64; block <= 95; ++block)
     {
@@ -695,7 +696,7 @@ AuthoritativeCheckpointFixture BuildAuthoritativeCheckpointFixture(
 
     PutFixtureBlock(fixture.image, kContainerOmapBlock, kBlockSize,
         BuildOmap(kContainerOmapTreeBlock, fixture.checkpoint_xid, kBlockSize,
-            kContainerOmapBlock, 0x4000000B, 0x40000002));
+            kContainerOmapBlock, 0x4000000B, 0x40000002, 1));
     PutFixtureBlock(fixture.image, kContainerOmapTreeBlock, kBlockSize,
         BuildBtreeNode({OmapRecordSpec{fixture.volume_oid,
             kVolumeSuperblockBlock, 0, fixture.checkpoint_xid}},
@@ -723,10 +724,47 @@ AuthoritativeCheckpointFixture BuildAuthoritativeCheckpointFixture(
     PutFixtureBlock(fixture.image, kExtentrefRootBlock, kBlockSize,
         BuildRawLeafNode({}, {}, fixture.checkpoint_xid, kBlockSize, 0,
             kExtentrefRootBlock, 0x40000002, 0x0000000F));
-    PutFixtureBlock(fixture.image, kFextRootBlock, kBlockSize,
-        BuildRawLeafNode({}, {}, fixture.checkpoint_xid, kBlockSize, 0,
-            kFextRootBlock, 0x40000002, 0x0000001F));
+    if (include_fext)
+        PutFixtureBlock(fixture.image, kFextRootBlock, kBlockSize,
+            BuildRawLeafNode({}, {}, fixture.checkpoint_xid, kBlockSize, 0,
+                kFextRootBlock, 0x40000002, 0x0000001F));
     return fixture;
+}
+
+AuthoritativeCheckpointFixture BuildOrdinaryCheckpointFixture()
+{
+    return BuildAuthoritativeCheckpointFixture(true, false);
+}
+
+bool TestOrdinaryCheckpointFixtureScope()
+{
+    using namespace apfsaccess::catalog;
+    using namespace apfsaccess::rw;
+    bool ok = true;
+    for (bool sealed : {false, true})
+    {
+        const auto fixture = BuildAuthoritativeCheckpointFixture(true, sealed);
+        VectorRandomAccessSource source(fixture.image); std::string error;
+        const auto checkpoint = LoadAppleCheckpointView(source, 0, source.SizeBytes(), error);
+        if (!Require(checkpoint.has_value(), "ordinary and sealed checkpoint vectors remain parseable: " + error)) return false;
+        const auto& volume = checkpoint->volumes.front();
+        std::set<std::uint64_t> metadata{volume.superblock_object.physical_block,
+            volume.object_map.object.physical_block, volume.object_map.tree.physical_block,
+            volume.root_tree.physical_block, volume.extentref_tree->physical_block,
+            volume.snapshot_metadata_tree->physical_block};
+        if (volume.file_extent_tree) metadata.insert(volume.file_extent_tree->physical_block);
+        ok &= Require(volume.file_extent_tree.has_value() == sealed &&
+            volume.superblock.space.allocated_block_count == metadata.size(),
+            "fixture optional-root profile has exact declared ownership counters");
+        AppleVolumeTransactionRequest request; request.volume_object_id = fixture.volume_oid;
+        if (!Require(ReadAppleVolumeFileSystemRecords(source, checkpoint->container, volume,
+                request.filesystem_records, error), "fixture scope reads canonical records")) return false;
+        AppleVolumeTransactionPlan plan;
+        const bool planned = PlanAppleVolumeTransaction(source, *checkpoint, request, plan, error);
+        ok &= Require(planned == !sealed && (!sealed || error == "SnapshotVolumeStateOrReservedFieldsUnsupported"),
+            "sealed optional tree stays outside ordinary publication admission: " + error);
+    }
+    return ok;
 }
 
 AuthoritativeCheckpointFixture BuildRetainedCheckpointFixture(
@@ -804,6 +842,78 @@ AuthoritativeCheckpointFixture BuildRetainedCheckpointFixture(
         BuildRootFsLeaf(newer_xid, block_size,
             fixture.volume_root_oid, 0x00000002, 0x0000000E));
     return fixture;
+}
+
+bool TestExactCheckpointAvoidsUnrelatedMappedReads()
+{
+    using namespace apfsaccess::catalog;
+    class ObservedSource final : public RandomAccessSource
+    {
+    public:
+        explicit ObservedSource(const std::vector<std::byte>& image) : bytes(image) {}
+        std::uint64_t SizeBytes() const override { return bytes.size(); }
+        bool Read(std::uint64_t offset, std::size_t size, std::vector<std::byte>& out) const override
+        {
+            reads.push_back({offset, size});
+            out.clear();
+            if (offset > bytes.size() || size > bytes.size() - offset) return false;
+            const auto begin = bytes.begin() + static_cast<std::ptrdiff_t>(offset);
+            out.assign(begin, begin + static_cast<std::ptrdiff_t>(size));
+            return true;
+        }
+        bool ReadBlock(std::uint64_t block) const
+        {
+            const auto begin = block * 4096;
+            return std::any_of(reads.begin(), reads.end(), [&](const auto& read) {
+                return read.first < begin + 4096 && begin < read.first + read.second;
+            });
+        }
+        bool ReadFullBlock(std::uint64_t block, std::uint64_t block_size) const
+        {
+            const auto begin = block * block_size;
+            return std::any_of(reads.begin(), reads.end(), [&](const auto& read) {
+                return read.first <= begin && read.second >= begin - read.first + block_size;
+            });
+        }
+        const std::vector<std::byte>& bytes;
+        mutable std::vector<std::pair<std::uint64_t, std::size_t>> reads;
+    };
+    auto fixture = BuildRetainedCheckpointFixture();
+    const auto anchor = ParseNxSuperblock(std::vector<std::byte>(
+        fixture.image.begin(), fixture.image.begin() + 4096));
+    if (!Require(anchor.has_value(), "read-observation fixture has valid descriptor geometry")) return false;
+    bool ok = true;
+    for (const auto target : {20ull, 21ull})
+    {
+        ObservedSource source(fixture.image);
+        std::string error;
+        const auto view = LoadContainerCheckpointView(source, 0, source.SizeBytes(), error, target);
+        ok &= Require(view && error.empty() && view->superblock.xid == target,
+            "exact checkpoint keeps the complete requested generation");
+        const auto selected = target == 20 ? 88ull : 91ull;
+        const auto unrelated = target == 20 ? 91ull : 88ull;
+        ok &= Require(source.ReadBlock(selected) && !source.ReadBlock(unrelated),
+            "exact checkpoint deep-validates only matching mapped objects");
+        for (std::uint32_t index = 0; index < anchor->xp_desc_block_count; ++index)
+            ok &= Require(source.ReadFullBlock(anchor->xp_desc_base_block + index, anchor->block_size),
+                "exact checkpoint still observes every full descriptor block");
+    }
+    ObservedSource latest(fixture.image);
+    std::string error;
+    const auto view = LoadContainerCheckpointView(latest, 0, latest.SizeBytes(), error);
+    ok &= Require(view && view->superblock.xid == 21 && latest.ReadBlock(88) && latest.ReadBlock(91),
+        "latest checkpoint retains complete candidate validation");
+
+    ObservedSource fresh(fixture.image);
+    ok &= Require(LoadContainerCheckpointView(fresh, 0, fresh.SizeBytes(), error, 20).has_value(),
+        "first exact acquisition succeeds");
+    fixture.image[88 * 4096 + 64] ^= std::byte{0x5A};
+    ok &= Require(!LoadContainerCheckpointView(fresh, 0, fresh.SizeBytes(), error, 20) && !error.empty(),
+        "same identity and XID cannot reuse a previous checksum verdict");
+    ObservedSource other(fixture.image);
+    ok &= Require(LoadContainerCheckpointView(other, 0, other.SizeBytes(), error, 21).has_value() &&
+            !other.ReadBlock(88), "unrelated corrupt mapped object does not invalidate an exact generation");
+    return ok;
 }
 
 bool TestExactCheckpointSelectsRetainedGeneration()
@@ -3051,7 +3161,7 @@ bool TestNativeWriterFeatureAdmission()
     bool ok = true;
     for (const auto& entry : cases)
     {
-        auto fixture = BuildAuthoritativeCheckpointFixture();
+        auto fixture = BuildOrdinaryCheckpointFixture();
         std::size_t patched = 0;
         for (std::size_t offset = 0; offset + 4096 <= fixture.image.size(); offset += 4096)
         {
@@ -3128,7 +3238,7 @@ bool TestNativeWriterFeatureAdmission()
 
 bool TestMetadataStoreCommitsAppleFileToAuthoritativeImage()
 {
-    const auto fixture = BuildAuthoritativeCheckpointFixture();
+    const auto fixture = BuildOrdinaryCheckpointFixture();
     TempImageFile file(fixture.image, "metadata-store-apple-commit", ".raw");
     apfsaccess::rw::MetadataStore::VolumeContext context;
     context.device_path = file.path.wstring();
@@ -3245,7 +3355,7 @@ bool TestAppleCommitRangeProviderRefusalIsAuthoritative()
 
     const auto run_case = [&](ProviderMode mode, const std::string& tag) -> bool
     {
-        const auto fixture = BuildAuthoritativeCheckpointFixture();
+        const auto fixture = BuildOrdinaryCheckpointFixture();
         TempImageFile file(fixture.image, tag, ".raw");
         MetadataStore::VolumeContext context;
         context.device_path = file.path.wstring();
@@ -3391,7 +3501,7 @@ bool TestAppleCommitRangeProviderRefusalIsAuthoritative()
 
 bool TestMetadataStoreAppleTransactionLifecycle()
 {
-    const auto fixture = BuildAuthoritativeCheckpointFixture();
+    const auto fixture = BuildOrdinaryCheckpointFixture();
     TempImageFile file(fixture.image, "metadata-store-apple-lifecycle", ".raw");
     apfsaccess::rw::MetadataStore::VolumeContext context;
     context.device_path = file.path.wstring();
@@ -4438,6 +4548,10 @@ bool TestReaderProjectsSymbolicLinkTargetWithoutResolvingIt()
     link.children_or_links = 1;
     link.mode = 0120777;
     link.uncompressed_size = 17;
+    // Apple APFS reference j_inode_val_t (p77): the size field is
+    // padding unless flagged; the 17-byte target claim needs the flag
+    // for the projection size check to engage.
+    link.internal_flags |= kAppleInodeHasUncompressedSize;
     encoded = {};
     if (!append(EncodeAppleInodeRecord(link, encoded, error), encoded,
             "symlink fixture inode encodes"))
@@ -4991,9 +5105,17 @@ bool TestDirectorySymbolicLinkConversionRejectsUnsafeState(bool restore = false)
             {
                 inode.mode = 0120755; inode.children_or_links = 1;
                 inode.uncompressed_size = 3; // Embedded target "./x" is three bytes.
+                // Apple APFS reference j_inode_val_t (p77): the size field
+                // is padding unless flagged; the control "identity" case
+                // needs a real claim so the import succeeds and the
+                // staging-time identity check is what refuses.
+                inode.internal_flags |= kAppleInodeHasUncompressedSize;
             }
             if (id == 23 && (label == "maintain-stats" || label == "stats-origin"))
-                inode.internal_flags = label == "maintain-stats" ? 0x2 : 0x4;
+                // Preserve any size-claim flag set above: the restore
+                // variants carry a flagged size, and overwriting the field
+                // would silently turn the claim back into padding.
+                inode.internal_flags |= label == "maintain-stats" ? 0x2 : 0x4;
             if (id == 23 && (label == "directory-stats" || label == "mounted-uuid" ||
                     label == "unknown-field" || label == "directory-dstream"))
             {
@@ -5135,6 +5257,10 @@ bool TestDirectorySymbolicLinkPendingTransitions(const std::string& restore_scen
             {
                 inode.mode = 0120755; inode.children_or_links = 1;
                 inode.uncompressed_size = 3; // Embedded target "./x" is three bytes.
+                // Apple APFS reference j_inode_val_t (p77): the size field
+                // is padding unless flagged; the 3-byte target claim needs
+                // the flag for the projection size check to engage.
+                inode.internal_flags |= kAppleInodeHasUncompressedSize;
             }
             if (id == 23 && label == "replacement")
             {
@@ -5306,6 +5432,7 @@ struct ExternalXattrFixtureSpec
     bool owner_decmpfs = false;
     std::uint64_t attribute_owner_inode = 2;
     bool share_external_with_root = false;
+    bool share_external_with_owner = false;
     bool second_file_alias = false;
     std::uint64_t logical_size = 5000;
     std::uint64_t allocated_size = 2 * kExternalXattrBlockSize;
@@ -5328,11 +5455,16 @@ struct ExternalXattrFixtureSpec
     std::vector<apfsaccess::rw::ApplePhysicalExtentRecord> physical_extents{
         {kExternalXattrFirstBlock, 1,
             apfsaccess::rw::kApplePhysicalExtentKindNew,
-            kExternalXattrStreamId, 1},
+            2, 1},
         {kExternalXattrSecondBlock, 1,
             apfsaccess::rw::kApplePhysicalExtentKindNew,
-            kExternalXattrStreamId, 1},
+            2, 1},
     };
+    void SetOwner(std::uint64_t owner)
+    {
+        attribute_owner_inode = owner;
+        for (auto& extent : physical_extents) extent.owning_object_id = owner;
+    }
 };
 
 std::vector<std::byte> ExternalXattrPayloadBlock(unsigned int multiplier, unsigned int addend)
@@ -5394,12 +5526,18 @@ std::vector<std::byte> BuildExternalXattrRangeImage(
         link.file_id = alias.object_id;
         link.flags = 8;
         link.name_utf8 = "alias.bin";
+        if (spec.second_file_alias)
+        {
+            AppleExtendedField sibling{1, 0, std::vector<std::byte>(8)};
+            PutU64LE(sibling.data, 0, 700); link.extended_fields.push_back(std::move(sibling));
+        }
         encoded = {};
         if (!append(EncodeAppleDirectoryRecord(link, encoded, error), encoded,
                 "external xattr private-ID alias link encodes")) return {};
         if (spec.second_file_alias)
         {
             link.name_utf8 = "second.bin";
+            PutU64LE(link.extended_fields.front().data, 0, 701);
             if (!append(EncodeAppleDirectoryRecord(link, encoded, error), encoded,
                     "external owner second link encodes")) return {};
             for (const auto& [name, sibling] :
@@ -5441,10 +5579,10 @@ std::vector<std::byte> BuildExternalXattrRangeImage(
                 "opaque compression marker encodes")) return {};
     }
 
-    if (spec.share_external_with_root)
+    if (spec.share_external_with_root || spec.share_external_with_owner)
     {
         auto shared = external;
-        shared.object_id = 2;
+        shared.object_id = spec.share_external_with_root ? 2 : spec.attribute_owner_inode;
         shared.name_utf8 = "user.shared-external";
         if (!append(EncodeAppleXattrRecord(shared, encoded, error), encoded,
                 "shared external xattr descriptor encodes")) return {};
@@ -5530,6 +5668,38 @@ std::vector<std::byte> BuildExternalXattrRangeImage(
         {kExternalXattrSecondBlock, ExternalXattrPayloadBlock(29, 0x80)},
     };
     return BuildStoreImage(store);
+}
+
+bool TestExternalAttributePhysicalOwnerScope()
+{
+    using namespace apfsaccess::catalog;
+    using namespace apfsaccess::rw;
+    bool ok = true;
+    for (unsigned fault = 0; fault != 4; ++fault)
+    {
+        ExternalXattrFixtureSpec spec; spec.block_count = 1024; spec.high_inode_id = 17; spec.SetOwner(17);
+        if (fault == 1) spec.physical_extents.front().owning_object_id = kExternalXattrStreamId;
+        if (fault == 2) { spec.share_external_with_root = true; spec.stream_reference_count = 2; }
+        if (fault == 3) { spec.share_external_with_owner = true; spec.stream_reference_count = 2; }
+        std::vector<std::byte> descriptor;
+        const auto bytes = BuildExternalXattrRangeImage(spec, descriptor);
+        if (!Require(!bytes.empty(), "external owner scope fixture encodes")) return false;
+        VectorRandomAccessSource source(bytes); std::string error;
+        const auto checkpoint = LoadAppleCheckpointView(source, 0, source.SizeBytes(), error);
+        if (!Require(checkpoint.has_value(), "external owner scope checkpoint remains parseable")) return false;
+        AppleVolumeTransactionRequest request; request.volume_object_id = 101;
+        if (!Require(ReadAppleVolumeFileSystemRecords(source, checkpoint->container, checkpoint->volumes.front(),
+                request.filesystem_records, error), "external owner scope canonical records")) return false;
+        AppleVolumeTransactionPlan plan;
+        const bool planned = PlanAppleVolumeTransaction(source, *checkpoint, request, plan, error);
+        const bool allowed = fault == 0 || fault == 3;
+        ok &= Require(planned == allowed && (allowed || error == (fault == 1 ?
+            "AppleVolumePhysicalExtentOwnerMismatch" : "AppleVolumeAttributeOwnerAmbiguous")),
+            "exact external header identity and same-header aliases; cross-header ambiguity refuses: " + error);
+        std::vector<std::byte> after;
+        ok &= Require(source.Read(0, bytes.size(), after) && after == bytes, "owner proof leaves every source byte unchanged");
+    }
+    return ok;
 }
 
 bool RequireExternalXattrRead(
@@ -5915,6 +6085,13 @@ std::vector<std::byte> BuildFileContentAttributeImage(
     file.children_or_links = (owner_mode & 0170000) == 0040000 ? 0 : 1;
     file.mode = owner_mode; file.bsd_flags = owner_flags;
     file.uncompressed_size = logical_size;
+    if (logical_size != 0)
+    {
+        // Apple APFS reference j_inode_val_t (p77): the size field is
+        // padding unless flagged; a nonzero logical size claim needs
+        // the flag for the projection to honor it.
+        file.internal_flags |= kAppleInodeHasUncompressedSize;
+    }
     if (logical_size != 0 && (owner_flags & kAppleBsdCompressedFlag) == 0 &&
         attribute.name_utf8 != "com.apple.decmpfs" && !decmpfs)
     {
@@ -5924,7 +6101,15 @@ std::vector<std::byte> BuildFileContentAttributeImage(
         PutU64LE(stream.data, 0, logical_size);
         file.extended_fields.push_back(std::move(stream));
     }
-    if ((owner_mode & 0170000) == 0120000) file.uncompressed_size = 3;
+    if ((owner_mode & 0170000) == 0120000)
+    {
+        // A symlink owner needs its embedded target to import: the size
+        // claim (3 bytes, "./x") must be flagged per the Apple APFS
+        // reference j_inode_val_t (p77), and the target xattr must exist
+        // or the projection refuses the targetless link.
+        file.uncompressed_size = 3;
+        file.internal_flags |= kAppleInodeHasUncompressedSize;
+    }
     if (!Require(EncodeAppleInodeRecord(file, encoded, error), "content attribute inode encodes")) return {};
     records.push_back(std::move(encoded));
     AppleDirectoryRecord link;
@@ -6077,9 +6262,14 @@ std::vector<std::byte> BuildNativeCompressionImage(const NativeCompressionFixtur
         AppleDirectoryRecord link;
         link.parent_id = 2; link.file_id = inode.object_id; link.flags = 8;
         link.name_utf8 = neighbor ? "neighbor" : "original";
+        if (!neighbor && spec.rewrite_alias_fixture)
+        {
+            AppleExtendedField sibling{1, 0, std::vector<std::byte>(8)};
+            PutU64LE(sibling.data, 0, 700); link.extended_fields.push_back(std::move(sibling));
+        }
         if (!append(EncodeAppleDirectoryRecord(link, encoded, error))) return {};
     }
-    auto payload = [&](std::uint64_t id, const std::vector<std::byte>& bytes, std::uint64_t first) {
+    auto payload = [&](std::uint64_t id, const std::vector<std::byte>& bytes, std::uint64_t first, std::uint64_t owner) {
         if (!append(EncodeAppleDataStreamIdRecord({id,
                 spec.wrong_reference_count && id == 777 ? 2u : 1u}, encoded, error))) return false;
         for (std::size_t at = 0; at < bytes.size(); at += 4096)
@@ -6087,7 +6277,7 @@ std::vector<std::byte> BuildNativeCompressionImage(const NativeCompressionFixtur
             const auto physical = first + (at / 4096) * 2;
             if (!append(EncodeAppleFileExtentRecord({id, at, 4096, physical, 0, 4096}, encoded, error)))
                 return false;
-            if (!Require(EncodeApplePhysicalExtentRecord({physical, 1, kApplePhysicalExtentKindNew, id, 1},
+            if (!Require(EncodeApplePhysicalExtentRecord({physical, 1, kApplePhysicalExtentKindNew, owner, 1},
                     encoded, error), "native compression physical ownership encodes")) return false;
             volume.extentref_records.push_back(std::move(encoded));
             ++volume.additional_file_system_allocated_blocks;
@@ -6107,17 +6297,19 @@ std::vector<std::byte> BuildNativeCompressionImage(const NativeCompressionFixtur
             PutU64LE(raw.data, 0, id);
             PutU64LE(raw.data, 8, bytes.size());
             PutU64LE(raw.data, 16, ((bytes.size() + 4095) / 4096) * 4096);
-            if (!payload(id, bytes, physical)) return false;
+            if (!payload(id, bytes, physical, 17)) return false;
         }
         return append(EncodeAppleXattrRecord(raw, encoded, error));
     };
-    if (!payload(118, NativeCompressionHex("6e00ff72"), 52)) return {};
+    if (!payload(118, NativeCompressionHex("6e00ff72"), 52, 118)) return {};
     if (!spec.omit_decmpfs && !attribute("com.apple.decmpfs", spec.decmpfs, spec.external_decmpfs, 777, 64)) return {};
     if (spec.resource && !attribute("com.apple.ResourceFork", *spec.resource, spec.external_resource, 778, 80)) return {};
     if (spec.rewrite_alias_fixture)
     {
         AppleDirectoryRecord alias;
         alias.parent_id = 2; alias.file_id = 17; alias.flags = 8; alias.name_utf8 = "alias";
+        AppleExtendedField sibling{1, 0, std::vector<std::byte>(8)};
+        PutU64LE(sibling.data, 0, 701); alias.extended_fields.push_back(std::move(sibling));
         if (!append(EncodeAppleDirectoryRecord(alias, encoded, error))) return {};
         for (const auto& [name, sibling] : std::vector<std::pair<std::string, std::uint64_t>>{{"original", 700}, {"alias", 701}})
         {
@@ -7171,7 +7363,7 @@ bool TestCompressionExternalRawAttributeAdmission()
     for (const bool external_decmpfs : {false, true})
     {
         ExternalXattrFixtureSpec spec;
-        spec.high_inode_id = spec.attribute_owner_inode = 17;
+        spec.high_inode_id = 17; spec.SetOwner(17);
         spec.owner_logical_size = 32;
         spec.attribute_name = external_decmpfs ? "com.apple.decmpfs" : "com.apple.ResourceFork";
         spec.owner_bsd_flags = external_decmpfs ? 0 : kAppleBsdCompressedFlag;
@@ -7335,8 +7527,8 @@ bool TestExternalAttributesSurviveContentWrites(bool resource_fork = false)
         ExternalXattrFixtureSpec spec;
         spec.attribute_name = attribute_name;
         spec.block_count = 1024;
-        spec.high_inode_id = spec.attribute_owner_inode = 17;
-        spec.share_external_with_root = shared;
+        spec.high_inode_id = 17; spec.SetOwner(17);
+        spec.share_external_with_owner = shared;
         spec.stream_reference_count = shared ? 2 : 1;
         std::vector<std::byte> descriptor;
         TempImageFile image(BuildExternalXattrRangeImage(spec, descriptor), "external-content-preservation");
@@ -7426,7 +7618,7 @@ bool TestExternalAttributesSurviveContentWrites(bool resource_fork = false)
             if (shared)
             {
                 std::fill(actual_external.begin(), actual_external.end(), std::byte{0});
-                if (!Require(reopened.ReadCommittedExtendedAttributeRange(2, "user.shared-external", 0, actual_external, read) &&
+                if (!Require(reopened.ReadCommittedExtendedAttributeRange(17, "user.shared-external", 0, actual_external, read) &&
                         read == external.size() && actual_external == external,
                         "second attribute owner retains the same shared stream")) return false;
             }
@@ -7450,8 +7642,8 @@ bool TestExternalAttributeRemovalRetiresOnlyLastOwner(bool resource_fork = false
         ExternalXattrFixtureSpec spec;
         spec.attribute_name = attribute_name;
         spec.block_count = 1024;
-        spec.high_inode_id = spec.attribute_owner_inode = 17;
-        spec.share_external_with_root = shared;
+        spec.high_inode_id = 17; spec.SetOwner(17);
+        spec.share_external_with_owner = shared;
         spec.stream_reference_count = shared ? 2 : 1;
         spec.second_file_alias = unlink;
         if (empty)
@@ -7505,13 +7697,13 @@ bool TestExternalAttributeRemovalRetiresOnlyLastOwner(bool resource_fork = false
                         "first unlink preserves the complete external payload after reopening")) return false;
             }
         }
-        for (unsigned phase = 0; phase != (shared ? 2u : 1u); ++phase)
+        for (unsigned phase = 0; phase != (shared && !unlink ? 2u : 1u); ++phase)
         {
             MetadataStore metadata(context);
             if (!Require(metadata.PrepareNativeWritePath(), "external removal prepares")) return false;
             MetadataStore::MutationRequest remove;
             remove.operation = MetadataStore::MutationOperation::RemoveExtendedAttribute;
-            remove.path = phase == 0 ? L"\\alias.bin" : L"\\";
+            remove.path = L"\\alias.bin";
             remove.secondary_path = phase == 0 ? attribute_wname : L"user.shared-external";
             if (replace)
             {
@@ -7549,7 +7741,7 @@ bool TestExternalAttributeRemovalRetiresOnlyLastOwner(bool resource_fork = false
             }
             MetadataStore reopened(context);
             if (!Require(reopened.PrepareNativeWritePath(), "retired external stream checkpoint reopens")) return false;
-            const auto final_attribute = reopened.LookupCommittedExtendedAttribute(phase == 0 ? 17 : 2,
+            const auto final_attribute = reopened.LookupCommittedExtendedAttribute(17,
                 phase == 0 ? attribute_name : "user.shared-external");
             if (!Require(replace ? final_attribute && (external_replacement
                     ? final_attribute->flags == kAppleXattrDataStream
@@ -7560,7 +7752,7 @@ bool TestExternalAttributeRemovalRetiresOnlyLastOwner(bool resource_fork = false
                 std::vector<std::byte> payload(remove.inline_payload.size()); std::size_t read = 0;
                 const auto new_id = apfsaccess::catalog::ReadU64LE(final_attribute->data, 0).value_or(0);
                 if (!Require(new_id >= 0x6000 && new_id != kExternalXattrStreamId && new_id != 17 &&
-                        reopened.ReadCommittedExtendedAttributeRange(phase == 0 ? 17 : 2,
+                        reopened.ReadCommittedExtendedAttributeRange(17,
                             phase == 0 ? attribute_name : "user.shared-external", 0, payload, read) &&
                         read == payload.size() && payload == remove.inline_payload,
                         "external replacement uses a new stream and reopens with exact binary bytes")) return false;
@@ -7568,11 +7760,11 @@ bool TestExternalAttributeRemovalRetiresOnlyLastOwner(bool resource_fork = false
             if (unlink && !Require(!reopened.LookupCommittedInodeByPath(L"\\alias.bin") &&
                     !reopened.LookupCommittedInodeByPath(L"\\second.bin"),
                     "last unlink removes the exact inode and both former paths")) return false;
-            const bool retained = shared && phase == 0;
+            const bool retained = shared && !unlink && phase == 0;
             if (retained)
             {
                 std::vector<std::byte> bytes(original.size()); std::size_t read = 0;
-                if (!Require(reopened.ReadCommittedExtendedAttributeRange(2, "user.shared-external", 0, bytes, read) &&
+                if (!Require(reopened.ReadCommittedExtendedAttributeRange(17, "user.shared-external", 0, bytes, read) &&
                         read == original.size() && bytes == original, "shared owner retains all original bytes")) return false;
             }
             apfsaccess::catalog::HeldFileSource source(image.path.string());
@@ -7613,10 +7805,11 @@ bool TestExternalAttributeRemovalRetiresOnlyLastOwner(bool resource_fork = false
                 if (!Require(DecodeApplePhysicalExtentRecord(record, extent, error), "external removal physical extent decodes")) return false;
                 if (unlink && !Require(extent.owning_object_id != 17,
                         "last unlink retires main-file physical ownership independently")) return false;
-                if (extent.owning_object_id == kExternalXattrStreamId) physical += static_cast<unsigned>(extent.block_count);
+                if (extent.owning_object_id == 17) physical += static_cast<unsigned>(extent.block_count);
             }
-            if (!Require(physical == (retained && !empty ? 2u : 0u),
-                    "physical allocation references retire only with their last attribute owner")) return false;
+            const auto replacement_blocks = external_replacement ? 3u * (phase + 1) : 0u;
+            if (!Require(physical == replacement_blocks + (retained && !empty ? 2u : 0u),
+                    "header-owned physical blocks equal retained original plus exact replacement allocation")) return false;
         }
     }
     return true;
@@ -7628,7 +7821,7 @@ bool TestTransactionalExternalAttributeWrites(bool resource_fork = false)
     const auto name = resource_fork ? "com.apple.ResourceFork" : "user.new";
     ExternalXattrFixtureSpec spec;
     spec.block_count = 4096;
-    spec.high_inode_id = spec.attribute_owner_inode = 17;
+    spec.high_inode_id = 17; spec.SetOwner(17);
     std::vector<std::byte> descriptor;
     TempImageFile image(BuildExternalXattrRangeImage(spec, descriptor), "new-external-attributes");
     MetadataStore::VolumeContext context;
@@ -7695,7 +7888,7 @@ bool TestNewExternalAttributePlannerRejectsInvalidBindings()
 {
     using namespace apfsaccess::rw;
     ExternalXattrFixtureSpec spec;
-    spec.block_count = 1024; spec.high_inode_id = spec.attribute_owner_inode = 17;
+    spec.block_count = 1024; spec.high_inode_id = 17; spec.SetOwner(17);
     std::vector<std::byte> original;
     TempImageFile image(BuildExternalXattrRangeImage(spec, original), "new-external-invalid");
     apfsaccess::catalog::HeldFileSource source(image.path.string());
@@ -7791,7 +7984,7 @@ bool TestExternalAttributeProtectedOwnerMutations()
     for (unsigned probe = 0; probe != 10; ++probe)
     {
         ExternalXattrFixtureSpec spec;
-        spec.block_count = 1024; spec.high_inode_id = spec.attribute_owner_inode = 17;
+        spec.block_count = 1024; spec.high_inode_id = 17; spec.SetOwner(17);
         if (probe == 1 || probe >= 7) spec.attribute_name = "com.apple.ResourceFork";
         if (probe == 2) spec.attribute_name = "com.apple.fs.opaque";
         if (probe == 3) spec.attribute_name = "com.apple.decmpfs";
@@ -7865,8 +8058,8 @@ bool TestExternalAttributeRetirementPlannerRejectsInvalidOwnership()
     {
         ExternalXattrFixtureSpec spec;
         spec.block_count = 1024;
-        spec.high_inode_id = spec.attribute_owner_inode = 17;
-        spec.share_external_with_root = shared;
+        spec.high_inode_id = 17; spec.SetOwner(17);
+        spec.share_external_with_owner = shared;
         spec.stream_reference_count = shared ? 2 : 1;
         std::vector<std::byte> descriptor;
         TempImageFile image(BuildExternalXattrRangeImage(spec, descriptor), "external-retirement-invalid");
@@ -7885,7 +8078,12 @@ bool TestExternalAttributeRetirementPlannerRejectsInvalidOwnership()
         valid.volume_object_id = 101;
         for (const auto& record : records)
         {
-            if (type(record) == 4 && oid(record) == 17) continue;
+            if (type(record) == 4 && oid(record) == 17)
+            {
+                AppleXattrRecord attribute;
+                if (!Require(ApfsExtendedRecordCodec::DecodeXattr(record, attribute, error), "retirement attribute decodes")) return false;
+                if (attribute.name_utf8 == spec.attribute_name) continue;
+            }
             if (!shared && oid(record) == kExternalXattrStreamId && (type(record) == 6 || type(record) == 8)) continue;
             valid.filesystem_records.push_back(record);
         }
@@ -8066,12 +8264,15 @@ bool TestContentWritesSupportPendingResourceFork()
             if (!Require(volume.extentref_tree && apfsaccess::catalog::ReadBtreeLeafRecords(source,
                     view->container.superblock.block_size, volume.extentref_tree->physical_block, true, 0,
                     view->container.superblock.xid, records, error), "retired fork physical tree loads: " + error)) return false;
+            std::uint64_t physical_blocks = 0;
             for (const auto& record : records)
             {
                 ApplePhysicalExtentRecord extent;
-                if (!Require(DecodeApplePhysicalExtentRecord(record, extent, error) && extent.owning_object_id != retired_stream,
-                        "replaced fork releases its independent physical references")) return false;
+                if (!Require(DecodeApplePhysicalExtentRecord(record, extent, error), "fork physical ownership decodes")) return false;
+                if (extent.owning_object_id == 17) physical_blocks += extent.block_count;
             }
+            const auto expected = (main.size() + 4095) / 4096 + (current_stream ? (sizes[phase] + 4095) / 4096 : 0);
+            if (!Require(physical_blocks == expected, "header-owned blocks equal only current main and external fork allocation")) return false;
         }
         retired_stream = current_stream;
     }
@@ -8385,7 +8586,14 @@ bool TestNativeSpecialNodePreservation()
         {
             auto invalid = fixture;
             auto bad_inode = original;
-            if (std::string(malformed) == "uncompressed") bad_inode.uncompressed_size = 1;
+            if (std::string(malformed) == "uncompressed")
+            {
+                // Apple APFS reference j_inode_val_t (p77): the size field
+                // is padding unless flagged, so a real size claim on a
+                // special node must set the flag for the refusal to engage.
+                bad_inode.uncompressed_size = 1;
+                bad_inode.internal_flags |= kAppleInodeHasUncompressedSize;
+            }
             if (std::string(malformed) == "stream" || std::string(malformed) == "empty-stream")
             {
                 bad_inode.extended_fields.push_back({8, 0, std::vector<std::byte>(40, std::byte{0})});
@@ -9593,7 +9801,14 @@ bool TestNativeAllocationSizeEmptyAndRejections()
         AppleInodeRecord inode;
         inode.object_id = inode.private_id = 17; inode.parent_id = 2;
         inode.mode = type | 0644; inode.children_or_links = type == 0040000 ? 0 : 1;
-        if (type == 0120000) inode.uncompressed_size = 1;
+        if (type == 0120000)
+        {
+            inode.uncompressed_size = 1;
+            // Apple APFS reference j_inode_val_t (p77): the size field is
+            // padding unless flagged; the 1-byte target claim needs the
+            // flag for the projection size check to engage.
+            inode.internal_flags |= kAppleInodeHasUncompressedSize;
+        }
         if (!Require(EncodeAppleInodeRecord(inode, encoded, error), "allocation rejection inode encodes")) return false;
         records.push_back(encoded);
         AppleDirectoryRecord link;
@@ -10116,6 +10331,7 @@ int main(int argc, char** argv)
     ok &= run("TestCheckpointViewFallsBackFromMalformedNewest", TestCheckpointViewFallsBackFromMalformedNewest);
     ok &= run("TestCheckpointViewRejectsDecoysAndUnsupportedLayout", TestCheckpointViewRejectsDecoysAndUnsupportedLayout);
     ok &= run("TestAppleCheckpointViewBindsOneTransaction", TestAppleCheckpointViewBindsOneTransaction);
+    ok &= run("TestExactCheckpointAvoidsUnrelatedMappedReads", TestExactCheckpointAvoidsUnrelatedMappedReads);
     ok &= run("TestExactCheckpointSelectsRetainedGeneration", TestExactCheckpointSelectsRetainedGeneration);
     ok &= run("TestExactCheckpointRejectsUnavailableAndCorruptGeneration", TestExactCheckpointRejectsUnavailableAndCorruptGeneration);
     ok &= run("TestExactCheckpointRejectsLegacyAndAmbiguousGeneration", TestExactCheckpointRejectsLegacyAndAmbiguousGeneration);
@@ -10132,6 +10348,10 @@ int main(int argc, char** argv)
     ok &= run("TestAppleCheckpointViewRejectsMixedGenerationAndTypeDecoys", TestAppleCheckpointViewRejectsMixedGenerationAndTypeDecoys);
     ok &= run("TestApsbRoundTrip", TestApsbRoundTrip);
     ok &= run("TestOmapResolve", TestOmapResolve);
+    ok &= run("TestOmapWalkReadsMapOnce", apfsaccess::omap_lookup_tests::TestOmapWalkReadsMapOnce);
+    ok &= run("TestOmapWalkRejectsMalformedAndRefreshes", apfsaccess::omap_lookup_tests::TestOmapWalkRejectsMalformedAndRefreshes);
+    ok &= run("TestStrictOmapWalkReadsOnceAndPreservesRefusals", apfsaccess::omap_lookup_tests::TestStrictOmapWalkReadsOnceAndPreservesRefusals);
+    ok &= run("TestOmapLookupRejectsZeroChildAndIndexBudget", apfsaccess::omap_lookup_tests::TestOmapLookupRejectsZeroChildAndIndexBudget);
     ok &= run("TestInterpretation", TestInterpretation);
     ok &= run("TestMetadataStoreReportsSharedVolumeCapacity", TestMetadataStoreReportsSharedVolumeCapacity);
     ok &= run("TestMetadataStoreQuotaRefusalPreservesPendingRetry", TestMetadataStoreQuotaRefusalPreservesPendingRetry);
@@ -10170,6 +10390,7 @@ int main(int argc, char** argv)
     ok &= run("TestMetadataStoreUsesAuthoritativeCheckpointView", TestMetadataStoreUsesAuthoritativeCheckpointView);
     ok &= run("TestMetadataStoreProjectsAuthoritativeRegularImage", TestMetadataStoreProjectsAuthoritativeRegularImage);
     ok &= run("TestNativeWriterFeatureAdmission", TestNativeWriterFeatureAdmission);
+    ok &= run("TestOrdinaryCheckpointFixtureScope", TestOrdinaryCheckpointFixtureScope);
     ok &= run("TestMetadataStoreCommitsAppleFileToAuthoritativeImage", TestMetadataStoreCommitsAppleFileToAuthoritativeImage);
     ok &= run("TestAppleCommitRangeProviderRefusalIsAuthoritative", TestAppleCommitRangeProviderRefusalIsAuthoritative);
     ok &= run("TestMetadataStoreAppleTransactionLifecycle", TestMetadataStoreAppleTransactionLifecycle);
@@ -10267,6 +10488,7 @@ int main(int argc, char** argv)
     ok &= run("TestTransactionalExternalAttributeWrites", [] { return TestTransactionalExternalAttributeWrites(); });
     ok &= run("TestNewExternalAttributePlannerRejectsInvalidBindings", TestNewExternalAttributePlannerRejectsInvalidBindings);
     ok &= run("TestExternalAttributeProtectedOwnerMutations", TestExternalAttributeProtectedOwnerMutations);
+    ok &= run("TestExternalAttributePhysicalOwnerScope", TestExternalAttributePhysicalOwnerScope);
     ok &= run("TestExternalAttributeRetirementPlannerRejectsInvalidOwnership", TestExternalAttributeRetirementPlannerRejectsInvalidOwnership);
     ok &= run("TestResourceForkSurvivesContentWrites", [] { return TestExternalAttributesSurviveContentWrites(true); });
     ok &= run("TestResourceForkRetiresOnlyLastOwner", [] { return TestExternalAttributeRemovalRetiresOnlyLastOwner(true); });

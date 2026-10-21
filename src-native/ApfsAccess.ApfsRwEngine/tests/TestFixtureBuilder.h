@@ -421,12 +421,14 @@ inline std::vector<std::byte> BuildBtreeNode(
 inline std::vector<std::byte> BuildOmap(std::uint64_t tree_block, std::uint64_t xid, std::size_t block_size,
     std::uint64_t omap_oid = kOmapOid,
     std::uint32_t object_type = 0x0000000B,
-    std::uint32_t tree_type = 0)
+    std::uint32_t tree_type = 0,
+    std::uint32_t omap_flags = 0)
 {
     std::vector<std::byte> block(block_size, std::byte{0});
     PutU64LE(block, 0x08, omap_oid);
     PutU64LE(block, 0x10, xid);
     PutU32LE(block, 0x18, object_type);
+    PutU32LE(block, 0x20, omap_flags);
     PutU32LE(block, 0x28, tree_type);
     PutU64LE(block, 0x30, tree_block);
     FletcherForBlock(block, block_size);
@@ -623,7 +625,9 @@ inline std::vector<std::byte> BuildStoreImage(const BuilderStore& spec)
             spec, spec.xid + static_cast<std::uint64_t>(spec.second_xid_offset),
             spec.second_uuid_hex, bs));
     }
-    put_block(kOmapOid, BuildOmap(kBtreeBlock, spec.xid, bs));
+    // OMAP_MANUALLY_MANAGED is mandatory only for the container object map.
+    put_block(kOmapOid, BuildOmap(kBtreeBlock, spec.xid, bs, kOmapOid,
+        0x0000000B, 0, 1));
     std::vector<OmapRecordSpec> mappings;
     for (std::size_t i = 0; i < spec.volumes.size(); ++i)
     {
@@ -769,7 +773,7 @@ inline std::vector<std::byte> BuildAuthoritativeStoreImage(const BuilderStore& i
         container_records.push_back(extra);
     }
     put_block(kOmapOid, BuildOmap(kBtreeBlock, spec.xid, bs, kOmapOid,
-        0x4000000B, 0x40000002));
+        0x4000000B, 0x40000002, 1));
     put_block(kBtreeBlock, BuildBtreeNode(container_records, spec.xid, bs, 0,
         kBtreeBlock, 0x40000002, 0x0000000B));
 

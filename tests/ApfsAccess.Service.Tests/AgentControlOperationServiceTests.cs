@@ -17,6 +17,31 @@ public sealed class AgentControlOperationServiceTests
     };
 
     [Fact]
+    public async Task SelectedIdentity615_NormalizationReplayAndConflictPreserveEveryField()
+    {
+        var root = CreateEvidenceRoot(); var calls = 0;
+        var target = new ApfsControlTarget("DEVICE-1", "DEVICE-1|Main", "recovery", Guid.NewGuid().ToString("D"), Guid.NewGuid().ToString("D"), 201, "selected-v1:" + new string('a', 64));
+        var request = new ControlOperationRequestPayload(Guid.NewGuid().ToString("D"), "mount", target, "read-write", DateTime.UtcNow.AddMinutes(1));
+        var service = new AgentControlOperationService((operation, _) => { calls++; Assert.Equal(target.VolumeUuid, operation.Target!.VolumeUuid);
+            Assert.Equal(target.ContainerUuid, operation.Target.ContainerUuid); Assert.Equal(target.VolumeObjectId, operation.Target.VolumeObjectId);
+            Assert.Equal(target.ObservationContract, operation.Target.ObservationContract); return Task.FromResult(Success(operation)); }, root);
+        try
+        {
+            var first = await service.ExecuteOrReplayAsync(request); Assert.True(first.Success, first.Diagnostic);
+            var replay = await service.ExecuteOrReplayAsync(request); Assert.True(replay.Success, replay.Diagnostic); Assert.Equal(1, calls);
+            foreach (var changed in new[] { target with { VolumeUuid = Guid.NewGuid().ToString("D") }, target with { ContainerUuid = Guid.NewGuid().ToString("D") },
+                target with { VolumeObjectId = 202 }, target with { ObservationContract = "selected-v1:" + new string('b', 64) } })
+            {
+                Assert.NotEqual(ApfsOperationFingerprint.Compute(request), ApfsOperationFingerprint.Compute(request with { Target = changed }));
+                var conflict = await service.ExecuteOrReplayAsync(request with { Target = changed }); Assert.False(conflict.Success); Assert.Equal(1, calls);
+            }
+            var malformed = await service.ExecuteOrReplayAsync(request with { OperationId = Guid.NewGuid().ToString(), Target = target with { VolumeUuid = null } });
+            Assert.False(malformed.Success); Assert.Equal(1, calls);
+        }
+        finally { await service.StopAsync(CancellationToken.None); Directory.Delete(root, true); }
+    }
+
+    [Fact]
     public async Task CanonicalCatalogVolumeId_ReachesExecutorWithExactDeviceTarget()
     {
         var root = CreateEvidenceRoot();
@@ -2195,6 +2220,333 @@ public sealed class AgentControlOperationServiceTests
         }
     }
 
+    [Fact]
+    public async Task SnapshotCreate_RequiresName_AtAdmission()
+    {
+        var root = CreateEvidenceRoot();
+        var calls = 0;
+        var service = new AgentControlOperationService(
+            (operation, _) => { calls++; return Task.FromResult(Success(operation)); }, root);
+        try
+        {
+            var result = await service.ExecuteOrReplayAsync(
+                CreateRequest(command: ApfsControlCommands.SnapshotCreate));
+            Assert.False(result.Success);
+            Assert.Equal(ApfsOperationCodes.InvalidArguments, result.Code);
+            Assert.Equal(0, calls);
+        }
+        finally { await service.StopAsync(CancellationToken.None); Directory.Delete(root, true); }
+    }
+
+    [Theory]
+    [InlineData("snapshot-delete")]
+    [InlineData("snapshot-recover")]
+    public async Task SnapshotDeleteRecover_MalformedParameters_AreInvalidArguments(string command)
+    {
+        var root = CreateEvidenceRoot();
+        var calls = 0;
+        var service = new AgentControlOperationService(
+            (operation, _) => { calls++; return Task.FromResult(Success(operation)); }, root);
+        try
+        {
+            var request = command == "snapshot-delete"
+                ? CreateRequest(command: command) with { SnapshotName = "victim" }
+                : CreateRequest(command: command) with { SnapshotName = "backup" };
+            var result = await service.ExecuteOrReplayAsync(request);
+            Assert.False(result.Success);
+            Assert.Equal(ApfsOperationCodes.InvalidArguments, result.Code);
+            Assert.Equal(0, calls);
+        }
+        finally { await service.StopAsync(CancellationToken.None); Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public async Task SnapshotCreate_DistinctNames_DoNotConflict()
+    {
+        var root = CreateEvidenceRoot();
+        var calls = 0;
+        var service = new AgentControlOperationService(
+            (operation, _) => { calls++; return Task.FromResult(Success(operation)); }, root);
+        try
+        {
+            var expiry = DateTime.UtcNow.AddMinutes(3);
+            var first = await service.ExecuteOrReplayAsync(
+                CreateRequest(command: ApfsControlCommands.SnapshotCreate, expiresAtUtc: expiry) with { SnapshotName = "alpha" });
+            var second = await service.ExecuteOrReplayAsync(
+                CreateRequest(command: ApfsControlCommands.SnapshotCreate, expiresAtUtc: expiry) with { SnapshotName = "beta" });
+            Assert.True(first.Success, first.Diagnostic);
+            Assert.True(second.Success, second.Diagnostic);
+            Assert.Equal(2, calls);
+        }
+        finally { await service.StopAsync(CancellationToken.None); Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public async Task SnapshotCreate_SameParameters_ReplaysWithoutReexecution()
+    {
+        var root = CreateEvidenceRoot();
+        var calls = 0;
+        var service = new AgentControlOperationService(
+            (operation, _) => { calls++; return Task.FromResult(Success(operation)); }, root);
+        try
+        {
+            var request = CreateRequest(command: ApfsControlCommands.SnapshotCreate) with { SnapshotName = "alpha" };
+            var first = await service.ExecuteOrReplayAsync(request);
+            var replay = await service.ExecuteOrReplayAsync(request);
+            Assert.True(first.Success, first.Diagnostic);
+            Assert.True(replay.Success, replay.Diagnostic);
+            Assert.Equal(1, calls);
+        }
+        finally { await service.StopAsync(CancellationToken.None); Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public async Task Mount_WithSnapshotParameters_IsInvalidArguments()
+    {
+        var root = CreateEvidenceRoot();
+        var calls = 0;
+        var service = new AgentControlOperationService(
+            (operation, _) => { calls++; return Task.FromResult(Success(operation)); }, root);
+        try
+        {
+            var result = await service.ExecuteOrReplayAsync(
+                CreateRequest(command: ApfsControlCommands.Mount, requestedMode: ApfsControlModes.ReadWrite) with { SnapshotName = "backup" });
+            Assert.False(result.Success);
+            Assert.Equal(ApfsOperationCodes.InvalidArguments, result.Code);
+            Assert.Equal(0, calls);
+        }
+        finally { await service.StopAsync(CancellationToken.None); Directory.Delete(root, true); }
+    }
+
+    [Theory]
+    [InlineData("volume-create")]
+    [InlineData("volume-delete")]
+    [InlineData("")]
+    public async Task ManagementPlan_UnknownOperation_IsInvalidArguments(string operation)
+    {
+        var root = CreateEvidenceRoot();
+        var calls = 0;
+        var service = new AgentControlOperationService(
+            (operation, _) => { calls++; return Task.FromResult(Success(operation)); }, root);
+        try
+        {
+            var result = await service.ExecuteOrReplayAsync(
+                CreateRequest(command: ApfsControlCommands.ManagementPlan) with { ManagementOperation = operation });
+            Assert.False(result.Success);
+            Assert.Equal(ApfsOperationCodes.InvalidArguments, result.Code);
+            Assert.Equal(0, calls);
+        }
+        finally { await service.StopAsync(CancellationToken.None); Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public async Task ManagementPlan_WithTokenOrValues_IsInvalidArguments()
+    {
+        var root = CreateEvidenceRoot();
+        var calls = 0;
+        var service = new AgentControlOperationService(
+            (operation, _) => { calls++; return Task.FromResult(Success(operation)); }, root);
+        try
+        {
+            var baseRequest = CreateRequest(command: ApfsControlCommands.ManagementPlan)
+                with { ManagementOperation = ApfsManagementOperations.RenameVolume };
+            foreach (var bad in new[]
+            {
+                baseRequest with { ManagementToken = "token" },
+                baseRequest with { ManagementName = "Renamed" },
+                baseRequest with { ManagementQuotaBytes = "65536" },
+            })
+            {
+                var result = await service.ExecuteOrReplayAsync(bad);
+                Assert.False(result.Success);
+                Assert.Equal(ApfsOperationCodes.InvalidArguments, result.Code);
+            }
+
+            Assert.Equal(0, calls);
+        }
+        finally { await service.StopAsync(CancellationToken.None); Directory.Delete(root, true); }
+    }
+
+    [Theory]
+    [InlineData(ApfsManagementOperations.RenameVolume, null, null, null, null, ImagePath)]
+    [InlineData(ApfsManagementOperations.RenameVolume, "t", "", null, null, ImagePath)]
+    [InlineData(ApfsManagementOperations.RenameVolume, "t", "New", "65536", "20480", ImagePath)]
+    [InlineData(ApfsManagementOperations.RenameVolume, "t", "New", null, null, null)]
+    [InlineData(ApfsManagementOperations.SetQuotaReserve, "t", null, null, null, ImagePath)]
+    [InlineData(ApfsManagementOperations.SetQuotaReserve, "t", "New", "65536", "20480", ImagePath)]
+    [InlineData(ApfsManagementOperations.SetQuotaReserve, "t", null, "01", "20480", ImagePath)]
+    [InlineData(ApfsManagementOperations.SetQuotaReserve, "t", null, "65536", null, ImagePath)]
+    [InlineData(ApfsManagementOperations.SetQuotaReserve, "t", null, null, "20480", ImagePath)]
+    [InlineData(ApfsManagementOperations.SetQuotaReserve, "t", null, "65536", "20480", null)]
+    public async Task ManagementApply_MalformedParameters_AreInvalidArguments(
+        string operation, string? token, string? name, string? quota, string? reserve, string? imagePath)
+    {
+        var root = CreateEvidenceRoot();
+        var calls = 0;
+        var service = new AgentControlOperationService(
+            (operation, _) => { calls++; return Task.FromResult(Success(operation)); }, root);
+        try
+        {
+            var result = await service.ExecuteOrReplayAsync(
+                CreateRequest(command: ApfsControlCommands.ManagementApply) with
+                {
+                    ManagementOperation = operation,
+                    ManagementToken = token,
+                    ManagementName = name,
+                    ManagementQuotaBytes = quota,
+                    ManagementReserveBytes = reserve,
+                    ManagementImagePath = imagePath,
+                });
+            Assert.False(result.Success);
+            Assert.Equal(ApfsOperationCodes.InvalidArguments, result.Code);
+            Assert.Equal(0, calls);
+        }
+        finally { await service.StopAsync(CancellationToken.None); Directory.Delete(root, true); }
+    }
+
+    [Theory]
+    [InlineData(ApfsManagementOperations.RenameVolume)]
+    [InlineData(ApfsManagementOperations.SetQuotaReserve)]
+    public async Task ManagementPlan_WellFormed_IsAdmitted(string operation)
+    {
+        var root = CreateEvidenceRoot();
+        var calls = 0;
+        var service = new AgentControlOperationService(
+            (operation, _) => { calls++; return Task.FromResult(Success(operation)); }, root);
+        try
+        {
+            var result = await service.ExecuteOrReplayAsync(
+                CreateRequest(command: ApfsControlCommands.ManagementPlan) with { ManagementOperation = operation });
+            Assert.True(result.Success, result.Diagnostic);
+            Assert.Equal(1, calls);
+        }
+        finally { await service.StopAsync(CancellationToken.None); Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public async Task ManagementApply_WellFormed_IsAdmitted()
+    {
+        var root = CreateEvidenceRoot();
+        var calls = 0;
+        var service = new AgentControlOperationService(
+            (operation, _) => { calls++; return Task.FromResult(Success(operation)); }, root);
+        try
+        {
+            var result = await service.ExecuteOrReplayAsync(
+                CreateRequest(command: ApfsControlCommands.ManagementApply) with
+                {
+                    ManagementOperation = ApfsManagementOperations.RenameVolume,
+                    ManagementToken = new string('a', 64),
+                    ManagementName = "Renamed",
+                    ManagementImagePath = ImagePath,
+                });
+            Assert.True(result.Success, result.Diagnostic);
+            Assert.Equal(1, calls);
+        }
+        finally { await service.StopAsync(CancellationToken.None); Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public async Task ManagementApply_QuotaPair_WellFormed_IsAdmitted()
+    {
+        var root = CreateEvidenceRoot();
+        var calls = 0;
+        var service = new AgentControlOperationService(
+            (operation, _) => { calls++; return Task.FromResult(Success(operation)); }, root);
+        try
+        {
+            var result = await service.ExecuteOrReplayAsync(
+                CreateRequest(command: ApfsControlCommands.ManagementApply) with
+                {
+                    ManagementOperation = ApfsManagementOperations.SetQuotaReserve,
+                    ManagementToken = new string('a', 64),
+                    ManagementQuotaBytes = "65536",
+                    ManagementReserveBytes = "0",
+                    ManagementImagePath = ImagePath,
+                });
+            Assert.True(result.Success, result.Diagnostic);
+            Assert.Equal(1, calls);
+        }
+        finally { await service.StopAsync(CancellationToken.None); Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public async Task Mount_WithManagementParameters_IsInvalidArguments()
+    {
+        var root = CreateEvidenceRoot();
+        var calls = 0;
+        var service = new AgentControlOperationService(
+            (operation, _) => { calls++; return Task.FromResult(Success(operation)); }, root);
+        try
+        {
+            var result = await service.ExecuteOrReplayAsync(
+                CreateRequest(command: ApfsControlCommands.Mount, requestedMode: ApfsControlModes.ReadWrite) with
+                {
+                    ManagementOperation = ApfsManagementOperations.RenameVolume,
+                });
+            Assert.False(result.Success);
+            Assert.Equal(ApfsOperationCodes.InvalidArguments, result.Code);
+            Assert.Equal(0, calls);
+        }
+        finally { await service.StopAsync(CancellationToken.None); Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public async Task ManagementPlan_TerminalEvidence_ReplaysAfterRestartWithEchoes()
+    {
+        // The stored plan-issued terminal must revalidate after a restart
+        // (evidence fingerprint recompute covers the echoed parameters) and
+        // replay without re-executing.
+        var root = CreateEvidenceRoot();
+        var request = CreateRequest(command: ApfsControlCommands.ManagementPlan)
+            with { ManagementOperation = ApfsManagementOperations.RenameVolume };
+        OperationResultPayload? stubResult = null;
+        var source = new AgentControlOperationService(
+            (operation, _) =>
+            {
+                stubResult = Success(operation) with
+                {
+                    Fingerprint = ApfsOperationFingerprint.Compute(operation),
+                    FinalStatus = "management-plan-issued",
+                    MountProof = "absent",
+                    OwnershipProof = "proven",
+                    DurabilityProof = "not-applicable",
+                    ManagementOperation = operation.ManagementOperation,
+                    ManagementPlanId = "mgmt-plan-v1:deadbeef",
+                    ManagementToken = new string('b', 64),
+                    ManagementObservedXid = "90",
+                };
+                return Task.FromResult(stubResult);
+            }, root);
+        try
+        {
+            var first = await source.ExecuteOrReplayAsync(request);
+            Assert.True(first.Success, first.Diagnostic);
+            Assert.NotNull(stubResult);
+            Assert.Equal(new string('b', 64), stubResult!.ManagementToken);
+            var raw = System.IO.File.ReadAllText(GetEvidencePath(root, request.OperationId));
+            Assert.Contains("managementToken", raw, StringComparison.Ordinal);
+            Assert.Equal(new string('b', 64), first.ManagementToken);
+        }
+        finally { await source.StopAsync(CancellationToken.None); }
+
+        var restarted = new AgentControlOperationService(
+            (_, _) => throw new InvalidOperationException("replay must not re-execute"), root);
+        try
+        {
+            var replay = await restarted.ExecuteOrReplayAsync(request);
+            Assert.True(replay.Success, replay.Diagnostic);
+            Assert.Equal("management-plan-issued", replay.FinalStatus);
+            Assert.Equal(ApfsManagementOperations.RenameVolume, replay.ManagementOperation);
+            Assert.Equal("mgmt-plan-v1:deadbeef", replay.ManagementPlanId);
+            Assert.Equal(new string('b', 64), replay.ManagementToken);
+            Assert.Equal("90", replay.ManagementObservedXid);
+        }
+        finally { await restarted.StopAsync(CancellationToken.None); Directory.Delete(root, true); }
+    }
+
+    private const string ImagePath = @"D:\keeper-test\image.apfs";
+
     private static ControlOperationRequestPayload CreateRequest(
         string? operationId = null,
         ApfsControlTarget? target = null,
@@ -2221,6 +2573,129 @@ public sealed class AgentControlOperationServiceTests
             StartedAtUtc: DateTime.UtcNow,
             CompletedAtUtc: DateTime.UtcNow,
             FinalStatus: "healthy-rw");
+
+    [Theory]
+    [InlineData(ApfsControlCommands.ContainerMount)]
+    [InlineData(ApfsControlCommands.ContainerUnmount)]
+    public async Task ContainerCommands_PassAdmissionWithNormalizedContainerTarget(string command)
+    {
+        var root = CreateEvidenceRoot(); var calls = 0;
+        var target = new ApfsControlTarget("DEVICE-1", string.Empty, null, null, new string('A', 32));
+        var request = new ControlOperationRequestPayload(Guid.NewGuid().ToString("D"), command, target,
+            command == ApfsControlCommands.ContainerMount ? "read-write" : null, DateTime.UtcNow.AddMinutes(1));
+        var service = new AgentControlOperationService((operation, _) => { calls++;
+            Assert.Equal("device-1", operation.Target!.DeviceId);
+            Assert.Equal(new string('a', 32), operation.Target.ContainerUuid);
+            Assert.True(string.IsNullOrEmpty(operation.Target.VolumeId));
+            return Task.FromResult(Success(operation)); }, root);
+        var result = await service.ExecuteOrReplayAsync(request);
+        Assert.True(result.Success, result.Diagnostic);
+        Assert.Equal(1, calls);
+
+        OperationResultPayload Success(ControlOperationRequestPayload operation)
+            => new(
+                OperationId: operation.OperationId,
+                Command: operation.Command,
+                Target: operation.Target,
+                Fingerprint: null,
+                State: ApfsOperationStates.Succeeded,
+                Code: ApfsOperationCodes.OperationSucceeded,
+                Success: true,
+                RequestedAtUtc: DateTime.UtcNow,
+                StartedAtUtc: DateTime.UtcNow,
+                CompletedAtUtc: DateTime.UtcNow,
+                FinalStatus: command == ApfsControlCommands.ContainerMount ? "container-mounted" : "container-unmounted");
+    }
+
+    [Theory]
+    [InlineData(ApfsControlCommands.ContainerMount)]
+    [InlineData(ApfsControlCommands.ContainerUnmount)]
+    public async Task ContainerCommands_RejectVolumeTargetsWithoutDispatch(string command)
+    {
+        var root = CreateEvidenceRoot(); var calls = 0;
+        var target = new ApfsControlTarget("device-1", "device-1|Main", null, null, new string('a', 32));
+        var request = new ControlOperationRequestPayload(Guid.NewGuid().ToString("D"), command, target,
+            command == ApfsControlCommands.ContainerMount ? "read-write" : null, DateTime.UtcNow.AddMinutes(1));
+        var service = new AgentControlOperationService((operation, _) => { calls++;
+            return Task.FromResult(Success(operation)); }, root);
+        var result = await service.ExecuteOrReplayAsync(request);
+        Assert.False(result.Success);
+        Assert.Equal(0, calls);
+
+        OperationResultPayload Success(ControlOperationRequestPayload operation)
+            => new(
+                OperationId: operation.OperationId,
+                Command: operation.Command,
+                Target: operation.Target,
+                Fingerprint: null,
+                State: ApfsOperationStates.Succeeded,
+                Code: ApfsOperationCodes.OperationSucceeded,
+                Success: true,
+                RequestedAtUtc: DateTime.UtcNow,
+                StartedAtUtc: DateTime.UtcNow,
+                CompletedAtUtc: DateTime.UtcNow,
+                FinalStatus: "container-mounted");
+    }
+
+    [Fact]
+    public async Task DeviceEject_PassesAdmissionWithDeviceOnlyTarget()
+    {
+        var root = CreateEvidenceRoot(); var calls = 0;
+        var target = new ApfsControlTarget("DEVICE-1", string.Empty);
+        var request = new ControlOperationRequestPayload(Guid.NewGuid().ToString("D"),
+            ApfsControlCommands.DeviceEject, target, ExpiresAtUtc: DateTime.UtcNow.AddMinutes(1));
+        var service = new AgentControlOperationService((operation, _) => { calls++;
+            Assert.Equal("device-1", operation.Target!.DeviceId);
+            Assert.True(string.IsNullOrEmpty(operation.Target.VolumeId));
+            return Task.FromResult(Success(operation)); }, root);
+        var result = await service.ExecuteOrReplayAsync(request);
+        Assert.True(result.Success, result.Diagnostic);
+        Assert.Equal(1, calls);
+
+        OperationResultPayload Success(ControlOperationRequestPayload operation)
+            => new(
+                OperationId: operation.OperationId,
+                Command: operation.Command,
+                Target: operation.Target,
+                Fingerprint: null,
+                State: ApfsOperationStates.Succeeded,
+                Code: ApfsOperationCodes.OperationSucceeded,
+                Success: true,
+                RequestedAtUtc: DateTime.UtcNow,
+                StartedAtUtc: DateTime.UtcNow,
+                CompletedAtUtc: DateTime.UtcNow,
+                FinalStatus: "device-ejected");
+    }
+
+    [Theory]
+    [InlineData("device-1|Main", null)]
+    [InlineData("", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")]
+    public async Task DeviceEject_RejectsScopedTargetsWithoutDispatch(string volumeId, string? containerUuid)
+    {
+        var root = CreateEvidenceRoot(); var calls = 0;
+        var target = new ApfsControlTarget("device-1", volumeId, null, null, containerUuid);
+        var request = new ControlOperationRequestPayload(Guid.NewGuid().ToString("D"),
+            ApfsControlCommands.DeviceEject, target, ExpiresAtUtc: DateTime.UtcNow.AddMinutes(1));
+        var service = new AgentControlOperationService((operation, _) => { calls++;
+            return Task.FromResult(Success(operation)); }, root);
+        var result = await service.ExecuteOrReplayAsync(request);
+        Assert.False(result.Success);
+        Assert.Equal(0, calls);
+
+        OperationResultPayload Success(ControlOperationRequestPayload operation)
+            => new(
+                OperationId: operation.OperationId,
+                Command: operation.Command,
+                Target: operation.Target,
+                Fingerprint: null,
+                State: ApfsOperationStates.Succeeded,
+                Code: ApfsOperationCodes.OperationSucceeded,
+                Success: true,
+                RequestedAtUtc: DateTime.UtcNow,
+                StartedAtUtc: DateTime.UtcNow,
+                CompletedAtUtc: DateTime.UtcNow,
+                FinalStatus: "device-ejected");
+    }
 
     private static string CreateEvidenceRoot()
     {

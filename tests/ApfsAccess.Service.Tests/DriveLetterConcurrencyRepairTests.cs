@@ -160,6 +160,85 @@ public sealed class DriveLetterConcurrencyRepairTests : IDisposable
         Assert.Equal("T", json.RootElement.GetProperty(A.ToString("D")).GetString());
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task InventoryNotificationAllowsPreferenceReentryOutsideAdmissionLocks(bool preference)
+    {
+        var backend = new Backend();
+        var publisher = new RuntimeStatusPublisher();
+        using var worker = Worker(backend, Policy(), publisher);
+        Task<AckPayload>? reentry = null;
+        var seen = 0;
+        var completedInsideNotification = false;
+        publisher.StatusChanged += _ =>
+        {
+            if (Interlocked.Increment(ref seen) != 1) return;
+            reentry = Task.Run(() => worker.SetDriveLetterPreferenceAsync(Request, CancellationToken.None));
+            completedInsideNotification = reentry.Wait(TimeSpan.FromSeconds(2));
+        };
+        if (preference) Assert.True((await worker.SetDriveLetterPreferenceAsync(Request, CancellationToken.None)).Success);
+        else Assert.NotEmpty(await worker.GetInventoryAsync(CancellationToken.None));
+        Assert.NotNull(reentry);
+        Assert.True((await reentry.WaitAsync(TimeSpan.FromSeconds(3))).Success);
+        Assert.True(completedInsideNotification);
+        Assert.Equal(0, backend.Mutations);
+    }
+
+    [Theory]
+    [InlineData("cycle")]
+    [InlineData("refresh")]
+    [InlineData("eject")]
+    [InlineData("failed-preference")]
+    public async Task WorkerNotificationsAllowReentryAndPreserveDiscoveryFailure(string route)
+    {
+        var backend = new Backend();
+        var publisher = new RuntimeStatusPublisher();
+        using var worker = Worker(backend, Policy(), publisher);
+        await worker.GetInventoryAsync(default);
+        backend.Volumes = [Volume with { VolumeName = "Changed" }];
+        var storageError = new IOException("controlled observer failure");
+        if (route == "failed-preference") backend.Failure = storageError;
+        Task? reentry = null;
+        var delivered = 0;
+        var completedInsideNotification = false;
+        publisher.StatusChanged += _ =>
+        {
+            if (Interlocked.Increment(ref delivered) != 1) return;
+            backend.Failure = null;
+            reentry = Task.Run(async () =>
+            {
+                Assert.True((await worker.EjectAllAsync(default)).Success);
+                Assert.True((await worker.SetDriveLetterPreferenceAsync(Request, default)).Success);
+            });
+            completedInsideNotification = reentry.Wait(TimeSpan.FromSeconds(2));
+            throw new InvalidOperationException("controlled subscriber failure");
+        };
+        if (route == "failed-preference")
+            Assert.Same(storageError, await Assert.ThrowsAsync<IOException>(() => worker.SetDriveLetterPreferenceAsync(Request, default)));
+        else if (route == "cycle") await Cycle(worker);
+        else if (route == "refresh") Assert.True((await worker.RefreshAsync(false, default)).Success);
+        else Assert.True((await worker.EjectAllAsync(default)).Success);
+        Assert.NotNull(reentry);
+        await reentry.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.True(completedInsideNotification);
+        Assert.Equal(0, backend.Mutations);
+    }
+
+    [Fact]
+    public async Task FailureProjectingMalformedInventoryInvalidatesOlderObservation()
+    {
+        var backend = new Backend(); var publisher = new RuntimeStatusPublisher();
+        using var worker = Worker(backend, Policy(), publisher);
+        await worker.GetInventoryAsync(default);
+        var oldGeneration = publisher.Latest.InventoryGeneration;
+        backend.NullVolume = true;
+        await Assert.ThrowsAsync<NullReferenceException>(() => worker.GetInventoryAsync(default));
+        Assert.Empty(publisher.Latest.ConnectedInventory!);
+        Assert.True(publisher.Latest.InventoryGeneration > oldGeneration);
+        Assert.Equal(0, backend.Mutations);
+    }
+
     private sealed class BlockingPolicy(FirstFreeMountPolicy inner, bool afterCommit) : IMountPolicy
     {
         public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -190,6 +269,8 @@ public sealed class DriveLetterConcurrencyRepairTests : IDisposable
     {
         public VolumeInfo[] Volumes = [Volume];
         public bool PauseFirst;
+        public IOException? Failure;
+        public bool NullVolume;
         public int Observations;
         public int Mutations;
         public TaskCompletionSource FirstCaptured { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -197,6 +278,8 @@ public sealed class DriveLetterConcurrencyRepairTests : IDisposable
         public async Task<IReadOnlyList<DeviceInventory>> ProbeInventoryAsync(bool authoritative, CancellationToken token)
         {
             Assert.True(authoritative);
+            if (Failure is { } failure) throw failure;
+            if (NullVolume) return [new(new("device", "Disk", true), [null!])];
             var snapshot = Volumes.ToArray();
             if (Interlocked.Increment(ref Observations) == 1 && PauseFirst)
             {

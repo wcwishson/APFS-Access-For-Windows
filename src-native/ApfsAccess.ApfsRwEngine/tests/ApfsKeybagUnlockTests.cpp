@@ -364,6 +364,50 @@ void LoaderBudgets()
     }
     CHECK(false);
 }
+void LoaderMetadata()
+{
+    ++groups;
+    for (bool entries : {false,true})
+    {
+        VectorRandomAccessSource raw(Image(entries));
+        auto reads=std::make_shared<ApfsReadBudget>(4096,16*1024*1024,100000,16*1024*1024);
+        BudgetedRandomAccessSource source(raw,reads);
+        UnlockError error;
+        auto inspected=InspectPasswordKeybagMetadata(source,101,
+            entries ? KeybagLength::EntriesOnly : KeybagLength::IncludesHeader,error);
+        CHECK(inspected); CHECK(error==UnlockError::None);
+        const auto expected=Request(entries);
+        auto& selected=inspected->selection;
+        CHECK(selected.container_uuid==expected.container_uuid);
+        CHECK(selected.volume_uuid==expected.volume_uuid);
+        CHECK(selected.volume_oid==101); CHECK(selected.checkpoint_xid==7);
+        CHECK(selected.container_bag.oid==901); CHECK(selected.container_bag.xid==7);
+        CHECK(selected.volume_bag.oid==902); CHECK(selected.volume_bag.xid==7);
+        CHECK(selected.user_uuid==KeybagUuid{});
+        CHECK(inspected->users==std::vector<KeybagUuid>{expected.user_uuid});
+        selected.user_uuid=inspected->users.front();
+        PasswordUnlockBudget attempts;
+        auto key=UnlockPasswordKeybags(source,selected,Hex(f::Password),attempts);
+        CHECK(key); CHECK(key.volume_oid==101); CHECK(key.volume_xid==7);
+    }
+    VectorRandomAccessSource raw(Image());
+    auto allowance=std::make_shared<ApfsReadBudget>(4096,16*1024*1024,100000,16*1024*1024);
+    BudgetedRandomAccessSource source(raw,allowance);
+    UnlockError error;
+    CHECK(!InspectPasswordKeybagMetadata(source,0,KeybagLength::IncludesHeader,error));
+    CHECK(error==UnlockError::InvalidArgument);
+    CHECK(!InspectPasswordKeybagMetadata(source,999,KeybagLength::IncludesHeader,error));
+    CHECK(error==UnlockError::IdentityMismatch);
+    CHECK(!InspectPasswordKeybagMetadata(source,101,KeybagLength::EntriesOnly,error));
+    CHECK(error!=UnlockError::None);
+    CHECK(!InspectPasswordKeybagMetadata(raw,101,KeybagLength::IncludesHeader,error));
+    CHECK(error==UnlockError::ResourceLimit);
+    auto denied=std::make_shared<ApfsReadBudget>(0,0,0,0);
+    BudgetedRandomAccessSource blocked(raw,denied);
+    CHECK(!InspectPasswordKeybagMetadata(blocked,101,KeybagLength::IncludesHeader,error));
+    CHECK(error==UnlockError::ResourceLimit); CHECK(denied->Failed());
+    Released();
+}
 class FaultSource final : public RandomAccessSource
 {
 public:
@@ -479,7 +523,7 @@ int main(int argc, char** argv)
             {"RecordVectors",RecordVectors}, {"DerAdversaries",DerAdversaries},
             {"FailureSweeps",FailureSweeps}, {"RetryControl",RetryControl},
             {"OuterVectors",OuterVectors}, {"LoaderBinding",LoaderBinding},
-            {"LoaderBudgets",LoaderBudgets}, {"LoaderSourceFailures",LoaderSourceFailures},
+            {"LoaderBudgets",LoaderBudgets}, {"LoaderMetadata",LoaderMetadata}, {"LoaderSourceFailures",LoaderSourceFailures},
             {"LoaderIdentityReview",LoaderIdentityReview}, {"OmapProfileRefusals",OmapProfileRefusals}};
         for (const auto& [name,run]:suite)
         {

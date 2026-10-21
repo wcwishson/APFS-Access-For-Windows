@@ -1,18 +1,24 @@
 #include "ApfsCrypto.h"
 #include "ApfsCryptoTestHooks.h"
 #include "ApfsCryptoVectors.h"
+#ifndef APFSACCESS_CRYPTO_ONLY_TESTS
 #include "ApfsKeybag.h"
+#endif
 
 #include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 using namespace apfsaccess::crypto;
+#ifndef APFSACCESS_CRYPTO_ONLY_TESTS
 using namespace apfsaccess::catalog;
+#endif
 namespace
 {
 unsigned checks = 0, groups = 0;
@@ -222,6 +228,154 @@ void XtsNotAuthenticated()
     auto wrong_tweak = XtsTransform(key, tweak, cipher, XtsDirection::Decrypt);
     CHECK(wrong_tweak); CHECK(!Same(wrong_tweak.bytes.Bytes(), plain));
 }
+// NIST CAVP CAVS 14.0, gcmtestvectors.zip, directly published fixtures:
+// https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/mac/gcmtestvectors.zip
+// gcmEncryptExtIV256.rsp, Count=0 for each (PTlen,AADlen) below;
+// all Keylen=256, IVlen=96, Taglen=128. Last vector: gcmDecrypt256.rsp,
+// Count=0, PTlen=256, AADlen=160. Expected decryption never uses seal output.
+struct GcmVector { const char* key; const char* nonce; const char* aad; const char* plain; const char* record; };
+constexpr GcmVector gcm_vectors[] = {
+    // (0,0)
+    {"b52c505a37d78eda5dd34f20c22540ea1b58963cf8e5bf8ffa85f9f2492505b4",
+     "516c33929df5a3284ff463d7", "", "", "bdc1ac884d332457a1d2664f168c76f0"},
+    // (0,160)
+    {"886cff5f3e6b8d0e1ad0a38fcdb26de97e8acbe79f6bed66959a598fa5047d65",
+     "3a8efa1cd74bbab5448f9945", "519fee519d25c7a304d6c6aa1897ee1eb8c59655", "",
+     "f6d47505ec96c98a42dc3ae719877b87"},
+    // (128,0)
+    {"31bdadd96698c204aa9ce1448ea94ae1fb4a9a0b3c9d773b51bb1822666b8f22",
+     "0d18e06c7c725ac9e362e1ce", "", "2db5168e932556f8089a0622981d017d",
+     "fa4362189661d163fcd6a56d8bf0405a" "d636ac1bbedd5cc3ee727dc2ab4a9489"},
+    // (128,160)
+    {"83688deb4af8007f9b713b47cfa6c73e35ea7a3aa4ecdb414dded03bf7a0fd3a",
+     "0b459724904e010a46901cf3", "794a14ccd178c8ebfd1379dc704c5e208f9d8424",
+     "33d893a2114ce06fc15d55e454cf90c3",
+     "cc66bee423e3fcd4c0865715e9586696" "0fb291bd3dba94a1dfd8b286cfb97ac5"},
+    // (256,160)
+    {"5853c020946b35f2c58ec427152b840420c40029636adcbb027471378cfdde0f",
+     "eec313dd07cc1b3e6b068a47", "1389b522c24a774181700553f0246bbabdd38d6f",
+     "ce7458e56aef9061cb0c42ec2315565e6168f5a6249ffd31610b6d17ab64935e",
+     "eadc3b8766a77ded1a58cb727eca2a9790496c298654cda78febf0da16b6903b"
+     "3d49a5b32fde7eafcce90079217ffb57"},
+    // (408,160), partial final block
+    {"24501ad384e473963d476edcfe08205237acfd49b5b8f33857f8114e863fec7f",
+     "9ff18563b978ec281b3f2794", "adb5ec720ccf9898500028bf34afccbcaca126ef",
+     "27f348f9cdc0c5bd5e66b1ccb63ad920ff2219d14e8d631b3872265cf117ee86757accb158bd9abb3868fdc0d0b074b5f01b2c",
+     "eb7cb754c824e8d96f7c6d9b76c7d26fb874ffbf1d65c6f64a698d839b0b06145dae82057ad55994cf59ad7f67c0fa5e85fab8"
+     "bc95c532fecc594c36d1550286a7a3f0"},
+    {"c70fcbba915478f66315a15ffc3b11d92c24cbf213cc858f8740713ed9493182",
+     "5b413f5dbfccc6a7c65ff5c4", "ee7b3521f1363c1fcbbb24c2c65f7ecee99d457c",
+     "f135e924c57ca538f72c700fb0c9c103a70fc1935797cfe08024397f1c1a8277",
+     "2ab2d676861b2281d3f740f637c997e25569ec7352e1767ce4c4c9ed5a6ab15a"
+     "9a4a3febec6413d461f26364b51237f3"}
+};
+
+void GcmVectors()
+{
+    for (const auto& v : gcm_vectors)
+    {
+        const auto key = Hex(v.key), nonce = Hex(v.nonce), aad = Hex(v.aad);
+        const auto plain = Hex(v.plain), record = Hex(v.record);
+        auto sealed = Aes256GcmSeal(key, nonce, plain, aad);
+        CHECK(sealed); CHECK(sealed.os_status == 0); CHECK(sealed.bytes.IsLocked());
+        CHECK(Same(sealed.bytes.Bytes(), record));
+        auto opened = Aes256GcmOpen(key, nonce, record, aad);
+        CHECK(opened); CHECK(opened.os_status == 0); CHECK(Same(opened.bytes.Bytes(), plain));
+        CHECK(opened.bytes.IsLocked() == !plain.empty());
+        CHECK(Same(key, Hex(v.key))); CHECK(Same(nonce, Hex(v.nonce)));
+        CHECK(Same(aad, Hex(v.aad))); CHECK(Same(plain, Hex(v.plain))); CHECK(Same(record, Hex(v.record)));
+    }
+}
+void GcmEmpty()
+{
+    const auto key = Hex(gcm_vectors[0].key), nonce = Hex(gcm_vectors[0].nonce);
+    auto record = Hex(gcm_vectors[0].record);
+    const auto nonnull_empty = std::span<const std::byte>(key).first(0);
+    for (bool nonnull : {false, true})
+    {
+        const auto empty = nonnull ? nonnull_empty : std::span<const std::byte>{};
+        auto sealed = Aes256GcmSeal(key, nonce, empty, empty);
+        CHECK(sealed); CHECK(sealed.bytes.Size() == kGcmTagBytes);
+        CHECK(Same(sealed.bytes.Bytes(), record));
+        auto opened = Aes256GcmOpen(key, nonce, record, empty);
+        CHECK(opened); CHECK(opened.bytes.Size() == 0); CHECK(!opened.bytes.IsLocked());
+        auto wrong = record; wrong[0] ^= std::byte{1};
+        Failed(Aes256GcmOpen(key, nonce, wrong, empty), CryptoError::IntegrityFailure);
+    }
+}
+void GcmIntegrity()
+{
+    const auto rejected = [](CryptoResult result) {
+        Failed(result, CryptoError::IntegrityFailure);
+        CHECK(result.os_status == 0xC000A002UL); // SDK STATUS_AUTH_TAG_MISMATCH.
+        CHECK(testing::hooks.all_released_bytes_zero);
+        CHECK(testing::hooks.releases == testing::hooks.locks);
+        CHECK(testing::hooks.unlocks == testing::hooks.locks);
+    };
+    for (const auto& v : gcm_vectors)
+    {
+        auto key = Hex(v.key), nonce = Hex(v.nonce), aad = Hex(v.aad), record = Hex(v.record);
+        key[0] ^= std::byte{1}; rejected(Aes256GcmOpen(key, nonce, record, aad)); key[0] ^= std::byte{1};
+        for (auto& b : nonce)
+        { b ^= std::byte{1}; rejected(Aes256GcmOpen(key, nonce, record, aad)); b ^= std::byte{1}; }
+        for (auto& b : record) // Every ciphertext AND tag byte; includes tag-only records.
+        { b ^= std::byte{1}; rejected(Aes256GcmOpen(key, nonce, record, aad)); b ^= std::byte{1}; }
+        for (auto& b : aad)
+        { b ^= std::byte{1}; rejected(Aes256GcmOpen(key, nonce, record, aad)); b ^= std::byte{1}; }
+        aad.push_back(std::byte{0}); rejected(Aes256GcmOpen(key, nonce, record, aad)); aad.pop_back();
+        if (!aad.empty()) rejected(Aes256GcmOpen(key, nonce, record, {}));
+        record.push_back(std::byte{0}); rejected(Aes256GcmOpen(key, nonce, record, aad)); record.pop_back();
+        if (record.size() > kGcmTagBytes)
+            rejected(Aes256GcmOpen(key, nonce, std::span(record).first(record.size() - 1), aad));
+    }
+    // Independently published FAIL records from gcmDecrypt256.rsp, Count=0,
+    // IVlen=96, Taglen=128: (PTlen,AADlen) = (0,160), (408,160).
+    rejected(Aes256GcmOpen(Hex("c0b46dc989a7bd45c15553e86a0bf206bf85a5222df1d5a7c8620ec8fa94cb95"),
+        Hex("c140cffdba21d9226eca8284"), Hex("54ba2bc9b8621d84e936c839c0de7118"),
+        Hex("410a4afa61dd30c2d687ba9cba18fe8a0cd37d58")));
+    rejected(Aes256GcmOpen(Hex("e9d381a9c413bee66175d5586a189836e5c20f5583535ab4d3f3e612dc21700e"),
+        Hex("23e81571da1c7821c681c7ca"),
+        Hex("a25f3f580306cd5065d22a6b7e9660110af7204bb77d370f7f34bee547feeff7b32a596fce29c9040e68b1589aad48da881990"
+            "5b6dcd70eefb0892fab1539298b92a4b"), Hex("6f39c9ae7b8e8a58a95f0dd8ea6a9087cbccdfd6")));
+}
+void GcmBounds()
+{
+    const auto key = Hex(gcm_vectors[0].key), nonce = Hex(gcm_vectors[0].nonce);
+    const auto record = Hex(gcm_vectors[0].record);
+    for (const std::size_t n : {0, 16, 24, 31, 33})
+    {
+        const std::vector<std::byte> bad(n);
+        Failed(Aes256GcmSeal(bad, nonce, {}, {}), CryptoError::InvalidArgument);
+        Failed(Aes256GcmOpen(bad, nonce, record, {}), CryptoError::InvalidArgument);
+    }
+    for (const std::size_t n : {0, 1, 11, 13, 16})
+    {
+        const std::vector<std::byte> bad(n);
+        Failed(Aes256GcmSeal(key, bad, {}, {}), CryptoError::InvalidArgument);
+        Failed(Aes256GcmOpen(key, bad, record, {}), CryptoError::InvalidArgument);
+    }
+    for (std::size_t n = 0; n < kGcmTagBytes; ++n)
+        Failed(Aes256GcmOpen(key, nonce, std::span(record).first(n), {}), CryptoError::InvalidArgument);
+    const std::vector<std::byte> over_record(kMaxGcmRecordBytes + 1), over_aad(kMaxGcmAadBytes + 1);
+    Failed(Aes256GcmSeal(key, nonce, std::span(over_record).first(kMaxGcmRecordBytes - kGcmTagBytes + 1), {}),
+        CryptoError::ResourceLimit);
+    Failed(Aes256GcmOpen(key, nonce, over_record, {}), CryptoError::ResourceLimit);
+    Failed(Aes256GcmSeal(key, nonce, {}, over_aad), CryptoError::ResourceLimit);
+    Failed(Aes256GcmOpen(key, nonce, record, over_aad), CryptoError::ResourceLimit);
+    CHECK(testing::hooks.cng_calls == 0); CHECK(testing::hooks.allocations == 0);
+    // Exact limits pass validation. Inject failure at the first secure allocation
+    // to exercise admission without depending on the host's 1 MiB lock quota.
+    for (bool seal : {false, true})
+    {
+        testing::hooks = {}; testing::hooks.allocation_failure_at = 0;
+        const auto input = std::span(over_record).first(seal ? kMaxGcmRecordBytes - kGcmTagBytes : kMaxGcmRecordBytes);
+        const auto aad = std::span(over_aad).first(kMaxGcmAadBytes);
+        auto result = seal ? Aes256GcmSeal(key, nonce, input, aad) : Aes256GcmOpen(key, nonce, input, aad);
+        Failed(result, CryptoError::AllocationFailed); CHECK(result.os_status != 0);
+        CHECK(testing::hooks.cng_calls > 0); CHECK(testing::hooks.locks == 0);
+    }
+}
+
 template<class F> void FailureSweep(F operation)
 {
     testing::hooks = {};
@@ -252,6 +406,34 @@ template<class F> void FailureSweep(F operation)
     }
 }
 
+void GcmFailures(bool seal)
+{
+    for (const std::size_t index : {0, 1, 5}) // Empty, AAD-only and partial multiblock.
+    {
+        const auto& v = gcm_vectors[index];
+        const auto key = Hex(v.key), nonce = Hex(v.nonce), aad = Hex(v.aad);
+        const auto input = Hex(seal ? v.plain : v.record);
+        const auto operation = [&] { return seal ? Aes256GcmSeal(key, nonce, input, aad)
+                                               : Aes256GcmOpen(key, nonce, input, aad); };
+        FailureSweep(operation);
+        testing::hooks = {};
+        { auto result = operation(); CHECK(result); }
+        const auto baseline = testing::hooks;
+        CHECK(baseline.allocations == ((!seal && index < 2) ? 1 : 2));
+        CHECK(baseline.unlocks == baseline.allocations);
+        testing::hooks = {};
+        testing::hooks.cng_failure_at = baseline.cng_calls - 1;
+        testing::hooks.cng_fail_after_call = true;
+        auto failed = operation(); // Fail after real encryption/decryption/tag processing.
+        Failed(failed, CryptoError::ProviderFailure); CHECK(failed.os_status != 0);
+        CHECK(testing::hooks.releases == baseline.allocations);
+        CHECK(testing::hooks.wipes == baseline.allocations);
+        CHECK(testing::hooks.unlocks == baseline.allocations);
+        CHECK(testing::hooks.all_released_bytes_zero);
+    }
+}
+
+#ifndef APFSACCESS_CRYPTO_ONLY_TESTS
 void Put(std::vector<std::byte>& b, std::size_t offset, std::uint64_t value, std::size_t n)
 {
     for (std::size_t i = 0; i < n; ++i) b.at(offset + i) = static_cast<std::byte>((value >> (8*i)) & 255);
@@ -400,6 +582,7 @@ void KeybagSources()
     CHECK(short_source.reads == reads);
     CHECK(!ReadKeybagMetadata(vector, 1, bag.size(), KeybagKind::Container, KeybagLength::EntriesOnly));
 }
+#endif // APFSACCESS_CRYPTO_ONLY_TESTS
 } // namespace
 
 int main()
@@ -416,6 +599,12 @@ int main()
         Group("XTS independent encryption and decryption vectors", XtsVectors);
         Group("XTS key/tweak/data-unit/direction bounds", XtsBounds);
         Group("XTS wrong key, ciphertext and tweak are not authenticated", XtsNotAuthenticated);
+        Group("GCM NIST CAVP independent seal/open KATs: empty, AAD, multiblock and partial block", GcmVectors);
+        Group("GCM tag-only authentication with null and non-null empty spans", GcmEmpty);
+        Group("GCM wrong key/nonce/AAD, every record byte, framing and NIST FAIL vectors", GcmIntegrity);
+        Group("GCM exact key/nonce sizes and record/AAD resource limits", GcmBounds);
+        Group("GCM seal exhaustive CNG/allocation/lock failures and wipes", [] { GcmFailures(true); });
+        Group("GCM open exhaustive CNG/allocation/lock failures and wipes", [] { GcmFailures(false); });
         Group("PBKDF2 exhaustive CNG/allocation/lock failure points", [] {
             const auto pass = Hex(kPbkdfVectors[0].password), salt = Hex(kPbkdfVectors[0].salt);
             FailureSweep([&] { return Pbkdf2HmacSha256(pass, salt, 2, 32); });
@@ -430,14 +619,17 @@ int main()
                 const auto input = Hex(direction == XtsDirection::Encrypt ? kXtsVectors[0].plain : kXtsVectors[0].cipher);
                 FailureSweep([&] { return XtsTransform(key, tweak, input, direction); });
             });
+#ifndef APFSACCESS_CRYPTO_ONLY_TESTS
         Group("keybag explicit framing conventions and metadata subset", KeybagMetadata);
         Group("keybag all truncations, trailing data, count/length/padding", KeybagMalformed);
         Group("keybag unknown tags/classes and no partial metadata", KeybagUnsupported);
         Group("keybag signed physical-range overflow", KeybagRanges);
         Group("keybag exact source reads and shared read/materialization budgets", KeybagSources);
+#endif
         std::cout << "PASS " << groups << " groups / " << checks << " assertions; "
             << std::size(kPbkdfVectors) << " PBKDF2, " << std::size(wraps) << " RFC3394, "
-            << std::size(kXtsVectors) << " XTS public KATs (XTS both directions).\n";
+            << std::size(kXtsVectors) << " XTS, " << std::size(gcm_vectors)
+            << " GCM public KATs (XTS/GCM both directions).\n";
         return 0;
     }
     catch (const std::exception& error)

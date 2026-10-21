@@ -2,6 +2,8 @@
 
 #include "ApfsFormat.h"
 
+namespace apfsaccess::rw { class NativeApfsReader; struct ApplePhysicalExtentRecord; }
+
 namespace apfsaccess::catalog
 {
 // All fields are exact. UUIDs are the existing opaque 32-lowercase-hex format.
@@ -63,10 +65,26 @@ public:
         const ApfsSnapshotIdentity& expected, ApfsSnapshotRecords& out_records,
         std::string& out_error);
 
+    // Same exact bundle with extentref resolved to a complete NEW view in memory.
+    // Reads each chronological predecessor through LoadExactRecords under one
+    // shared budget, checks every layer against that snapshot's exact mappings.
+    // The raw API above continues to return the original on-disk layer.
+    static bool LoadExactResolvedRecords(const RandomAccessSource& source,
+        const ApfsSnapshotIdentity& expected, ApfsSnapshotRecords& out_records,
+        std::string& out_error);
+
     // Re-reads authoritative bytes; never treats a cached descriptor as proof.
     // Mismatched XID/name/root identity fails, without selecting another view.
     static bool ValidateExact(const RandomAccessSource& source,
         const ApfsSnapshotIdentity& expected, ApfsSnapshotInfo& out_snapshot,
         std::string& out_error);
+private:
+    friend class rw::NativeApfsReader;
+    // The strict chronological resolver already validates complete per-view
+    // coverage and clone counts. Only the reader may consume that owned result
+    // directly instead of encoding and validating the same NEW graph again.
+    static bool LoadExactProjectionRecords(const RandomAccessSource& source,
+        const ApfsSnapshotIdentity& expected, ApfsSnapshotRecords& out_records,
+        std::vector<rw::ApplePhysicalExtentRecord>& out_geometry, std::string& out_error);
 };
 } // namespace apfsaccess::catalog

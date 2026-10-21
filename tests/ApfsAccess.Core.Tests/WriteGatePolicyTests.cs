@@ -4,6 +4,35 @@ namespace ApfsAccess.Core.Tests;
 
 public sealed class WriteGatePolicyTests
 {
+    [Theory]
+    [InlineData(@"\\.\PhysicalDrive1", true)]
+    [InlineData(@"\\?\PhysicalDrive1", true)]
+    [InlineData(@"\\.\PhysicalDrive10", false)]
+    [InlineData(@"\\.\PhysicalDrive12", false)]
+    [InlineData(@"\\?\PhysicalDrive12", false)]
+    public void EvaluateForVolume_HardwareAllowListDoesNotAdmitAnotherDiskByPrefix(
+        string deviceId, bool expected)
+    {
+        var options = new ServiceHostOptions
+        {
+            EnableNativeWrite = true,
+            WriteRolloutChannel = "Pilot",
+            NativeWriteAllowRawPhysicalDevices = true,
+            NativeWritePromotionPolicy = "CanonicalImage",
+            NativeWriteHardwarePilotDeviceAllowList = [@"\\.\PhysicalDrive1"],
+        };
+        var volume = new VolumeInfo(
+            VolumeId: "v1", DeviceId: deviceId, VolumeName: "Data",
+            SupportsReadWrite: true, IsEncrypted: false,
+            SupportsExplorerMount: true, NativeVolumePath: null,
+            SupportsNativeWrite: true);
+
+        var decision = WriteGatePolicy.EvaluateForVolume(options, volume);
+
+        Assert.Equal(expected, decision.AllowWrite);
+        Assert.Equal(expected ? "Enabled" : "HardwarePilotAllowListBlocked", decision.GateState);
+    }
+
     [Fact]
     public void ServiceHostOptions_DisablesValidationEvidenceExpiryByDefault()
     {

@@ -93,6 +93,8 @@ public sealed class RuntimeStatusPublisher
            left.WriteEnabled == right.WriteEnabled &&
            SequenceEqualOrdinal(left.CompatibilityWarnings, right.CompatibilityWarnings) &&
            MountedVolumesEqual(left.MountedVolumes, right.MountedVolumes) &&
+           left.InventoryGeneration.HasValue == right.InventoryGeneration.HasValue &&
+           (left.InventoryGeneration is > 0) == (right.InventoryGeneration is > 0) &&
            ConnectedInventoryEqual(left.ConnectedInventory, right.ConnectedInventory) &&
            string.Equals(left.WriteBackend, right.WriteBackend, StringComparison.Ordinal) &&
            left.CommitModel == right.CommitModel &&
@@ -115,13 +117,62 @@ public sealed class RuntimeStatusPublisher
     private static bool ConnectedInventoryEqual(
         IReadOnlyList<DeviceInventory>? left, IReadOnlyList<DeviceInventory>? right)
         => UnorderedEqual(left, right, (a, b) =>
-            a.Device == b.Device && UnorderedEqual(a.Volumes, b.Volumes, InventoryVolumeEqual));
+            a.Device == b.Device && TopologyEqual(a.Topology, b.Topology) && UnorderedEqual(a.Volumes, b.Volumes, InventoryVolumeEqual));
+
+    private static bool TopologyEqual(ApfsDiscoveryTopology? left, ApfsDiscoveryTopology? right)
+    {
+        if (ReferenceEquals(left, right)) return true;
+        if (left is null || right is null) return false;
+        if ((left.Generation > 0) != (right.Generation > 0)) return false;
+        // Observation counters do not change the displayed graph. Still install the
+        // latest payload so command admission can use its current generation.
+        var a = left.Snapshot; var b = right.Snapshot;
+        if (a is null || b is null)
+            return a is null && b is null && left.DeviceId == right.DeviceId &&
+                UnorderedEqual(left.DiskIds, right.DiskIds, StringEqualsOrdinal);
+        return left.DeviceId == right.DeviceId &&
+            UnorderedEqual(left.DiskIds, right.DiskIds, StringEqualsOrdinal) &&
+            UnorderedEqual(a.Disks, b.Disks, (x, y) => x == y) &&
+            UnorderedEqual(a.Partitions, b.Partitions, (x, y) => x == y) &&
+            UnorderedEqual(a.Stores, b.Stores, (x, y) => x == y) &&
+            UnorderedEqual(a.Containers, b.Containers, ContainerEqual) &&
+            UnorderedEqual(a.Volumes, b.Volumes, CatalogVolumeEqual) &&
+            UnorderedEqual(a.Groups, b.Groups, (x, y) =>
+                UnorderedEqual(x.VolumeIds, y.VolumeIds, StringEqualsOrdinal) && x == y with { VolumeIds = x.VolumeIds });
+    }
+
+    private static bool ContainerEqual(ApfsContainerRecord x, ApfsContainerRecord y)
+        => UnorderedEqual(x.StoreIds, y.StoreIds, StringEqualsOrdinal) &&
+           UnorderedEqual(x.VolumeIds, y.VolumeIds, StringEqualsOrdinal) &&
+           UnorderedEqual(x.CompatibleFeatureBits, y.CompatibleFeatureBits, StringEqualsOrdinal) &&
+           UnorderedEqual(x.UnknownFeatureBits, y.UnknownFeatureBits, StringEqualsOrdinal) &&
+           UnorderedEqual(x.IncompatibleFeatureBits, y.IncompatibleFeatureBits, StringEqualsOrdinal) &&
+           UnorderedEqual(x.ReadonlyFeatureBits ?? [], y.ReadonlyFeatureBits ?? [], StringEqualsOrdinal) &&
+           SharedSpaceEqual(x.SharedSpace, y.SharedSpace) &&
+           x == y with { StoreIds = x.StoreIds, VolumeIds = x.VolumeIds,
+               CompatibleFeatureBits = x.CompatibleFeatureBits, UnknownFeatureBits = x.UnknownFeatureBits,
+               IncompatibleFeatureBits = x.IncompatibleFeatureBits, ReadonlyFeatureBits = x.ReadonlyFeatureBits,
+               SharedSpace = x.SharedSpace };
+
+    private static bool SharedSpaceEqual(ApfsSharedSpaceProjection? x, ApfsSharedSpaceProjection? y)
+        => ReferenceEquals(x, y) || x is not null && y is not null &&
+           UnorderedEqual(x.Volumes, y.Volumes, (a, b) => a == b) && x == y with { Volumes = x.Volumes };
+
+    private static bool CatalogVolumeEqual(ApfsVolumeRecord x, ApfsVolumeRecord y)
+        => UnorderedEqual(x.Roles, y.Roles, StringEqualsOrdinal) &&
+           UnorderedEqual(x.CompatibleFeatureBits, y.CompatibleFeatureBits, StringEqualsOrdinal) &&
+           UnorderedEqual(x.UnknownFeatureBits, y.UnknownFeatureBits, StringEqualsOrdinal) &&
+           UnorderedEqual(x.IncompatibleFeatureBits, y.IncompatibleFeatureBits, StringEqualsOrdinal) &&
+           UnorderedEqual(x.ReadonlyFeatureBits ?? [], y.ReadonlyFeatureBits ?? [], StringEqualsOrdinal) &&
+           x == y with { Roles = x.Roles, CompatibleFeatureBits = x.CompatibleFeatureBits,
+               UnknownFeatureBits = x.UnknownFeatureBits, IncompatibleFeatureBits = x.IncompatibleFeatureBits,
+               ReadonlyFeatureBits = x.ReadonlyFeatureBits };
 
     private static bool InventoryVolumeEqual(VolumeInfo left, VolumeInfo right)
         // Records compare list references. Compare those lists by content, then let
         // record equality retain all scalar and nested value-record comparisons.
-        => UnorderedEqual(left.WriteIncompatibilities, right.WriteIncompatibilities, StringEqualsOrdinal) &&
-           UnorderedEqual(left.WriteUnsupportedFeatures, right.WriteUnsupportedFeatures, StringEqualsOrdinal) &&
+        => UnorderedEqual(left.WriteIncompatibilities ?? [], right.WriteIncompatibilities ?? [], StringEqualsOrdinal) &&
+           UnorderedEqual(left.WriteUnsupportedFeatures ?? [], right.WriteUnsupportedFeatures ?? [], StringEqualsOrdinal) &&
            UnorderedEqual(left.CatalogReasons, right.CatalogReasons, StringEqualsOrdinal) &&
            left == right with
            {
@@ -136,9 +187,13 @@ public sealed class RuntimeStatusPublisher
     private static bool UnorderedEqual<T>(
         IReadOnlyList<T>? left, IReadOnlyList<T>? right, Func<T, T, bool> equals)
     {
-        left ??= Array.Empty<T>();
-        right ??= Array.Empty<T>();
+        // Null graph/identity lists are malformed, not an equivalent empty list.
+        // Optional capability lists retain their legacy null/empty semantics below.
+        if (left is null || right is null) return left is null && right is null;
         if (left.Count != right.Count) return false;
+        // Bound comparison work even when a malformed producer bypasses validation.
+        // Large lists still install as a changed payload for fail-closed consumers.
+        if (left.Count > 4096) return false;
         // Scan order is not inventory state. Match each entry once so duplicate
         // routing identities remain observable rather than being collapsed.
         var matched = new bool[right.Count];
@@ -147,7 +202,8 @@ public sealed class RuntimeStatusPublisher
             var index = -1;
             for (var i = 0; i < right.Count; i++)
             {
-                if (!matched[i] && equals(item, right[i])) { index = i; break; }
+                if (!matched[i] && (item is null ? right[i] is null : right[i] is not null && equals(item, right[i])))
+                { index = i; break; }
             }
             if (index < 0) return false;
             matched[index] = true;
@@ -165,11 +221,14 @@ public sealed class RuntimeStatusPublisher
     private static bool MountedVolumesEqual(
         IReadOnlyList<MountedVolumeDisplay>? left,
         IReadOnlyList<MountedVolumeDisplay>? right)
-    {
-        left ??= Array.Empty<MountedVolumeDisplay>();
-        right ??= Array.Empty<MountedVolumeDisplay>();
-        return left.SequenceEqual(right);
-    }
+        => UnorderedEqual(left ?? [], right ?? [], (a, b) =>
+            SequenceEqualOrdinal(a.WriteIncompatibilities, b.WriteIncompatibilities) &&
+            SequenceEqualOrdinal(a.WriteUnsupportedFeatures, b.WriteUnsupportedFeatures) &&
+            UnorderedEqual(a.CatalogReasons, b.CatalogReasons, StringEqualsOrdinal) &&
+            NativeWriteDiagnosticsEqual(a.NativeWriteDiagnostics, b.NativeWriteDiagnostics) &&
+            a == b with { WriteIncompatibilities = a.WriteIncompatibilities,
+                WriteUnsupportedFeatures = a.WriteUnsupportedFeatures, CatalogReasons = a.CatalogReasons,
+                NativeWriteDiagnostics = a.NativeWriteDiagnostics });
 
     private static bool NativeWriteDiagnosticsEqual(
         IReadOnlyList<NativeWriteDiagnostic>? left,

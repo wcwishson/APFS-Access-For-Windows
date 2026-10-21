@@ -1,4 +1,5 @@
 #include "EncryptedReadTransport.h"
+#include "MaintenanceCredentialTransport.h"
 #include <tlhelp32.h>
 #include <bcrypt.h>
 #include <aclapi.h>
@@ -139,6 +140,8 @@ CredentialResult ReceiveCredential(HANDLE owned_input, std::chrono::milliseconds
     }
 }
 
+#include "MaintenanceCredentialFrames.inc"
+
 OwnedEncryptedImageSource::OwnedEncryptedImageSource(std::shared_ptr<WindowsImageLease> lease,
     std::uint64_t offset, std::uint64_t size)
     : lease_(std::move(lease)), budget_(std::make_shared<catalog::ApfsReadBudget>(100000, 256ULL*1024*1024,
@@ -155,5 +158,20 @@ bool OwnedEncryptedImageSource::Read(std::uint64_t offset, std::size_t size, std
     out.clear();
     if (!budget_->Read(size) || offset > size_ || size > size_ - offset || !lease_->VerifyUnchanged()) return false;
     return lease_->Read(offset_ + offset, size, out);
+}
+bool OwnedEncryptedImageSource::ReadRuntime(const RuntimeRead& request, std::vector<std::byte>& out) const
+{
+    out.clear();
+    if (!request.IsFor(*this) || budget_->Failed() ||
+        request.Offset() > size_ || request.Size() > size_ - request.Offset() ||
+        !lease_->VerifyUnchanged()) return false;
+    // The session reserved this operation's I/O before invoking the held lease.
+    if (!lease_->Read(offset_ + request.Offset(), request.Size(), out) ||
+        out.size() != request.Size() || !lease_->VerifyUnchanged() || budget_->Failed())
+    {
+        out.clear();
+        return false;
+    }
+    return true;
 }
 }

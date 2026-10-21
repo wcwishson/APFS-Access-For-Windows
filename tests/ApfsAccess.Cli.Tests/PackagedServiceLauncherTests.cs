@@ -26,10 +26,9 @@ public sealed class PackagedServiceLauncherTests
 
         var root = CreateTestRoot("environment");
         var packageRoot = Path.Combine(root, "package");
-        CopyPowerShellPackage(packageRoot);
+        CopyTestChildPackage(packageRoot);
         var resultPath = Path.Combine(root, "environment.json");
         var startupHookMarker = Path.Combine(root, "startup-hook.txt");
-        var executablePath = Path.Combine(packageRoot, "pwsh.exe");
         var hostileNames = new[]
         {
             "DOTNET_STARTUP_HOOKS",
@@ -44,23 +43,9 @@ public sealed class PackagedServiceLauncherTests
             "COR_PROFILER",
             "COMPlus_ReadyToRunExcludeList",
         };
-        var script = $$"""
-            $names = @({{string.Join(",", hostileNames.Select(PowerShellQuoted))}})
-            $values = [ordered]@{}
-            foreach ($name in $names) {
-                $values[$name] = [Environment]::GetEnvironmentVariable($name)
-            }
-            $values['APFSACCESS_TEST_STARTUP_HOOK_MARKER'] = [Environment]::GetEnvironmentVariable('APFSACCESS_TEST_STARTUP_HOOK_MARKER')
-            $values['APFSACCESS_TRACE_MOVES'] = [Environment]::GetEnvironmentVariable('APFSACCESS_TRACE_MOVES')
-            $values['PACKAGED_SERVICE_BENIGN'] = [Environment]::GetEnvironmentVariable('PACKAGED_SERVICE_BENIGN')
-            $values['PATH'] = [Environment]::GetEnvironmentVariable('PATH')
-            $values['PATHEXT'] = [Environment]::GetEnvironmentVariable('PATHEXT')
-            $values['COMSPEC'] = [Environment]::GetEnvironmentVariable('COMSPEC')
-            [IO.File]::WriteAllText('{{PowerShellLiteral(resultPath)}}', ($values | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
-            """;
-        var startInfo = CreatePowerShellStartInfo(executablePath, script);
+        var startInfo = CreateProbeStartInfo(packageRoot, "environment", resultPath);
         startInfo.Environment["DOTNET_STARTUP_HOOKS"] = typeof(StartupHook).Assembly.Location;
-        startInfo.Environment["DOTNET_ADDITIONAL_DEPS"] = Path.Combine(packageRoot, "pwsh.deps.json");
+        startInfo.Environment["DOTNET_ADDITIONAL_DEPS"] = Path.Combine(packageRoot, "ApfsAccess.Cli.TestChild.deps.json");
         startInfo.Environment["DOTNET_SHARED_STORE"] = packageRoot;
         startInfo.Environment["DOTNET_ROOT_X64"] = packageRoot;
         startInfo.Environment["DOTNET_ROOT(x86)"] = packageRoot;
@@ -121,31 +106,15 @@ public sealed class PackagedServiceLauncherTests
 
         var root = CreateTestRoot("breakaway");
         var pwshPath = GetPowerShellPath();
+        var packageRoot = Path.Combine(root, "package");
+        CopyTestChildPackage(packageRoot);
+        var servicePath = Path.Combine(packageRoot, "ApfsAccess.Cli.TestChild.exe");
         var readyPath = Path.Combine(root, "ready.json");
         var serviceLaunchPath = readyPath + ".service-launch";
         var serviceAcceptedPath = readyPath + ".service-accepted";
-        var serviceScriptPath = Path.Combine(root, "service.ps1");
         var ordinaryChildScriptPath = Path.Combine(root, "ordinary-child.ps1");
         var cliAssemblyPath = typeof(PackagedServiceLauncher).Assembly.Location;
         var jobName = $@"Local\ApfsAccess.Cli.ServiceBreakaway.{Guid.NewGuid():N}";
-        var serviceScript = $$"""
-            $ErrorActionPreference = 'Stop'
-            $self = [Diagnostics.Process]::GetCurrentProcess()
-            $evidence = [ordered]@{
-                processId = $PID
-                startTimeUtcTicks = $self.StartTime.ToUniversalTime().Ticks
-                imagePath = $self.MainModule.FileName
-            }
-            $temporary = '{{PowerShellLiteral(readyPath)}}.service.tmp'
-            [IO.File]::WriteAllText($temporary, ($evidence | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
-            [IO.File]::Move($temporary, '{{PowerShellLiteral(readyPath)}}.service')
-            $deadline = [DateTime]::UtcNow.AddSeconds(5)
-            while (-not [IO.File]::Exists('{{PowerShellLiteral(serviceAcceptedPath)}}')) {
-                if ([DateTime]::UtcNow -ge $deadline) { exit 0 }
-                Start-Sleep -Milliseconds 25
-            }
-            while ($true) { Start-Sleep -Milliseconds 100 }
-            """;
         var ordinaryChildScript = $$"""
             $ErrorActionPreference = 'Stop'
             $assembly = [Reflection.Assembly]::LoadFrom('{{PowerShellLiteral(cliAssemblyPath)}}')
@@ -159,15 +128,16 @@ public sealed class PackagedServiceLauncherTests
             $launcher = $assembly.GetType('ApfsAccess.Cli.PackagedServiceLauncher', $true)
             $start = $launcher.GetMethod('Start', [Reflection.BindingFlags]'Static,NonPublic')
             $startInfo = [Diagnostics.ProcessStartInfo]::new()
-            $startInfo.FileName = '{{PowerShellLiteral(pwshPath)}}'
-            $startInfo.WorkingDirectory = '{{PowerShellLiteral(Path.GetDirectoryName(pwshPath)! )}}'
+            $startInfo.FileName = '{{PowerShellLiteral(servicePath)}}'
+            $startInfo.WorkingDirectory = '{{PowerShellLiteral(packageRoot)}}'
             $startInfo.UseShellExecute = $false
             $startInfo.CreateNoWindow = $true
-            $startInfo.ArgumentList.Add('-NoLogo')
-            $startInfo.ArgumentList.Add('-NoProfile')
-            $startInfo.ArgumentList.Add('-NonInteractive')
-            $startInfo.ArgumentList.Add('-File')
-            $startInfo.ArgumentList.Add('{{PowerShellLiteral(serviceScriptPath)}}')
+            $startInfo.ArgumentList.Add('--probe')
+            $startInfo.ArgumentList.Add('service')
+            $startInfo.ArgumentList.Add('--result-path')
+            $startInfo.ArgumentList.Add('{{PowerShellLiteral(readyPath)}}.service')
+            $startInfo.ArgumentList.Add('--accepted-path')
+            $startInfo.ArgumentList.Add('{{PowerShellLiteral(serviceAcceptedPath)}}')
             $servicePid = [int]$start.Invoke($null, @($startInfo))
             $service = [Diagnostics.Process]::GetProcessById($servicePid)
             $serviceEvidence = [ordered]@{
@@ -193,7 +163,6 @@ public sealed class PackagedServiceLauncherTests
             while ($true) { Start-Sleep -Milliseconds 100 }
             """;
 
-        await File.WriteAllTextAsync(serviceScriptPath, serviceScript, new UTF8Encoding(false));
         await File.WriteAllTextAsync(ordinaryChildScriptPath, ordinaryChildScript, new UTF8Encoding(false));
         using var job = CliElevationTransport.CreateJob(jobName);
         using var ordinaryOwner = StartPowerShellFile(pwshPath, ordinaryChildScriptPath);
@@ -422,65 +391,14 @@ public sealed class PackagedServiceLauncherTests
 
         var root = CreateTestRoot("grandchild-lock");
         var packageRoot = Path.Combine(root, "package");
-        CopyPowerShellPackage(packageRoot);
-        var executablePath = Path.Combine(packageRoot, "pwsh.exe");
-        var dependencyPath = Path.Combine(packageRoot, "pwsh.runtimeconfig.json");
+        CopyTestChildPackage(packageRoot);
+        var dependencyPath = Path.Combine(packageRoot, "ApfsAccess.Cli.TestChild.runtimeconfig.json");
         var movedDependencyPath = dependencyPath + ".replacement";
         var readyPath = Path.Combine(root, "ready.json");
         var releasePath = Path.Combine(root, "release.txt");
-        var originalPowerShell = GetPowerShellPath();
-        var script = $$"""
-            $ErrorActionPreference = 'Stop'
-            try {
-            $definition = @'
-            using System;
-            using System.Runtime.InteropServices;
-            using System.Text;
-            public static class Native {
-                [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-                public struct STARTUPINFO {
-                    public int cb;
-                    public string lpReserved;
-                    public string lpDesktop;
-                    public string lpTitle;
-                    public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute;
-                    public int dwFlags;
-                    public short wShowWindow, cbReserved2;
-                    public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
-                }
-                [StructLayout(LayoutKind.Sequential)]
-                public struct PROCESS_INFORMATION {
-                    public IntPtr hProcess, hThread;
-                    public int dwProcessId, dwThreadId;
-                }
-                [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-                public static extern bool CreateProcess(
-                    string applicationName, StringBuilder commandLine, IntPtr processAttributes, IntPtr threadAttributes,
-                    bool inheritHandles, uint creationFlags, IntPtr environment, string currentDirectory,
-                    ref STARTUPINFO startupInfo, out PROCESS_INFORMATION processInformation);
-                [DllImport("kernel32.dll")]
-                public static extern bool CloseHandle(IntPtr handle);
-            }
-            '@
-            Add-Type -TypeDefinition $definition
-            $startupInfo = [Native+STARTUPINFO]::new()
-            $startupInfo.cb = [Runtime.InteropServices.Marshal]::SizeOf($startupInfo)
-            $processInfo = [Native+PROCESS_INFORMATION]::new()
-            $commandLine = [Text.StringBuilder]::new('"{{PowerShellLiteral(originalPowerShell)}}" -NoLogo -NoProfile -NonInteractive -Command "Start-Sleep -Seconds 30"')
-            if (-not [Native]::CreateProcess('{{PowerShellLiteral(originalPowerShell)}}', $commandLine, [IntPtr]::Zero, [IntPtr]::Zero, $true, 0x08000000, [IntPtr]::Zero, '{{PowerShellLiteral(Path.GetDirectoryName(originalPowerShell)! )}}', [ref]$startupInfo, [ref]$processInfo)) {
-                throw [ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastWin32Error())
-            }
-            $grandchild = [Diagnostics.Process]::GetProcessById($processInfo.dwProcessId)
-            $null = [Native]::CloseHandle($processInfo.hThread)
-            $null = [Native]::CloseHandle($processInfo.hProcess)
-            [IO.File]::WriteAllText('{{PowerShellLiteral(readyPath)}}', $grandchild.Id.ToString(), [Text.UTF8Encoding]::new($false))
-            while (-not [IO.File]::Exists('{{PowerShellLiteral(releasePath)}}')) { Start-Sleep -Milliseconds 25 }
-            } catch {
-                [IO.File]::WriteAllText('{{PowerShellLiteral(readyPath)}}', ('ERROR: ' + $_.Exception.ToString()), [Text.UTF8Encoding]::new($false))
-                exit 91
-            }
-            """;
-        var startInfo = CreatePowerShellStartInfo(executablePath, script);
+        var startInfo = CreateProbeStartInfo(packageRoot, "grandchild", readyPath);
+        startInfo.ArgumentList.Add("--release-path");
+        startInfo.ArgumentList.Add(releasePath);
 
         Process? child = null;
         ProcessEvidence? grandchild = null;
@@ -488,16 +406,10 @@ public sealed class PackagedServiceLauncherTests
         {
             child = Process.GetProcessById(PackagedServiceLauncher.Start(startInfo));
             await WaitForFileAsync(readyPath, child, TimeSpan.FromSeconds(15));
-            var ready = await File.ReadAllTextAsync(readyPath);
-            Assert.False(ready.StartsWith("ERROR:", StringComparison.Ordinal), ready);
-            var grandchildProcessId = int.Parse(ready);
-            using (var grandchildProcess = Process.GetProcessById(grandchildProcessId))
-            {
-                grandchild = new ProcessEvidence(
-                    grandchildProcess.Id,
-                    grandchildProcess.StartTime.ToUniversalTime().Ticks,
-                    grandchildProcess.MainModule!.FileName);
-            }
+            grandchild = TryReadProcessEvidence(readyPath);
+            Assert.NotNull(grandchild);
+            using var ready = JsonDocument.Parse(await File.ReadAllTextAsync(readyPath));
+            Assert.True(ready.RootElement.GetProperty("inheritedSentinel").GetBoolean());
 
             Assert.True(IsExactProcessRunning(grandchild));
             _ = Assert.Throws<IOException>(() => File.Move(dependencyPath, movedDependencyPath));
@@ -579,7 +491,7 @@ public sealed class PackagedServiceLauncherTests
             var identityType = identity!.GetType();
             var appHost = identityType.GetProperty("AppHost")!.GetValue(identity)!;
             var appHostType = appHost.GetType();
-            Assert.Equal(Path.GetFullPath(executablePath), appHostType.GetProperty("CanonicalPath")!.GetValue(appHost));
+            Assert.Equal(Path.GetFullPath(executablePath), (string?)appHostType.GetProperty("CanonicalPath")!.GetValue(appHost), StringComparer.OrdinalIgnoreCase);
             Assert.Equal(new FileInfo(executablePath).Length, appHostType.GetProperty("Length")!.GetValue(appHost));
             Assert.Equal(
                 Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(executablePath))),
@@ -684,8 +596,7 @@ public sealed class PackagedServiceLauncherTests
 
         var root = CreateTestRoot("handle-isolation");
         var packageRoot = Path.Combine(root, "package");
-        CopyPowerShellPackage(packageRoot);
-        var pwshPath = Path.Combine(packageRoot, "pwsh.exe");
+        CopyTestChildPackage(packageRoot);
         var resultPath = Path.Combine(root, "sentinel.json");
         using var sentinel = File.OpenHandle(
             Path.Combine(root, "sentinel.bin"),
@@ -695,29 +606,19 @@ public sealed class PackagedServiceLauncherTests
         Assert.True(SetHandleInformation(sentinel, HandleFlagInherit, HandleFlagInherit));
         var sentinelValue = sentinel.DangerousGetHandle().ToInt64();
         var sentinelPath = Path.GetFullPath(Path.Combine(root, "sentinel.bin"));
-        var script = $$"""
-            $definition = @'
-            [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
-            public static extern uint GetFinalPathNameByHandle(System.IntPtr handle, System.Text.StringBuilder path, int length, uint flags);
-            '@
-            Add-Type -MemberDefinition $definition -Name Native -Namespace ApfsHandleIsolation
-            $path = [Text.StringBuilder]::new(32768)
-            $length = [ApfsHandleIsolation.Native]::GetFinalPathNameByHandle([IntPtr]{{sentinelValue}}, $path, $path.Capacity, 0)
-            $observed = if ($length -gt 0) { $path.ToString() -replace '^\\\\\?\\', '' } else { '' }
-            $evidence = [ordered]@{
-                inheritedSentinel = [string]::Equals($observed, '{{PowerShellLiteral(sentinelPath)}}', [StringComparison]::OrdinalIgnoreCase)
-                observedPath = $observed
-            }
-            [IO.File]::WriteAllText('{{PowerShellLiteral(resultPath)}}', ($evidence | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
-            """;
-        var startInfo = CreatePowerShellStartInfo(pwshPath, script);
+        var startInfo = CreateProbeStartInfo(packageRoot, "handle", resultPath);
+        startInfo.ArgumentList.Add("--handle");
+        startInfo.ArgumentList.Add(sentinelValue.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        startInfo.ArgumentList.Add("--expected-path");
+        startInfo.ArgumentList.Add(sentinelPath);
 
         Process? child = null;
         try
         {
             var processId = PackagedServiceLauncher.Start(startInfo);
             child = Process.GetProcessById(processId);
-            await child.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            await child.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(0, child.ExitCode);
             using var result = JsonDocument.Parse(await File.ReadAllTextAsync(resultPath));
             Assert.False(result.RootElement.GetProperty("inheritedSentinel").GetBoolean());
         }
@@ -752,19 +653,18 @@ public sealed class PackagedServiceLauncherTests
         return path;
     }
 
-    private static ProcessStartInfo CreatePowerShellStartInfo(string pwshPath, string script)
+    private static ProcessStartInfo CreateProbeStartInfo(string packageRoot, string probe, string resultPath)
     {
-        var startInfo = new ProcessStartInfo(pwshPath)
+        var startInfo = new ProcessStartInfo(Path.Combine(packageRoot, "ApfsAccess.Cli.TestChild.exe"))
         {
-            WorkingDirectory = Path.GetDirectoryName(pwshPath)!,
+            WorkingDirectory = packageRoot,
             UseShellExecute = false,
             CreateNoWindow = true,
         };
-        startInfo.ArgumentList.Add("-NoLogo");
-        startInfo.ArgumentList.Add("-NoProfile");
-        startInfo.ArgumentList.Add("-NonInteractive");
-        startInfo.ArgumentList.Add("-EncodedCommand");
-        startInfo.ArgumentList.Add(EncodePowerShell(script));
+        startInfo.ArgumentList.Add("--probe");
+        startInfo.ArgumentList.Add(probe);
+        startInfo.ArgumentList.Add("--result-path");
+        startInfo.ArgumentList.Add(resultPath);
         return startInfo;
     }
 
@@ -785,14 +685,8 @@ public sealed class PackagedServiceLauncherTests
            ?? throw new InvalidOperationException("Could not start the PowerShell test helper.");
     }
 
-    private static string EncodePowerShell(string script)
-        => Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
-
     private static string PowerShellLiteral(string value)
         => value.Replace("'", "''", StringComparison.Ordinal);
-
-    private static string PowerShellQuoted(string value)
-        => $"'{PowerShellLiteral(value)}'";
 
     private static async Task WaitForFileAsync(string path, Process owner, TimeSpan timeout)
     {
@@ -929,28 +823,6 @@ public sealed class PackagedServiceLauncherTests
         Assert.True(File.Exists(Path.Combine(destination, "ApfsAccess.Cli.TestChild.dll")));
         Assert.True(File.Exists(Path.Combine(destination, "ApfsAccess.Cli.TestChild.deps.json")));
         Assert.True(File.Exists(Path.Combine(destination, "ApfsAccess.Cli.TestChild.runtimeconfig.json")));
-    }
-
-    private static void CopyPowerShellPackage(string destination)
-    {
-        Directory.CreateDirectory(destination);
-        var source = Path.GetDirectoryName(GetPowerShellPath())!;
-        foreach (var directory in Directory.EnumerateDirectories(source, "*", SearchOption.AllDirectories))
-        {
-            Directory.CreateDirectory(Path.Combine(destination, Path.GetRelativePath(source, directory)));
-        }
-
-        foreach (var file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
-        {
-            var target = Path.Combine(destination, Path.GetRelativePath(source, file));
-            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-            File.Copy(file, target, overwrite: false);
-        }
-
-        Assert.True(File.Exists(Path.Combine(destination, "pwsh.exe")));
-        Assert.True(File.Exists(Path.Combine(destination, "pwsh.dll")));
-        Assert.True(File.Exists(Path.Combine(destination, "pwsh.deps.json")));
-        Assert.True(File.Exists(Path.Combine(destination, "pwsh.runtimeconfig.json")));
     }
 
     private static void TryDeleteDirectory(string path)

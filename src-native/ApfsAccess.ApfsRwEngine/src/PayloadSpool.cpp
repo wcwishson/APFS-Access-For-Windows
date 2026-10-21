@@ -2,12 +2,15 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 #include <windows.h>
@@ -17,6 +20,9 @@
 
 namespace apfsaccess::rw
 {
+#ifdef APFSACCESS_PROTECTED_SPOOL_TESTING
+namespace protected_spool_testing { thread_local Hooks hooks; }
+#endif
 struct PayloadReadHandleState
 {
     explicit PayloadReadHandleState(HANDLE value)
@@ -536,21 +542,1381 @@ std::uint64_t SaturatingAdd(std::uint64_t lhs, std::uint64_t rhs) noexcept
         ? (std::numeric_limits<std::uint64_t>::max)()
         : lhs + rhs;
 }
+
+bool ChargeStartupPayloadBytes(
+    std::uint64_t bytes, std::uint64_t budget, std::uint64_t& consumed) noexcept
+{
+    if (budget == 0)
+    {
+        return true;
+    }
+    if (bytes > budget - consumed)
+    {
+        return false;
+    }
+    consumed += bytes;
+    return true;
+}
+
+constexpr std::uint64_t kProtectedOverhead = journal::kJournalRecordHeaderBytes + crypto::kGcmTagBytes;
+constexpr std::size_t kProtectedMaxRanges = 4096;
+constexpr std::size_t kProtectedMaxKeyDirectoryEntries = 4096;
+constexpr std::uint64_t kProtectedIndexLimit = 16ull * 1024 * 1024;
+constexpr std::uint64_t kProtectedIndexMagic = 0x3158444953505041ull; // "APPSIDX1"
+constexpr std::uint64_t kProtectedAnchorMagic = 0x31524f5453505041ull; // "APPSTOR1"
+constexpr wchar_t kProtectedMarkerName[] = L"payload-spool.protected";
+constexpr std::size_t kProtectedAnchorBytes = 16 + kProtectedOverhead;
+
+void ProtectedPut(std::span<std::byte> bytes, std::size_t at, std::uint64_t value)
+{
+    for (unsigned i = 0; i < 8; ++i) bytes[at + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
+}
+
+std::uint64_t ProtectedGet(std::span<const std::byte> bytes, std::size_t at)
+{
+    std::uint64_t value = 0;
+    for (unsigned i = 0; i < 8; ++i) value |= std::to_integer<std::uint64_t>(bytes[at + i]) << (8 * i);
+    return value;
+}
+
+bool ProtectedExact(HANDLE file, const std::filesystem::path& path, bool directory)
+{
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (file == INVALID_HANDLE_VALUE || GetFileType(file) != FILE_TYPE_DISK ||
+        !GetFileInformationByHandle(file, &info) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+        ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) != directory ||
+        (!directory && info.nNumberOfLinks != 1)) return false;
+    std::wstring actual(512, L'\0');
+    const auto n = GetFinalPathNameByHandleW(file, actual.data(), static_cast<DWORD>(actual.size()),
+        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (!n || n >= actual.size()) return false;
+    actual.resize(n);
+    const auto expected = L"\\\\?\\" + path.wstring();
+    return CompareStringOrdinal(actual.c_str(), -1, expected.c_str(), -1, TRUE) == CSTR_EQUAL;
+}
+
+bool ProtectedPath(const std::filesystem::path& path)
+{
+    const auto p = path.wstring();
+    if (p.size() < 4 || p.size() > 210 || !((p[0] >= L'A' && p[0] <= L'Z') || (p[0] >= L'a' && p[0] <= L'z')) ||
+        p[1] != L':' || p[2] != L'\\' || p.back() == L'\\' ||
+        p.find_first_of(L":/*?\"<>|", 3) != p.npos || GetDriveTypeW(p.substr(0, 3).c_str()) != DRIVE_FIXED) return false;
+    for (auto ch : p) if (ch < 32) return false;
+    for (std::size_t at = 3; at < p.size();)
+    {
+        auto end = p.find(L'\\', at);
+        if (end == p.npos) end = p.size();
+        const auto part = p.substr(at, end - at);
+        if (part.empty() || part == L"." || part == L".." || part.back() == L'.' || part.back() == L' ') return false;
+        const auto stem = part.substr(0, part.find(L'.'));
+        const auto is = [&](const wchar_t* name) {
+            return CompareStringOrdinal(stem.c_str(), -1, name, -1, TRUE) == CSTR_EQUAL;
+        };
+        if (is(L"CON") || is(L"PRN") || is(L"AUX") || is(L"NUL") || is(L"CONIN$") || is(L"CONOUT$")) return false;
+        if (stem.size() == 4 && (CompareStringOrdinal(stem.data(), 3, L"COM", 3, TRUE) == CSTR_EQUAL ||
+            CompareStringOrdinal(stem.data(), 3, L"LPT", 3, TRUE) == CSTR_EQUAL)) return false;
+        at = end + 1;
+    }
+    return true;
+}
+
+bool ProtectedPinDirectory(const std::filesystem::path& path, std::vector<std::unique_ptr<FileHandle>>& pins)
+{
+    if (!ProtectedPath(path)) return false;
+    const auto p = path.wstring();
+    for (std::size_t end = 2;;)
+    {
+        const std::filesystem::path prefix(p.substr(0, end == 2 ? 3 : end));
+        auto pin = std::make_unique<FileHandle>();
+        pin->value = CreateFileW(prefix.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr,
+            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (!ProtectedExact(pin->value, prefix, true)) return false;
+        pins.push_back(std::move(pin));
+        if (end == p.size()) break;
+        end = p.find(L'\\', end + 1);
+        if (end == p.npos) end = p.size();
+    }
+    return true;
+}
+
+bool ProtectedSize(HANDLE file, std::uint64_t& bytes)
+{
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart < 0) return false;
+    bytes = static_cast<std::uint64_t>(size.QuadPart);
+    return true;
+}
+
+bool ProtectedIo(HANDLE file, std::uint64_t offset, std::span<std::byte> bytes, bool write)
+{
+    if (offset > static_cast<std::uint64_t>(INT64_MAX) || bytes.size() > MAXDWORD) return false;
+    LARGE_INTEGER at{};
+    at.QuadPart = static_cast<LONGLONG>(offset);
+    if (!SetFilePointerEx(file, at, nullptr, FILE_BEGIN)) return false;
+    DWORD transferred = 0;
+    const auto count = static_cast<DWORD>(bytes.size());
+    const auto ok = write ? WriteFile(file, bytes.data(), count, &transferred, nullptr)
+                          : ReadFile(file, bytes.data(), count, &transferred, nullptr);
+    return ok && transferred == count;
+}
+
+bool ProtectedWrite(HANDLE file, std::uint64_t offset, std::span<std::byte> bytes, bool index)
+{
+#ifdef APFSACCESS_PROTECTED_SPOOL_TESTING
+    auto& hooks = protected_spool_testing::hooks;
+    hooks.events.push_back(index ? 3u : 1u);
+    const auto fault = index ? protected_spool_testing::Fault::IndexWrite : protected_spool_testing::Fault::DataWrite;
+    if (hooks.fault == fault && !hooks.triggered)
+    {
+        hooks.triggered = true;
+        (void)ProtectedIo(file, offset, bytes.first(13), true);
+        return false;
+    }
+#else
+    (void)index;
+#endif
+    return ProtectedIo(file, offset, bytes, true);
+}
+
+bool ProtectedFlush(HANDLE file, bool index)
+{
+#ifdef APFSACCESS_PROTECTED_SPOOL_TESTING
+    auto& hooks = protected_spool_testing::hooks;
+    hooks.events.push_back(index ? 4u : 2u);
+    const auto fault = index ? protected_spool_testing::Fault::IndexFlush : protected_spool_testing::Fault::DataFlush;
+    if (hooks.fault == fault && !hooks.triggered) { hooks.triggered = true; return false; }
+#else
+    (void)index;
+#endif
+    return FlushFileBuffers(file) != FALSE;
+}
+
+constexpr std::wstring_view kCleanupPrefix = L"payload-spool.cleanup.";
+constexpr std::size_t kCleanupIntentBytes = 272, kCleanupCommitBytes = 64;
+constexpr std::size_t kCleanupGuardBytes = 24 + kProtectedOverhead;
+constexpr std::uint64_t kCleanupMagic = 0x31504e4353505041ull; // "APPSCNP1"
+constexpr std::uint64_t kCleanupCommitMagic = 0x314d434353505041ull;
+using CleanupProof = PayloadSpool::ProtectedCleanupProof;
+using CleanupDigest = std::array<std::uint8_t, 32>;
+struct CleanupIntent
+{
+    CleanupProof proof;
+    std::uint64_t serial = 0, reset = 0, references = 0, data_bytes = 0, index_bytes = 0;
+    std::uint64_t previous_reset = 0, previous_floor = 0;
+    CleanupDigest refs{}, data{}, index{}, previous{};
+};
+bool CleanupCut(std::string_view stage)
+{
+#ifdef APFSACCESS_PROTECTED_SPOOL_TESTING
+    auto& hooks = protected_spool_testing::hooks;
+    hooks.maintenance_events.emplace_back(stage);
+    if (hooks.maintenance_observer) hooks.maintenance_observer(stage);
+    if (hooks.maintenance_fault == stage && !hooks.triggered) { hooks.triggered = true; return true; }
+#else
+    (void)stage;
+#endif
+    return false;
+}
+bool CleanupPresent(const std::filesystem::path& root)
+{
+    WIN32_FIND_DATAW data{};
+    const auto h = FindFirstFileW((root / (std::wstring(kCleanupPrefix) + L"*")).c_str(), &data);
+    if (h != INVALID_HANDLE_VALUE) { FindClose(h); return true; }
+    const auto error = GetLastError();
+    return error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND;
+}
+bool CleanupProofValid(const CleanupProof& proof, bool continued = false)
+{
+    return proof.wal_bytes >= 104 && proof.wal_bytes <= 64ull * 1024 * 1024 && proof.wal_records <= 65536 &&
+        proof.wal_last_sequence != UINT64_MAX && (continued || (proof.wal_records == 0) == (proof.wal_last_sequence == 0)) &&
+        proof.cleanup_sequence <= proof.durable_sequence && proof.durable_sequence <= proof.wal_last_sequence &&
+        std::any_of(proof.wal_sha256.begin(), proof.wal_sha256.end(), [](auto b) { return b != 0; });
+}
+bool CleanupSameProof(const CleanupProof& a, const CleanupProof& b)
+{
+    return a.source_binding == b.source_binding && a.wal_sha256 == b.wal_sha256 && a.wal_bytes == b.wal_bytes &&
+        a.wal_records == b.wal_records && a.wal_last_sequence == b.wal_last_sequence &&
+        a.durable_sequence == b.durable_sequence && a.cleanup_sequence == b.cleanup_sequence;
+}
+auto CleanupEncode(const CleanupIntent& i)
+{
+    auto encoded = crypto::SecureBytes::Allocate(kCleanupIntentBytes);
+    if (!encoded) return encoded;
+    const auto b = encoded.bytes.Bytes();
+    ProtectedPut(b, 0, kCleanupMagic); ProtectedPut(b, 8, 1); ProtectedPut(b, 16, i.serial); ProtectedPut(b, 24, i.reset);
+    ProtectedPut(b, 32, i.proof.cleanup_sequence); ProtectedPut(b, 40, i.proof.durable_sequence);
+    ProtectedPut(b, 48, i.proof.wal_bytes); ProtectedPut(b, 56, i.proof.wal_records); ProtectedPut(b, 64, i.proof.wal_last_sequence);
+    ProtectedPut(b, 72, i.references); ProtectedPut(b, 80, i.data_bytes); ProtectedPut(b, 88, i.index_bytes);
+    ProtectedPut(b, 96, i.previous_reset); ProtectedPut(b, 104, i.previous_floor);
+    for (const auto& [at, digest] : std::array<std::pair<std::size_t, const CleanupDigest*>, 5>{
+        {{112, &i.proof.wal_sha256}, {144, &i.refs}, {176, &i.data}, {208, &i.index}, {240, &i.previous}}})
+        std::memcpy(b.data() + at, digest->data(), 32);
+    return encoded;
+}
+bool CleanupDecode(std::span<const std::byte> b, const journal::JournalDigest& binding, CleanupIntent& i, bool continued = false)
+{
+    if (b.size() != kCleanupIntentBytes || ProtectedGet(b, 0) != kCleanupMagic || ProtectedGet(b, 8) != 1) return false;
+    i.serial = ProtectedGet(b, 16); i.reset = ProtectedGet(b, 24); i.proof.source_binding = binding;
+    i.proof.cleanup_sequence = ProtectedGet(b, 32); i.proof.durable_sequence = ProtectedGet(b, 40);
+    i.proof.wal_bytes = ProtectedGet(b, 48); i.proof.wal_records = ProtectedGet(b, 56); i.proof.wal_last_sequence = ProtectedGet(b, 64);
+    i.references = ProtectedGet(b, 72); i.data_bytes = ProtectedGet(b, 80); i.index_bytes = ProtectedGet(b, 88);
+    i.previous_reset = ProtectedGet(b, 96); i.previous_floor = ProtectedGet(b, 104);
+    for (const auto& [at, digest] : std::array<std::pair<std::size_t, CleanupDigest*>, 5>{
+        {{112, &i.proof.wal_sha256}, {144, &i.refs}, {176, &i.data}, {208, &i.index}, {240, &i.previous}}})
+        std::memcpy(digest->data(), b.data() + at, 32);
+    return CleanupProofValid(i.proof, continued) && i.reset <= 1 && i.references <= kProtectedMaxRanges &&
+        i.previous_reset <= i.previous_floor && i.previous_floor <= i.proof.cleanup_sequence && i.index_bytes <= kProtectedIndexLimit;
+}
+std::filesystem::path CleanupPath(const std::filesystem::path& root, std::uint64_t serial, bool commit)
+{
+    auto n = std::to_wstring(serial);
+    return root / (std::wstring(kCleanupPrefix) + std::wstring(16 - n.size(), L'0') + n + (commit ? L".commit" : L".intent"));
+}
+bool CleanupAbsent(const std::filesystem::path& path)
+{
+    return GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND;
+}
+bool CleanupOpen(FileHandle& h, const std::filesystem::path& path, bool create)
+{
+    if (!ProtectedPath(path)) return false;
+    h.value = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr,
+        create ? CREATE_NEW : OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH, nullptr);
+    return ProtectedExact(h.value, path, false);
+}
+bool CleanupRead(HANDLE file, std::vector<std::byte>& frame)
+{
+    std::uint64_t size = 0;
+    if (!ProtectedSize(file, size) || size > kCleanupIntentBytes + kProtectedOverhead) return false;
+    frame.resize(static_cast<std::size_t>(size));
+    return ProtectedIo(file, 0, frame, false);
+}
+bool CleanupFileHash(HANDLE file, std::uint64_t expected, CleanupDigest& digest)
+{
+    std::uint64_t actual = 0;
+    auto& provider = SharedSha256Provider();
+    if (!ProtectedSize(file, actual) || actual != expected || !provider.algorithm) return false;
+    auto object = crypto::SecureBytes::Allocate(provider.object_bytes);
+    auto buffer = crypto::SecureBytes::Allocate(64 * 1024);
+    if (!object || !buffer) return false;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    if (BCryptCreateHash(provider.algorithm, &hash, reinterpret_cast<PUCHAR>(object.bytes.Bytes().data()),
+        static_cast<ULONG>(object.bytes.Size()), nullptr, 0, 0) < 0) return false;
+    bool ok = true;
+    for (std::uint64_t at = 0; ok && at < expected;)
+    {
+        const auto b = buffer.bytes.Bytes().first(static_cast<std::size_t>((std::min)(expected - at, std::uint64_t{64 * 1024})));
+        ok = ProtectedIo(file, at, b, false) && BCryptHashData(hash, reinterpret_cast<PUCHAR>(b.data()), static_cast<ULONG>(b.size()), 0) >= 0;
+        at += b.size();
+    }
+    ok = ok && BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) >= 0;
+    BCryptDestroyHash(hash);
+    return ok && ProtectedSize(file, actual) && actual == expected;
+}
+bool CleanupQuarantine(HANDLE h, const std::filesystem::path& root, std::span<const std::byte> bytes)
+{
+    CleanupDigest hash{}; if (!HashPayloadSha256(bytes, hash)) return false;
+    constexpr wchar_t hex[] = L"0123456789abcdef";
+    auto name = std::wstring(kCleanupPrefix) + L"failed.";
+    for (auto b : hash) { name += hex[b >> 4]; name += hex[b & 15]; }
+    for (unsigned n = 0; n < 16; ++n)
+    {
+        const auto path = root / (name + L"." + std::to_wstring(n));
+        if (!ProtectedPath(path)) return false;
+        if (!CleanupAbsent(path)) continue;
+        const auto p = path.wstring();
+        std::vector<std::byte> storage(sizeof(FILE_RENAME_INFO) + p.size() * sizeof(wchar_t));
+        auto* info = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
+        info->ReplaceIfExists = FALSE; info->RootDirectory = nullptr; info->FileNameLength = static_cast<DWORD>(p.size() * sizeof(wchar_t));
+        std::memcpy(info->FileName, p.data(), info->FileNameLength);
+        return !CleanupCut("cleanup-before-quarantine") &&
+            SetFileInformationByHandle(h, FileRenameInfo, info, static_cast<DWORD>(storage.size())) &&
+            ProtectedExact(h, path, false) && !CleanupCut("cleanup-after-quarantine") &&
+            !CleanupCut("cleanup-quarantine-flush") && FlushFileBuffers(h);
+    }
+    return false;
+}
 } // namespace
+
+struct PayloadSpool::ProtectedState
+{
+    std::vector<std::unique_ptr<FileHandle>> pins;
+    FileHandle data, index, anchor;
+    std::array<std::uint8_t, 32> anchor_digest{};
+    bool anchor_ready = false;
+    std::unique_ptr<journal::ProtectedJournalEpoch> epoch;
+    std::uint64_t index_bytes = 0;
+    // Only authenticated valid-index / absent-index cases can rebuild. Any
+    // ambiguous I/O or corrupt index poisons this instance without truncation.
+    bool rebuild_allowed = false;
+    bool index_missing = false;
+    bool maintenance_available = false, maintenance_seen = false;
+    std::uint64_t cleanup_floor = 0;
+    std::vector<DirtyRange> physical_ranges;
+    // Only complete, authenticated and flushed receipt pairs enter this prefix.
+    // Retained handles deny external writes/deletion. Reads still authenticate
+    // every receipt and key slot; only a redundant durability barrier is cached.
+    std::vector<std::unique_ptr<FileHandle>> durable_cleanup_receipts;
+};
+
+journal::JournalRecordContext PayloadSpool::ProtectedCleanupContext(std::uint64_t serial, bool commit) const
+{
+    auto context = ProtectedContext(nullptr, 0);
+    if (std::all_of(context.operation.begin(), context.operation.end(), [](auto b) { return b == std::byte{}; })) return {};
+    context.purpose = commit ? 0x505305u : 0x505304u;
+    context.chunk = serial;
+    return context;
+}
+
+journal::JournalRecordContext PayloadSpool::ContinuationSpoolContext(const ContinuationBaseline& baseline) const
+{
+    auto context = ProtectedContext(nullptr, 0);
+    std::array<std::byte, 80> encoded{};
+    std::memcpy(encoded.data(), context.operation.data(), 32);
+    std::memcpy(encoded.data() + 32, baseline.certificate.data(), 32);
+    ProtectedPut(encoded, 64, baseline.floor); ProtectedPut(encoded, 72, baseline.generation);
+    CleanupDigest digest{};
+    if (!baseline.floor || !baseline.generation || !HashPayloadSha256(encoded, digest)) return {};
+    std::memcpy(context.operation.data(), digest.data(), 32);
+    context.purpose = 0x505307u; context.chunk = baseline.generation;
+    return context;
+}
+
+bool PayloadSpool::CaptureContinuationSpool(ContinuationLease& lease, std::string& error)
+{
+    lease.lock = AcquireMutex();
+    const auto fail = [&] { error = "ContinuationSpoolCensusRequired"; return false; };
+    if (!protected_ || !protected_->maintenance_seen || !protected_->rebuild_allowed || recovery_required_ ||
+        !ProtectedAuthority() || !ranges_.empty() || !protected_->physical_ranges.empty() || next_spool_offset_ ||
+        protected_->index_bytes != kCleanupGuardBytes || !protected_->cleanup_floor ||
+        protected_->durable_cleanup_receipts.size() > 2048 || protected_->durable_cleanup_receipts.size() % 2) return fail();
+    lease.floor = protected_->cleanup_floor;
+    lease.tip = continuation_baseline_ ? continuation_baseline_->tip : CleanupDigest{};
+    std::size_t found = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(options_.root)) {
+        const auto name = entry.path().filename().wstring();
+        if (name.starts_with(kCleanupPrefix)) ++found;
+    }
+    if (found != protected_->durable_cleanup_receipts.size()) return fail();
+    for (std::size_t n = 0; n < found; ++n) {
+        const auto path = CleanupPath(options_.root, n / 2 + 1, n % 2 != 0);
+        auto& pin = protected_->durable_cleanup_receipts[n];
+        // Reconciliation installed only flushed immutable receipt handles.
+        // Keep that proof under this lock; a reopened owner must establish it
+        // again before CaptureContinuationSpool can export any receipt.
+        if (!pin || !ProtectedExact(pin->value, path, false)) return fail();
+        lease.receipts.emplace_back(path, reinterpret_cast<std::uintptr_t>(pin->value));
+        if (n + 1 == found && !CleanupFileHash(pin->value, kCleanupCommitBytes + kProtectedOverhead, lease.tip)) return fail();
+    }
+    return (FlushFileBuffers(protected_->data.value) && FlushFileBuffers(protected_->index.value)) || fail();
+}
+
+bool PayloadSpool::SuspendContinuationSpool(ContinuationLease& lease, std::string& error, bool require_empty)
+{
+    if (!lease.lock.owns_lock()) lease.lock = AcquireMutex();
+    if (!protected_ || !protected_->anchor_ready || !ProtectedExact(protected_->anchor.value, protected_marker_file_, false) ||
+        !ProtectedExact(protected_->data.value, spool_file_, false)) { error = "ContinuationSpoolUnavailable"; return false; }
+    std::uint64_t size = 0;
+    if (!ProtectedSize(protected_->data.value, size) || (require_empty && size)) { error = "ContinuationSpoolNotEmpty"; return false; }
+    protected_->rebuild_allowed = false; recovery_required_ = true;
+    protected_->epoch.reset();
+    if (protected_->index.value != INVALID_HANDLE_VALUE) {
+        if (!CloseHandle(std::exchange(protected_->index.value, INVALID_HANDLE_VALUE))) return false;
+    }
+    return true;
+}
+
+bool PayloadSpool::SealContinuationSpool(const ContinuationBaseline& baseline, std::vector<std::byte>& bytes, std::string& error)
+{
+    bytes.clear();
+    if (!protected_ || !protected_->anchor_ready) return false;
+    protected_->epoch.reset();
+    auto epoch = journal::ProtectedJournalEpoch::AcquireWriter(options_.protected_key_directory.wstring(), options_.protected_binding);
+    if (!epoch) { error = "ContinuationSpoolKeyPublicationFailed"; return false; }
+    protected_->epoch = std::move(epoch.epoch);
+    std::array<std::byte, 24> plain{};
+    ProtectedPut(plain, 0, kCleanupCommitMagic); ProtectedPut(plain, 8, 6); ProtectedPut(plain, 16, baseline.floor);
+    auto frame = protected_->epoch->Seal(ContinuationSpoolContext(baseline), plain);
+    if (!frame) { error = "ContinuationSpoolSealFailed"; return false; }
+    bytes.assign(frame.bytes.Bytes().begin(), frame.bytes.Bytes().end());
+    return true;
+}
+
+bool PayloadSpool::InstallContinuationSpool(ContinuationLease& lease, ContinuationBaseline baseline, std::string& error)
+{
+    const auto fail = [&] { error = "ContinuationSpoolCheckpointInvalid"; return false; };
+    if (!lease.lock.owns_lock() || !baseline.authority || !protected_ || !protected_->anchor_ready) return fail();
+    if (protected_->index.value != INVALID_HANDLE_VALUE) return fail();
+    protected_->index.value = CreateFileW(index_file_.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    std::uint64_t size = 0;
+    std::array<std::byte, kCleanupGuardBytes> bytes{};
+    if (!ProtectedExact(protected_->index.value, index_file_, false) || !ProtectedSize(protected_->index.value, size) ||
+        size < bytes.size() || !ProtectedIo(protected_->index.value, 0, bytes, false)) return fail();
+    // A later ordinary cleanup replaces this guard with its serial-bound guard.
+    // Its receipt chain must then be authenticated by the original bridge.
+    const bool receipts = CleanupPresent(options_.root);
+    if (!receipts) {
+        auto plain = journal::ProtectedJournalEpoch::Open(options_.protected_key_directory.wstring(), options_.protected_binding,
+            ContinuationSpoolContext(baseline), bytes);
+        if (!plain || plain.bytes.Size() != 24 || ProtectedGet(plain.bytes.Bytes(), 0) != kCleanupCommitMagic ||
+            ProtectedGet(plain.bytes.Bytes(), 8) != 6 || ProtectedGet(plain.bytes.Bytes(), 16) != baseline.floor) return fail();
+    }
+    protected_->durable_cleanup_receipts.clear();
+    continuation_baseline_ = std::move(baseline);
+    protected_->cleanup_floor = continuation_baseline_->floor;
+    protected_->index_bytes = size; protected_->maintenance_seen = true; protected_->maintenance_available = true;
+    protected_->rebuild_allowed = false; recovery_required_ = true;
+    return true;
+}
+
+void PayloadSpool::ReleaseContinuationReceipts(ContinuationLease& lease)
+{
+    if (lease.lock.owns_lock() && protected_) protected_->durable_cleanup_receipts.clear();
+}
+
+bool PayloadSpool::ProtectedStoreMarkerPresent() const noexcept
+{
+    if (GetFileAttributesW(protected_marker_file_.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+    const auto error = GetLastError();
+    return (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) || CleanupPresent(options_.root);
+}
+
+bool PayloadSpool::MutationRefused() const noexcept
+{
+    return protected_format_refused_ || (!options_.protected_persistence &&
+        (ordinary_layout_unproven_ || ProtectedStoreMarkerPresent()));
+}
+
+journal::JournalRecordContext PayloadSpool::ProtectedContext(const DirtyRange* range, std::uint64_t offset, bool anchor) const
+{
+    journal::JournalRecordContext context{};
+    if (!anchor && (!protected_ || !protected_->anchor_ready)) return context;
+    auto encoded = crypto::SecureBytes::Allocate(64 + options_.volume_identity.size() + (anchor ? 0 : 32));
+    if (!encoded) return context;
+    const auto b = encoded.bytes.Bytes();
+    // Fixed-width LE fields followed by exact length-delimited volume bytes.
+    ProtectedPut(b, 0, range ? 0x3154414453505041ull : (anchor ? kProtectedAnchorMagic : kProtectedIndexMagic));
+    ProtectedPut(b, 8, options_.volume_identity.size());
+    if (range)
+    {
+        ProtectedPut(b, 16, range->object_id); ProtectedPut(b, 24, range->generation);
+        ProtectedPut(b, 32, range->logical_offset); ProtectedPut(b, 40, range->bytes);
+        ProtectedPut(b, 48, range->wal_sequence); ProtectedPut(b, 56, offset);
+    }
+    std::memcpy(b.data() + 64, options_.volume_identity.data(), options_.volume_identity.size());
+    if (!anchor) std::memcpy(b.data() + 64 + options_.volume_identity.size(), protected_->anchor_digest.data(), 32);
+    std::array<std::uint8_t, 32> digest{};
+    if (!HashPayloadSha256(b, digest)) return context;
+    std::memcpy(context.operation.data(), digest.data(), digest.size());
+    context.purpose = range ? 0x505301u : (anchor ? 0x505303u : 0x505302u);
+    context.chunk = offset;
+    return context;
+}
+
+bool PayloadSpool::ProtectedAuthority() const
+{
+    if (!protected_ || !protected_->anchor_ready || !ProtectedExact(protected_->anchor.value, protected_marker_file_, false) ||
+        (!protected_->maintenance_seen && CleanupPresent(options_.root)) ||
+        !ProtectedExact(protected_->data.value, spool_file_, false) ||
+        !ProtectedExact(protected_->index.value, index_file_, false)) return false;
+    std::uint64_t data_size = 0, index_size = 0, anchor_size = 0;
+    return ProtectedSize(protected_->anchor.value, anchor_size) && anchor_size == kProtectedAnchorBytes &&
+        ProtectedSize(protected_->data.value, data_size) && data_size == next_spool_offset_ &&
+        ProtectedSize(protected_->index.value, index_size) && index_size == protected_->index_bytes;
+}
+
+journal::JournalRecordResult PayloadSpool::ReadProtectedRange(const DirtyRange& range) const
+{
+    const auto failure = []() -> journal::JournalRecordResult {
+        return {{journal::JournalError::IntegrityFailure}, {}};
+    };
+    if (!ProtectedAuthority() || range.object_id == 0 || range.generation == 0 || range.wal_sequence == 0 ||
+        range.bytes == 0 || range.bytes > journal::kMaxJournalPlaintextBytes ||
+        range.logical_offset > UINT64_MAX - range.bytes || range.spool_offset > next_spool_offset_ ||
+        range.bytes + kProtectedOverhead > next_spool_offset_ - range.spool_offset) return failure();
+    auto frame = crypto::SecureBytes::Allocate(static_cast<std::size_t>(range.bytes + kProtectedOverhead));
+    if (!frame || !ProtectedIo(protected_->data.value, range.spool_offset, frame.bytes.Bytes(), false)) return failure();
+    auto opened = journal::ProtectedJournalEpoch::Open(options_.protected_key_directory.wstring(),
+        options_.protected_binding, ProtectedContext(&range, range.spool_offset), frame.bytes.Bytes());
+    if (!opened || opened.bytes.Size() != range.bytes || HashPayload(opened.bytes.Bytes()) != range.checksum) return failure();
+    return opened;
+}
+
+bool PayloadSpool::InitializeProtected()
+{
+    if (options_.volume_identity.empty() || options_.volume_identity.size() > 4096 || options_.max_bytes == 0 ||
+        options_.max_bytes > kMaxDirtyFlushBytes ||
+        std::all_of(options_.protected_binding.begin(), options_.protected_binding.end(), [](auto b) { return b == std::byte{}; }) ||
+        !ProtectedPath(options_.root) || !ProtectedPath(options_.protected_key_directory)) return false;
+    protected_ = std::make_unique<ProtectedState>();
+    if (!ProtectedPinDirectory(options_.root, protected_->pins) ||
+        !ProtectedPinDirectory(options_.protected_key_directory, protected_->pins)) return false;
+    // Old slots remain evidence. Bound fresh epoch admission, never delete slots.
+    std::size_t key_entries = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(options_.protected_key_directory))
+    {
+        (void)entry;
+        if (++key_entries >= kProtectedMaxKeyDirectoryEntries) return false;
+    }
+    protected_->anchor.value = CreateFileW(protected_marker_file_.c_str(), GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    const bool existing_anchor = protected_->anchor.value != INVALID_HANDLE_VALUE;
+    if (!existing_anchor && GetLastError() != ERROR_FILE_NOT_FOUND) return false;
+    if (existing_anchor && !ProtectedExact(protected_->anchor.value, protected_marker_file_, false)) return false;
+    const auto authenticate_anchor = [this]() {
+        std::uint64_t size = 0;
+        std::array<std::byte, kProtectedAnchorBytes> frame{};
+        if (!ProtectedSize(protected_->anchor.value, size) || size != frame.size() ||
+            !ProtectedIo(protected_->anchor.value, 0, frame, false)) return false;
+        auto plain = journal::ProtectedJournalEpoch::Open(options_.protected_key_directory.wstring(), options_.protected_binding,
+            ProtectedContext(nullptr, 0, true), frame);
+        if (!plain || plain.bytes.Size() != 16 || ProtectedGet(plain.bytes.Bytes(), 0) != kProtectedAnchorMagic ||
+            ProtectedGet(plain.bytes.Bytes(), 8) != 1 || !HashPayloadSha256(frame, protected_->anchor_digest)) return false;
+        protected_->anchor_ready = true;
+        return true;
+    };
+    // A foreign/corrupt anchor cannot create even an empty missing data/index file.
+    if (existing_anchor && !authenticate_anchor()) return false;
+    protected_->maintenance_seen = CleanupPresent(options_.root);
+    if (!existing_anchor && protected_->maintenance_seen) return false;
+    const auto open = [this, existing_anchor](FileHandle& file, const std::filesystem::path& path) {
+        file.value = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+            (existing_anchor || protected_->maintenance_seen) ? OPEN_EXISTING : OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        return ProtectedExact(file.value, path, false);
+    };
+    if (!open(protected_->data, spool_file_) || !ProtectedSize(protected_->data.value, next_spool_offset_) ||
+        next_spool_offset_ > options_.max_bytes) return false;
+    // No adoption: without the durable discriminator, existing bytes have no
+    // established protected-store authority, regardless of their byte prefix.
+    if (!existing_anchor && next_spool_offset_ != 0) return false;
+    if (!open(protected_->index, index_file_))
+    {
+        const auto attributes = GetFileAttributesW(index_file_.c_str());
+        if (existing_anchor && !protected_->maintenance_seen && protected_->index.value == INVALID_HANDLE_VALUE &&
+            attributes == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND)
+        {
+            // Leave the advisory file absent until exact authenticated references
+            // cover all original data. A lost cleanup guard is never rebuilt here.
+            protected_->index_missing = true;
+            protected_->maintenance_available = protected_->rebuild_allowed = true;
+        }
+        return false;
+    }
+    if (!ProtectedSize(protected_->index.value, protected_->index_bytes) ||
+        protected_->index_bytes > kProtectedIndexLimit ||
+        (options_.startup_index_max_bytes && protected_->index_bytes > options_.startup_index_max_bytes) ||
+        (!existing_anchor && protected_->index_bytes != 0)) return false;
+    if (!existing_anchor)
+    {
+        auto writer = journal::ProtectedJournalEpoch::AcquireWriter(options_.protected_key_directory.wstring(), options_.protected_binding);
+        if (!writer) return false;
+        protected_->epoch = std::move(writer.epoch);
+        std::array<std::byte, 16> identity{};
+        ProtectedPut(identity, 0, kProtectedAnchorMagic); ProtectedPut(identity, 8, 1);
+        auto sealed = protected_->epoch->Seal(ProtectedContext(nullptr, 0, true), identity);
+        if (!sealed) return false;
+        protected_->anchor.value = CreateFileW(protected_marker_file_.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+            nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH, nullptr);
+        if (!ProtectedExact(protected_->anchor.value, protected_marker_file_, false)) return false;
+#ifdef APFSACCESS_PROTECTED_SPOOL_TESTING
+        auto& hooks = protected_spool_testing::hooks;
+        hooks.events.push_back(5);
+        if (hooks.fault == protected_spool_testing::Fault::AnchorWrite && !hooks.triggered)
+        {
+            hooks.triggered = true;
+            (void)ProtectedIo(protected_->anchor.value, 0, sealed.bytes.Bytes().first(13), true);
+            return false;
+        }
+#endif
+        if (!ProtectedIo(protected_->anchor.value, 0, sealed.bytes.Bytes(), true)) return false;
+#ifdef APFSACCESS_PROTECTED_SPOOL_TESTING
+        hooks.events.push_back(6);
+        if (hooks.fault == protected_spool_testing::Fault::AnchorFlush && !hooks.triggered)
+        { hooks.triggered = true; return false; }
+#endif
+        if (!FlushFileBuffers(protected_->anchor.value)) return false;
+#ifdef APFSACCESS_PROTECTED_SPOOL_TESTING
+        hooks.events.push_back(7);
+        if (hooks.fault == protected_spool_testing::Fault::AnchorReadback && !hooks.triggered)
+        { hooks.triggered = true; return false; }
+#endif
+        std::array<std::byte, kProtectedAnchorBytes> readback{};
+        if (!ProtectedIo(protected_->anchor.value, 0, readback, false) ||
+            !std::equal(readback.begin(), readback.end(), sealed.bytes.Bytes().begin())) return false;
+#ifdef APFSACCESS_PROTECTED_SPOOL_TESTING
+        hooks.events.push_back(8);
+        if (hooks.fault == protected_spool_testing::Fault::AfterAnchorPublication && !hooks.triggered)
+        { hooks.triggered = true; return false; }
+#endif
+    }
+    if (!existing_anchor && !authenticate_anchor()) return false;
+    protected_->maintenance_available = true;
+    // Never interpret a reset endpoint or an advisory index as cleanup authority.
+    // The explicit API authenticates the receipt chain and caller's original WAL.
+    if (protected_->maintenance_seen) return false;
+    // Check physical framing before index replay. This establishes bounds only;
+    // trusted refs plus AEAD authenticate
+    // an unindexed tail later. Mixed/plain/torn bytes cannot authorize writes.
+    std::uint64_t physical_offset = 0;
+    std::size_t physical_records = 0;
+    while (physical_offset < next_spool_offset_)
+    {
+        std::array<std::byte, journal::kJournalRecordHeaderBytes> header{};
+        if (++physical_records > kProtectedMaxRanges || next_spool_offset_ - physical_offset < header.size() ||
+            !ProtectedIo(protected_->data.value, physical_offset, header, false) ||
+            std::memcmp(header.data(), "APFSREC1", 8) != 0 ||
+            ProtectedGet(header, 8) != (std::uint64_t{64} << 32 | 1)) return false;
+        const auto size = ProtectedGet(header, 16) & 0xffffffffull;
+        const auto cipher_size = ProtectedGet(header, 16) >> 32;
+        if (size <= kProtectedOverhead || size > journal::kMaxJournalRecordBytes ||
+            size > next_spool_offset_ - physical_offset || cipher_size != size - journal::kJournalRecordHeaderBytes ||
+            std::any_of(header.begin() + 52, header.end(), [](auto b) { return b != std::byte{}; })) return false;
+        physical_offset += size;
+    }
+    PublishNextSpoolOffsetHintLocked();
+    std::uint64_t index_offset = 0;
+    std::vector<DirtyRange> loaded;
+    while (index_offset < protected_->index_bytes)
+    {
+        std::array<std::byte, journal::kJournalRecordHeaderBytes> header{};
+        if (protected_->index_bytes - index_offset < header.size() ||
+            !ProtectedIo(protected_->index.value, index_offset, header, false)) return false;
+        const auto size = ProtectedGet(header, 16) & 0xffffffffull;
+        if (size < kProtectedOverhead || size > journal::kMaxJournalRecordBytes ||
+            size > protected_->index_bytes - index_offset) return false;
+        auto frame = crypto::SecureBytes::Allocate(static_cast<std::size_t>(size));
+        if (!frame || !ProtectedIo(protected_->index.value, index_offset, frame.bytes.Bytes(), false)) return false;
+        auto plain = journal::ProtectedJournalEpoch::Open(options_.protected_key_directory.wstring(),
+            options_.protected_binding, ProtectedContext(nullptr, index_offset), frame.bytes.Bytes());
+        if (!plain || plain.bytes.Size() < 24) return false;
+        const auto b = plain.bytes.Bytes();
+        const auto end = ProtectedGet(b, 8), count = ProtectedGet(b, 16);
+        if (ProtectedGet(b, 0) != kProtectedIndexMagic || count > kProtectedMaxRanges || count < loaded.size() ||
+            b.size() != 24 + count * kIndexRangeBytes || end > next_spool_offset_) return false;
+        std::vector<DirtyRange> snapshot;
+        snapshot.reserve(static_cast<std::size_t>(count));
+        std::uint64_t physical_end = 0;
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const auto at = 24 + i * kIndexRangeBytes;
+            DirtyRange range{};
+            range.object_id = ProtectedGet(b, at); range.generation = ProtectedGet(b, at + 8);
+            range.logical_offset = ProtectedGet(b, at + 16); range.bytes = ProtectedGet(b, at + 24);
+            range.spool_offset = ProtectedGet(b, at + 32); range.wal_sequence = ProtectedGet(b, at + 40);
+            range.checksum = ProtectedGet(b, at + 48);
+            if (!range.object_id || !range.generation || !range.wal_sequence || !range.bytes ||
+                range.bytes > journal::kMaxJournalPlaintextBytes || range.logical_offset > UINT64_MAX - range.bytes ||
+                range.spool_offset != physical_end || range.bytes + kProtectedOverhead > next_spool_offset_ - physical_end) return false;
+            physical_end += range.bytes + kProtectedOverhead;
+            if (i < loaded.size())
+            {
+                const auto& old = loaded[i];
+                if (old.object_id != range.object_id || old.generation != range.generation ||
+                    old.logical_offset != range.logical_offset || old.bytes != range.bytes ||
+                    old.spool_offset != range.spool_offset || old.wal_sequence != range.wal_sequence ||
+                    old.checksum != range.checksum) return false;
+            }
+            range.created_at = std::chrono::steady_clock::now();
+            snapshot.push_back(range);
+        }
+        if (physical_end != end) return false;
+        loaded = std::move(snapshot);
+        index_offset += size;
+    }
+    std::uint64_t consumed = 0;
+    for (const auto& range : loaded)
+    {
+        if (!ChargeStartupPayloadBytes(range.bytes + kProtectedOverhead,
+                options_.startup_payload_read_max_bytes, consumed) || !ReadProtectedRange(range)) return false;
+    }
+    if (!protected_->epoch)
+    {
+        auto writer = journal::ProtectedJournalEpoch::AcquireWriter(options_.protected_key_directory.wstring(), options_.protected_binding);
+        if (!writer) return false;
+        protected_->epoch = std::move(writer.epoch);
+    }
+    protected_->rebuild_allowed = true;
+    protected_->physical_ranges = loaded;
+    ranges_ = std::move(loaded);
+    RebuildRangeSequenceIndex(); RebuildRangeLookup(); RecomputeOldestDirtyRangeLocked();
+    recovery_required_ = next_spool_offset_ != 0;
+    return true;
+}
+
+PayloadSpool::AppendStatus PayloadSpool::AppendProtected(const WriteRequest& request, AppendResult* result)
+{
+    if (!request.generation || !request.wal_sequence || (protected_ && request.wal_sequence <= protected_->cleanup_floor)) return AppendStatus::InvalidRequest;
+    const auto capacity = CheckAppendCapacityLocked(request.payload.size());
+    if (capacity != AppendStatus::Succeeded) return capacity;
+    if (!ProtectedAuthority()) return AppendStatus::StorageFailure;
+    DirtyRange range{};
+    range.object_id = request.object_id; range.generation = request.generation;
+    range.logical_offset = request.logical_offset; range.bytes = request.payload.size();
+    range.spool_offset = next_spool_offset_; range.wal_sequence = request.wal_sequence;
+    range.created_at = std::chrono::steady_clock::now();
+    std::array<std::uint8_t, 32> digest{};
+    if (!HashPayloadDigests(request.payload, &range.checksum, digest)) return AppendStatus::StorageFailure;
+    auto frame = protected_->epoch->Seal(ProtectedContext(&range, range.spool_offset), request.payload);
+    if (!frame) return AppendStatus::StorageFailure;
+    // Reserve the range owner before writing; fallible lookup rebuilding after
+    // publication poisons the instance and preserves all evidence on failure.
+    ranges_.reserve(ranges_.size() + 1);
+    protected_->physical_ranges.reserve(protected_->physical_ranges.size() + 1);
+    if (!ProtectedWrite(protected_->data.value, next_spool_offset_, frame.bytes.Bytes(), false))
+    {
+        protected_->rebuild_allowed = false; recovery_required_ = true;
+        return AppendStatus::StorageFailure;
+    }
+    next_spool_offset_ += frame.bytes.Size();
+    PublishNextSpoolOffsetHintLocked();
+    ranges_.push_back(range);
+    protected_->physical_ranges.push_back(range);
+    try { RebuildRangeSequenceIndex(); RebuildRangeLookup(); RecomputeOldestDirtyRangeLocked(); }
+    catch (...) { protected_->rebuild_allowed = false; recovery_required_ = true; return AppendStatus::StorageFailure; }
+    bytes_since_sync_ += frame.bytes.Size(); ++appends_since_sync_; index_dirty_ = true;
+    const bool should_flush = (options_.durable_flush_bytes && bytes_since_sync_ >=
+        (std::min)(options_.durable_flush_bytes, kMaxDirtyFlushBytes)) ||
+        (options_.durable_flush_appends && appends_since_sync_ >=
+            (std::min)(options_.durable_flush_appends, kMaxDirtyFlushAppends));
+    if (should_flush && !FlushDirtyStateLocked())
+    {
+        protected_->rebuild_allowed = false; recovery_required_ = true;
+        return AppendStatus::StorageFailure;
+    }
+    ++append_direct_count_;
+    if (result) *result = {range.object_id, range.generation, range.logical_offset, range.bytes,
+        range.spool_offset, range.wal_sequence, range.checksum, digest};
+    return AppendStatus::Succeeded;
+}
+
+bool PayloadSpool::PersistProtectedIndex()
+{
+    if (!protected_ || !protected_->rebuild_allowed || recovery_required_ || !ProtectedAuthority() ||
+        protected_->physical_ranges.size() > kProtectedMaxRanges) return false;
+    const auto& physical = protected_->physical_ranges;
+    const auto size = 24 + physical.size() * kIndexRangeBytes;
+    const auto limit = options_.startup_index_max_bytes ?
+        (std::min)(kProtectedIndexLimit, options_.startup_index_max_bytes) : kProtectedIndexLimit;
+    if (size + kProtectedOverhead > limit || protected_->index_bytes > limit - size - kProtectedOverhead) return false;
+    auto plain = crypto::SecureBytes::Allocate(size);
+    if (!plain) return false;
+    const auto b = plain.bytes.Bytes();
+    ProtectedPut(b, 0, kProtectedIndexMagic); ProtectedPut(b, 8, next_spool_offset_); ProtectedPut(b, 16, physical.size());
+    for (std::size_t i = 0; i < physical.size(); ++i)
+    {
+        const auto& range = physical[i]; const auto at = 24 + i * kIndexRangeBytes;
+        ProtectedPut(b, at, range.object_id); ProtectedPut(b, at + 8, range.generation);
+        ProtectedPut(b, at + 16, range.logical_offset); ProtectedPut(b, at + 24, range.bytes);
+        ProtectedPut(b, at + 32, range.spool_offset); ProtectedPut(b, at + 40, range.wal_sequence);
+        ProtectedPut(b, at + 48, range.checksum);
+    }
+    auto frame = protected_->epoch->Seal(ProtectedContext(nullptr, protected_->index_bytes), b);
+    if (!frame) return false;
+    if (!ProtectedWrite(protected_->index.value, protected_->index_bytes, frame.bytes.Bytes(), true) ||
+        !ProtectedFlush(protected_->index.value, true))
+    {
+        protected_->rebuild_allowed = false; recovery_required_ = true;
+        return false;
+    }
+    protected_->index_bytes += frame.bytes.Size();
+    ++index_persist_count_; index_persist_bytes_ += frame.bytes.Size();
+    ++index_journal_frame_count_; ++index_journal_snapshot_count_;
+    return true;
+}
+
+bool PayloadSpool::RebuildProtectedIndex(std::span<const PersistedRangeReference> references,
+    std::uint64_t safe_discard_sequence, std::span<const PersistedRangeReference> discardable_references) try
+{
+    const auto missing_authority = [this]() {
+        if (!protected_ || !protected_->index_missing || continuation_baseline_ || protected_->maintenance_seen ||
+            protected_->index.value != INVALID_HANDLE_VALUE || !protected_->anchor_ready || CleanupPresent(options_.root) ||
+            !ProtectedExact(protected_->anchor.value, protected_marker_file_, false) ||
+            !ProtectedExact(protected_->data.value, spool_file_, false)) return false;
+        std::uint64_t size = 0;
+        if (!ProtectedSize(protected_->data.value, size) || size != next_spool_offset_) return false;
+        return GetFileAttributesW(index_file_.c_str()) == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND;
+    };
+    const bool missing = missing_authority();
+    if (!protected_ || !protected_->rebuild_allowed || protected_->maintenance_seen || (!ProtectedAuthority() && !missing) || safe_discard_sequence != 0 ||
+        !discardable_references.empty() || references.size() > kProtectedMaxRanges) return false;
+    std::vector<DirtyRange> rebuilt;
+    rebuilt.reserve(references.size());
+    std::uint64_t consumed = 0;
+    for (const auto& reference : references)
+    {
+        if (!IsVolumeMatch(reference.volume_identity) || !reference.object_id || !reference.generation ||
+            !reference.wal_sequence || !reference.payload_length || reference.payload_length > journal::kMaxJournalPlaintextBytes ||
+            reference.logical_offset > UINT64_MAX - reference.payload_length ||
+            std::all_of(reference.payload_sha256.begin(), reference.payload_sha256.end(), [](auto b) { return b == 0; })) return false;
+        DirtyRange range{};
+        range.object_id = reference.object_id; range.generation = reference.generation;
+        range.logical_offset = reference.logical_offset; range.bytes = reference.payload_length;
+        range.spool_offset = reference.spool_offset; range.wal_sequence = reference.wal_sequence;
+        if (range.spool_offset > next_spool_offset_ || range.bytes + kProtectedOverhead > next_spool_offset_ - range.spool_offset ||
+            !ChargeStartupPayloadBytes(range.bytes + kProtectedOverhead, options_.startup_payload_read_max_bytes, consumed)) return false;
+        auto frame = crypto::SecureBytes::Allocate(static_cast<std::size_t>(range.bytes + kProtectedOverhead));
+        if (!frame || !ProtectedIo(protected_->data.value, range.spool_offset, frame.bytes.Bytes(), false)) return false;
+        auto plain = journal::ProtectedJournalEpoch::Open(options_.protected_key_directory.wstring(), options_.protected_binding,
+            ProtectedContext(&range, range.spool_offset), frame.bytes.Bytes());
+        std::array<std::uint8_t, 32> digest{};
+        if (!plain || plain.bytes.Size() != range.bytes || !HashPayloadDigests(plain.bytes.Bytes(), &range.checksum, digest) ||
+            digest != reference.payload_sha256) return false;
+        range.created_at = std::chrono::steady_clock::now();
+        rebuilt.push_back(range);
+    }
+    std::sort(rebuilt.begin(), rebuilt.end(), [](const auto& a, const auto& b) { return a.spool_offset < b.spool_offset; });
+    std::uint64_t end = 0;
+    for (std::size_t i = 0; i < rebuilt.size(); ++i)
+    {
+        const auto& range = rebuilt[i];
+        if (range.spool_offset != end) return false;
+        end += range.bytes + kProtectedOverhead;
+        if (i < ranges_.size())
+        {
+            const auto& old = ranges_[i];
+            if (old.object_id != range.object_id || old.generation != range.generation || old.logical_offset != range.logical_offset ||
+                old.bytes != range.bytes || old.spool_offset != range.spool_offset || old.wal_sequence != range.wal_sequence ||
+                old.checksum != range.checksum) return false;
+        }
+    }
+    if (end != next_spool_offset_ || rebuilt.size() < ranges_.size()) return false;
+    if (missing)
+    {
+        if (CleanupCut("rebuild-missing-index-data-flush") || !FlushFileBuffers(protected_->data.value) ||
+            !missing_authority() || CleanupCut("rebuild-missing-index-before-create")) return false;
+        protected_->rebuild_allowed = false;
+        protected_->index.value = CreateFileW(index_file_.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+            nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (!ProtectedExact(protected_->index.value, index_file_, false) || CleanupCut("rebuild-missing-index-after-create") ||
+            CleanupCut("rebuild-missing-index-flush") || !FlushFileBuffers(protected_->index.value)) return false;
+        auto writer = journal::ProtectedJournalEpoch::AcquireWriter(options_.protected_key_directory.wstring(), options_.protected_binding);
+        if (!writer) return false;
+        protected_->epoch = std::move(writer.epoch);
+        protected_->index_missing = false;
+        protected_->rebuild_allowed = true;
+    }
+    protected_->physical_ranges = rebuilt;
+    ranges_ = std::move(rebuilt);
+    try { RebuildRangeSequenceIndex(); RebuildRangeLookup(); RecomputeOldestDirtyRangeLocked(); }
+    catch (...) { protected_->rebuild_allowed = false; recovery_required_ = true; return false; }
+    recovery_required_ = false;
+    index_dirty_ = true;
+    PublishNextSpoolOffsetHintLocked();
+    return true;
+}
+catch (...)
+{
+    if (protected_) protected_->rebuild_allowed = false;
+    recovery_required_ = true;
+    return false;
+}
+
+PayloadSpool::ProtectedMaintenanceResult PayloadSpool::ReconcileProtectedHistory(
+    const ProtectedCleanupProof& proof, std::span<const PersistedRangeReference> references)
+{
+    return ReconcileProtectedOriginalHistory(proof, references, {});
+}
+
+PayloadSpool::ProtectedMaintenanceResult PayloadSpool::ReconcileProtectedOriginalHistory(
+    const ProtectedCleanupProof& proof, std::span<const PersistedRangeReference> references,
+    std::span<const std::uint64_t> optional_inline_sequences)
+{
+    auto lock = AcquireMutex();
+    bool wrote = false, protocol_started = false;
+    const auto failed = [&]() {
+        if ((wrote || protocol_started) && protected_) { protected_->rebuild_allowed = false; recovery_required_ = true; }
+        return wrote ? ProtectedMaintenanceResult::RecoveryRequired : ProtectedMaintenanceResult::RejectedBeforeWrite;
+    };
+    try
+    {
+        if (!options_.protected_persistence || !protected_ || !protected_->maintenance_available ||
+            !CleanupProofValid(proof, continuation_baseline_.has_value()) || proof.source_binding != options_.protected_binding ||
+            (continuation_baseline_ && (!continuation_baseline_->authority || proof.cleanup_sequence < continuation_baseline_->floor)) ||
+            !ProtectedPath(CleanupPath(options_.root, 1024, false)) || !ProtectedPath(CleanupPath(options_.root, 1024, true)) ||
+            !ProtectedPath(options_.root / (std::wstring(kCleanupPrefix) + L"failed." + std::wstring(64, L'0') + L".15")) ||
+            references.size() > kProtectedMaxRanges || references.size() > proof.wal_records ||
+            !ProtectedExact(protected_->anchor.value, protected_marker_file_, false) ||
+            !ProtectedExact(protected_->data.value, spool_file_, false) ||
+            (!protected_->index_missing && !ProtectedExact(protected_->index.value, index_file_, false))) return failed();
+        const bool missing_index = protected_->index_missing;
+        if (missing_index && (continuation_baseline_ || protected_->maintenance_seen || CleanupPresent(options_.root))) return failed();
+        std::uint64_t data_size = 0, index_size = 0, anchor_size = 0;
+        if (!ProtectedSize(protected_->anchor.value, anchor_size) || anchor_size != kProtectedAnchorBytes ||
+            !ProtectedSize(protected_->data.value, data_size) || data_size > options_.max_bytes ||
+            (!missing_index && !ProtectedSize(protected_->index.value, index_size)) || index_size > kProtectedIndexLimit ||
+            (options_.startup_index_max_bytes && index_size > options_.startup_index_max_bytes)) return failed();
+        auto read_pass = journal::ProtectedJournalReadPass::Acquire(options_.protected_key_directory.wstring(), options_.protected_binding);
+        if (!read_pass) return failed();
+
+        std::vector<const PersistedRangeReference*> ordered;
+        std::unordered_set<std::uint64_t> optional, sequences;
+        if (optional_inline_sequences.size() > references.size()) return failed();
+        for (auto sequence : optional_inline_sequences)
+            if (!sequence || !optional.insert(sequence).second) return failed();
+        std::size_t optional_found = 0;
+        for (const auto& r : references)
+        {
+            if (!IsVolumeMatch(r.volume_identity) || !r.object_id || !r.generation || !r.wal_sequence || r.wal_sequence > proof.wal_last_sequence ||
+                !r.payload_length || r.payload_length > journal::kMaxJournalPlaintextBytes || r.logical_offset > UINT64_MAX - r.payload_length ||
+                r.spool_offset > options_.max_bytes || r.payload_length + kProtectedOverhead > options_.max_bytes - r.spool_offset ||
+                std::all_of(r.payload_sha256.begin(), r.payload_sha256.end(), [](auto b) { return b == 0; })) return failed();
+            if (!optional.empty() && !sequences.insert(r.wal_sequence).second) return failed();
+            if (optional.contains(r.wal_sequence)) ++optional_found;
+            ordered.push_back(&r);
+        }
+        if (optional_found != optional.size()) return failed();
+        std::sort(ordered.begin(), ordered.end(), [](auto a, auto b) {
+            return std::tie(a->wal_sequence, a->spool_offset) < std::tie(b->wal_sequence, b->spool_offset);
+        });
+        CleanupDigest refs_digest{};
+        {
+            auto& provider = SharedSha256Provider();
+            if (!provider.algorithm || !provider.object_bytes) return failed();
+            auto object = crypto::SecureBytes::Allocate(provider.object_bytes);
+            auto encoded_ref = crypto::SecureBytes::Allocate(80);
+            if (!object || !encoded_ref) return failed();
+            struct HashOwner
+            {
+                BCRYPT_HASH_HANDLE value = nullptr;
+                ~HashOwner() { if (value) BCryptDestroyHash(value); }
+            } hash;
+            if (CleanupCut("cleanup-reference-hash-create") || BCryptCreateHash(provider.algorithm, &hash.value,
+                reinterpret_cast<PUCHAR>(object.bytes.Bytes().data()), static_cast<ULONG>(object.bytes.Size()), nullptr, 0, 0) < 0) return failed();
+            // Same sorted 80-byte encodings and SHA-256, without a range-sized
+            // locked allocation. Finish even an empty stream for wire compatibility.
+            for (std::size_t n = 0; n < ordered.size(); ++n)
+            {
+                const auto& r = *ordered[n]; const auto b = encoded_ref.bytes.Bytes();
+                if (n && ordered[n - 1]->wal_sequence == r.wal_sequence && ordered[n - 1]->spool_offset == r.spool_offset) return failed();
+                ProtectedPut(b, 0, r.object_id); ProtectedPut(b, 8, r.generation); ProtectedPut(b, 16, r.logical_offset);
+                ProtectedPut(b, 24, r.payload_length); ProtectedPut(b, 32, r.spool_offset); ProtectedPut(b, 40, r.wal_sequence);
+                std::memcpy(b.data() + 48, r.payload_sha256.data(), 32);
+                if (CleanupCut("cleanup-reference-hash-data") || BCryptHashData(hash.value,
+                    reinterpret_cast<PUCHAR>(b.data()), static_cast<ULONG>(b.size()), 0) < 0) return failed();
+            }
+            if (CleanupCut("cleanup-reference-hash-finish") ||
+                BCryptFinishHash(hash.value, refs_digest.data(), static_cast<ULONG>(refs_digest.size()), 0) < 0) return failed();
+        }
+
+        // Authenticate a contiguous bounded receipt chain. Only a final torn
+        // intent/commit is eligible for caller-authorized preserved quarantine.
+        std::map<std::uint64_t, unsigned> names;
+        std::vector<std::unique_ptr<FileHandle>> quarantines;
+        std::size_t entries = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(options_.root))
+        {
+            const auto name = entry.path().filename().wstring();
+            if (name.size() < kCleanupPrefix.size() || CompareStringOrdinal(name.data(), static_cast<int>(kCleanupPrefix.size()),
+                kCleanupPrefix.data(), static_cast<int>(kCleanupPrefix.size()), TRUE) != CSTR_EQUAL) continue;
+            if (!name.starts_with(kCleanupPrefix)) return failed();
+            if (++entries > 4096 || !ProtectedPath(entry.path())) return failed();
+            const auto attributes = GetFileAttributesW(entry.path().c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY))) return failed();
+            auto suffix = std::wstring_view(name).substr(kCleanupPrefix.size());
+            if (suffix.starts_with(L"failed."))
+            {
+                auto h = std::make_unique<FileHandle>(); std::uint64_t size = 0;
+                if (!CleanupOpen(*h, entry.path(), false) || !ProtectedSize(h->value, size) || size > kCleanupIntentBytes + kProtectedOverhead) return failed();
+                quarantines.push_back(std::move(h)); continue;
+            }
+            if (suffix.size() != 23 || (suffix.substr(16) != L".intent" && suffix.substr(16) != L".commit")) return failed();
+            std::uint64_t serial = 0;
+            for (auto c : suffix.substr(0, 16)) { if (c < L'0' || c > L'9') return failed(); serial = serial * 10 + (c - L'0'); }
+            if (!serial || serial > 1024) return failed();
+            names[serial] |= suffix.substr(16) == L".intent" ? 1u : 2u;
+        }
+        CleanupDigest tip = continuation_baseline_ ? continuation_baseline_->tip : CleanupDigest{};
+        std::uint64_t floor = continuation_baseline_ ? continuation_baseline_->floor : 0, reset_floor = floor, committed = 0;
+        CleanupIntent intent{}, latest{};
+        bool pending = false, bad_intent = false, bad_commit = false;
+        std::vector<std::unique_ptr<FileHandle>> pins;
+        std::vector<HANDLE> committed_handles;
+        auto& durable_receipts = protected_->durable_cleanup_receipts;
+        if (durable_receipts.size() > 2048 || durable_receipts.size() % 2) return failed();
+        const auto durable_pairs = durable_receipts.size() / 2;
+        for (std::size_t n = 1; n <= durable_pairs; ++n)
+        {
+            const auto name = names.find(n);
+            if (name == names.end() || name->second != 3) return failed();
+        }
+        durable_receipts.reserve(2048);
+        FileHandle* intent_handle = nullptr; FileHandle* bad_handle = nullptr;
+        std::vector<std::byte> intent_frame, bad_frame;
+        const auto open_receipt = [&](std::uint64_t serial, bool commit) -> FileHandle* {
+            if (serial <= durable_pairs)
+            {
+                auto* cached = durable_receipts[static_cast<std::size_t>((serial - 1) * 2 + commit)].get();
+                return cached && ProtectedExact(cached->value, CleanupPath(options_.root, serial, commit), false) ? cached : nullptr;
+            }
+            auto h = std::make_unique<FileHandle>();
+            if (!CleanupOpen(*h, CleanupPath(options_.root, serial, commit), false)) return nullptr;
+            pins.push_back(std::move(h)); return pins.back().get();
+        };
+        for (const auto& [serial, mask] : names)
+        {
+            if (serial != committed + 1 || !(mask & 1)) return failed();
+            intent_handle = open_receipt(serial, false);
+            if (!intent_handle || !CleanupRead(intent_handle->value, intent_frame)) return failed();
+            auto opened = read_pass.reader->Open(ProtectedCleanupContext(serial, false), intent_frame);
+            if (!opened || !CleanupDecode(opened.bytes.Bytes(), options_.protected_binding, intent, continuation_baseline_.has_value()))
+            {
+                // Missing keys, authentic-but-invalid receipts and full-length
+                // tag corruption are unknown authority, never repairable tails.
+                if (opened || intent_frame.size() >= kCleanupIntentBytes + kProtectedOverhead || mask != 1 || serial != names.rbegin()->first) return failed();
+                bad_intent = true; bad_handle = intent_handle; bad_frame = intent_frame; break;
+            }
+            if (intent.serial != serial || intent.previous != tip || intent.previous_floor != floor || intent.previous_reset != reset_floor ||
+                intent.data_bytes > options_.max_bytes) return failed();
+            if (!(mask & 2)) { if (serial != names.rbegin()->first) return failed(); pending = true; break; }
+            auto* commit_handle = open_receipt(serial, true); std::vector<std::byte> commit_frame;
+            if (!commit_handle || !CleanupRead(commit_handle->value, commit_frame)) return failed();
+            auto commit = read_pass.reader->Open(ProtectedCleanupContext(serial, true), commit_frame);
+            CleanupDigest hash{};
+            if (!HashPayloadSha256(intent_frame, hash)) return failed();
+            if (!commit)
+            {
+                if (commit_frame.size() >= kCleanupCommitBytes + kProtectedOverhead || serial != names.rbegin()->first) return failed();
+                pending = true; bad_commit = true; bad_handle = commit_handle; bad_frame = std::move(commit_frame); break;
+            }
+            const auto b = commit.bytes.Bytes();
+            if (b.size() != kCleanupCommitBytes || ProtectedGet(b, 0) != kCleanupCommitMagic || ProtectedGet(b, 8) != 1 ||
+                ProtectedGet(b, 16) != serial || std::memcmp(b.data() + 24, hash.data(), 32) || ProtectedGet(b, 56) != 0 ||
+                !HashPayloadSha256(commit_frame, tip)) return failed();
+            if (serial > durable_pairs)
+            { committed_handles.push_back(intent_handle->value); committed_handles.push_back(commit_handle->value); }
+            committed = serial; floor = intent.proof.cleanup_sequence;
+            if (intent.reset) reset_floor = floor;
+            latest = intent;
+        }
+        if (proof.cleanup_sequence < floor || (pending && (!CleanupSameProof(proof, intent.proof) || intent.refs != refs_digest || intent.references != references.size()))) return failed();
+
+        const bool reset_endpoint = pending && intent.reset && data_size == 0;
+        std::vector<DirtyRange> physical, live;
+        if (!optional.empty())
+        {
+            if (reset_endpoint)
+            {
+                // The authenticated intent plus mandatory encrypted guard
+                // certify the prior census after an interrupted all-clean reset.
+                // Optional presence cannot be inferred anew from the zero file.
+                for (auto* r : ordered)
+                    if (r->wal_sequence > reset_floor && r->wal_sequence > proof.cleanup_sequence &&
+                        !optional.contains(r->wal_sequence)) return failed();
+            }
+            else
+            {
+                std::unordered_set<std::uint64_t> matched;
+                std::uint64_t cursor = 0, consumed = 0;
+                const auto read_limit = options_.startup_payload_read_max_bytes ?
+                    (std::min)(options_.startup_payload_read_max_bytes, kMaxDirtyFlushBytes) : kMaxDirtyFlushBytes;
+                while (cursor < data_size)
+                {
+                    std::array<std::byte, journal::kJournalRecordHeaderBytes> header{};
+                    if (matched.size() >= kProtectedMaxRanges || data_size - cursor < header.size() ||
+                        !ProtectedIo(protected_->data.value, cursor, header, false) ||
+                        std::memcmp(header.data(), "APFSREC1", 8) || ProtectedGet(header, 8) != (std::uint64_t{64} << 32 | 1)) return failed();
+                    const auto size = ProtectedGet(header, 16) & 0xffffffffull;
+                    if (size <= kProtectedOverhead || size > journal::kMaxJournalRecordBytes || size > data_size - cursor ||
+                        ProtectedGet(header, 16) >> 32 != size - journal::kJournalRecordHeaderBytes) return failed();
+                    const PersistedRangeReference* selected = nullptr;
+                    DirtyRange selected_range{};
+                    for (auto* r : ordered)
+                    {
+                        if (r->wal_sequence <= reset_floor || r->spool_offset != cursor || r->payload_length + kProtectedOverhead != size) continue;
+                        if (!ChargeStartupPayloadBytes(size, read_limit, consumed)) return failed();
+                        DirtyRange range{};
+                        range.object_id = r->object_id; range.generation = r->generation; range.logical_offset = r->logical_offset;
+                        range.bytes = r->payload_length; range.spool_offset = cursor; range.wal_sequence = r->wal_sequence;
+                        range.created_at = std::chrono::steady_clock::now();
+                        auto frame = crypto::SecureBytes::Allocate(static_cast<std::size_t>(size));
+                        if (!frame || !ProtectedIo(protected_->data.value, cursor, frame.bytes.Bytes(), false)) return failed();
+                        auto plain = read_pass.reader->Open(ProtectedContext(&range, cursor), frame.bytes.Bytes());
+                        CleanupDigest digest{};
+                        if (!plain || plain.bytes.Size() != range.bytes ||
+                            !HashPayloadDigests(plain.bytes.Bytes(), &range.checksum, digest) || digest != r->payload_sha256) continue;
+                        if (selected) return failed();
+                        selected = r; selected_range = range;
+                    }
+                    if (!selected || !matched.insert(selected->wal_sequence).second) return failed();
+                    physical.push_back(selected_range);
+                    if (selected_range.wal_sequence > proof.cleanup_sequence) live.push_back(selected_range);
+                    cursor += size;
+                }
+                for (auto* r : ordered)
+                    if (r->wal_sequence > reset_floor && !optional.contains(r->wal_sequence) && !matched.contains(r->wal_sequence)) return failed();
+                if (pending && data_size != intent.data_bytes) return failed();
+            }
+        }
+        else
+        {
+        std::vector<const PersistedRangeReference*> physical_refs;
+        for (auto* r : ordered) if (r->wal_sequence > reset_floor) physical_refs.push_back(r);
+        std::sort(physical_refs.begin(), physical_refs.end(), [](auto a, auto b) { return a->spool_offset < b->spool_offset; });
+        std::uint64_t physical_end = 0;
+        for (auto* r : physical_refs)
+        {
+            if (r->spool_offset != physical_end) return failed();
+            physical_end += r->payload_length + kProtectedOverhead;
+        }
+        if ((data_size != physical_end && !reset_endpoint) || (pending && physical_end != intent.data_bytes)) return failed();
+        std::uint64_t consumed = 0;
+        for (auto* r : physical_refs)
+        {
+            DirtyRange range{};
+            range.object_id = r->object_id; range.generation = r->generation; range.logical_offset = r->logical_offset;
+            range.bytes = r->payload_length; range.spool_offset = r->spool_offset; range.wal_sequence = r->wal_sequence;
+            range.created_at = std::chrono::steady_clock::now();
+            if (!reset_endpoint)
+            {
+                if (!ChargeStartupPayloadBytes(range.bytes + kProtectedOverhead, options_.startup_payload_read_max_bytes, consumed)) return failed();
+                auto frame = crypto::SecureBytes::Allocate(static_cast<std::size_t>(range.bytes + kProtectedOverhead));
+                if (!frame || !ProtectedIo(protected_->data.value, range.spool_offset, frame.bytes.Bytes(), false)) return failed();
+                auto plain = read_pass.reader->Open(ProtectedContext(&range, range.spool_offset), frame.bytes.Bytes());
+                CleanupDigest digest{};
+                if (!plain || plain.bytes.Size() != range.bytes || !HashPayloadDigests(plain.bytes.Bytes(), &range.checksum, digest) || digest != r->payload_sha256) return failed();
+            }
+            physical.push_back(range);
+            if (range.wal_sequence > proof.cleanup_sequence) live.push_back(range);
+        }
+        }
+        CleanupDigest data_hash{}, index_hash{};
+        if (missing_index)
+        {
+            // The complete original-derived census above includes optional
+            // inline refs and authenticates every physical frame before creation.
+            if (CleanupCut("rebuild-missing-index-data-flush") || !FlushFileBuffers(protected_->data.value) ||
+                CleanupPresent(options_.root) || CleanupCut("rebuild-missing-index-before-create")) return failed();
+            protected_->rebuild_allowed = false;
+            protected_->index.value = CreateFileW(index_file_.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+                nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+            wrote = protected_->index.value != INVALID_HANDLE_VALUE;
+            if (!ProtectedExact(protected_->index.value, index_file_, false) || CleanupCut("rebuild-missing-index-after-create") ||
+                CleanupCut("rebuild-missing-index-flush") || !FlushFileBuffers(protected_->index.value)) return failed();
+            protected_->index_missing = false;
+        }
+        if (!CleanupFileHash(protected_->data.value, data_size, data_hash) || !CleanupFileHash(protected_->index.value, index_size, index_hash)) return failed();
+        if (pending && (intent.reset != static_cast<std::uint64_t>(live.empty()) || (!reset_endpoint && data_hash != intent.data))) return failed();
+        const auto valid_guard = [&](std::uint64_t serial) {
+            if (!serial && !continuation_baseline_) return false;
+            if (index_size < kCleanupGuardBytes) return false;
+            std::array<std::byte, kCleanupGuardBytes> frame{};
+            auto context = serial || !continuation_baseline_ ? ProtectedCleanupContext(serial, false) : ContinuationSpoolContext(*continuation_baseline_);
+            if (serial) { if (context.purpose != 0x505304u) return false; context.purpose = 0x505306u; }
+            if (!ProtectedIo(protected_->index.value, 0, frame, false)) return false;
+            auto plain = read_pass.reader->Open(context, frame);
+            return plain && plain.bytes.Size() == 24 && ProtectedGet(plain.bytes.Bytes(), 0) == kCleanupCommitMagic &&
+                ProtectedGet(plain.bytes.Bytes(), 8) == (serial ? 1 : 6) &&
+                ProtectedGet(plain.bytes.Bytes(), 16) == (serial ? serial : continuation_baseline_->floor);
+        };
+        // The guard was durable BEFORE data reset. Its loss is unknown damage,
+        // not a recoverable zero-index endpoint or permission for older writers.
+        if (reset_endpoint && intent.data_bytes != 0 && !valid_guard(intent.serial)) return failed();
+        const bool baseline_endpoint = continuation_baseline_ && !committed && references.empty() &&
+            proof.cleanup_sequence == continuation_baseline_->floor;
+        const bool idempotent = !pending && !bad_intent && data_size == 0 && index_size == kCleanupGuardBytes &&
+            valid_guard(committed) && (baseline_endpoint || (committed && latest.reset &&
+            CleanupSameProof(proof, latest.proof) && latest.refs == refs_digest && latest.references == references.size()));
+        const auto index_limit = options_.startup_index_max_bytes ? (std::min)(kProtectedIndexLimit, options_.startup_index_max_bytes) : kProtectedIndexLimit;
+        if (kCleanupGuardBytes + (live.empty() ? 0 : 24 + physical.size() * kIndexRangeBytes + kProtectedOverhead) > index_limit ||
+            (!idempotent && ((!pending && committed >= 1024) || entries + (pending ? 1 : 2) > 4096))) return failed();
+
+        // Flush the exact authenticated originals even for a freshly reopened
+        // owner or zero-byte reset endpoint, before any receipt/namespace write.
+        if (CleanupCut("cleanup-original-data-flush") || !FlushFileBuffers(protected_->data.value) ||
+            CleanupCut("cleanup-original-index-flush") || !FlushFileBuffers(protected_->index.value) ||
+            !ProtectedExact(protected_->data.value, spool_file_, false) || !ProtectedExact(protected_->index.value, index_file_, false) ||
+            CleanupCut("cleanup-after-original-barrier")) return failed();
+        // Complete receipt bytes may also come from an ambiguously flushed
+        // owner. Durably retain the chain before referencing its tip or success.
+        for (auto h : committed_handles)
+            if (CleanupCut("cleanup-chain-flush") || !FlushFileBuffers(h)) return failed();
+        for (const auto& h : quarantines)
+            if (CleanupCut("cleanup-quarantine-flush") || !FlushFileBuffers(h->value)) return failed();
+        if (CleanupCut("cleanup-after-chain-barrier")) return failed();
+        // Transfer the exact handles just flushed, in contiguous pair order.
+        // Failed/reopened owners start with no cached durability proof.
+        for (std::size_t n = 0; n < committed_handles.size(); ++n)
+        {
+            if (n >= pins.size() || !pins[n] || pins[n]->value != committed_handles[n]) return failed();
+            durable_receipts.push_back(std::move(pins[n]));
+        }
+        if (durable_receipts.size() != committed * 2) return failed();
+        if (!protected_->epoch)
+        {
+            wrote = true; // Even a failed acquisition may leave a published slot.
+            auto epoch = journal::ProtectedJournalEpoch::AcquireWriter(options_.protected_key_directory.wstring(), options_.protected_binding);
+            if (!epoch) return failed(); protected_->epoch = std::move(epoch.epoch);
+        }
+        const auto publish_view = [&]() {
+            if (live.empty()) physical.clear();
+            protected_->physical_ranges = std::move(physical); ranges_ = std::move(live);
+            protected_->cleanup_floor = proof.cleanup_sequence; protected_->maintenance_seen = true;
+            next_spool_offset_ = ranges_.empty() ? 0 : data_size; protected_->index_bytes = kCleanupGuardBytes;
+            RebuildRangeSequenceIndex(); RebuildRangeLookup(); RecomputeOldestDirtyRangeLocked(); ClearValidatedPayloadCacheLocked();
+            PublishNextSpoolOffsetHintLocked(); bytes_since_sync_ = appends_since_sync_ = 0;
+            recovery_required_ = false; protected_->rebuild_allowed = true; index_dirty_ = !ranges_.empty();
+        };
+        // A completed all-clean operation is idempotent under the SAME authority.
+        if (idempotent)
+        { publish_view(); return ProtectedMaintenanceResult::Succeeded; }
+        if (bad_intent)
+        {
+            protocol_started = true;
+            wrote = true;
+            if (!CleanupQuarantine(bad_handle->value, options_.root, bad_frame)) return failed();
+            intent_handle = nullptr;
+        }
+        if (!pending)
+        {
+            intent = {}; intent.proof = proof; intent.serial = committed + 1; intent.reset = live.empty(); intent.references = references.size();
+            intent.data_bytes = data_size; intent.index_bytes = index_size; intent.previous_reset = reset_floor; intent.previous_floor = floor;
+            intent.refs = refs_digest; intent.data = data_hash; intent.index = index_hash; intent.previous = tip;
+            auto plain = CleanupEncode(intent); if (!plain) return failed();
+            const auto context = ProtectedCleanupContext(intent.serial, false); if (context.purpose != 0x505304u) return failed();
+            auto frame = protected_->epoch->Seal(context, plain.bytes.Bytes()); if (!frame) return failed();
+            protocol_started = true;
+            if (CleanupCut("cleanup-before-intent-create")) return failed();
+            auto h = std::make_unique<FileHandle>();
+            if (!CleanupOpen(*h, CleanupPath(options_.root, intent.serial, false), true)) return failed();
+            intent_handle = h.get(); pins.push_back(std::move(h)); wrote = true; protected_->maintenance_seen = true;
+            if (CleanupCut("cleanup-after-intent-create")) return failed();
+            if (CleanupCut("cleanup-partial-intent-write")) { (void)ProtectedIo(intent_handle->value, 0, frame.bytes.Bytes().first(13), true); return failed(); }
+            if (!ProtectedIo(intent_handle->value, 0, frame.bytes.Bytes(), true) || CleanupCut("cleanup-after-intent-write")) return failed();
+            intent_frame.assign(frame.bytes.Bytes().begin(), frame.bytes.Bytes().end());
+        }
+        // A readable intent from an ambiguous prior flush is not a durable one.
+        if (CleanupCut("cleanup-intent-flush") || !FlushFileBuffers(intent_handle->value) || CleanupCut("cleanup-after-intent-flush")) return failed();
+        std::vector<std::byte> readback;
+        if (!CleanupRead(intent_handle->value, readback) || readback != intent_frame || CleanupCut("cleanup-after-intent-readback")) return failed();
+        // Publish an incompatible, authenticated guard before ANY data removal.
+        // Older protected-spool binaries fail authentication instead of accepting
+        // an empty store while ignoring its cleanup floor/receipt protocol.
+        auto guard_plain = crypto::SecureBytes::Allocate(24);
+        if (!guard_plain) return failed();
+        ProtectedPut(guard_plain.bytes.Bytes(), 0, kCleanupCommitMagic); ProtectedPut(guard_plain.bytes.Bytes(), 8, 1);
+        ProtectedPut(guard_plain.bytes.Bytes(), 16, intent.serial);
+        auto guard_context = ProtectedCleanupContext(intent.serial, false); if (guard_context.purpose != 0x505304u) return failed();
+        guard_context.purpose = 0x505306u;
+        auto guard = protected_->epoch->Seal(guard_context, guard_plain.bytes.Bytes()); if (!guard) return failed();
+        if (CleanupCut("cleanup-before-guard-write")) return failed();
+        wrote = true;
+        if (CleanupCut("cleanup-partial-guard-write")) { (void)ProtectedIo(protected_->index.value, 0, guard.bytes.Bytes().first(13), true); return failed(); }
+        if (!ProtectedIo(protected_->index.value, 0, guard.bytes.Bytes(), true) || CleanupCut("cleanup-after-guard-write") ||
+            CleanupCut("cleanup-guard-flush") || !FlushFileBuffers(protected_->index.value) || CleanupCut("cleanup-after-guard-flush")) return failed();
+        std::array<std::byte, kCleanupGuardBytes> guard_readback{};
+        if (!ProtectedIo(protected_->index.value, 0, guard_readback, false) ||
+            !std::equal(guard_readback.begin(), guard_readback.end(), guard.bytes.Bytes().begin(), guard.bytes.Bytes().end()) ||
+            CleanupCut("cleanup-after-guard-readback")) return failed();
+        const auto truncate = [&](HANDLE h, bool data) {
+            if (CleanupCut(data ? "cleanup-before-data-reset" : "cleanup-before-index-reset")) return false;
+            wrote = true;
+            LARGE_INTEGER end{}; end.QuadPart = data ? 0 : static_cast<LONGLONG>(kCleanupGuardBytes);
+            if (!SetFilePointerEx(h, end, nullptr, FILE_BEGIN) || !SetEndOfFile(h) || CleanupCut(data ? "cleanup-after-data-reset" : "cleanup-after-index-reset")) return false;
+            return !CleanupCut(data ? "cleanup-data-reset-flush" : "cleanup-index-reset-flush") && FlushFileBuffers(h) &&
+                !CleanupCut(data ? "cleanup-after-data-reset-flush" : "cleanup-after-index-reset-flush");
+        };
+        if ((intent.reset && !truncate(protected_->data.value, true)) || !truncate(protected_->index.value, false)) return failed();
+        if (bad_commit)
+        {
+            wrote = true;
+            if (!CleanupQuarantine(bad_handle->value, options_.root, bad_frame)) return failed();
+        }
+        auto commit_plain = crypto::SecureBytes::Allocate(kCleanupCommitBytes); CleanupDigest intent_hash{};
+        if (!commit_plain || !HashPayloadSha256(intent_frame, intent_hash)) return failed();
+        const auto b = commit_plain.bytes.Bytes();
+        ProtectedPut(b, 0, kCleanupCommitMagic); ProtectedPut(b, 8, 1); ProtectedPut(b, 16, intent.serial);
+        std::memcpy(b.data() + 24, intent_hash.data(), 32);
+        const auto context = ProtectedCleanupContext(intent.serial, true); if (context.purpose != 0x505305u) return failed();
+        auto commit = protected_->epoch->Seal(context, b); if (!commit) return failed();
+        protocol_started = true;
+        if (CleanupCut("cleanup-before-commit-create")) return failed();
+        auto commit_handle = std::make_unique<FileHandle>();
+        if (!CleanupOpen(*commit_handle, CleanupPath(options_.root, intent.serial, true), true)) return failed();
+        wrote = true;
+        if (CleanupCut("cleanup-after-commit-create")) return failed();
+        if (CleanupCut("cleanup-partial-commit-write")) { (void)ProtectedIo(commit_handle->value, 0, commit.bytes.Bytes().first(13), true); return failed(); }
+        if (!ProtectedIo(commit_handle->value, 0, commit.bytes.Bytes(), true) || CleanupCut("cleanup-after-commit-write") ||
+            CleanupCut("cleanup-commit-flush") || !FlushFileBuffers(commit_handle->value) || CleanupCut("cleanup-after-commit-flush") ||
+            !CleanupRead(commit_handle->value, readback) || !std::equal(readback.begin(), readback.end(), commit.bytes.Bytes().begin(), commit.bytes.Bytes().end()) ||
+            CleanupCut("cleanup-after-commit-readback")) return failed();
+        const auto intent_pin = std::find_if(pins.begin(), pins.end(), [&](const auto& h) { return h.get() == intent_handle; });
+        if (intent_pin == pins.end() || durable_receipts.size() != (intent.serial - 1) * 2) return failed();
+        durable_receipts.push_back(std::move(*intent_pin)); durable_receipts.push_back(std::move(commit_handle));
+        publish_view();
+        return ProtectedMaintenanceResult::Succeeded;
+    }
+    catch (...) { return failed(); }
+}
+
+bool PayloadSpool::OverlayProtected(const ReadRequest& request, std::size_t& bytes_overlayed,
+    bool require_full_coverage, std::uint64_t* logical_end) const
+{
+    if (recovery_required_ || !protected_ || !protected_->rebuild_allowed || !ProtectedAuthority() ||
+        request.destination.size() > crypto::SecureBytes::kMaxBytes) return false;
+    if (logical_end) *logical_end = 0;
+    const auto lookup = range_object_lookup_.find({request.object_id, request.generation});
+    if (lookup == range_object_lookup_.end()) return !require_full_coverage;
+    auto staging = crypto::SecureBytes::Allocate(request.destination.size());
+    if (!staging) return false;
+    const auto destination = staging.bytes.Bytes();
+    std::copy(request.destination.begin(), request.destination.end(), destination.begin());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> covered;
+    const auto end = request.logical_offset + request.destination.size();
+    for (const auto i : lookup->second)
+    {
+        const auto& range = ranges_[i];
+        const auto tail = range.logical_offset + range.bytes;
+        if (logical_end) *logical_end = (std::max)(*logical_end, tail);
+        const auto begin = (std::max)(request.logical_offset, range.logical_offset);
+        const auto finish = (std::min)(end, tail);
+        if (begin >= finish) continue;
+        auto plain = ReadProtectedRange(range);
+        if (!plain) return false;
+        const auto source = plain.bytes.Bytes().subspan(static_cast<std::size_t>(begin - range.logical_offset), static_cast<std::size_t>(finish - begin));
+        std::copy(source.begin(), source.end(), destination.begin() + static_cast<std::ptrdiff_t>(begin - request.logical_offset));
+        covered.push_back({begin, finish});
+    }
+    std::sort(covered.begin(), covered.end());
+    std::uint64_t covered_end = request.logical_offset;
+    std::size_t total = 0;
+    for (const auto& [begin, finish] : covered)
+    {
+        if (finish > covered_end) total += static_cast<std::size_t>(finish - (std::max)(begin, covered_end));
+        covered_end = (std::max)(covered_end, finish);
+    }
+    if (require_full_coverage && total != destination.size()) return false;
+    std::copy(destination.begin(), destination.end(), request.destination.begin());
+    bytes_overlayed = total;
+    return true;
+}
 
 PayloadSpool::PayloadSpool(Options options)
     : options_(std::move(options))
     , perf_counters_enabled_(ReadPerfCountersEnabled())
 {
-    if (options_.root.empty())
+    if (options_.root.empty() && !options_.protected_persistence)
     {
         options_.root = ResolveDefaultRoot();
     }
     spool_file_ = options_.root / "payload-spool.bin";
     index_file_ = options_.root / "payload-spool.idx";
+    protected_marker_file_ = options_.root / kProtectedMarkerName;
+    if (options_.protected_persistence)
+    {
+        recovery_required_ = true;
+        try { (void)InitializeProtected(); }
+        catch (...) { if (protected_) protected_->rebuild_allowed = false; }
+        return;
+    }
+    if (ProtectedStoreMarkerPresent())
+    {
+        protected_format_refused_ = true; recovery_required_ = true;
+        return;
+    }
     index_delta_enabled_ = !ReadEnvironmentFlag("APFSACCESS_DISABLE_INDEX_DELTA");
     const auto index_loaded = LoadIndex();
     recovery_required_ = recovery_required_ || !index_loaded;
+    ordinary_layout_unproven_ = !index_loaded || (ranges_.empty() && next_spool_offset_ != 0);
 }
 
 std::unique_lock<std::mutex> PayloadSpool::AcquireMutex() const
@@ -626,6 +1992,8 @@ PayloadSpool::AppendStatus PayloadSpool::CheckAppendCapacity(std::uint64_t paylo
 
 PayloadSpool::AppendStatus PayloadSpool::CheckAppendCapacityFast(std::uint64_t payload_bytes) const
 {
+    if (MutationRefused()) return AppendStatus::StorageFailure;
+    if (options_.protected_persistence) return CheckAppendCapacity(payload_bytes);
     if (payload_bytes == 0)
     {
         return AppendStatus::InvalidRequest;
@@ -655,6 +2023,7 @@ PayloadSpool::AppendStatus PayloadSpool::AppendWithStatus(const WriteRequest& re
     {
         *result = {};
     }
+    if (MutationRefused()) return AppendStatus::StorageFailure;
     if (!IsVolumeMatch(request.volume_identity) ||
         request.object_id == 0 ||
         request.payload.empty() ||
@@ -664,6 +2033,12 @@ PayloadSpool::AppendStatus PayloadSpool::AppendWithStatus(const WriteRequest& re
     }
 
     auto lock = AcquireMutex();
+
+    if (options_.protected_persistence)
+    {
+        try { return AppendProtected(request, result); }
+        catch (...) { if (protected_) protected_->rebuild_allowed = false; recovery_required_ = true; return AppendStatus::StorageFailure; }
+    }
 
     const auto request_begin = request.logical_offset;
     const auto request_end = request.logical_offset + static_cast<std::uint64_t>(request.payload.size());
@@ -1056,10 +2431,52 @@ PayloadSpool::AppendStatus PayloadSpool::AppendWithStatus(const WriteRequest& re
     return AppendStatus::Succeeded;
 }
 
+bool PayloadSpool::WithProtectedPersistedRange(const PersistedRangeReference& reference,
+    std::uint64_t max_payload_bytes, const std::function<bool(std::span<const std::byte>)>& consumer,
+    std::string& error) const
+{
+    error.clear();
+    const auto fail = [&](const char* reason) { error = reason; return false; };
+    if (!options_.protected_persistence || !consumer || !max_payload_bytes ||
+        max_payload_bytes > journal::kMaxJournalPlaintextBytes ||
+        !reference.payload_length || reference.payload_length > max_payload_bytes ||
+        !IsVolumeMatch(reference.volume_identity) || !reference.object_id || !reference.generation ||
+        !reference.wal_sequence || reference.logical_offset > UINT64_MAX - reference.payload_length ||
+        std::all_of(reference.payload_sha256.begin(), reference.payload_sha256.end(), [](auto b) { return b == 0; }))
+        return fail("ProtectedPayloadReferenceInvalid");
+    try {
+        auto lock = AcquireMutex();
+        if (recovery_required_ || !protected_ || !protected_->rebuild_allowed)
+            return fail("ProtectedPayloadReconciliationRequired");
+        const auto found = range_lookup_.find({reference.object_id, reference.generation, reference.wal_sequence});
+        if (found == range_lookup_.end()) return fail("ProtectedPayloadReferenceUnavailable");
+        const DirtyRange* matched = nullptr;
+        for (auto index : found->second) {
+            if (index >= ranges_.size()) return fail("ProtectedPayloadReferenceUnavailable");
+            const auto& range = ranges_[index];
+            if (range.logical_offset != reference.logical_offset || range.bytes != reference.payload_length ||
+                range.spool_offset != reference.spool_offset) continue;
+            if (matched) return fail("ProtectedPayloadReferenceUnavailable");
+            matched = &range;
+        }
+        if (!matched) return fail("ProtectedPayloadReferenceUnavailable");
+        auto plain = ReadProtectedRange(*matched);
+        std::array<std::uint8_t, 32> digest{};
+        if (!plain || plain.bytes.Size() != reference.payload_length ||
+            !HashPayloadSha256(plain.bytes.Bytes(), digest) || digest != reference.payload_sha256)
+            return fail("ProtectedPayloadAuthenticationFailed");
+        // The sole plaintext owner stays locked until the synchronous borrow
+        // returns, including consumer rejection and stack unwinding.
+        if (!consumer(plain.bytes.Bytes())) return fail("ProtectedPayloadConsumerRejected");
+        return true;
+    } catch (...) { return fail("ProtectedPayloadConsumerOrProviderFailed"); }
+}
+
 bool PayloadSpool::ReadPersistedRange(
     const PersistedRangeReference& reference,
     std::vector<std::byte>& payload) const
 {
+    if (options_.protected_persistence && !payload.empty()) SecureZeroMemory(payload.data(), payload.size());
     payload.clear();
     if (!IsVolumeMatch(reference.volume_identity) ||
         reference.object_id == 0 ||
@@ -1106,6 +2523,16 @@ bool PayloadSpool::ReadPersistedRange(
             matched_range = &range;
         }
     }
+    if (options_.protected_persistence)
+    {
+        if (!matched_range || !protected_ || !protected_->rebuild_allowed) return false;
+        auto plain = ReadProtectedRange(*matched_range);
+        std::array<std::uint8_t, 32> digest{};
+        if (!plain || !HashPayloadSha256(plain.bytes.Bytes(), digest) || digest != reference.payload_sha256) return false;
+        // Caller-owned legacy vector output is intentionally outside SecureBytes.
+        payload.assign(plain.bytes.Bytes().begin(), plain.bytes.Bytes().end());
+        return true;
+    }
     if (!matched_range || !ReadRangePayloadFromHandleLocked(*matched_range, payload))
     {
         payload.clear();
@@ -1130,6 +2557,24 @@ bool PayloadSpool::FlushDirtyState()
 bool PayloadSpool::RestoreInlineRange(
     const PersistedRangeReference& reference, std::span<const std::byte> payload)
 {
+    if (MutationRefused()) return false;
+    if (options_.protected_persistence)
+    {
+        auto lock = AcquireMutex();
+        if (recovery_required_ || !IsVolumeMatch(reference.volume_identity) ||
+            payload.size() != reference.payload_length || !protected_ || !protected_->rebuild_allowed) return false;
+        for (const auto& range : ranges_)
+        {
+            if (range.object_id != reference.object_id || range.generation != reference.generation ||
+                range.logical_offset != reference.logical_offset || range.bytes != reference.payload_length ||
+                range.spool_offset != reference.spool_offset || range.wal_sequence != reference.wal_sequence) continue;
+            auto plain = ReadProtectedRange(range);
+            std::array<std::uint8_t, 32> digest{};
+            return plain && HashPayloadSha256(plain.bytes.Bytes(), digest) && digest == reference.payload_sha256 &&
+                std::equal(plain.bytes.Bytes().begin(), plain.bytes.Bytes().end(), payload.begin());
+        }
+        return false;
+    }
     std::array<std::uint8_t, 32> sha256{};
     if (!IsVolumeMatch(reference.volume_identity) || reference.object_id == 0 ||
         reference.generation == 0 || reference.wal_sequence == 0 || payload.empty() ||
@@ -1216,6 +2661,9 @@ bool PayloadSpool::RebuildIndexFromReferences(
     std::span<const PersistedRangeReference> discardable_references)
 {
     auto lock = AcquireMutex();
+    if (protected_format_refused_ || (!options_.protected_persistence && ProtectedStoreMarkerPresent())) return false;
+
+    if (options_.protected_persistence) return RebuildProtectedIndex(references, safe_discard_sequence, discardable_references);
 
     std::unordered_map<std::uint64_t, const PersistedRangeReference*> discardable_by_sequence;
     discardable_by_sequence.reserve(discardable_references.size());
@@ -1395,6 +2843,7 @@ bool PayloadSpool::RebuildIndexFromReferences(
             return false;
         }
         recovery_required_ = false;
+        ordinary_layout_unproven_ = false;
         return true;
     }
 
@@ -1403,6 +2852,7 @@ bool PayloadSpool::RebuildIndexFromReferences(
     RebuildRangeLookup();
     RecomputeOldestDirtyRangeLocked();
     recovery_required_ = false;
+    ordinary_layout_unproven_ = false;
     index_dirty_ = true;
     index_requires_snapshot_ = true;
     pending_index_additions_.clear();
@@ -1669,6 +3119,7 @@ bool PayloadSpool::OverlayDirtyRanges(const ReadRequest& request, std::size_t& b
     }
 
     auto lock = AcquireMutex();
+    if (options_.protected_persistence) return OverlayProtected(request, bytes_overlayed, false, nullptr);
     bool handled = false;
     const std::vector<std::size_t>* reused_lookup = nullptr;
     const auto fast_result = TryOverlaySingleDirtyRange(
@@ -1708,6 +3159,7 @@ bool PayloadSpool::OverlayDirtyRangesWithLogicalEnd(
     }
 
     auto lock = AcquireMutex();
+    if (options_.protected_persistence) return OverlayProtected(request, bytes_overlayed, false, &logical_end);
     bool handled = false;
     const std::vector<std::size_t>* reused_lookup = nullptr;
     const auto fast_result = TryOverlaySingleDirtyRange(
@@ -1744,6 +3196,7 @@ bool PayloadSpool::ReadFullyCoveredRange(const ReadRequest& request, std::size_t
     }
 
     auto lock = AcquireMutex();
+    if (options_.protected_persistence) return OverlayProtected(request, bytes_overlayed, true, nullptr);
     bool handled = false;
     const std::vector<std::size_t>* reused_lookup = nullptr;
     const auto fast_result = TryOverlaySingleDirtyRange(
@@ -2652,6 +4105,13 @@ std::uint64_t PayloadSpool::MaxDirtyRangeEnd(
 bool PayloadSpool::CleanupThroughSequence(std::uint64_t wal_sequence)
 {
     auto lock = AcquireMutex();
+    if (MutationRefused()) return false;
+
+    if (options_.protected_persistence)
+    {
+        if (recovery_required_ || !protected_ || !protected_->rebuild_allowed || !ProtectedAuthority()) return false;
+        return std::none_of(ranges_.begin(), ranges_.end(), [wal_sequence](const auto& r) { return r.wal_sequence <= wal_sequence; });
+    }
 
     if (!min_dirty_wal_sequence_tracked_ || wal_sequence < min_dirty_wal_sequence_)
     {
@@ -2686,6 +4146,13 @@ bool PayloadSpool::CleanupThroughSequence(std::uint64_t wal_sequence)
 bool PayloadSpool::DiscardSequence(std::uint64_t wal_sequence)
 {
     auto lock = AcquireMutex();
+    if (MutationRefused()) return false;
+
+    if (options_.protected_persistence)
+    {
+        if (recovery_required_ || !protected_ || !protected_->rebuild_allowed || !ProtectedAuthority()) return false;
+        return !range_sequences_.contains(wal_sequence);
+    }
 
     if (range_sequences_.find(wal_sequence) == range_sequences_.end())
     {
@@ -2720,6 +4187,8 @@ bool PayloadSpool::DiscardSequence(std::uint64_t wal_sequence)
 bool PayloadSpool::ResolveUnindexedPayloadRecovery(bool wal_proves_no_accepted_work)
 {
     auto lock = AcquireMutex();
+    if (options_.protected_persistence) return false;
+    if (protected_format_refused_ || ProtectedStoreMarkerPresent()) return false;
     if (!wal_proves_no_accepted_work ||
         !recovery_required_ ||
         !unindexed_payload_recovery_ ||
@@ -2742,6 +4211,7 @@ bool PayloadSpool::ResolveUnindexedPayloadRecovery(bool wal_proves_no_accepted_w
     }
     recovery_required_ = false;
     unindexed_payload_recovery_ = false;
+    ordinary_layout_unproven_ = false;
     return true;
 }
 
@@ -2754,6 +4224,19 @@ PayloadSpool::Counters PayloadSpool::SnapshotCounters() const
 const std::filesystem::path& PayloadSpool::SpoolFilePath() const noexcept
 {
     return spool_file_;
+}
+
+bool PayloadSpool::MatchesProtectedMaintenanceAuthority(const journal::JournalDigest& binding,
+    std::string_view volume, const std::filesystem::path& original_keys) const noexcept
+{
+    try {
+        if (!options_.protected_persistence || binding != options_.protected_binding || !IsVolumeMatch(volume) ||
+            !ProtectedPath(original_keys) || !ProtectedPath(options_.protected_key_directory) ||
+            !ProtectedPath(CleanupPath(options_.root, 1024, false)) || !ProtectedPath(CleanupPath(options_.root, 1024, true)) ||
+            !ProtectedPath(options_.root / (std::wstring(kCleanupPrefix) + L"failed." + std::wstring(64, L'0') + L".15"))) return false;
+        const auto order = CompareStringOrdinal(original_keys.c_str(), -1, options_.protected_key_directory.c_str(), -1, TRUE);
+        return order == CSTR_LESS_THAN || order == CSTR_GREATER_THAN;
+    } catch (...) { return false; }
 }
 
 bool PayloadSpool::RecoveryRequired() const noexcept
@@ -3095,6 +4578,20 @@ void PayloadSpool::ClearValidatedPayloadCacheLocked() const noexcept
 
 PayloadSpool::AppendStatus PayloadSpool::CheckAppendCapacityLocked(std::uint64_t payload_bytes) const noexcept
 {
+    if (MutationRefused()) return AppendStatus::StorageFailure;
+    if (options_.protected_persistence)
+    {
+        if (!payload_bytes || payload_bytes > journal::kMaxJournalPlaintextBytes) return AppendStatus::InvalidRequest;
+        if (recovery_required_ || !protected_ || !protected_->epoch || !protected_->rebuild_allowed) return AppendStatus::StorageFailure;
+        if (protected_->physical_ranges.size() >= kProtectedMaxRanges) return AppendStatus::QuotaExceeded;
+        const auto limit = options_.startup_index_max_bytes ?
+            (std::min)(kProtectedIndexLimit, options_.startup_index_max_bytes) : kProtectedIndexLimit;
+        const auto reserved = 24 + (protected_->physical_ranges.size() + 1) * kIndexRangeBytes + kProtectedOverhead;
+        if (reserved > limit || protected_->index_bytes > limit - reserved || next_spool_offset_ > options_.max_bytes ||
+            payload_bytes + kProtectedOverhead > options_.max_bytes - next_spool_offset_) return AppendStatus::QuotaExceeded;
+        // Authority validation is performed in AppendProtected before any write.
+        return AppendStatus::Succeeded;
+    }
     if (payload_bytes == 0 ||
         payload_bytes > (std::numeric_limits<std::uint64_t>::max)() - next_spool_offset_)
     {
@@ -3139,7 +4636,7 @@ bool PayloadSpool::AppendBytes(std::span<const std::byte> payload, std::uint64_t
         return false;
     }
 
-    if (!EnsureAppendStreamLocked())
+    if (!EnsureAppendStreamLocked() || MutationRefused())
     {
         return false;
     }
@@ -3381,6 +4878,20 @@ bool PayloadSpool::AppendIndexJournalBytesLocked(std::span<const std::byte> byte
 
 bool PayloadSpool::FlushPayloadBytesLocked(bool observe_durable_flush)
 {
+    if (MutationRefused()) return false;
+    if (options_.protected_persistence)
+    {
+        if (recovery_required_ || !protected_ || !protected_->rebuild_allowed || !ProtectedAuthority()) return false;
+        if (!ProtectedFlush(protected_->data.value, false))
+        {
+            protected_->rebuild_allowed = false; recovery_required_ = true;
+            return false;
+        }
+        bytes_since_sync_ = 0; appends_since_sync_ = 0;
+        ++spool_sync_count_; ++spool_sync_handle_flush_count_;
+        if (observe_durable_flush) ++payload_only_flush_count_;
+        return true;
+    }
     if (bytes_since_sync_ == 0 && appends_since_sync_ == 0)
     {
         return true;
@@ -3457,6 +4968,14 @@ bool PayloadSpool::FlushPayloadBytesLocked(bool observe_durable_flush)
 
 bool PayloadSpool::FlushDirtyStateLocked()
 {
+    if (MutationRefused()) return false;
+    if (options_.protected_persistence)
+    {
+        if (!FlushPayloadBytesLocked(false) || (index_dirty_ && !PersistProtectedIndex())) return false;
+        index_dirty_ = false;
+        ++durable_flush_count_;
+        return true;
+    }
     if (!index_dirty_ &&
         bytes_since_sync_ == 0 &&
         appends_since_sync_ == 0)
@@ -3822,20 +5341,48 @@ bool PayloadSpool::LoadIndex()
         return !ec && next_spool_offset_ == 0;
     }
 
+    std::uintmax_t index_size = 0;
+    if (options_.startup_index_max_bytes != 0)
+    {
+        index_size = std::filesystem::file_size(index_file_, ec);
+        if (ec || index_size > options_.startup_index_max_bytes ||
+            index_size > static_cast<std::uintmax_t>((std::numeric_limits<std::streamsize>::max)()))
+        {
+            return false;
+        }
+    }
+
     std::ifstream input(index_file_, std::ios::binary);
     if (!input.good())
     {
         return false;
     }
 
-    const std::vector<char> raw_bytes(
-        (std::istreambuf_iterator<char>(input)),
-        std::istreambuf_iterator<char>());
     std::vector<std::byte> file_bytes;
-    file_bytes.reserve(raw_bytes.size());
-    for (const auto byte : raw_bytes)
+    if (options_.startup_index_max_bytes != 0)
     {
-        file_bytes.push_back(static_cast<std::byte>(static_cast<unsigned char>(byte)));
+        if (index_size > file_bytes.max_size())
+        {
+            return false;
+        }
+        file_bytes.resize(static_cast<std::size_t>(index_size));
+        input.read(reinterpret_cast<char*>(file_bytes.data()), static_cast<std::streamsize>(index_size));
+        if (!input.good() || input.gcount() != static_cast<std::streamsize>(index_size) ||
+            input.peek() != std::char_traits<char>::eof() || input.bad())
+        {
+            return false;
+        }
+    }
+    else
+    {
+        const std::vector<char> raw_bytes(
+            (std::istreambuf_iterator<char>(input)),
+            std::istreambuf_iterator<char>());
+        file_bytes.reserve(raw_bytes.size());
+        for (const auto byte : raw_bytes)
+        {
+            file_bytes.push_back(static_cast<std::byte>(static_cast<unsigned char>(byte)));
+        }
     }
     if (file_bytes.size() < sizeof(std::uint64_t))
     {
@@ -3877,9 +5424,12 @@ bool PayloadSpool::LoadIndex()
         return false;
     }
 
+    std::uint64_t startup_payload_bytes_read = 0;
     for (const auto& range : loaded)
     {
         if (RangeEnd(range.spool_offset, range.bytes) > next_spool_offset_ ||
+            !ChargeStartupPayloadBytes(
+                range.bytes, options_.startup_payload_read_max_bytes, startup_payload_bytes_read) ||
             !ReadRangePayloadFromStream(payload_input, range, range_payload))
         {
             return false;
@@ -4190,9 +5740,12 @@ bool PayloadSpool::LoadIndexJournal(const std::vector<std::byte>& file_bytes)
     {
         return false;
     }
+    std::uint64_t startup_payload_bytes_read = 0;
     for (const auto& range : loaded)
     {
         if (RangeEnd(range.spool_offset, range.bytes) > next_spool_offset_ ||
+            !ChargeStartupPayloadBytes(
+                range.bytes, options_.startup_payload_read_max_bytes, startup_payload_bytes_read) ||
             !ReadRangePayloadFromStream(payload_input, range, range_payload))
         {
             return false;

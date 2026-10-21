@@ -1,17 +1,20 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
+using ApfsAccess.Backend.Native;
 using ApfsAccess.Core;
 using ApfsAccess.Ipc;
 using Microsoft.Extensions.Options;
 
 namespace ApfsAccess.Service;
 
-public sealed class ApfsMountWorker : BackgroundService
+public sealed partial class ApfsMountWorker : BackgroundService
 {
     private readonly ILogger<ApfsMountWorker> _logger;
     private readonly IApfsBackend _backend;
     private readonly IMountPolicy _mountPolicy;
     private readonly RuntimeStatusPublisher _statusPublisher;
     private readonly IOptionsMonitor<ServiceHostOptions> _optionsMonitor;
+    private readonly PhysicalWritePermissions? _physicalWritePermissions;
     private readonly HashSet<string> _mountedOnce = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _userEjectedVolumeIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _unsafeUnmountedVolumeIds = new(StringComparer.OrdinalIgnoreCase);
@@ -20,13 +23,16 @@ public sealed class ApfsMountWorker : BackgroundService
     private readonly SemaphoreSlim _mountOperationLock = new(1, 1);
     private readonly object _shutdownSync = new();
     private Task<ShutdownPreparationResult>? _shutdownPreparation;
+    private IReadOnlyList<MountedVolumeState>? _shutdownSelectedMounts;
     private long _mountCommandGeneration;
     private long _mountOperationGeneration;
     private readonly object _discoveryAdmissionSync = new();
     private long _discoveryGeneration;
     private long _admittedDiscoveryGeneration;
+    private long _selectionEvidenceGeneration;
     private DiscoverySnapshot? _admittedDiscovery;
     private readonly SemaphoreSlim _preferenceOperationLock = new(1, 1);
+    private readonly AsyncLocal<DeferredNotifications?> _deferredNotifications = new();
     private int _shutdownRequested;
     private readonly ConcurrentDictionary<(string Device, string Volume, string? Catalog, char Letter), string?> _selectedVolumeUuids = new();
     private IReadOnlyList<VolumeInfo> _preferenceVolumes = Array.Empty<VolumeInfo>();
@@ -36,7 +42,8 @@ public sealed class ApfsMountWorker : BackgroundService
         IApfsBackend backend,
         IMountPolicy mountPolicy,
         RuntimeStatusPublisher statusPublisher,
-        IOptionsMonitor<ServiceHostOptions> optionsMonitor
+        IOptionsMonitor<ServiceHostOptions> optionsMonitor,
+        PhysicalWritePermissions? physicalWritePermissions = null
     )
     {
         _logger = logger;
@@ -44,17 +51,29 @@ public sealed class ApfsMountWorker : BackgroundService
         _mountPolicy = mountPolicy;
         _statusPublisher = statusPublisher;
         _optionsMonitor = optionsMonitor;
+        _physicalWritePermissions = physicalWritePermissions;
     }
 
     public Task<ShutdownPreparationResult> PrepareForShutdownAsync(CancellationToken cancellationToken)
+        => PrepareForShutdownAsync(cancellationToken, retryIncomplete: false);
+
+    internal Task<ShutdownPreparationResult> PrepareFreshShutdownAttemptAsync(CancellationToken cancellationToken)
+        => PrepareForShutdownAsync(cancellationToken, retryIncomplete: true);
+
+    private Task<ShutdownPreparationResult> PrepareForShutdownAsync(CancellationToken cancellationToken, bool retryIncomplete)
     {
         Interlocked.Exchange(ref _shutdownRequested, 1);
-        Interlocked.Increment(ref _mountCommandGeneration);
+        ReserveEncryptedCommand();
 
         Task<ShutdownPreparationResult> preparation;
         lock (_shutdownSync)
         {
-            _shutdownPreparation ??= PrepareForShutdownCoreAsync();
+            if (_shutdownPreparation is null)
+                _shutdownPreparation = PrepareForShutdownCoreAsync(null);
+            else if (retryIncomplete && _shutdownPreparation.IsCompleted &&
+                     !(_shutdownPreparation.IsCompletedSuccessfully && _shutdownPreparation.Result.CleanupCompleted))
+                _shutdownPreparation = PrepareForShutdownCoreAsync(
+                    _shutdownPreparation.IsCompletedSuccessfully ? _shutdownPreparation.Result : null);
             preparation = _shutdownPreparation;
         }
 
@@ -117,25 +136,30 @@ public sealed class ApfsMountWorker : BackgroundService
 
     private async Task RunCycleAsync(CancellationToken cancellationToken)
     {
+        using var notifications = new DeferredNotifications(this);
         if (Volatile.Read(ref _shutdownRequested) != 0)
         {
             return;
         }
 
+        await ReconcileVolumeIntentsAsync(cancellationToken).ConfigureAwait(false);
         var commandGeneration = Volatile.Read(ref _mountCommandGeneration);
         var discovery = await DiscoverVolumesAsync(cancellationToken).ConfigureAwait(false);
 
         await _mountOperationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            ++_mountOperationGeneration;
             if (Volatile.Read(ref _shutdownRequested) != 0 ||
                 commandGeneration != Volatile.Read(ref _mountCommandGeneration))
             {
                 return;
             }
 
-            await RunCycleCoreAsync(discovery, cancellationToken).ConfigureAwait(false);
+            await ObserveVolumeManagementAvailabilityAsync(discovery.Inventory, cancellationToken).ConfigureAwait(false);
+            var mounted = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+            // An empty, auto-mount-disabled cycle cannot change backend ownership.
+            if (discovery.Options.AutoMountEnabled || mounted.Count != 0) ++_mountOperationGeneration;
+            await RunCycleCoreAsync(discovery, cancellationToken, mounted).ConfigureAwait(false);
         }
         catch (SelectionSupersededException) { }
         finally
@@ -153,9 +177,12 @@ public sealed class ApfsMountWorker : BackgroundService
 
         // Every selection/inventory admission re-observes APFS identities. Partition
         // layout and image timestamps are insufficient to retain UUID associations.
-        var inventory = (await _backend.ProbeInventoryAsync(authoritative: true, cancellationToken).ConfigureAwait(false))
-            .Where(d => d.Device.IsConnected)
-            .Select(d => d with { Volumes = d.Volumes.ToArray() }).ToArray();
+        DeviceInventory[] inventory;
+        try
+        {
+            inventory = (await _backend.ProbeInventoryAsync(authoritative: true, cancellationToken).ConfigureAwait(false))
+                .Where(d => d.Device.IsConnected)
+                .Select(d => d with { Volumes = d.Volumes.ToArray() }).ToArray();
         cancellationToken.ThrowIfCancellationRequested();
         var connectedDevices = inventory.Select(d => d.Device).ToArray();
 
@@ -182,7 +209,7 @@ public sealed class ApfsMountWorker : BackgroundService
                     warnings.Add(CatalogMountPolicy.Refusal(volume, requestedMode: null));
                 }
 
-                var writeDecision = WriteGatePolicy.EvaluateForVolume(options, volume);
+                var writeDecision = EvaluateVolumeWriteGate(options, volume);
                 if (options.EnableNativeWrite && !writeDecision.AllowWrite && CatalogMountPolicy.AllowsOrdinaryMount(volume))
                 {
                     compatibilityWarnings.Add(
@@ -202,6 +229,15 @@ public sealed class ApfsMountWorker : BackgroundService
             discoveredVolumes,
             warnings.ToArray(),
             compatibilityWarnings.ToArray());
+        }
+        catch
+        {
+            // Probe, projection and policy failures all invalidate older identity.
+            // An older failed observation cannot erase a newer admission.
+            TryAdmitDiscovery(new(generation, options, [], [],
+                new Dictionary<string, VolumeInfo>(), [], [], []));
+            throw;
+        }
     }
 
     private async Task RunCycleCoreAsync(
@@ -211,52 +247,116 @@ public sealed class ApfsMountWorker : BackgroundService
         string? requestedVolumeId = null,
         string? requestedDeviceId = null,
         MountAccessMode? requestedAccessMode = null,
-        string? requestedRecoveryIdentity = null)
+        string? requestedRecoveryIdentity = null, ApfsControlTarget? selectedTarget = null,
+        IReadOnlySet<string>? requestedContainerVolumeIds = null,
+        Func<CancellationToken, Task>? validateMountMutation = null)
     {
         var options = discovery.Options;
+        var scopedMount = selectedTarget is not null || requestedContainerVolumeIds is not null;
         var connectedDevices = discovery.ConnectedDevices;
         var discoveredVolumeById = discovery.VolumeById;
         // Keep duplicate rows across devices: deduplicating by routing ID would hide
         // ambiguous identities. All selection paths run here under the mount lock.
-        if (!TryAdmitDiscovery(discovery)) return;
+        if (!(scopedMount ? TryAdmitSelectedDiscovery(discovery) : TryAdmitDiscovery(discovery)))
+        {
+            if (scopedMount) throw new SelectionSupersededException();
+            return;
+        }
         var warnings = new HashSet<string>(discovery.Warnings, StringComparer.OrdinalIgnoreCase);
         var compatibilityWarnings = new HashSet<string>(
             discovery.CompatibilityWarnings,
             StringComparer.OrdinalIgnoreCase);
 
-        if (discoveredVolumeById.Count > 0)
-        {
-            var disconnectedEjectedVolumes = _userEjectedVolumeIds
-                .Where(volumeId => !discoveredVolumeById.ContainsKey(volumeId))
-                .ToArray();
-            foreach (var volumeId in disconnectedEjectedVolumes)
-            {
-                _userEjectedVolumeIds.Remove(volumeId);
-            }
-        }
+        // Explicit-eject suppression is session-scoped and never auto-clears
+        // on discovery signals: backend group turmoil after a container
+        // unmount can gap whole devices (not just rows) for tens of seconds,
+        // which is indistinguishable from a brief unplug at this layer, and
+        // any reappearance-triggered clearing auto-remounts just-unmounted
+        // volumes. Suppression clears only on explicit mount/fix of the
+        // volume through the normal mount path, or on service restart (fresh
+        // boot auto-mounts eligible volumes as before). Consequence: after
+        // an explicit eject + physical replug in the same session, use Mount
+        // to mount again; this is the safe direction and is stated in the
+        // ejected warning below.
 
         var mounted = (mountedOverride ?? await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false)).ToList();
         var unmountMissingResult = await UnmountMissingVolumesAsync(
-            mounted,
+            scopedMount ? [] : mounted,
             discoveredVolumeById.Keys,
             warnings,
             cancellationToken
         ).ConfigureAwait(false);
-        mounted = unmountMissingResult.Mounted.ToList();
+        if (!scopedMount) mounted = unmountMissingResult.Mounted.ToList();
         var mountStateChanged = unmountMissingResult.Changed;
+
+        // Enforce explicit-eject intent against mounts that bypassed
+        // suppression (backend host-startup mounts, discovery races):
+        // anything mounted while suppressed is unmounted again. Explicit
+        // mount clears suppression before mounting, so this never fights
+        // user intent; failures stay visible and retry next cycle.
+        if (!scopedMount)
+        {
+            foreach (var mount in mounted.ToArray())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!_userEjectedVolumeIds.Contains(mount.VolumeId))
+                {
+                    continue;
+                }
+
+                UnmountResult enforcement;
+                try
+                {
+                    enforcement = await _backend.UnmountAsync(mount.MountPoint, cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    warnings.Add($"Suppressed mount '{BuildMountDisplayName(mount)}' could not be released: {ex.Message}");
+                    continue;
+                }
+
+                if (enforcement.MountRemoved)
+                {
+                    mounted.RemoveAll(candidate => string.Equals(
+                        candidate.VolumeId,
+                        mount.VolumeId,
+                        StringComparison.OrdinalIgnoreCase));
+                    mountStateChanged = true;
+                    warnings.Add($"'{mount.VolumeName}' was mounted despite explicit eject suppression and was unmounted to honor it.");
+                }
+                else
+                {
+                    warnings.Add($"Suppressed mount '{BuildMountDisplayName(mount)}' resisted release: {enforcement.Error ?? "no terminal proof"}.");
+                }
+            }
+        }
+
+        // A failed attempt belongs only to a still-connected, unmounted volume
+        // that has not been explicitly suppressed.
+        foreach (var volumeId in _mountRetryStates.Keys.ToArray())
+        {
+            if (!discoveredVolumeById.ContainsKey(volumeId) ||
+                mounted.Any(mount => string.Equals(mount.VolumeId, volumeId, StringComparison.OrdinalIgnoreCase)) ||
+                _userEjectedVolumeIds.Contains(volumeId) || _unsafeUnmountedVolumeIds.Contains(volumeId))
+            {
+                _mountRetryStates.Remove(volumeId);
+            }
+        }
 
         if (connectedDevices.Count == 0)
         {
-            if (mounted.Count == 0)
-            {
-                _userEjectedVolumeIds.Clear();
-            }
-
+            // Suppression outlives empty discoveries: replug clears it
+            // selectively when devices reappear (see above), so a full
+            // discovery outage must not wipe explicit-eject intent.
             PublishFromMounts(mounted, null, warnings, compatibilityWarnings);
             return;
         }
 
-        if (!options.AutoMountEnabled && string.IsNullOrWhiteSpace(requestedVolumeId))
+        if (!options.AutoMountEnabled && string.IsNullOrWhiteSpace(requestedVolumeId) && requestedContainerVolumeIds is null)
         {
             PublishFromMounts(mounted, null, warnings, compatibilityWarnings);
             return;
@@ -301,13 +401,40 @@ public sealed class ApfsMountWorker : BackgroundService
         var pendingVolumes = new List<VolumeInfo>();
         foreach (var volume in volumesToProcess.OrderBy(x => x.VolumeName, StringComparer.OrdinalIgnoreCase))
         {
-            if (!string.IsNullOrWhiteSpace(requestedVolumeId) &&
-                !string.Equals(volume.VolumeId, requestedVolumeId, StringComparison.OrdinalIgnoreCase))
+            if (requestedContainerVolumeIds is not null && !requestedContainerVolumeIds.Contains(volume.VolumeId))
+            {
+                continue;
+            }
+            if (VolumeIntentBlocks(volume.DeviceId))
+            {
+                warnings.Add("Volume management intent requires reconciliation for " + volume.DeviceId);
+                continue;
+            }
+            var isRequestedVolume = !string.IsNullOrWhiteSpace(requestedVolumeId) &&
+                string.Equals(volume.VolumeId, requestedVolumeId, StringComparison.OrdinalIgnoreCase);
+
+            var isContainerSiblingForInitialOwner = false;
+            if (!string.IsNullOrWhiteSpace(requestedVolumeId) && !isRequestedVolume &&
+                discoveredVolumeById.TryGetValue(requestedVolumeId, out var targetVol) &&
+                !string.IsNullOrWhiteSpace(targetVol.CatalogContainerUuid) &&
+                string.Equals(volume.CatalogContainerUuid, targetVol.CatalogContainerUuid, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(volume.DeviceId, targetVol.DeviceId, StringComparison.OrdinalIgnoreCase))
+            {
+                var containerActive = mounted.Any(m =>
+                    string.Equals(m.CatalogContainerUuid, targetVol.CatalogContainerUuid, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(m.DeviceId, targetVol.DeviceId, StringComparison.OrdinalIgnoreCase));
+                if (!containerActive && options.AutoMountEnabled && _mountPolicy.ShouldAutoMount(volume))
+                {
+                    isContainerSiblingForInitialOwner = true;
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(requestedVolumeId) && !isRequestedVolume && !isContainerSiblingForInitialOwner)
             {
                 continue;
             }
 
-            if (!RecoveryIdentityMatches(volume.RecoveryIdentity, requestedRecoveryIdentity))
+            if (isRequestedVolume && !RecoveryIdentityMatches(volume.RecoveryIdentity, requestedRecoveryIdentity))
             {
                 continue;
             }
@@ -322,42 +449,68 @@ public sealed class ApfsMountWorker : BackgroundService
                 continue;
             }
 
-            var explicitInspection = !string.IsNullOrWhiteSpace(requestedVolumeId) &&
+            var explicitInspection = (!string.IsNullOrWhiteSpace(requestedVolumeId) || requestedContainerVolumeIds is not null) &&
                 requestedAccessMode == MountAccessMode.ReadOnly;
-            if (!CatalogMountPolicy.AllowsMount(volume, explicitInspection) ||
-                (!explicitInspection && !_mountPolicy.ShouldAutoMount(volume)) ||
+            var explicitBackup = (!string.IsNullOrWhiteSpace(requestedVolumeId) || requestedContainerVolumeIds is not null) &&
+                BackupImageMountPolicy.AllowsExplicitMount(options, volume, requestedAccessMode);
+            if (!discovery.Inventory.Any(d => d.Volumes.Contains(volume) && TopologyAdmission.Validate(d)) ||
+                (!CatalogMountPolicy.AllowsMount(volume, explicitInspection) && !explicitBackup) ||
+                (!explicitInspection && !explicitBackup && requestedContainerVolumeIds is null && !_mountPolicy.ShouldAutoMount(volume)) ||
                 mountedVolumeIds.Contains(volume.VolumeId))
             {
                 continue;
             }
 
-            if (_userEjectedVolumeIds.Contains(volume.VolumeId))
+            // Unsafe attention outranks the benign ejected note: an explicit
+            // eject that went unsafe stays suppressed AND keeps its
+            // use-Fix warning, since suppression now covers every removed
+            // mount rather than only the safely unmounted ones.
+            if (_incompleteAccessModeVolumeIds.Contains(volume.VolumeId))
             {
-                warnings.Add($"'{volume.VolumeName}' is safely ejected; unplug and reinsert it to mount again.");
+                warnings.Add($"'{volume.VolumeName}' remains unmounted after an incomplete container access mode transition; use an explicit mount or Fix to retry.");
                 continue;
             }
-
-            if (_unsafeUnmountedVolumeIds.Contains(volume.VolumeId))
+            var guardedImageFix = validateMountMutation is not null &&
+                requestedContainerVolumeIds?.Contains(volume.VolumeId) == true;
+            if (_unsafeUnmountedVolumeIds.Contains(volume.VolumeId) && !guardedImageFix)
             {
                 warnings.Add($"'{volume.VolumeName}' remains unmounted after an unsafe host stop; use Fix to recover it before remounting.");
                 continue;
             }
 
-            if (!options.NativeAutoRemountOnReconnect && _mountedOnce.Contains(volume.VolumeId))
+            if (_userEjectedVolumeIds.Contains(volume.VolumeId) && !guardedImageFix)
+            {
+                warnings.Add($"'{volume.VolumeName}' is safely ejected; use Mount to mount it again.");
+                continue;
+            }
+
+            if (string.IsNullOrWhiteSpace(requestedVolumeId) && requestedContainerVolumeIds is null &&
+                !options.NativeAutoRemountOnReconnect && _mountedOnce.Contains(volume.VolumeId))
             {
                 warnings.Add($"Auto-remount disabled for '{volume.VolumeName}' after prior disconnect.");
                 continue;
             }
 
-            if (string.IsNullOrWhiteSpace(requestedVolumeId) &&
+            if (string.IsNullOrWhiteSpace(requestedVolumeId) && requestedContainerVolumeIds is null &&
                 IsMountRetryBackoffActive(volume.VolumeId, out var retryWarning))
             {
                 warnings.Add(retryWarning);
+                var retainedError = _mountRetryStates[volume.VolumeId].LastError;
+                if (!string.IsNullOrWhiteSpace(retainedError))
+                {
+                    firstMountError ??= retainedError;
+                    warnings.Add($"Mount failed for '{volume.VolumeName}': {retainedError}");
+                }
                 continue;
             }
 
             pendingVolumes.Add(volume);
         }
+
+        if (validateMountMutation is not null && requestedContainerVolumeIds is not null &&
+            (pendingVolumes.Count != requestedContainerVolumeIds.Count ||
+             !requestedContainerVolumeIds.SetEquals(pendingVolumes.Select(volume => volume.VolumeId))))
+            throw new SelectionSupersededException();
 
         var mountOutcomes = new List<(VolumeInfo Volume, MountAttemptOutcome Outcome)>(pendingVolumes.Count);
         if (_backend is IContainerMountBackend containerBackend && pendingVolumes.Count > 1)
@@ -370,10 +523,12 @@ public sealed class ApfsMountWorker : BackgroundService
                 cancellationToken,
                 deviceDisplayNames,
                 requestedAccessMode,
-                discovery.Generation).ConfigureAwait(false));
+                discovery.Generation,
+                mounted, validateMountMutation).ConfigureAwait(false));
         }
         else
         {
+            IReadOnlyList<MountedVolumeState> preparationMounts = mounted;
             foreach (var volume in pendingVolumes)
             {
                 var outcome = await TryMountAsync(
@@ -383,13 +538,16 @@ public sealed class ApfsMountWorker : BackgroundService
                     cancellationToken,
                     deviceDisplayNames.GetValueOrDefault(volume.DeviceId),
                     requestedAccessMode,
-                    discovery.Generation).ConfigureAwait(false);
+                    discovery.Generation, selectedTarget: selectedTarget,
+                    preparationMounts: preparationMounts, validateMountMutation: validateMountMutation).ConfigureAwait(false);
                 mountOutcomes.Add((volume, new MountAttemptOutcome(
                     outcome.Success,
                     outcome.Error,
                     outcome.Warning,
                     outcome.CompatibilityWarning,
                     outcome.MountedState)));
+                if (_mountPolicy.RequiresDriveLetterStorage && mountOutcomes.Count < pendingVolumes.Count)
+                    preparationMounts = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
             }
         }
 
@@ -398,6 +556,11 @@ public sealed class ApfsMountWorker : BackgroundService
             var (success, error, warning, compatibilityWarning, mountedState) = outcome;
             if (success)
             {
+                if (validateMountMutation is not null)
+                {
+                    _userEjectedVolumeIds.Remove(volume.VolumeId);
+                    _unsafeUnmountedVolumeIds.Remove(volume.VolumeId);
+                }
                 _mountRetryStates.Remove(volume.VolumeId);
                 mountStateChanged = true;
                 requiresMountStateRefresh = true;
@@ -455,11 +618,61 @@ public sealed class ApfsMountWorker : BackgroundService
     // cannot reinstall identity or clear new ambiguity, even during an eject.
     private bool TryAdmitDiscovery(DiscoverySnapshot discovery)
     {
-        Action? notification = null;
+        var admitted = TryAdmitDiscovery(discovery, out var notification);
+        NotifyDiscovery(notification);
+        return admitted;
+    }
+
+    private bool TryAdmitSelectedDiscovery(DiscoverySnapshot discovery)
+    {
+        if (TryAdmitDiscovery(discovery)) return true;
+        // A later identical poll may publish while an explicit mount awaits
+        // backend state. Reuse only the existing identity/policy evidence fence.
+        lock (_discoveryAdmissionSync) return SelectionDiscoveryIsCurrent(discovery.Generation);
+    }
+
+    private void NotifyDiscovery(Action? notification)
+    {
+        if (notification is null) return;
+        if (_deferredNotifications.Value is { } deferred)
+        {
+            deferred.Pending.Add(notification);
+            return;
+        }
+        try { notification?.Invoke(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Inventory retained; display refresh failed."); }
+    }
+
+    // Scope follows this async operation, never another concurrent caller. Install
+    // state immediately, but deliver arbitrary callbacks only after its gates close.
+    private sealed class DeferredNotifications : IDisposable
+    {
+        private readonly ApfsMountWorker _owner;
+        private readonly DeferredNotifications? _previous;
+        internal List<Action> Pending { get; } = [];
+
+        internal DeferredNotifications(ApfsMountWorker owner)
+        {
+            _owner = owner;
+            _previous = owner._deferredNotifications.Value;
+            owner._deferredNotifications.Value = this;
+        }
+
+        public void Dispose()
+        {
+            _owner._deferredNotifications.Value = _previous;
+            foreach (var notification in Pending) _owner.NotifyDiscovery(notification);
+        }
+    }
+
+    private bool TryAdmitDiscovery(DiscoverySnapshot discovery, out Action? notification)
+    {
+        notification = null;
         lock (_discoveryAdmissionSync)
         {
             if (discovery.Generation < _admittedDiscoveryGeneration) return false;
             if (discovery.Generation == _admittedDiscoveryGeneration) return true;
+            if (!RetainsSelectionEvidence(discovery)) _selectionEvidenceGeneration = discovery.Generation;
             _admittedDiscoveryGeneration = discovery.Generation;
             _admittedDiscovery = discovery;
             UpdatePreferenceDiscovery(discovery.Volumes);
@@ -467,40 +680,76 @@ public sealed class ApfsMountWorker : BackgroundService
             do
             {
                 latest = _statusPublisher.Latest;
-            } while (!_statusPublisher.TryPublish(latest, latest with { ConnectedInventory = discovery.Inventory }, out notification));
+            } while (!_statusPublisher.TryPublish(latest, latest with { ConnectedInventory = discovery.Inventory, InventoryGeneration = discovery.Generation }, out notification));
         }
-        notification?.Invoke();
         return true;
     }
+
+    private bool RetainsSelectionEvidence(DiscoverySnapshot next)
+    {
+        var previous = _admittedDiscovery;
+        if (previous is null || !ReferenceEquals(previous.Options, next.Options) ||
+            previous.Inventory.Count != next.Inventory.Count ||
+            previous.Inventory.Sum(d => d.Volumes.Count) != next.Inventory.Sum(d => d.Volumes.Count)) return false;
+        // Legacy/unknown topology keeps strict observation invalidation. Reuse the
+        // existing complete selected contracts, including every sibling and bucket.
+        foreach (var inventory in new[] { previous.Inventory, next.Inventory })
+            if (inventory.Count == 0 || inventory.Count > TopologyGraphIndex.Limit ||
+                inventory.Select(d => d.Device.DeviceId).Distinct(StringComparer.OrdinalIgnoreCase).Count() != inventory.Count ||
+                inventory.Any(d => d.Topology is null || d.Volumes.Count == 0 || !TopologyAdmission.Validate(d))) return false;
+        try
+        {
+            return previous.Inventory.All(d => d.Volumes.All(v =>
+            {
+                if (!SelectedControlTarget.Matches(next.Inventory, SelectedControlTarget.Create(d, v))) return false;
+                var current = next.Inventory.SelectMany(item => item.Volumes).Single(row =>
+                    string.Equals(row.VolumeId, v.VolumeId, StringComparison.OrdinalIgnoreCase));
+                return EvaluateVolumeWriteGate(previous.Options, v) ==
+                    EvaluateVolumeWriteGate(next.Options, current);
+            }));
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException) { return false; }
+    }
+
+    private bool SelectionDiscoveryIsCurrent(long generation) =>
+        generation >= _selectionEvidenceGeneration && generation <= _admittedDiscoveryGeneration;
 
     public async Task<IReadOnlyList<DeviceInventory>> GetInventoryAsync(CancellationToken cancellationToken)
     {
         var discovery = await DiscoverVolumesAsync(cancellationToken).ConfigureAwait(false);
         var mounts = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
-        List<(DeviceInfo Device, (VolumeInfo Volume, Func<DriveLetterPreference?> Preference)[] Volumes)> captured;
+        List<(DeviceInventory Inventory, (VolumeInfo Volume, Func<DriveLetterPreference?> Preference)[] Volumes)> captured;
+        Action? notification;
         cancellationToken.ThrowIfCancellationRequested();
         lock (_discoveryAdmissionSync)
         {
-            if (!TryAdmitDiscovery(discovery)) discovery = _admittedDiscovery!;
+            if (!TryAdmitDiscovery(discovery, out notification)) discovery = _admittedDiscovery!;
             // Preserve the device bucket returned by discovery, including invalid
             // cross-device rows that exact-target validation must reject explicitly.
-            captured = discovery.Inventory.Select(d => (d.Device,
+            captured = discovery.Inventory.Select(d => (d,
                 d.Volumes.Select(v => (v, CaptureInventoryPreference(v, mounts))).ToArray())).ToList();
         }
+        NotifyDiscovery(notification);
         // Preference storage reads may block in Windows; never perform them under
         // the mount lock, and await their actual completion rather than detach them.
-        return await Task.Run<IReadOnlyList<DeviceInventory>>(() => captured.Select(d => new DeviceInventory(d.Device,
-            d.Volumes.Select(v => v.Volume with { DriveLetterPreference = v.Preference() }).ToArray())).ToArray(), cancellationToken).ConfigureAwait(false);
+        return await Task.Run<IReadOnlyList<DeviceInventory>>(() => captured.Select(d => d.Inventory with { Volumes =
+            d.Volumes.Select(v => v.Volume with { DriveLetterPreference = v.Preference() }).ToArray() }).ToArray(), cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<AckPayload> SetDriveLetterPreferenceAsync(DriveLetterPreferenceRequestPayload request, CancellationToken cancellationToken)
     {
+        using var notifications = new DeferredNotifications(this);
         if (string.IsNullOrWhiteSpace(request.DeviceId) || string.IsNullOrWhiteSpace(request.VolumeId) ||
             !(Guid.TryParseExact(request.VolumeUuid, "D", out var uuid) || Guid.TryParseExact(request.VolumeUuid, "N", out uuid)) ||
             uuid == Guid.Empty || request.Letter is not { Length: 1 } || char.ToUpperInvariant(request.Letter[0]) is < 'A' or > 'Z')
             return new(false, "Supply exact device, volume and actual volume UUID, and one letter A-Z.", ApfsOperationCodes.InvalidArguments);
+        if (request.Target is {} selected && (!SelectedControlTarget.IsAdvertised(selected) || !SelectedControlTarget.IsWellFormed(selected) ||
+            !string.Equals(selected.DeviceId, request.DeviceId, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(selected.VolumeId, request.VolumeId, StringComparison.OrdinalIgnoreCase) || !TopologyAdmission.SameUuid(selected.VolumeUuid, request.VolumeUuid)))
+            return new(false, "Conflicting selected preference identity.", ApfsOperationCodes.AmbiguousTarget);
         await _preferenceOperationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         DriveLetterPreferenceResult result;
+        Action? inventoryNotification = null;
         try
         {
             var discovery = await DiscoverVolumesAsync(cancellationToken).ConfigureAwait(false);
@@ -509,12 +758,16 @@ public sealed class ApfsMountWorker : BackgroundService
             {
                 if (Volatile.Read(ref _shutdownRequested) != 0)
                     return new(false, "Service is stopping. Try again after restart.", ApfsOperationCodes.ServiceUnavailable);
-                if (!TryAdmitDiscovery(discovery))
+                if (!TryAdmitDiscovery(discovery, out inventoryNotification))
                     return new(false, "A newer inventory superseded this validation. Refresh and try again.", ApfsOperationCodes.AmbiguousTarget);
+                if (request.Target is {} target && !SelectedControlTarget.Matches(discovery.Inventory, target))
+                    return new(false, "Selected preference observation changed.", ApfsOperationCodes.AmbiguousTarget);
                 var matches = _preferenceVolumes.Where(v => v.DeviceId == request.DeviceId && v.VolumeId == request.VolumeId).ToArray();
                 if (matches.Length != 1)
                     return new(false, "Volume identity is stale or ambiguous. Refresh and try again.",
                         matches.Length == 0 ? ApfsOperationCodes.MissingVolume : ApfsOperationCodes.AmbiguousTarget);
+                if (!discovery.Inventory.Any(d => d.Volumes.Contains(matches[0]) && TopologyAdmission.Validate(d)))
+                    return new(false, "Topology evidence is malformed or contradictory.", ApfsOperationCodes.AmbiguousTarget);
                 cancellationToken.ThrowIfCancellationRequested();
                 // Admission captures the exact validated UUID. Subsequent inventory
                 // changes do not retarget an admitted edit to a replacement volume.
@@ -523,7 +776,11 @@ public sealed class ApfsMountWorker : BackgroundService
 
             result = await Task.Run(() => commit(cancellationToken), cancellationToken).ConfigureAwait(false);
         }
-        finally { _preferenceOperationLock.Release(); }
+        finally
+        {
+            _preferenceOperationLock.Release();
+            NotifyDiscovery(inventoryNotification);
+        }
         // Commit owns cancellation semantics: no token checks after a saved result.
         // Release the edit gate too before display notification can reenter the worker.
         try { await PublishPreferenceDisplayAsync().ConfigureAwait(false); }
@@ -551,7 +808,7 @@ public sealed class ApfsMountWorker : BackgroundService
             if (generation == _admittedDiscoveryGeneration)
                 _statusPublisher.TryPublish(latest, payload, out notification);
         }
-        notification?.Invoke();
+        NotifyDiscovery(notification);
     }
 
     private Func<DriveLetterPreference?> CaptureInventoryPreference(VolumeInfo volume, IReadOnlyList<MountedVolumeState> mounts)
@@ -584,7 +841,7 @@ public sealed class ApfsMountWorker : BackgroundService
         var operationGeneration = _mountOperationGeneration;
         lock (_discoveryAdmissionSync)
         {
-            if (discoveryGeneration != _admittedDiscoveryGeneration || Volatile.Read(ref _shutdownRequested) != 0)
+            if (!SelectionDiscoveryIsCurrent(discoveryGeneration) || Volatile.Read(ref _shutdownRequested) != 0)
                 throw new SelectionSupersededException();
             select = _mountPolicy.PrepareDriveLetterSelection(volume, occupied);
         }
@@ -608,10 +865,16 @@ public sealed class ApfsMountWorker : BackgroundService
         cancellationToken.ThrowIfCancellationRequested();
         lock (_discoveryAdmissionSync)
         {
-            if (discoveryGeneration != _admittedDiscoveryGeneration ||
-                commandGeneration != Volatile.Read(ref _mountCommandGeneration) ||
-                operationGeneration != _mountOperationGeneration || Volatile.Read(ref _shutdownRequested) != 0)
+            var discoveryCurrent = SelectionDiscoveryIsCurrent(discoveryGeneration);
+            var commandChanged = commandGeneration != Volatile.Read(ref _mountCommandGeneration);
+            var operationChanged = operationGeneration != _mountOperationGeneration;
+            var shutdownRequested = Volatile.Read(ref _shutdownRequested) != 0;
+            if (!discoveryCurrent || commandChanged || operationChanged || shutdownRequested)
+            {
+                _logger.LogWarning("Drive-letter preparation superseded: discovery current={DiscoveryCurrent}, command changed={CommandChanged}, operation changed={OperationChanged}, shutdown={ShutdownRequested}",
+                    discoveryCurrent, commandChanged, operationChanged, shutdownRequested);
                 throw new SelectionSupersededException();
+            }
         }
     }
 
@@ -672,7 +935,7 @@ public sealed class ApfsMountWorker : BackgroundService
         string volumeId,
         MountAccessMode? requestedAccessMode,
         CancellationToken cancellationToken,
-        string? recoveryIdentity = null)
+        string? recoveryIdentity = null, ApfsControlTarget? selectedTarget = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(deviceId);
         ArgumentException.ThrowIfNullOrWhiteSpace(volumeId);
@@ -683,12 +946,56 @@ public sealed class ApfsMountWorker : BackgroundService
             cancellationToken: cancellationToken,
             requestedAccessMode: requestedAccessMode,
             requestedDeviceId: deviceId,
-            requestedRecoveryIdentity: recoveryIdentity);
+            requestedRecoveryIdentity: recoveryIdentity, selectedTarget: selectedTarget);
     }
 
     public Task<IReadOnlyList<MountedVolumeState>> GetAuthoritativeMountStateAsync(
         CancellationToken cancellationToken)
         => _backend.GetMountStateAsync(cancellationToken);
+
+    // Snapshot control reaches the live container owner through the backend's
+    // owner-held control endpoint. Backends without container ownership report
+    // the endpoint unavailable; the executor maps that to service-unavailable.
+    public Task<SnapshotControlResult> SendSnapshotControlAsync(
+        string containerUuid,
+        ulong volumeObjectId,
+        SnapshotControlAction action,
+        IReadOnlyList<string>? extraLines,
+        CancellationToken cancellationToken)
+        => _backend is ISnapshotControlBackend snapshotBackend
+            ? snapshotBackend.SendSnapshotControlAsync(containerUuid, volumeObjectId, action, extraLines, cancellationToken)
+            : Task.FromResult(new SnapshotControlResult(false, "ControlEndpointUnavailable"));
+
+    // Read-only offline verification of a derived scope reaches the
+    // backend's observer transport. Backends without a verify endpoint
+    // yield null; the executor records verify:unsupported and keeps the
+    // legacy mount-health behavior. A null scope is never sent.
+    public async Task<ImageVerifyResult?> VerifyImageAsync(
+        VerifyScope scope,
+        CancellationToken cancellationToken)
+        => _backend is IVerifyBackend verifyBackend
+            ? await verifyBackend.VerifyImageAsync(scope, cancellationToken).ConfigureAwait(false)
+            : null;
+
+    // Management keepers execute planned offline mutations through the
+    // backend's native-tool transport. Backends without a keeper report it
+    // unavailable; the executor maps that to keeper-unavailable without
+    // consuming any further authority (the plan token is already burned).
+    public Task<ManagementKeeperRenameResult> SendManagementRenameAsync(
+        ManagementKeeperRenameRequest request,
+        CancellationToken cancellationToken)
+        => _backend is IManagementRenameKeeper keeper
+            ? keeper.RenameVolumeAsync(request, cancellationToken)
+            : Task.FromResult(new ManagementKeeperRenameResult(false, 0,
+                ManagementKeeperCodes.KeeperUnavailable, "The backend has no management keeper endpoint."));
+
+    public Task<ManagementKeeperQuotaResult> SendManagementQuotaAsync(
+        ManagementKeeperQuotaRequest request,
+        CancellationToken cancellationToken)
+        => _backend is IManagementQuotaKeeper keeper
+            ? keeper.SetQuotaReserveAsync(request, cancellationToken)
+            : Task.FromResult(new ManagementKeeperQuotaResult(false, 0,
+                ManagementKeeperCodes.KeeperUnavailable, "The backend has no management keeper endpoint."));
 
     private async Task<(bool Success, string Message)> RefreshCoreAsync(
         bool clearUserEjectedVolumes,
@@ -697,9 +1004,11 @@ public sealed class ApfsMountWorker : BackgroundService
         CancellationToken cancellationToken,
         MountAccessMode? requestedAccessMode = null,
         string? requestedDeviceId = null,
-        string? requestedRecoveryIdentity = null)
+        string? requestedRecoveryIdentity = null, ApfsControlTarget? selectedTarget = null)
     {
-        var commandGeneration = Interlocked.Increment(ref _mountCommandGeneration);
+        using var notifications = new DeferredNotifications(this);
+        var commandGeneration = ReserveEncryptedCommand();
+        await ReconcileVolumeIntentsAsync(cancellationToken).ConfigureAwait(false);
         var discovery = await DiscoverVolumesAsync(cancellationToken).ConfigureAwait(false);
 
         await _mountOperationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -729,6 +1038,10 @@ public sealed class ApfsMountWorker : BackgroundService
             if (!TryAdmitDiscovery(discovery))
                 return (false, "Refresh was superseded by a newer inventory observation.");
 
+            if (discovery.Volumes.Any(v => (requestedDeviceId is null || string.Equals(v.DeviceId, requestedDeviceId, StringComparison.OrdinalIgnoreCase)) &&
+                (volumeId is null || string.Equals(v.VolumeId, volumeId, StringComparison.OrdinalIgnoreCase)) && VolumeIntentBlocks(v.DeviceId)))
+                return (false, "Volume management intent requires reconciliation before access.");
+
             if (!string.IsNullOrWhiteSpace(requestedDeviceId) &&
                 !string.IsNullOrWhiteSpace(volumeId))
             {
@@ -753,6 +1066,9 @@ public sealed class ApfsMountWorker : BackgroundService
                 return (false, $"Requested APFS volume '{volumeId}' was not found.");
             }
 
+            if (selectedTarget is not null && !SelectedControlTarget.Matches(discovery.Inventory, selectedTarget))
+                return (false, "Selected identity or topology changed; mutation was not attempted.");
+
             // Only a unique selected volume with an explicit RO mode is inspection.
             // General Refresh/Fix and default-mode requests retain ordinary admission.
             if (!string.IsNullOrWhiteSpace(volumeId))
@@ -763,7 +1079,10 @@ public sealed class ApfsMountWorker : BackgroundService
                      string.Equals(volume.DeviceId, requestedDeviceId, StringComparison.OrdinalIgnoreCase))).ToArray();
                 if (targets.Length != 1)
                     return (false, $"Requested APFS volume '{volumeId}' was not uniquely found; mutation was not attempted.");
-                if (!CatalogMountPolicy.AllowsMount(targets[0], requestedAccessMode == MountAccessMode.ReadOnly))
+                if (!discovery.Inventory.Any(d => d.Volumes.Contains(targets[0]) && TopologyAdmission.Validate(d)))
+                    return (false, "Topology evidence is malformed or contradictory.");
+                if (!CatalogMountPolicy.AllowsMount(targets[0], requestedAccessMode == MountAccessMode.ReadOnly) &&
+                    !BackupImageMountPolicy.AllowsExplicitMount(discovery.Options, targets[0], requestedAccessMode))
                     return (false, CatalogMountPolicy.Refusal(targets[0], requestedAccessMode));
             }
 
@@ -772,6 +1091,13 @@ public sealed class ApfsMountWorker : BackgroundService
             var remountWarnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (clearUserEjectedVolumes)
             {
+                var transition = await TryTransitionSharedContainerAccessModeAsync(
+                    volumeId, requestedDeviceId, requestedAccessMode, discovery, selectedTarget,
+                    cancellationToken).ConfigureAwait(false);
+                if (transition.HasValue) return transition.Value;
+                if (volumeId is null) _incompleteAccessModeVolumeIds.Clear();
+                else _incompleteAccessModeVolumeIds.Remove(volumeId);
+
                 if (string.IsNullOrWhiteSpace(volumeId))
                 {
                     _userEjectedVolumeIds.Clear();
@@ -781,6 +1107,23 @@ public sealed class ApfsMountWorker : BackgroundService
                 {
                     _userEjectedVolumeIds.Remove(volumeId);
                     _unsafeUnmountedVolumeIds.Remove(volumeId);
+                    if (discovery.VolumeById.TryGetValue(volumeId, out var vTarget) && !string.IsNullOrWhiteSpace(vTarget.CatalogContainerUuid))
+                    {
+                        var currentMounts = refreshedMounted ?? await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+                        var containerActive = currentMounts.Any(m =>
+                            string.Equals(m.CatalogContainerUuid, vTarget.CatalogContainerUuid, StringComparison.OrdinalIgnoreCase) &&
+                            string.Equals(m.DeviceId, vTarget.DeviceId, StringComparison.OrdinalIgnoreCase));
+                        if (!containerActive && discovery.Options.AutoMountEnabled)
+                        {
+                            foreach (var peer in discovery.VolumeById.Values.Where(p =>
+                                string.Equals(p.CatalogContainerUuid, vTarget.CatalogContainerUuid, StringComparison.OrdinalIgnoreCase) &&
+                                string.Equals(p.DeviceId, vTarget.DeviceId, StringComparison.OrdinalIgnoreCase)))
+                            {
+                                _userEjectedVolumeIds.Remove(peer.VolumeId);
+                                _unsafeUnmountedVolumeIds.Remove(peer.VolumeId);
+                            }
+                        }
+                    }
                 }
 
                 refreshedMounted = await RemountUpgradeableReadOnlyVolumesAsync(
@@ -789,7 +1132,7 @@ public sealed class ApfsMountWorker : BackgroundService
                     requestedAccessMode,
                     discovery,
                     remountWarnings,
-                    cancellationToken).ConfigureAwait(false);
+                    cancellationToken, selectedTarget).ConfigureAwait(false);
             }
 
             if (remountWarnings.Count > 0)
@@ -807,7 +1150,7 @@ public sealed class ApfsMountWorker : BackgroundService
                 requestedVolumeId: volumeId,
                 requestedDeviceId: requestedDeviceId,
                 requestedAccessMode: requestedAccessMode,
-                requestedRecoveryIdentity: requestedRecoveryIdentity).ConfigureAwait(false);
+                requestedRecoveryIdentity: requestedRecoveryIdentity, selectedTarget: selectedTarget).ConfigureAwait(false);
 
             if (requireTargetMounted && !string.IsNullOrWhiteSpace(volumeId))
             {
@@ -844,7 +1187,7 @@ public sealed class ApfsMountWorker : BackgroundService
         MountAccessMode? requestedAccessMode,
         DiscoverySnapshot discovery,
         HashSet<string> warnings,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, ApfsControlTarget? selectedTarget = null)
     {
         var options = discovery.Options;
         if (!options.AutoMountEnabled || !options.EnableNativeWrite)
@@ -854,6 +1197,8 @@ public sealed class ApfsMountWorker : BackgroundService
 
         var mounted = (await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false)).ToList();
         var remountCandidates = mounted
+            .Where(mount => selectedTarget is null || SelectedControlTarget.MatchesMount(selectedTarget, mount))
+            .Where(mount => requestedAccessMode.HasValue || !RetainsManualReadOnlyMode(mount))
             .Where(mount =>
                 IsUpgradeableOrDegradedMount(mount) ||
                 requestedAccessMode.HasValue &&
@@ -911,15 +1256,18 @@ public sealed class ApfsMountWorker : BackgroundService
                 continue;
             }
 
-            if (!CatalogMountPolicy.AllowsOrdinaryMount(volume) ||
-                !_mountPolicy.ShouldAutoMount(volume) ||
+            var explicitBackup = !string.IsNullOrWhiteSpace(volumeId) && requestedAccessMode.HasValue &&
+                BackupImageMountPolicy.CanRequest(options, volume) &&
+                mounted.Count(owner => TopologyAdmission.SameUuid(owner.CatalogContainerUuid, volume.CatalogContainerUuid)) == 1;
+            if ((!CatalogMountPolicy.AllowsOrdinaryMount(volume) && !explicitBackup) ||
+                (!_mountPolicy.ShouldAutoMount(volume) && !explicitBackup) ||
                 options.SkipEncryptedVolumes && volume.IsEncrypted ||
                 !volume.SupportsExplorerMount)
             {
                 continue;
             }
 
-            var writeDecision = WriteGatePolicy.EvaluateForVolume(options, volume);
+            var writeDecision = EvaluateVolumeWriteGate(options, volume);
             if (!writeDecision.AllowWrite)
             {
                 continue;
@@ -962,9 +1310,7 @@ public sealed class ApfsMountWorker : BackgroundService
             // Generation checks cover worker commands. Recheck the backend snapshot
             // as well: external removal/replacement must not inherit an old plan.
             // Runtime diagnostics and WAL counters can refresh on the same owner.
-            var ownership = (MountedVolumeState state) => (state.VolumeId, state.DeviceId, state.MountPoint,
-                state.CatalogVolumeId, state.RecoveryIdentity, state.HostProcessId, state.AccessMode);
-            if (current.Count != mounted.Count || !current.Select(ownership).ToHashSet().SetEquals(mounted.Select(ownership)))
+            if (!SamePreparedMountOwners(mounted, current))
                 return current;
         }
 
@@ -976,6 +1322,7 @@ public sealed class ApfsMountWorker : BackgroundService
             if (preparedLetter.HasValue && preparedLetter.Value != driveLetter && usedLetters.Contains(preparedLetter.Value))
                 continue;
 
+            await ValidateSelectedMutationAsync(selectedTarget, cancellationToken, mount).ConfigureAwait(false);
             var unmount = await UnmountAsync([mount], cancellationToken, warnings).ConfigureAwait(false);
             if (unmount.Removed.Count > 0)
             {
@@ -1005,7 +1352,7 @@ public sealed class ApfsMountWorker : BackgroundService
                 deviceDisplayNames.GetValueOrDefault(volume.DeviceId),
                 requestedAccessMode,
                 discovery.Generation,
-                preparedLetter
+                preparedLetter, selectedTarget
             ).ConfigureAwait(false);
             if (!success)
             {
@@ -1068,27 +1415,45 @@ public sealed class ApfsMountWorker : BackgroundService
         string deviceId,
         string volumeId,
         CancellationToken cancellationToken,
-        string? recoveryIdentity = null)
+        string? recoveryIdentity = null, ApfsControlTarget? selectedTarget = null, long encryptedGeneration = 0)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(deviceId);
         ArgumentException.ThrowIfNullOrWhiteSpace(volumeId);
-        return EjectCoreAsync(volumeId, deviceId, recoveryIdentity, cancellationToken);
+        return EjectCoreAsync(volumeId, deviceId, recoveryIdentity, cancellationToken, selectedTarget, encryptedGeneration);
     }
+
+    internal Task<EjectOperationResult> EjectAdmittedPhysicalWriteOwnerAsync(
+        ApfsControlTarget target, MountedVolumeState expectedOwner)
+        => EjectCoreAsync(target.VolumeId, target.DeviceId, target.RecoveryIdentity, CancellationToken.None,
+            target, expectedOwner: expectedOwner);
 
     private async Task<EjectOperationResult> EjectCoreAsync(
         string? volumeId,
         string? deviceId,
         string? recoveryIdentity,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, ApfsControlTarget? selectedTarget = null, long encryptedGeneration = 0,
+        MountedVolumeState? expectedOwner = null)
     {
-        Interlocked.Increment(ref _mountCommandGeneration);
+        using var notifications = new DeferredNotifications(this);
+        if(encryptedGeneration==0) ReserveEncryptedCommand();
         await _mountOperationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             ++_mountOperationGeneration;
             var warnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            EjectOperationResult RetainChangedOwner(IReadOnlyList<MountedVolumeState> current)
+            {
+                PublishFromMounts(current, null, warnings, Array.Empty<string>());
+                return new EjectOperationResult(false,
+                    "PhysicalWritePermissionCleanupOwnerChanged: The admitted runtime owner changed; current ownership retained.",
+                    current, new Dictionary<string, UnmountResult>(StringComparer.OrdinalIgnoreCase));
+            }
             var mountedBeforeEject = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
             var selectedMounts = SelectMountsForEject(mountedBeforeEject, volumeId, deviceId, recoveryIdentity);
+            if (expectedOwner is not null &&
+                (expectedOwner.HostProcessId <= 0 || expectedOwner.HostProcessCreationTimeFileTimeUtc <= 0 ||
+                 !SamePreparedMountOwners([expectedOwner], selectedMounts)))
+                return RetainChangedOwner(mountedBeforeEject);
             if (selectedMounts.Count == 0)
             {
                 PublishFromMounts(mountedBeforeEject, null, warnings, Array.Empty<string>());
@@ -1113,15 +1478,78 @@ public sealed class ApfsMountWorker : BackgroundService
                     UnmountResults: new Dictionary<string, UnmountResult>(StringComparer.OrdinalIgnoreCase));
             }
 
-            var unmount = await UnmountAsync(selectedMounts, cancellationToken, warnings).ConfigureAwait(false);
+            await ValidateSelectedMutationAsync(selectedTarget, cancellationToken,
+                expectedOwner ?? (selectedTarget is null ? null : selectedMounts.SingleOrDefault())).ConfigureAwait(false);
+            if (expectedOwner is not null)
+            {
+                // Validation awaits discovery; keep the admitted identity through the final unmount boundary.
+                var current = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+                var selected = SelectMountsForEject(current, volumeId, deviceId, recoveryIdentity);
+                if (!SamePreparedMountOwners([expectedOwner], selected)) return RetainChangedOwner(current);
+                mountedBeforeEject = current;
+                selectedMounts = selected;
+            }
+            var unmount = await UnmountAsync(selectedMounts, cancellationToken, warnings,
+                sharedOwnerMounts: !string.IsNullOrWhiteSpace(volumeId) ? mountedBeforeEject : null).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(volumeId) && unmount.UnsafeRemoved.Count > 0 &&
+                _backend is IUnmountTerminalStateBackend terminalBackend)
+            {
+                var proofs = unmount.Results.ToDictionary(p => p.Key, p => p.Value, StringComparer.OrdinalIgnoreCase);
+                using var proofTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(
+                    Math.Clamp(_optionsMonitor.CurrentValue.NativeHostStopTimeoutSeconds, 1, 60)));
+                foreach (var mount in unmount.UnsafeRemoved)
+                {
+                    try
+                    {
+                        var proof = await terminalBackend.GetUnmountTerminalStateAsync(mount, proofTimeout.Token)
+                            .WaitAsync(proofTimeout.Token).ConfigureAwait(false);
+                        if (!IsCompleteShutdownProof(mount, proof)) continue;
+                        var previous = proofs[mount.VolumeId];
+                        var error = string.IsNullOrWhiteSpace(previous.Error)
+                            ? "Unmount did not prove mount removal, host ownership release, and pending durability clearance."
+                            : previous.Error;
+                        warnings.Remove($"Unmount failed for '{mount.MountPoint}': {error}");
+                        proofs[mount.VolumeId] = proof;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Could not prove the original shared owner exited for {MountPoint}", mount.MountPoint);
+                    }
+                }
+                var safe = unmount.Removed.Where(m => IsCompleteShutdownProof(m, proofs[m.VolumeId])).ToArray();
+                unmount = unmount with { Results = proofs, SafelyUnmounted = safe,
+                    UnsafeRemoved = unmount.Removed.Where(m => !IsCompleteShutdownProof(m, proofs[m.VolumeId])).ToArray() };
+            }
             var unmountedIds = unmount.Removed.Select(static x => x.VolumeId).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var remaining = mountedBeforeEject
-                .Where(mount => !unmountedIds.Contains(mount.VolumeId))
-                .ToArray();
+            MountedVolumeState[] remaining;
+            if (string.IsNullOrWhiteSpace(volumeId))
+            {
+                try
+                {
+                    using var finalProbeTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(
+                        Math.Clamp(_optionsMonitor.CurrentValue.NativeHostStopTimeoutSeconds, 1, 60)));
+                    remaining = (await _backend.GetMountStateAsync(finalProbeTimeout.Token)
+                        .WaitAsync(finalProbeTimeout.Token).ConfigureAwait(false)).ToArray();
+                }
+                catch (Exception ex)
+                {
+                    warnings.Add("Current mount absence could not be verified after eject: " + ex.Message);
+                    remaining = mountedBeforeEject.ToArray();
+                }
+            }
+            else
+            {
+                remaining = mountedBeforeEject.Where(mount => !unmountedIds.Contains(mount.VolumeId)).ToArray();
+            }
             var remainingIds = remaining.Select(static x => x.VolumeId).ToHashSet(StringComparer.OrdinalIgnoreCase);
             var remainingCount = remaining.Length;
             var statusWarnings = new HashSet<string>(warnings, StringComparer.OrdinalIgnoreCase);
-            foreach (var mount in unmount.SafelyUnmounted)
+            // Explicit eject must stick for every removed mount, not just the
+            // safely unmounted ones: unsafe removals otherwise auto-remount on
+            // the next cycle while still needing attention. Unsafe members
+            // keep their attention marking below; a later explicit mount
+            // still clears suppression through the normal mount path.
+            foreach (var mount in unmount.Removed)
             {
                 _userEjectedVolumeIds.Add(mount.VolumeId);
             }
@@ -1130,7 +1558,6 @@ public sealed class ApfsMountWorker : BackgroundService
                 _unsafeUnmountedVolumeIds.Add(mount.VolumeId);
                 statusWarnings.Add(BuildUnsafeUnmountWarning(mount));
             }
-
             foreach (var mount in unmount.SafelyUnmounted)
             {
                 statusWarnings.Add(BuildSafelyEjectedWarning(mount));
@@ -1190,6 +1617,449 @@ public sealed class ApfsMountWorker : BackgroundService
         }
     }
 
+    public Task<EjectOperationResult> EjectContainerAsync(
+        string deviceId,
+        string containerUuid,
+        CancellationToken cancellationToken,
+        long encryptedGeneration = 0)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(deviceId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(containerUuid);
+        return EjectContainerCoreAsync(deviceId, containerUuid, cancellationToken, encryptedGeneration);
+    }
+
+    public Task<(bool Success, string Message)> MountContainerAsync(
+        string deviceId,
+        string containerUuid,
+        IReadOnlyList<VolumeInfo> admittedMembers,
+        MountAccessMode requestedMode,
+        CancellationToken cancellationToken)
+        => MountContainerCoreAsync(deviceId, containerUuid, admittedMembers, requestedMode, cancellationToken, null);
+
+    private async Task<(bool Success, string Message)> MountContainerCoreAsync(
+        string deviceId,
+        string containerUuid,
+        IReadOnlyList<VolumeInfo> admittedMembers,
+        MountAccessMode requestedMode,
+        CancellationToken cancellationToken,
+        Func<IReadOnlyList<DeviceInventory>, bool>? imageFixAdmission)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(deviceId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(containerUuid);
+        ArgumentNullException.ThrowIfNull(admittedMembers);
+        var expectedMembers = admittedMembers.ToArray();
+        using var notifications = new DeferredNotifications(this);
+        var commandGeneration = ReserveEncryptedCommand();
+        await ReconcileVolumeIntentsAsync(cancellationToken).ConfigureAwait(false);
+        var discovery = await DiscoverVolumesAsync(cancellationToken).ConfigureAwait(false);
+        await _mountOperationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ++_mountOperationGeneration;
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Volatile.Read(ref _shutdownRequested) != 0 ||
+                commandGeneration != Volatile.Read(ref _mountCommandGeneration) || !TryAdmitSelectedDiscovery(discovery))
+                return (false, "Container mount was superseded or shutdown cleanup has started.");
+            if (imageFixAdmission is not null && !imageFixAdmission(discovery.Inventory))
+                return (false, "The original image source, capabilities or container selection changed before mount.");
+
+            var devices = discovery.Inventory.Where(item => string.Equals(
+                item.Device.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (devices.Length != 1 || !TopologyAdmission.Validate(devices[0]))
+                return (false, "The requested device no longer has unique valid topology.");
+
+            var members = devices[0].Volumes.Where(volume =>
+                string.Equals(volume.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase) &&
+                ApfsTopology.MatchesContainerUuid(containerUuid, volume.CatalogContainerUuid) &&
+                (CatalogMountPolicy.AllowsMount(volume, requestedMode == MountAccessMode.ReadOnly) ||
+                 BackupImageMountPolicy.AllowsExplicitMount(discovery.Options, volume, requestedMode))).ToArray();
+            var memberIds = members.Select(volume => volume.VolumeId).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (members.Length == 0 || memberIds.Count != members.Length || members.Length != expectedMembers.Length ||
+                expectedMembers.Select(volume => volume.VolumeId).Distinct(StringComparer.OrdinalIgnoreCase).Count() != expectedMembers.Length ||
+                expectedMembers.Any(expected => !members.Any(current =>
+                    string.Equals(expected.DeviceId, current.DeviceId, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(expected.VolumeId, current.VolumeId, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(current.RecoveryIdentity, expected.RecoveryIdentity, StringComparison.Ordinal) &&
+                    current.CatalogVolumeObjectId == expected.CatalogVolumeObjectId &&
+                    string.Equals(current.CatalogVolumeUuid, expected.CatalogVolumeUuid, StringComparison.OrdinalIgnoreCase))))
+                return (false, "Container membership or volume identity changed; refresh and retry.");
+
+            if (VolumeIntentBlocks(deviceId))
+                return (false, "Volume management intent requires reconciliation before access.");
+            if (members.Length > 1 && _backend is not IContainerMountBackend)
+                return (false, "The backend cannot mount container siblings as one batch.");
+
+            var mounted = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+            if (mounted.Any(mount => string.Equals(mount.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase) &&
+                    memberIds.Contains(mount.VolumeId)))
+                return (false, "Container members are still mounted after the reset; refresh and retry.");
+
+            async Task ValidateImageFixMutationAsync(CancellationToken token)
+            {
+                var fresh = await DiscoverVolumesAsync(token).ConfigureAwait(false);
+                var currentOwners = await _backend.GetMountStateAsync(token).ConfigureAwait(false);
+                token.ThrowIfCancellationRequested();
+                if (Volatile.Read(ref _shutdownRequested) != 0 || commandGeneration != Volatile.Read(ref _mountCommandGeneration) ||
+                    !imageFixAdmission!(fresh.Inventory) || !SamePreparedMountOwners(mounted, currentOwners))
+                    throw new SelectionSupersededException();
+            }
+
+            // Letter storage releases the mount gate. Retain suppression so a
+            // concurrent poll cannot mount outside this Fix's admission guard.
+            foreach (var member in members)
+            {
+                if (imageFixAdmission is not null)
+                    _userEjectedVolumeIds.Add(member.VolumeId);
+                else
+                {
+                    _userEjectedVolumeIds.Remove(member.VolumeId);
+                    _unsafeUnmountedVolumeIds.Remove(member.VolumeId);
+                }
+                _mountRetryStates.Remove(member.VolumeId);
+            }
+            await RunCycleCoreAsync(discovery, cancellationToken, mounted,
+                requestedDeviceId: deviceId, requestedAccessMode: requestedMode,
+                requestedContainerVolumeIds: memberIds,
+                validateMountMutation: imageFixAdmission is null ? null : ValidateImageFixMutationAsync).ConfigureAwait(false);
+            var current = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+            var missing = members.Where(member => current.Count(owner =>
+                string.Equals(owner.DeviceId, member.DeviceId, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(owner.VolumeId, member.VolumeId, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(owner.RecoveryIdentity, member.RecoveryIdentity, StringComparison.Ordinal)) != 1).ToArray();
+            if (missing.Length != 0)
+                return (false, "Container mount did not install every requested member: " +
+                    string.Join(", ", missing.Select(member => member.VolumeName)) + ". " + _statusPublisher.Latest.LastError);
+            return (true, "The requested container mounts are present.");
+        }
+        catch (SelectionSupersededException)
+        {
+            return (false, "Container mount was superseded while preparing drive-letter settings.");
+        }
+        finally
+        {
+            _mountOperationLock.Release();
+        }
+    }
+
+    // Clears explicit-eject suppression (and unsafe quarantine marks) for
+    // exactly the given volumes so a subsequent mount may proceed. Scoped
+    // per volume, unlike RefreshAsync(clearUserEjectedVolumes:true) which
+    // clears globally. Explicit container mounting instead clears suppression
+    // inside its own scoped scheduling operation.
+    public async Task ClearEjectSuppressionAsync(
+        IReadOnlyList<string> volumeIds,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(volumeIds);
+        await _mountOperationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            foreach (var volumeId in volumeIds)
+            {
+                if (string.IsNullOrWhiteSpace(volumeId))
+                {
+                    continue;
+                }
+
+                _userEjectedVolumeIds.Remove(volumeId);
+                _unsafeUnmountedVolumeIds.Remove(volumeId);
+            }
+        }
+        finally
+        {
+            _mountOperationLock.Release();
+        }
+    }
+
+    // Container-wide eject detaches every mounted member of one container in
+    // a single mount-operation scope and then relies on the backend's
+    // empty-group host stop (the same path per-volume eject uses for its last
+    // member). Fanning out through per-volume eject instead would leave every
+    // non-last member in an unprovable state: its mount is gone but the shared
+    // host must stay up for its siblings, so host-ownership release can never
+    // complete. Suppression covers every safely unmounted member, so explicit
+    // container unmount sticks instead of auto-remounting.
+    private async Task<EjectOperationResult> EjectContainerCoreAsync(
+        string deviceId,
+        string containerUuid,
+        CancellationToken cancellationToken,
+        long encryptedGeneration,
+        IReadOnlyList<VolumeInfo>? expectedImageMembers = null,
+        Func<IReadOnlyList<DeviceInventory>, bool>? imageFixAdmission = null)
+    {
+        using var notifications = new DeferredNotifications(this);
+        if (encryptedGeneration == 0) ReserveEncryptedCommand();
+        await _mountOperationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ++_mountOperationGeneration;
+            var warnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var inventory = await _backend.ProbeInventoryAsync(authoritative: true, cancellationToken).ConfigureAwait(false);
+            var devices = inventory
+                .Where(item => item?.Device is not null &&
+                    string.Equals(item.Device.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            if (devices.Length != 1 || !TopologyAdmission.Validate(devices[0]))
+            {
+                return new EjectOperationResult(
+                    Success: false,
+                    Message: devices.Length == 0
+                        ? $"Device '{deviceId}' is not connected."
+                        : "Container topology evidence is malformed or contradictory; mutation was not attempted.",
+                    RemainingMounts: await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false),
+                    UnmountResults: new Dictionary<string, UnmountResult>(StringComparer.OrdinalIgnoreCase));
+            }
+
+            var memberIds = devices[0].Volumes
+                .Where(volume => volume is not null && ApfsTopology.MatchesContainerUuid(containerUuid, volume.CatalogContainerUuid))
+                .Select(static volume => volume.VolumeId)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (expectedImageMembers is not null)
+            {
+                if (imageFixAdmission is null || !imageFixAdmission(inventory))
+                    return new EjectOperationResult(false, "The original image source, capabilities or container selection changed before Fix.",
+                        await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false),
+                        new Dictionary<string, UnmountResult>(StringComparer.OrdinalIgnoreCase));
+                var currentMembers = devices[0].Volumes.Where(v =>
+                    TopologyAdmission.SameUuid(v.CatalogContainerUuid, containerUuid)).ToArray();
+                if (!VolumeTopologyProfile.LocalPath(deviceId) || currentMembers.Length != expectedImageMembers.Count ||
+                    expectedImageMembers.Select(v => v.VolumeId).Distinct(StringComparer.OrdinalIgnoreCase).Count() != expectedImageMembers.Count ||
+                    expectedImageMembers.Any(expected => !currentMembers.Any(current =>
+                        current.VolumeId == expected.VolumeId && current.DeviceId == expected.DeviceId &&
+                        current.RecoveryIdentity == expected.RecoveryIdentity && current.CatalogVolumeId == expected.CatalogVolumeId &&
+                        current.CatalogVolumeObjectId == expected.CatalogVolumeObjectId &&
+                        TopologyAdmission.SameUuid(current.CatalogVolumeUuid, expected.CatalogVolumeUuid) &&
+                        TopologyAdmission.SameUuid(current.CatalogContainerUuid, expected.CatalogContainerUuid))))
+                    return new EjectOperationResult(false, "The original image container membership changed before Fix; refresh and retry.",
+                        await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false),
+                        new Dictionary<string, UnmountResult>(StringComparer.OrdinalIgnoreCase));
+            }
+            if (memberIds.Count == 0)
+            {
+                return new EjectOperationResult(
+                    Success: false,
+                    Message: $"Container '{containerUuid}' has no inventoried volumes on device '{deviceId}'.",
+                    RemainingMounts: await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false),
+                    UnmountResults: new Dictionary<string, UnmountResult>(StringComparer.OrdinalIgnoreCase));
+            }
+
+            var mountedBeforeEject = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+            if (expectedImageMembers is not null)
+            {
+                var affected = mountedBeforeEject.Where(m => string.Equals(m.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase) ||
+                    TopologyAdmission.SameUuid(m.CatalogContainerUuid, containerUuid)).ToArray();
+                if (affected.Any(m => !string.Equals(m.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase) || !memberIds.Contains(m.VolumeId)) ||
+                    affected.Select(m => m.VolumeId).Distinct(StringComparer.OrdinalIgnoreCase).Count() != affected.Length ||
+                    affected.Select(m => m.MountPoint).Distinct(StringComparer.OrdinalIgnoreCase).Count() != affected.Length ||
+                    affected.Any(m => m.HostProcessId <= 0 || m.HostProcessCreationTimeFileTimeUtc <= 0) ||
+                    affected.Select(m => (m.HostProcessId, m.HostProcessCreationTimeFileTimeUtc)).Distinct().Count() > 1)
+                    return new EjectOperationResult(false, "An unrelated, duplicate or conflicting owner still uses the original image source; no members were detached.",
+                        mountedBeforeEject, new Dictionary<string, UnmountResult>(StringComparer.OrdinalIgnoreCase));
+            }
+            var selectedMounts = mountedBeforeEject
+                .Where(mount =>
+                    string.Equals(mount.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase) &&
+                    mount.VolumeId is not null && memberIds.Contains(mount.VolumeId))
+                .ToArray();
+            if (expectedImageMembers is not null && selectedMounts.Any(mount =>
+                !expectedImageMembers.Any(member => mount.VolumeId == member.VolumeId && mount.DeviceId == member.DeviceId &&
+                    mount.RecoveryIdentity == member.RecoveryIdentity && mount.CatalogVolumeId == member.CatalogVolumeId &&
+                    mount.CatalogVolumeObjectId == member.CatalogVolumeObjectId &&
+                    TopologyAdmission.SameUuid(mount.CatalogContainerUuid, member.CatalogContainerUuid) &&
+                    TopologyAdmission.SameUuid(mount.CatalogVolumeUuid, member.CatalogVolumeUuid))))
+                return new EjectOperationResult(false, "The original image owner identity changed before Fix; refresh and retry.",
+                    mountedBeforeEject, new Dictionary<string, UnmountResult>(StringComparer.OrdinalIgnoreCase));
+            if (selectedMounts.Length == 0)
+            {
+                PublishFromMounts(mountedBeforeEject, null, warnings, Array.Empty<string>());
+                return new EjectOperationResult(
+                    Success: true,
+                    Message: "No member of the exact APFS container is currently mounted.",
+                    RemainingMounts: mountedBeforeEject,
+                    UnmountResults: new Dictionary<string, UnmountResult>(StringComparer.OrdinalIgnoreCase));
+            }
+
+            if (expectedImageMembers is not null)
+            {
+                var fresh = await _backend.ProbeInventoryAsync(authoritative: true, cancellationToken).ConfigureAwait(false);
+                var currentOwners = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+                if (!imageFixAdmission!(fresh) || !SamePreparedMountOwners(mountedBeforeEject, currentOwners))
+                    return new EjectOperationResult(false, "The original image selection or owners changed immediately before Fix; no members were detached.",
+                        currentOwners, new Dictionary<string, UnmountResult>(StringComparer.OrdinalIgnoreCase));
+            }
+
+            var batchWarnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var unmount = await UnmountAsync(selectedMounts, cancellationToken, batchWarnings).ConfigureAwait(false);
+            var merged = new Dictionary<string, UnmountResult>(unmount.Results, StringComparer.OrdinalIgnoreCase);
+            // The backend stops the shared host asynchronously once the group
+            // is empty, so per-detach results taken immediately can predate
+            // the stop and report ownership unreleased even though the stop
+            // completes a moment later. Settle briefly and re-request proof
+            // for members that detached quiesced but did not witness exit, so
+            // a completed stop is observed instead of reported unproven.
+            // Bounded (~12 s) and never inventing: only a backend-proven
+            // retry replaces the original result, otherwise it stands.
+            var unsettled = merged
+                .Where(entry => entry.Value.Success && entry.Value.MountRemoved &&
+                    entry.Value.PendingDurabilityCleared && !entry.Value.HostOwnershipReleased)
+                .Select(static entry => entry.Key)
+                .ToArray();
+            if (unsettled.Length > 0)
+            {
+                var settleDeadline = DateTime.UtcNow.AddSeconds(12);
+                var pending = unsettled.ToList();
+                var reproofNotes = new List<(string VolumeId, string Note)>();
+                while (pending.Count > 0 && DateTime.UtcNow < settleDeadline)
+                {
+                    try
+                    {
+                        await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        break;
+                    }
+
+                    foreach (var volumeId in pending.ToArray())
+                    {
+                        // Cancellation must still reach suppression/debt publication.
+                        if (cancellationToken.IsCancellationRequested) break;
+                        var mount = selectedMounts.FirstOrDefault(candidate =>
+                            string.Equals(candidate.VolumeId, volumeId, StringComparison.OrdinalIgnoreCase));
+                        if (mount is null)
+                        {
+                            continue;
+                        }
+
+                        UnmountResult retry;
+                        try
+                        {
+                            retry = await _backend.UnmountAsync(mount.MountPoint, cancellationToken).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                        {
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            reproofNotes.Add((volumeId, $"Ownership re-proof failed for '{mount.MountPoint}': {ex.Message}"));
+                            continue;
+                        }
+
+                        if (retry.Success && retry.HostOwnershipReleased)
+                        {
+                            merged[volumeId] = retry;
+                            pending.Remove(volumeId);
+                        }
+                    }
+                    if (cancellationToken.IsCancellationRequested) break;
+                }
+
+                // Re-proof notes describe still-unproven members only: notes
+                // for members whose retry eventually proved ownership are
+                // dropped, since final-state warnings below are regenerated
+                // from merged results.
+                var stillUnproven = pending.ToHashSet(StringComparer.OrdinalIgnoreCase);
+                foreach (var (_, note) in reproofNotes.Where(entry => stillUnproven.Contains(entry.VolumeId)))
+                {
+                    warnings.Add(note);
+                }
+            }
+
+            var removedIds = merged
+                .Where(entry => entry.Value.MountRemoved)
+                .Select(static entry => entry.Key)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            // Warnings describe FINAL state only: the batch above wrote
+            // per-mount failure notes into a throwaway set because settle
+            // below can still observe the missing proofs. Regenerate notes
+            // for members that remain unproven after settle.
+            foreach (var mount in selectedMounts)
+            {
+                if (!merged.TryGetValue(mount.VolumeId, out var final) ||
+                    (final.Success && final.MountRemoved && final.PendingDurabilityCleared && final.HostOwnershipReleased))
+                {
+                    continue;
+                }
+
+                var error = string.IsNullOrWhiteSpace(final?.Error)
+                    ? "Unmount did not prove mount removal, host ownership release, and pending durability clearance."
+                    : final!.Error;
+                warnings.Add($"Unmount failed for '{mount.MountPoint}': {error}");
+            }
+
+            var removed = selectedMounts.Where(mount => removedIds.Contains(mount.VolumeId)).ToArray();
+            var safelyUnmounted = selectedMounts
+                .Where(mount => merged.TryGetValue(mount.VolumeId, out var result) &&
+                    result.Success && result.MountRemoved &&
+                    result.HostOwnershipReleased && result.PendingDurabilityCleared)
+                .ToArray();
+            var unsafeRemoved = removed.Where(mount => !safelyUnmounted.Any(candidate =>
+                string.Equals(candidate.VolumeId, mount.VolumeId, StringComparison.OrdinalIgnoreCase))).ToArray();
+            var unmountedIds = removed.Select(static x => x.VolumeId).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var remaining = mountedBeforeEject
+                .Where(mount => !unmountedIds.Contains(mount.VolumeId))
+                .ToArray();
+            var memberRemaining = remaining
+                .Where(mount =>
+                    string.Equals(mount.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase) &&
+                    mount.VolumeId is not null && memberIds.Contains(mount.VolumeId))
+                .ToArray();
+            var statusWarnings = new HashSet<string>(warnings, StringComparer.OrdinalIgnoreCase);
+            // Explicit container unmount must stick: suppress every detached
+            // member (not just the safely unmounted ones), or just-unmounted
+            // volumes auto-remount on the next cycle. Unsafe members keep
+            // their attention marking; a later explicit mount still clears
+            // suppression through the normal mount path.
+            foreach (var mount in removed)
+            {
+                _userEjectedVolumeIds.Add(mount.VolumeId);
+            }
+            foreach (var mount in unsafeRemoved)
+            {
+                _unsafeUnmountedVolumeIds.Add(mount.VolumeId);
+                statusWarnings.Add(BuildUnsafeUnmountWarning(mount));
+            }
+
+            foreach (var mount in safelyUnmounted)
+            {
+                statusWarnings.Add(BuildSafelyEjectedWarning(mount));
+            }
+
+            PublishFromMounts(remaining, null, statusWarnings, Array.Empty<string>());
+
+            if (memberRemaining.Length == 0 && warnings.Count == 0)
+            {
+                return new EjectOperationResult(
+                    Success: true,
+                    Message: "All members of the exact APFS container were safely ejected.",
+                    RemainingMounts: remaining,
+                    UnmountResults: merged);
+            }
+
+            if (memberRemaining.Length == 0)
+            {
+                return new EjectOperationResult(
+                    Success: false,
+                    Message: string.Join(" ", warnings),
+                    RemainingMounts: remaining,
+                    UnmountResults: merged);
+            }
+
+            var stillMounted = string.Join(", ", memberRemaining.Select(static x => x.MountPoint));
+            var detail = warnings.Count == 0 ? string.Empty : $" {string.Join(" ", warnings)}";
+            return new EjectOperationResult(
+                Success: false,
+                Message: $"Some members of the APFS container are still mounted: {stillMounted}.{detail}",
+                RemainingMounts: remaining,
+                UnmountResults: merged);
+        }
+        finally
+        {
+            _mountOperationLock.Release();
+        }
+    }
+
     private static IReadOnlyList<MountedVolumeState> SelectMountsForEject(
         IReadOnlyList<MountedVolumeState> mounted,
         string? volumeId,
@@ -1209,6 +2079,27 @@ public sealed class ApfsMountWorker : BackgroundService
                  string.Equals(mount.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase)) &&
                 RecoveryIdentityMatches(mount.RecoveryIdentity, recoveryIdentity))
             .ToArray();
+    }
+
+    private async Task ValidateSelectedMutationAsync(ApfsControlTarget? target, CancellationToken cancellationToken, MountedVolumeState? expectedOwner = null)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (target is null) return;
+        var fresh = await DiscoverVolumesAsync(cancellationToken).ConfigureAwait(false);
+        if (!SelectedControlTarget.Matches(fresh.Inventory, target))
+        {
+            TryAdmitDiscovery(fresh);
+            throw new InvalidOperationException("Selected identity or topology changed immediately before mutation.");
+        }
+        if (expectedOwner is not null)
+        {
+            var mounts = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+            var owners = mounts.Where(m => m.MountPoint == expectedOwner.MountPoint).ToArray();
+            if (owners.Length != 1 || !SelectedControlTarget.MatchesMount(target, owners[0]) ||
+                !SamePreparedMountOwners([expectedOwner], owners))
+                throw new InvalidOperationException("Selected runtime owner changed immediately before mutation.");
+        }
+        cancellationToken.ThrowIfCancellationRequested();
     }
 
     private static bool RecoveryIdentityMatches(string? actual, string? requested)
@@ -1280,6 +2171,18 @@ public sealed class ApfsMountWorker : BackgroundService
         string? CompatibilityWarning,
         string? DeviceDisplayName);
 
+    private static bool SamePreparedMountOwners(
+        IReadOnlyList<MountedVolumeState> prepared, IReadOnlyList<MountedVolumeState> current)
+    {
+        static bool Matches(MountedVolumeState owner, MountedVolumeState candidate)
+            => SameShutdownOwner(owner, candidate) && owner.AccessMode == candidate.AccessMode &&
+               string.Equals(owner.CatalogVolumeId, candidate.CatalogVolumeId, StringComparison.OrdinalIgnoreCase);
+
+        return current.Count == prepared.Count &&
+            prepared.All(owner => current.Count(candidate => Matches(owner, candidate)) == 1) &&
+            current.All(owner => prepared.Count(candidate => Matches(candidate, owner)) == 1);
+    }
+
     private async Task<IReadOnlyList<(VolumeInfo Volume, MountAttemptOutcome Outcome)>> TryMountContainerBatchAsync(
         IContainerMountBackend containerBackend,
         IReadOnlyList<VolumeInfo> volumes,
@@ -1288,8 +2191,12 @@ public sealed class ApfsMountWorker : BackgroundService
         CancellationToken cancellationToken,
         IReadOnlyDictionary<string, string> deviceDisplayNames,
         MountAccessMode? requestedAccessMode,
-        long discoveryGeneration)
+        long discoveryGeneration,
+        IReadOnlyList<MountedVolumeState> preparationMounts,
+        Func<CancellationToken, Task>? validateMountMutation = null)
     {
+        var preparationCommand = Volatile.Read(ref _mountCommandGeneration);
+        var preparationOperation = _mountOperationGeneration;
         var completed = new List<(VolumeInfo, MountAttemptOutcome)>(volumes.Count);
         var prepared = new List<PreparedContainerMount>(volumes.Count);
         foreach (var volume in volumes)
@@ -1307,16 +2214,17 @@ public sealed class ApfsMountWorker : BackgroundService
                 continue;
             }
 
-            var writeDecision = WriteGatePolicy.EvaluateForVolume(options, volume);
-            var requestedAccess = requestedAccessMode ??
-                (writeDecision.AllowWrite ? MountAccessMode.ReadWrite : MountAccessMode.ReadOnly);
-            var shouldAttemptWrite = requestedAccess == MountAccessMode.ReadWrite && writeDecision.AllowWrite;
+            var writeDecision = EvaluateVolumeWriteGate(options, volume);
+            var requestedAccess = ResolveRememberedAccessMode(volume, requestedAccessMode,
+                writeDecision.AllowWrite ? MountAccessMode.ReadWrite : MountAccessMode.ReadOnly);
+            var managementRootReady = requestedAccess != MountAccessMode.ReadWrite || !writeDecision.AllowWrite || ImageMutationRootReady(volume.DeviceId);
+            var shouldAttemptWrite = requestedAccess == MountAccessMode.ReadWrite && writeDecision.AllowWrite && managementRootReady;
             var primaryAccess = shouldAttemptWrite ? MountAccessMode.ReadWrite : MountAccessMode.ReadOnly;
             string? compatibilityWarning = null;
             if (!shouldAttemptWrite && options.EnableNativeWrite)
             {
                 compatibilityWarning = $"Write gate is active but '{volume.VolumeName}' mounted read-only " +
-                                       $"(gate={writeDecision.GateState}, reason={writeDecision.Reason ?? "n/a"}).";
+                                         $"(gate={writeDecision.GateState}, reason={(!managementRootReady ? "ManagementJournalRootUninspectedOrPending" : writeDecision.Reason ?? "n/a")}).";
             }
             prepared.Add(new PreparedContainerMount(
                 volume,
@@ -1330,8 +2238,22 @@ public sealed class ApfsMountWorker : BackgroundService
         {
             return completed;
         }
+        if (validateMountMutation is not null && prepared.Count != volumes.Count)
+            throw new SelectionSupersededException();
+
+        if (_mountPolicy.RequiresDriveLetterStorage)
+        {
+            // Settings waits release the mount gate. Inventory may observe a new
+            // backend owner without a worker command; recheck the entire owner set.
+            var current = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+            ValidateDriveLetterSelection(discoveryGeneration, preparationCommand, preparationOperation, cancellationToken);
+            if (!SamePreparedMountOwners(preparationMounts, current))
+                throw new SelectionSupersededException();
+        }
 
         IReadOnlyList<MountResult> primaryResults;
+        if (validateMountMutation is not null)
+            await validateMountMutation(cancellationToken).ConfigureAwait(false);
         try
         {
             primaryResults = await containerBackend.MountContainerAsync(
@@ -1360,9 +2282,13 @@ public sealed class ApfsMountWorker : BackgroundService
             .ToArray();
         if (fallbackIndexes.Length > 0)
         {
+            if (validateMountMutation is not null && fallbackIndexes.Length != prepared.Count)
+                throw new SelectionSupersededException();
             var fallbackRequests = fallbackIndexes
                 .Select(index => prepared[index].Request with { AccessMode = MountAccessMode.ReadOnly })
                 .ToArray();
+            if (validateMountMutation is not null)
+                await validateMountMutation(cancellationToken).ConfigureAwait(false);
             var fallbackResults = await containerBackend.MountContainerAsync(
                 fallbackRequests, cancellationToken).ConfigureAwait(false);
             if (fallbackResults.Count == fallbackIndexes.Length)
@@ -1436,9 +2362,30 @@ public sealed class ApfsMountWorker : BackgroundService
         string? deviceDisplayName = null,
         MountAccessMode? requestedAccessMode = null,
         long discoveryGeneration = 0,
-        char? preparedLetter = null
+        char? preparedLetter = null, ApfsControlTarget? selectedTarget = null,
+        IReadOnlyList<MountedVolumeState>? preparationMounts = null,
+        Func<CancellationToken, Task>? validateMountMutation = null
     )
     {
+        var preparationCommand = Volatile.Read(ref _mountCommandGeneration);
+        var preparationOperation = _mountOperationGeneration;
+        if (_mountPolicy.RequiresDriveLetterStorage && preparationMounts is null)
+            preparationMounts = (await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false)).ToArray();
+
+        async Task ValidatePreparationOwnersAsync()
+        {
+            await ValidateSelectedMutationAsync(selectedTarget, cancellationToken).ConfigureAwait(false);
+            if (validateMountMutation is not null)
+                await validateMountMutation(cancellationToken).ConfigureAwait(false);
+            if (_mountPolicy.RequiresDriveLetterStorage && preparationMounts is not null)
+            {
+                var current = await _backend.GetMountStateAsync(cancellationToken).ConfigureAwait(false);
+                ValidateDriveLetterSelection(discoveryGeneration, preparationCommand, preparationOperation, cancellationToken);
+                if (!SamePreparedMountOwners(preparationMounts, current))
+                    throw new SelectionSupersededException();
+            }
+        }
+
         char letter;
         try
         {
@@ -1451,12 +2398,14 @@ public sealed class ApfsMountWorker : BackgroundService
             return (false, ex.Message, null, null, null);
         }
 
-        var writeDecision = WriteGatePolicy.EvaluateForVolume(options, volume);
-        var requestedAccess = requestedAccessMode ??
-            (writeDecision.AllowWrite ? MountAccessMode.ReadWrite : MountAccessMode.ReadOnly);
-        var shouldAttemptWrite = requestedAccess == MountAccessMode.ReadWrite && writeDecision.AllowWrite;
+        var writeDecision = EvaluateVolumeWriteGate(options, volume);
+        var requestedAccess = ResolveRememberedAccessMode(volume, requestedAccessMode,
+            writeDecision.AllowWrite ? MountAccessMode.ReadWrite : MountAccessMode.ReadOnly);
+        var managementRootReady = requestedAccess != MountAccessMode.ReadWrite || !writeDecision.AllowWrite || ImageMutationRootReady(volume.DeviceId);
+        var shouldAttemptWrite = requestedAccess == MountAccessMode.ReadWrite && writeDecision.AllowWrite && managementRootReady;
         var primaryAccess = shouldAttemptWrite ? MountAccessMode.ReadWrite : MountAccessMode.ReadOnly;
         var primaryRequest = new MountRequest(volume.VolumeId, letter, primaryAccess);
+        await ValidatePreparationOwnersAsync().ConfigureAwait(false);
         var result = await _backend.MountAsync(primaryRequest, cancellationToken).ConfigureAwait(false);
         MountResult? primaryFailureResult = null;
 
@@ -1464,7 +2413,7 @@ public sealed class ApfsMountWorker : BackgroundService
         if (!shouldAttemptWrite && options.EnableNativeWrite)
         {
             compatibilityWarning = $"Write gate is active but '{volume.VolumeName}' mounted read-only " +
-                                   $"(gate={writeDecision.GateState}, reason={writeDecision.Reason ?? "n/a"}).";
+                                     $"(gate={writeDecision.GateState}, reason={(!managementRootReady ? "ManagementJournalRootUninspectedOrPending" : writeDecision.Reason ?? "n/a")}).";
         }
 
         if (!result.Success &&
@@ -1472,6 +2421,8 @@ public sealed class ApfsMountWorker : BackgroundService
         {
             primaryFailureResult = result;
             var fallbackRequest = new MountRequest(volume.VolumeId, letter, MountAccessMode.ReadOnly);
+            // A failed primary grants no ownership; fallback must retain the original owner set.
+            await ValidatePreparationOwnersAsync().ConfigureAwait(false);
             result = await _backend.MountAsync(fallbackRequest, cancellationToken).ConfigureAwait(false);
 
             if (requestedAccess == MountAccessMode.ReadWrite && result.Success)
@@ -1620,13 +2571,14 @@ public sealed class ApfsMountWorker : BackgroundService
         };
     }
 
-    private async Task<ShutdownPreparationResult> PrepareForShutdownCoreAsync()
+    private async Task<ShutdownPreparationResult> PrepareForShutdownCoreAsync(ShutdownPreparationResult? previous)
     {
         var stopTimeout = TimeSpan.FromSeconds(Math.Clamp(
             _optionsMonitor.CurrentValue.NativeHostStopTimeoutSeconds,
             1,
             60));
         using var stopCts = new CancellationTokenSource(stopTimeout);
+        var attemptStarted = Stopwatch.GetTimestamp();
         var warnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         IReadOnlyList<MountedVolumeState> remaining = Array.Empty<MountedVolumeState>();
         UnmountBatchResult? unmount = null;
@@ -1636,20 +2588,112 @@ public sealed class ApfsMountWorker : BackgroundService
             await _mountOperationLock.WaitAsync(stopCts.Token).ConfigureAwait(false);
             try
             {
-                var mountedBefore = (await _backend
+                var observed = (await _backend
                     .GetMountStateAsync(stopCts.Token)
                     .ConfigureAwait(false))
                     .ToArray();
-                remaining = mountedBefore;
+                // Preserve the first selected owners even if later discovery is
+                // empty. Absence cannot manufacture their terminal safety proof.
+                var mountedBefore = _shutdownSelectedMounts ??= observed;
+                remaining = observed;
+                var proofs = new Dictionary<string, UnmountResult>(StringComparer.OrdinalIgnoreCase);
+                var pending = new List<MountedVolumeState>();
+                foreach (var mount in mountedBefore)
+                {
+                    if (previous?.UnmountResultsOrEmpty.TryGetValue(mount.VolumeId, out var proven) == true)
+                    {
+                        proofs[mount.VolumeId] = proven;
+                        if (IsCompleteShutdownProof(mount, proven)) continue;
+                    }
+                    var current = observed.Where(row =>
+                        string.Equals(row.MountPoint, mount.MountPoint, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(row.VolumeId, mount.VolumeId, StringComparison.OrdinalIgnoreCase)).ToArray();
+                    if (current.Length > 1 || current.Length == 1 && !SameShutdownOwner(mount, current[0]))
+                    {
+                        if (!proofs.ContainsKey(mount.VolumeId))
+                            proofs[mount.VolumeId] = new(false, mount.MountPoint,
+                                "The original shutdown selection changed; its terminal proof remains unproven.");
+                        warnings.Add($"Shutdown owner changed for '{mount.MountPoint}'; no replacement owner was stopped.");
+                        continue;
+                    }
+                    if (current.Length == 0)
+                    {
+                        if (!proofs.ContainsKey(mount.VolumeId))
+                            proofs[mount.VolumeId] = new(false, mount.MountPoint,
+                                "The original shutdown selection is absent; its terminal safety proof remains unproven.");
+                        warnings.Add($"Shutdown terminal proof remains unproven for '{mount.MountPoint}': {proofs[mount.VolumeId].Error}");
+                        continue;
+                    }
+                    pending.Add(mount);
+                }
 
+                var retainedGracefulDrain = _backend is IGracefulShutdownBackend;
+                if (retainedGracefulDrain) stopCts.CancelAfter(Timeout.InfiniteTimeSpan);
                 unmount = await UnmountAsync(
-                    mountedBefore,
+                    pending,
                     stopCts.Token,
-                    warnings).ConfigureAwait(false);
+                    warnings,
+                    gracefulShutdown: retainedGracefulDrain).ConfigureAwait(false);
+                if (retainedGracefulDrain)
+                {
+                    // A completed owned drain starts the bounded final-proof phase.
+                    attemptStarted = Stopwatch.GetTimestamp();
+                    stopCts.CancelAfter(stopTimeout);
+                }
+                foreach (var result in unmount.Results) proofs[result.Key] = result.Value;
+                unmount = unmount with { Results = proofs };
                 var reconciliation = await ReconcileRemainingMountsAsync(
                     remaining,
-                    stopTimeout).ConfigureAwait(false);
+                    stopTimeout, attemptStarted).ConfigureAwait(false);
                 remaining = reconciliation.Mounts;
+
+                // Late cleanup can complete after an earlier detach/stop failure.
+                // Query only the original incarnation's retained terminal proof.
+                var detached = mountedBefore.Where(mount =>
+                    unmount.Results.TryGetValue(mount.VolumeId, out var result) &&
+                    !IsCompleteShutdownProof(mount, result)).ToArray();
+                if (reconciliation.Succeeded && remaining.Count == 0 && detached.Length > 0)
+                {
+                    foreach (var mount in detached)
+                    {
+                        UnmountResult terminal;
+                        try
+                        {
+                            if (_backend is not IUnmountTerminalStateBackend terminalBackend ||
+                                mount.HostProcessId <= 0 || mount.HostProcessCreationTimeFileTimeUtc <= 0)
+                            {
+                                warnings.Add($"Shutdown terminal proof is unavailable for the original owner of '{mount.MountPoint}'.");
+                                continue;
+                            }
+                            terminal = await terminalBackend.GetUnmountTerminalStateAsync(mount, stopCts.Token)
+                                .WaitAsync(stopCts.Token).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException) when (stopCts.IsCancellationRequested)
+                        {
+                            warnings.Add($"Shutdown terminal proof timed out for '{mount.MountPoint}'; the original detach proof is retained.");
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            warnings.Add($"Shutdown terminal proof failed for '{mount.MountPoint}': {ex.Message}");
+                            continue;
+                        }
+
+                        if (IsCompleteShutdownProof(mount, terminal))
+                        {
+                            proofs[mount.VolumeId] = terminal;
+                            warnings.Remove($"Unmount failed for '{mount.MountPoint}': Unmount did not prove mount removal, host ownership release, and pending durability clearance.");
+                        }
+                        else
+                        {
+                            warnings.Add($"Shutdown terminal proof remains unproven for '{mount.MountPoint}': " +
+                                $"mount={terminal.MountPoint}, success={terminal.Success}, removed={terminal.MountRemoved}, " +
+                                $"ownership={terminal.HostOwnershipReleased}, durability={terminal.PendingDurabilityCleared}. {terminal.Error}");
+                        }
+                    }
+                    reconciliation = await ReconcileRemainingMountsAsync(remaining, stopTimeout, attemptStarted).ConfigureAwait(false);
+                    remaining = reconciliation.Mounts;
+                }
 
                 var allSelectedHaveResults = mountedBefore.All(mount =>
                     unmount.Results.ContainsKey(mount.VolumeId));
@@ -1660,6 +2704,8 @@ public sealed class ApfsMountWorker : BackgroundService
                                         {
                                             var result = unmount.Results[mount.VolumeId];
                                             return result.Success &&
+                                                   string.IsNullOrWhiteSpace(result.Error) &&
+                                                   string.Equals(result.MountPoint, mount.MountPoint, StringComparison.OrdinalIgnoreCase) &&
                                                    result.MountRemoved &&
                                                    result.HostOwnershipReleased;
                                         });
@@ -1670,6 +2716,8 @@ public sealed class ApfsMountWorker : BackgroundService
                                         {
                                             var result = unmount.Results[mount.VolumeId];
                                             return result.Success &&
+                                                   string.IsNullOrWhiteSpace(result.Error) &&
+                                                   string.Equals(result.MountPoint, mount.MountPoint, StringComparison.OrdinalIgnoreCase) &&
                                                    result.MountRemoved &&
                                                    result.PendingDurabilityCleared;
                                         });
@@ -1698,7 +2746,7 @@ public sealed class ApfsMountWorker : BackgroundService
         {
             var reconciliation = await ReconcileRemainingMountsAsync(
                 remaining,
-                stopTimeout).ConfigureAwait(false);
+                stopTimeout, attemptStarted).ConfigureAwait(false);
             remaining = reconciliation.Mounts;
             var diagnostic = BuildShutdownDiagnostic(
                 warnings,
@@ -1713,13 +2761,13 @@ public sealed class ApfsMountWorker : BackgroundService
                 HostOwnershipReleased: false,
                 PendingDurabilityCleared: false,
                 Diagnostic: diagnostic,
-                UnmountResults: unmount?.Results);
+                UnmountResults: unmount?.Results ?? previous?.UnmountResults);
         }
         catch (Exception ex)
         {
             var reconciliation = await ReconcileRemainingMountsAsync(
                 remaining,
-                stopTimeout).ConfigureAwait(false);
+                stopTimeout, attemptStarted).ConfigureAwait(false);
             remaining = reconciliation.Mounts;
             var diagnostic = BuildShutdownDiagnostic(
                 warnings,
@@ -1734,23 +2782,31 @@ public sealed class ApfsMountWorker : BackgroundService
                 HostOwnershipReleased: false,
                 PendingDurabilityCleared: false,
                 Diagnostic: diagnostic,
-                UnmountResults: unmount?.Results);
+                UnmountResults: unmount?.Results ?? previous?.UnmountResults);
         }
     }
 
     private async Task<MountStateReconciliation> ReconcileRemainingMountsAsync(
         IReadOnlyList<MountedVolumeState> fallback,
-        TimeSpan stopTimeout)
+        TimeSpan stopTimeout,
+        long attemptStarted)
     {
         var timeout = TimeSpan.FromSeconds(Math.Clamp(
             (int)Math.Ceiling(stopTimeout.TotalSeconds),
             1,
             5));
+        // All independent probes share the original attempt's reconciliation
+        // allowance. A second probe or cancellation wait cannot restart it.
+        var remaining = stopTimeout + timeout - Stopwatch.GetElapsedTime(attemptStarted);
+        if (remaining <= TimeSpan.Zero)
+            return new(false, fallback, "The original shutdown reconciliation deadline expired.");
+        if (remaining < timeout) timeout = remaining;
         using var reconciliationCts = new CancellationTokenSource(timeout);
         try
         {
             var mounts = await _backend
                 .GetMountStateAsync(reconciliationCts.Token)
+                .WaitAsync(reconciliationCts.Token)
                 .ConfigureAwait(false);
             return new MountStateReconciliation(true, mounts.ToArray(), null);
         }
@@ -1769,6 +2825,22 @@ public sealed class ApfsMountWorker : BackgroundService
                 $"Authoritative remaining-mount reconciliation failed: {ex.Message}");
         }
     }
+
+    private static bool IsCompleteShutdownProof(MountedVolumeState mount, UnmountResult proof)
+        => proof.Success && proof.MountRemoved && proof.HostOwnershipReleased && proof.PendingDurabilityCleared &&
+           string.IsNullOrWhiteSpace(proof.Error) &&
+           string.Equals(proof.MountPoint, mount.MountPoint, StringComparison.OrdinalIgnoreCase);
+
+    private static bool SameShutdownOwner(MountedVolumeState original, MountedVolumeState current)
+        => string.Equals(original.MountPoint, current.MountPoint, StringComparison.OrdinalIgnoreCase) &&
+           string.Equals(original.DeviceId, current.DeviceId, StringComparison.OrdinalIgnoreCase) &&
+           string.Equals(original.VolumeId, current.VolumeId, StringComparison.OrdinalIgnoreCase) &&
+           string.Equals(original.RecoveryIdentity, current.RecoveryIdentity, StringComparison.Ordinal) &&
+           original.HostProcessId == current.HostProcessId &&
+           original.HostProcessCreationTimeFileTimeUtc == current.HostProcessCreationTimeFileTimeUtc &&
+           string.Equals(original.CatalogContainerUuid, current.CatalogContainerUuid, StringComparison.OrdinalIgnoreCase) &&
+           original.CatalogVolumeObjectId == current.CatalogVolumeObjectId &&
+           string.Equals(original.CatalogVolumeUuid, current.CatalogVolumeUuid, StringComparison.OrdinalIgnoreCase);
 
     private static string BuildShutdownDiagnostic(
         IEnumerable<string> warnings,
@@ -1810,7 +2882,9 @@ public sealed class ApfsMountWorker : BackgroundService
     private async Task<UnmountBatchResult> UnmountAsync(
         IReadOnlyList<MountedVolumeState> mounted,
         CancellationToken cancellationToken,
-        HashSet<string>? warnings = null
+        HashSet<string>? warnings = null,
+        IReadOnlyList<MountedVolumeState>? sharedOwnerMounts = null,
+        bool gracefulShutdown = false
     )
     {
         var removed = new List<MountedVolumeState>(mounted.Count);
@@ -1823,9 +2897,16 @@ public sealed class ApfsMountWorker : BackgroundService
             UnmountResult result;
             try
             {
-                result = await _backend
-                    .UnmountAsync(mount.MountPoint, cancellationToken)
-                    .ConfigureAwait(false);
+                if (gracefulShutdown && _backend is IGracefulShutdownBackend retained)
+                {
+                    using var acquisition = new CancellationTokenSource(TimeSpan.FromSeconds(
+                        Math.Clamp(_optionsMonitor.CurrentValue.NativeHostStopTimeoutSeconds, 1, 60)));
+                    result = await retained.UnmountForShutdownAsync(mount.MountPoint, acquisition.Token).ConfigureAwait(false);
+                }
+                else
+                {
+                    result = await _backend.UnmountAsync(mount.MountPoint, cancellationToken).ConfigureAwait(false);
+                }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -1850,10 +2931,34 @@ public sealed class ApfsMountWorker : BackgroundService
                 break;
             }
 
+            if (sharedOwnerMounts is not null && result.ContainerMemberDetached && !result.HostOwnershipReleased)
+            {
+                var memberProven = false;
+                if (sharedOwnerMounts is not null && mounted.Count == 1 &&
+                    result.Success && result.MountRemoved && result.PendingDurabilityCleared &&
+                    string.Equals(result.MountPoint.TrimEnd('\\', '/'), mount.MountPoint.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var proofTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(
+                            Math.Clamp(_optionsMonitor.CurrentValue.NativeHostStopTimeoutSeconds, 1, 60)));
+                        var current = await _backend.GetMountStateAsync(proofTimeout.Token)
+                            .WaitAsync(proofTimeout.Token).ConfigureAwait(false);
+                        memberProven = IsSharedContainerMemberDetachProven(mount, sharedOwnerMounts, current);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Could not reconcile the shared owner after detaching {MountPoint}", mount.MountPoint);
+                    }
+                }
+                if (!memberProven)
+                    result = result with { ContainerMemberDetached = false,
+                        Error = result.Error ?? "The detached drive's original shared owner could not be verified against its mounted sibling." };
+            }
             results[mount.VolumeId] = result;
             var safelyRemoved = result.Success &&
                                 result.MountRemoved &&
-                                result.HostOwnershipReleased &&
+                                (result.HostOwnershipReleased || (sharedOwnerMounts is not null && result.ContainerMemberDetached)) &&
                                 result.PendingDurabilityCleared;
             if (result.MountRemoved)
             {
@@ -1881,6 +2986,32 @@ public sealed class ApfsMountWorker : BackgroundService
         }
 
         return new UnmountBatchResult(removed, safelyUnmounted, unsafeRemoved, results);
+    }
+
+    private static bool IsSharedContainerMemberDetachProven(
+        MountedVolumeState selected,
+        IReadOnlyList<MountedVolumeState> before,
+        IReadOnlyList<MountedVolumeState> current)
+    {
+        if (selected.HostProcessId <= 0 || selected.HostProcessCreationTimeFileTimeUtc <= 0 ||
+            string.IsNullOrWhiteSpace(selected.DeviceId) || string.IsNullOrWhiteSpace(selected.CatalogContainerUuid) ||
+            string.IsNullOrWhiteSpace(selected.RecoveryIdentity) ||
+            current.Any(m => string.Equals(m.VolumeId, selected.VolumeId, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(m.MountPoint.TrimEnd('\\', '/'), selected.MountPoint.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase))) return false;
+        return before.Any(sibling => !string.Equals(sibling.VolumeId, selected.VolumeId, StringComparison.OrdinalIgnoreCase) &&
+            !string.IsNullOrWhiteSpace(sibling.RecoveryIdentity) &&
+            string.Equals(sibling.DeviceId, selected.DeviceId, StringComparison.OrdinalIgnoreCase) &&
+            TopologyAdmission.SameUuid(sibling.CatalogContainerUuid, selected.CatalogContainerUuid) &&
+            sibling.HostProcessId == selected.HostProcessId &&
+            sibling.HostProcessCreationTimeFileTimeUtc == selected.HostProcessCreationTimeFileTimeUtc &&
+            current.Count(m => string.Equals(m.VolumeId, sibling.VolumeId, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(m.DeviceId, sibling.DeviceId, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(m.RecoveryIdentity, sibling.RecoveryIdentity, StringComparison.Ordinal) &&
+                string.Equals(m.MountPoint.TrimEnd('\\', '/'), sibling.MountPoint.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase) &&
+                TopologyAdmission.SameUuid(m.CatalogContainerUuid, selected.CatalogContainerUuid) &&
+                m.HostProcessId == selected.HostProcessId &&
+                m.HostProcessCreationTimeFileTimeUtc == selected.HostProcessCreationTimeFileTimeUtc &&
+                m.MountReady && !m.ShutdownDrainActive) == 1);
     }
 
     private static void AddNotReachedUnmountResults(
@@ -2562,75 +3693,23 @@ public sealed class ApfsMountWorker : BackgroundService
 
     private void PublishWithCurrentInventory(StatusChangedPayload payload)
     {
+        var managementRootInspected = TryInspectManagementRoot();
         Action? notification;
         lock (_discoveryAdmissionSync)
         {
-            payload = payload with { ConnectedInventory = _admittedDiscovery?.Inventory };
+            payload = payload with { ConnectedInventory = _admittedDiscovery?.Inventory, InventoryGeneration = _admittedDiscovery?.Generation,
+                VolumeManagementReadyImages = _volumeManagementReadyImages,
+                ManagementJournalRootInspected = managementRootInspected, ImageResizeFormatEnabled = ImageResizeFormatEnabled,
+                ImageManagementMutationsEnabled = ImageManagementMutationsEnabled };
             StatusChangedPayload latest;
             do { latest = _statusPublisher.Latest; }
             while (!_statusPublisher.TryPublish(latest, payload, out notification));
         }
-        notification?.Invoke();
+        NotifyDiscovery(notification);
     }
 
     private static IReadOnlyList<MountedVolumeDisplay> BuildMountedVolumeDisplays(IReadOnlyList<MountedVolumeState> mounts)
-        => mounts
-            .Where(static mount => !string.IsNullOrWhiteSpace(mount.MountPoint))
-            .Select(static mount => new MountedVolumeDisplay(
-                VolumeId: mount.VolumeId,
-                MountPoint: mount.MountPoint,
-                VolumeName: !string.IsNullOrWhiteSpace(mount.VolumeName)
-                    ? mount.VolumeName
-                    : TryParseVolumeNameFromVolumeId(mount.VolumeId) ?? "APFS",
-                DeviceId: !string.IsNullOrWhiteSpace(mount.DeviceId)
-                    ? mount.DeviceId
-                    : TryParseDeviceIdFromVolumeId(mount.VolumeId) ?? string.Empty,
-                DeviceDisplayName: !string.IsNullOrWhiteSpace(mount.DeviceDisplayName)
-                    ? mount.DeviceDisplayName
-                    : TryParseDeviceIdFromVolumeId(mount.VolumeId) ?? "APFS drive",
-                AccessMode: mount.AccessMode,
-                RecoveryIdentity: mount.RecoveryIdentity,
-                State: mount.AccessMode == MountAccessMode.ReadWrite
-                    ? RuntimeState.MountedRw
-                    : RuntimeState.MountedRo,
-                WriteEnabled: mount.AccessMode == MountAccessMode.ReadWrite,
-                WriteBackend: mount.WriteBackend,
-                CommitModel: mount.CommitModel,
-                NativeWriteReadiness: mount.NativeWriteReadiness,
-                NativeWriteEngineState: mount.NativeWriteEngineState,
-                NativeWriteValidationState: mount.NativeWriteValidationState,
-                NativeWriteSafetyState: mount.NativeWriteSafetyState,
-                RecoveryActive: mount.RecoveryActive,
-                RecoveryReason: mount.RecoveryReason,
-                LastRecoveryAction: mount.LastRecoveryAction,
-                LastCommitXid: mount.LastCommitXid,
-                WriteIncompatibilities: mount.WriteIncompatibilities,
-                WriteUnsupportedFeatures: mount.WriteUnsupportedFeatures,
-                DirtyTransactionCount: mount.DirtyTransactionCount,
-                ShutdownDrainActive: mount.ShutdownDrainActive,
-                InFlightMutationCallbacks: mount.InFlightMutationCallbacks,
-                NativeWriteValidationEvidence: mount.NativeWriteValidationEvidence,
-                NativeWriteDiagnostics: mount.NativeWriteDiagnostics,
-                MountReady: mount.MountReady,
-                HostProcessId: mount.HostProcessId,
-                WalAcceptedSequence: mount.WalAcceptedSequence,
-                WalApfsDurableSequence: mount.WalApfsDurableSequence,
-                WalCleanupSequence: mount.WalCleanupSequence,
-                PendingDurability: mount.WalAcceptedSequence > mount.WalApfsDurableSequence ||
-                    mount.DirtyTransactionCount > 0 ||
-                    mount.ShutdownDrainActive ||
-                    mount.InFlightMutationCallbacks > 0,
-                HostOwnershipState: mount.HostProcessId > 0 ? "owned" : "unknown",
-                CatalogVolumeId: mount.CatalogVolumeId,
-                CatalogContainerUuid: mount.CatalogContainerUuid,
-                CatalogVolumeObjectId: mount.CatalogVolumeObjectId,
-                CatalogDecision: mount.CatalogDecision,
-                CatalogReasons: mount.CatalogReasons,
-                CatalogAutoMountAllowed: mount.CatalogAutoMountAllowed,
-                CatalogSpace: mount.CatalogSpace,
-                HasRuntimeStatus: true))
-            .OrderBy(static volume => volume.MountPoint, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
+        => MountedStatusProjection.FromMounts(mounts);
 
     private static string? TryParseDeviceIdFromVolumeId(string? volumeId)
     {

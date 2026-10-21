@@ -19,8 +19,8 @@ public sealed class NativeObserverLocationTests
         Assert.Contains("ApfsObserver.exe", nativeBuild, StringComparison.Ordinal);
         Assert.Contains("$observerExe", nativeBuild, StringComparison.Ordinal);
         Assert.Contains("$nativeObserverExe", publish, StringComparison.Ordinal);
-        Assert.Contains("Join-Path $serviceOut \"ApfsObserver.exe\"", publish, StringComparison.Ordinal);
-        Assert.Contains("Join-Path $bundleOut \"ApfsObserver.exe\"", publish, StringComparison.Ordinal);
+        Assert.Contains("foreach ($destination in @($serviceOut, $probeOut, $cliOut, $bundleOut))", publish, StringComparison.Ordinal);
+        Assert.Contains("Copy-Item -LiteralPath $nativeObserverExe -Destination (Join-Path $destination \"ApfsObserver.exe\") -Force", publish, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -9,12 +10,59 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <iterator>
 #include <limits>
+#include <new>
 #include <span>
 #include <string>
+#include <string_view>
 #include <shared_mutex>
 #include <thread>
 #include <vector>
+
+namespace startup_allocation_observer
+{
+struct State
+{
+    bool armed = false;
+    std::size_t refusal_size = 0;
+    std::size_t largest = 0;
+    unsigned refused = 0;
+};
+thread_local State state;
+
+struct Watch
+{
+    explicit Watch(std::size_t refusal_size)
+    {
+        state = {true, refusal_size, 0, 0};
+    }
+    ~Watch() { state.armed = false; }
+};
+} // namespace startup_allocation_observer
+
+// Observe constructor allocations only, without a production allocation hook.
+void* operator new(std::size_t size)
+{
+    auto& state = startup_allocation_observer::state;
+    if (state.armed)
+    {
+        state.largest = (std::max)(state.largest, size);
+        if (size >= state.refusal_size)
+        {
+            ++state.refused;
+            throw std::bad_alloc();
+        }
+    }
+    auto* allocation = std::malloc(size == 0 ? 1 : size);
+    if (!allocation) throw std::bad_alloc();
+    return allocation;
+}
+void* operator new[](std::size_t size) { return ::operator new(size); }
+void operator delete(void* allocation) noexcept { std::free(allocation); }
+void operator delete(void* allocation, std::size_t) noexcept { std::free(allocation); }
+void operator delete[](void* allocation) noexcept { std::free(allocation); }
+void operator delete[](void* allocation, std::size_t) noexcept { std::free(allocation); }
 
 namespace apfsaccess::rw
 {
@@ -155,7 +203,7 @@ std::filesystem::path MakeRunRoot()
 {
     std::error_code ec;
     const auto unique_id = std::chrono::steady_clock::now().time_since_epoch().count();
-    auto root = std::filesystem::temp_directory_path(ec) /
+    auto root = std::filesystem::path("D:/ApfsAccessScratch/WindowsClosure/readonly-performance-20261013") /
         ("ApfsAccessPayloadSpoolTests_" + std::to_string(unique_id));
     std::filesystem::remove_all(root, ec);
     std::filesystem::create_directories(root, ec);
@@ -2245,7 +2293,7 @@ struct ScopedIndexDeltaDisable
     std::string previous;
     bool had_previous = false;
 
-    ScopedIndexDeltaDisable()
+    explicit ScopedIndexDeltaDisable(const char* disabled = "1")
     {
         char* value = nullptr;
         std::size_t value_size = 0;
@@ -2258,7 +2306,7 @@ struct ScopedIndexDeltaDisable
         {
             std::free(value);
         }
-        _putenv_s("APFSACCESS_DISABLE_INDEX_DELTA", "1");
+        _putenv_s("APFSACCESS_DISABLE_INDEX_DELTA", disabled);
     }
 
     ~ScopedIndexDeltaDisable()
@@ -2407,6 +2455,251 @@ bool TestLegacyIndexFallbackRemainsReadable(const std::filesystem::path& root)
     const auto counters = reloaded.SnapshotCounters();
     return Require(counters.recovery_required, "legacy index should remain recoverable") &&
            Require(counters.dirty_range_count == 1, "legacy index should reload its range");
+}
+
+struct StartupFileEvidence
+{
+    std::filesystem::path name;
+    std::vector<char> bytes;
+    std::filesystem::file_time_type write_time;
+
+    bool operator==(const StartupFileEvidence&) const = default;
+};
+
+bool CaptureStartupEvidence(
+    const std::filesystem::path& root, std::vector<StartupFileEvidence>& evidence)
+{
+    evidence.clear();
+    std::error_code ec;
+    const std::filesystem::directory_iterator entries(root, ec);
+    if (!Require(!ec, "Startup evidence directory should be readable")) return false;
+    for (const auto& entry : entries)
+    {
+        const auto size = entry.file_size(ec);
+        if (!Require(!ec, "Startup evidence file size should be readable")) return false;
+        const auto write_time = entry.last_write_time(ec);
+        if (!Require(!ec, "Startup evidence file timestamp should be readable")) return false;
+        std::ifstream input(entry.path(), std::ios::binary);
+        if (!Require(input.good(), "Startup evidence file should open")) return false;
+        std::vector<char> bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        if (!Require(!input.bad() && bytes.size() == size,
+                "Startup evidence should capture every original byte")) return false;
+        evidence.push_back({entry.path().filename(), std::move(bytes), write_time});
+    }
+    std::sort(evidence.begin(), evidence.end(), [](const auto& lhs, const auto& rhs)
+    {
+        return lhs.name < rhs.name;
+    });
+    return true;
+}
+
+bool StartupEvidenceUnchanged(
+    const std::filesystem::path& root, const std::vector<StartupFileEvidence>& before)
+{
+    std::vector<StartupFileEvidence> after;
+    return CaptureStartupEvidence(root, after) &&
+           Require(after == before, "Startup should preserve all file names, bytes and write timestamps");
+}
+
+bool WriteStartupBudgetFixture(
+    const std::filesystem::path& root,
+    bool journal,
+    std::span<const std::size_t> sizes,
+    std::vector<apfsaccess::rw::PayloadSpool::PersistedRangeReference>& references)
+{
+    using Spool = apfsaccess::rw::PayloadSpool;
+    ScopedIndexDeltaDisable index_format(journal ? "0" : "1");
+    Spool::Options options{root, kVolume};
+    options.max_bytes = 0;
+    options.durable_flush_bytes = 0;
+    options.durable_flush_appends = 0;
+    Spool spool(options);
+    references.clear();
+    for (std::size_t index = 0; index < sizes.size(); ++index)
+    {
+        const std::vector<std::byte> payload(sizes[index], static_cast<std::byte>(0x41 + index));
+        Spool::AppendResult accepted{};
+        if (!Require(spool.Append({kVolume, 920 + index, 1, 0, index + 1, payload}, &accepted) &&
+                spool.FlushDirtyState(), "Startup fixture should use production spool and index writers"))
+        {
+            return false;
+        }
+        references.push_back({kVolume, accepted.object_id, accepted.generation, accepted.logical_offset,
+            accepted.payload_length, accepted.spool_offset, accepted.wal_sequence, accepted.payload_sha256});
+    }
+    const auto counters = spool.SnapshotCounters();
+    return Require(counters.dirty_range_count == sizes.size(), "Startup fixture should keep distinct ranges") &&
+           Require(journal
+               ? counters.index_journal_snapshot_count == 1 &&
+                 counters.index_journal_append_count == sizes.size() - 1
+               : counters.index_journal_frame_count == 0,
+               "Startup fixture should write the requested real index format");
+}
+
+bool TestStartupBudgetsAdmitValidIndexes(const std::filesystem::path& root)
+{
+    using Spool = apfsaccess::rw::PayloadSpool;
+    constexpr std::array<std::size_t, 2> sizes{4096, 6144};
+    for (const bool journal : {false, true})
+    {
+        const auto directory = root / (journal ? "startup-admit-journal" : "startup-admit-snapshot");
+        std::vector<Spool::PersistedRangeReference> references;
+        if (!WriteStartupBudgetFixture(directory, journal, sizes, references)) return false;
+        std::vector<StartupFileEvidence> before;
+        if (!CaptureStartupEvidence(directory, before)) return false;
+        const auto index_size = std::filesystem::file_size(directory / "payload-spool.idx");
+        constexpr auto payload_size = sizes[0] + sizes[1];
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 3> budgets{{
+            {8ull * 1024 * 1024, 32ull * 1024 * 1024},
+            {index_size + 1, payload_size + 1},
+            {index_size, payload_size},
+        }};
+        for (const auto& [index_budget, payload_budget] : budgets)
+        {
+            Spool::Options options{directory, kVolume};
+            options.startup_index_max_bytes = index_budget;
+            options.startup_payload_read_max_bytes = payload_budget;
+            {
+                Spool reloaded(options);
+                const auto counters = reloaded.SnapshotCounters();
+                if (!Require(counters.dirty_range_count == sizes.size() && !counters.index_dirty,
+                        "Below-budget and exact-budget startup should decode all indexed ranges") ||
+                    !Require(reloaded.RecoveryRequired() && counters.recovery_required,
+                        "Admitted dirty startup should retain its existing recovery requirement")) return false;
+                // Repeated normal reads exceed the startup total without consuming that budget.
+                for (unsigned repeat = 0; repeat < 2; ++repeat)
+                {
+                    for (std::size_t index = 0; index < references.size(); ++index)
+                    {
+                        std::vector<std::byte> actual;
+                        const auto expected = static_cast<std::byte>(0x41 + index);
+                        if (!Require(reloaded.ReadPersistedRange(references[index], actual) &&
+                                actual.size() == sizes[index] &&
+                                std::all_of(actual.begin(), actual.end(), [expected](auto byte)
+                                    { return byte == expected; }),
+                                "Startup budgets should leave normal checksum-validated reads unchanged")) return false;
+                    }
+                }
+            }
+            if (!StartupEvidenceUnchanged(directory, before)) return false;
+        }
+    }
+    return true;
+}
+
+bool TestStartupIndexBudgetRefusesBeforeAllocation(const std::filesystem::path& root)
+{
+    using Spool = apfsaccess::rw::PayloadSpool;
+    constexpr std::uint64_t index_budget = 8ull * 1024 * 1024;
+    constexpr std::size_t allocation_limit = 1024 * 1024;
+    constexpr std::array<std::size_t, 1> sizes{4096};
+    for (const bool journal : {false, true})
+    {
+        const auto directory = root / (journal ? "startup-oversized-journal" : "startup-oversized-snapshot");
+        std::vector<Spool::PersistedRangeReference> references;
+        if (!WriteStartupBudgetFixture(directory, journal, sizes, references)) return false;
+        const auto index_path = directory / "payload-spool.idx";
+        std::error_code ec;
+        std::filesystem::resize_file(index_path, index_budget + 1, ec);
+        if (!Require(!ec && std::filesystem::file_size(index_path) == index_budget + 1,
+                "Oversized startup fixture should be an actual file larger than 8 MiB")) return false;
+        std::vector<StartupFileEvidence> before;
+        if (!CaptureStartupEvidence(directory, before)) return false;
+        Spool::Options options{directory, kVolume};
+        options.startup_index_max_bytes = index_budget;
+        options.startup_payload_read_max_bytes = 32ull * 1024 * 1024;
+        bool refused = false;
+        try
+        {
+            startup_allocation_observer::Watch watch(allocation_limit);
+            Spool reloaded(options);
+            const auto counters = reloaded.SnapshotCounters();
+            refused = reloaded.RecoveryRequired() && counters.recovery_required &&
+                counters.dirty_range_count == 0 && !counters.index_dirty;
+        }
+        catch (const std::bad_alloc&)
+        {
+            return Require(false, "Oversized index refusal must precede proportional allocation");
+        }
+        if (!Require(refused, "Oversized index startup should refuse with truthful recovery state") ||
+            !Require(startup_allocation_observer::state.refused == 0 &&
+                startup_allocation_observer::state.largest < allocation_limit,
+                "Oversized index startup should not attempt even a 1 MiB allocation") ||
+            !StartupEvidenceUnchanged(directory, before)) return false;
+    }
+    return true;
+}
+
+bool TestStartupPayloadBudgetRefusesRanges(const std::filesystem::path& root)
+{
+    using Spool = apfsaccess::rw::PayloadSpool;
+    constexpr std::uint64_t payload_budget = 32ull * 1024 * 1024;
+    constexpr std::array<std::size_t, 1> single{payload_budget + 1};
+    // Separate allocation sizes so STL alignment overhead on the admitted range
+    // cannot cross the observer's threshold for the over-budget second range.
+    constexpr std::array<std::size_t, 2> aggregate{payload_budget / 4, payload_budget * 3 / 4 + 1};
+    for (const bool journal : {false, true})
+    {
+        for (const bool multiple : {false, true})
+        {
+            const auto directory = root / (journal ? "startup-payload-journal" : "startup-payload-snapshot") /
+                (multiple ? "aggregate" : "single");
+            const auto sizes = multiple ? std::span<const std::size_t>(aggregate) : std::span<const std::size_t>(single);
+            std::vector<Spool::PersistedRangeReference> references;
+            if (!WriteStartupBudgetFixture(directory, journal, sizes, references)) return false;
+            std::vector<StartupFileEvidence> before;
+            if (!CaptureStartupEvidence(directory, before)) return false;
+            Spool::Options options{directory, kVolume};
+            options.startup_index_max_bytes = 8ull * 1024 * 1024;
+            options.startup_payload_read_max_bytes = payload_budget;
+            bool refused = false;
+            const auto report_allocations = [&](const char* phase)
+            {
+                const auto& observed = startup_allocation_observer::state;
+                std::cout << "[ALLOC] format=" << (journal ? "journal" : "legacy")
+                    << " case=" << (multiple ? "aggregate" : "single")
+                    << " phase=" << phase
+                    << " first_range=" << sizes.front() << " last_range=" << sizes.back()
+                    << " threshold=" << observed.refusal_size << " largest=" << observed.largest
+                    << " allocation_refusals=" << observed.refused << std::endl;
+            };
+            try
+            {
+                startup_allocation_observer::Watch watch(sizes.back());
+                Spool reloaded(options);
+                const auto counters = reloaded.SnapshotCounters();
+                refused = reloaded.RecoveryRequired() && counters.recovery_required &&
+                    counters.dirty_range_count == 0 && !counters.index_dirty;
+            }
+            catch (const std::bad_alloc&)
+            {
+                report_allocations("bounded");
+                return Require(false, "Payload budget refusal must precede the over-budget range allocation");
+            }
+            report_allocations("bounded");
+            if (!Require(refused, "Valid ranges exceeding 32 MiB startup reads should require recovery") ||
+                !Require(startup_allocation_observer::state.refused == 0 &&
+                    startup_allocation_observer::state.largest < sizes.back(),
+                    "Startup should refuse before allocating the range that exceeds its remaining budget") ||
+                !Require(!multiple || startup_allocation_observer::state.largest >= sizes.front(),
+                    "Aggregate fixture should admit the first range before refusing the second") ||
+                !StartupEvidenceUnchanged(directory, before)) return false;
+            // Both options are independently optional; this restart also proves valid evidence was retained.
+            options.startup_payload_read_max_bytes = 0;
+            {
+                startup_allocation_observer::Watch watch((std::numeric_limits<std::size_t>::max)());
+                Spool unbounded_payload(options);
+                if (!Require(unbounded_payload.SnapshotCounters().dirty_range_count == sizes.size(),
+                        "Zero payload budget should retain unbounded compatibility for the same valid index")) return false;
+            }
+            report_allocations("zero-budget");
+            if (!Require(startup_allocation_observer::state.refused == 0 &&
+                    startup_allocation_observer::state.largest >= sizes.back(),
+                    "Zero-budget control should observe the larger production payload allocation")) return false;
+            if (!StartupEvidenceUnchanged(directory, before)) return false;
+        }
+    }
+    return true;
 }
 
 bool TestFastCapacityProbeSkipsHealthySpoolLock(const std::filesystem::path& root)
@@ -2848,73 +3141,96 @@ bool TestInlineRestoreKeepsImmutableOffsets(const std::filesystem::path& root)
     return true;
 }
 
-int main()
+int main(int argc, char** argv)
 {
+    if (argc != 1 && (argc != 3 || std::string_view(argv[1]) != "--test"))
+    {
+        std::cerr << "Usage: PayloadSpoolTests [--test TestName]" << std::endl;
+        return 1;
+    }
+    const std::string_view selected_test = argc == 3 ? argv[2] : "";
     const auto root = MakeRunRoot();
     bool ok = true;
-    ok &= TestAppendReturnsAcceptedPayloadReference(root);
-    ok &= TestInlineRestoreKeepsImmutableOffsets(root);
-    ok &= TestPersistedRangeRequiresExactWalIdentityAndSha256(root);
-    ok &= TestPayloadOnlyFlushRebuildsMissingIndex(root);
-    ok &= TestIndexRebuildDiscardsInlineWalRangesAndKeepsLegacyPayload(root);
-    ok &= TestIndexRebuildRejectsUnknownTailDespiteInlineWalRange(root);
-    ok &= TestCoalescingAndPartialReads(root);
-    ok &= TestOverlappingWritesReportUniqueCoverage(root);
-    ok &= TestOverlayUsesWalSequenceOrderNotAppendOrder(root);
-    ok &= TestOverlayUsesSpoolOrderAfterMergedAppend(root);
-    ok &= TestLargeSequentialWritesStayAppendFriendly(root);
-    ok &= TestDiscardSequenceKeepsEarlierWrites(root);
-    ok &= TestChecksumMismatchAndWrongVolume(root);
-    ok &= TestCleanupAndQuota(root);
-    ok &= TestFinalCleanupSkipsRedundantPayloadFlush(root);
-    ok &= TestMaxDirtyRangeEndTracksLatestLogicalTail(root);
-    ok &= TestOverlayReportsLogicalTailWithOneSpoolLookup(root);
-    ok &= TestIndexReloadAndCorruption(root);
-    ok &= TestAppendBatchesIndexPersistenceUntilFlush(root);
-    ok &= TestManySequentialAppendsAvoidPerAppendIndexRewrite(root);
-    ok &= TestNonOverlappingOverlayAvoidsPayloadOpen(root);
-    ok &= TestCoverageQueryUsesRangeIndexOnly(root);
-    ok &= TestManyRangeCoverageUsesSortedUnion(root);
-    ok &= TestCoverageQueryDefersChecksumValidationToRead(root);
-    ok &= TestRepeatedDirtyReadsReusePayloadReadHandle(root);
-    ok &= TestPartialDirtyReadsReuseValidatedPayloadCache(root);
-    ok &= TestConcurrentSingleRangeReadsPreserveBytes(root);
-    ok &= TestConcurrentMultiRangeReadsReleaseSpoolMutexDuringPayloadIo(root);
-    ok &= TestOverlayUsesDirectDestinationReads(root);
-    ok &= TestOverlayScratchStoragePersistsAcrossCalls(root);
-    ok &= TestAppendMergeScratchStoragePersistsAcrossCalls(root);
-    ok &= TestReadFullyCoveredRangeCombinesCoverageAndRead(root);
-    ok &= TestOverlayPastDirtyTailAvoidsPayloadOpen(root);
-    ok &= TestThresholdFlushFailureRollsBackLastAppend(root);
-    ok &= TestThresholdFlushFailureRollsBackMergedRanges(root);
-    ok &= TestManyObjectReadsUseObjectLookup(root);
-    ok &= TestOrphanedSpoolBytesRequireRecovery(root);
-    ok &= TestUnindexedPayloadRecoveryRequiresEmptyWalProof(root);
-    ok &= TestCorruptIndexCannotUseUnindexedPayloadRecovery(root);
-    ok &= TestOldestDirtyAgeTracksOldestRangeIncrementally(root);
-    ok &= TestCleanupClearsDirtyTailCache(root);
-    ok &= TestCleanupNoOpAvoidsSpoolRewrite(root);
-    ok &= TestCleanupPersistsOnlySurvivingIndexState(root);
-    ok &= TestCleanupReportsBlockedSpoolDeletion(root);
-    ok &= TestCleanupBlocksPayloadRemovalWhenIndexRemovalFails(root);
-    ok &= TestCleanupPreservesWalOffsetsForLaterRanges(root);
-    ok &= TestCleanupNoOpAvoidsSequenceScan(root);
-    ok &= TestDirtyTailCacheKeepsZeroOffsetRanges(root);
-    ok &= TestIndexJournalUsesAppendFramesAndReloads(root);
-    ok &= TestIndexJournalPreservesCleanupTailAcrossReload(root);
-    ok &= TestIndexJournalRejectsTornTail(root);
-    ok &= TestLegacyIndexFallbackRemainsReadable(root);
-    ok &= TestFastCapacityProbeSkipsHealthySpoolLock(root);
-    ok &= TestFastCapacityProbeFallsBackForQuota(root);
-    ok &= TestDirectReadReleasesPayloadIoBeforeMetadataReacquire(root);
-    ok &= TestMultiRangeFailureReleasesPayloadIoBeforeMetadataReacquire(root);
-    ok &= TestFailedLargeDirectAppendTruncatesUnindexedTail(root);
-    ok &= TestPayloadSpoolDisablesMutexWaitTelemetry(root);
-    ok &= TestPayloadSpoolReportsContendedMutexWaitLatency(root);
-    ok &= TestPayloadSpoolMutexWaitPercentileAndSaturationBoundaries(root);
+    unsigned selected_count = 0;
+    const auto run = [&](const char* name, bool (*test)(const std::filesystem::path&))
+    {
+        if (!selected_test.empty() && selected_test != name) return;
+        ++selected_count;
+        const bool passed = test(root);
+        ok &= passed;
+        std::cout << (passed ? "[PASS] " : "[FAIL] ") << name << std::endl;
+    };
+    run("TestAppendReturnsAcceptedPayloadReference", TestAppendReturnsAcceptedPayloadReference);
+    run("TestInlineRestoreKeepsImmutableOffsets", TestInlineRestoreKeepsImmutableOffsets);
+    run("TestPersistedRangeRequiresExactWalIdentityAndSha256", TestPersistedRangeRequiresExactWalIdentityAndSha256);
+    run("TestPayloadOnlyFlushRebuildsMissingIndex", TestPayloadOnlyFlushRebuildsMissingIndex);
+    run("TestIndexRebuildDiscardsInlineWalRangesAndKeepsLegacyPayload", TestIndexRebuildDiscardsInlineWalRangesAndKeepsLegacyPayload);
+    run("TestIndexRebuildRejectsUnknownTailDespiteInlineWalRange", TestIndexRebuildRejectsUnknownTailDespiteInlineWalRange);
+    run("TestCoalescingAndPartialReads", TestCoalescingAndPartialReads);
+    run("TestOverlappingWritesReportUniqueCoverage", TestOverlappingWritesReportUniqueCoverage);
+    run("TestOverlayUsesWalSequenceOrderNotAppendOrder", TestOverlayUsesWalSequenceOrderNotAppendOrder);
+    run("TestOverlayUsesSpoolOrderAfterMergedAppend", TestOverlayUsesSpoolOrderAfterMergedAppend);
+    run("TestLargeSequentialWritesStayAppendFriendly", TestLargeSequentialWritesStayAppendFriendly);
+    run("TestDiscardSequenceKeepsEarlierWrites", TestDiscardSequenceKeepsEarlierWrites);
+    run("TestChecksumMismatchAndWrongVolume", TestChecksumMismatchAndWrongVolume);
+    run("TestCleanupAndQuota", TestCleanupAndQuota);
+    run("TestFinalCleanupSkipsRedundantPayloadFlush", TestFinalCleanupSkipsRedundantPayloadFlush);
+    run("TestMaxDirtyRangeEndTracksLatestLogicalTail", TestMaxDirtyRangeEndTracksLatestLogicalTail);
+    run("TestOverlayReportsLogicalTailWithOneSpoolLookup", TestOverlayReportsLogicalTailWithOneSpoolLookup);
+    run("TestIndexReloadAndCorruption", TestIndexReloadAndCorruption);
+    run("TestAppendBatchesIndexPersistenceUntilFlush", TestAppendBatchesIndexPersistenceUntilFlush);
+    run("TestManySequentialAppendsAvoidPerAppendIndexRewrite", TestManySequentialAppendsAvoidPerAppendIndexRewrite);
+    run("TestNonOverlappingOverlayAvoidsPayloadOpen", TestNonOverlappingOverlayAvoidsPayloadOpen);
+    run("TestCoverageQueryUsesRangeIndexOnly", TestCoverageQueryUsesRangeIndexOnly);
+    run("TestManyRangeCoverageUsesSortedUnion", TestManyRangeCoverageUsesSortedUnion);
+    run("TestCoverageQueryDefersChecksumValidationToRead", TestCoverageQueryDefersChecksumValidationToRead);
+    run("TestRepeatedDirtyReadsReusePayloadReadHandle", TestRepeatedDirtyReadsReusePayloadReadHandle);
+    run("TestPartialDirtyReadsReuseValidatedPayloadCache", TestPartialDirtyReadsReuseValidatedPayloadCache);
+    run("TestConcurrentSingleRangeReadsPreserveBytes", TestConcurrentSingleRangeReadsPreserveBytes);
+    run("TestConcurrentMultiRangeReadsReleaseSpoolMutexDuringPayloadIo", TestConcurrentMultiRangeReadsReleaseSpoolMutexDuringPayloadIo);
+    run("TestOverlayUsesDirectDestinationReads", TestOverlayUsesDirectDestinationReads);
+    run("TestOverlayScratchStoragePersistsAcrossCalls", TestOverlayScratchStoragePersistsAcrossCalls);
+    run("TestAppendMergeScratchStoragePersistsAcrossCalls", TestAppendMergeScratchStoragePersistsAcrossCalls);
+    run("TestReadFullyCoveredRangeCombinesCoverageAndRead", TestReadFullyCoveredRangeCombinesCoverageAndRead);
+    run("TestOverlayPastDirtyTailAvoidsPayloadOpen", TestOverlayPastDirtyTailAvoidsPayloadOpen);
+    run("TestThresholdFlushFailureRollsBackLastAppend", TestThresholdFlushFailureRollsBackLastAppend);
+    run("TestThresholdFlushFailureRollsBackMergedRanges", TestThresholdFlushFailureRollsBackMergedRanges);
+    run("TestManyObjectReadsUseObjectLookup", TestManyObjectReadsUseObjectLookup);
+    run("TestOrphanedSpoolBytesRequireRecovery", TestOrphanedSpoolBytesRequireRecovery);
+    run("TestUnindexedPayloadRecoveryRequiresEmptyWalProof", TestUnindexedPayloadRecoveryRequiresEmptyWalProof);
+    run("TestCorruptIndexCannotUseUnindexedPayloadRecovery", TestCorruptIndexCannotUseUnindexedPayloadRecovery);
+    run("TestOldestDirtyAgeTracksOldestRangeIncrementally", TestOldestDirtyAgeTracksOldestRangeIncrementally);
+    run("TestCleanupClearsDirtyTailCache", TestCleanupClearsDirtyTailCache);
+    run("TestCleanupNoOpAvoidsSpoolRewrite", TestCleanupNoOpAvoidsSpoolRewrite);
+    run("TestCleanupPersistsOnlySurvivingIndexState", TestCleanupPersistsOnlySurvivingIndexState);
+    run("TestCleanupReportsBlockedSpoolDeletion", TestCleanupReportsBlockedSpoolDeletion);
+    run("TestCleanupBlocksPayloadRemovalWhenIndexRemovalFails", TestCleanupBlocksPayloadRemovalWhenIndexRemovalFails);
+    run("TestCleanupPreservesWalOffsetsForLaterRanges", TestCleanupPreservesWalOffsetsForLaterRanges);
+    run("TestCleanupNoOpAvoidsSequenceScan", TestCleanupNoOpAvoidsSequenceScan);
+    run("TestDirtyTailCacheKeepsZeroOffsetRanges", TestDirtyTailCacheKeepsZeroOffsetRanges);
+    run("TestIndexJournalUsesAppendFramesAndReloads", TestIndexJournalUsesAppendFramesAndReloads);
+    run("TestIndexJournalPreservesCleanupTailAcrossReload", TestIndexJournalPreservesCleanupTailAcrossReload);
+    run("TestIndexJournalRejectsTornTail", TestIndexJournalRejectsTornTail);
+    run("TestLegacyIndexFallbackRemainsReadable", TestLegacyIndexFallbackRemainsReadable);
+    run("TestStartupBudgetsAdmitValidIndexes", TestStartupBudgetsAdmitValidIndexes);
+    run("TestStartupIndexBudgetRefusesBeforeAllocation", TestStartupIndexBudgetRefusesBeforeAllocation);
+    run("TestStartupPayloadBudgetRefusesRanges", TestStartupPayloadBudgetRefusesRanges);
+    run("TestFastCapacityProbeSkipsHealthySpoolLock", TestFastCapacityProbeSkipsHealthySpoolLock);
+    run("TestFastCapacityProbeFallsBackForQuota", TestFastCapacityProbeFallsBackForQuota);
+    run("TestDirectReadReleasesPayloadIoBeforeMetadataReacquire", TestDirectReadReleasesPayloadIoBeforeMetadataReacquire);
+    run("TestMultiRangeFailureReleasesPayloadIoBeforeMetadataReacquire", TestMultiRangeFailureReleasesPayloadIoBeforeMetadataReacquire);
+    run("TestFailedLargeDirectAppendTruncatesUnindexedTail", TestFailedLargeDirectAppendTruncatesUnindexedTail);
+    run("TestPayloadSpoolDisablesMutexWaitTelemetry", TestPayloadSpoolDisablesMutexWaitTelemetry);
+    run("TestPayloadSpoolReportsContendedMutexWaitLatency", TestPayloadSpoolReportsContendedMutexWaitLatency);
+    run("TestPayloadSpoolMutexWaitPercentileAndSaturationBoundaries", TestPayloadSpoolMutexWaitPercentileAndSaturationBoundaries);
 
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
+    if (selected_count == 0)
+    {
+        std::cerr << "[FAIL] Unknown PayloadSpool test: " << selected_test << std::endl;
+        return 1;
+    }
     if (!ok)
     {
         return 1;

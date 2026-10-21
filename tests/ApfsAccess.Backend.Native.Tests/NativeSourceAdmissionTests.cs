@@ -20,6 +20,21 @@ public sealed class NativeSourceAdmissionTests
     };
 
     [Theory]
+    [InlineData(@"\\.\PhysicalDrive1", @"\\.\PhysicalDrive1", true)]
+    [InlineData(@"\\?\PhysicalDrive1", @"\\.\PhysicalDrive1", true)]
+    [InlineData(@"\\.\PhysicalDrive1", @"\\?\PhysicalDrive1", true)]
+    [InlineData(@"\\.\PhysicalDrive10", @"\\.\PhysicalDrive1", false)]
+    [InlineData(@"\\.\PhysicalDrive12", @"\\.\PhysicalDrive1", false)]
+    [InlineData(@"\\?\PhysicalDrive12", @"\\.\PhysicalDrive1", false)]
+    [InlineData(@"\\.\PhysicalDrive1", "PhysicalDrive", false)]
+    public void RawDriveAllowListRequiresTheExactDevice(string source, string allowed, bool expected)
+    {
+        var options = RawPilotOptions(true, [allowed]);
+
+        Assert.Equal(expected, NativeWriteSourceAdmission.IsAllowListedRawDrive(source, options));
+    }
+
+    [Theory]
     [InlineData(@"\\.\PhysicalDrive999")]
     [InlineData(@"\\?\PhysicalDrive999")]
     [InlineData(@"\\.\Harddisk999Partition1")]
@@ -104,7 +119,7 @@ public sealed class NativeSourceAdmissionTests
                 "P", Volumes: [new CatalogVolumeSpec("Data")])]));
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
             "a9cb92d28b7c4b599eab633c7625f491",
-            [new ObserverEvidenceJson.VolumeJson("Data", 201)]);
+            [new ObserverEvidenceJson.VolumeJson("Data", 201)], devicePath: path);
         var options = Options();
         using var backend = new NativeApfsBackend(options, lifecycleTestHooks: null,
             observerRunner: new StubRunner(evidence),
@@ -127,6 +142,59 @@ public sealed class NativeSourceAdmissionTests
         Assert.True(refreshed.SupportsNativeWrite);
         Assert.True(WriteGatePolicy.EvaluateForVolume(options, refreshed).AllowWrite);
     }
+
+    [Theory]
+    [InlineData(@"\\.\PhysicalDrive2", true, true)]
+    [InlineData(@"\\?\PhysicalDrive2", true, true)]
+    [InlineData(@"\\.\PHYSICALDRIVE2", true, true)]
+    [InlineData(@"\\.\PhysicalDrive2", false, false)]
+    [InlineData(@"\\.\PhysicalDrive999", false, true)]
+    [InlineData(@"\\.\Harddisk2Partition1", false, true)]
+    [InlineData(@"\\.\PhysicalDrive2x", false, true)]
+    [InlineData(@"\\.\PhysicalDrive", false, true)]
+    [InlineData(@"D:\volume.img", false, true)]
+    public void IsAllowListedRawDrive_MatchesSpellingAndPilotAllowList(
+        string source, bool expected, bool allowRaw)
+    {
+        var options = RawPilotOptions(allowRaw, [@"\\.\PhysicalDrive2"]);
+        Assert.Equal(expected, NativeWriteSourceAdmission.IsAllowListedRawDrive(source, options));
+        Assert.False(NativeWriteSourceAdmission.IsAllowListedRawDrive(source, null));
+        Assert.False(NativeWriteSourceAdmission.IsAllowListedRawDrive(
+            source, RawPilotOptions(true, [])));
+    }
+
+    [Fact]
+    public void AllowListedButAbsent_RawDrive_StaysBlockedOnHandleProof()
+    {
+        var options = RawPilotOptions(true, [@"\\.\PhysicalDrive999"]);
+        using var backend = new NativeApfsBackend(options);
+        Assert.True(NativeWriteSourceAdmission.IsAllowListedRawDrive(@"\\.\PhysicalDrive999", options));
+        AssertBlocked(BuildLegacyVolume(backend, @"\\.\PhysicalDrive999"), options);
+    }
+
+    [SacrificialRawFact]
+    public void SacrificialRawDrive_AllowListed_AdmitsAtSpellingLayer()
+    {
+        // Hardware-gated pilot pin: runs only when the operator explicitly
+        // opts in with the sacrificial device present. It proves the spelling
+        // + allow-list + disk-handle proof chain end to end on real media;
+        // downstream gates (catalog, evidence, readiness) still decide writes.
+        var options = RawPilotOptions(true, [@"\\.\PhysicalDrive2"]);
+        Assert.Null(NativeWriteSourceAdmission.GetBlockReason(@"\\.\PhysicalDrive2", options));
+    }
+
+    private static ServiceHostOptions RawPilotOptions(bool allowRaw, string[] allowList) => new()
+    {
+        BackendMode = "Native",
+        EnableNativeWrite = true,
+        WriteBackendMode = "Native",
+        WriteRolloutChannel = "Enabled",
+        AllowWriteOnUnsupportedFeatures = true,
+        NativeWriteAllowRawPhysicalDevices = allowRaw,
+        NativeWriteHardwarePilotDeviceAllowList = allowList,
+        NativeWritePromotionPolicy = "Stable",
+        NativeAutoDiscoverPhysicalDrives = false,
+    };
 
     private static VolumeInfo BuildLegacyVolume(NativeApfsBackend backend, string source)
     {
@@ -152,5 +220,14 @@ public sealed class NativeSourceAdmissionTests
     {
         public ObserverRunResult Run(string observerPath, IReadOnlyList<string> arguments)
             => new(0, evidence, string.Empty);
+    }
+
+    private sealed class SacrificialRawFactAttribute : FactAttribute
+    {
+        public SacrificialRawFactAttribute()
+        {
+            if (!string.Equals(Environment.GetEnvironmentVariable("APFSACCESS_ALLOW_SACRIFICIAL_RAW"), "1", StringComparison.Ordinal))
+                Skip = "Requires an explicitly approved sacrificial physical drive.";
+        }
     }
 }

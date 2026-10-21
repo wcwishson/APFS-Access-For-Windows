@@ -21,6 +21,8 @@ NTSTATUS DrainDeferredAccessTimeBatch(MountContext* c)
     // Admit one bounded worker batch before staging. Stop and admission share
     // the scheduler lock: a later stop lets this batch finish, while a stop
     // that won first leaves the queue intact for the final shutdown drain.
+    LatencySpan batch(TraceFor(c), "atime.batch", {c->deferred_access_times.size(),
+        c->deferred_access_time_overflow, deferred_commit_worker_context == c});
     const bool worker_batch = deferred_commit_worker_context == c;
     ScopeExit release_admission{[&] {
         if (worker_batch) admitted_worker_atime_context = nullptr;
@@ -164,6 +166,7 @@ NTSTATUS DrainDeferredAccessTimeBatch(MountContext* c)
 
 NTSTATUS DrainDeferredAccessTimes(MountContext* c)
 {
+    LatencySpan latency(TraceFor(c), "atime.drain");
 #ifdef APFSACCESS_HAS_RW_ENGINE
     if (!c || c->draining_access_times) return STATUS_SUCCESS;
     do
@@ -206,20 +209,67 @@ bool TryDeferAutomaticAccessTime(MountContext* c, OpenContext* o)
 {
 #ifdef APFSACCESS_HAS_RW_ENGINE
     // Caller owns the mutation gate and external admission. Unsupported,
-    // detached, overlay, legacy and mixed data cases retain the old callback.
+    // detached, overlay, legacy and mixed file-data cases retain the old callback.
+    const bool regular_file = o->node->node_kind == NodeKind::RegularFile;
+    // atime.decision args: reason, same-inode writers (including aliases),
+    // global writers, older pending work, inode, regular. Reasons: 0 queued,
+    // 1 policy (states unsampled), 2 kind, 3 identity, 4 writer, 5 alias
+    // transition, 6 queued owner mismatch, 7 unbound manifest prefix.
+    // Diagnostic storage is fixed-size.
+    std::uint64_t inode_writers = 0;
+    bool global_writers = false, pending = false;
+    auto* trace = TraceFor(c);
+    const auto decision = [&](std::uint64_t reason) {
+        LatencySpan latency(trace, "atime.decision",
+            {reason, inode_writers, global_writers, pending, o->node->object_id, regular_file});
+        return reason == 0;
+    };
     if (!IsDeferCloseCommitsEnabled() || !IsNativeMutationWriteEnabled(c) ||
         !c->tx_manager || !c->payload_spool || !ShouldCaptureNativeContentTimes(c) ||
-        o->node->node_kind != NodeKind::RegularFile || o->node->object_id == 0 ||
-        HasOpenWriteHandles(c) || HasPendingNativeMutations(c)) return false;
+        o->node->object_id == 0) return decision(1);
+    if (regular_file || trace)
+    {
+        global_writers = HasOpenWriteHandles(c);
+        // Preserve the short-circuit cost when diagnostics are disabled.
+        if (!global_writers || trace) pending = HasPendingNativeMutations(c);
+    }
+    const bool isolate_regular_reader = regular_file && (global_writers || pending);
+    // Only the ordinary binder can give queued manifest requests identities.
+    // Bound older work uses the existing drain; unbound prefixes keep fallback.
+    if (isolate_regular_reader && IsManifestSession(c) && ManifestQueuedRequestCount(c) != 0)
+        return decision(7);
+    bool directory_reader = false;
     bool force_drain = false;
     {
         std::lock_guard<std::mutex> names(c->mutex);
         const auto& node = o->node;
+        directory_reader = node->node_kind == NodeKind::Directory;
+        if (!regular_file && !directory_reader) return decision(2);
+        // Metadata-only atime may follow unrelated work: the drain commits
+        // that older prefix before staging. Keep same-inode writers and alias
+        // transitions on the original callback path.
         if (node->namespace_detached || IsDeleteBlockedStateLocked(node) ||
             (node->shared_payload && node->shared_payload->object_id != node->object_id) ||
-            TryGetNodeLockedNormalized(c, node->path) != node) return false;
+            TryGetNodeLockedNormalized(c, node->path) != node) return decision(3);
+        if (regular_file)
+        {
+            inode_writers = node->write_handle_count;
+            if (node->shared_payload)
+                for (const auto& weak : node->shared_payload->aliases)
+                    if (const auto alias = weak.lock(); alias && alias != node && alias->shared_payload == node->shared_payload)
+                        inode_writers += alias->write_handle_count;
+            if (inode_writers != 0) return decision(4);
+            if (isolate_regular_reader && !node->committed_read_path.empty()) return decision(5);
+            if (isolate_regular_reader && node->shared_payload)
+                for (const auto& weak : node->shared_payload->aliases)
+                    if (const auto alias = weak.lock(); alias &&
+                        (alias->shared_payload != node->shared_payload || alias->object_id != node->object_id ||
+                            alias->namespace_detached || IsDeleteBlockedStateLocked(alias) ||
+                            !alias->committed_read_path.empty() || TryGetNodeLockedNormalized(c, alias->path) != alias))
+                        return decision(5);
+        }
         const auto found = c->deferred_access_times.find(node->object_id);
-        if (found != c->deferred_access_times.end() && found->second.owner != node->shared_payload) return false;
+        if (found != c->deferred_access_times.end() && found->second.owner != node->shared_payload) return decision(6);
         const auto now = ToFileTimeValue(UtcNow());
         node->deferred_access_time = now;
         if (node->shared_payload) node->shared_payload->deferred_access_time.store(now, std::memory_order_release);
@@ -238,14 +288,15 @@ bool TryDeferAutomaticAccessTime(MountContext* c, OpenContext* o)
         if (!c->deferred_access_time_requested) c->deferred_access_time_first = now;
         force_drain |= now >= c->deferred_access_time_first + kDeferredAccessTimeMaximumDelay;
         c->deferred_access_time_requested = true;
-        c->deferred_access_time_deadline = (std::min)(now + kDeferredAccessTimeIdleDelay,
-            c->deferred_access_time_first + kDeferredAccessTimeMaximumDelay);
+        c->deferred_access_time_deadline = (directory_reader || isolate_regular_reader) && force_drain ? now :
+            (std::min)(now + kDeferredAccessTimeIdleDelay,
+                c->deferred_access_time_first + kDeferredAccessTimeMaximumDelay);
     }
     c->deferred_commit_cv.notify_all();
-    // Already own the mutation gate. Foreground reads cannot starve the worker
-    // past the original maximum age, and a failed drain retains this new time.
-    if (force_drain) (void)DrainDeferredAccessTimes(c);
-    return true;
+    // Directory-list and isolated-reader Cleanup only wake the bounded worker,
+    // including overflow and overdue debt. Preserve the quiet-volume policy.
+    if (force_drain && !directory_reader && !isolate_regular_reader) (void)DrainDeferredAccessTimes(c);
+    return decision(0);
 #else
     return false;
 #endif

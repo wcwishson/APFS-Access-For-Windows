@@ -13,6 +13,9 @@ internal sealed record ObserverRunResult(int ExitCode, string StandardOutput, st
 internal interface IObserverRunner
 {
     ObserverRunResult Run(string observerPath, IReadOnlyList<string> arguments);
+    ObserverRunResult RunWithCredential(string observerPath, IReadOnlyList<string> arguments,
+        ApfsAccess.Cli.SupervisedCredential credential, CancellationToken cancellationToken)
+        => throw new NotSupportedException("This observer runner has no credential-pipe transport.");
 
     // Legacy runners remain source compatible. Production overrides this boundary
     // and stops the owned observer, rather than timing out only the caller.
@@ -39,7 +42,12 @@ internal sealed class ProcessObserverRunner : IObserverRunner
     public ObserverRunResult Run(string observerPath, IReadOnlyList<string> arguments, CancellationToken cancellationToken)
         => RunAsync(observerPath, arguments, cancellationToken).GetAwaiter().GetResult();
 
-    private async Task<ObserverRunResult> RunAsync(string observerPath, IReadOnlyList<string> arguments, CancellationToken cancellationToken)
+    public ObserverRunResult RunWithCredential(string observerPath, IReadOnlyList<string> arguments,
+        ApfsAccess.Cli.SupervisedCredential credential, CancellationToken cancellationToken)
+        => RunAsync(observerPath, arguments, cancellationToken, credential).GetAwaiter().GetResult();
+
+    private async Task<ObserverRunResult> RunAsync(string observerPath, IReadOnlyList<string> arguments, CancellationToken cancellationToken,
+        ApfsAccess.Cli.SupervisedCredential? credential = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(observerPath);
         ArgumentNullException.ThrowIfNull(arguments);
@@ -53,6 +61,7 @@ internal sealed class ProcessObserverRunner : IObserverRunner
             CreateNoWindow = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            RedirectStandardInput = credential is not null,
             WorkingDirectory = Path.GetDirectoryName(observerPath) ?? AppContext.BaseDirectory,
         };
         foreach (var argument in arguments) psi.ArgumentList.Add(argument);
@@ -86,6 +95,11 @@ internal sealed class ProcessObserverRunner : IObserverRunner
         var drains = Task.WhenAll(stdout, stderr);
         try
         {
+            if (credential is not null)
+            {
+                try { await credential.SendAsync(process.StandardInput.BaseStream, deadline.Token).ConfigureAwait(false); }
+                finally { process.StandardInput.Close(); }
+            }
             await process.WaitForExitAsync(deadline.Token).ConfigureAwait(false);
             // Include pipe draining in the execution deadline, including inherited handles.
             await drains.WaitAsync(deadline.Token).ConfigureAwait(false);
@@ -296,6 +310,27 @@ internal static class NativeApfsObserver
         // --image, mirroring the observer CLI contract.
         var sourceFlag = IsRawPhysicalDevicePath(devicePath) ? "--device" : "--image";
         return [sourceFlag, devicePath, "--profile", profile, "--mode", "collect", "--device-id", deviceSlug];
+    }
+
+    // Fusion two-store discovery vector. Both members are regular image files
+    // (raw-device Fusion sets stay NotReached); the observer requires both
+    // --store-a/--store-b with --mode fusion. deviceSlugA identifies the
+    // primary (--store-a) member, mirroring the single-device contract.
+    internal static IReadOnlyList<string> BuildFusionObserverArguments(
+        string storeAPath, string storeBPath, string profile, string deviceSlugA)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(storeAPath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(storeBPath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(profile);
+        ArgumentException.ThrowIfNullOrWhiteSpace(deviceSlugA);
+        if (string.Equals(storeAPath, storeBPath, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException(
+                "Fusion members must be two distinct store paths.", nameof(storeBPath));
+        }
+
+        return ["--store-a", storeAPath, "--store-b", storeBPath,
+            "--profile", profile, "--mode", "fusion", "--device-id", deviceSlugA];
     }
 
     internal static ApfsObserverEvidence ParseAndValidateEvidence(string stdout)

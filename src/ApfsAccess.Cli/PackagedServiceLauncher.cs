@@ -248,25 +248,50 @@ internal static class PackagedServiceLauncher
             startupInfo.AttributeList = attributeList;
             environmentBlock = BuildEnvironmentBlock(startInfo.Environment, packageDirectory);
             startupJob = CreateStartupJob();
+            var creationFlags = CreateNoWindow |
+                CreateSuspended |
+                CreateUnicodeEnvironment |
+                ExtendedStartupInfoPresent |
+                CreateBreakawayFromJob;
             if (!CreateProcessW(
                     applicationPath,
                     commandLine,
                     IntPtr.Zero,
                     IntPtr.Zero,
                     true,
-                    CreateNoWindow |
-                    CreateSuspended |
-                    CreateUnicodeEnvironment |
-                    ExtendedStartupInfoPresent |
-                    CreateBreakawayFromJob,
+                    creationFlags,
                     environmentBlock,
                     workingDirectory,
                     ref startupInfo,
                     out processInformation))
             {
-                throw new Win32Exception(
-                    Marshal.GetLastWin32Error(),
-                    $"Could not start packaged service '{applicationPath}'.");
+                var error = Marshal.GetLastWin32Error();
+                if (error == 5 && (creationFlags & CreateBreakawayFromJob) != 0)
+                {
+                    creationFlags &= ~CreateBreakawayFromJob;
+                    if (!CreateProcessW(
+                            applicationPath,
+                            commandLine,
+                            IntPtr.Zero,
+                            IntPtr.Zero,
+                            true,
+                            creationFlags,
+                            environmentBlock,
+                            workingDirectory,
+                            ref startupInfo,
+                            out processInformation))
+                    {
+                        throw new Win32Exception(
+                            Marshal.GetLastWin32Error(),
+                            $"Could not start packaged service '{applicationPath}'.");
+                    }
+                }
+                else
+                {
+                    throw new Win32Exception(
+                        error,
+                        $"Could not start packaged service '{applicationPath}'.");
+                }
             }
 
             processCreated = true;

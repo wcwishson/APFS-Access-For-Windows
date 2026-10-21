@@ -110,6 +110,129 @@ public sealed class CliContractTests
     }
 
     [Fact]
+    public async Task MountAcceptsImageFileIdsAndRejectsBareDriveLetters()
+    {
+        // Bare drive-letter mount points are never exact IDs.
+        var pipeName = $"ApfsAccess.Cli.Tests.{Guid.NewGuid():N}";
+        var rejected = await InvokeAsync(
+            "mount",
+            "--device-id", "E:",
+            "--volume-id", "E:|Main",
+            "--pipe-name", pipeName,
+            "--no-start-service",
+            "--timeout-ms", "250");
+
+        Assert.Equal(2, rejected.ExitCode);
+        using var rej = JsonDocument.Parse(rejected.Output);
+        Assert.Contains("rive-letter", rej.RootElement.GetProperty("error").GetString(), StringComparison.OrdinalIgnoreCase);
+
+        // Absolute image-file paths are legitimate exact device/volume IDs and
+        // must pass argument validation (then fail closed on the absent
+        // service here, never on ID shape).
+        var image = @"D:\Temp\ApfsAccessTests\cli-image-id.apfs.img";
+        var accepted = await InvokeAsync(
+            "mount",
+            "--device-id", image,
+            "--volume-id", image + "|Main",
+            "--pipe-name", pipeName,
+            "--no-start-service",
+            "--timeout-ms", "250");
+
+        Assert.Equal(3, accepted.ExitCode);
+        using var acc = JsonDocument.Parse(accepted.Output);
+        Assert.DoesNotContain("rive-letter", acc.RootElement.GetProperty("error").GetString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task RepairCommandDispatchesWithStableInvalidArgumentsContract()
+    {
+        // Bounded RCT2 repair is user-reachable only through the explicit
+        // `repair` command (never through `fix`, which stays mount-health
+        // retry). Bare `repair` must dispatch to that command and fail closed
+        // on missing selectors with the stable exit-2 contract.
+        var result = await InvokeAsync("repair");
+
+        Assert.Equal(2, result.ExitCode);
+        using var json = JsonDocument.Parse(result.Output);
+        var root = json.RootElement;
+        Assert.False(root.GetProperty("success").GetBoolean());
+        Assert.Equal("repair", root.GetProperty("command").GetString());
+        Assert.Equal(2, root.GetProperty("exitCode").GetInt32());
+        Assert.Equal("InvalidArguments", root.GetProperty("code").GetString());
+        Assert.Equal("InvalidArguments", root.GetProperty("errorCode").GetString());
+    }
+
+    [Theory]
+    [InlineData("volume")]
+    [InlineData("format")]
+    [InlineData("manage")]
+    public async Task VolumeManagementVerbsAreRejectedUnknown(string command)
+    {
+        // Topology mutations (create/delete/grow/shrink/format/credential work)
+        // have no user-reachable command until Task 11 lands each keeper slice
+        // behind the management gate. Unknown verbs must fail closed with the
+        // stable exit-2 contract and never reach the service.
+        var result = await InvokeAsync(command);
+
+        Assert.Equal(2, result.ExitCode);
+        using var json = JsonDocument.Parse(result.Output);
+        var root = json.RootElement;
+        Assert.False(root.GetProperty("success").GetBoolean());
+        Assert.Equal(2, root.GetProperty("exitCode").GetInt32());
+        Assert.Equal(ApfsOperationCodes.InvalidArguments, root.GetProperty("errorCode").GetString());
+    }
+
+    [Theory]
+    [InlineData("container-mount")]
+    [InlineData("container-unmount")]
+    [InlineData("container-verify")]
+    [InlineData("container-repair")]
+    public async Task ContainerWideVerbsFailClosedWithEchoedEnvelope(string command)
+    {
+        // Task 12 Step 5: container-wide orchestration is not yet user-reachable.
+        // Unknown container verbs must fail closed with exit 2, schema-2 envelope,
+        // echoed command, and a valid operationId, and never reach the service.
+        var result = await InvokeAsync(command);
+
+        Assert.Equal(2, result.ExitCode);
+        using var json = JsonDocument.Parse(result.Output);
+        var root = json.RootElement;
+        Assert.False(root.GetProperty("success").GetBoolean());
+        Assert.Equal(2, root.GetProperty("schemaVersion").GetInt32());
+        Assert.Equal(command, root.GetProperty("command").GetString());
+        Assert.True(Guid.TryParseExact(root.GetProperty("operationId").GetString(), "D", out _));
+        Assert.Equal(2, root.GetProperty("exitCode").GetInt32());
+        Assert.Equal(ApfsOperationCodes.InvalidArguments, root.GetProperty("errorCode").GetString());
+    }
+
+    [Fact]
+    public async Task UnknownVerbEchoesCallerOperationId()
+    {
+        const string supplied = "01234567-89ab-cdef-0123-456789abcdef";
+        var result = await InvokeAsync("container-mount", "--operation-id", supplied);
+
+        Assert.Equal(2, result.ExitCode);
+        using var json = JsonDocument.Parse(result.Output);
+        Assert.Equal(supplied, json.RootElement.GetProperty("operationId").GetString()!.ToLowerInvariant());
+        Assert.Equal("container-mount", json.RootElement.GetProperty("command").GetString());
+    }
+
+    [Fact]
+    public async Task UnknownVerbsMintFreshOperationIds()
+    {
+        var first = await InvokeAsync("container-mount");
+        var second = await InvokeAsync("container-mount");
+
+        using var firstJson = JsonDocument.Parse(first.Output);
+        using var secondJson = JsonDocument.Parse(second.Output);
+        var firstId = firstJson.RootElement.GetProperty("operationId").GetString();
+        var secondId = secondJson.RootElement.GetProperty("operationId").GetString();
+        Assert.False(string.IsNullOrWhiteSpace(firstId));
+        Assert.False(string.IsNullOrWhiteSpace(secondId));
+        Assert.NotEqual(firstId, secondId);
+    }
+
+    [Fact]
     public async Task MissingServiceUsesBoundedServiceUnavailableExitCode()
     {
         var pipeName = $"ApfsAccess.Cli.Tests.{Guid.NewGuid():N}";

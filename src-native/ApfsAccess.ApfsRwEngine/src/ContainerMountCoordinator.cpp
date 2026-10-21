@@ -2,12 +2,14 @@
 // identity, serialized commits, shared extent ledger, independent sessions.
 
 #include "ContainerMountCoordinator.h"
+#include "NativeApfsReader.h"
 
 #include "ApfsContainerCatalog.h"
 #include "BlockDevice.h"
 #include "CheckpointDelta.h"
 #include "ExtentAllocator.h"
 #include "MetadataStore.h"
+#include "RawSnapshotRuntimeAuthority.h"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -28,7 +30,9 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <new>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -828,16 +832,82 @@ bool ReadOptionalString(
     return ReadString(*field, out_text);
 }
 
+bool ManifestFilePath(
+    const std::string& text, fs::path& out_path, std::string& out_error)
+{
+#if defined(_WIN32)
+    auto wide = WidenUtf8(text);
+    std::replace(wide.begin(), wide.end(), L'/', L'\\');
+    // Only ordinary local drive-absolute spelling may enter the private
+    // extended namespace. Reject aliases before prefixing disables Win32 normalization.
+    if (wide.size() < 4 ||
+        !((wide[0] >= L'A' && wide[0] <= L'Z') || (wide[0] >= L'a' && wide[0] <= L'z')) ||
+        wide[1] != L':' || wide[2] != L'\\' || wide.back() == L'\\' ||
+        wide.find_first_of(L":*?\"<>|", 3) != wide.npos ||
+        std::any_of(wide.begin(), wide.end(), [](wchar_t ch) { return ch < 32; }))
+    {
+        out_error = "ManifestPathInvalid";
+        return false;
+    }
+    for (std::size_t begin = 3; begin < wide.size();)
+    {
+        auto end = wide.find(L'\\', begin);
+        if (end == wide.npos) end = wide.size();
+        const auto part = wide.substr(begin, end - begin);
+        if (part.empty() || part.back() == L'.' || part.back() == L' ')
+        {
+            out_error = "ManifestPathInvalid";
+            return false;
+        }
+        auto stem = part.substr(0, part.find(L'.'));
+        while (!stem.empty() && stem.back() == L' ') stem.pop_back();
+        std::transform(stem.begin(), stem.end(), stem.begin(), [](wchar_t ch) {
+            return ch >= L'a' && ch <= L'z' ? static_cast<wchar_t>(ch - L'a' + L'A') : ch;
+        });
+        if (stem == L"CON" || stem == L"PRN" || stem == L"AUX" || stem == L"NUL" ||
+            stem == L"CONIN$" || stem == L"CONOUT$" ||
+            (stem.size() == 4 && (stem.starts_with(L"COM") || stem.starts_with(L"LPT")) &&
+                ((stem[3] >= L'1' && stem[3] <= L'9') || stem[3] == L'\u00b9' ||
+                    stem[3] == L'\u00b2' || stem[3] == L'\u00b3')))
+        {
+            out_error = "ManifestPathInvalid";
+            return false;
+        }
+        begin = end + 1;
+    }
+    const auto drive_type = ::GetDriveTypeW(wide.substr(0, 3).c_str());
+    if (drive_type != DRIVE_FIXED && drive_type != DRIVE_REMOVABLE && drive_type != DRIVE_RAMDISK)
+    {
+        out_error = "ManifestLocalPathRequired";
+        return false;
+    }
+    out_path = fs::path(wide);
+#else
+    out_path = fs::path(text);
+#endif
+    return true;
+}
+
+fs::path ManifestIoPath(const fs::path& path)
+{
+#if defined(_WIN32)
+    return fs::path(L"\\\\?\\" + path.native());
+#else
+    return path;
+#endif
+}
+
 bool IsLinkOrReparsePoint(const fs::path& path, std::error_code& out_error)
 {
     out_error.clear();
-    const auto status = fs::symlink_status(path, out_error);
+    const auto io_path = ManifestIoPath(path);
+    const auto status = fs::symlink_status(io_path, out_error);
     if (out_error || fs::is_symlink(status))
     {
         return !out_error;
     }
 #if defined(_WIN32)
-    const DWORD attributes = ::GetFileAttributesW(path.c_str());
+    const DWORD attributes = ::GetFileAttributesW(io_path.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES)
     {
         out_error = std::error_code(
@@ -864,6 +934,8 @@ bool ValidateManifestPath(const fs::path& path, std::string& out_error)
         return false;
     }
 
+    // Walk conventional spelling: MSVC treats the extended drive root as
+    // "\\\\?\\D:" without its required trailing separator when taking parents.
     fs::path ancestor = fs::absolute(path, ec).parent_path();
     if (ec || ancestor.empty())
     {
@@ -932,8 +1004,14 @@ struct ContainerMountCoordinator::SessionState
     std::uint64_t volume_object_id = 0;
     std::string mount_point;
     std::string recovery_identity;
+    // Owner-derived canonical journal identity, fixed at mount from the
+    // loaded container UUID and the resolved OID. Empty until mounted.
+    std::string canonical_journal_identity;
     bool requested_write = false;
     bool use_canonical_transaction = false;
+    bool prepared_for_commit = false;
+    std::uint64_t prepared_generation = 0;
+    std::uint64_t prepared_state_epoch = 0;
     std::unique_ptr<MetadataStore> store;
 };
 
@@ -941,12 +1019,44 @@ struct ContainerMountCoordinator::ScopedCommitDiagnostics
 {
     ContainerMountCoordinator& owner;
     std::uint64_t volume_object_id;
-    const ContainerCommitResult& result;
+    ContainerCommitResult& result;
     std::chrono::steady_clock::time_point started;
     std::chrono::steady_clock::time_point acquired;
+    std::array<char, 128> failure_stage{};
+    std::array<char, 2048> failure_detail{};
+    std::size_t failure_stage_size = 0;
+    std::size_t failure_detail_size = 0;
+    bool result_captured = false;
+
+    void CaptureResult() noexcept
+    {
+        result_captured = true;
+        const bool successful =
+            ((result.accepted_without_publication || result.committed) &&
+                result.commit_status_code == static_cast<int>(MetadataStore::CommitStatus::Committed)) ||
+            (result.committed && result.commit_status_code ==
+                static_cast<int>(MetadataStore::CommitStatus::NothingToCommit));
+        if (successful) return;
+        const std::string_view stage = result.commit_stage.empty()
+            ? std::string_view{"commit-admission"} : std::string_view{result.commit_stage};
+        const std::string_view detail = result.error.empty()
+            ? std::string_view{"CommitFailedWithoutDetail"} : std::string_view{result.error};
+        failure_stage_size = std::min(stage.size(), failure_stage.size());
+        failure_detail_size = std::min(detail.size(), failure_detail.size());
+        std::copy_n(stage.data(), failure_stage_size, failure_stage.data());
+        std::copy_n(detail.data(), failure_detail_size, failure_detail.data());
+    }
+
+    ContainerCommitResult Finish()
+    {
+        // Capture before return-value movement can empty the result strings.
+        CaptureResult();
+        return std::move(result);
+    }
 
     ~ScopedCommitDiagnostics()
     {
+        if (!result_captured) CaptureResult();
         const auto finished = std::chrono::steady_clock::now();
         const auto wait_us = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(acquired - started).count());
@@ -957,14 +1067,37 @@ struct ContainerMountCoordinator::ScopedCommitDiagnostics
             ++counters.commit_attempts;
             // Read only scalar members: return-value movement may have already
             // moved result.error before this scope is destroyed without NRVO.
-            if (result.committed && result.commit_status_code ==
+            if (result.accepted_without_publication && result.commit_status_code ==
+                static_cast<int>(MetadataStore::CommitStatus::Committed))
+                ++counters.commit_deferred_acceptances;
+            else if (result.committed && result.commit_status_code ==
                 static_cast<int>(MetadataStore::CommitStatus::Committed))
                 ++counters.commit_successes;
             else if (result.committed && result.commit_status_code ==
                 static_cast<int>(MetadataStore::CommitStatus::NothingToCommit))
                 ++counters.commit_noops;
             else
+            {
                 ++counters.commit_failures;
+                try
+                {
+                    // Prepare both strings before the no-throw publication.
+                    std::string stage(failure_stage.data(), failure_stage_size);
+                    std::string detail(failure_detail.data(), failure_detail_size);
+                    counters.last_failure_stage.swap(stage);
+                    counters.last_failure_detail.swap(detail);
+                }
+                catch (const std::bad_alloc&)
+                {
+                    counters.last_failure_stage.clear();
+                    counters.last_failure_detail.clear();
+                }
+                catch (const std::length_error&)
+                {
+                    counters.last_failure_stage.clear();
+                    counters.last_failure_detail.clear();
+                }
+            }
             counters.commit_wait_total_us += wait_us;
             counters.commit_hold_total_us += hold_us;
             counters.commit_total_us += wait_us + hold_us;
@@ -1015,11 +1148,13 @@ bool ParseContainerManifest(
 {
     out_manifest = ContainerManifest{};
     out_error.clear();
-    const fs::path path(manifest_path);
-    if (!ValidateManifestPath(path, out_error))
+    fs::path path;
+    if (!ManifestFilePath(manifest_path, path, out_error) ||
+        !ValidateManifestPath(path, out_error))
     {
         return false;
     }
+    path = ManifestIoPath(path);
     std::error_code ec;
     const auto symlink_state = fs::symlink_status(path, ec);
     if (!fs::is_regular_file(symlink_state))
@@ -1097,7 +1232,7 @@ bool ParseContainerManifest(
         return false;
     }
     if (version == nullptr || !ReadUint64(*version, version_number) ||
-        version_number != 1)
+        (version_number != 1 && version_number != 2))
     {
         out_error = "ManifestSchemaViolation: version";
         return false;
@@ -1147,6 +1282,14 @@ bool ParseContainerManifest(
         const JsonValue* member_field = FindField(entry, "containerUuid");
         const JsonValue* mount_field = FindField(entry, "mount");
         const JsonValue* write_field = FindField(entry, "requestedWrite");
+        const JsonValue* active_field = FindField(entry, "initiallyActive");
+        if ((version_number == 1 && active_field != nullptr) ||
+            (version_number == 2 && (!active_field || active_field->type != JsonValue::Type::Bool)))
+        {
+            out_error = "ManifestSchemaViolation: initiallyActive";
+            return false;
+        }
+        const bool active = version_number == 1 || active_field->boolean;
         if (entry.type != JsonValue::Type::Object || oid_field == nullptr ||
             !ReadUint64(*oid_field, oid) || oid == 0 ||
             member_field == nullptr ||
@@ -1154,11 +1297,16 @@ bool ParseContainerManifest(
             LowerHex(member_uuid) != manifest.container_uuid_hex ||
             !ReadOptionalString(entry, "name", name) ||
             mount_field == nullptr || !ReadString(*mount_field, mount) ||
-            mount.empty() || write_field == nullptr ||
+            (active && mount.empty()) || write_field == nullptr ||
             write_field->type != JsonValue::Type::Bool ||
             !ReadOptionalString(entry, "recoveryIdentity", recovery))
         {
             out_error = "ManifestSchemaViolation: volume entry";
+            return false;
+        }
+        if (!active && (!mount.empty() || !write_field->boolean))
+        {
+            out_error = "ManifestDormantAdmissionInvalid";
             return false;
         }
         if (write_field->boolean && recovery.empty())
@@ -1174,7 +1322,7 @@ bool ParseContainerManifest(
                 out_error = "ManifestDuplicateVolume";
                 return false;
             }
-            if (NormalizeWindowsMountKey(seen.mount_point) == mount_key)
+            if (active && seen.initially_active && NormalizeWindowsMountKey(seen.mount_point) == mount_key)
             {
                 out_error = "ManifestDuplicateMount";
                 return false;
@@ -1194,11 +1342,18 @@ bool ParseContainerManifest(
         volume.mount_point = mount;
         volume.requested_write = write_field->boolean;
         volume.recovery_identity = recovery;
+        volume.initially_active = active;
         manifest.volumes.push_back(std::move(volume));
     }
     // Section 7 checksum over the canonical serialization excluding itself.
     std::ostringstream canonical;
-    canonical << "manifest-check-v1\n"
+    if (std::none_of(manifest.volumes.begin(), manifest.volumes.end(),
+            [](const auto& volume) { return volume.initially_active; }))
+    {
+        out_error = "ManifestActiveVolumeRequired";
+        return false;
+    }
+    canonical << (version_number == 1 ? "manifest-check-v1\n" : "manifest-check-v2\n")
               << manifest.container_uuid_hex << "\n"
               << manifest.device_path << "\n"
               << manifest.device_offset_bytes << "\n";
@@ -1210,6 +1365,7 @@ bool ParseContainerManifest(
                   << volume.mount_point << "\n"
                   << (volume.requested_write ? "W" : "R") << "\n"
                   << volume.recovery_identity << "\n";
+        if (version_number == 2) canonical << (volume.initially_active ? "A" : "I") << "\n";
     }
     Sha256Self sha;
     const std::string canonical_text = canonical.str();
@@ -1223,13 +1379,68 @@ bool ParseContainerManifest(
     return true;
 }
 
+// Explicit raw-device writer admission for the container lease. Mirrors the
+// MetadataStore admission contract: parse the geometry read-only, open
+// deny-write bound to the GPT/APFS range, then revalidate the NXSB identity
+// behind the exclusive handle. Fails closed with a typed reason.
+bool AdmitCoordinatorRawWriter(
+    apfsaccess::rw::BlockDevice& lease, std::string& out_error)
+{
+    out_error.clear();
+    if (lease.IsRegularFile() || lease.IsRawWriterAccepted())
+    {
+        return true;
+    }
+    std::vector<std::byte> nxsb_bytes;
+    if (!lease.Read(0, 4096, nxsb_bytes))
+    {
+        out_error = "RawWriterGeometryUnreadable";
+        return false;
+    }
+    const auto parsed = ParseNxSuperblock(nxsb_bytes);
+    if (!parsed.has_value() || parsed->block_size == 0 || parsed->block_count == 0 ||
+        parsed->block_count >
+            ((std::numeric_limits<std::uint64_t>::max)() /
+                static_cast<std::uint64_t>(parsed->block_size)))
+    {
+        out_error = "RawWriterGeometryInvalid";
+        return false;
+    }
+    const auto limit_bytes = parsed->block_count *
+        static_cast<std::uint64_t>(parsed->block_size);
+    std::string admit_error;
+    if (!lease.AdmitExclusiveRawWriter(limit_bytes, admit_error))
+    {
+        out_error = admit_error;
+        return false;
+    }
+    std::vector<std::byte> reread;
+    if (!lease.Read(0, parsed->block_size, reread))
+    {
+        out_error = "RawDeviceAdmissionReverifyUnreadable";
+        return false;
+    }
+    const auto confirmed = ParseNxSuperblock(reread);
+    if (!confirmed.has_value() || confirmed->uuid_hex != parsed->uuid_hex ||
+        confirmed->xid != parsed->xid ||
+        confirmed->block_count != parsed->block_count ||
+        confirmed->block_size != parsed->block_size)
+    {
+        out_error = "RawDeviceIdentityChanged";
+        return false;
+    }
+    return true;
+}
+
 std::unique_ptr<ContainerMountCoordinator> ContainerMountCoordinator::Open(
     const std::string& device_path,
     std::uint64_t device_offset_bytes,
     std::string& out_error,
     CatalogLoadPolicy catalog_load_policy,
     bool require_writable_lease,
-    bool require_checkpoint_census)
+    bool require_checkpoint_census,
+    bool exclusive_management_image,
+    bool admit_raw_device_writer)
 {
     out_error.clear();
     if (device_path.empty())
@@ -1243,8 +1454,32 @@ std::unique_ptr<ContainerMountCoordinator> ContainerMountCoordinator::Open(
         out_error = "ContainerDevicePathInvalid";
         return nullptr;
     }
-    auto lease =
-        std::make_shared<BlockDevice>(wide_path, device_offset_bytes);
+    auto lease = exclusive_management_image
+        ? BlockDevice::OpenExclusiveManagementImage(wide_path, device_offset_bytes, out_error)
+        : std::make_shared<BlockDevice>(wide_path, device_offset_bytes);
+    if (!lease) return nullptr;
+    if (require_writable_lease && !lease->IsRegularFile() && admit_raw_device_writer &&
+        !AdmitCoordinatorRawWriter(*lease, out_error))
+    {
+        return nullptr;
+    }
+    return OpenHeldImage(std::move(lease), device_offset_bytes, out_error,
+        catalog_load_policy, require_writable_lease, require_checkpoint_census);
+}
+
+std::unique_ptr<ContainerMountCoordinator> ContainerMountCoordinator::OpenRepairImage(
+    std::shared_ptr<apfsaccess::rw::BlockDevice> image, std::string& error)
+{
+    if (!image || !image->IsRegularFile() || !image->HasWriteHandle() || image->BaseOffsetBytes() != 0) {
+        error = "Held repair image required"; return nullptr;
+    }
+    return OpenHeldImage(std::move(image), 0, error, CatalogLoadPolicy::StrictApple, true, true);
+}
+
+std::unique_ptr<ContainerMountCoordinator> ContainerMountCoordinator::OpenHeldImage(
+    std::shared_ptr<apfsaccess::rw::BlockDevice> lease, std::uint64_t device_offset_bytes, std::string& out_error,
+    CatalogLoadPolicy catalog_load_policy, bool require_writable_lease, bool require_checkpoint_census)
+{
     if (require_writable_lease && !lease->IsWritable())
     {
         out_error = "ContainerWritableLeaseUnavailable";
@@ -1327,7 +1562,9 @@ std::unique_ptr<ContainerMountCoordinator> ContainerMountCoordinator::Open(
     return coordinator;
 }
 
-ContainerMountCoordinator::~ContainerMountCoordinator() = default;
+ContainerMountCoordinator::~ContainerMountCoordinator() {
+    for(const auto& weak:snapshot_readers_)if(auto reader=weak.lock())reader->Close();
+}
 
 bool ContainerMountCoordinator::CheckpointCensusRequired() const noexcept
 {
@@ -1589,6 +1826,8 @@ bool ContainerMountCoordinator::MountVolume(
     state->volume_object_id = resolved.object_id;
     state->mount_point = session.mount_point;
     state->recovery_identity = session.recovery_identity;
+    state->canonical_journal_identity = "apfs-vol:" + container_uuid_hex_ + ":" +
+        std::to_string(resolved.object_id);
     state->requested_write = session.requested_write;
     state->use_canonical_transaction = session.use_canonical_transaction;
     state->store = std::move(store);
@@ -1631,13 +1870,47 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
     bool accepted_replay,
     std::optional<std::uint64_t> expected_replay_preimage,
     const ContainerMutationPreparationHook& mutation_preparation_hook,
-    const ContainerPostpublicationVerifierHook& postpublication_verifier_hook)
+    const ContainerPostpublicationVerifierHook& postpublication_verifier_hook,
+    bool retain_accepted_owner_until_cleanup,
+    bool defer_publication)
 {
-    const auto commit_started = std::chrono::steady_clock::now();
+    const auto started = std::chrono::steady_clock::now();
+    std::lock_guard<std::timed_mutex> commit_guard(commit_mutex_);
+    return CommitNoLock(volume_object_id, mutations, prepublication_hook,
+        mutation_staging_hook, retention_cleanup_hook, accepted_replay,
+        expected_replay_preimage, mutation_preparation_hook,
+        postpublication_verifier_hook, retain_accepted_owner_until_cleanup, defer_publication, {}, {}, started);
+}
+
+ContainerCommitResult ContainerMountCoordinator::CommitRawSnapshot(std::uint64_t oid,
+    const std::vector<MetadataStore::MutationRequest>& mutations,
+    const ContainerPrepublicationHook& accept, const ContainerMutationPreparationHook& prepare,
+    const ContainerPostpublicationVerifierHook& verify,
+    const std::shared_ptr<const apfsaccess::rw::RawSnapshotRuntimeRecoveryToken>& candidate)
+{
+    const auto started = std::chrono::steady_clock::now();
+    std::lock_guard<std::timed_mutex> commit_guard(commit_mutex_);
+    return CommitNoLock(oid, mutations, accept, {}, {}, false, {}, prepare, verify, true, false, candidate, {}, started);
+}
+
+ContainerCommitResult ContainerMountCoordinator::CommitNoLock(
+    std::uint64_t volume_object_id,
+    const std::vector<MetadataStore::MutationRequest>& mutations,
+    const ContainerPrepublicationHook& prepublication_hook,
+    const ContainerMutationStagingHook& mutation_staging_hook,
+    const ContainerRetentionCleanupHook& retention_cleanup_hook,
+    bool accepted_replay, std::optional<std::uint64_t> expected_replay_preimage,
+    const ContainerMutationPreparationHook& mutation_preparation_hook,
+    const ContainerPostpublicationVerifierHook& postpublication_verifier_hook,
+    bool retain_accepted_owner_until_cleanup, bool defer_publication,
+    const std::shared_ptr<const apfsaccess::rw::RawSnapshotRuntimeRecoveryToken>& raw_candidate,
+    const std::shared_ptr<const apfsaccess::rw::RawSnapshotRuntimeRecoveryToken>& raw_recovery,
+    std::chrono::steady_clock::time_point commit_started)
+{
     ContainerCommitResult result{};
-    std::unique_lock<std::timed_mutex> commit_guard(
-        commit_mutex_, std::defer_lock);
-    commit_guard.lock();
+    // Allocate the known completion reasons before raw acceptance/publication.
+    std::string raw_completion_reason = raw_candidate ? "RawSnapshotHostCompletionPending" : "";
+    std::string raw_completion_expected = raw_completion_reason;
     ScopedCommitDiagnostics diagnostics_scope{*this, volume_object_id, result,
         commit_started, std::chrono::steady_clock::now()};
     {
@@ -1645,14 +1918,21 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
         if (draining_)
         {
             result.error = "ContainerDraining";
-            return result;
+            return diagnostics_scope.Finish();
         }
-        if (recovery_required_)
+        const bool exact_typed_recovery = raw_recovery && raw_recovery == raw_snapshot_recovery_ &&
+            recovery_volume_object_id_ == volume_object_id && recovery_reason_ == raw_snapshot_recovery_reason_;
+        if (recovery_required_ && !exact_typed_recovery)
         {
             result.error = "ContainerRecoveryRequired: " + recovery_reason_;
             result.commit_recovery_required = true;
             result.commit_recovery_reason = WidenUtf8(recovery_reason_);
-            return result;
+            return diagnostics_scope.Finish();
+        }
+        if (raw_snapshot_recovery_ && !exact_typed_recovery)
+        {
+            result.error = "RawSnapshotRetainedRecoveryRequired";
+            return diagnostics_scope.Finish();
         }
     }
     SessionState* session = nullptr;
@@ -1670,7 +1950,7 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
     if (session == nullptr)
     {
         result.error = "VolumeNotMounted";
-        return result;
+        return diagnostics_scope.Finish();
     }
     const auto native_staging_clean = [&]() {
         const auto& store = *session->store;
@@ -1684,14 +1964,38 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
         result.commit_status_code = static_cast<int>(
             MetadataStore::CommitStatus::NotWritable);
         result.error = "VolumeNotWritable";
-        return result;
+        return diagnostics_scope.Finish();
     }
+    if (defer_publication && !prepublication_hook)
+    {
+        result.commit_status_code = static_cast<int>(
+            MetadataStore::CommitStatus::InvariantFailed);
+        result.commit_stage = "deferred-publication-hook-required";
+        result.error = "DeferredPublicationHookRequired";
+        return diagnostics_scope.Finish();
+    }
+    const auto has_pending_store_work = [&]()
+    {
+        const auto& store = *session->store;
+        return store.PendingMutationCount() != 0 ||
+            store.PendingAllocationCount() != 0 ||
+            store.PendingDeallocationCount() != 0 ||
+            store.PendingObjectMapUpdateCount() != 0 ||
+            store.PendingBtreeRecordCount() != 0 ||
+            store.PendingPayloadByteEstimate() != 0 ||
+            store.HasUncommittedAllocatorState();
+    };
+    const auto* selected_pins = FindVolumeCheckpointPinsNoLock(volume_object_id);
+    const bool selected_accepted_owner = selected_pins != nullptr &&
+        selected_pins->unapplied_accepted_work;
+    const bool existing_accepted_pending = selected_accepted_owner &&
+        has_pending_store_work();
     if (require_checkpoint_census_ && !checkpoint_census_initialized_)
     {
         result.commit_status_code = static_cast<int>(
             MetadataStore::CommitStatus::NotReady);
         result.error = "RequiredCheckpointCensusIncomplete";
-        return result;
+        return diagnostics_scope.Finish();
     }
     if (require_checkpoint_census_)
     {
@@ -1703,7 +2007,8 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
         for (const auto& pins : volume_checkpoint_pins_)
         {
             if (!pins.unapplied_accepted_work ||
-                accepted_replay_authorized) continue;
+                accepted_replay_authorized ||
+                (pins.volume_object_id == volume_object_id && existing_accepted_pending)) continue;
             result.error = (pins.volume_object_id == volume_object_id
                     ? "VolumeAcceptedRecoveryPending: oid=" : "SiblingAcceptedRecoveryPending: oid=") +
                 std::to_string(pins.volume_object_id);
@@ -1712,7 +2017,48 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
             // This attempt has not touched staging or called any hooks. Do not
             // certify an already dirty selected store as a clean refusal.
             result.clean_prepublication_refusal = !accepted_replay && native_staging_clean();
-            return result;
+            return diagnostics_scope.Finish();
+        }
+    }
+    const bool quota_management = std::any_of(mutations.begin(), mutations.end(), [](const auto& m) {
+        return m.operation == MetadataStore::MutationOperation::SetVolumeQuotaReserve;
+    });
+    if (quota_management) {
+        if ((!accepted_replay && !prepublication_hook) || (accepted_replay && !expected_replay_preimage)) {
+            result.error="VolumeQuotaReserveAcceptedWalBoundaryRequired";return diagnostics_scope.Finish();
+        }
+        if (!require_checkpoint_census_ || !checkpoint_census_initialized_ || !session->use_canonical_transaction) {
+            result.error = "VolumeQuotaReserveCanonicalCensusRequired"; return diagnostics_scope.Finish();
+        }
+        for (const auto& candidate : sessions_) {
+            const auto& s = *candidate->store;
+            if (s.PendingMutationCount() || s.PendingAllocationCount() || s.PendingDeallocationCount() ||
+                s.PendingPayloadByteEstimate() || s.PendingObjectMapUpdateCount() || s.PendingBtreeRecordCount() ||
+                s.HasUncommittedAllocatorState() || s.IsRecoveryRequired()) {
+                result.error = "VolumeQuotaReserveActiveSessionReservation"; return diagnostics_scope.Finish();
+            }
+        }
+        for (const auto& pins : volume_checkpoint_pins_)
+            if (pins.unapplied_accepted_work && (!accepted_replay || pins.volume_object_id != volume_object_id)) {
+                result.error = "VolumeQuotaReserveConflictingReplay"; return diagnostics_scope.Finish();
+            }
+    }
+    const bool source_bound_management = std::any_of(mutations.begin(), mutations.end(), [](const auto& m) {
+        return m.operation == MetadataStore::MutationOperation::RepairVolumeFileCount ||
+            m.operation == MetadataStore::MutationOperation::CreateSnapshot ||
+            m.operation == MetadataStore::MutationOperation::DeleteSnapshot;
+    });
+    if (source_bound_management) {
+        // Check before any selected-session reload can discard a reservation
+        // added after preparation. Quota has the same full census check above.
+        for (const auto& candidate : sessions_) {
+            const auto& state = *candidate->store;
+            if (state.PendingMutationCount() || state.HasUncommittedAllocatorState() ||
+                state.PendingAllocationCount() || state.PendingDeallocationCount() ||
+                state.PendingObjectMapUpdateCount() || state.PendingBtreeRecordCount() ||
+                state.PendingPayloadByteEstimate() || state.IsRecoveryRequired()) {
+                result.error = "NativeManagementActiveSessionReservation"; return diagnostics_scope.Finish();
+            }
         }
     }
     const std::uint64_t in_flight =
@@ -1733,24 +2079,49 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
     }
     // Funnel invariant: nothing may be pre-staged outside Commit (staging
     // outside the container mutex admits stale-view allocation overlap).
-    if (session->store->PendingMutationCount() != 0)
+    if (has_pending_store_work() && !existing_accepted_pending)
     {
         result.commit_status_code = static_cast<int>(
             MetadataStore::CommitStatus::InvariantFailed);
         result.error = "CommitUnexpectedPendingState";
-        return result;
+        return diagnostics_scope.Finish();
     }
-    // Every per-volume store must reload the latest shared container
-    // checkpoint before it chooses a target XID or allocates extents. A
-    // spaceman-only refresh leaves the checkpoint slot and XID stale.
-    // Do not elide this based on XID/readiness: borrowed stores have no
-    // mutation epoch, image handles share write access, and publication
-    // guards are captured during planning rather than retained from this load.
-    std::string reload_error;
-    if (!ReloadSessionForCommitNoLock(*session, reload_error, ReloadReason::BeforeCommit))
+    // A session may reuse the last owner-prepared checkpoint only while the
+    // coordinator's publication generation is unchanged and the session's
+    // XID still matches the owner. Any sibling publication, remount, recovery
+    // refresh, or XID mismatch takes the full reload path. This keeps the
+    // old stale-view protection while removing repeated reloads from a burst
+    // of commits against the same volume.
+    const auto session_checkpoint_xid = session->store->CheckpointXid();
+    const auto coordinator_checkpoint_xid = checkpoint_xid_.load(std::memory_order_relaxed);
+    const bool can_reuse_prepared_session =
+        session->prepared_for_commit &&
+        session->prepared_generation == commit_generation_ &&
+        session->prepared_state_epoch == session->store->StateEpoch() &&
+        session_checkpoint_xid.has_value() &&
+        session_checkpoint_xid.value() == coordinator_checkpoint_xid &&
+        !session->store->IsRecoveryRequired();
+    if (existing_accepted_pending)
     {
-        result.error = "CommitCommitterReloadFailed: " + reload_error;
-        return result;
+        // Accepted WAL work deliberately remains staged in the borrowed
+        // store. Reloading here would discard the working view while the WAL
+        // still promises to publish it, so continue from that view.
+    }
+    else if (can_reuse_prepared_session)
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        ++diagnostics_.reload_reuses;
+        if (auto* counters = FindVolumeDiagnosticsNoLock(session->volume_object_id))
+            ++counters->reload_reuses;
+    }
+    else
+    {
+        std::string reload_error;
+        if (!ReloadSessionForCommitNoLock(*session, reload_error, ReloadReason::BeforeCommit))
+        {
+            result.error = "CommitCommitterReloadFailed: " + reload_error;
+            return diagnostics_scope.Finish();
+        }
     }
     const std::optional<std::uint64_t> preimage_checkpoint_xid =
         session->store->CheckpointXid();
@@ -1759,17 +2130,44 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
     {
         result.commit_status_code = static_cast<int>(MetadataStore::CommitStatus::NotReady);
         result.error = "AcceptedReplayPreimageAdvanced";
-        return result;
+        return diagnostics_scope.Finish();
     }
     if ((prepublication_hook || mutation_preparation_hook) && !preimage_checkpoint_xid.has_value())
     {
         result.commit_status_code = static_cast<int>(
             MetadataStore::CommitStatus::InvariantFailed);
         result.error = "CommitPreimageCheckpointMissing";
-        return result;
+        return diagnostics_scope.Finish();
     }
     result.checkpoint_xid = preimage_checkpoint_xid.value_or(
         checkpoint_xid_.load(std::memory_order_relaxed));
+    const auto* admission_view = session->store->AuthoritativeAppleCheckpointView();
+    if (!accepted_replay && session->use_canonical_transaction && admission_view &&
+        std::any_of(admission_view->volumes.begin(), admission_view->volumes.end(),
+            [](const auto& volume) { return volume.object_map.snapshot_tree_oid != 0; }))
+    {
+        // Publication precedes the host's durable cleanup and census refresh.
+        // A sibling must wait for that owner's pin release before planning a
+        // snapshot-preserving retirement against the newer checkpoint.
+        for (const auto& pins : volume_checkpoint_pins_)
+        {
+            if (pins.volume_object_id == volume_object_id ||
+                pins.required_checkpoint_xids.empty() ||
+                pins.required_checkpoint_xids.front() >= result.checkpoint_xid) continue;
+            result.error = "SiblingCheckpointCleanupPending: oid=" +
+                std::to_string(pins.volume_object_id);
+            result.commit_status_code = static_cast<int>(MetadataStore::CommitStatus::RetentionBlocked);
+            result.commit_stage = "awaiting-checkpoint-cleanup";
+            result.clean_prepublication_refusal = native_staging_clean();
+            return diagnostics_scope.Finish();
+        }
+    }
+    // Reader registration and deletion admission share this serialization lock.
+    // Refuse deletion while any selected-volume reader owns historical storage.
+    for(const auto& mutation:mutations)if(mutation.operation==MetadataStore::MutationOperation::DeleteSnapshot)
+        for(const auto& weak:snapshot_readers_)if(auto reader=weak.lock();reader && reader->volume_==volume_object_id){
+            result.error="SnapshotRuntimeReaderBusy";result.clean_prepublication_refusal=native_staging_clean();return diagnostics_scope.Finish();
+        }
     auto staged_requests = mutations;
     if (mutation_preparation_hook)
     {
@@ -1869,12 +2267,23 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
                 recovery_reason_ = "MutationPreparationIdentityChanged";
                 result.commit_recovery_required = true;
                 result.commit_recovery_reason = WidenUtf8(recovery_reason_);
-                return result;
+                return diagnostics_scope.Finish();
             }
             // No WAL acceptance has run: preserve the existing pin census and
             // caller-owned evidence. Discard only local scratch/illegal staging.
             std::string rollback_error;
-            if (!ReloadSessionForCommitNoLock(*session, rollback_error))
+            if (existing_accepted_pending)
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+                recovery_required_ = true;
+                InvalidateSharedSpaceNoLock();
+                recovery_volume_object_id_ = session->volume_object_id;
+                recovery_reason_ = "PartialStageWithAcceptedWork";
+                result.error += " | " + recovery_reason_;
+                result.commit_recovery_required = true;
+                result.commit_recovery_reason = WidenUtf8(recovery_reason_);
+            }
+            else if (!ReloadSessionForCommitNoLock(*session, rollback_error))
             {
                 std::lock_guard<std::mutex> guard(mutex_);
                 recovery_required_ = true;
@@ -1890,7 +2299,7 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
                 result.clean_prepublication_refusal = !accepted_replay && native_staging_clean() &&
                     session->store->CheckpointXid() == preimage_checkpoint_xid;
             }
-            return result;
+            return diagnostics_scope.Finish();
         }
     }
     for (std::size_t mutation_index = 0;
@@ -1906,13 +2315,27 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
         if (stage != MetadataStore::MutationStatus::Applied)
         {
             result.mutation_staging_status = stage;
+            result.mutation_staging_failure = ContainerMutationStagingFailure{
+                mutation_index, request.operation, request.path, request.secondary_path,
+                request.offset, request.length, session->store->LastMutationFailureReason()};
             result.commit_stage = "mutation-staging";
             result.error = "CommitStageFailed: status=" +
                 std::to_string(static_cast<int>(stage)) + " | " +
-                NarrowLossy(session->store->RecoveryReason());
+                NarrowLossy(result.mutation_staging_failure->reason);
             result.staged_identities.clear();
             std::string rollback_error;
-            if (!ReloadSessionForCommitNoLock(*session, rollback_error))
+            if (existing_accepted_pending)
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+                recovery_required_ = true;
+                InvalidateSharedSpaceNoLock();
+                recovery_volume_object_id_ = session->volume_object_id;
+                recovery_reason_ = "DeferredStageFailed";
+                result.error += " | " + recovery_reason_;
+                result.commit_recovery_required = true;
+                result.commit_recovery_reason = WidenUtf8(recovery_reason_);
+            }
+            else if (!ReloadSessionForCommitNoLock(*session, rollback_error))
             {
                 std::lock_guard<std::mutex> guard(mutex_);
                 recovery_required_ = true;
@@ -1933,7 +2356,7 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
                     !accepted_replay && !mutation_staging_hook && native_staging_clean() &&
                     session->store->CheckpointXid() == preimage_checkpoint_xid;
             }
-            return result;
+            return diagnostics_scope.Finish();
         }
         result.staged_identities.push_back(staged_identity);
         request.expected_unlink_outcome = std::move(unlink_outcome);
@@ -1965,7 +2388,18 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
                 }
                 result.staged_identities.clear();
                 std::string rollback_error;
-                if (!ReloadSessionForCommitNoLock(*session, rollback_error))
+                if (existing_accepted_pending)
+                {
+                    std::lock_guard<std::mutex> guard(mutex_);
+                    recovery_required_ = true;
+                    InvalidateSharedSpaceNoLock();
+                    recovery_volume_object_id_ = session->volume_object_id;
+                    recovery_reason_ = "MutationStagingHookWithAcceptedWork";
+                    result.error += " | " + recovery_reason_;
+                    result.commit_recovery_required = true;
+                    result.commit_recovery_reason = WidenUtf8(recovery_reason_);
+                }
+                else if (!ReloadSessionForCommitNoLock(*session, rollback_error))
                 {
                     std::lock_guard<std::mutex> guard(mutex_);
                     recovery_required_ = true;
@@ -1978,20 +2412,121 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
                     result.commit_recovery_reason =
                         WidenUtf8(recovery_reason_);
                 }
-                return result;
+                return diagnostics_scope.Finish();
             }
         }
     }
-    const auto capacity_status = session->store->CheckPendingAppleCapacity(RequiredCheckpointXidUnionNoLock());
+    // A retention-only refusal can be resolved by the same serialized cleanup
+    // used after acceptance. Run at most one cleanup per commit and recheck
+    // capacity before allowing any new WAL acceptance.
+    bool retention_cleanup_attempted = false;
+    std::string retention_cleanup_failure;
+    // A worker proves its existing accepted overlay afresh in this Commit.
+    // No ticket survives acceptance deferral, recovery replay or this invocation.
+    std::shared_ptr<MetadataStore::PreparedAppleMetadataPlan> prepared_metadata_plan;
+    const auto accepted_worker_owner_current = [&] {
+        if (!existing_accepted_pending || !staged_requests.empty() || mutation_preparation_hook || mutation_staging_hook ||
+            !require_checkpoint_census_ || !checkpoint_census_initialized_ ||
+            !session->store->Context().allow_native_snapshot_runtime || !preimage_checkpoint_xid ||
+            session->store->CheckpointXid() != preimage_checkpoint_xid) return false;
+        const auto* own = FindVolumeCheckpointPinsNoLock(volume_object_id);
+        if (!own || !own->unapplied_accepted_work ||
+            !std::binary_search(own->required_checkpoint_xids.begin(), own->required_checkpoint_xids.end(), *preimage_checkpoint_xid)) return false;
+        const auto* view = session->store->AuthoritativeAppleCheckpointView();
+        if (!view || !std::any_of(view->volumes.begin(), view->volumes.end(),
+            [](const auto& volume) { return volume.object_map.snapshot_tree_oid != 0; })) return false;
+        for (const auto& pins : volume_checkpoint_pins_)
+            if (pins.volume_object_id != volume_object_id && pins.unapplied_accepted_work) return false;
+        for (const auto& peer : sessions_) {
+            if (peer->volume_object_id == volume_object_id) continue;
+            const auto& store = *peer->store;
+            if (store.IsRecoveryRequired() || store.PendingMutationCount() || store.PendingAllocationCount() ||
+                store.PendingDeallocationCount() || store.PendingObjectMapUpdateCount() || store.PendingBtreeRecordCount() ||
+                store.PendingPayloadByteEstimate() || store.HasUncommittedAllocatorState()) return false;
+        }
+        return true;
+    };
+    const bool accepted_worker_handoff = accepted_worker_owner_current();
+    const bool permit_metadata_plan_handoff = session->use_canonical_transaction &&
+        !defer_publication && !accepted_replay && (!existing_accepted_pending || accepted_worker_handoff);
+    const auto cleanup_retention = [&](MetadataStore::CommitStatus status, bool before_acceptance) {
+        if (status != MetadataStore::CommitStatus::RetentionBlocked ||
+            !session->use_canonical_transaction || !retention_cleanup_hook || retention_cleanup_attempted)
+            return status;
+        retention_cleanup_attempted = true;
+        prepared_metadata_plan.reset();
+        auto* volume_pins = FindVolumeCheckpointPinsNoLock(volume_object_id);
+        auto allowed_pins = volume_pins != nullptr
+            ? volume_pins->required_checkpoint_xids : std::vector<std::uint64_t>{};
+        // A callback may conservatively keep the prospective source. Before
+        // new acceptance it may also clean all old debt; current-checkpoint
+        // protection is inherent in the planner and needs no invented WAL pin.
+        if (before_acceptance && !staged_requests.empty()) {
+            allowed_pins.push_back(preimage_checkpoint_xid.value());
+            std::sort(allowed_pins.begin(), allowed_pins.end());
+            allowed_pins.erase(std::unique(allowed_pins.begin(), allowed_pins.end()), allowed_pins.end());
+        }
+        auto refreshed_pins = allowed_pins;
+        const auto pending_before = apfsaccess::rw::CheckpointDeltaCodec::Encode(
+            session->store->DebugBuildPendingCheckpointDelta());
+        const auto mutation_count = session->store->PendingMutationCount();
+        bool census_valid = false;
+        try { census_valid = retention_cleanup_hook(refreshed_pins, retention_cleanup_failure); }
+        catch (...) { retention_cleanup_failure = "RetentionCleanupHookException"; }
+        std::vector<std::uint64_t> normalized_pins;
+        if (session->store->CheckpointXid() != preimage_checkpoint_xid ||
+            session->store->PendingMutationCount() != mutation_count ||
+            apfsaccess::rw::CheckpointDeltaCodec::Encode(session->store->DebugBuildPendingCheckpointDelta()) != pending_before)
+            retention_cleanup_failure = "RetentionCleanupStagingChanged";
+        if (!census_valid || !retention_cleanup_failure.empty() || volume_pins == nullptr ||
+            !NormalizeRequiredCheckpointXids(refreshed_pins,
+                preimage_checkpoint_xid.value_or(0), normalized_pins, retention_cleanup_failure))
+        {
+            if (retention_cleanup_failure.empty()) retention_cleanup_failure = "RetentionCleanupRefused";
+        }
+        else if (!std::includes(allowed_pins.begin(), allowed_pins.end(), normalized_pins.begin(), normalized_pins.end()) ||
+                 (!staged_requests.empty() && (!before_acceptance || volume_pins->unapplied_accepted_work) &&
+                  !std::binary_search(normalized_pins.begin(), normalized_pins.end(), preimage_checkpoint_xid.value_or(0))))
+            retention_cleanup_failure = "RetentionCleanupPinsInvalid";
+        else if (normalized_pins != allowed_pins)
+        {
+            volume_pins->required_checkpoint_xids = std::move(normalized_pins);
+            status = before_acceptance
+                ? session->store->CheckPendingAppleCapacity(RequiredCheckpointXidUnionNoLock(),
+                    permit_metadata_plan_handoff ? &prepared_metadata_plan : nullptr, accepted_worker_handoff)
+                : session->store->CommitCanonicalTransaction(RequiredCheckpointXidUnionNoLock(), {});
+            if (!before_acceptance && status == MetadataStore::CommitStatus::NothingToCommit && !staged_requests.empty())
+                retention_cleanup_failure = "RetentionRetryLostPendingMutation";
+        }
+        return retention_cleanup_failure.empty() ? status : MetadataStore::CommitStatus::InvariantFailed;
+    };
+    // Accepted WAL binds logical mutations and the preimage, not an unpublished
+    // allocation layout. Recovery must use the same capacity policy as admission.
+    auto capacity_status = session->store->CheckPendingAppleCapacity(RequiredCheckpointXidUnionNoLock(),
+        permit_metadata_plan_handoff ? &prepared_metadata_plan : nullptr, accepted_worker_handoff);
+    capacity_status = cleanup_retention(capacity_status, true);
     if (capacity_status != MetadataStore::CommitStatus::NothingToCommit)
     {
         result.commit_status_code = static_cast<int>(capacity_status);
-        result.commit_stage = "before-wal-capacity-admission";
+        result.commit_stage = retention_cleanup_failure.empty() ? "before-wal-capacity-admission" : "retention-cleanup";
         result.error = "CommitCapacityAdmissionRefused: " +
-            NarrowLossy(session->store->LastCommitFailureReason());
+            NarrowLossy(session->store->LastCommitFailureReason()) + " | " +
+            NarrowLossy(session->store->LastCommitFailureDetail());
+        if (!retention_cleanup_failure.empty()) result.error += " | " + retention_cleanup_failure;
         result.staged_identities.clear();
         std::string rollback_error;
-        if (!ReloadSessionForCommitNoLock(*session, rollback_error))
+        if (existing_accepted_pending || (accepted_replay && selected_accepted_owner))
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            recovery_required_ = true;
+            InvalidateSharedSpaceNoLock();
+            recovery_volume_object_id_ = session->volume_object_id;
+            recovery_reason_ = "AcceptedWorkCapacityAdmissionRefused";
+            result.error += " | " + recovery_reason_;
+            result.commit_recovery_required = true;
+            result.commit_recovery_reason = WidenUtf8(recovery_reason_);
+        }
+        else if (!ReloadSessionForCommitNoLock(*session, rollback_error))
         {
             std::lock_guard<std::mutex> guard(mutex_);
             recovery_required_ = true;
@@ -2005,8 +2540,9 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
         else
             result.clean_prepublication_refusal = !accepted_replay && !mutation_staging_hook &&
                 native_staging_clean() && session->store->CheckpointXid() == preimage_checkpoint_xid;
-        return result;
+        return diagnostics_scope.Finish();
     }
+    bool raw_acceptance_completed = false;
     if (prepublication_hook)
     {
         std::string hook_error;
@@ -2028,6 +2564,26 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
         catch (...)
         {
             hook_error = "PrepublicationHookException";
+        }
+        if (raw_candidate && !hook_succeeded && !raw_candidate->AcceptanceStarted())
+        {
+            // The opaque private runtime receipt proves Begin was not entered.
+            // Preserve the original census on a source/evidence refusal.
+            result.error = hook_error;
+            result.commit_stage = "raw-snapshot-before-acceptance";
+            result.commit_status_code = static_cast<int>(MetadataStore::CommitStatus::RetentionBlocked);
+            std::string rollback_error;
+            if (!ReloadSessionForCommitNoLock(*session, rollback_error))
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+                recovery_required_ = true;
+                recovery_volume_object_id_ = volume_object_id;
+                recovery_reason_ = "RawSnapshotCapacityRollbackFailed: " + rollback_error;
+                result.commit_recovery_required = true;
+                InvalidateSharedSpaceNoLock();
+            }
+            else result.clean_prepublication_refusal = native_staging_clean();
+            return diagnostics_scope.Finish();
         }
         // In required mode a hook failure may occur after WAL acceptance but
         // before its rescan can refresh the output. Retaining the exact source
@@ -2090,7 +2646,18 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
                 result.error += ": " + hook_error;
             }
             std::string rollback_error;
-            if (!ReloadSessionForCommitNoLock(*session, rollback_error))
+            if (defer_publication || existing_accepted_pending)
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+                recovery_required_ = true;
+                InvalidateSharedSpaceNoLock();
+                recovery_volume_object_id_ = session->volume_object_id;
+                recovery_reason_ = "DeferredPrepublicationHookFailed";
+                result.error += " | " + recovery_reason_;
+                result.commit_recovery_required = true;
+                result.commit_recovery_reason = WidenUtf8(recovery_reason_);
+            }
+            else if (!ReloadSessionForCommitNoLock(*session, rollback_error))
             {
                 std::lock_guard<std::mutex> guard(mutex_);
                 recovery_required_ = true;
@@ -2102,8 +2669,23 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
                 result.commit_recovery_required = true;
                 result.commit_recovery_reason = WidenUtf8(recovery_reason_);
             }
-            return result;
+            return diagnostics_scope.Finish();
         }
+        raw_acceptance_completed = raw_candidate != nullptr;
+    }
+    if (defer_publication)
+    {
+        // The prepublication hook has durably accepted the WAL records and
+        // retained the source checkpoint pin. Leave the staged working view
+        // intact for the close/quiet worker; no APFS publication occurred.
+        result.accepted_without_publication = true;
+        result.commit_status_code = static_cast<int>(
+            MetadataStore::CommitStatus::Committed);
+        result.commit_stage = "accepted-deferred";
+        result.committed_xid = preimage_checkpoint_xid.value_or(0);
+        result.checkpoint_xid = preimage_checkpoint_xid.value_or(result.checkpoint_xid);
+        result.committed = false;
+        return diagnostics_scope.Finish();
     }
     const apfsaccess::rw::CheckpointDelta pending =
         session->store->DebugBuildPendingCheckpointDelta();
@@ -2140,45 +2722,11 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
     // uncertain outcome. Leave unknown until the entire successful path below
     // has verified the durable view. Snapshot failures never change that path.
     InvalidateSharedSpaceNoLock();
+    if (accepted_worker_handoff && !accepted_worker_owner_current()) prepared_metadata_plan.reset();
     auto status = session->use_canonical_transaction
-        ? session->store->CommitCanonicalTransaction(required_checkpoint_xids)
+        ? session->store->CommitCanonicalTransaction(required_checkpoint_xids, std::move(prepared_metadata_plan))
         : session->store->CommitTransaction(required_checkpoint_xids);
-    std::string retention_cleanup_failure;
-    if (status == MetadataStore::CommitStatus::RetentionBlocked &&
-        session->use_canonical_transaction && retention_cleanup_hook)
-    {
-        auto* volume_pins = FindVolumeCheckpointPinsNoLock(volume_object_id);
-        auto refreshed_pins = volume_pins != nullptr
-            ? volume_pins->required_checkpoint_xids : std::vector<std::uint64_t>{};
-        bool census_valid = false;
-        try { census_valid = retention_cleanup_hook(refreshed_pins, retention_cleanup_failure); }
-        catch (...) { retention_cleanup_failure = "RetentionCleanupHookException"; }
-        std::vector<std::uint64_t> normalized_pins;
-        if (!census_valid || !retention_cleanup_failure.empty() || volume_pins == nullptr ||
-            !NormalizeRequiredCheckpointXids(refreshed_pins,
-                preimage_checkpoint_xid.value_or(0), normalized_pins, retention_cleanup_failure))
-        {
-            if (retention_cleanup_failure.empty()) retention_cleanup_failure = "RetentionCleanupRefused";
-        }
-        else if (!std::includes(volume_pins->required_checkpoint_xids.begin(),
-                     volume_pins->required_checkpoint_xids.end(), normalized_pins.begin(), normalized_pins.end()) ||
-                 (!staged_requests.empty() && !std::binary_search(normalized_pins.begin(), normalized_pins.end(),
-                     preimage_checkpoint_xid.value_or(0))))
-        {
-            retention_cleanup_failure = "RetentionCleanupPinsInvalid";
-        }
-        else if (normalized_pins != volume_pins->required_checkpoint_xids)
-        {
-            // RetentionBlocked preserves staging and guarantees no device I/O.
-            // Keep identities/source and global ownership intact; do not rerun
-            // staging or the WAL acceptance hook on this single retry.
-            volume_pins->required_checkpoint_xids = std::move(normalized_pins);
-            status = session->store->CommitCanonicalTransaction(RequiredCheckpointXidUnionNoLock());
-            if (status == MetadataStore::CommitStatus::NothingToCommit && !staged_requests.empty())
-                retention_cleanup_failure = "RetentionRetryLostPendingMutation";
-        }
-        if (!retention_cleanup_failure.empty()) status = MetadataStore::CommitStatus::InvariantFailed;
-    }
+    status = cleanup_retention(status, false);
     result.commit_status_code = static_cast<int>(status);
     result.commit_stage = retention_cleanup_failure.empty()
         ? session->store->LastCommitStage() : "retention-cleanup";
@@ -2193,6 +2741,7 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
     if (status != MetadataStore::CommitStatus::Committed &&
         status != MetadataStore::CommitStatus::NothingToCommit)
     {
+        const auto snapshot_failure = session->store->LastCommitFailureReason();
         result.error =
             (status == MetadataStore::CommitStatus::RetentionBlocked
                 ? "CommitRetentionBlocked: status="
@@ -2203,16 +2752,6 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
             NarrowLossy(session->store->RecoveryReason()) + " | " +
             NarrowLossy(session->store->LastCommitFailureDetail());
         if (!retention_cleanup_failure.empty()) result.error += " | " + retention_cleanup_failure;
-        {
-            std::lock_guard<std::mutex> guard(mutex_);
-            diagnostics_.last_failure_stage = result.commit_stage;
-            diagnostics_.last_failure_detail = result.error;
-            if (auto* counters = FindVolumeDiagnosticsNoLock(session->volume_object_id))
-            {
-                counters->last_failure_stage = result.commit_stage;
-                counters->last_failure_detail = result.error;
-            }
-        }
         if (session->store->IsRecoveryRequired())
         {
             std::lock_guard<std::mutex> guard(mutex_);
@@ -2221,6 +2760,19 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
             recovery_volume_object_id_ = session->volume_object_id;
             recovery_reason_ = "SessionCommitRecoveryRequired: " +
                 NarrowLossy(session->store->RecoveryReason());
+        }
+        else if (existing_accepted_pending || prepublication_hook ||
+            (accepted_replay && selected_accepted_owner))
+        {
+            // Prior work or the successful current hook durably accepted WAL
+            // records. A failed publication must retain that working view.
+            std::lock_guard<std::mutex> guard(mutex_);
+            recovery_required_ = true;
+            InvalidateSharedSpaceNoLock();
+            recovery_volume_object_id_ = session->volume_object_id;
+            recovery_reason_ = "AcceptedWorkPublicationFailed";
+            result.commit_recovery_required = true;
+            result.commit_recovery_reason = WidenUtf8(recovery_reason_);
         }
         else
         {
@@ -2242,7 +2794,32 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
         // A rollback reload may have projected a checkpoint. The failed
         // publication attempt remains conservative until a fresh later load.
         InvalidateSharedSpaceNoLock();
-        return result;
+        // Only this private raw acceptance route records provenance. Transport,
+        // ledger, rollback, and unknown failures cannot mint a recovery entry.
+        const auto& receipt = raw_recovery ? raw_recovery : raw_candidate;
+        const bool accepted_raw_prepublication = raw_candidate && !raw_recovery && raw_acceptance_completed &&
+            !raw_snapshot_recovery_ && recovery_required_ && recovery_volume_object_id_ == volume_object_id &&
+            recovery_reason_ == "AcceptedWorkPublicationFailed" &&
+            status == MetadataStore::CommitStatus::PersistFailed &&
+            session->store->LastCommitStage() == "apple-publish-stage-blocked" &&
+            !session->store->IsRecoveryRequired() && preimage_checkpoint_xid.has_value() &&
+            session->store->CheckpointXid() == preimage_checkpoint_xid &&
+            retention_cleanup_failure.empty();
+        const bool known_snapshot_failure =
+            (snapshot_failure == L"AppleCommitInterruptedBeforePublish" &&
+                (!recovery_required_ || accepted_raw_prepublication || (raw_recovery && recovery_volume_object_id_ == volume_object_id &&
+                    recovery_reason_ == raw_snapshot_recovery_reason_))) ||
+            (snapshot_failure == L"AppleCommitInterruptedAfterPublish" &&
+                recovery_required_ && recovery_volume_object_id_ == volume_object_id &&
+                recovery_reason_ == "SessionCommitRecoveryRequired: AppleCommitInterruptedAfterPublish");
+        if (receipt && (raw_acceptance_completed || raw_recovery) && known_snapshot_failure &&
+            session->use_canonical_transaction)
+        {
+            raw_snapshot_recovery_ = receipt;
+            raw_snapshot_recovery_reason_ = recovery_reason_;
+            receipt->CaptureSelectedState(*session->store);
+        }
+        return diagnostics_scope.Finish();
     }
     if (const auto xid = session->store->CheckpointXid(); xid.has_value())
     {
@@ -2274,7 +2851,7 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
                 MetadataStore::CommitStatus::InvariantFailed);
             result.commit_recovery_required = true;
             result.commit_recovery_reason = WidenUtf8(recovery_reason_);
-            return result;
+            return diagnostics_scope.Finish();
         }
     }
     if (status == MetadataStore::CommitStatus::Committed && postpublication_verifier_hook)
@@ -2317,14 +2894,7 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
             else if (!verification_error.empty()) result.error += ": " + verification_error;
             else result.error += ": PostpublicationVerifierRefused";
             result.commit_recovery_reason = WidenUtf8(result.error);
-            diagnostics_.last_failure_stage = result.commit_stage;
-            diagnostics_.last_failure_detail = result.error;
-            if (auto* counters = FindVolumeDiagnosticsNoLock(session->volume_object_id))
-            {
-                counters->last_failure_stage = result.commit_stage;
-                counters->last_failure_detail = result.error;
-            }
-            return result;
+            return diagnostics_scope.Finish();
         }
     }
     if (status == MetadataStore::CommitStatus::Committed && !accepted_replay)
@@ -2333,11 +2903,46 @@ ContainerCommitResult ContainerMountCoordinator::Commit(
         // split across commits, so only its explicit WAL cleanup census update
         // may clear the pending flag. Retention pins remain until cleanup.
         if (auto* pins = FindVolumeCheckpointPinsNoLock(volume_object_id))
-            pins->unapplied_accepted_work = false;
+            pins->unapplied_accepted_work = retain_accepted_owner_until_cleanup;
+    }
+    if (status == MetadataStore::CommitStatus::Committed)
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        ++commit_generation_;
+        for (const auto& candidate : sessions_)
+        {
+            candidate->prepared_for_commit = candidate.get() == session;
+            candidate->prepared_generation = candidate.get() == session
+                ? commit_generation_ : 0;
+            candidate->prepared_state_epoch = candidate.get() == session
+                ? candidate->store->StateEpoch() : 0;
+        }
     }
     result.committed = true;
+    if (raw_candidate && raw_acceptance_completed && status == MetadataStore::CommitStatus::Committed)
+    {
+        const bool receipt_verified = raw_candidate->CaptureVerifiedPublication(*session->store);
+        std::lock_guard<std::mutex> guard(mutex_);
+        recovery_required_ = true;
+        recovery_volume_object_id_ = volume_object_id;
+        InvalidateSharedSpaceNoLock();
+        if (receipt_verified)
+        {
+            raw_snapshot_recovery_ = raw_candidate;
+            recovery_reason_.swap(raw_completion_reason);
+            raw_snapshot_recovery_reason_.swap(raw_completion_expected);
+        }
+        else
+        {
+            recovery_reason_ = "RawSnapshotPublicationReceiptInvalid";
+            result.commit_status_code = static_cast<int>(MetadataStore::CommitStatus::InvariantFailed);
+        }
+        result.commit_recovery_required = true;
+        result.commit_recovery_reason = WidenUtf8(recovery_reason_);
+        return diagnostics_scope.Finish();
+    }
     PublishSharedSpaceNoLock(session->store->AuthoritativeAppleCheckpointView(), true);
-    return result;
+    return diagnostics_scope.Finish();
 }
 
 bool ContainerMountCoordinator::RefreshSessionForRecovery(
@@ -2348,7 +2953,7 @@ bool ContainerMountCoordinator::RefreshSessionForRecovery(
     SessionState* selected = nullptr;
     {
         std::lock_guard<std::mutex> guard(mutex_);
-        if (draining_ || recovery_required_)
+        if (draining_ || recovery_required_ || raw_snapshot_recovery_)
         {
             out_error = "ContainerRecoveryRefreshUnavailable";
             return false;
@@ -2358,7 +2963,10 @@ bool ContainerMountCoordinator::RefreshSessionForRecovery(
     }
     if (selected)
     {
-        if (selected->store->PendingMutationCount() != 0)
+        const auto& state = *selected->store;
+        if (state.PendingMutationCount() || state.HasUncommittedAllocatorState() ||
+            state.PendingAllocationCount() || state.PendingDeallocationCount() ||
+            state.PendingObjectMapUpdateCount() || state.PendingBtreeRecordCount() || state.PendingPayloadByteEstimate())
         {
             out_error = "RecoveryRefreshUnexpectedPendingState";
             return false;
@@ -2392,6 +3000,17 @@ bool ContainerMountCoordinator::RefreshCheckpointFromSession(
             {
             }
         }
+        // This API observes a checkpoint from outside the coordinator's
+        // normal publication path. Treat that observation as a new owner
+        // generation and invalidate every prepared session; the next commit
+        // must reload instead of trusting a borrowed store/XID pair.
+        ++commit_generation_;
+        for (const auto& candidate : sessions_)
+        {
+            candidate->prepared_for_commit = false;
+            candidate->prepared_generation = 0;
+            candidate->prepared_state_epoch = 0;
+        }
         // This store may still hold the checkpoint preceding a sibling commit.
         // It is not proof of a fresh load and cannot clear an invalidation.
         PublishSharedSpaceNoLock(session->store->AuthoritativeAppleCheckpointView(), false);
@@ -2419,6 +3038,15 @@ ContainerShutdownResult ContainerMountCoordinator::DrainAndStop(
         result.error = "ContainerDrainTimeout";
         return result;
     }
+    // Keep the device and pin census until every active read has finished.
+    // Readers never acquire coordinator locks, so this order cannot cycle.
+    for(const auto& weak:snapshot_readers_)if(auto reader=weak.lock()) {
+        if(!reader->CloseUntil(deadline)) {
+            result.error="ContainerSnapshotReaderDrainTimeout";
+            return result;
+        }
+    }
+    snapshot_readers_.clear();
     {
         std::lock_guard<std::mutex> guard(mutex_);
         InvalidateSharedSpaceNoLock();
@@ -2573,6 +3201,123 @@ MetadataStore* ContainerMountCoordinator::FindSessionStore(
     return nullptr;
 }
 
+bool ContainerMountCoordinator::SessionCanonicalJournalIdentity(
+    std::uint64_t volume_object_id, std::string& out_identity) const
+{
+    out_identity.clear();
+    std::lock_guard<std::mutex> guard(mutex_);
+    for (const auto& session : sessions_)
+    {
+        if (session->volume_object_id == volume_object_id &&
+            !session->canonical_journal_identity.empty())
+        {
+            out_identity = session->canonical_journal_identity;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ContainerMountCoordinator::SessionRecoveryIdentity(
+    std::uint64_t volume_object_id, std::string& out_identity) const
+{
+    out_identity.clear();
+    std::lock_guard<std::mutex> guard(mutex_);
+    for (const auto& session : sessions_)
+        if (session->volume_object_id == volume_object_id && !session->recovery_identity.empty())
+        {
+            out_identity = session->recovery_identity;
+            return true;
+        }
+    return false;
+}
+
+bool ContainerMountCoordinator::InspectCurrentSession(std::uint64_t oid,
+    const std::function<bool(const MetadataStore&, std::string&)>& inspect, std::string& error, bool accepted_replay)
+{
+    error.clear();
+    std::lock_guard<std::timed_mutex> commit_guard(commit_mutex_);
+    const MetadataStore* store = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (draining_ || recovery_required_ || raw_snapshot_recovery_ || !device_ || !require_checkpoint_census_ ||
+            !checkpoint_census_initialized_) { error = "InspectionOwnerNotReady"; return false; }
+        for (const auto& session : sessions_) if (session->volume_object_id == oid) {
+            if (!session->use_canonical_transaction) { error = "InspectionCanonicalSessionRequired"; return false; }
+            store = session->store.get();
+        }
+    }
+    const auto* target = FindVolumeCheckpointPinsNoLock(oid);
+    if (accepted_replay && (!target || !target->unapplied_accepted_work)) {
+        error = "InspectionAcceptedOwnerRequired"; return false;
+    }
+    for (const auto& pins : volume_checkpoint_pins_) if (pins.unapplied_accepted_work &&
+        !(accepted_replay && pins.volume_object_id == oid)) {
+        error = "InspectionAcceptedOwnerConflict"; return false;
+    }
+    // Source-bound inspection must not authorize repair over a live raw
+    // reservation. AllocateExtent is not represented by PendingMutationCount.
+    for (const auto& session : sessions_) if (session->store->HasUncommittedAllocatorState()) {
+        error = "InspectionActiveSessionReservation"; return false;
+    }
+    if (!store || store->PendingMutationCount() || store->PendingAllocationCount() ||
+        store->PendingDeallocationCount() || store->PendingObjectMapUpdateCount() ||
+        store->PendingBtreeRecordCount() || store->PendingPayloadByteEstimate() || !store->IsNativeWriteReady() ||
+        store->IsRecoveryRequired() || store->CheckpointXid() != checkpoint_xid_.load(std::memory_order_relaxed) || !inspect) {
+        error = "InspectionCurrentCleanSessionRequired"; return false;
+    }
+    try {
+        const bool ok = inspect(*store, error);
+        return ok && error.empty();
+    } catch (...) { error = "InspectionFailed"; return false; }
+}
+
+bool ContainerMountCoordinator::InspectPublishedCheckpointForVerification(std::uint64_t oid,
+    const std::function<bool(const MetadataStore&, const AppleCheckpointView&, std::string&)>& inspect,
+    std::string& error)
+{
+    error.clear();
+    std::lock_guard<std::timed_mutex> commit_guard(commit_mutex_);
+    const MetadataStore* selected = nullptr;
+    const AppleCheckpointView* current = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (draining_ || recovery_required_ || raw_snapshot_recovery_ || !device_ || !require_checkpoint_census_ ||
+            !checkpoint_census_initialized_ || !inspect)
+        { error = "VerificationInspectionOwnerNotReady"; return false; }
+        for (const auto& pins : volume_checkpoint_pins_) if (pins.unapplied_accepted_work)
+        { error = "VerificationInspectionAcceptedWork"; return false; }
+        const auto xid = checkpoint_xid_.load(std::memory_order_relaxed);
+        for (const auto& session : sessions_)
+        {
+            const auto& store = *session->store;
+            const auto* view = store.AuthoritativeAppleCheckpointView();
+            if (!session->use_canonical_transaction || !view || &store.Device() != device_.get() ||
+                store.IsImmutableSnapshotView() || !store.IsNativeWriteReady() || store.IsRecoveryRequired() ||
+                store.HasUncommittedAllocatorState() || store.PendingMutationCount() || store.PendingAllocationCount() ||
+                store.PendingDeallocationCount() || store.PendingObjectMapUpdateCount() || store.PendingBtreeRecordCount() ||
+                store.PendingPayloadByteEstimate() || store.CheckpointXid() != view->container.superblock.xid ||
+                view->container.superblock.xid > xid || view->container.superblock.uuid_hex != container_uuid_hex_)
+            { error = "VerificationInspectionCleanSessionRequired"; return false; }
+            if (session->volume_object_id == oid) selected = &store;
+            if (view->container.superblock.xid == xid) current = view;
+        }
+    }
+    if (!selected || !current) { error = "VerificationInspectionPublishedViewRequired"; return false; }
+    const auto* previous = selected->AuthoritativeAppleCheckpointView();
+    const auto find_volume = [oid](const AppleCheckpointView& view) {
+        return std::find_if(view.volumes.begin(), view.volumes.end(),
+            [oid](const auto& volume) { return volume.superblock.object_id == oid; });
+    };
+    const auto old_volume = find_volume(*previous);
+    const auto new_volume = find_volume(*current);
+    if (old_volume == previous->volumes.end() || new_volume == current->volumes.end() ||
+        old_volume->superblock.uuid_hex != new_volume->superblock.uuid_hex)
+    { error = "VerificationInspectionVolumeIdentityChanged"; return false; }
+    try { return inspect(*selected, *current, error) && error.empty(); }
+    catch (...) { error = "VerificationInspectionFailed"; return false; }
+}
+
 bool ContainerMountCoordinator::IsRecoveryRequired() const noexcept
 {
     std::lock_guard<std::mutex> guard(mutex_);
@@ -2666,6 +3411,7 @@ std::vector<std::uint64_t>
 ContainerMountCoordinator::RequiredCheckpointXidUnionNoLock() const
 {
     std::vector<std::uint64_t> required_checkpoint_xids;
+    for(const auto& weak:snapshot_readers_)if(auto reader=weak.lock())required_checkpoint_xids.push_back(reader->checkpoint_);
     for (const VolumeCheckpointPins& pins : volume_checkpoint_pins_)
     {
         required_checkpoint_xids.insert(
@@ -2682,6 +3428,44 @@ ContainerMountCoordinator::RequiredCheckpointXidUnionNoLock() const
     return required_checkpoint_xids;
 }
 
+std::vector<ContainerMountCoordinator::RawSnapshotPeerObservation>
+ContainerMountCoordinator::ObserveRawSnapshotPeersNoLock() const
+{
+    std::vector<RawSnapshotPeerObservation> peers;
+    if (!require_checkpoint_census_ || !checkpoint_census_initialized_) return peers;
+    for (const auto& session : sessions_)
+    {
+        const auto* pins = FindVolumeCheckpointPinsNoLock(session->volume_object_id);
+        if (!pins) return {};
+        peers.push_back({session->volume_object_id, session->store.get(),
+            session->canonical_journal_identity, session->recovery_identity, *pins,
+            session->requested_write && session->use_canonical_transaction});
+    }
+    return peers;
+}
+
+bool ContainerMountCoordinator::ReloadRawSnapshotRecoveryNoLock(std::uint64_t oid, std::string& error)
+{
+    for (const auto& session : sessions_)
+        if (session->volume_object_id == oid && session->requested_write && session->use_canonical_transaction)
+            return ReloadSessionForCommitNoLock(*session, error, ReloadReason::Recovery);
+    error = "SnapshotRuntimeRawRecoverySessionChanged";
+    return false;
+}
+
+void ContainerMountCoordinator::AccountRawSnapshotRecoveryNoLock(std::uint64_t xid)
+{
+    checkpoint_xid_.store(xid, std::memory_order_relaxed);
+    ++commit_generation_;
+    for (const auto& session : sessions_)
+    {
+        session->prepared_for_commit = false;
+        session->prepared_state_epoch = 0;
+        session->prepared_generation = 0;
+    }
+    InvalidateSharedSpaceNoLock();
+}
+
 bool ContainerMountCoordinator::ReloadSessionForCommitNoLock(
     SessionState& session, std::string& out_error, ReloadReason reason)
 {
@@ -2690,12 +3474,23 @@ bool ContainerMountCoordinator::ReloadSessionForCommitNoLock(
     InvalidateSharedSpaceNoLock();
     if (!session.store->PrepareNativeWritePath())
     {
+        session.prepared_for_commit = false;
+        session.prepared_state_epoch = 0;
         InvalidateSharedSpaceNoLock();
         out_error = "VolumeWritePathReloadFailed: " +
             NarrowLossy(session.store->RecoveryReason());
         return false;
     }
     PublishSharedSpaceNoLock(session.store->AuthoritativeAppleCheckpointView(), true);
+    // A rollback reload restores the durable view after a partial or failed
+    // transaction. It is deliberately not reusable for the next mutation:
+    // failure paths may have touched hydration, compression, or recovery
+    // state that shares the same checkpoint XID. The next commit must perform
+    // a fresh preparation pass. Only the normal precommit/recovery paths can
+    // establish a reusable prepared session.
+    session.prepared_for_commit = reason != ReloadReason::Rollback;
+    session.prepared_generation = session.prepared_for_commit ? commit_generation_ : 0;
+    session.prepared_state_epoch = session.prepared_for_commit ? session.store->StateEpoch() : 0;
     diagnostics_scope.succeeded = true;
     return true;
 }
@@ -2860,3 +3655,36 @@ bool ContainerMountCoordinator::RangesOverlap(
 }
 
 } // namespace apfsaccess::catalog
+
+// Snapshot reader ownership is kept in the canonical coordinator, independently
+// of WAL cleanup. Weak registrations expire only when the final reader releases.
+namespace apfsaccess::catalog {
+std::vector<std::uint64_t> ContainerMountCoordinator::SnapshotRuntimeCheckpointPins() const {
+    std::lock_guard<std::timed_mutex> lock(commit_mutex_);
+    return RequiredCheckpointXidUnionNoLock();
+}
+std::shared_ptr<const SnapshotRuntimeReader> ContainerMountCoordinator::AcquireSnapshotReader(const ApfsSnapshotIdentity& id,std::string& error) {
+    std::lock_guard<std::timed_mutex> lock(commit_mutex_);
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if(draining_||!device_||!require_checkpoint_census_||!checkpoint_census_initialized_||recovery_required_||id.scope.checkpoint_xid!=checkpoint_xid_.load()||id.scope.container_uuid_hex!=container_uuid_hex_){error="SnapshotRuntimeReaderOwnerNotReady";return {};}
+    }
+    for(const auto&p:volume_checkpoint_pins_)if(p.unapplied_accepted_work){error="SnapshotRuntimeReaderRecoveryPending";return {};}
+    class Source final:public RandomAccessSource {const apfsaccess::rw::BlockDevice&d;public:explicit Source(const apfsaccess::rw::BlockDevice&v):d(v){}std::uint64_t SizeBytes()const override{return d.GetGeometry().total_bytes;}bool Read(std::uint64_t o,std::size_t n,std::vector<std::byte>&b)const override{return d.Read(o,n,b)&&b.size()==n;}} source(*device_);
+    auto reader=std::make_shared<SnapshotRuntimeReader>();
+    if(!apfsaccess::rw::NativeApfsReader::TryLoadSnapshotProjection(source,id,reader->projection_,error))return {};
+    reader->closed_=false;reader->device_=device_;reader->checkpoint_=id.scope.checkpoint_xid;reader->volume_=id.scope.volume_oid;
+    snapshot_readers_.erase(std::remove_if(snapshot_readers_.begin(),snapshot_readers_.end(),[](const auto&w){return w.expired();}),snapshot_readers_.end());
+    if(snapshot_readers_.size()>=64){error="SnapshotRuntimeReaderLimit";return {};}
+    snapshot_readers_.push_back(reader);return reader;
+}
+bool SnapshotRuntimeReader::Read(std::uint64_t inode,std::uint64_t offset,std::size_t size,std::vector<std::byte>&out)const {
+    std::lock_guard<std::timed_mutex> lock(read_mutex_);out.clear();if(closed_)return false;const auto&view=projection_->View();const auto file=std::find_if(view.inodes.begin(),view.inodes.end(),[&](const auto&i){return i.object_id==inode;});
+    if(file==view.inodes.end()||offset>file->logical_size||size>file->logical_size-offset||size>(64u<<20))return false;
+    const auto it=view.read_extents_by_inode.find(inode);if(size&&it==view.read_extents_by_inode.end())return false;
+    out.resize(size);std::uint64_t done=0;
+    if(size)for(const auto&e:it->second){const auto start=(std::max)(offset,e.logical_offset);const auto end=(std::min)(offset+size,e.logical_offset+e.bytes);
+        if(start>=end)continue;std::vector<std::byte>b;if(e.physical_address){if(!device_->Read(e.physical_address+start-e.logical_offset,static_cast<std::size_t>(end-start),b)){out.clear();return false;}std::copy(b.begin(),b.end(),out.begin()+start-offset);}done+=end-start;}
+    if(done!=size){out.clear();return false;}return true;
+}
+}

@@ -7,6 +7,142 @@ namespace ApfsAccess.Service.Tests;
 
 public sealed class ApfsMountWorkerAutoMountTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ExplicitMountAfterEjectIgnoresAutomaticReconnectSuppression(bool keepSiblingMounted)
+    {
+        var backend = new ControllableBackend { IncludeSecondaryVolume = keepSiblingMounted };
+        using var worker = CreateWorker(
+            backend, new RuntimeStatusPublisher(),
+            new ServiceHostOptions
+            {
+                AutoMountEnabled = true,
+                NativeAutoRemountOnReconnect = false,
+                EnableNativeWrite = false,
+                ReadWriteMode = "RwWithRoFallback",
+            },
+            new FirstFreeMountPolicy(["R", "S"]));
+        await InvokeRunCycleAsync(worker);
+        var initial = await backend.GetMountStateAsync(CancellationToken.None);
+        Assert.Equal(keepSiblingMounted ? 2 : 1, initial.Count);
+        var sibling = initial.SingleOrDefault(m => m.VolumeId == ControllableBackend.SecondaryVolumeId);
+
+        var eject = await worker.EjectAsync(ControllableBackend.VolumeId, CancellationToken.None);
+        Assert.True(eject.Success, eject.Message);
+        var attempts = backend.MountAttempts;
+        await InvokeRunCycleAsync(worker);
+        Assert.Equal(attempts, backend.MountAttempts);
+        Assert.DoesNotContain(await backend.GetMountStateAsync(CancellationToken.None),
+            mount => mount.VolumeId == ControllableBackend.VolumeId);
+
+        var mounted = await worker.EnsureMountedExactAsync(
+            ControllableBackend.DeviceId, ControllableBackend.VolumeId,
+            MountAccessMode.ReadOnly, CancellationToken.None);
+        Assert.True(mounted.Success, mounted.Message);
+        var after = await backend.GetMountStateAsync(CancellationToken.None);
+        Assert.Single(after, mount => mount.VolumeId == ControllableBackend.VolumeId);
+        if (sibling is not null) Assert.Contains(sibling, after);
+        Assert.Equal(attempts + 1, backend.MountAttempts);
+        await InvokeRunCycleAsync(worker);
+        Assert.Equal(attempts + 1, backend.MountAttempts);
+    }
+
+    [Fact]
+    public async Task RunCycle_RetainsFailedMountDiagnosticDuringBackoffUntilExplicitMountSucceeds()
+    {
+        const string error = "Native helper exited with code 5 before mount readiness.";
+        var backend = new ControllableBackend { MountError = error };
+        var publisher = new RuntimeStatusPublisher();
+        using var worker = CreateWorker(backend, publisher);
+
+        await InvokeRunCycleAsync(worker);
+        Assert.Equal(RuntimeState.Error, publisher.Latest.State);
+        Assert.Equal(error, publisher.Latest.LastError);
+        var attempts = backend.MountAttempts;
+        ExtendRetryBackoff(worker);
+
+        await InvokeRunCycleAsync(worker);
+        await InvokeRunCycleAsync(worker);
+
+        Assert.Equal(attempts, backend.MountAttempts);
+        Assert.Equal(RuntimeState.Error, publisher.Latest.State);
+        Assert.Equal(error, publisher.Latest.LastError);
+        Assert.Contains(publisher.Latest.Warnings, warning => warning == $"Mount failed for 'Main': {error}");
+        Assert.Contains(publisher.Latest.Warnings, warning => warning.Contains("Automatic mount retry", StringComparison.Ordinal));
+
+        backend.MountError = null;
+        var result = await worker.EnsureMountedExactAsync(
+            ControllableBackend.DeviceId, ControllableBackend.VolumeId,
+            MountAccessMode.ReadOnly, CancellationToken.None);
+
+        Assert.True(result.Success, result.Message);
+        Assert.Null(publisher.Latest.LastError);
+        await InvokeRunCycleAsync(worker);
+        Assert.Equal(RuntimeState.MountedRo, publisher.Latest.State);
+        Assert.Null(publisher.Latest.LastError);
+        Assert.DoesNotContain(publisher.Latest.Warnings, warning => warning.Contains(error, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task RunCycle_DisconnectClearsFailedMountDiagnosticAndRetryBackoff()
+    {
+        var backend = new ControllableBackend { MountError = "Native helper exited with code 5." };
+        var publisher = new RuntimeStatusPublisher();
+        using var worker = CreateWorker(backend, publisher);
+        await InvokeRunCycleAsync(worker);
+        ExtendRetryBackoff(worker);
+        var attempts = backend.MountAttempts;
+
+        backend.IsConnected = false;
+        await InvokeRunCycleAsync(worker);
+        Assert.Equal(RuntimeState.Idle, publisher.Latest.State);
+        Assert.Null(publisher.Latest.LastError);
+
+        backend.IsConnected = true;
+        backend.MountError = null;
+        await InvokeRunCycleAsync(worker);
+        Assert.Equal(attempts + 1, backend.MountAttempts);
+        Assert.Equal(RuntimeState.MountedRo, publisher.Latest.State);
+        Assert.Null(publisher.Latest.LastError);
+    }
+
+    [Fact]
+    public async Task RunCycle_ExplicitEjectClearsFailedMountDiagnosticAndRetryBackoff()
+    {
+        var backend = new ControllableBackend { MountError = "Native helper exited with code 5." };
+        var publisher = new RuntimeStatusPublisher();
+        using var worker = CreateWorker(backend, publisher);
+        await InvokeRunCycleAsync(worker);
+        ExtendRetryBackoff(worker);
+
+        // Simulate a mount observed from outside the worker, then explicitly eject it.
+        backend.MountError = null;
+        await backend.MountAsync(new(ControllableBackend.VolumeId, 'R', MountAccessMode.ReadOnly), CancellationToken.None);
+        var eject = await worker.EjectAsync(ControllableBackend.VolumeId, CancellationToken.None);
+        Assert.True(eject.Success, eject.Message);
+        var attempts = backend.MountAttempts;
+        await InvokeRunCycleAsync(worker);
+        Assert.Equal(attempts, backend.MountAttempts);
+        Assert.Null(publisher.Latest.LastError);
+        Assert.DoesNotContain(publisher.Latest.Warnings, warning => warning.Contains("failed startup", StringComparison.Ordinal));
+
+        await worker.ClearEjectSuppressionAsync([ControllableBackend.VolumeId], CancellationToken.None);
+        await InvokeRunCycleAsync(worker);
+        Assert.Equal(attempts + 1, backend.MountAttempts);
+        Assert.Equal(RuntimeState.MountedRo, publisher.Latest.State);
+    }
+
+    private static void ExtendRetryBackoff(ApfsMountWorker worker)
+    {
+        // Avoid depending on execution speed relative to the first one-second retry.
+        var field = typeof(ApfsMountWorker).GetField("_mountRetryStates",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        var states = (System.Collections.IDictionary)field.GetValue(worker)!;
+        var state = states[ControllableBackend.VolumeId]!;
+        state.GetType().GetProperty("NextAttemptUtc")!.SetValue(state, DateTime.UtcNow.AddMinutes(1));
+    }
+
     [Fact]
     public async Task RunCycle_MultipleVolumesUsesOneContainerBatch()
     {
@@ -155,8 +291,13 @@ public sealed class ApfsMountWorkerAutoMountTests
     }
 
     [Fact]
-    public async Task RunCycle_RemountsAfterUserEjectedDriveWasPhysicallyDisconnected()
+    public async Task RunCycle_KeepsUserEjectedDriveUnmountedAcrossPhysicalDisconnect()
     {
+        // Explicit-eject suppression is session-scoped: a physical
+        // disconnect/reconnect cycle must not silently drop it (backend
+        // group turmoil after a container unmount gaps whole devices the
+        // same way a brief unplug does). Replug alone leaves the volume
+        // unmounted; the normal explicit mount path still remounts.
         var backend = new ControllableBackend();
         var worker = CreateWorker(backend);
 
@@ -173,6 +314,11 @@ public sealed class ApfsMountWorkerAutoMountTests
         backend.IsConnected = true;
         await InvokeRunCycleAsync(worker);
 
+        Assert.Empty(await backend.GetMountStateAsync(CancellationToken.None));
+        Assert.Equal(1, backend.MountAttempts);
+
+        var refresh = await worker.RefreshAsync(clearUserEjectedVolumes: true, CancellationToken.None);
+        Assert.True(refresh.Success);
         Assert.Single(await backend.GetMountStateAsync(CancellationToken.None));
         Assert.Equal(2, backend.MountAttempts);
     }
@@ -556,7 +702,7 @@ public sealed class ApfsMountWorkerAutoMountTests
     }
 
     [Fact]
-    public async Task Eject_WhenFinalWriteDrainFails_QuarantinesVolumeFromAutomaticRemount()
+    public async Task     Eject_WhenFinalWriteDrainFails_QuarantinesVolumeFromAutomaticRemount()
     {
         var backend = new ControllableBackend { FailWriteFinalizationAfterUnmount = true };
         var statusPublisher = new RuntimeStatusPublisher();
@@ -575,6 +721,55 @@ public sealed class ApfsMountWorkerAutoMountTests
         Assert.Contains(
             statusPublisher.Latest.Warnings,
             warning => warning.Contains("unsafe", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Cycle_UnmountsSuppressedVolumeMountedBehindWorkerBack()
+    {
+        var backend = new ControllableBackend();
+        var statusPublisher = new RuntimeStatusPublisher();
+        var worker = CreateWorker(backend, statusPublisher);
+
+        await InvokeRunCycleAsync(worker);
+        var eject = await worker.EjectAsync(ControllableBackend.VolumeId, CancellationToken.None);
+        Assert.True(eject.Success);
+        Assert.Empty(await backend.GetMountStateAsync(CancellationToken.None));
+
+        await backend.MountAsync(
+            new MountRequest(ControllableBackend.VolumeId, 'F', MountAccessMode.ReadWrite),
+            CancellationToken.None);
+        Assert.Single(await backend.GetMountStateAsync(CancellationToken.None));
+
+        await InvokeRunCycleAsync(worker);
+
+        Assert.Empty(await backend.GetMountStateAsync(CancellationToken.None));
+        // Attempts: 1 worker-driven (first cycle) + 1 direct backend mount
+        // above. The second cycle must add none: enforcement releases the
+        // bypass mount and suppression blocks any worker-driven remount.
+        Assert.Equal(2, backend.MountAttempts);
+        Assert.Contains(
+            statusPublisher.Latest.Warnings,
+            warning => warning.Contains("despite explicit eject suppression", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task ClearEjectSuppression_AllowsExplicitRemountOnNextCycle()
+    {
+        var backend = new ControllableBackend();
+        var worker = CreateWorker(backend, new RuntimeStatusPublisher());
+
+        await InvokeRunCycleAsync(worker);
+        var eject = await worker.EjectAsync(ControllableBackend.VolumeId, CancellationToken.None);
+        Assert.True(eject.Success);
+        await InvokeRunCycleAsync(worker);
+        Assert.Empty(await backend.GetMountStateAsync(CancellationToken.None));
+        Assert.Equal(1, backend.MountAttempts);
+
+        await worker.ClearEjectSuppressionAsync([ControllableBackend.VolumeId], CancellationToken.None);
+        await InvokeRunCycleAsync(worker);
+
+        Assert.Single(await backend.GetMountStateAsync(CancellationToken.None));
+        Assert.Equal(2, backend.MountAttempts);
     }
 
     [Fact]
@@ -705,13 +900,13 @@ public sealed class ApfsMountWorkerAutoMountTests
         var refreshTask = worker.RefreshAsync(clearUserEjectedVolumes: true, CancellationToken.None);
         var refreshOrTimeout = await Task.WhenAny(refreshTask, Task.Delay(TimeSpan.FromMilliseconds(200)));
         Assert.False(refreshOrTimeout == refreshTask);
+        Assert.Equal(new[] { "mounted:R:\\" }, backend.OperationHistory);
         backend.ReleaseUnmount();
 
-        var ejectCompletedFirst = await Task.WhenAny(ejectTask, refreshTask) == ejectTask;
         var eject = await ejectTask;
         var refresh = await refreshTask;
 
-        Assert.True(ejectCompletedFirst, "The eject holding the operation lock must finish before the queued refresh runs.");
+        Assert.Equal(new[] { "mounted:R:\\", "unmounted:R:\\", "mounted:R:\\" }, backend.OperationHistory);
         Assert.True(eject.Success, eject.Message);
         Assert.True(refresh.Success, refresh.Message);
 
@@ -913,6 +1108,8 @@ public sealed class ApfsMountWorkerAutoMountTests
 
         public string? MountDiagnosticCode { get; set; }
 
+        public string? MountError { get; set; }
+
         public ulong? AuthoritativeLastCommitXid { get; init; }
 
         public bool AuthoritativeRecoveryActive { get; init; }
@@ -926,6 +1123,8 @@ public sealed class ApfsMountWorkerAutoMountTests
         private readonly List<string> _unmountHistory = [];
 
         public IReadOnlyList<string> UnmountHistory => _unmountHistory;
+        private readonly List<string> _operationHistory = [];
+        public IReadOnlyList<string> OperationHistory => _operationHistory;
 
         private readonly Dictionary<string, int> _mountAttemptsByVolumeId = new(StringComparer.OrdinalIgnoreCase);
 
@@ -1011,6 +1210,11 @@ public sealed class ApfsMountWorkerAutoMountTests
             _mountAttemptsByVolumeId.TryGetValue(request.VolumeId, out var attempts);
             _mountAttemptsByVolumeId[request.VolumeId] = attempts + 1;
 
+            if (MountError is not null)
+            {
+                return Task.FromResult(new MountResult(false, null, MountError, request.AccessMode));
+            }
+
             if (!IsConnected)
             {
                 return Task.FromResult(new MountResult(
@@ -1039,6 +1243,7 @@ public sealed class ApfsMountWorkerAutoMountTests
                 RecoveryActive: AuthoritativeRecoveryActive,
                 LastCommitXid: AuthoritativeLastCommitXid,
                 RecoveryReason: AuthoritativeRecoveryReason);
+            _operationHistory.Add("mounted:" + mountPoint);
 
             return Task.FromResult(new MountResult(
                 Success: true,
@@ -1124,6 +1329,7 @@ public sealed class ApfsMountWorkerAutoMountTests
                     $"Mount point '{mountPoint}' remained visible after FsHost stopped. Close Explorer windows or files and try eject again.");
             }
 
+            _operationHistory.Add("unmounted:" + mountPoint);
             return FailWriteFinalizationAfterUnmount
                 ? new UnmountResult(
                     false,

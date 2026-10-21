@@ -1,3 +1,7 @@
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+
 namespace ApfsAccess.Backend.Native.Tests;
 
 // Stages the stable observer binary under the test host base directory so
@@ -12,6 +16,12 @@ internal static class StagedPackagedObserver
     // the integration tests; fails instead of skipping when absent).
     public static string StableObserverPath()
     {
+        if (Environment.GetEnvironmentVariable("APFS_VERIFY_TEST_OBSERVER") is { Length: > 0 } explicitInput)
+        {
+            if (!Path.IsPathFullyQualified(explicitInput) || !File.Exists(explicitInput))
+                throw new InvalidOperationException("The explicit observer input is unavailable.");
+            return explicitInput;
+        }
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
         for (var level = 0; level < 14 && directory is not null; level++)
         {
@@ -47,8 +57,23 @@ internal static class StagedPackagedObserver
             var dir = Path.Combine(AppContext.BaseDirectory, "staged-packaged-observer", tag);
             Directory.CreateDirectory(dir);
             var staged = Path.Combine(dir, "ApfsObserver.exe");
-            File.Copy(realObserverPath, staged, overwrite: true);
+            if (OperatingSystem.IsWindows() && Environment.GetEnvironmentVariable("APFS_VERIFY_TEST_OBSERVER") is { Length: > 0 })
+            {
+                if (File.Exists(staged))
+                {
+                    using var source = File.OpenRead(realObserverPath);
+                    using var existing = File.OpenRead(staged);
+                    if (!SHA256.HashData(source).AsSpan().SequenceEqual(SHA256.HashData(existing)))
+                        throw new InvalidOperationException("Staged explicit observer input drifted.");
+                }
+                else if (!CreateHardLink(staged, realObserverPath, IntPtr.Zero))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            else File.Copy(realObserverPath, staged, overwrite: true);
             return staged;
         }
     }
+
+    [DllImport("kernel32.dll", EntryPoint = "CreateHardLinkW", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CreateHardLink(string path, string existing, IntPtr reserved);
 }

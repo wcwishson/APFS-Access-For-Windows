@@ -129,7 +129,12 @@ public sealed class FirstFreeMountPolicy : IMountPolicy
     public bool ShouldAutoMount(VolumeInfo volume)
     {
         ArgumentNullException.ThrowIfNull(volume);
-        return true;
+        // Role-aware gate (Task 6): only ordinary eligible Data volumes
+        // auto-mount. Sealed System, Preboot, Recovery, VM, Update, backup and
+        // every other special role stays visible but never auto-mounts; locked,
+        // unsupported and read-only-feature verdicts refuse the same way.
+        // Volumes without catalog verdicts keep the previous allow behavior.
+        return CatalogMountPolicy.AllowsOrdinaryMount(volume);
     }
 
     private static char[] NormalizeCandidates(IEnumerable<string>? candidateLetters)

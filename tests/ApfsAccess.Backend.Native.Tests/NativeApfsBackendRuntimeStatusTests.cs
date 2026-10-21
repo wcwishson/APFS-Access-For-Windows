@@ -271,6 +271,25 @@ public sealed class NativeApfsBackendRuntimeStatusTests
         var mount = backend.MountAsync(
             new MountRequest(@"\\.\PhysicalDrive9|Main", 'S', MountAccessMode.ReadOnly),
             mountCancellation.Token);
+        // Mount must be parked on the lifecycle gate (discovery drained) before
+        // Dispose starts. Dispose cancels in-flight discovery via the linked
+        // dispose CTS, so starting Dispose while the mount is still probing lets
+        // the mount fault and the drain finish immediately: Dispose would return
+        // at once and the TimeoutException assertions below could never observe
+        // the queued drain. Polling the discovery gate establishes the test's own
+        // precondition deterministically; it changes no assertion.
+        var discoveryGate = (SemaphoreSlim)typeof(NativeApfsBackend)
+            .GetField("_discoveryGate", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(backend)!;
+        var settled = Stopwatch.StartNew();
+        while (!mount.IsCompleted && discoveryGate.CurrentCount == 0 &&
+            settled.Elapsed < TimeSpan.FromSeconds(10))
+        {
+            await Task.Delay(10);
+        }
+        Assert.False(mount.IsCompleted,
+            "Mount left discovery before Dispose started; the gate-queued drain cannot be verified.");
+        Assert.Equal(1, discoveryGate.CurrentCount);
         var dispose = Task.Run(backend.Dispose);
         Task? concurrentDispose = null;
 
@@ -344,7 +363,15 @@ public sealed class NativeApfsBackendRuntimeStatusTests
         File.WriteAllText(lifetimePath, "alive");
         File.WriteAllText(statusPath, "{}");
 
-        using var process = StartLongRunningProcess();
+        using var process = Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"))
+        {
+            ArgumentList = { "/d", "/c", "set /p apfs_unmount_drain=&exit /b 0" },
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        }) ?? throw new InvalidOperationException("Could not start the cooperative test host.");
         var processId = process.Id;
         using var backend = new NativeApfsBackend(CreateOverlayRuntimeOptions());
         SeedMountedHost(
@@ -356,6 +383,9 @@ public sealed class NativeApfsBackendRuntimeStatusTests
             writeBackend: "Overlay",
             readiness: NativeWriteReadiness.MutationReady);
         using var cancellation = new CancellationTokenSource();
+        var seededHosts = typeof(NativeApfsBackend).GetField("_hosts", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(backend)!;
+        var seededHost = seededHosts.GetType().GetProperty("Item")!.GetValue(seededHosts, ["R:\\"])!;
+        HostTerminalFixture.BindOrdinary(seededHost, process, statusPath);
 
         try
         {
@@ -368,10 +398,20 @@ public sealed class NativeApfsBackendRuntimeStatusTests
             Assert.False(File.Exists(lifetimePath));
             cancellation.Cancel();
 
+            // Cancellation and the observation deadline must retain the draining owner.
+            await Task.Delay(TimeSpan.FromMilliseconds(1_200));
+            Assert.False(unmount.IsCompleted);
+            Assert.False(process.HasExited);
+            Assert.True((bool)seededHosts.GetType().GetMethod("ContainsKey")!.Invoke(seededHosts, ["R:\\"])!);
+            await process.StandardInput.WriteLineAsync("drain completed");
+            await process.StandardInput.FlushAsync();
             var result = await unmount.WaitAsync(TimeSpan.FromSeconds(5));
 
             Assert.Throws<ArgumentException>(() => Process.GetProcessById(processId));
+            Assert.True(result.Success, result.Error);
             Assert.True(result.MountRemoved);
+            Assert.True(result.HostOwnershipReleased);
+            Assert.True(result.PendingDurabilityCleared);
         }
         finally
         {
@@ -449,6 +489,7 @@ public sealed class NativeApfsBackendRuntimeStatusTests
         var refreshTask = backend.GetMountStateAsync(CancellationToken.None);
         await Task.Delay(60);
         process.Kill(entireProcessTree: true);
+        await process.WaitForExitAsync();
         statusLock.Dispose();
 
         var mounts = await refreshTask;
@@ -458,6 +499,9 @@ public sealed class NativeApfsBackendRuntimeStatusTests
         Assert.True(mount.RecoveryActive);
         Assert.Equal("FsHostExitedUnexpectedly", mount.RecoveryReason);
         Assert.Equal(NativeWriteSafetyState.RecoveryBlocked, mount.NativeWriteSafetyState);
+        var retained = typeof(NativeApfsBackend).GetField("_hosts", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(backend)!;
+        Assert.True((bool)retained.GetType().GetMethod("ContainsKey")!.Invoke(retained, ["R:\\"])!);
+        Assert.True(File.Exists(statusPath));
     }
 
     [Fact]

@@ -36,7 +36,7 @@ public sealed class ContainerSessionGroupingTests : IDisposable
             ObserverEvidenceJson.BuildSingleContainer(
                 ContainerHexA,
                 [new ObserverEvidenceJson.VolumeJson("Data", 101),
-                 new ObserverEvidenceJson.VolumeJson("Backup", 102)]));
+                 new ObserverEvidenceJson.VolumeJson("Backup", 102)], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")));
         var planned = BuildPlanned(backend, ["R", "S"], MountAccessMode.ReadOnly);
 
         var plans = backend.PlanContainerGroups(planned);
@@ -54,7 +54,7 @@ public sealed class ContainerSessionGroupingTests : IDisposable
             temp,
             ObserverEvidenceJson.BuildContainers(
                 [(ContainerHexA, [new ObserverEvidenceJson.VolumeJson("Data", 101)]),
-                 (ContainerHexB, [new ObserverEvidenceJson.VolumeJson("Media", 201)])]));
+                 (ContainerHexB, [new ObserverEvidenceJson.VolumeJson("Media", 201)])], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")));
         var planned = BuildPlanned(backend, ["R", "S"], MountAccessMode.ReadOnly);
 
         var plans = backend.PlanContainerGroups(planned);
@@ -99,12 +99,25 @@ public sealed class ContainerSessionGroupingTests : IDisposable
             ObserverEvidenceJson.BuildSingleContainer(
                 ContainerHexA,
                 [new ObserverEvidenceJson.VolumeJson("Data", 101),
-                 new ObserverEvidenceJson.VolumeJson("Backup", 102)]),
+                 new ObserverEvidenceJson.VolumeJson("Backup", 102)], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")),
             launched);
         var planned = BuildPlanned(backend, ["R", "S"], MountAccessMode.ReadOnly);
         var plan = Assert.Single(backend.PlanContainerGroups(planned));
 
-        var key = backend.StartContainerGroupOwner(plan);
+        // Mirror production, where the service always sets
+        // APFSACCESS_RUNTIME_ROOT (D:-rooted) before the backend writes its
+        // container manifest. Scoped to this call; restored afterwards.
+        var previousRuntimeRoot = Environment.GetEnvironmentVariable("APFSACCESS_RUNTIME_ROOT");
+        Environment.SetEnvironmentVariable("APFSACCESS_RUNTIME_ROOT", temp.Path);
+        string key;
+        try
+        {
+            key = backend.StartContainerGroupOwner(plan);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("APFSACCESS_RUNTIME_ROOT", previousRuntimeRoot);
+        }
 
         Assert.Equal(ContainerHexA, key);
         Assert.Single(launched);
@@ -131,7 +144,7 @@ public sealed class ContainerSessionGroupingTests : IDisposable
                 [(ContainerHexA, [new ObserverEvidenceJson.VolumeJson("Data", 101),
                                   new ObserverEvidenceJson.VolumeJson("Backup", 102)]),
                  (ContainerHexB, [new ObserverEvidenceJson.VolumeJson("Media", 201),
-                                  new ObserverEvidenceJson.VolumeJson("Archive", 202)])]),
+                                  new ObserverEvidenceJson.VolumeJson("Archive", 202)])], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")),
             launched);
         var planned = BuildPlanned(backend, ["R", "S", "T", "Q"], MountAccessMode.ReadOnly);
         var plans = backend.PlanContainerGroups(planned);
@@ -191,7 +204,7 @@ public sealed class ContainerSessionGroupingTests : IDisposable
         var startHost = typeof(NativeApfsBackend).GetMethod(
             "StartHostProcess", BindingFlags.NonPublic | BindingFlags.Instance);
         Assert.NotNull(startHost);
-        startHost!.Invoke(backend, [volume, "R:\\", MountAccessMode.ReadOnly]);
+        startHost!.Invoke(backend, [volume, "R:\\", MountAccessMode.ReadOnly, null]);
 
         // Container call with a single volume must take the same path.
         var results = await backend.MountContainerAsync(
@@ -216,7 +229,7 @@ public sealed class ContainerSessionGroupingTests : IDisposable
             temp,
             ObserverEvidenceJson.BuildSingleContainer(
                 ContainerHexA,
-                [new ObserverEvidenceJson.VolumeJson("Data", 101)]),
+                [new ObserverEvidenceJson.VolumeJson("Data", 101)], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")),
             launched);
         var volume = Assert.Single(BuildPlanned(backend, ["R"], MountAccessMode.ReadOnly));
 
@@ -230,6 +243,171 @@ public sealed class ContainerSessionGroupingTests : IDisposable
     }
 
     [Fact]
+    public async Task MountAsync_EarlyExit_PrefersBoundNativeStatusOverStderr()
+    {
+        using var temp = DTempDirectory.Create("startup-status");
+        var imagePath = Path.Combine(temp.Path, "single.apfs.img");
+        SyntheticApfsTestImage.Create(imagePath, sizeMiB: 4);
+        var backend = CreateBackend("{}", temp, startProcess: psi =>
+        {
+            var child = StartExitChild("FspFileSystemCreate failed: 0xc0000001");
+            var arguments = psi.ArgumentList.ToList();
+            var statusPath = arguments[arguments.IndexOf("--status-file") + 1];
+            File.WriteAllText(statusPath, JsonSerializer.Serialize(new
+            {
+                hostPid = child.Id,
+                mountReady = false,
+                recoveryActive = true,
+                recoveryReason = "RootEnumerationUnavailable",
+                lastRecoveryAction = "MountStartupBlocked",
+            }));
+            return child;
+        });
+        var volume = Assert.Single(await backend.ProbeVolumesAsync(imagePath, CancellationToken.None));
+
+        var result = await backend.MountAsync(
+            new MountRequest(volume.VolumeId, 'R', MountAccessMode.ReadOnly), CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal("FsHostStartupExit", result.DiagnosticCode);
+        Assert.Contains("exitCode=5", result.Error);
+        Assert.Contains("recoveryReason=RootEnumerationUnavailable", result.Error);
+        Assert.DoesNotContain("FspFileSystemCreate", result.Error);
+    }
+
+    [Fact]
+    public async Task MountAsync_EarlyExit_IgnoresStatusFromAnotherPidAndUsesStderr()
+    {
+        using var temp = DTempDirectory.Create("startup-stderr");
+        var imagePath = Path.Combine(temp.Path, "single.apfs.img");
+        SyntheticApfsTestImage.Create(imagePath, sizeMiB: 4);
+        var backend = CreateBackend("{}", temp, startProcess: psi =>
+        {
+            var child = StartExitChild("[FsHost] FspFileSystemCreate failed: 0xc0000001");
+            var arguments = psi.ArgumentList.ToList();
+            File.WriteAllText(arguments[arguments.IndexOf("--status-file") + 1], JsonSerializer.Serialize(new
+            {
+                hostPid = child.Id + 1,
+                mountReady = false,
+                recoveryActive = true,
+                recoveryReason = "WrongHostReason",
+            }));
+            return child;
+        });
+        var volume = Assert.Single(await backend.ProbeVolumesAsync(imagePath, CancellationToken.None));
+
+        var result = await backend.MountAsync(
+            new MountRequest(volume.VolumeId, 'R', MountAccessMode.ReadOnly), CancellationToken.None);
+
+        Assert.Equal("FsHostStartupExit", result.DiagnosticCode);
+        Assert.Contains("FspFileSystemCreate failed: 0xc0000001", result.Error);
+        Assert.DoesNotContain("WrongHostReason", result.Error);
+    }
+
+    [Fact]
+    public async Task MountAsync_ContainerEarlyExit_ReportsStderr()
+    {
+        using var temp = DTempDirectory.Create("container-startup-stderr");
+        var backend = await CreateProbedBackendAsync(
+            temp,
+            ObserverEvidenceJson.BuildSingleContainer(
+                ContainerHexA,
+                [new ObserverEvidenceJson.VolumeJson("Data", 101)],
+                devicePath: Path.Combine(temp.Path, "fixture.apfs.img")),
+            startProcess: _ => StartExitChild("[FsHost] Container open failed (invalid checkpoint)"));
+        var planned = Assert.Single(BuildPlanned(backend, ["R"], MountAccessMode.ReadOnly));
+
+        var result = await backend.MountAsync(planned.Request, CancellationToken.None);
+
+        Assert.Equal("FsHostStartupExit", result.DiagnosticCode);
+        Assert.Contains("Container open failed (invalid checkpoint)", result.Error);
+    }
+
+    [Fact]
+    public async Task MountAsync_EarlyExitWithoutDetail_KeepsExitCodeFallback()
+    {
+        using var temp = DTempDirectory.Create("startup-no-detail");
+        var imagePath = Path.Combine(temp.Path, "single.apfs.img");
+        SyntheticApfsTestImage.Create(imagePath, sizeMiB: 4);
+        var backend = CreateBackend("{}", temp, startProcess: _ => StartExitChild(string.Empty));
+        var volume = Assert.Single(await backend.ProbeVolumesAsync(imagePath, CancellationToken.None));
+
+        var result = await backend.MountAsync(
+            new MountRequest(volume.VolumeId, 'R', MountAccessMode.ReadOnly), CancellationToken.None);
+
+        Assert.Equal("FsHostStartupExit", result.DiagnosticCode);
+        Assert.Contains("exitCode=5", result.Error);
+        Assert.DoesNotContain("FsHost status:", result.Error);
+        Assert.DoesNotContain("FsHost stderr:", result.Error);
+    }
+
+    [Fact]
+    public async Task MountAsync_CanceledAfterLegacyHostLaunch_PropagatesCancellation()
+    {
+        using var temp = DTempDirectory.Create("legacy-startup-cancel");
+        using var cancellation = new CancellationTokenSource();
+        var imagePath = Path.Combine(temp.Path, "single.apfs.img");
+        SyntheticApfsTestImage.Create(imagePath, sizeMiB: 4);
+        var backend = CreateBackend("{}", temp, startProcess: _ =>
+        {
+            var child = StartPingChild(30);
+            cancellation.Cancel();
+            return child;
+        });
+        var volume = Assert.Single(await backend.ProbeVolumesAsync(imagePath, CancellationToken.None));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => backend.MountAsync(
+            new MountRequest(volume.VolumeId, 'R', MountAccessMode.ReadOnly), cancellation.Token));
+    }
+
+    [Fact]
+    public async Task MountAsync_CanceledAfterContainerOwnerLaunch_PropagatesCancellation()
+    {
+        using var temp = DTempDirectory.Create("container-startup-cancel");
+        using var cancellation = new CancellationTokenSource();
+        var backend = await CreateProbedBackendAsync(
+            temp,
+            ObserverEvidenceJson.BuildSingleContainer(
+                ContainerHexA,
+                [new ObserverEvidenceJson.VolumeJson("Data", 101)],
+                devicePath: Path.Combine(temp.Path, "fixture.apfs.img")),
+            startProcess: _ =>
+            {
+                var child = StartPingChild(30);
+                cancellation.Cancel();
+                return child;
+            });
+        var planned = Assert.Single(BuildPlanned(backend, ["R"], MountAccessMode.ReadOnly));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => backend.MountAsync(
+            planned.Request, cancellation.Token));
+    }
+
+    [Fact]
+    public async Task ContainerWait_ProcessObservationFailure_IsNotAnExit()
+    {
+        using var temp = DTempDirectory.Create("container-observation-failure");
+        using var backend = CreateBackend("{}", temp);
+        using var unassociated = new Process();
+        var hostType = typeof(NativeApfsBackend).GetNestedType("HostProcessState", BindingFlags.NonPublic)!;
+        var host = Activator.CreateInstance(hostType,
+            BindingFlags.Instance | BindingFlags.NonPublic, null,
+            [unassociated, string.Empty, string.Empty, MountAccessMode.ReadOnly, "Disabled"], null)!;
+        var groupType = typeof(NativeApfsBackend).GetNestedType("ContainerGroupState", BindingFlags.NonPublic)!;
+        var group = Activator.CreateInstance(groupType,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null,
+            [ContainerHexA, "fixture", 0UL, string.Empty, host, false], null)!;
+        var method = typeof(NativeApfsBackend).GetMethod("WaitForContainerMountsAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        var wait = (Task)method.Invoke(backend,
+            [group, Array.Empty<NativeApfsBackend.PlannedVolume>(), TimeSpan.FromSeconds(2), CancellationToken.None])!;
+        await wait;
+        var result = wait.GetType().GetProperty("Result")!.GetValue(wait)!;
+        Assert.Equal("ObservationFailed", result.GetType().GetField("Item1")!.GetValue(result)!.ToString());
+    }
+
+    [Fact]
     public async Task MountContainer_OneEligibleCanonicalSurvivorUsesContainerOwner()
     {
         using var temp = DTempDirectory.Create("container-one-survivor");
@@ -239,7 +417,7 @@ public sealed class ContainerSessionGroupingTests : IDisposable
             ObserverEvidenceJson.BuildSingleContainer(
                 ContainerHexA,
                 [new ObserverEvidenceJson.VolumeJson("Data", 101),
-                 new ObserverEvidenceJson.VolumeJson("Backup", 102)]),
+                 new ObserverEvidenceJson.VolumeJson("Backup", 102)], devicePath: Path.Combine(temp.Path, "fixture.apfs.img")),
             launched);
         var volumeCache = (System.Collections.IDictionary)typeof(NativeApfsBackend)
             .GetField("_volumeCache", BindingFlags.NonPublic | BindingFlags.Instance)!
@@ -311,18 +489,20 @@ public sealed class ContainerSessionGroupingTests : IDisposable
     private async Task<NativeApfsBackend> CreateProbedBackendAsync(
         DTempDirectory temp,
         string evidence,
-        List<string[]>? launched = null)
+        List<string[]>? launched = null,
+        Func<ProcessStartInfo, Process>? startProcess = null)
     {
         var imagePath = Path.Combine(temp.Path, "fixture.apfs.img");
         SyntheticApfsTestImage.CreateCatalogFixture(imagePath);
-        var backend = CreateBackend(evidence, temp, launched);
+        var backend = CreateBackend(evidence, temp, launched, startProcess);
         var volumes = await backend.ProbeVolumesAsync(imagePath, CancellationToken.None);
         Assert.NotEmpty(volumes);
         return backend;
     }
 
     private NativeApfsBackend CreateBackend(
-        string evidence, DTempDirectory temp, List<string[]>? launched = null)
+        string evidence, DTempDirectory temp, List<string[]>? launched = null,
+        Func<ProcessStartInfo, Process>? startProcess = null)
     {
         var observerShim = Path.Combine(temp.Path, "ApfsObserver.exe");
         File.WriteAllBytes(observerShim, [0x4D, 0x5A]);
@@ -331,7 +511,7 @@ public sealed class ContainerSessionGroupingTests : IDisposable
             StartProcess = psi =>
             {
                 launched?.Add(psi.ArgumentList.ToArray());
-                return StartPingChild(30);
+                return startProcess?.Invoke(psi) ?? StartPingChild(30);
             },
         };
         var backend = new NativeApfsBackend(
@@ -461,6 +641,25 @@ public sealed class ContainerSessionGroupingTests : IDisposable
             _children.Add(child);
         }
 
+        return child;
+    }
+
+    private Process StartExitChild(string stderr)
+    {
+        var stderrCommand = string.IsNullOrEmpty(stderr) ? string.Empty : $" & echo {stderr} 1>&2";
+        var child = Process.Start(new ProcessStartInfo
+        {
+            FileName = Path.Combine(Environment.SystemDirectory, "cmd.exe"),
+            Arguments = $"/d /s /c \"\"{Path.Combine(Environment.SystemDirectory, "PING.EXE")}\" -n 2 127.0.0.1 >nul{stderrCommand} & exit /b 5\"",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        })!;
+        lock (_sync)
+        {
+            _children.Add(child);
+        }
         return child;
     }
 

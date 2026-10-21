@@ -1,5 +1,47 @@
 # APFS Access Release Notes
 
+## APFS Access 1.0.6
+
+APFS Access 1.0.6 delivers substantial user experience and functionality upgrades over 1.0.5, introducing an interactive visual drive-and-container hierarchy, automatic drive-letter remounting with in-use safety warnings, automatic weekly update checks, a direct GitHub project button, theme customization, and robust multi-volume APFS container support.
+
+### Download
+
+Most users should download:
+
+- `APFS Access.exe`
+
+Advanced users can also download `APFSAccess-1.0.6-win-x64-click-run.zip` for the unpackaged portable folder.
+
+### What Changed in 1.0.6
+
+- **Visual Drive & Container Hierarchy:** The Dashboard now organizes your storage into an intuitive visual tree showing physical drives, partitions, APFS containers, and individual volumes, showing available capacity and mount status at a glance.
+- **Drive Letter Customization & Auto-Remount:** You can now change the preferred drive letter for any volume directly in the dashboard. Saving a new letter automatically remounts the volume immediately onto your chosen drive letter.
+- **Smart In-Use Safety Warning:** If files are open or File Explorer is browsing a volume when changing its drive letter, the app prompts you with options to **Queue Remount** (which automatically remounts as soon as applications finish using the drive) or **Cancel**.
+- **Automatic Weekly Update Checks:** APFS Access now checks GitHub in the background once weekly for new releases and notifies you when an update is available.
+- **Direct GitHub Access:** Added a dedicated **GitHub** button right next to "Check for updates" in the dashboard footer to open the repository and release notes with a single click.
+- **Theme Selection (Follow Windows, Light, Dark):** Choose your preferred appearance from the dashboard dropdown or the tray context menu; your preference is remembered across restarts.
+- **Multi-Volume Container Co-Mounting:** Greatly improved handling for APFS containers containing multiple volumes, ensuring sibling volumes co-mount seamlessly and clearing prior ejection states cleanly.
+- **Durable Read/Write Performance:** High-throughput, low-latency file operations (copy, move, rename, delete) on supported ordinary APFS data volumes with safe checkpoint commits and drain guarantees.
+- **Clean Safe Eject & Graceful Quit:** Ejection and application shutdown wait until all pending writes and background tasks are fully flushed, preventing filesystem inconsistencies.
+- **Recycle Bin Integration:** Deleting files to the Windows Recycle Bin preserves security descriptor metadata needed for standard recycling.
+- **Clearer Error Guidance:** The dashboard details pane explains exact mounting states and includes a one-click **Copy info** button for easy reporting.
+
+### Everyday Use
+
+- **Green** means healthy read/write.
+- **Yellow** means read-only but fully accessible for reading and copying files out.
+- **Blue** means file operations or data synchronizations are finishing.
+- **Red** means an issue was detected or recovery is required.
+- **Fix** performs a safe refresh and remounts the volume if read/write mode is safe.
+- **Eject** flushes all pending data and safely unmounts the drive before disconnecting.
+- Closing the dashboard minimizes the app to the Windows system tray. Right-click the tray icon to access themes, eject drives, or quit.
+
+### Known Limits
+
+- Windows SmartScreen may show a one-time prompt on first launch for new releases (click "More info" -> "Run anyway").
+- Encrypted physical drives, macOS System/sealed containers, and Fusion drives remain read-only or unsupported for write safety.
+- Always eject drives from the dashboard or tray icon before unplugging.
+
 ## APFS Access 1.0.5
 
 APFS Access 1.0.5 improves day-to-day reliability, control, and performance for supported writable APFS data volumes. It also makes read-only states clearer and gives scripts and AI agents a complete command-line interface.

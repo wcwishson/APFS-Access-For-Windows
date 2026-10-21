@@ -195,6 +195,11 @@ MutationCompactor::Summary MutationCompactor::Summarize(
             break;
         case MutationKind::SetAllocationSize:
         case MutationKind::CloneFile:
+        case MutationKind::CreateSnapshot:
+        case MutationKind::DeleteSnapshot:
+        case MutationKind::SetVolumeQuotaReserve:
+        case MutationKind::RenameVolume:
+        case MutationKind::RepairVolumeFileCount:
         case MutationKind::RewriteCompressedContent:
             // Allocation shrink may truncate EOF; a final-path summary cannot
             // represent the ordered writes, truncations and growth around it.

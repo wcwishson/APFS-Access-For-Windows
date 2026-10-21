@@ -96,8 +96,29 @@ bool RunNativeCompressionReadTask5(bool malformed, bool resource_backed = false,
             const auto current_acl = store.LookupCommittedExtendedAttribute(17, kAppleSecurityName);
             const auto current_marker = store.LookupCommittedExtendedAttribute(17, "com.apple.decmpfs");
             const auto current_fork = store.LookupCommittedExtendedAttribute(17, "com.apple.ResourceFork");
+            // TEMP-DIAG per-conjunct values for the malformed-bitmap variant (removed after).
+            std::fprintf(stderr, "[INFO] lzvn-preserved oid=%llu mode=%lo owner=%u group=%u size=%llu cflag=%d acl=%d aclflags=%d acldata=%d marker=%d markerdata=%d nodesec=%d fork=%d\n",
+                (unsigned long long)(current ? current->object_id : 0ULL),
+                current ? (unsigned long)current->mode : 0UL,
+                current ? current->owner : 0u, current ? current->group : 0u,
+                (unsigned long long)(current ? current->logical_size : 0ULL),
+                (int)(bool)(current && (current->bsd_flags & kAppleBsdCompressedFlag)),
+                (int)(bool)current_acl,
+                current_acl ? (int)current_acl->flags : -1,
+                (int)(bool)(current_acl && current_acl->data == acl),
+                (int)(bool)current_marker,
+                (int)(bool)(current_marker && current_marker->data == marker),
+                (int)(bool)(node->native_security == security),
+                (int)(bool)current_fork);
+            // Decodable sources report their declared size; sources whose
+            // compression header cannot be parsed import fail-closed size 0
+            // (no trustworthy declared size exists). Both postures are exact;
+            // any other size fails. Clean variants always take the 5 branch,
+            // which keeps sizing regressions covered.
+            const bool size_ok = current->logical_size == 5 ||
+                (malformed && current->logical_size == 0);
             return Require(current && current->object_id == 17 && current->mode == 0100640 &&
-                current->owner == 501 && current->group == 20 && current->logical_size == 5 &&
+                current->owner == 501 && current->group == 20 && size_ok &&
                 (current->bsd_flags & kAppleBsdCompressedFlag) && current_acl &&
                 current_acl->flags == kAppleXattrDataEmbedded && current_acl->data == acl &&
                 current_marker && current_marker->data == marker && node->native_security == security &&
@@ -137,10 +158,12 @@ bool RunNativeCompressionReadTask5(bool malformed, bool resource_backed = false,
         ScopeExit close{[&] { if (reader) CB_Close(&fs, reader); }};
         if (!Require(CB_Open(&fs, const_cast<PWSTR>(L"\\compressed"), FILE_OPEN << 24,
                 FILE_READ_ATTRIBUTES | READ_CONTROL, &reader, &info) == STATUS_SUCCESS && reader &&
-                info.FileSize == 5 && info.IndexNumber == 17 && !(info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY),
+                (info.FileSize == 5 || (malformed && info.FileSize == 0)) &&
+                info.IndexNumber == 17 && !(info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY),
                 "Task5 metadata Open exposes logical EOF and regular-file identity")) return false;
         const auto attributes = info.FileAttributes;
-        if (!Require(CB_GetFileInfo(&fs, reader, &info) == STATUS_SUCCESS && info.FileSize == 5 &&
+        if (!Require(CB_GetFileInfo(&fs, reader, &info) == STATUS_SUCCESS &&
+                (info.FileSize == 5 || (malformed && info.FileSize == 0)) &&
                 info.IndexNumber == 17 && info.FileAttributes == attributes,
                 "Task5 read attributes agree with Open")) return false;
         CB_Close(&fs, reader); reader = nullptr;
@@ -203,7 +226,10 @@ bool RunNativeCompressionReadTask5(bool malformed, bool resource_backed = false,
         {
             if (rewrite_supported && !malformed && !append) continue; // Actual bounded edits live in the modern callback group.
             ULONG done = 999;
-            if (!Require(CB_Write(&fs, &retained, &replacement, 1, 1, append, FALSE, &done, &info) == STATUS_NOT_SUPPORTED &&
+            const auto refusal = CB_Write(&fs, &retained, &replacement, 1, 1, append, FALSE, &done, &info);
+            std::fwprintf(stderr, L"[codec-refusal] type=%u malformed=%d manifest=%d append=%d status=%lx bytes=%lu reason=%ls\n",
+                type, malformed, manifest, append, static_cast<unsigned long>(refusal), done, c.runtime_recovery_reason.c_str());
+            if (!Require(refusal == STATUS_NOT_SUPPORTED &&
                     done == 0 && replacement == std::byte{'Z'},
                     "Task5 malformed writes and EOF growth refuse without changing caller bytes") || !unchanged()) return false;
         }

@@ -408,10 +408,10 @@ bool RequireReadbackStoppedBeforePublication(const ReadbackWriteTarget& target,
         static_cast<std::ptrdiff_t>(plan.superblock_write.physical_block * plan.block_size);
     return Require(target.faults_injected == 1 &&
             target.memory.WrittenBlocks() == expected_writes &&
-            target.memory.FlushWriteCounts().empty() &&
+            target.memory.FlushWriteCounts() == std::vector<std::size_t>{expected_writes.size()} &&
             std::all_of(nxsb_begin, nxsb_begin + plan.block_size,
                 [](std::byte value) { return value == std::byte{0}; }),
-        label + ": fault reached after ordered writes, no flush or NXSB publication");
+        label + ": fault reached after the first flush, before NXSB publication");
 }
 
 bool TestBoundedReadbackCoalescesAndChecksAllBytes()
@@ -424,12 +424,12 @@ bool TestBoundedReadbackCoalescesAndChecksAllBytes()
             [&](std::string_view stage) { stages.emplace_back(stage); return true; }),
         "bounded readback executes: " + error);
     const std::vector<std::pair<std::uint64_t, std::size_t>> expected_ranges{
-        {1, 64}, {65, 64}, {129, 2}};
+        {1, 64}, {65, 64}, {129, 2}, {1, 64}, {65, 64}, {129, 2}, {131, 1}};
     ok &= Require(target.range_reads == expected_ranges &&
-            target.range_buffers.size() == 3 &&
+            target.range_buffers.size() == 7 &&
             target.range_buffers[0] == target.range_buffers[1] &&
             target.range_buffers[1] == target.range_buffers[2],
-        "130 blocks use three bounded ranges and reuse scratch storage");
+        "130 blocks use three bounded ranges per barrier plus the switch read, reusing scratch storage");
     std::vector<std::uint64_t> expected_writes;
     for (const auto& write : plan.before_superblock_writes)
     {
@@ -479,7 +479,8 @@ bool TestBoundedReadbackPreservesNonadjacentOrder()
     bool ok = Require(ExecuteAppleCheckpointPublication(target, plan, error),
         "nonadjacent readback executes: " + error);
     const std::vector<std::pair<std::uint64_t, std::size_t>> expected{
-        {10, 2}, {4, 2}, {7, 1}, {6, 1}, {20, 1}};
+        {10, 2}, {4, 2}, {7, 1}, {6, 1}, {20, 1},
+        {10, 2}, {4, 2}, {7, 1}, {6, 1}, {20, 1}, {21, 1}};
     ok &= Require(target.range_reads == expected &&
             target.memory.WrittenBlocks() ==
                 std::vector<std::uint64_t>{10, 11, 4, 5, 7, 6, 20, 21},
@@ -507,7 +508,7 @@ bool TestBoundedReadbackCorruptionAndFailuresStopPublication()
                     [&](std::string_view stage) { stages.emplace_back(stage); return true; }) &&
                     error == "AppleCheckpointReadbackFailed" &&
                     target.range_reads.size() == (block - 1) / kReadbackBlocksPerRange + 1 &&
-                    stages == std::vector<std::string>{"before-apple-device-write"}, label);
+                    stages == std::vector<std::string>{"before-apple-device-write", "before-apple-prepublication-flush"}, label);
             ok &= RequireReadbackStoppedBeforePublication(target, plan, label);
         }
     }
@@ -539,7 +540,7 @@ bool TestDefaultReadbackPreservesSingleBlockFailureOrder()
     std::string error;
     bool ok = Require(ExecuteAppleCheckpointPublication(completed, plan, error) &&
             completed.range_reads.empty() &&
-            completed.single_reads == std::vector<std::uint64_t>{0, 1, 2, 3, 4, 5, 0, 6},
+            completed.single_reads == std::vector<std::uint64_t>{0, 1, 2, 3, 4, 5, 0, 6, 1, 2, 3, 4, 5, 6},
         "default range fallback keeps every original single-block read: " + error);
     for (const auto block : {1ULL, 3ULL, 5ULL})
     {
@@ -557,6 +558,80 @@ bool TestDefaultReadbackPreservesSingleBlockFailureOrder()
                 "legacy target stops at first bad block " + std::to_string(block));
             ok &= RequireReadbackStoppedBeforePublication(target, plan, "legacy failure");
         }
+    }
+    return ok;
+}
+
+class FlushLossTarget final : public AppleCheckpointWriteTarget
+{
+public:
+    FlushLossTarget(const AppleCheckpointPublicationPlan& plan, unsigned loss_flush, bool lose_switch)
+        : memory(std::vector<std::byte>((plan.superblock_write.physical_block + 1) * plan.block_size)),
+          switch_block(plan.superblock_write.physical_block), loss_flush_(loss_flush),
+          lost_block_(lose_switch ? switch_block : plan.before_superblock_writes.front().physical_block),
+          old_(plan.block_size) {}
+
+    bool ReadBlock(std::uint64_t block, std::uint32_t block_size, std::vector<std::byte>& bytes) override
+    {
+        const auto found = std::find_if(cache_.begin(), cache_.end(),
+            [&](const auto& item) { return item.first == block; });
+        if (found != cache_.end()) { bytes = found->second; return true; }
+        return memory.ReadBlock(block, block_size, bytes);
+    }
+
+    // No override specifier permits the same fault to execute against the old
+    // interface; there it is unused, exposing the cached-read false success.
+    bool ReadBlockRangeForVerification(std::uint64_t block, std::uint32_t block_size,
+        std::size_t max_blocks, std::vector<std::byte>& bytes)
+    {
+        ++fresh_reads;
+        return max_blocks != 0 && memory.ReadBlock(block, block_size, bytes);
+    }
+
+    bool WriteBlock(std::uint64_t block, std::span<const std::byte> bytes) override
+    {
+        if (block == switch_block) ++switch_writes;
+        cache_.emplace_back(block, std::vector<std::byte>(bytes.begin(), bytes.end()));
+        return memory.WriteBlock(block, bytes);
+    }
+
+    bool Flush() override
+    {
+        ++flushes;
+        if (flushes == loss_flush_ && !memory.WriteBlock(lost_block_, old_)) return false;
+        return memory.Flush();
+    }
+
+    MemoryWriteTarget memory;
+    std::uint64_t switch_block;
+    unsigned fresh_reads = 0, switch_writes = 0, flushes = 0;
+private:
+    unsigned loss_flush_;
+    std::uint64_t lost_block_;
+    std::vector<std::byte> old_;
+    std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> cache_;
+};
+
+bool TestFlushLossCannotHideBehindReadCache()
+{
+    const auto plan = BuildReadbackPlan({1, 2, 3});
+    bool ok = true;
+    for (const auto scenario : {0u, 1u, 2u, 3u})
+    {
+        const auto loss_flush = scenario == 3 ? 2u : scenario;
+        FlushLossTarget target(plan, loss_flush, scenario == 3);
+        std::string error;
+        const bool success = ExecuteAppleCheckpointPublication(target, plan, error);
+        std::cout << "[INFO] flush loss scenario=" << scenario << " success=" << success
+            << " freshReads=" << target.fresh_reads << " switchWrites=" << target.switch_writes
+            << " error=" << error << '\n';
+        if (scenario == 0)
+            ok &= Require(success && error.empty() && target.flushes == 2 && target.fresh_reads >= 7,
+                "healthy publication verifies each complete post-flush view without extra writes");
+        else
+            ok &= Require(!success && error == "AppleCheckpointReadbackFailed" && target.fresh_reads != 0 &&
+                    target.switch_writes == (scenario == 1 ? 0u : 1u),
+                "acknowledged flush loss is refused despite expected bytes remaining in the read cache");
     }
     return ok;
 }
@@ -882,7 +957,12 @@ bool TestPublishesReachableFileThroughBothObjectMaps()
     file.private_id = kFileId;
     file.children_or_links = 1;
     file.mode = 0100644;
-    file.uncompressed_size = payload_text.size();
+    // Ordinary EOF belongs to INO_EXT_TYPE_DSTREAM. uncompressed_size
+    // without INODE_HAS_UNCOMPRESSED_SIZE is not an ordinary file size.
+    AppleExtendedField stream_field{8, 0, std::vector<std::byte>(40)};
+    PutU64LE(stream_field.data, 0, payload_text.size());
+    PutU64LE(stream_field.data, 8, kBlockSize);
+    file.extended_fields.push_back(std::move(stream_field));
     ok &= Require(EncodeAppleInodeRecord(file, record, error),
         "encode reachable file inode: " + error);
     records.push_back(std::move(record));
@@ -1839,16 +1919,18 @@ bool TestLateRecoveryPinRejectsReclaimedDescendants(bool with_payload = false)
     store.authoritative_checkpoint = true;
     store.authoritative_checkpoint_ring_blocks = 16;
     store.authoritative_internal_pool_blocks = 16;
-    store.block_count = 512;
+    store.block_count = 2048;
     store.volumes[0].incompat = kIncompatCaseInsensitive;
-    store.volumes[0].fext_tree_oid = 10;
     const auto root_oid = 0x2000 + store.volumes[0].oid;
     const auto snapshot_oid = 0x3000 + store.volumes[0].oid;
     constexpr std::uint64_t payload_block = 220;
     constexpr std::uint64_t payload_blocks = 20;
+    constexpr std::uint64_t filesystem_child_block = 300;
     std::string error;
     std::vector<apfsaccess::catalog::BtreeRecord> records;
-    for (std::uint64_t oid = 2; oid < 102; ++oid)
+    // Real reachable nodes force the OMAP split within the retirement proof's
+    // supported non-deleted mapping profile.
+    for (std::uint64_t oid = 2; oid < 4098; ++oid)
     {
         AppleInodeRecord inode;
         inode.object_id = oid;
@@ -1883,7 +1965,14 @@ bool TestLateRecoveryPinRejectsReclaimedDescendants(bool with_payload = false)
     options.root_object_id = root_oid;
     options.root_physical_block = 7;
     options.first_child_object_id = 0x5000;
-    options.first_child_physical_block = 160;
+    options.first_child_physical_block = filesystem_child_block;
+    // Keep block 10 in the retained metadata graph without an unsupported
+    // separate file-extent tree.
+    for (std::uint64_t index = 0; index < 128; ++index)
+    {
+        options.child_object_ids.push_back(0x5000 + index);
+        options.child_physical_blocks.push_back(index == 1 ? 10 : filesystem_child_block + index);
+    }
     options.subtype = kObjectTypeFsTree;
     options.tree_flags = kAppleBtreeKvNonAligned;
     options.key_order = AppleBtreeKeyOrder::FileSystemHashedDirectory;
@@ -1902,13 +1991,6 @@ bool TestLateRecoveryPinRejectsReclaimedDescendants(bool with_payload = false)
         if (!EncodeAppleOmapRecord(mapping, record, error)) return false;
         mappings.push_back(std::move(record));
     }
-    for (std::uint64_t oid = 0x7000; oid < 0x70C8; ++oid)
-    {
-        AppleOmapRecord tombstone{oid, store.xid, kAppleOmapValueDeleted, 0, 0};
-        apfsaccess::catalog::BtreeRecord record;
-        if (!EncodeAppleOmapRecord(tombstone, record, error)) return false;
-        mappings.push_back(std::move(record));
-    }
     AppleOmapRecord snapshot{snapshot_oid, store.xid, 0, kBlockSize, 9};
     apfsaccess::catalog::BtreeRecord snapshot_mapping;
     if (!EncodeAppleOmapRecord(snapshot, snapshot_mapping, error)) return false;
@@ -1917,6 +1999,8 @@ bool TestLateRecoveryPinRejectsReclaimedDescendants(bool with_payload = false)
     options.root_physical_block = 6;
     options.first_child_object_id = 190;
     options.first_child_physical_block = 190;
+    options.child_object_ids.clear();
+    options.child_physical_blocks.clear();
     options.storage_type = kObjectPhysical;
     options.subtype = kObjectTypeOmap;
     options.tree_flags = kAppleBtreePhysical | kAppleBtreeKvNonAligned;
@@ -1940,7 +2024,8 @@ bool TestLateRecoveryPinRejectsReclaimedDescendants(bool with_payload = false)
     request.filesystem_records = records;
     request.required_checkpoint_xids = {store.xid};
     AppleVolumeTransactionPlan first;
-    if (!Require(PlanAppleVolumeTransaction(source, *old, request, first, error),
+    const auto first_planned = PlanAppleVolumeTransaction(source, *old, request, first, error);
+    if (!Require(first_planned,
             "multi-node history publishes a new current generation: " + error)) return false;
     MemoryWriteTarget target(image);
     if (!Require(ExecuteAppleCheckpointPublication(target, first.commit.publication, error),
@@ -1954,7 +2039,7 @@ bool TestLateRecoveryPinRejectsReclaimedDescendants(bool with_payload = false)
     bool ok = Require(admitted,
         "still-owned historical descendant pin succeeds: " + error);
     if (!ok) return false;
-    std::vector<std::uint64_t> victims{160, 190, 8, 9, 10};
+    std::vector<std::uint64_t> victims{filesystem_child_block, 190, 8, 9, 10};
     if (with_payload)
     {
         victims.push_back(payload_block);
@@ -1990,7 +2075,7 @@ bool TestLateRecoveryPinRejectsReclaimedDescendants(bool with_payload = false)
         }
         const auto& nxsb = old->container.superblock;
         const auto& pool = old->spaceman.internal_pool;
-        for (const auto overlap : {std::uint64_t{160}, std::uint64_t{190},
+        for (const auto overlap : {filesystem_child_block, std::uint64_t{190},
                 nxsb.xp_desc_base_block + nxsb.xp_desc_block_count - 1,
                 nxsb.xp_data_base_block + nxsb.xp_data_block_count - 1,
                 pool.base_block + pool.block_count - 1,
@@ -2087,8 +2172,9 @@ bool TestLateRecoveryPinRejectsReclaimedDescendants(bool with_payload = false)
     }
     for (const auto victim : victims)
     {
-        if (reallocated && victim != 160 && victim != 190 && victim < payload_block) continue;
-        const auto variants = reallocated && with_payload && victim >= payload_block ? 3 : 1;
+        if (reallocated && victim != filesystem_child_block && victim != 190 && victim < payload_block) continue;
+        const auto variants = reallocated && with_payload && victim >= payload_block &&
+            victim < payload_block + payload_blocks ? 3 : 1;
         for (int queue_variant = 0; queue_variant < variants; ++queue_variant)
         {
         auto reclaimed = image;
@@ -2109,18 +2195,33 @@ bool TestLateRecoveryPinRejectsReclaimedDescendants(bool with_payload = false)
         auto oldest_xid = std::numeric_limits<std::uint64_t>::max();
         for (const auto& entry : queue.entries)
         {
-            for (std::uint64_t ordinal = 0; ordinal < entry.block_count; ++ordinal)
+            for (std::uint64_t ordinal = 0; ordinal < entry.block_count;)
             {
                 const auto block = entry.physical_block + ordinal;
-                if (block == victim && queue_variant == 0) continue;
+                if (block == victim && queue_variant == 0)
+                {
+                    ++ordinal;
+                    continue;
+                }
                 const auto retirement_xid = block == victim && queue_variant == 2
                     ? current->container.superblock.xid : entry.xid;
+                // Split at the probed block, keeping unrelated runs compact so
+                // the larger real metadata graph still fits one queue node.
+                const auto end = entry.physical_block + entry.block_count;
+                const auto count = block == victim ? 1 :
+                    (victim > block && victim < end ? victim - block : end - block);
                 apfsaccess::catalog::BtreeRecord record;
                 record.key.resize(16);
                 PutU64LE(record.key, 0, retirement_xid);
                 PutU64LE(record.key, 8, block);
+                if (count > 1)
+                {
+                    record.value.resize(8);
+                    PutU64LE(record.value, 0, count);
+                }
                 queue_records.push_back(std::move(record));
-                ++queued_blocks;
+                ordinal += count;
+                queued_blocks += count;
                 oldest_xid = (std::min)(oldest_xid, retirement_xid);
             }
         }
@@ -2437,11 +2538,257 @@ bool TestRejectsUnsafePlansAndStaleExecution()
     return ok;
 }
 
+bool TestKeylockerRelocationFieldAndGuards()
+{
+    auto fixture = BuildWrappedPublisherFixture();
+    for (const auto block : {std::uint64_t{0}, fixture.checkpoint.superblock_physical_block})
+    {
+        std::vector<std::byte> nx(kBlockSize);
+        std::copy_n(fixture.image.begin() + static_cast<std::ptrdiff_t>(block * kBlockSize), kBlockSize, nx.begin());
+        PutU64LE(nx, 0x510, 20); PutU64LE(nx, 0x518, 1);
+        FletcherForBlock(nx, kBlockSize); PutBlock(fixture.image, block, nx);
+    }
+    const std::vector<std::byte> old_bag(kBlockSize, std::byte{0xB3});
+    const std::vector<std::byte> new_bag(kBlockSize, std::byte{0x8C});
+    PutBlock(fixture.image, 20, old_bag);
+    VectorRandomAccessSource source(fixture.image);
+    std::string error;
+    const auto selected = LoadContainerCheckpointView(source, 0, source.SizeBytes(), error);
+    bool ok = Require(selected.has_value(), "keylocker fixture canonical selection: " + error);
+    if (!ok) return false;
+    fixture.checkpoint = *selected;
+    auto request = BuildRequest(fixture);
+    request.allocator_owned_writes.push_back({30, new_bag});
+    AppleCheckpointPublicationPlan legacy, empty, relocated;
+    ok &= Require(PlanAppleCheckpointPublication(source, fixture.checkpoint, request, legacy, error) &&
+        PlanAppleCheckpointPublication(source, fixture.checkpoint, request, empty, error, {}) &&
+        legacy.superblock_write.bytes == empty.superblock_write.bytes &&
+        ReadU64LE(legacy.published_checkpoint.superblock_bytes, 0x510).value_or(0) == 20,
+        "default publisher keeps exact legacy keylocker fields and output: " + error);
+    ok &= Require(PlanAppleCheckpointPublication(source, fixture.checkpoint, request, relocated, error, {30, 1}) &&
+        ReadU64LE(relocated.published_checkpoint.superblock_bytes, 0x510).value_or(0) == 30 &&
+        ReadU64LE(relocated.published_checkpoint.superblock_bytes, 0x518).value_or(0) == 1 &&
+        std::any_of(relocated.guard_blocks.begin(), relocated.guard_blocks.end(), [&](const auto& g) {
+            return g.physical_block == 20 && g.bytes == old_bag;
+        }), "relocated keylocker is staged and old source bag is guarded: " + error);
+    if (!ok) return false;
+    MemoryWriteTarget target(fixture.image);
+    ok &= Require(ExecuteAppleCheckpointPublication(target, relocated, error),
+        "keylocker field publication executes: " + error);
+    VectorRandomAccessSource after(target.Image());
+    const auto final = LoadContainerCheckpointView(after, 0, after.SizeBytes(), error);
+    std::vector<std::byte> old_after, new_after;
+    ok &= Require(final && final->superblock.xid == request.transaction_xid &&
+        ReadU64LE(final->superblock_bytes, 0x510).value_or(0) == 30 && ReadU64LE(final->superblock_bytes, 0x518).value_or(0) == 1 &&
+        target.ReadBlock(20, kBlockSize, old_after) && old_after == old_bag &&
+        target.ReadBlock(30, kBlockSize, new_after) && new_after == new_bag,
+        "canonical reopened checkpoint changes pointer and preserves old bag: " + error);
+    const auto rejects = [&](AppleCheckpointKeylockerReplacement replacement, const auto& candidate,
+        const char* code) {
+        AppleCheckpointPublicationPlan rejected;
+        error.clear();
+        return Require(!PlanAppleCheckpointPublication(source, fixture.checkpoint, candidate, rejected, error, replacement) &&
+            error == code && rejected.superblock_write.bytes.empty() && rejected.before_superblock_writes.empty(),
+            std::string("invalid keylocker request refuses without candidate: ") + code + ": " + error);
+    };
+    ok &= rejects({30, 0}, request, "AppleCheckpointKeylockerRangeInvalid");
+    ok &= rejects({0, 1}, request, "AppleCheckpointKeylockerRangeInvalid");
+    ok &= rejects({20, 1}, request, "AppleCheckpointKeylockerRetentionOverlap");
+    ok &= rejects({64, 1}, request, "AppleCheckpointKeylockerRangeInvalid");
+    ok &= rejects({30, 2}, request, "AppleCheckpointKeylockerRangeInvalid");
+    auto unstaged = request; unstaged.allocator_owned_writes.clear();
+    ok &= rejects({30, 1}, unstaged, "AppleCheckpointKeylockerUnstaged");
+    ok &= rejects({31, 1}, request, "AppleCheckpointKeylockerUnstaged");
+    auto old_bag_write = request;
+    old_bag_write.allocator_owned_writes.push_back({20, new_bag});
+    ok &= rejects({30, 1}, old_bag_write, "AppleCheckpointKeylockerDestinationOverlap");
+    old_bag_write.allocator_owned_writes.back().bytes = old_bag;
+    ok &= rejects({30, 1}, old_bag_write, "AppleCheckpointKeylockerDestinationOverlap");
+    MemoryWriteTarget changed(fixture.image);
+    changed.MutableImage()[20 * kBlockSize] ^= std::byte{1};
+    ok &= Require(!ExecuteAppleCheckpointPublication(changed, relocated, error) &&
+        error == "AppleCheckpointGuardChanged" && changed.MutatingOperationCount() == 0,
+        "changed old keylocker stops publication before writes: " + error);
+    // Malformed old ranges can also intersect destinations generated by the
+    // publisher. They must refuse before exposing a plan, not after writing.
+    for (const auto block : {47ull, 40ull, 55ull}) {
+        auto malformed_image = fixture.image;
+        auto malformed_nx = fixture.checkpoint.superblock_bytes;
+        PutU64LE(malformed_nx, 0x510, block);
+        FletcherForBlock(malformed_nx, kBlockSize);
+        PutBlock(malformed_image, fixture.checkpoint.superblock_physical_block, malformed_nx);
+        VectorRandomAccessSource malformed(malformed_image);
+        auto cp = LoadContainerCheckpointView(malformed, 0, malformed.SizeBytes(), error);
+        if (!Require(cp.has_value(), "generated destination collision fixture parses: " + error)) return false;
+        auto malformed_fixture = fixture; malformed_fixture.checkpoint = *cp;
+        malformed_fixture.image = malformed_image;
+        auto candidate = BuildRequest(malformed_fixture);
+        candidate.allocator_owned_writes.push_back({30, new_bag});
+        AppleCheckpointPublicationPlan refused;
+        ok &= Require(!PlanAppleCheckpointPublication(malformed, *cp, candidate, refused, error, {30, 1}) &&
+            error == "AppleCheckpointKeylockerDestinationOverlap" && refused.before_superblock_writes.empty() &&
+            refused.superblock_write.bytes.empty(), "generated destination cannot overwrite an old keylocker: " + error);
+    }
+    return ok;
+}
+
+bool TestKeylockerInitialization()
+{
+    auto fixture = BuildWrappedPublisherFixture();
+    VectorRandomAccessSource source(fixture.image);
+    auto request = BuildRequest(fixture);
+    const std::vector<std::byte> bag(2 * kBlockSize, std::byte{0x71});
+    request.allocator_owned_writes.push_back({30, bag});
+    std::string error;
+    AppleCheckpointPublicationPlan legacy, initialized;
+    bool ok = Require(PlanAppleCheckpointPublication(source, fixture.checkpoint, request, legacy, error) &&
+        ReadU64LE(legacy.published_checkpoint.superblock_bytes, 0x510) == 0 &&
+        ReadU64LE(legacy.published_checkpoint.superblock_bytes, 0x518) == 0,
+        "default publisher never initializes a keylocker: " + error);
+    ok &= Require(!PlanAppleCheckpointPublication(source, fixture.checkpoint, request, initialized, error, {30, 2}) &&
+        error == "AppleCheckpointKeylockerRangeInvalid" && initialized.before_superblock_writes.empty(),
+        "replacement cannot initialize absent keylocker: " + error);
+    ok &= Require(PlanAppleCheckpointKeylockerInitialization(source, fixture.checkpoint, request, initialized, error, {30, 2}) &&
+        ReadU64LE(initialized.published_checkpoint.superblock_bytes, 0x510) == 30 &&
+        ReadU64LE(initialized.published_checkpoint.superblock_bytes, 0x518) == 2 &&
+        VerifyObjectChecksum(initialized.superblock_write.bytes, kBlockSize),
+        "typed initialization stages a checksummed new NX range: " + error);
+    if (!ok) return false;
+    MemoryWriteTarget target(fixture.image);
+    ok &= Require(ExecuteAppleCheckpointPublication(target, initialized, error), "initial keylocker publication executes: " + error);
+    VectorRandomAccessSource after(target.Image());
+    const auto selected = LoadContainerCheckpointView(after, 0, after.SizeBytes(), error);
+    std::vector<std::byte> first, second;
+    ok &= Require(selected && selected->superblock.xid == request.transaction_xid &&
+        ReadU64LE(selected->superblock_bytes, 0x510) == 30 && ReadU64LE(selected->superblock_bytes, 0x518) == 2 &&
+        target.ReadBlock(30, kBlockSize, first) && target.ReadBlock(31, kBlockSize, second) &&
+        std::equal(first.begin(), first.end(), bag.begin()) &&
+        std::equal(second.begin(), second.end(), bag.begin() + kBlockSize),
+        "fresh canonical owner sees both initial keylocker blocks: " + error);
+    const auto refuses = [&](AppleCheckpointKeylockerInitialization range, const auto& candidate, const char* code) {
+        AppleCheckpointPublicationPlan rejected = initialized;
+        const auto old_image = fixture.image;
+        return Require(!PlanAppleCheckpointKeylockerInitialization(source, fixture.checkpoint, candidate, rejected, error, range) &&
+            error == code && rejected.before_superblock_writes.empty() && rejected.superblock_write.bytes.empty() && fixture.image == old_image,
+            std::string("initialization refuses without executable plan: ") + code + ": " + error);
+    };
+    ok &= refuses({}, request, "AppleCheckpointKeylockerInitializationRequiresEmpty");
+    ok &= refuses({0, 1}, request, "AppleCheckpointKeylockerInitializationRequiresEmpty");
+    ok &= refuses({30, 0}, request, "AppleCheckpointKeylockerInitializationRequiresEmpty");
+    ok &= refuses({63, 2}, request, "AppleCheckpointKeylockerRangeInvalid");
+    ok &= refuses({30, 17}, request, "AppleCheckpointKeylockerRangeInvalid");
+    auto missing = request; missing.allocator_owned_writes[0].bytes.resize(kBlockSize);
+    ok &= refuses({30, 2}, missing, "AppleCheckpointKeylockerUnstaged");
+    auto reserved = request; reserved.allocator_owned_writes[0].physical_block = 40;
+    ok &= refuses({40, 2}, reserved, "AppleCheckpointAllocatedWriteInvalid");
+    if (selected) {
+        auto later_fixture = fixture; later_fixture.image = target.Image(); later_fixture.checkpoint = *selected;
+        auto later = BuildRequest(later_fixture);
+        later.allocator_owned_writes.push_back({32, bag});
+        AppleCheckpointPublicationPlan rejected;
+        ok &= Require(!PlanAppleCheckpointKeylockerInitialization(after, *selected, later, rejected, error, {32, 2}) &&
+            error == "AppleCheckpointKeylockerInitializationRequiresEmpty" && rejected.superblock_write.bytes.empty(),
+            "initialization cannot replace an existing keylocker: " + error);
+    }
+    return ok;
+}
+
+bool TestKeylockerDistinctRetainedRanges()
+{
+    auto fixture = BuildWrappedPublisherFixture(8, 12, true);
+    for (const auto block : {std::uint64_t{0}, fixture.checkpoint.superblock_physical_block}) {
+        std::vector<std::byte> nx(kBlockSize);
+        std::copy_n(fixture.image.begin() + static_cast<std::ptrdiff_t>(block * kBlockSize), kBlockSize, nx.begin());
+        PutU64LE(nx, 0x510, 20); PutU64LE(nx, 0x518, 2);
+        FletcherForBlock(nx, kBlockSize); PutBlock(fixture.image, block, nx);
+    }
+    for (std::uint64_t block = 20; block < 22; ++block)
+        PutBlock(fixture.image, block, std::vector<std::byte>(kBlockSize, std::byte{0xB3}));
+    std::string error;
+    VectorRandomAccessSource before(fixture.image);
+    auto selected = LoadContainerCheckpointView(before, 0, before.SizeBytes(), error);
+    if (!Require(selected.has_value(), "retained keylocker source selection: " + error)) return false;
+    fixture.checkpoint = *selected;
+    auto first = BuildRequest(fixture);
+    first.allocator_owned_writes.push_back({30, std::vector<std::byte>(2 * kBlockSize, std::byte{0xC4})});
+    AppleCheckpointPublicationPlan first_plan;
+    if (!Require(PlanAppleCheckpointPublication(before, fixture.checkpoint, first, first_plan, error, {30, 2}),
+            "first keylocker relocation plans: " + error)) return false;
+    MemoryWriteTarget first_target(fixture.image);
+    if (!Require(ExecuteAppleCheckpointPublication(first_target, first_plan, error),
+            "first keylocker relocation publishes: " + error)) return false;
+    fixture.image = first_target.Image();
+    VectorRandomAccessSource current(fixture.image);
+    selected = LoadContainerCheckpointView(current, 0, current.SizeBytes(), error);
+    if (!Require(selected && selected->superblock.xid == 41, "second keylocker source selection: " + error)) return false;
+    fixture.checkpoint = *selected;
+    auto second = BuildRequest(fixture);
+    second.required_checkpoint_xids = {40};
+    second.allocator_owned_writes.push_back({33, std::vector<std::byte>(kBlockSize, std::byte{0xD5})});
+    second.allocator_owned_writes.push_back({34, std::vector<std::byte>(kBlockSize, std::byte{0xE6})});
+    AppleCheckpointPublicationPlan plan;
+    bool ok = Require(PlanAppleCheckpointPublication(current, fixture.checkpoint, second, plan, error, {33, 2}),
+        "distinct retained bags and split staging plan: " + error);
+    if (!ok) return false;
+    for (const auto block : {20ull, 21ull, 30ull, 31ull})
+        ok &= Require(std::any_of(plan.guard_blocks.begin(), plan.guard_blocks.end(), [&](const auto& g) {
+            return g.physical_block == block;
+        }), "every distinct retained/current bag block is guarded");
+    const auto rejects = [&](const auto& request, AppleCheckpointKeylockerReplacement replacement,
+        const char* code) {
+        AppleCheckpointPublicationPlan rejected;
+        error.clear();
+        const auto refused = !PlanAppleCheckpointPublication(current, fixture.checkpoint, request, rejected, error, replacement);
+        MemoryWriteTarget untouched(fixture.image);
+        return Require(refused && error == code && rejected.before_superblock_writes.empty() &&
+            rejected.superblock_write.bytes.empty() && untouched.MutatingOperationCount() == 0 &&
+            untouched.Image() == fixture.image, std::string("retained keylocker conflict: ") + code + ": " + error);
+    };
+    for (const auto block : {20ull, 21ull, 30ull, 31ull}) {
+        auto conflict = second;
+        conflict.allocator_owned_writes.push_back({block, std::vector<std::byte>(kBlockSize, std::byte{0xA7})});
+        ok &= rejects(conflict, {33, 2}, "AppleCheckpointKeylockerDestinationOverlap");
+    }
+    auto partial = second;
+    partial.allocator_owned_writes = {{21, std::vector<std::byte>(2 * kBlockSize, std::byte{0x88})}};
+    ok &= rejects(partial, {21, 2}, "AppleCheckpointKeylockerRetentionOverlap");
+    auto missing = second;
+    missing.allocator_owned_writes.pop_back();
+    ok &= rejects(missing, {33, 2}, "AppleCheckpointKeylockerUnstaged");
+    for (const auto block : {20ull, 21ull, 30ull, 31ull}) {
+        MemoryWriteTarget drift(fixture.image);
+        drift.MutableImage()[block * kBlockSize] ^= std::byte{1};
+        ok &= Require(!ExecuteAppleCheckpointPublication(drift, plan, error) &&
+            error == "AppleCheckpointGuardChanged" && drift.MutatingOperationCount() == 0,
+            "each distinct bag drift refuses before first write: " + error);
+    }
+    MemoryWriteTarget published(fixture.image);
+    ok &= Require(ExecuteAppleCheckpointPublication(published, plan, error),
+        "distinct required bags can publish without overlap: " + error);
+    for (const auto block : {20ull, 21ull, 30ull, 31ull})
+        ok &= Require(std::equal(fixture.image.begin() + block * kBlockSize,
+            fixture.image.begin() + (block + 1) * kBlockSize,
+            published.Image().begin() + block * kBlockSize), "required/current bag bytes survive publication");
+    return ok;
+}
+
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+    if (argc == 2 && std::string(argv[1]) == "--only-keylocker")
+        return TestKeylockerRelocationFieldAndGuards() && TestKeylockerDistinctRetainedRanges() && TestKeylockerInitialization() && g_failures == 0 ? 0 : 1;
+    if (argc == 2 && std::string(argv[1]) == "--only-keylocker-init")
+        return TestKeylockerInitialization() && g_failures == 0 ? 0 : 1;
+    if (argc == 2 && std::string(argv[1]) == "--only-keylocker-retained")
+        return TestKeylockerDistinctRetainedRanges() && g_failures == 0 ? 0 : 1;
+    if (argc == 2 && std::string(argv[1]) == "--only-barrier")
+        return TestFlushLossCannotHideBehindReadCache() && g_failures == 0 ? 0 : 1;
     bool ok = true;
+    ok &= TestKeylockerRelocationFieldAndGuards();
+    ok &= TestKeylockerDistinctRetainedRanges();
+    ok &= TestKeylockerInitialization();
+    ok &= TestFlushLossCannotHideBehindReadCache();
     ok &= TestBoundedReadbackCoalescesAndChecksAllBytes();
     ok &= TestBoundedReadbackPreservesNonadjacentOrder();
     ok &= TestBoundedReadbackCorruptionAndFailuresStopPublication();

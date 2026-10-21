@@ -17,7 +17,8 @@ public sealed record ContainerManifestVolume(
     string? Name,
     string MountPoint,
     bool RequestedWrite,
-    string? RecoveryIdentity);
+    string? RecoveryIdentity,
+    bool InitiallyActive = true);
 
 public sealed record WrittenContainerManifest(
     string ManifestPath,
@@ -53,6 +54,8 @@ public static class ContainerManifestWriter
     // `<objectId decimal>\n<containerUuid>\n<name>\n<mount>\n<W|R>\n<recoveryIdentity>\n`
     // (missing optional name/recoveryIdentity = empty string; hex lowercase).
     // RequestedWrite maps to `W` (true) or `R` (false).
+    // Dormant rows select v2: use manifest-check-v2 and append A/I plus newline
+    // after each row's recovery identity. All-active callers retain exact v1 bytes.
     public static string ComputeManifestSha256(
         string containerUuid,
         string device,
@@ -64,7 +67,8 @@ public static class ContainerManifestWriter
         ArgumentException.ThrowIfNullOrWhiteSpace(device);
 
         var builder = new StringBuilder();
-        builder.Append(ChecksumDomain).Append('\n');
+        var version = volumes.All(static volume => volume.InitiallyActive) ? 1 : 2;
+        builder.Append(version == 1 ? ChecksumDomain : "manifest-check-v2").Append('\n');
         builder.Append(normalizedContainer).Append('\n');
         builder.Append(device).Append('\n');
         builder.Append(deviceOffsetBytes.ToString(CultureInfo.InvariantCulture)).Append('\n');
@@ -77,6 +81,7 @@ public static class ContainerManifestWriter
             builder.Append(volume.MountPoint).Append('\n');
             builder.Append(volume.RequestedWrite ? "W" : "R").Append('\n');
             builder.Append(volume.RecoveryIdentity ?? string.Empty).Append('\n');
+            if (version == 2) builder.Append(volume.InitiallyActive ? "A" : "I").Append('\n');
         }
 
         var bytes = Encoding.UTF8.GetBytes(builder.ToString());
@@ -105,7 +110,8 @@ public static class ContainerManifestWriter
         string containerUuid,
         string devicePath,
         ulong deviceOffsetBytes,
-        IReadOnlyList<ContainerManifestVolume> volumes)
+        IReadOnlyList<ContainerManifestVolume> volumes,
+        string? tempRoot = null)
     {
         ArgumentNullException.ThrowIfNull(volumes);
         var normalizedContainer = NormalizeContainerUuid(containerUuid);
@@ -114,7 +120,7 @@ public static class ContainerManifestWriter
             throw new ContainerManifestException("Device path is required for a container manifest.");
         }
 
-        if (volumes.Count == 0)
+        if (volumes.Count == 0 || !volumes.Any(static volume => volume.InitiallyActive))
         {
             throw new ContainerManifestException("A container manifest requires at least one volume.");
         }
@@ -145,14 +151,18 @@ public static class ContainerManifestWriter
                     $"Manifest volume object ID {volume.ObjectId} belongs to a different container.");
             }
 
-            if (string.IsNullOrWhiteSpace(volume.MountPoint))
+            if (!volume.InitiallyActive &&
+                (volume.MountPoint.Length != 0 || !volume.RequestedWrite))
+                throw new ContainerManifestException("Dormant census members require admitted recovery write access and no mount target.");
+
+            if (volume.InitiallyActive && string.IsNullOrWhiteSpace(volume.MountPoint))
             {
                 throw new ContainerManifestException(
                     $"Manifest volume object ID {volume.ObjectId} is missing its mount point.");
             }
 
             var mountKey = NormalizeMountTargetForComparison(volume.MountPoint);
-            if (!seenMountPoints.Add(mountKey))
+            if (volume.InitiallyActive && !seenMountPoints.Add(mountKey))
             {
                 throw new ContainerManifestException(
                     $"Duplicate manifest mount target '{volume.MountPoint}'.");
@@ -175,7 +185,7 @@ public static class ContainerManifestWriter
         string directory;
         try
         {
-            directory = ResolveManifestDirectory();
+            directory = ResolveManifestDirectory(tempRoot);
             Directory.CreateDirectory(directory);
         }
         catch (Exception ex) when (ex is not ContainerManifestException)
@@ -285,7 +295,8 @@ public static class ContainerManifestWriter
         using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true });
         writer.WriteStartObject();
         writer.WriteString("format", ManifestFormat);
-        writer.WriteNumber("version", ManifestVersion);
+        var version = volumes.All(static volume => volume.InitiallyActive) ? 1 : 2;
+        writer.WriteNumber("version", version);
         writer.WriteString("containerUuid", containerUuid);
         writer.WriteString("device", device);
         writer.WriteNumber("deviceOffsetBytes", deviceOffsetBytes);
@@ -300,6 +311,7 @@ public static class ContainerManifestWriter
             writer.WriteString("mount", volume.MountPoint);
             writer.WriteBoolean("requestedWrite", volume.RequestedWrite);
             writer.WriteString("recoveryIdentity", volume.RecoveryIdentity ?? string.Empty);
+            if (version == 2) writer.WriteBoolean("initiallyActive", volume.InitiallyActive);
             writer.WriteEndObject();
         }
 
@@ -332,7 +344,7 @@ public static class ContainerManifestWriter
         if (!root.TryGetProperty("version", out var version) ||
             version.ValueKind != JsonValueKind.Number ||
             !version.TryGetInt32(out var versionNumber) ||
-            versionNumber != ManifestVersion)
+            versionNumber != (expectedVolumes.All(static volume => volume.InitiallyActive) ? 1 : 2))
         {
             throw new ContainerManifestException("Manifest self-verify: unexpected version.");
         }
@@ -359,7 +371,8 @@ public static class ContainerManifestWriter
                 Name: GetOptionalString(element, "name"),
                 MountPoint: GetRequiredString(element, "mount"),
                 RequestedWrite: GetRequiredBoolean(element, "requestedWrite"),
-                RecoveryIdentity: GetOptionalString(element, "recoveryIdentity")));
+                RecoveryIdentity: GetOptionalString(element, "recoveryIdentity"),
+                InitiallyActive: versionNumber == 1 || GetRequiredBoolean(element, "initiallyActive")));
         }
 
         var parsedContainer = GetRequiredString(root, "containerUuid");

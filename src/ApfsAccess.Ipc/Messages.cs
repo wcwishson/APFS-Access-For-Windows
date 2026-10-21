@@ -41,7 +41,12 @@ public sealed record StatusChangedPayload(
     int InFlightMutationCallbacks = 0,
     NativeWriteValidationEvidence? NativeWriteValidationEvidence = null,
     IReadOnlyList<NativeWriteDiagnostic>? NativeWriteDiagnostics = null,
-    IReadOnlyList<DeviceInventory>? ConnectedInventory = null
+    IReadOnlyList<DeviceInventory>? ConnectedInventory = null,
+    long? InventoryGeneration = null,
+    IReadOnlyList<string>? VolumeManagementReadyImages = null,
+    bool ManagementJournalRootInspected = false,
+    bool ImageResizeFormatEnabled = false,
+    bool ImageManagementMutationsEnabled = false
 );
 
 public sealed record QuitRequestedPayload(string Requester, DateTime TimestampUtc);
@@ -84,9 +89,37 @@ public static class ApfsControlCommands
 {
     public const string Unknown = "unknown";
     public const string Mount = "mount";
+    public const string ContainerMount = "container-mount";
+    public const string ContainerUnmount = "container-unmount";
+    public const string DeviceEject = "device-eject";
+    public const string RegisterImage = "register-image";
+    public const string RegisterFusion = "register-fusion";
+    public const string Unlock = "unlock";
+    public const string Lock = "lock";
+    public const string ImageKeyManagement = "image-key-management";
     public const string Fix = "fix";
     public const string Eject = "eject";
     public const string Quit = "quit";
+    public const string SnapshotCreate = "snapshot-create";
+    public const string SnapshotDelete = "snapshot-delete";
+    public const string SnapshotRecover = "snapshot-recover";
+    public const string SnapshotList = "snapshot-list";
+    public const string ManagementPlan = "management-plan";
+    public const string ManagementApply = "management-apply";
+    public const string VolumeVerify = "volume-verify";
+    public const string VolumeResizePlan = "volume-resize-plan";
+    public const string VolumeFormatPlan = "volume-format-plan";
+    public const string VolumeCreatePlan = "volume-create-plan";
+    public const string VolumeDeletePlan = "volume-delete-plan";
+    public const string VolumeManagementApply = "volume-management-apply";
+    public const string VolumeManagementCancel = "volume-management-cancel";
+    public const string VolumeManagementRecover = "volume-management-recover";
+}
+
+public static class ApfsManagementOperations
+{
+    public const string RenameVolume = "rename-volume";
+    public const string SetQuotaReserve = "set-quota-reserve";
 }
 
 public static class ApfsOperationStates
@@ -104,17 +137,40 @@ public static class ApfsControlModes
     public const string ReadWrite = "read-write";
 }
 
+[System.Text.Json.Serialization.JsonUnmappedMemberHandling(System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow)]
 public sealed record ApfsControlTarget(
     string DeviceId,
     string VolumeId,
-    string? RecoveryIdentity = null);
+    string? RecoveryIdentity = null,
+    string? VolumeUuid = null,
+    string? ContainerUuid = null,
+    ulong? VolumeObjectId = null,
+    string? ObservationContract = null,
+    EncryptedImageProfile? RegisteredImage = null,
+    FusionImageProfile? RegisteredFusion = null);
 
+[System.Text.Json.Serialization.JsonUnmappedMemberHandling(System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow)]
 public sealed record ControlOperationRequestPayload(
     string OperationId,
     string Command,
     ApfsControlTarget? Target,
     string? RequestedMode = null,
-    DateTime? ExpiresAtUtc = null);
+    DateTime? ExpiresAtUtc = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? SnapshotName = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<string>? SnapshotIdentity = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ManagementOperation = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ManagementToken = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ManagementName = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ManagementQuotaBytes = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ManagementReserveBytes = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ManagementImagePath = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] VolumeManagementParameters? VolumeManagement = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ApprovedImageRepairPlanId = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] ImageKeyManagementRequest? KeyManagement = null)
+{
+    [System.Text.Json.Serialization.JsonIgnore] public int CredentialClientProcessId { get; init; }
+    [System.Text.Json.Serialization.JsonIgnore] public long CredentialClientStartTimeUtcTicks { get; init; }
+}
 
 public sealed record OperationResultQueryPayload(string OperationId);
 
@@ -144,7 +200,27 @@ public sealed record OperationResultPayload(
     string? DurabilityProof = null,
     string? Diagnostic = null,
     bool QuitMarkerWritten = false,
-    DateTime? ExpiresAtUtc = null);
+    DateTime? ExpiresAtUtc = null,
+    EncryptedVolumeState? EncryptionState = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? SnapshotName = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<string>? SnapshotIdentity = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ManagementOperation = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ManagementPlanId = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ManagementToken = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ManagementObservedXid = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ManagementName = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ManagementQuotaBytes = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ManagementReserveBytes = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ManagementImagePath = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] System.Text.Json.JsonElement? SnapshotInventory = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] VolumeManagementParameters? VolumeManagement = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] System.Text.Json.JsonElement? VolumeManagementReport = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] System.Text.Json.JsonElement? VolumeVerificationReport = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ApprovedImageRepairPlanId = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] ImageRepairOffer? ImageRepairOffer = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] ImageRepairReceipt? ImageRepairReceipt = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] ImageKeyManagementRequest? KeyManagement = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] ImageKeyManagementReceipt? KeyManagementReceipt = null);
 
 public sealed record AckPayload(
     bool Success,
@@ -227,5 +303,13 @@ public sealed record MountedVolumeDisplay(
     bool? CatalogAutoMountAllowed = null,
     DriveLetterPreference? DriveLetterPreference = null,
     ApfsVolumeSpaceObservation? CatalogSpace = null,
-    bool HasRuntimeStatus = false
+    bool HasRuntimeStatus = false,
+    string? CatalogVolumeUuid = null,
+    bool SnapshotInventorySupported = false,
+    bool SnapshotMutationSupported = false,
+    bool VolumeVerificationSupported = false,
+    LiveVolumeVerificationScope? VolumeVerificationScope = null,
+    bool SnapshotRecoverySupported = false,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)]
+    long HostProcessCreationTimeFileTimeUtc = 0
 );

@@ -2,7 +2,9 @@
 #include "ApfsCompression.h"
 #include "ApfsContainerCatalog.h"
 #include "ApfsExtendedRecordCodec.h"
+#include "ApfsFirmlinkRouter.h"
 #include "AppleTransactionCommit.h"
+#include "SnapshotRuntime.h"
 #include "RandomAccessSource.h"
 
 #include <algorithm>
@@ -17,6 +19,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <Windows.h>
+#include "SnapshotCompressionRead.h"
 
 namespace apfsaccess::rw
 {
@@ -42,6 +45,24 @@ constexpr std::uint64_t kApfsTypeFileExtent = 8;
 constexpr std::uint64_t kApfsTypeDirectoryRecord = 9;
 constexpr std::uint64_t kApfsTypeSiblingMap = 12;
 constexpr std::uint64_t kRootDirectoryInode = 2;
+
+bool MaterializeNamespaceRecord(
+    const std::shared_ptr<catalog::ApfsReadBudget>& budget,
+    const catalog::BtreeRecord& record, std::uint64_t type)
+{
+    if (!budget) return true;
+    // Extents decode to scalars and bounded index/vector entries. Variable
+    // metadata still reserves its larger codec and name-expansion envelope.
+    const auto base = type == kApfsTypeFileExtent ? 1024ull : 4096ull;
+    const auto factor = type == kApfsTypeFileExtent ? 4ull : 32ull;
+    const auto key_bytes = static_cast<std::uint64_t>(record.key.size());
+    const auto value_bytes = static_cast<std::uint64_t>(record.value.size());
+    if (value_bytes > UINT64_MAX - key_bytes ||
+        key_bytes + value_bytes > (UINT64_MAX - base) / factor)
+        return budget->Refuse("ApfsReadBudgetRecordLimit");
+    return budget->Materialize(1, base + factor * (key_bytes + value_bytes));
+}
+
 constexpr std::uint8_t kInodeExtendedFieldDataStream = 8;
 constexpr std::uint8_t kInodeExtendedFieldSparseBytes = 13;
 constexpr std::uint64_t kInodeHasSparseBytes = 0x200;
@@ -444,7 +465,7 @@ bool ProjectValidatedAttributeStreams(
     const std::vector<catalog::BtreeRecord>& records,
     std::uint32_t block_size, std::uint64_t block_count,
     std::uint64_t store_offset, NativeApfsVolumeProjection& projection, bool strict,
-    std::uint64_t routed_address_blocks = 0)
+    std::uint64_t routed_address_blocks = 0, bool observational = false)
 {
     const auto address_blocks = routed_address_blocks ? routed_address_blocks : block_count;
     const auto container_bytes = block_count * block_size;
@@ -467,7 +488,8 @@ bool ProjectValidatedAttributeStreams(
         if (type == kApfsTypeInode)
         {
             AppleInodeRecord inode;
-            if (!ApfsExtendedRecordCodec::DecodeInode(record, inode, error)) return false;
+            if (!(observational ? ApfsExtendedRecordCodec::DecodeInodeReadOnly(record, inode, error) :
+                ApfsExtendedRecordCodec::DecodeInode(record, inode, error))) return false;
             inode_streams.insert(inode.object_id);
             inode_streams.insert(inode.private_id);
         }
@@ -572,8 +594,24 @@ void ProjectAttributeStreams(
     if (store_offset > (std::numeric_limits<std::uint64_t>::max)() - container_bytes) return;
     std::string error;
     std::vector<ApplePhysicalExtentRecord> physical;
-    if (!ValidateApplePayloadExtentGraph(records, extentref_records,
-            block_size, block_count, physical, error) ||
+    std::vector<catalog::BtreeRecord> live_references;
+    const auto selected = std::find_if(checkpoint.volumes.begin(), checkpoint.volumes.end(),
+        [&](const auto& volume) { return volume.superblock.object_id == projection.volume_object_id; });
+    const auto* references = &extentref_records;
+    if (selected != checkpoint.volumes.end() && selected->superblock.role_raw == 0x0180 &&
+        selected->object_map.snapshot_tree_oid)
+    {
+        // Backup extent-reference trees include historical owners. Resolve the
+        // canonical chronological layers before validating this live fork map.
+        if (!LoadSnapshotRuntimeLiveReferences(source, checkpoint, projection.volume_object_id,
+                live_references, error)) return;
+        references = &live_references;
+    }
+    if (!ValidateApplePayloadExtentGraph(records, *references,
+            block_size, block_count, physical, error)) return;
+    // The snapshot resolver above first proves complete retained metadata and
+    // payload ownership. The ordinary checker deliberately excludes snapshots.
+    if (references == &extentref_records &&
         !ValidateAppleCheckpointPayloadOwnership(source, checkpoint, physical, error)) return;
 
     if (!ProjectValidatedAttributeStreams(records, block_size, block_count,
@@ -653,12 +691,48 @@ private:
 };
 
 bool ValidateSnapshotStreams(const std::vector<catalog::BtreeRecord>& records,
-    NativeApfsVolumeProjection& projection, std::string& error)
+    NativeApfsVolumeProjection& projection,
+    const std::shared_ptr<catalog::ApfsReadBudget>& budget, std::string& error, bool observational = false,
+    const std::unordered_set<std::uint64_t>* compressed = nullptr)
 {
     const auto fail = [&](const char* reason) { error = reason; return false; };
     std::unordered_map<std::uint64_t, std::uint32_t> owners, references;
     std::unordered_set<std::uint64_t> file_streams;
     std::unordered_set<std::uint64_t> projected_file_streams;
+    struct NativeSparseMetadata
+    {
+        std::uint64_t bytes = 0;
+        std::optional<std::uint64_t> allocation_size;
+    };
+    std::unordered_map<std::uint64_t, NativeSparseMetadata> sparse_bytes;
+    for (const auto& record : records)
+    {
+        if ((ReadLe64(record.key, 0) >> kApfsObjectTypeShift) != kApfsTypeInode) continue;
+        AppleInodeRecord inode;
+        if (!(observational ? ApfsExtendedRecordCodec::DecodeInodeReadOnly(record, inode, error) :
+            ApfsExtendedRecordCodec::DecodeInode(record, inode, error))) return false;
+        bool sparse = false;
+        std::optional<std::uint64_t> native_allocation_size;
+        for (const auto& field : inode.extended_fields)
+        {
+            if (field.type == kInodeExtendedFieldDataStream)
+            {
+                if (field.data.size() != 40 || ReadLe64(field.data, 16) != 0)
+                    return fail("SnapshotEncryptedOrMalformedDataStreamUnsupported");
+                native_allocation_size = ReadLe64(field.data, 8);
+            }
+            if (field.type != kInodeExtendedFieldSparseBytes) continue;
+            if (field.data.size() != sizeof(std::uint64_t)) return fail("SnapshotSparseMetadataInvalid");
+            if (!budget || !budget->Materialize(1, 64 + sizeof(std::pair<std::uint64_t, NativeSparseMetadata>)))
+                return fail("SnapshotProjectionBudget");
+            if (!sparse_bytes.emplace(inode.object_id, NativeSparseMetadata{ReadLe64(field.data, 0), {}}).second)
+                return fail("SnapshotSparseMetadataInvalid");
+            sparse = true;
+        }
+        if (sparse != ((inode.internal_flags & kAppleInodeSparseFlag) != 0))
+            return fail("SnapshotSparseMetadataInvalid");
+        if (sparse) sparse_bytes.at(inode.object_id).allocation_size = native_allocation_size;
+    }
     for (const auto& inode : projection.inodes)
     {
         if (inode.node_type != MetadataStore::NodeType::RegularFile) continue;
@@ -672,25 +746,66 @@ bool ValidateSnapshotStreams(const std::vector<catalog::BtreeRecord>& records,
         if ((inode.bsd_flags & kAppleBsdCompressedFlag) ||
             (attributes != projection.extended_attributes_by_inode.end() &&
                 attributes->second.contains("com.apple.decmpfs")))
-            return fail("SnapshotCompressedDataProjectionUnsupported");
+        {
+            if (!compressed || !compressed->contains(inode.object_id))
+                return fail("SnapshotCompressedDataProjectionUnsupported");
+            // A compressed default fork has no payload mappings. Its historical
+            // attribute forks still pass the complete ownership census below.
+            continue;
+        }
         const auto found = projection.read_extents_by_inode.find(inode.object_id);
         if (found != projection.read_extents_by_inode.end() && !found->second.empty())
             projected_file_streams.insert(inode.private_id);
+        if (projection.block_size == 0 ||
+            inode.logical_size > UINT64_MAX - (projection.block_size - 1))
+            return fail("SnapshotFileExtentCoverageInvalid");
+        const auto covered = AlignUp(inode.logical_size, projection.block_size);
         std::uint64_t end = 0, allocated = 0;
+        bool implicit_holes = false;
         if (found != projection.read_extents_by_inode.end())
             for (const auto& extent : found->second)
             {
-                // This bounded slice requires explicit logical coverage,
-                // including explicit hole records. Missing data is never zero.
-                if (extent.logical_offset != end) return fail("SnapshotFileExtentCoverageInvalid");
-                end += extent.bytes;
+                if (!extent.bytes || extent.logical_offset < end || extent.logical_offset > covered ||
+                    extent.bytes > covered - extent.logical_offset)
+                    return fail("SnapshotFileExtentCoverageInvalid");
+                implicit_holes |= extent.logical_offset != end;
+                end = extent.logical_offset + extent.bytes;
                 if (extent.physical_address) allocated += extent.bytes;
             }
-        if (projection.block_size == 0 ||
-            inode.logical_size > UINT64_MAX - (projection.block_size - 1) ||
-            end != AlignUp(inode.logical_size, projection.block_size) ||
-            (inode.allocation_size && allocated != *inode.allocation_size))
+        implicit_holes |= end != covered;
+        const auto declared = sparse_bytes.find(inode.object_id);
+        // Projected allocation can default to zero without a native dstream.
+        // Implicit holes require its actual decoded allocation field.
+        if ((inode.allocation_size && allocated != *inode.allocation_size) ||
+            (implicit_holes && (!(inode.internal_flags & kAppleInodeSparseFlag) ||
+                declared == sparse_bytes.end() || !declared->second.allocation_size ||
+                allocated != *declared->second.allocation_size)))
             return fail("SnapshotFileExtentCoverageInvalid");
+        if (declared != sparse_bytes.end() && declared->second.bytes != covered - allocated)
+            return fail("SnapshotSparseByteCountMismatch");
+        if (implicit_holes)
+        {
+            // Missing mappings are holes only when the native sparse declaration
+            // and physical accounting agree for this exact validated stream.
+            const auto count = found == projection.read_extents_by_inode.end() ? 0 : found->second.size();
+            if (count > ((SIZE_MAX - 64) / sizeof(MetadataStore::FileExtent) - 1) / 2)
+                return fail("SnapshotFileExtentCoverageInvalid");
+            const auto capacity = 2 * count + 1;
+            if (!budget || !budget->Materialize(1, 64 + capacity * sizeof(MetadataStore::FileExtent)))
+                return fail("SnapshotProjectionBudget");
+            std::vector<MetadataStore::FileExtent> complete;
+            complete.reserve(capacity);
+            end = 0;
+            if (found != projection.read_extents_by_inode.end())
+                for (const auto& extent : found->second)
+                {
+                    if (extent.logical_offset != end) complete.push_back({end, 0, extent.logical_offset - end});
+                    complete.push_back(extent);
+                    end = extent.logical_offset + extent.bytes;
+                }
+            if (end != covered) complete.push_back({end, 0, covered - end});
+            projection.read_extents_by_inode[inode.object_id] = std::move(complete);
+        }
     }
     for (const auto& [inode, attributes] : projection.extended_attributes_by_inode)
         for (const auto& [name, attribute] : attributes)
@@ -701,28 +816,7 @@ bool ValidateSnapshotStreams(const std::vector<catalog::BtreeRecord>& records,
         const auto id = header & kApfsObjectIdMask;
         switch (header >> kApfsObjectTypeShift)
         {
-        case kApfsTypeInode:
-        {
-            AppleInodeRecord inode;
-            if (!ApfsExtendedRecordCodec::DecodeInode(record, inode, error)) return false;
-            for (const auto& field : inode.extended_fields)
-            {
-                if (field.type == kInodeExtendedFieldDataStream &&
-                    (field.data.size() != 40 || ReadLe64(field.data, 16) != 0))
-                    return fail("SnapshotEncryptedOrMalformedDataStreamUnsupported");
-                if (field.type == kInodeExtendedFieldSparseBytes)
-                {
-                    std::uint64_t holes = 0;
-                    const auto extents = projection.read_extents_by_inode.find(inode.object_id);
-                    if (extents != projection.read_extents_by_inode.end())
-                        for (const auto& extent : extents->second)
-                            if (!extent.physical_address) holes += extent.bytes;
-                    if (ReadLe64(field.data, 0) != holes)
-                        return fail("SnapshotSparseByteCountMismatch");
-                }
-            }
-            break;
-        }
+        case kApfsTypeInode: break;
         case 6:
         {
             AppleDataStreamIdRecord reference;
@@ -748,9 +842,72 @@ bool ValidateSnapshotStreams(const std::vector<catalog::BtreeRecord>& records,
         default: return fail("SnapshotFilesystemRecordUnsupported");
         }
     }
+    for (const auto& [inode, declared] : sparse_bytes)
+    {
+        std::uint64_t holes = 0;
+        const auto extents = projection.read_extents_by_inode.find(inode);
+        if (extents != projection.read_extents_by_inode.end())
+            for (const auto& extent : extents->second)
+                if (!extent.physical_address)
+                {
+                    if (extent.bytes > UINT64_MAX - holes) return fail("SnapshotSparseByteCountMismatch");
+                    holes += extent.bytes;
+                }
+        if (declared.bytes != holes) return fail("SnapshotSparseByteCountMismatch");
+    }
     for (const auto& [id, count] : owners)
         if (count > 1 && (!references.contains(id) || references.at(id) != count))
             return fail("SnapshotSharedStreamOwnershipInvalid");
+    return true;
+}
+
+bool ValidateSnapshotDirectorySiblings(
+    const std::vector<catalog::BtreeRecord>& records,
+    const NativeApfsVolumeProjection& projection,
+    const std::shared_ptr<catalog::ApfsReadBudget>& budget,
+    std::string& error)
+{
+    // The shared projector derives link IDs from sibling-link/map records.
+    // Complete snapshot authority also requires the directory's own ID to agree.
+    if (!budget->Materialize(1, 4096 + 2ull * sizeof(const MetadataStore::DirectoryLink*) *
+            projection.directory_links.size())) return false;
+    std::vector<const MetadataStore::DirectoryLink*> links;
+    links.reserve(projection.directory_links.size());
+    for (const auto& link : projection.directory_links) links.push_back(&link);
+    std::sort(links.begin(), links.end(), [](const auto* left, const auto* right) {
+        return left->parent_object_id < right->parent_object_id ||
+            (left->parent_object_id == right->parent_object_id && left->entry_name_utf8 < right->entry_name_utf8);
+    });
+    for (const auto& record : records)
+    {
+        if ((ReadLe64(record.key, 0) >> kApfsObjectTypeShift) != kApfsTypeDirectoryRecord) continue;
+        if (!MaterializeNamespaceRecord(budget, record, kApfsTypeDirectoryRecord)) return false;
+        AppleDirectoryRecord directory;
+        if (!ApfsExtendedRecordCodec::DecodeDirectory(record, projection.name_policy, directory, error)) return false;
+        std::uint64_t sibling_id = 0;
+        for (const auto& field : directory.extended_fields)
+        {
+            if (field.type != 1) continue;
+            if (field.flags || field.data.size() != 8 ||
+                !(sibling_id = catalog::ReadU64LE(field.data, 0).value_or(0)))
+            {
+                error = "SnapshotDirectorySiblingInvalid";
+                return false;
+            }
+        }
+        const auto link = std::lower_bound(links.begin(), links.end(), directory,
+            [](const auto* entry, const auto& value) {
+                return entry->parent_object_id < value.parent_id ||
+                    (entry->parent_object_id == value.parent_id && entry->entry_name_utf8 < value.name_utf8);
+            });
+        if (link == links.end() || (*link)->parent_object_id != directory.parent_id ||
+            (*link)->entry_name_utf8 != directory.name_utf8 || (*link)->child_object_id != directory.file_id ||
+            (*link)->sibling_id != sibling_id)
+        {
+            error = "SnapshotDirectorySiblingMismatch";
+            return false;
+        }
+    }
     return true;
 }
 } // namespace
@@ -761,8 +918,39 @@ bool NativeApfsReader::ValidateOrdinaryFileSystemRecords(
     const std::shared_ptr<catalog::ApfsReadBudget>& budget, std::string& out_error)
 {
     NativeApfsVolumeProjection projection;
+    return TryProjectOrdinaryFileSystemRecords(records, container, volume, budget, projection, out_error);
+}
+
+bool NativeApfsReader::TryProjectOrdinaryFileSystemRecords(
+    const std::vector<catalog::BtreeRecord>& records,
+    const catalog::NxSuperblock& container, const catalog::ApsbVolume& volume,
+    const std::shared_ptr<catalog::ApfsReadBudget>& budget,
+    NativeApfsVolumeProjection& out_projection, std::string& out_error)
+{
     return ProjectReadOnlyRecords(records, container, volume, container.block_count,
-        budget, projection, out_error);
+        budget, out_projection, out_error);
+}
+
+bool NativeApfsReader::ValidateBackupWriterFileSystemRecords(
+    const std::vector<catalog::BtreeRecord>& records,
+    const catalog::NxSuperblock& container, const catalog::ApsbVolume& volume,
+    const std::shared_ptr<catalog::ApfsReadBudget>& budget, std::string& out_error)
+{
+    if (volume.role_raw != 0x0180)
+    {
+        out_error = "BackupWriterVolumeProfileUnsupported";
+        return false;
+    }
+    NativeApfsVolumeProjection projection;
+    if (!ProjectReadOnlyRecordsWithAdmission(records, container, volume,
+        container.block_count, budget, projection, out_error, false, true)) return false;
+    for (const auto& inode : projection.inodes)
+        if (inode.node_type == MetadataStore::NodeType::RegularFile && inode.logical_size > (8ull << 20))
+        {
+            out_error = "BackupWriterLiveFileLimit";
+            return false;
+        }
+    return true;
 }
 
 bool NativeApfsReader::ProjectReadOnlyRecords(
@@ -772,6 +960,77 @@ bool NativeApfsReader::ProjectReadOnlyRecords(
     const std::shared_ptr<catalog::ApfsReadBudget>& budget,
     NativeApfsVolumeProjection& out_projection, std::string& out_error)
 {
+    return ProjectReadOnlyRecordsWithAdmission(records,container,volume,routed_address_blocks,budget,out_projection,out_error,false);
+}
+
+bool NativeApfsReader::ValidateBackupHistoricalFileSystemRecords(
+    const catalog::RandomAccessSource& source, const std::vector<catalog::BtreeRecord>& records,
+    const catalog::NxSuperblock& container, const catalog::ApsbVolume& volume, std::string& out_error)
+{
+    if (volume.role_raw != 0x0180 || !source.ReadBudget())
+    {
+        out_error = "BackupWriterHistoricalProfileUnsupported";
+        return false;
+    }
+    NativeApfsVolumeProjection projection;
+    return ProjectReadOnlyRecordsWithAdmission(records, container, volume, container.block_count,
+        source.ReadBudget(), projection, out_error, false, true, &source);
+}
+
+bool NativeApfsReader::ProjectFusionReadOnlyRecords(
+    const std::vector<catalog::BtreeRecord>& records,
+    const catalog::NxSuperblock& container, const catalog::ApsbVolume& volume,
+    std::uint64_t routed_address_blocks, const std::shared_ptr<catalog::ApfsReadBudget>& budget,
+    NativeApfsVolumeProjection& projection, std::string& error)
+{
+    return ProjectReadOnlyRecordsWithProfile(records, container, volume, routed_address_blocks,
+        budget, projection, error, false, false, nullptr, true);
+}
+
+bool NativeApfsReader::ValidateObservationalFileSystemRecords(
+    const std::vector<catalog::BtreeRecord>& records, const catalog::NxSuperblock& container,
+    const catalog::ApsbVolume& volume, const std::shared_ptr<catalog::ApfsReadBudget>& budget, std::string& error)
+{
+    NativeApfsVolumeProjection projection;
+    return TryProjectObservationalFileSystemRecords(records,container,volume,budget,projection,error);
+}
+
+bool NativeApfsReader::TryProjectObservationalFileSystemRecords(
+    const std::vector<catalog::BtreeRecord>& records, const catalog::NxSuperblock& container,
+    const catalog::ApsbVolume& volume, const std::shared_ptr<catalog::ApfsReadBudget>& budget,
+    NativeApfsVolumeProjection& projection, std::string& error)
+{
+    return ProjectReadOnlyRecordsWithAdmission(records,container,volume,container.block_count,budget,projection,error,true);
+}
+
+bool NativeApfsReader::ProjectReadOnlyRecordsWithAdmission(
+    const std::vector<catalog::BtreeRecord>& records, const catalog::NxSuperblock& container,
+    const catalog::ApsbVolume& volume, std::uint64_t routed_address_blocks,
+    const std::shared_ptr<catalog::ApfsReadBudget>& budget,
+    NativeApfsVolumeProjection& projection, std::string& error, bool observational,
+    bool backup_clone_hint, const catalog::RandomAccessSource* historical_compression_source)
+{
+    return ProjectReadOnlyRecordsWithProfile(records, container, volume, routed_address_blocks,
+        budget, projection, error, observational, backup_clone_hint, historical_compression_source, false);
+}
+
+bool NativeApfsReader::TryProjectMarkedReferenceFileSystemRecords(
+    const std::vector<catalog::BtreeRecord>& records, const catalog::NxSuperblock& container,
+    const catalog::ApsbVolume& volume, const std::shared_ptr<catalog::ApfsReadBudget>& budget,
+    NativeApfsVolumeProjection& projection, std::string& error)
+{
+    return ProjectReadOnlyRecordsWithProfile(records, container, volume, container.block_count,
+        budget, projection, error, true, false, nullptr, false, true);
+}
+
+bool NativeApfsReader::ProjectReadOnlyRecordsWithProfile(
+    const std::vector<catalog::BtreeRecord>& records, const catalog::NxSuperblock& container,
+    const catalog::ApsbVolume& volume, std::uint64_t routed_address_blocks,
+    const std::shared_ptr<catalog::ApfsReadBudget>& budget,
+    NativeApfsVolumeProjection& out_projection, std::string& out_error, bool observational,
+    bool backup_clone_hint, const catalog::RandomAccessSource* historical_compression_source,
+    bool fusion_private_namespace, bool marked_reference_namespace)
+{
     out_projection = {};
     out_error.clear();
     const auto fail = [&](const char* reason) {
@@ -779,51 +1038,12 @@ bool NativeApfsReader::ProjectReadOnlyRecords(
         return false;
     };
     if (!budget) return fail("VerifierNamespaceBudgetRequired");
+    if (marked_reference_namespace && (!observational || backup_clone_hint || fusion_private_namespace))
+        return fail("VerifierMarkedReferenceProfileUnsupported");
     try
     {
-        // The projection preserves some opaque metadata for ordinary readers.
-        // A verifier must instead disclose unsupported semantics. Reuse the
-        // authoritative codecs and keep this admission policy deliberately small.
-        for (const auto& record : records)
-        {
-            if (!budget->Materialize(1, 4096 + 32ull * (record.key.size() + record.value.size())))
-                return fail("VerifierNamespaceBudget");
-            const auto header = catalog::ReadU64LE(record.key, 0);
-            if (!header) return fail("VerifierFilesystemRecordInvalid");
-            switch (*header >> kApfsObjectTypeShift)
-            {
-            case kApfsTypeInode:
-            {
-                AppleInodeRecord inode;
-                if (!ApfsExtendedRecordCodec::DecodeInode(record, inode, out_error)) return false;
-                constexpr std::uint64_t neutral = 0x8 | 0x20 | 0x40 | 0x100 | 0x8000;
-                if (inode.reserved_pad || (inode.internal_flags &
-                    ~(neutral | kAppleInodeSparseFlag | kAppleInodeHasUncompressedSize)))
-                    return fail("VerifierInodeFlagsUnsupported");
-                for (const auto& field : inode.extended_fields)
-                    if (field.flags || (field.type != 4 && field.type != kInodeExtendedFieldDataStream &&
-                        field.type != kInodeExtendedFieldSparseBytes))
-                        return fail("VerifierInodeExtendedFieldUnsupported");
-                break;
-            }
-            case kApfsTypeXattr:
-            {
-                AppleXattrRecord attribute;
-                if (!ApfsExtendedRecordCodec::DecodeXattr(record, attribute, out_error)) return false;
-                if (attribute.flags & ~(kAppleXattrDataEmbedded | kAppleXattrDataStream | kAppleXattrFileSystemOwned))
-                    return fail("VerifierXattrFlagsUnsupported");
-                break;
-            }
-            case kApfsTypeDirectoryRecord:
-                // The existing namespace projector does not interpret drec
-                // xfields. Accept only its base record with understood type bits.
-                if (record.value.size() > 18 || (catalog::ReadU16LE(record.value, 16).value_or(0) & ~0xfu))
-                    return fail("VerifierDirectoryExtendedMetadataUnsupported");
-                break;
-            case 6: case kApfsTypeSiblingLink: case kApfsTypeSiblingMap: case kApfsTypeFileExtent: break;
-            default: return fail("VerifierFilesystemRecordUnsupported");
-            }
-        }
+        // Admit ordinary semantics on the same decoded records used below;
+        // a separate preflight would duplicate codecs and temporary objects.
         NativeApfsVolumeProjection view;
         view.block_size = container.block_size;
         view.total_blocks = container.block_count;
@@ -831,12 +1051,18 @@ bool NativeApfsReader::ProjectReadOnlyRecords(
         view.volume_object_id = volume.object_id;
         view.root_directory_inode = kRootDirectoryInode;
         view.name_policy = ApfsNamePolicy::FromIncompatibleFeatures(volume.incompatible_features);
-        if (!ProjectFileSystemTree(records, container.block_size, container.block_count,
-            container.xid, view.name_policy, view, true, budget, routed_address_blocks))
-            return fail("VerifierNamespaceOrLinkInconsistent");
+        if (!ProjectFileSystemTreeWithProfile(records, container.block_size, container.block_count,
+            container.xid, view.name_policy, view, true, budget, routed_address_blocks, &out_error, observational,
+            backup_clone_hint, fusion_private_namespace, marked_reference_namespace))
+            return fail(out_error.empty() ? "VerifierNamespaceOrLinkInconsistent" : out_error.c_str());
         if (!ProjectValidatedAttributeStreams(records, container.block_size,
-            container.block_count, 0, view, true, routed_address_blocks)) return fail("VerifierAttributeStreamInvalid");
-        if (!ValidateSnapshotStreams(records, view, out_error)) return fail(out_error.c_str());
+            container.block_count, 0, view, true, routed_address_blocks, observational)) return fail("VerifierAttributeStreamInvalid");
+        std::unordered_set<std::uint64_t> compressed;
+        if (historical_compression_source &&
+            !snapshot_compression::Admit(*historical_compression_source, view, budget, compressed, out_error))
+            return fail(out_error.c_str());
+        if (!ValidateSnapshotStreams(records, view, budget, out_error, observational,
+                historical_compression_source ? &compressed : nullptr)) return fail(out_error.c_str());
         if (budget->Failed()) return fail("VerifierNamespaceBudget");
         view.btree_records.clear();
         out_projection = std::move(view);
@@ -874,7 +1100,8 @@ bool NativeApfsReader::TryLoadSnapshotProjection(
         catalog::BudgetedRandomAccessSource bounded(source, budget);
         SnapshotMetadataSource metadata(bounded);
         catalog::ApfsSnapshotRecords loaded;
-        if (!catalog::ApfsSnapshotStore::LoadExactRecords(metadata, identity, loaded, out_error))
+        std::vector<ApplePhysicalExtentRecord> physical;
+        if (!catalog::ApfsSnapshotStore::LoadExactProjectionRecords(metadata, identity, loaded, physical, out_error))
             return fail(out_error.c_str());
         const auto& checkpoint = loaded.checkpoint;
         const auto& nx = checkpoint.container.superblock;
@@ -900,22 +1127,21 @@ bool NativeApfsReader::TryLoadSnapshotProjection(
         view.incompatible_features = volume.superblock.incompatible_features;
         view.name_policy = ApfsNamePolicy::FromIncompatibleFeatures(view.incompatible_features);
         auto& records = loaded.trees.filesystem;
-        // Charge sort/graph/ownership scratch before calling source-free codecs.
-        for (const auto* input : {&records, &loaded.trees.extentref})
-            for (const auto& record : *input)
-                if (!budget->Materialize(1, 8192 + 32ULL * (record.key.size() + record.value.size())))
-                    return fail("SnapshotProjectionBudget");
+        // Sort compares scalar/byte keys and moves existing buffers in place.
+        // Bound its stack/pivot workspace separately; namespace allocations
+        // are reserved by ProjectFileSystemTree before each actual codec/index.
+        if (!budget->Materialize(1, 65536 + 2 * sizeof(catalog::BtreeRecord)))
+            return fail("SnapshotProjectionBudget");
         if (!SortAppleBtreeRecords(records, view.name_policy.UsesHashedDirectoryKeys()
             ? AppleBtreeKeyOrder::FileSystemHashedDirectory : AppleBtreeKeyOrder::FileSystemCaseSensitive,
             out_error)) return false;
         if (!ProjectFileSystemTree(records, nx.block_size, nx.block_count,
             identity.snapshot_xid, view.name_policy, view, true, budget))
             return fail("SnapshotNamespaceProjectionInvalid");
-        std::vector<ApplePhysicalExtentRecord> physical;
-        // Conservative supported extentref subset: complete KIND_NEW graph.
-        // UPDATE/retained accounting is refused by this existing validator.
-        if (!ValidateApplePayloadExtentGraph(records, loaded.trees.extentref,
-            nx.block_size, nx.block_count, physical, out_error)) return false;
+        if (!ValidateSnapshotDirectorySiblings(records, view, budget, out_error))
+            return fail(out_error.empty() ? "SnapshotDirectorySiblingInvalid" : out_error.c_str());
+        // The exact chronological resolver supplied the same complete graph
+        // after its coverage/owner/refcount validation. Do not re-encode it.
         // Exclude all metadata read in this operation, plus complete reserved
         // checkpoint and spaceman pool ranges. Do not consult live free bits.
         const auto reserve = [&](std::uint64_t block, std::uint64_t count) {
@@ -953,7 +1179,9 @@ bool NativeApfsReader::TryLoadSnapshotProjection(
         }
         if (!ProjectValidatedAttributeStreams(records, nx.block_size, nx.block_count,
             offset, view, true)) return fail("SnapshotAttributeStreamInvalid");
-        if (!ValidateSnapshotStreams(records, view, out_error)) return false;
+        std::unordered_set<std::uint64_t> compressed;
+        if (!snapshot_compression::Admit(bounded, view, budget, compressed, out_error) ||
+            !ValidateSnapshotStreams(records, view, budget, out_error, false, &compressed)) return false;
         // Core projection uses store-relative addresses; translate once, keeping
         // zero holes as zero. Attribute streams above already use source offsets.
         for (auto& [inode, extents] : view.read_extents_by_inode)
@@ -990,6 +1218,82 @@ bool NativeApfsReader::TryLoadVolumeProjection(
     std::optional<std::uint64_t> exact_checkpoint_xid,
     std::shared_ptr<catalog::ApfsReadBudget> budget)
 {
+    return TryLoadVolumeProjectionImpl(device, volume_object_id, out_projection,
+        out_error, exact_checkpoint_xid, std::move(budget), nullptr);
+}
+
+bool NativeApfsReader::TryLoadVolumeProjectionFromValidatedCheckpoint(
+    ValidatedCheckpointProjection& context,
+    NativeApfsVolumeProjection& projection, std::wstring& error)
+{
+    projection = {};
+    error.clear();
+    const auto fail = [&](const wchar_t* reason) { projection = {}; error = reason; return false; };
+    if (context.consumed) return fail(L"NativeApfsCheckpointHandoffConsumed");
+    context.consumed = true;
+    const auto budget = context.source.ReadBudget();
+    if (budget && budget->Failed())
+    {
+        const std::string reason = budget->Failure();
+        error.assign(reason.begin(), reason.end());
+        return false;
+    }
+    const auto stable = [&] {
+        if (context.image_identity)
+        {
+            BlockDevice::StableImageIdentity observed;
+            return context.device.QueryStableReadOnlyImageIdentity(observed) &&
+                observed == *context.image_identity && context.device.RevalidateStableReadOnlyImage();
+        }
+        return context.expected.shared_container_session && !context.raw_identity.empty() &&
+            context.device.IsRawWriterAccepted() &&
+            context.device.RawWriterIdentity() == context.raw_identity;
+    };
+    if (!stable()) return fail(L"NativeApfsCheckpointHandoffSourceUnstable");
+    const auto& checkpoint = context.checkpoint;
+    const auto& nx = checkpoint.container.superblock;
+    const auto source_size = context.source.SizeBytes();
+    if (context.device.BaseOffsetBytes() != context.expected.device_offset_bytes ||
+        source_size != context.device.GetGeometry().total_bytes || nx.block_size == 0 ||
+        nx.block_size > (1u << 20) || nx.block_count == 0 ||
+        nx.block_count > source_size / nx.block_size ||
+        checkpoint.container.superblock_physical_block >= nx.block_count ||
+        (!context.image_identity && context.device.RawWriteLimitBytes() != nx.block_count * nx.block_size))
+        return fail(L"NativeApfsCheckpointHandoffWindowMismatch");
+    if (context.checkpoint_xid == 0 || nx.xid != context.checkpoint_xid ||
+        checkpoint.container.checkpoint_map_blocks.empty() ||
+        checkpoint.container.superblock_bytes.size() != nx.block_size ||
+        !catalog::VerifyObjectChecksum(checkpoint.container.superblock_bytes, nx.block_size) ||
+        catalog::ReadU64LE(checkpoint.container.superblock_bytes, 16) != nx.xid)
+        return fail(L"NativeApfsCheckpointHandoffGenerationMismatch");
+    if (!context.expected.container_uuid_hex.empty() &&
+        context.expected.container_uuid_hex != nx.uuid_hex)
+        return fail(L"NativeApfsCheckpointHandoffContainerMismatch");
+    if (std::any_of(nx.fusion_uuid.begin(), nx.fusion_uuid.end(), [](auto byte) { return byte != std::byte{0}; }) ||
+        nx.fusion_middle_tree_oid || nx.fusion_writeback_oid)
+        return fail(L"NativeApfsFusionUnsupported");
+    const catalog::AppleVolumeCheckpointView* selected = nullptr;
+    for (const auto& volume : checkpoint.volumes)
+        if (volume.superblock.object_id == context.expected.volume_object_id)
+        {
+            if (selected) return fail(L"NativeApfsVolumeAmbiguous");
+            selected = &volume;
+        }
+    if (context.expected.volume_object_id == 0 || !selected ||
+        (!context.expected.volume_uuid_hex.empty() &&
+            context.expected.volume_uuid_hex != selected->superblock.uuid_hex))
+        return fail(L"NativeApfsCheckpointHandoffVolumeMismatch");
+    if (!TryLoadVolumeProjectionImpl(context.device, context.expected.volume_object_id,
+            projection, error, std::nullopt, budget, &context)) return false;
+    if (!stable()) return fail(L"NativeApfsCheckpointHandoffSourceChanged");
+    return true;
+}
+
+bool NativeApfsReader::TryLoadVolumeProjectionImpl(const BlockDevice& device,
+    std::uint64_t volume_object_id, NativeApfsVolumeProjection& out_projection,
+    std::wstring& out_error, std::optional<std::uint64_t> exact_checkpoint_xid,
+    std::shared_ptr<catalog::ApfsReadBudget> budget, const ValidatedCheckpointProjection* context)
+{
     out_projection = {};
     out_error.clear();
     bool complete = false;
@@ -1025,7 +1329,21 @@ bool NativeApfsReader::TryLoadVolumeProjection(
     // media. There is no block-0 guess, no proximity scan, and every object
     // traversed here is checksum- and xid-verified by the catalog walk.
     BlockDeviceSource device_source(device, budget);
+    const catalog::RandomAccessSource& projection_source = context ? context->source : device_source;
     catalog::ApfsContainerCatalog catalog;
+    catalog::ApfsPhysicalStoreDescriptor handoff_store;
+    const catalog::ApfsPhysicalStoreDescriptor* matched_store = nullptr;
+    const catalog::ApfsVolumeDescriptor* matched_volume = nullptr;
+    const catalog::AppleCheckpointView* checkpoint = nullptr;
+    if (context)
+    {
+        handoff_store.offset_bytes = 0;
+        handoff_store.size_bytes = projection_source.SizeBytes();
+        matched_store = &handoff_store;
+        checkpoint = &context->checkpoint;
+    }
+    else
+    {
     std::wstring catalog_error;
     // TryLoadDevice owns an unbudgeted adapter. Use its existing portable
     // authority directly for opted-in callers, never a direct-device fallback.
@@ -1052,7 +1370,6 @@ bool NativeApfsReader::TryLoadVolumeProjection(
         return false;
     }
     const catalog::ApfsContainerDescriptor* matched_container = nullptr;
-    const catalog::ApfsVolumeDescriptor* matched_volume = nullptr;
     for (const auto& container : catalog.Containers())
     {
         for (const auto& volume : container.volumes)
@@ -1082,7 +1399,6 @@ bool NativeApfsReader::TryLoadVolumeProjection(
         out_error = L"NativeApfsFusionUnsupported";
         return false;
     }
-    const catalog::ApfsPhysicalStoreDescriptor* matched_store = nullptr;
     for (const auto& store : catalog.Stores())
     {
         if (store.stable_store_id == matched_container->member_store_ids.front())
@@ -1096,18 +1412,18 @@ bool NativeApfsReader::TryLoadVolumeProjection(
         out_error = L"NativeApfsStoreMissing";
         return false;
     }
-    const catalog::AppleCheckpointView* checkpoint =
-        catalog.TryGetAppleCheckpointView(matched_store->stable_store_id);
+    checkpoint = catalog.TryGetAppleCheckpointView(matched_store->stable_store_id);
     if (checkpoint == nullptr)
     {
         out_error = L"NativeApfsAuthoritativeCheckpointMissing";
         return false;
     }
+    }
     std::optional<catalog::AppleCheckpointView> historical_checkpoint;
     if (exact_checkpoint_xid)
     {
         std::string error;
-        historical_checkpoint = catalog::LoadAppleCheckpointView(device_source,
+        historical_checkpoint = catalog::LoadAppleCheckpointView(projection_source,
             matched_store->offset_bytes, matched_store->size_bytes, error, exact_checkpoint_xid);
         if (!historical_checkpoint || historical_checkpoint->container.superblock.uuid_hex !=
                 checkpoint->container.superblock.uuid_hex)
@@ -1151,7 +1467,7 @@ bool NativeApfsReader::TryLoadVolumeProjection(
     }
     const std::uint64_t store_block_base = matched_store->offset_bytes / block_size;
     catalog::OffsetRandomAccessSource store_view(
-        &device_source, matched_store->offset_bytes, matched_store->size_bytes);
+        &projection_source, matched_store->offset_bytes, matched_store->size_bytes);
 
     auto to_device_block = [&](std::uint64_t store_block, std::uint64_t& out_device_block)
     {
@@ -1327,7 +1643,7 @@ bool NativeApfsReader::TryLoadVolumeProjection(
         }
         else if (budget) return budget->Refuse("ApfsReadBudgetAttributeWalkIncomplete");
     }
-    ProjectExternalCompressionSizes(device_source, out_projection);
+    ProjectExternalCompressionSizes(projection_source, out_projection);
     if (budget && budget->Failed()) return false;
     complete = true;
     return true;
@@ -1666,8 +1982,36 @@ bool NativeApfsReader::ProjectFileSystemTree(
     NativeApfsVolumeProjection& projection,
     bool require_complete_namespace,
     const std::shared_ptr<catalog::ApfsReadBudget>& budget,
-    std::uint64_t routed_address_blocks)
+    std::uint64_t routed_address_blocks,
+    std::string* ordinary_record_error)
 {
+    return ProjectFileSystemTreeWithAdmission(records,block_size,total_blocks,xid,name_policy,projection,
+        require_complete_namespace,budget,routed_address_blocks,ordinary_record_error,false);
+}
+
+bool NativeApfsReader::ProjectFileSystemTreeWithAdmission(
+    const std::vector<RawBtreeRecord>& records, std::uint32_t block_size, std::uint64_t total_blocks,
+    std::uint64_t xid, const ApfsNamePolicy& name_policy, NativeApfsVolumeProjection& projection,
+    bool require_complete_namespace, const std::shared_ptr<catalog::ApfsReadBudget>& budget,
+    std::uint64_t routed_address_blocks, std::string* ordinary_record_error, bool observational,
+    bool backup_clone_hint)
+{
+    return ProjectFileSystemTreeWithProfile(records, block_size, total_blocks, xid, name_policy,
+        projection, require_complete_namespace, budget, routed_address_blocks, ordinary_record_error,
+        observational, backup_clone_hint, false);
+}
+
+bool NativeApfsReader::ProjectFileSystemTreeWithProfile(
+    const std::vector<RawBtreeRecord>& records, std::uint32_t block_size, std::uint64_t total_blocks,
+    std::uint64_t xid, const ApfsNamePolicy& name_policy, NativeApfsVolumeProjection& projection,
+    bool require_complete_namespace, const std::shared_ptr<catalog::ApfsReadBudget>& budget,
+    std::uint64_t routed_address_blocks, std::string* ordinary_record_error, bool observational,
+    bool backup_clone_hint, bool fusion_private_namespace, bool marked_reference_namespace)
+{
+    const auto ordinary_refusal = [&](const char* reason) {
+        if (ordinary_record_error) *ordinary_record_error = reason;
+        return false;
+    };
     if (block_size == 0)
     {
         return false;
@@ -1737,10 +2081,12 @@ bool NativeApfsReader::ProjectFileSystemTree(
         // Reserve a conservative envelope before codecs copy variable fields
         // and before the derived inode/xattr/name/extent indexes allocate.
         // Path-dependent and shared-extent copies are charged below separately.
-        if (budget && !budget->Materialize(1, 4096 +
-                32ULL * (record.key.size() + record.value.size()))) return false;
+        const auto type = record.key.size() >= sizeof(std::uint64_t)
+            ? ReadLe64(record.key, 0) >> kApfsObjectTypeShift : 0;
+        if (!MaterializeNamespaceRecord(budget, record, type)) return false;
         if (record.key.size() < sizeof(std::uint64_t))
         {
+            if (ordinary_record_error) return ordinary_refusal("VerifierFilesystemRecordInvalid");
             if (require_complete_namespace) return false;
             continue;
         }
@@ -1748,6 +2094,19 @@ bool NativeApfsReader::ProjectFileSystemTree(
         const auto obj_id_and_type = ReadLe64(record.key, 0);
         const auto object_id = obj_id_and_type & kApfsObjectIdMask;
         const auto record_type = (obj_id_and_type >> kApfsObjectTypeShift) & 0x0f;
+        if (ordinary_record_error)
+        {
+            switch (record_type)
+            {
+            case kApfsTypeInode: case kApfsTypeXattr: case kApfsTypeSiblingLink:
+            case 6: case kApfsTypeFileExtent: case kApfsTypeSiblingMap: break;
+            case kApfsTypeDirectoryRecord:
+                if (catalog::ReadU16LE(record.value, 16).value_or(0) & ~0xfu)
+                    return ordinary_refusal("VerifierDirectoryExtendedMetadataUnsupported");
+                break;
+            default: return ordinary_refusal("VerifierFilesystemRecordUnsupported");
+            }
+        }
         if (record_type != kApfsTypeInode && record_type != kApfsTypeXattr &&
             record_type != kApfsTypeDirectoryRecord)
             type_dependent_record_ids.insert(object_id);
@@ -1761,13 +2120,33 @@ bool NativeApfsReader::ProjectFileSystemTree(
 
         if (record_type == kApfsTypeInode)
         {
-            catalog::BtreeRecord typed_record{record.key, record.value};
             AppleInodeRecord apple_inode;
             std::string record_error;
-            if (!ApfsExtendedRecordCodec::DecodeInode(
-                    typed_record, apple_inode, record_error))
+            if (!(observational ? ApfsExtendedRecordCodec::DecodeInodeReadOnly(record,apple_inode,record_error) :
+                ApfsExtendedRecordCodec::DecodeInode(record, apple_inode, record_error)))
             {
+                if (ordinary_record_error) *ordinary_record_error = record_error;
                 return false;
+            }
+            if (ordinary_record_error)
+            {
+                constexpr std::uint64_t neutral = 0x8 | 0x20 | 0x40 | 0x100 | 0x8000;
+                // This historical regular-file hint is not extent ownership authority.
+                const std::uint64_t clone_hint = (backup_clone_hint || observational) &&
+                    (apple_inode.mode & 0170000) == 0100000 ? 0x400 : 0;
+                const std::uint64_t marked_flags = marked_reference_namespace && observational &&
+                    (apple_inode.mode & 0170000) == 0100000 ? 0x180000 : 0;
+                if (apple_inode.reserved_pad || (apple_inode.internal_flags &
+                    ~(neutral | clone_hint | marked_flags | kAppleInodeSparseFlag | kAppleInodeHasUncompressedSize |
+                        (fusion_private_namespace ? 1ull : 0ull))))
+                    return ordinary_refusal("VerifierInodeFlagsUnsupported");
+                for (const auto& field : apple_inode.extended_fields)
+                    if ((field.flags && !(observational &&
+                            ((field.type == 4 && field.flags == 0x02) ||
+                             (field.type == kInodeExtendedFieldDataStream && field.flags == 0x20)))) ||
+                        (field.type != 4 && field.type != kInodeExtendedFieldDataStream &&
+                        field.type != kInodeExtendedFieldSparseBytes))
+                        return ordinary_refusal("VerifierInodeExtendedFieldUnsupported");
             }
             // DecodeInode already validates the xfield envelope and uniqueness.
             // INODE_IS_SPARSE means INO_EXT_TYPE_SPARSE_BYTES is present, even
@@ -1815,7 +2194,10 @@ bool NativeApfsReader::ProjectFileSystemTree(
             inode.node_type = NodeTypeFromMode(inode.mode);
             // A type change may preserve neutral fields, but must not carry directory
             // statistics, mounted-filesystem state, storage or unknown fields into a link.
-            constexpr std::uint64_t neutral_flags = 0x8 | 0x20 | 0x40 | 0x100 | 0x8000;
+            // Strict imports require a valid size. Observational Apple links
+            // may derive it from an exact filesystem-owned terminated target.
+            constexpr std::uint64_t neutral_flags =
+                0x8 | 0x20 | 0x40 | 0x100 | 0x8000 | kAppleInodeHasUncompressedSize;
             inode.directory_symlink_metadata_safe =
                 (inode.is_directory || inode.node_type == MetadataStore::NodeType::SymbolicLink) &&
                 (!inode.is_directory || apple_inode.uncompressed_size == 0) &&
@@ -1872,7 +2254,15 @@ bool NativeApfsReader::ProjectFileSystemTree(
             }
             if (!inode.is_directory)
             {
-                if (auto data_stream = ReadInodeDataStreamInfo(record.value); data_stream.has_value())
+                if(observational){
+                    for(const auto& field:apple_inode.extended_fields)if(field.type==kInodeExtendedFieldDataStream){
+                        AppleDataStreamRecord stream;
+                        if(!ApfsExtendedRecordCodec::DecodeDataStream(field,stream,record_error))
+                            return ordinary_refusal("VerifierDataStreamInvalid");
+                        inode.logical_size=stream.size;inode.allocated_size=stream.allocated_size;inode.has_data_stream_info=true;
+                    }
+                }
+                else if (auto data_stream = ReadInodeDataStreamInfo(record.value); data_stream.has_value())
                 {
                     inode.logical_size = data_stream->logical_size;
                     inode.allocated_size = data_stream->allocated_size;
@@ -1884,14 +2274,17 @@ bool NativeApfsReader::ProjectFileSystemTree(
         }
         else if (record_type == kApfsTypeXattr)
         {
-            catalog::BtreeRecord typed_record{record.key, record.value};
             AppleXattrRecord xattr;
             std::string record_error;
             if (!ApfsExtendedRecordCodec::DecodeXattr(
-                    typed_record, xattr, record_error))
+                    record, xattr, record_error))
             {
+                if (ordinary_record_error) *ordinary_record_error = record_error;
                 return false;
             }
+            if (ordinary_record_error &&
+                (xattr.flags & ~(kAppleXattrDataEmbedded | kAppleXattrDataStream | kAppleXattrFileSystemOwned)))
+                return ordinary_refusal("VerifierXattrFlagsUnsupported");
             if ((xattr.flags & kAppleXattrDataStream) != 0)
                 projection.highest_file_system_object_id = (std::max)(
                     projection.highest_file_system_object_id, ReadLe64(xattr.data, 0));
@@ -1899,6 +2292,18 @@ bool NativeApfsReader::ProjectFileSystemTree(
                 !symlink_targets.emplace(xattr.object_id, xattr).second)
             {
                 return false;
+            }
+            // Firmlink markers are opaque here: count them for evidence and
+            // keep the original record untouched. No path is resolved, no
+            // payload interpreted, no route built. A unified group view
+            // stays unavailable until macOS fixtures prove a decoder.
+            if (InspectFirmlinkAttribute(xattr) == FirmlinkDecodeStatus::UnsupportedSerialization)
+            {
+                // A census counter must never fail projection: saturate on
+                // the unreachable overflow instead.
+                if (projection.firmlink_markers_unsupported <
+                    std::numeric_limits<std::uint64_t>::max())
+                    ++projection.firmlink_markers_unsupported;
             }
             const auto name = xattr.name_utf8;
             if (!projection.extended_attributes_by_inode[xattr.object_id].emplace(
@@ -1955,6 +2360,17 @@ bool NativeApfsReader::ProjectFileSystemTree(
             entry.child_id = ReadLe64(record.value, 0x00);
             entry.timestamp = ReadLe64(record.value, 0x08);
             entry.flags = ReadLe16(record.value, 0x10);
+            if (ordinary_record_error && record.value.size() > 18)
+            {
+                AppleDirectoryRecord typed;
+                std::string record_error;
+                if (!ApfsExtendedRecordCodec::DecodeDirectory(record, name_policy, typed, record_error) ||
+                    typed.flags != 8 || typed.extended_fields.size() != 1 ||
+                    typed.extended_fields.front().type != 1 || typed.extended_fields.front().flags ||
+                    typed.extended_fields.front().data.size() != 8 ||
+                    !(entry.sibling_id = catalog::ReadU64LE(typed.extended_fields.front().data, 0).value_or(0)))
+                    return ordinary_refusal("VerifierDirectoryExtendedMetadataUnsupported");
+            }
             if (entry.name.empty() ||
                 entry.name == L"." ||
                 entry.name == L".." ||
@@ -2123,6 +2539,19 @@ bool NativeApfsReader::ProjectFileSystemTree(
             }
             continue;
         }
+        if (observational && target != symlink_targets.end() &&
+            target->second.flags == (kAppleXattrDataEmbedded | kAppleXattrFileSystemOwned) &&
+            !target->second.data.empty() && target->second.data.back() == std::byte{0})
+        {
+            const auto& data = target->second.data;
+            if (inode.has_data_stream_info || data.size() < 2 || data.size() > 3804 ||
+                std::find(data.begin(), data.end() - 1, std::byte{0}) != data.end() - 1 ||
+                ((inode.internal_flags & kAppleInodeHasUncompressedSize) && inode.logical_size != data.size() - 1))
+                return false;
+            inode.symlink_target_utf8.assign(reinterpret_cast<const char*>(data.data()), data.size() - 1);
+            inode.logical_size = data.size() - 1;
+            continue;
+        }
         if (target == symlink_targets.end() ||
             (target->second.flags & (kAppleXattrDataStream | kAppleXattrDataEmbedded)) !=
                 kAppleXattrDataEmbedded ||
@@ -2139,6 +2568,38 @@ bool NativeApfsReader::ProjectFileSystemTree(
         {
             return false;
         }
+    }
+
+    if (marked_reference_namespace)
+    {
+        // Apple reserves directory7 for purgeable references and gives it no
+        // inode. Validate its typed target relation; do not interpret names as
+        // policy or treat these references as user-visible hard links.
+        if (raw_inodes.contains(7) || type_dependent_record_ids.contains(7) ||
+            projection.extended_attributes_by_inode.contains(7))
+            return ordinary_refusal("VerifierMarkedReferenceDirectoryUnsupported");
+        std::unordered_set<std::uint64_t> targets;
+        std::unordered_set<std::string> names;
+        for (const auto& entry : directory_entries)
+        {
+            if (budget && !budget->Materialize(1, 1)) return false;
+            if (entry.parent_id != 7) continue;
+            const auto inode = raw_inodes.find(entry.child_id);
+            if (inode == raw_inodes.end() || inode->second.node_type != MetadataStore::NodeType::RegularFile ||
+                !(inode->second.internal_flags & 0x80000) || inode->second.link_count != 1 ||
+                entry.flags != 8 || entry.sibling_id)
+                return ordinary_refusal("VerifierMarkedReferenceMismatch");
+            if (budget && !budget->Materialize(2, 128 + entry.name_utf8.size())) return false;
+            if (!targets.insert(entry.child_id).second || !names.insert(entry.name_utf8).second)
+                return ordinary_refusal("VerifierMarkedReferenceMismatch");
+        }
+        for (const auto& [id, inode] : raw_inodes)
+        {
+            if (budget && !budget->Materialize(1, 1)) return false;
+            if ((inode.internal_flags & 0x80000) && !targets.contains(id))
+                return ordinary_refusal("VerifierMarkedReferenceMissing");
+        }
+        std::erase_if(directory_entries, [](const auto& entry) { return entry.parent_id == 7; });
     }
 
     const auto sibling_link_key = [](
@@ -2175,11 +2636,14 @@ bool NativeApfsReader::ProjectFileSystemTree(
         if (inode == raw_inodes.end() || inode->second.is_directory ||
             inode->second.link_count <= 1)
         {
+            if (ordinary_record_error && entry.sibling_id)
+                return ordinary_refusal("VerifierDirectorySiblingMismatch");
             continue;
         }
         const auto sibling = sibling_by_link.find(
             sibling_link_key(entry.child_id, entry.parent_id, entry.name_utf8));
         if (sibling == sibling_by_link.end() ||
+            (ordinary_record_error && entry.sibling_id != sibling->second) ||
             !matched_sibling_ids.insert(sibling->second).second)
         {
             return false;
@@ -2209,6 +2673,35 @@ bool NativeApfsReader::ProjectFileSystemTree(
     std::unordered_map<std::uint64_t, std::vector<RawDirectoryEntry>> children_by_parent;
     std::unordered_map<std::uint64_t, std::unordered_set<std::wstring>> names_by_parent;
     std::unordered_map<std::uint64_t, std::size_t> incoming_links;
+    bool fusion_private_root = false;
+#include "FusionPrivateNamespace.inc"
+    if(observational && std::any_of(directory_entries.begin(),directory_entries.end(),
+        [](const auto& entry){return entry.parent_id==1;})){
+        // ROOT_DIR_PARENT is an on-disk sentinel, not an inode. Admit only the
+        // two canonical anchors and an empty private directory in this profile.
+        const auto root=raw_inodes.find(2), reserved=raw_inodes.find(3);
+        if(raw_inodes.contains(1)||root==raw_inodes.end()||reserved==raw_inodes.end()||
+            !root->second.is_directory||root->second.parent_id!=1||root->second.private_id!=2||root->second.primary_name_utf8!="root"||
+            !reserved->second.is_directory||reserved->second.parent_id!=1||reserved->second.private_id!=3||
+            reserved->second.primary_name_utf8!="private-dir"||reserved->second.directory_entry_count||
+            !reserved->second.directory_symlink_metadata_safe||
+            reserved->second.has_data_stream_info||reserved->second.uncompressed_size||
+            extent_record_ids.contains(3)||type_dependent_record_ids.contains(3)||
+            projection.extended_attributes_by_inode.contains(3))return ordinary_refusal("VerifierReservedNamespaceUnsupported");
+        unsigned roots=0,private_dirs=0;
+        for(const auto& entry:directory_entries){
+            if(entry.parent_id==3||(entry.child_id==3&&entry.parent_id!=1))
+                return ordinary_refusal("VerifierPrivateDirectoryHistoryUnsupported");
+            if(entry.parent_id!=1)continue;
+            if(entry.flags!=4)return ordinary_refusal("VerifierRootAnchorInvalid");
+            if(entry.child_id==2&&entry.name_utf8=="root")++roots;
+            else if(entry.child_id==3&&entry.name_utf8=="private-dir")++private_dirs;
+            else return ordinary_refusal("VerifierRootAnchorInvalid");
+        }
+        if(roots!=1||private_dirs!=1)return ordinary_refusal("VerifierRootAnchorInvalid");
+        std::erase_if(directory_entries,[](const auto& entry){return entry.parent_id==1;});
+        raw_inodes.erase(3);
+    }
     for (const auto& entry : directory_entries)
     {
         if (!raw_inodes.contains(entry.child_id))
@@ -2234,10 +2727,11 @@ bool NativeApfsReader::ProjectFileSystemTree(
         if (!raw_inodes.at(kRootDirectoryInode).is_directory) return false;
         for (const auto& [id, inode] : raw_inodes)
         {
-            const auto expected_links = id == kRootDirectoryInode ? 0 : inode.is_directory ? 1 : inode.link_count;
+            const auto expected_links = id == kRootDirectoryInode || (fusion_private_root && id == 3)
+                ? 0 : inode.is_directory ? 1 : inode.link_count;
             if (incoming_links[id] != expected_links || (inode.is_directory &&
                     children_by_parent[id].size() != inode.directory_entry_count)) return false;
-            if (id != kRootDirectoryInode)
+            if (id != kRootDirectoryInode && !(fusion_private_root && id == 3))
             {
                 const auto parent = raw_inodes.find(inode.parent_id);
                 const auto entries = children_by_parent.find(inode.parent_id);
@@ -2268,6 +2762,7 @@ bool NativeApfsReader::ProjectFileSystemTree(
     std::queue<PendingInode> pending;
     std::unordered_set<std::uint64_t> visited_inodes;
     pending.push({ kRootDirectoryInode, L"\\", {} });
+    if (fusion_private_root) pending.push({3, L"\\private-dir", "private-dir"});
 
     while (!pending.empty())
     {

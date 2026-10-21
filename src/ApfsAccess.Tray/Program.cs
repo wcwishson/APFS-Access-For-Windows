@@ -15,6 +15,7 @@ public static class Program
         "APFSACCESS_PORTABLE_ROOT",
         "APFSACCESS_RUNTIME_ROOT",
         "APFSACCESS_SPOOL_ROOT",
+        "APFSACCESS_RECOVERY_ROOT",
         "TEMP",
         "TMP",
         "APFSACCESS_TRACE_MOVES",
@@ -204,7 +205,10 @@ public static class Program
     {
         var runtimeRoot = ResolveRuntimeRoot();
         var tempRoot = Path.Combine(runtimeRoot, "temp");
-        var spoolRoot = Path.Combine(runtimeRoot, "payload-spool");
+        var configuredSpoolRoot = Environment.GetEnvironmentVariable("APFSACCESS_SPOOL_ROOT");
+        var spoolRoot = string.IsNullOrWhiteSpace(configuredSpoolRoot)
+            ? Path.Combine(runtimeRoot, "payload-spool")
+            : Path.GetFullPath(configuredSpoolRoot);
 
         Directory.CreateDirectory(tempRoot);
         Directory.CreateDirectory(spoolRoot);

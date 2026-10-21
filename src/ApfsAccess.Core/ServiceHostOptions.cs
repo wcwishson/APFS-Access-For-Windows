@@ -4,11 +4,28 @@ public sealed class ServiceHostOptions
 {
     public const string SectionName = "Service";
 
+    internal ServiceHostOptions WithPhysicalWritePermission(string deviceId)
+    {
+        var copy = (ServiceHostOptions)MemberwiseClone();
+        copy.NativeWriteAllowRawPhysicalDevices = true;
+        copy.NativeWriteHardwarePilotDeviceAllowList = [deviceId];
+        return copy;
+    }
+
     public string BackendMode { get; set; } = "Mock";
 
     public string? NativeFsHostPath { get; set; }
 
     public string? NativeObserverPath { get; set; }
+
+    // Explicit management remains disabled until a durable, external root is configured.
+    public string? ManagementJournalRoot { get; set; }
+    // The default service retains its fixed authenticated endpoint.
+    public Guid? PrivateControlInstanceId { get; set; }
+    public bool EnableImageResizeFormat { get; set; } = false;
+    public bool EnableImageManagementMutations { get; set; } = false;
+    public bool EnablePhysicalVolumeManagement { get; set; } = false;
+    public OrdinaryManagementImageRegistration[] OrdinaryManagementImages { get; set; } = [];
 
     public string[] NativeDeviceCandidates { get; set; } = [];
 
@@ -55,6 +72,14 @@ public sealed class ServiceHostOptions
     public string NativeWritePromotionPolicy { get; set; } = "ScaffoldOnly";
 
     public bool NativeWriteRequireCanonicalCommit { get; set; } = true;
+
+    public bool EnableImageSnapshots { get; set; } = false;
+    public bool EnableRawSnapshots { get; set; } = false;
+    public RawSnapshotHardwareQualification? RawSnapshotHardwareQualification { get; set; } = null;
+    public bool EnableRetainedPhysicalSnapshotInventory { get; set; } = false;
+
+    public bool EnableBackupImageWrites { get; set; } = false;
+    public bool EnableBackupHeldWrites { get; set; } = false;
 
     public bool NativeWriteDisallowScaffoldCommitOnNonFixture { get; set; } = true;
 

@@ -108,6 +108,10 @@ public:
     {
         out.clear();
         if (!budget->Read(count)) return false;
+        return ReadFixture(offset, count, out);
+    }
+    bool ReadFixture(std::uint64_t offset, std::size_t count, std::vector<std::byte>& out) const
+    {
         ++reads;
         if (before) before(offset);
         if (offset == fault_offset)
@@ -597,9 +601,491 @@ void IncompleteProjectionCopyCleanup()
 }
 
 }
+#include "ApfsEncryptedNamespaceTests.h"
+#include "ApfsEncryptedRuntimeBudgetTests.h"
+namespace
+{
+void AppleImageMetadataProfiles()
+{
+    ++groups;
+    auto records = NamespaceRecords();
+    for (auto& record : records)
+        if (ReadU64LE(record.key, 0).value() >> 60 == 3)
+            PutU64LE(record.value, 0x30, 0x8000); // INODE_NO_RSRC_FORK, including directories.
+    auto source = std::make_shared<Source>();
+    InstallNamespace(source, records);
+    E error; auto session = Open(source, error);
+    CHECK(session); CHECK(error == E::None);
+    EncryptedNodeInfo inode;
+    CHECK(session->GetMetadata(2, inode) == E::None && inode.internal_flags == 0x8000);
+    CHECK(session->GetMetadata(100, inode) == E::None && inode.internal_flags == 0x8000);
+    session->Close(); Released();
+}
+void AppleImageFramingAndRolling()
+{
+    ++groups;
+    auto records = NamespaceRecords(1);
+    for (auto& record : records)
+    {
+        const auto type = ReadU64LE(record.key, 0).value() >> 60;
+        const auto offset = type == 3 ? 92u : type == 9 ? 18u : 0u;
+        if (!offset || record.value.size() <= offset) continue;
+        const auto count = ReadU16LE(record.value, offset).value();
+        const auto used = ReadU16LE(record.value, offset + 2).value();
+        CHECK(used >= count * 4);
+        PutU16LE(record.value, offset + 2, used - count * 4);
+    }
+    for (unsigned fault = 0; fault < 9; ++fault)
+    {
+        auto changed = records;
+        if (fault >= 1 && fault <= 4)
+        {
+            auto found = std::find_if(changed.begin(), changed.end(), [](const auto& r) {
+                return ReadU64LE(r.key,0).value() == ((3ULL << 60) | 100);
+            });
+            auto& value = found->value;
+            if (fault == 1) PutU16LE(value,94,ReadU16LE(value,94).value()+1);
+            if (fault == 2) value.push_back(std::byte{1});
+            if (fault == 3) PutU16LE(value,92,1025);
+            if (fault == 4) PutU16LE(value,98,UINT16_MAX);
+        }
+        auto source = std::make_shared<Source>();
+        InstallNamespace(source,changed,1);
+        source->MutateAt(4, [&](auto& bytes) {
+            PutU64LE(bytes,0x38, fault == 8 ? 0x1001 : 5); // Historical ENC_ROLLED.
+            if (fault == 5) PutU64LE(bytes,0x3D0,77); // Active rolling state.
+        });
+        if (fault == 6 || fault == 7)
+        {
+            const auto map = ReadU64LE(source->image,4ULL*4096+0x80).value();
+            const auto tree = ReadU64LE(source->image,map*4096+48).value();
+            if (fault == 6) source->MutateAt(map,[](auto& b) { PutU32LE(b,32,0x10); });
+            if (fault == 7) source->MutateAt(tree,[](auto& b) { PutU32LE(b,b.size()-40-16,0x14); });
+        }
+        E error; auto session = Open(source,error);
+        CHECK(static_cast<bool>(session) == (fault == 0));
+        if (session)
+        {
+            EncryptedDirectoryEntry entry;
+            CHECK(session->LookupWindows(2,L"report.txt",entry) == E::None && entry.inode_id == 100);
+            std::vector<std::byte> bytes;
+            CHECK(session->ReadFile(100,509,191,bytes) == E::None && bytes.size() == 191);
+            session->Close();
+        }
+        else CHECK(error != E::None);
+        Released();
+    }
+}
+std::vector<BtreeRecord> SymbolicLinkRecords()
+{
+    auto records = NamespaceRecords(); std::string detail;
+    for (auto& record : records)
+        if (ReadU64LE(record.key,0).value() == ((3ULL << 60) | 2)) PutU32LE(record.value,56,4);
+    rw::AppleInodeRecord inode;
+    inode.object_id = inode.private_id = 200; inode.parent_id = 2;
+    inode.mode = 0120777; inode.children_or_links = 1; inode.internal_flags = 0x8000;
+    BtreeRecord record; CHECK(rw::EncodeAppleInodeRecord(inode,record,detail)); records.push_back(record);
+    rw::AppleDirectoryRecord entry; entry.parent_id = 2; entry.file_id = 200;
+    entry.name_utf8 = "Link"; entry.flags = 10;
+    CHECK(rw::EncodeAppleDirectoryRecord(entry,record,detail)); records.push_back(record);
+    const std::string target = "../outside/target";
+    rw::AppleXattrRecord attr{200,"com.apple.fs.symlink",6,{}};
+    for (auto byte : target) attr.data.push_back(static_cast<std::byte>(byte));
+    attr.data.push_back(std::byte{});
+    CHECK(rw::EncodeAppleXattrRecord(attr,record,detail)); records.push_back(record);
+    return records;
+}
+void SymbolicLinkMetadataOnly()
+{
+    ++groups;
+    auto source = std::make_shared<Source>(); InstallNamespace(source,SymbolicLinkRecords());
+    E error; auto session = Open(source,error); CHECK(session); CHECK(error == E::None);
+    const auto reads = source->reads;
+    EncryptedNodeInfo inode;
+    CHECK(session->ResolvePath(L"\\Link",inode) == E::None && inode.inode_id == 200);
+    CHECK((inode.mode & 0170000) == 0120000);
+    CHECK(session->ResolvePath(L"\\Link\\target",inode) == E::NotDirectory && inode.inode_id == 0);
+    std::vector<std::byte> bytes;
+    CHECK(session->ReadFile(200,0,1,bytes) == E::FileNotFound && bytes.empty());
+    CHECK(session->ReadXattr(200,"com.apple.fs.symlink",bytes) == E::None);
+    const std::string target = "../outside/target";
+    CHECK(bytes.size() == target.size()+1 && bytes.back() == std::byte{});
+    CHECK(std::equal(target.begin(),target.end(),bytes.begin(),[](char a,auto b) { return std::byte(a) == b; }));
+    CHECK(source->reads == reads); session->Close(); Released();
+}
+void AppleCryptoPlaceholderAndExtentProfiles()
+{
+    ++groups;
+    for (unsigned fault = 0; fault < 13; ++fault)
+    {
+        auto records = NamespaceRecords();
+        BtreeRecord crypto; crypto.key.resize(8); crypto.value.resize(24);
+        PutU64LE(crypto.key,0,(7ULL << 60) | 4); PutU32LE(crypto.value,0,1);
+        if (fault != 0)
+        {
+            PutU16LE(crypto.value,4,5); PutU32LE(crypto.value,12,3);
+            PutU32LE(crypto.value,16,306250119); PutU16LE(crypto.value,20,1);
+        }
+        if (fault == 2) PutU16LE(crypto.value,4,6);
+        if (fault == 3) PutU16LE(crypto.value,6,1);
+        if (fault == 4) PutU32LE(crypto.value,8,1);
+        if (fault == 5) PutU32LE(crypto.value,12,4);
+        if (fault == 6) PutU16LE(crypto.value,22,1);
+        if (fault == 7) PutU64LE(crypto.key,0,(7ULL << 60) | 5);
+        if (fault == 8) crypto.value.push_back(std::byte{});
+        if (fault == 9) PutU32LE(crypto.value,0,0x80000000u);
+        if (fault == 10) PutU16LE(crypto.value,20,2);
+        records.push_back(std::move(crypto));
+        for (auto& record : records)
+            if (ReadU64LE(record.key,0).value() >> 60 == 8)
+                record.value[7] = static_cast<std::byte>(fault == 11 ? 2 : fault == 12 ? 0x81 : 1);
+        auto source = std::make_shared<Source>(); InstallNamespace(source,records);
+        E error; auto session = Open(source,error);
+        CHECK(static_cast<bool>(session) == (fault <= 1));
+        if (session)
+        {
+            std::vector<std::byte> bytes;
+            CHECK(session->ReadFile(100,509,191,bytes) == E::None && bytes.size() == 191);
+            for (std::size_t i=0;i<bytes.size();++i) CHECK(bytes[i] == static_cast<std::byte>(((i+509)*7+3)%256));
+            session->Close();
+        }
+        else CHECK(error == E::UnsupportedEncryptionLayout);
+        Released();
+    }
+}
+void ExplicitEncryptedExtentCodec()
+{
+    ++groups;
+    constexpr auto profile = rw::AppleEncryptedExtentProfile::OneKeyGenerationZero;
+    for (const auto flags : {0u, 1u})
+    {
+        auto records = NamespaceRecords();
+        std::string detail;
+        unsigned extents = 0;
+        for (auto& record : records)
+        {
+            if (ReadU64LE(record.key, 0).value() >> 60 != 8) continue;
+            rw::AppleEncryptedFileExtentRecord decoded;
+            CHECK(rw::DecodeAppleEncryptedFileExtentRecord(record, 4096, profile, decoded, detail));
+            decoded.flags = static_cast<std::uint8_t>(flags);
+            CHECK(decoded.extent.physical_block == 100 && decoded.extent.crypto_id == 500);
+            CHECK(rw::EncodeAppleEncryptedFileExtentRecord(decoded, profile, record, detail));
+            CHECK(record.value[7] == static_cast<std::byte>(flags));
+            ++extents;
+        }
+        CHECK(extents == 1);
+        auto source = std::make_shared<Source>();
+        InstallNamespace(source, records);
+        E error;
+        auto session = Open(source, error);
+        CHECK(session && error == E::None);
+        std::vector<std::byte> bytes;
+        CHECK(session->ReadFile(100, 0, 700, bytes) == E::None && bytes.size() == 700);
+        for (std::size_t i = 0; i < bytes.size(); ++i)
+            CHECK(bytes[i] == static_cast<std::byte>((i * 7 + 3) % 256));
+        session->Close();
+        Released();
+    }
+}
+void ReservedPrivateDirectoryProfiles()
+{
+    ++groups;
+    for (unsigned fault = 0; fault < 10; ++fault)
+    {
+        auto records = NamespaceRecords(); std::string detail;
+        rw::AppleInodeRecord inode;
+        inode.object_id = inode.private_id = 3; inode.parent_id = fault == 1 ? 2 : 1;
+        inode.mode = 0040700; inode.internal_flags = 0x8000;
+        inode.children_or_links = fault == 2 ? 1 : 0;
+        rw::AppleExtendedField name; name.type = 4;
+        const std::string text = fault == 3 ? "other-dir" : "private-dir";
+        for (auto byte : text) name.data.push_back(static_cast<std::byte>(byte));
+        name.data.push_back(std::byte{}); inode.extended_fields.push_back(std::move(name));
+        BtreeRecord record; CHECK(rw::EncodeAppleInodeRecord(inode,record,detail)); records.push_back(record);
+        rw::AppleDirectoryRecord entry;
+        entry.parent_id = fault == 7 ? 2 : 1; entry.file_id = 3;
+        entry.name_utf8 = fault == 6 ? "other-dir" : "private-dir"; entry.flags = fault == 9 ? 8 : 4;
+        CHECK(rw::EncodeAppleDirectoryRecord(entry,record,detail));
+        if (fault != 5) records.push_back(record);
+        if (fault == 8) records.push_back(record);
+        if (fault == 4)
+        {
+            CHECK(rw::EncodeAppleXattrRecord(rw::AppleXattrRecord{3,"user.hidden",2,{}},record,detail));
+            records.push_back(record);
+        }
+        if (fault == 8)
+        {
+            records.pop_back();
+            CHECK(rw::SortAppleBtreeRecords(records,rw::AppleBtreeKeyOrder::FileSystemCaseSensitive,detail));
+            const auto at=std::find_if(records.begin(),records.end(),[&](const auto& r) { return r.key == record.key; });
+            CHECK(at != records.end()); records.insert(at+1,record);
+        }
+        auto source = std::make_shared<Source>(); InstallNamespace(source,records,0,fault != 8);
+        E error; auto session = Open(source,error);
+        CHECK(static_cast<bool>(session) == (fault == 0));
+        if (session)
+        {
+            EncryptedNodeInfo metadata;
+            CHECK(session->GetMetadata(3,metadata) == E::FileNotFound && metadata.inode_id == 0);
+            EncryptedNamespaceInfo info;
+            CHECK(session->GetNamespaceInfo(info) == E::None && info.inode_count == 3);
+            session->Close();
+        }
+        else CHECK(error == E::UnsupportedEncryptionLayout || (fault == 8 && error == E::MetadataIntegrityFailure));
+        Released();
+    }
+}
+void SymbolicLinkRefusals()
+{
+    ++groups;
+    for (unsigned fault=0;fault<5;++fault)
+    {
+        auto records = SymbolicLinkRecords();
+        const auto target = std::find_if(records.begin(),records.end(),[](const auto& r) {
+            return ReadU64LE(r.key,0).value() == ((4ULL << 60) | 200);
+        });
+        if (fault == 0) records.erase(target);
+        if (fault == 1) PutU64LE(target->key,0,(4ULL << 60) | 100);
+        if (fault == 2) PutU16LE(target->value,0,2);
+        if (fault == 3) target->value.back() = std::byte{1};
+        if (fault == 4) target->value[5] = std::byte{};
+        auto source=std::make_shared<Source>(); InstallNamespace(source,records);
+        E error; auto session=Open(source,error); CHECK(!session); CHECK(error != E::None); Released();
+    }
+}
+void ReservedRootDirectoryEntry()
+{
+    ++groups;
+    for (unsigned fault=0;fault<6;++fault)
+    {
+        auto records=NamespaceRecords(); std::string detail;
+        for (auto& record : records)
+            if (ReadU64LE(record.key,0).value() == ((3ULL << 60) | 2))
+            {
+                rw::AppleInodeRecord inode;
+                CHECK(rw::ApfsExtendedRecordCodec::DecodeInode(record,inode,detail));
+                rw::AppleExtendedField name; name.type=4;
+                name.data={std::byte{'r'},std::byte{'o'},std::byte{'o'},std::byte{'t'},std::byte{}};
+                inode.extended_fields.push_back(std::move(name));
+                CHECK(rw::EncodeAppleInodeRecord(inode,record,detail));
+            }
+        rw::AppleDirectoryRecord entry;
+        entry.parent_id=fault==1?10:1; entry.file_id=2; entry.flags=fault==2?8:4;
+        entry.name_utf8=fault==3?"Root":"root";
+        if (fault==5) { rw::AppleExtendedField sibling; sibling.type=1; sibling.data.resize(8); PutU64LE(sibling.data,0,900); entry.extended_fields.push_back(sibling); }
+        BtreeRecord record; CHECK(rw::EncodeAppleDirectoryRecord(entry,record,detail)); records.push_back(record);
+        if (fault==4)
+        {
+            CHECK(rw::SortAppleBtreeRecords(records,rw::AppleBtreeKeyOrder::FileSystemCaseSensitive,detail));
+            const auto at=std::find_if(records.begin(),records.end(),[&](const auto& r) { return r.key == record.key; });
+            CHECK(at != records.end()); records.insert(at+1,record);
+        }
+        auto source=std::make_shared<Source>(); InstallNamespace(source,records,0,fault != 4);
+        E error; auto session=Open(source,error); CHECK(static_cast<bool>(session)==(fault==0));
+        if(session) { EncryptedNamespaceInfo info; CHECK(session->GetNamespaceInfo(info)==E::None && info.entry_count==4); session->Close(); }
+        else CHECK(error==E::MetadataIntegrityFailure);
+        Released();
+    }
+}
+}
+namespace
+{
+std::shared_ptr<Source> CanonicalSource()
+{
+    auto source = std::make_shared<Source>();
+    // The reader vector replaces the OMAP with only FS nodes. Its synthetic
+    // snapshot declaration therefore has no mapping and is not a full view.
+    source->MutateAt(4,[](auto& block){PutU64LE(block,0x98,0);});
+    return source;
+}
+void CanonicalEncryptedContext()
+{
+    ++groups;
+    auto source = CanonicalSource(); E error;
+    auto session = Open(source, error); CHECK(session);
+    auto context = session->CreateMetadataReadContext(error); CHECK(context); CHECK(error == E::None);
+    std::string detail;
+    CHECK(!LoadAppleCheckpointView(*source, 0, source->size, detail));
+    CHECK(detail == "AppleTreeChecksumInvalid");
+    auto view = LoadAppleCheckpointView(*source, 0, source->size, detail, *context);
+    if (!view) throw std::runtime_error("canonical context: " + detail);
+    CHECK(view); CHECK(view->volumes.size() == 1);
+    CHECK(view->volumes.front().root_tree.type == 0x10000002u);
+    CHECK(view->volumes.front().superblock.fs_flags == kFsFlagOneKey);
+    std::vector<BtreeRecord> records;
+    CHECK(ReadAppleVolumeFileSystemRecords(*source, view->container, view->volumes.front(), records, detail, *context));
+    CHECK(!records.empty());
+    const auto count = records.size();
+    for (auto& row : records) { std::fill(row.key.begin(),row.key.end(),std::byte{}); std::fill(row.value.begin(),row.value.end(),std::byte{}); }
+    CHECK(ReadAppleVolumeFileSystemRecords(*source, view->container, view->volumes.front(), records, detail, *context));
+    CHECK(records.size() == count);
+    session->Close();
+    CHECK(!ReadAppleVolumeFileSystemRecords(*source, view->container, view->volumes.front(), records, detail, *context));
+    CHECK(records.empty()); CHECK(detail == "AppleEncryptedContextClosed");
+    CHECK(!session->CreateMetadataReadContext(error)); CHECK(error == E::Closed);
+    Released();
+}
+void CanonicalEncryptedContextRefusals()
+{
+    ++groups;
+    auto source = CanonicalSource(); E error;
+    auto session = Open(source, error); CHECK(session);
+    auto context = session->CreateMetadataReadContext(error); CHECK(context);
+    std::string detail;
+    auto view = LoadAppleCheckpointView(*source, 0, source->size, detail, *context); CHECK(view);
+    auto other = std::make_shared<Source>();
+    CHECK(!LoadAppleCheckpointView(*other, 0, other->size, detail, *context));
+    CHECK(detail == "AppleEncryptedOriginalSourceMismatch");
+    CHECK(!LoadAppleCheckpointView(*source, 1, source->size-1, detail, *context));
+    CHECK(!LoadAppleCheckpointView(*source, 0, source->size, detail, *context, 6));
+    std::vector<BtreeRecord> records(1);
+    auto volume = view->volumes.front(); ++volume.root_tree.physical_block;
+    CHECK(!ReadAppleVolumeFileSystemRecords(*source,view->container,volume,records,detail,*context)); CHECK(records.empty());
+    volume = view->volumes.front(); ++volume.superblock.omap_oid;
+    CHECK(!ReadAppleVolumeFileSystemRecords(*source,view->container,volume,records,detail,*context)); CHECK(records.empty());
+    auto checkpoint = view->container; ++checkpoint.superblock.block_size;
+    CHECK(!ReadAppleVolumeFileSystemRecords(*source,checkpoint,view->volumes.front(),records,detail,*context)); CHECK(records.empty());
+    ++source->revision;
+    CHECK(!LoadAppleCheckpointView(*source,0,source->size,detail,*context));
+    --source->revision;
+    CHECK(!LoadAppleCheckpointView(*source,0,source->size,detail,*context));
+    session->Close(); Released();
+    // Fault injection changes the held fixture in memory only, after unlock.
+    // A complete earlier parse must never turn a later failed walk into success.
+    for (unsigned fault = 0; fault < 6; ++fault)
+    {
+        auto input = CanonicalSource();
+        auto protected_session = Open(input,error); CHECK(protected_session);
+        auto bound = protected_session->CreateMetadataReadContext(error); CHECK(bound);
+        auto selected = LoadAppleCheckpointView(*input,0,input->size,detail,*bound); CHECK(selected);
+        if (fault == 0) input->child[0] ^= std::byte{1};
+        if (fault == 1) input->root = Hex(f::WrongOid);
+        if (fault == 2) protected_session->Cancel();
+        if (fault == 3) input->budget->LimitRemainingTo(0,0,0,0);
+        if (fault == 4 || fault == 5)
+        {
+            const auto map = selected->volumes.front().superblock.omap_oid;
+            const auto tree = ReadU64LE(input->image,map*input->bs+48).value();
+            auto changed = BuildBtreeNode({OmapRecordSpec{8293,input->root_block,fault == 4 ? 8u : 4u,7},
+                OmapRecordSpec{9000,input->root_block+1,4,7}},7,input->bs,0,tree,0x40000002,11);
+            if (fault == 5) input->MutateAt(map,[](auto& block){PutU32LE(block,32,2);});
+            std::copy(changed.begin(),changed.end(),input->image.begin()+tree*input->bs);
+        }
+        records.resize(1);
+        CHECK(!ReadAppleVolumeFileSystemRecords(*input,selected->container,selected->volumes.front(),records,detail,*bound));
+        CHECK(records.empty());
+        protected_session->Close(); Released();
+    }
+    auto runtime = std::make_shared<RuntimeSource>();
+    runtime->limits.materialized_bytes = 1;
+    auto bounded_session = OpenRuntime(runtime);
+    auto bounded = bounded_session->CreateMetadataReadContext(error); CHECK(bounded);
+    CHECK(!LoadAppleCheckpointView(*runtime,0,runtime->SizeBytes(),detail,*bounded));
+    CHECK(!runtime->inner->budget->Failed());
+    bounded_session->Close(); Released();
+}
+void CanonicalEncryptedContextMetadataOnly()
+{
+    ++groups;
+    auto source = CanonicalSource(); E error;
+    auto session = Open(source, error); CHECK(session);
+    auto context = session->CreateMetadataReadContext(error); CHECK(context);
+    std::string detail;
+    auto full = LoadAppleCheckpointView(*source, 0, source->size, detail, *context); CHECK(full);
+    CHECK(!full->spaceman.bytes.empty());
+    const auto xid = full->container.superblock.xid;
+    source->fault_offset = full->spaceman.object.physical_block * source->bs;
+    source->fault = 2;
+    auto metadata = LoadAppleCheckpointView(*source, 0, source->size, detail, *context, xid, false);
+    CHECK(metadata); CHECK(detail.empty()); CHECK(metadata->volumes.size() == 1);
+    CHECK(metadata->container.superblock_bytes == full->container.superblock_bytes);
+    CHECK(metadata->volumes.front().root_tree.physical_block == full->volumes.front().root_tree.physical_block);
+    CHECK(metadata->volumes.front().object_map.object.physical_block == full->volumes.front().object_map.object.physical_block);
+    CHECK(metadata->spaceman.bytes.empty()); CHECK(metadata->spaceman.chunks.empty());
+    CHECK(metadata->spaceman.object.physical_block == 0);
+    std::vector<BtreeRecord> records;
+    CHECK(ReadAppleVolumeFileSystemRecords(*source, metadata->container, metadata->volumes.front(), records, detail, *context));
+    CHECK(!records.empty());
+    for (auto& row : records) { std::fill(row.key.begin(),row.key.end(),std::byte{}); std::fill(row.value.begin(),row.value.end(),std::byte{}); }
+    CHECK(!LoadAppleCheckpointView(*source, 0, source->size, detail, *context));
+    source->fault_offset = UINT64_MAX;
+    CHECK(LoadAppleCheckpointView(*source, 0, source->size, detail, *context, xid, true));
+    auto other = CanonicalSource();
+    CHECK(!LoadAppleCheckpointView(*other, 0, other->size, detail, *context, xid, false));
+    CHECK(detail == "AppleEncryptedOriginalSourceMismatch");
+    CHECK(!LoadAppleCheckpointView(*source, 1, source->size - 1, detail, *context, xid, false));
+    CHECK(detail == "AppleEncryptedGeometryOrCheckpointMismatch");
+    CHECK(!LoadAppleCheckpointView(*source, 0, source->size, detail, *context, xid + 1, false));
+    CHECK(detail == "AppleEncryptedGeometryOrCheckpointMismatch");
+    ++source->revision;
+    CHECK(!LoadAppleCheckpointView(*source, 0, source->size, detail, *context, xid, false));
+    --source->revision;
+    CHECK(!LoadAppleCheckpointView(*source, 0, source->size, detail, *context, xid, false));
+    session->Close(); Released();
+
+    auto cancelled_source = CanonicalSource();
+    auto cancelled_session = Open(cancelled_source, error); CHECK(cancelled_session);
+    auto cancelled_context = cancelled_session->CreateMetadataReadContext(error); CHECK(cancelled_context);
+    cancelled_session->Cancel();
+    CHECK(!LoadAppleCheckpointView(*cancelled_source, 0, cancelled_source->size, detail, *cancelled_context, xid, false));
+    CHECK(detail == "AppleEncryptedContextCancelled");
+    cancelled_session->Close();
+    CHECK(!LoadAppleCheckpointView(*cancelled_source, 0, cancelled_source->size, detail, *cancelled_context, xid, false));
+    CHECK(detail == "AppleEncryptedContextClosed"); Released();
+
+    auto corrupt_source = CanonicalSource();
+    auto corrupt_session = Open(corrupt_source, error); CHECK(corrupt_session);
+    auto corrupt_context = corrupt_session->CreateMetadataReadContext(error); CHECK(corrupt_context);
+    corrupt_source->root[0] ^= std::byte{1};
+    CHECK(!LoadAppleCheckpointView(*corrupt_source, 0, corrupt_source->size, detail, *corrupt_context, xid, false));
+    CHECK(!detail.empty()); corrupt_session->Close(); Released();
+}
+}
+namespace {
+void EncryptedOwnershipGraph()
+{
+    ++groups;
+    namespace rw = apfsaccess::rw;
+    std::string detail;
+    rw::AppleEncryptedFileExtentRecord extent{{21,0,4096,44,77,4096},1};
+    BtreeRecord file, reference;
+    CHECK(rw::EncodeAppleEncryptedFileExtentRecord(extent,rw::AppleEncryptedExtentProfile::OneKeyGenerationZero,file,detail));
+    CHECK(rw::EncodeApplePhysicalExtentRecord({44,1,rw::kApplePhysicalExtentKindNew,21,1},reference,detail));
+    const auto raw=file.value;
+    std::vector<rw::ApplePhysicalExtentRecord> owners;
+    CHECK(rw::ValidateAppleEncryptedPayloadExtentGraph({file},{reference},4096,128,owners,detail));
+    CHECK(owners.size()==1 && owners.front().physical_block==44 && file.value==raw);
+    CHECK(!rw::ValidateApplePayloadExtentGraph({file},{reference},4096,128,owners,detail));
+    CHECK(owners.empty());
+    auto wrong=file; wrong.value[7]=std::byte{2};
+    CHECK(!rw::ValidateAppleEncryptedPayloadExtentGraph({wrong},{reference},4096,128,owners,detail)); CHECK(owners.empty());
+    CHECK(rw::EncodeApplePhysicalExtentRecord({45,1,rw::kApplePhysicalExtentKindNew,21,1},reference,detail));
+    CHECK(!rw::ValidateAppleEncryptedPayloadExtentGraph({file},{reference},4096,128,owners,detail)); CHECK(owners.empty());
+    CHECK(rw::EncodeApplePhysicalExtentRecord({44,1,rw::kApplePhysicalExtentKindNew,21,2},reference,detail));
+    CHECK(!rw::ValidateAppleEncryptedPayloadExtentGraph({file},{reference},4096,128,owners,detail)); CHECK(owners.empty());
+}
+}
 int main(int argc,char** argv)
 {
     const std::pair<const char*,void(*)()> tests[]={
+        {"EncryptedOwnershipGraph",EncryptedOwnershipGraph},
+        {"CanonicalEncryptedContext",CanonicalEncryptedContext},
+        {"CanonicalEncryptedContextRefusals",CanonicalEncryptedContextRefusals},
+        {"CanonicalEncryptedContextMetadataOnly",CanonicalEncryptedContextMetadataOnly},
+        {"AppleImageMetadataProfiles",AppleImageMetadataProfiles},
+        {"AppleImageFramingAndRolling",AppleImageFramingAndRolling},
+        {"SymbolicLinkMetadataOnly",SymbolicLinkMetadataOnly},
+        {"AppleCryptoPlaceholderAndExtentProfiles",AppleCryptoPlaceholderAndExtentProfiles},
+        {"ExplicitEncryptedExtentCodec",ExplicitEncryptedExtentCodec},
+        {"ReservedPrivateDirectoryProfiles",ReservedPrivateDirectoryProfiles},
+        {"SymbolicLinkRefusals",SymbolicLinkRefusals},
+        {"ReservedRootDirectoryEntry",ReservedRootDirectoryEntry},
+        {"RuntimeRepeatedReads",RuntimeRepeatedReads},{"RuntimeRepeatedMetadata",RuntimeRepeatedMetadata},
+        {"RuntimeLimitsAndRecovery",RuntimeLimitsAndRecovery},{"RuntimeStickyBindingAndParse",RuntimeStickyBindingAndParse},
+        {"RuntimeFailuresAndCleanup",RuntimeFailuresAndCleanup},{"RuntimePublicationAndClose",RuntimePublicationAndClose},
+        {"NamespaceBudgetsAndReferences",NamespaceBudgetsAndReferences},{"NamespaceCloseDrain",NamespaceCloseDrain},
+        {"NamespaceLifecycle",NamespaceLifecycle},{"NamespacePublicationCleanup",NamespacePublicationCleanup},{"NamespaceGraphsAndEdges",NamespaceGraphsAndEdges},
+        {"NamespaceRoundTrip",NamespaceRoundTrip},{"NamespaceNames",NamespaceNames},{"NamespaceRefusals",NamespaceRefusals},
         {"IncompleteProjectionCopyCleanup",IncompleteProjectionCopyCleanup},
         {"RoutingExceptionCleanup",RoutingExceptionCleanup},{"CleanupControls",CleanupControls},{"PublicationExceptionCleanup",PublicationExceptionCleanup},
         {"IncompleteRecordCleanup",IncompleteRecordCleanup},{"ReadsAndBinding",ReadsAndBinding},{"MetadataRefusals",MetadataRefusals},

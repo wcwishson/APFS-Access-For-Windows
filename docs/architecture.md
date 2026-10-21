@@ -3,17 +3,17 @@
 ## Runtime model
 
 1. `ApfsAccess.Service` is the orchestration process.
-2. `ApfsAccess.Tray` is the tray-only UI shell (left-click no-op, right-click `Quit`).
+2. `ApfsAccess.Tray` provides the dashboard and tray icon. Left-click opens the dashboard; closing the dashboard keeps the tray running. Tray `Quit` requests service shutdown.
 3. IPC uses named pipe `\\.\pipe\ApfsAccess.Tray.v1`.
-4. `ApfsAccess.FsHost.exe` is a per-volume native child process launched by `NativeApfsBackend`.
+4. `NativeApfsBackend` launches `ApfsAccess.FsHost.exe` as a native container owner. Independently mounted volumes in the same identified container share its raw-device lease and checkpoint coordinator.
 
 ## Data flow
 
 1. Service probes APFS devices and volumes through `IApfsBackend`.
 2. Service applies `IMountPolicy` and host options (letter pool, encrypted-volume skip, remount behavior).
-3. Native backend launches/stops `ApfsAccess.FsHost.exe` for each mounted volume.
+3. Native backend resolves the selected volumes and starts or joins their container owner. Each exposed volume has its own mount point, access mode, health, and recovery identity.
 4. Service publishes runtime state and warnings to tray over IPC `StatusChanged`.
-5. Tray icon updates by state and supports only `Quit` action.
+5. Dashboard and tray reflect the published state and offer mount, open, Fix, eject, and quit actions through the service contracts.
 
 ## Native backend (self-developed APFS + FsHost)
 
@@ -23,10 +23,11 @@
    - default read-only mode.
    - experimental `WriteBackendMode=Overlay` mode for session-scoped write-path testing (no APFS media mutation).
    - experimental `WriteBackendMode=Native` mode that executes the self-developed mutation/commit path for supported basic APFS data volumes, with fixture/image-backed validation currently ahead of real-device validation.
-   - encrypted volumes are skipped/rejected in phase 1.
+   - encrypted physical-volume discovery remains restricted. Registered software-encrypted images use the separately admitted unlock and image-write paths described by their feature contracts.
 4. Mount lifecycle is process-based:
-   - launch `ApfsAccess.FsHost.exe --device --volume --mount (--readonly|--readwrite) --lifetime-file --status-file`.
-   - unmount via lifetime-file signal, then timeout kill fallback.
+   - launch a native owner with the selected device and volume identities, mount manifest, lifetime signal, and status paths. The direct single-volume arguments remain available for their admitted callers.
+   - logical eject first drains the selected namespace. A surviving mounted sibling can keep the shared owner; releasing the final namespace requires container retirement and ownership proof.
+   - lifetime signaling, supervised shutdown, retained-host tracking, and direct mount checks govern cleanup. A timeout alone is not proof that a host, mount, or raw-device lease has disappeared.
 5. FsHost mounts a real WinFsp-backed drive letter.
 6. Directory entries, inode metadata, and committed file ranges are served on-demand from the native APFS metadata store and extent readers.
 7. Hydration/cache state remains session-scoped under `%TEMP%\ApfsAccess\sessions\<session>\hydrate` and is cleaned on host exit to avoid stale cross-session payload reuse.

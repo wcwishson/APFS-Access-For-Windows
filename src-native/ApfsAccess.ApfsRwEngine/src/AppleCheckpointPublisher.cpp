@@ -1,4 +1,5 @@
 #include "AppleCheckpointPublisher.h"
+#include "AppleCapacityPreviewInternal.h"
 
 #include "ApfsTransactionWriter.h"
 #include "BlockDevice.h"
@@ -222,15 +223,14 @@ bool WriteAndVerify(AppleCheckpointWriteTarget& target,
     return true;
 }
 
-bool WriteAndVerifyBatch(AppleCheckpointWriteTarget& target,
+bool VerifyBatchAfterFlush(AppleCheckpointWriteTarget& target,
     std::span<const AppleCheckpointPlannedWrite> writes,
     std::uint32_t block_size, std::string& out_error)
 {
-    if (writes.empty() || std::any_of(writes.begin(), writes.end(),
+    if (writes.empty() || block_size == 0 || std::any_of(writes.begin(), writes.end(),
             [block_size](const auto& write) {
                 return write.bytes.size() != block_size;
-            }) ||
-        !target.WriteBlocks(writes))
+            }))
     {
         return Fail(out_error, "AppleCheckpointWriteFailed");
     }
@@ -250,10 +250,8 @@ bool WriteAndVerifyBatch(AppleCheckpointWriteTarget& target,
         }
         // Planner block sizes are at most 64 KiB. Keep the old single-block
         // behavior for larger caller-supplied blocks without enlarging ranges.
-        const bool read = block_size > kCheckpointReadbackBytes
-            ? target.ReadBlock(writes[first].physical_block, block_size, readback)
-            : target.ReadBlockRange(writes[first].physical_block, block_size,
-                count, readback);
+        const bool read = target.ReadBlockRangeForVerification(
+            writes[first].physical_block, block_size, count, readback);
         if (!read || readback.empty() || readback.size() % block_size != 0 ||
             readback.size() / block_size > count)
         {
@@ -331,6 +329,19 @@ public:
                 bytes);
     }
 
+    bool ReadBlockRangeForVerification(std::uint64_t physical_block,
+        std::uint32_t block_size, std::size_t max_blocks,
+        std::vector<std::byte>& out_bytes) override
+    {
+        if (block_size == 0 || max_blocks == 0 ||
+            max_blocks > (std::max<std::size_t>)(1, kCheckpointReadbackBytes / block_size) ||
+            max_blocks > std::numeric_limits<std::size_t>::max() / block_size ||
+            physical_block > std::numeric_limits<std::uint64_t>::max() / block_size)
+            return false;
+        return device_.ReadForVerification(physical_block * static_cast<std::uint64_t>(block_size),
+            max_blocks * block_size, out_bytes);
+    }
+
     bool WriteBlocks(
         std::span<const AppleCheckpointPlannedWrite> writes) override
     {
@@ -362,12 +373,15 @@ private:
 
 } // namespace
 
-bool PlanAppleCheckpointPublication(
+static bool PlanAppleCheckpointPublicationWithKeylocker(
     const catalog::RandomAccessSource& source,
     const catalog::ContainerCheckpointView& checkpoint,
     const AppleCheckpointPublicationRequest& request,
     AppleCheckpointPublicationPlan& out_plan,
-    std::string& out_error)
+    std::string& out_error,
+    const AppleCheckpointKeylockerReplacement& keylocker,
+    bool initialize_keylocker,
+    std::span<const std::uint64_t> capacity_payload = {}, bool capacity_only = false)
 {
     out_plan = {};
     out_error.clear();
@@ -439,6 +453,38 @@ bool PlanAppleCheckpointPublication(
         request.next_object_id == 0)
     {
         return Fail(out_error, "AppleCheckpointNextObjectIdInvalid");
+    }
+    const auto locker_start = keylocker.start_block;
+    const auto locker_count = keylocker.block_count;
+    const auto original_locker_start = catalog::ReadU64LE(checkpoint.superblock_bytes, 0x510).value_or(0);
+    const auto original_locker_count = catalog::ReadU64LE(checkpoint.superblock_bytes, 0x518).value_or(0);
+    if (initialize_keylocker && (original_locker_start || original_locker_count || !locker_start || !locker_count))
+        return Fail(out_error, "AppleCheckpointKeylockerInitializationRequiresEmpty");
+    if ((locker_start == 0) != (locker_count == 0))
+        return Fail(out_error, "AppleCheckpointKeylockerRangeInvalid");
+    if (locker_start != 0)
+    {
+        if ((!initialize_keylocker && (!original_locker_start || !original_locker_count ||
+            original_locker_start >= nxsb.block_count || original_locker_count > nxsb.block_count - original_locker_start ||
+            locker_count != original_locker_count)) || locker_count > 16 || locker_start >= nxsb.block_count ||
+            locker_count > nxsb.block_count - locker_start)
+            return Fail(out_error, "AppleCheckpointKeylockerRangeInvalid");
+        const auto overlaps = [&](const auto& prior) {
+            const auto start = catalog::ReadU64LE(prior.superblock_bytes, 0x510).value_or(0);
+            const auto count = catalog::ReadU64LE(prior.superblock_bytes, 0x518).value_or(0);
+            return count && start < nxsb.block_count && count <= nxsb.block_count - start &&
+                locker_start < start + count && start < locker_start + locker_count;
+        };
+        if (overlaps(checkpoint) || std::any_of(retained.begin(), retained.end(), overlaps))
+            return Fail(out_error, "AppleCheckpointKeylockerRetentionOverlap");
+        for (const auto& prior : retained)
+        {
+            const auto start = catalog::ReadU64LE(prior.superblock_bytes, 0x510).value_or(0);
+            const auto count = catalog::ReadU64LE(prior.superblock_bytes, 0x518).value_or(0);
+            if ((start == 0) != (count == 0) || count > 16 ||
+                start >= nxsb.block_count || count > nxsb.block_count - start)
+                return Fail(out_error, "AppleCheckpointKeylockerRangeInvalid");
+        }
     }
     if (request.container_object_map_oid != 0)
     {
@@ -637,8 +683,28 @@ bool PlanAppleCheckpointPublication(
             return Fail(out_error, "AppleCheckpointGuardUnreadable");
         }
     }
+    if (locker_start != 0)
+    {
+        for (std::uint64_t i = 0; i < original_locker_count; ++i)
+            if (!AddGuard(source, original_locker_start + i, nxsb.block_size, plan.guard_blocks))
+                return Fail(out_error, "AppleCheckpointKeylockerGuardUnreadable");
+        for (const auto& prior : retained)
+            for (std::uint64_t i = 0,
+                start = catalog::ReadU64LE(prior.superblock_bytes, 0x510).value_or(0),
+                count = catalog::ReadU64LE(prior.superblock_bytes, 0x518).value_or(0); i < count; ++i)
+                if (!AddGuard(source, start + i, nxsb.block_size, plan.guard_blocks))
+                    return Fail(out_error, "AppleCheckpointKeylockerGuardUnreadable");
+    }
 
     std::unordered_set<std::uint64_t> planned_blocks;
+    for (const auto block : capacity_payload)
+    {
+        if (!capacity_only || block == 0 || block >= nxsb.block_count ||
+            AreaContains(nxsb.xp_desc_base_block, nxsb.xp_desc_block_count, block) ||
+            AreaContains(nxsb.xp_data_base_block, nxsb.xp_data_block_count, block) ||
+            !planned_blocks.insert(block).second)
+            return Fail(out_error, "AppleCheckpointAllocatedWriteInvalid");
+    }
     for (const auto& allocation : request.allocator_owned_writes)
     {
         if (allocation.physical_block == 0 || allocation.bytes.empty() ||
@@ -673,6 +739,10 @@ bool PlanAppleCheckpointPublication(
         }
     }
 
+    if (locker_start != 0)
+        for (std::uint64_t i = 0; i < locker_count; ++i)
+            if (!planned_blocks.contains(locker_start + i))
+                return Fail(out_error, "AppleCheckpointKeylockerUnstaged");
     plan.published_checkpoint.mappings.reserve(ordered.size());
     std::uint32_t data_cursor = 0;
     for (const auto* object : ordered)
@@ -757,6 +827,11 @@ bool PlanAppleCheckpointPublication(
     {
         PutU64(superblock, 0xA0, request.container_object_map_oid);
     }
+    if (locker_start != 0)
+    {
+        PutU64(superblock, 0x510, locker_start);
+        PutU64(superblock, 0x518, locker_count);
+    }
     PutU32(superblock, 0x80, (descriptor_index + descriptor_length) %
         nxsb.xp_desc_block_count);
     PutU32(superblock, 0x84,
@@ -772,7 +847,9 @@ bool PlanAppleCheckpointPublication(
     const auto parsed = catalog::ParseNxSuperblock(superblock);
     const auto expected_container_omap = request.container_object_map_oid != 0 ?
         request.container_object_map_oid : nxsb.omap_oid;
-    if (!parsed.has_value() || parsed->omap_oid != expected_container_omap)
+    if (!parsed.has_value() || parsed->omap_oid != expected_container_omap ||
+        catalog::ReadU64LE(superblock, 0x510).value_or(0) != (locker_start ? locker_start : original_locker_start) ||
+        catalog::ReadU64LE(superblock, 0x518).value_or(0) != (locker_start ? locker_count : original_locker_count))
     {
         return Fail(out_error, "AppleCheckpointSuperblockInvalid");
     }
@@ -788,8 +865,74 @@ bool PlanAppleCheckpointPublication(
     plan.published_checkpoint.superblock_physical_block =
         plan.superblock_write.physical_block;
     plan.published_checkpoint.superblock_bytes = std::move(superblock);
+    if (locker_start != 0)
+    {
+        const auto protected_destination = [&](std::uint64_t block) {
+            if (AreaContains(original_locker_start, static_cast<std::uint32_t>(original_locker_count), block)) return true;
+            return std::any_of(retained.begin(), retained.end(), [&](const auto& prior) {
+                return AreaContains(catalog::ReadU64LE(prior.superblock_bytes, 0x510).value_or(0),
+                    static_cast<std::uint32_t>(catalog::ReadU64LE(prior.superblock_bytes, 0x518).value_or(0)), block);
+            });
+        };
+        // Guards detect source drift; they cannot make a write into an old
+        // owner's bag safe. Exclude allocator and generated ring destinations
+        // alike before exposing any executable publication.
+        if (protected_destination(plan.superblock_write.physical_block) ||
+            std::any_of(plan.before_superblock_writes.begin(), plan.before_superblock_writes.end(),
+                [&](const auto& write) { return protected_destination(write.physical_block); }))
+            return Fail(out_error, "AppleCheckpointKeylockerDestinationOverlap");
+    }
+    if (capacity_only)
+    {
+        // Execute rejects this before reading guards or issuing any I/O.
+        plan.superblock_write.bytes.clear();
+    }
     out_plan = std::move(plan);
     return true;
+}
+
+bool capacity_detail::PlanPublication(const catalog::RandomAccessSource& source,
+    const catalog::ContainerCheckpointView& checkpoint,
+    const AppleCheckpointPublicationRequest& request,
+    std::span<const std::uint64_t> payload_blocks,
+    AppleCheckpointPublicationPlan& out_plan, std::string& error)
+{
+    return PlanAppleCheckpointPublicationWithKeylocker(source, checkpoint, request,
+        out_plan, error, {}, false, payload_blocks, true);
+}
+
+bool PlanAppleCheckpointPublication(
+    const catalog::RandomAccessSource& source,
+    const catalog::ContainerCheckpointView& checkpoint,
+    const AppleCheckpointPublicationRequest& request,
+    AppleCheckpointPublicationPlan& out_plan,
+    std::string& out_error,
+    const AppleCheckpointKeylockerReplacement& keylocker)
+{
+    return PlanAppleCheckpointPublicationWithKeylocker(source, checkpoint, request, out_plan,
+        out_error, keylocker, false);
+}
+
+bool PlanAppleCheckpointKeylockerInitialization(
+    const catalog::RandomAccessSource& source,
+    const catalog::ContainerCheckpointView& checkpoint,
+    const AppleCheckpointPublicationRequest& request,
+    AppleCheckpointPublicationPlan& out_plan,
+    std::string& out_error,
+    const AppleCheckpointKeylockerInitialization& keylocker)
+{
+    return PlanAppleCheckpointPublicationWithKeylocker(source, checkpoint, request, out_plan,
+        out_error, {keylocker.start_block, keylocker.block_count}, true);
+}
+
+bool PlanAppleCheckpointPublication(
+    const catalog::RandomAccessSource& source,
+    const catalog::ContainerCheckpointView& checkpoint,
+    const AppleCheckpointPublicationRequest& request,
+    AppleCheckpointPublicationPlan& out_plan,
+    std::string& out_error)
+{
+    return PlanAppleCheckpointPublication(source, checkpoint, request, out_plan, out_error, {});
 }
 
 bool ExecuteAppleCheckpointPublication(
@@ -815,10 +958,11 @@ bool ExecuteAppleCheckpointPublication(
     {
         return false;
     }
-    if (!WriteAndVerifyBatch(target, plan.before_superblock_writes,
-            plan.block_size, out_error))
+    if (std::any_of(plan.before_superblock_writes.begin(), plan.before_superblock_writes.end(),
+            [&](const auto& write) { return write.bytes.size() != plan.block_size; }) ||
+        !target.WriteBlocks(plan.before_superblock_writes))
     {
-        return false;
+        return Fail(out_error, "AppleCheckpointWriteFailed");
     }
     if (!AllowStage(
             stage_hook, "before-apple-prepublication-flush", out_error))
@@ -829,9 +973,34 @@ bool ExecuteAppleCheckpointPublication(
     {
         return Fail(out_error, "AppleCheckpointPrepublicationFlushFailed");
     }
+    if (!VerifyBatchAfterFlush(target, plan.before_superblock_writes, plan.block_size, out_error))
+        return false;
     if (!VerifyGuards(target, plan))
     {
         return Fail(out_error, "AppleCheckpointGuardChanged");
+    }
+    // Fusion tier-2 anchor mirror, when the plan carries one: written and
+    // verified after the prepublication flush, then flushed again before the
+    // main switch. Crash order is deliberate: an interruption here leaves the
+    // tier-2 anchor at most one generation ahead, which the bind layer
+    // tolerates by selecting the main anchor; the main switch stays last so
+    // a main-ahead skew (unrecoverable without repair) cannot occur.
+    if (plan.fusion_tier2_anchor_write.has_value())
+    {
+        if (!AllowStage(stage_hook, "before-apple-fusion-anchor-mirror", out_error))
+        {
+            return false;
+        }
+        if (!WriteAndVerify(target, *plan.fusion_tier2_anchor_write, plan.block_size, out_error))
+        {
+            return false;
+        }
+        if (!target.Flush())
+        {
+            return Fail(out_error, "AppleCheckpointFusionAnchorFlushFailed");
+        }
+        if (!VerifyBatchAfterFlush(target, std::span(&*plan.fusion_tier2_anchor_write, 1), plan.block_size, out_error))
+            return false;
     }
     if (!AllowStage(
             stage_hook, "before-apple-checkpoint-switch", out_error))
@@ -843,6 +1012,23 @@ bool ExecuteAppleCheckpointPublication(
     {
         return false;
     }
+    // Fusion main anchor: the same new superblock bytes at block 0. Fusion
+    // rebinds require the anchor to match the selected checkpoint, while
+    // single-store selection ignores block-zero content; this write runs only
+    // for Fusion plans (mirror present), so single-store behavior is
+    // unchanged. It shares the switch's flush barrier: a crash before the
+    // barrier leaves the old generation rebindable, and anything after is
+    // forward-recovery territory (journal replay re-issues the identical
+    // bytes). The tier-2 anchor was already mirrored and flushed pre-switch.
+    if (plan.fusion_tier2_anchor_write.has_value())
+    {
+        auto anchor = plan.superblock_write;
+        anchor.physical_block = 0;
+        if (!WriteAndVerify(target, anchor, plan.block_size, out_error))
+        {
+            return false;
+        }
+    }
     if (!AllowStage(stage_hook, "before-apple-final-flush", out_error))
     {
         return false;
@@ -850,6 +1036,17 @@ bool ExecuteAppleCheckpointPublication(
     if (!target.Flush())
     {
         return Fail(out_error, "AppleCheckpointFinalFlushFailed");
+    }
+    if (!VerifyBatchAfterFlush(target, plan.before_superblock_writes, plan.block_size, out_error) ||
+        !VerifyBatchAfterFlush(target, std::span(&plan.superblock_write, 1), plan.block_size, out_error))
+        return false;
+    if (plan.fusion_tier2_anchor_write)
+    {
+        auto anchor = plan.superblock_write;
+        anchor.physical_block = 0;
+        if (!VerifyBatchAfterFlush(target, std::span(&*plan.fusion_tier2_anchor_write, 1), plan.block_size, out_error) ||
+            !VerifyBatchAfterFlush(target, std::span(&anchor, 1), plan.block_size, out_error))
+            return false;
     }
     return true;
 }

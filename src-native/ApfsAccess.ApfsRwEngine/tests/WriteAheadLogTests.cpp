@@ -1,5 +1,6 @@
 #include "WriteAheadLog.h"
 #include "InodeMetadataPatch.h"
+#include "TransactionManager.h"
 
 #include <algorithm>
 #include <atomic>
@@ -10,8 +11,15 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <windows.h>
+
+namespace apfsaccess::rw
+{
+std::array<std::wstring, 4> InspectWalPathsForTest(
+    const std::filesystem::path& path, std::string_view volume_identity);
+}
 
 namespace
 {
@@ -23,9 +31,11 @@ constexpr const wchar_t* kCompactionAttemptEventEnv = L"APFSACCESS_WAL_COMPACTIO
 constexpr std::string_view kCompactionIntentTag = "apfsaccess-wal-compaction-intent-v1";
 constexpr std::uint64_t kCompactionIntentNamespaceDurableFlag = 0x1;
 constexpr DWORD kCompactionCrashExitCode = 77;
+std::uint64_t check_count = 0;
 
 bool Require(bool condition, const char* message)
 {
+    ++check_count;
     if (!condition)
     {
         std::cerr << "[FAIL] " << message << std::endl;
@@ -1029,6 +1039,351 @@ bool RunImmediateWalContender(
     return child_wait == WAIT_OBJECT_0;
 }
 
+std::filesystem::path LongPathTestIoPath(const std::filesystem::path& path)
+{
+    return std::filesystem::path(L"\\\\?\\" + path.wstring());
+}
+
+std::wstring Win32FullPathForTest(const std::wstring& path)
+{
+    // String resolution only: this API never opens a file, share or device.
+    std::wstring buffer(32768, L'\0');
+    const auto count = GetFullPathNameW(path.c_str(), static_cast<DWORD>(buffer.size()), buffer.data(), nullptr);
+    if (!count || count >= buffer.size()) return {};
+    buffer.resize(count);
+    return buffer;
+}
+
+bool WalPathBindingUnchanged(const std::filesystem::path& path, const std::array<std::wstring, 4>& inspected)
+{
+    auto key = std::filesystem::absolute(path).lexically_normal().wstring();
+    CharLowerBuffW(key.data(), static_cast<DWORD>(key.size()));
+    const auto reference = apfsaccess::rw::InspectWalPathsForTest(L"D:\\binding-reference.wal", kVolume);
+    return Require(inspected[2] == key && inspected[3] == reference[3],
+        "path conversion preserves the original logical registry/mutex key and volume pipe identity");
+}
+
+bool TestWalPathResolutionUncShareRoot(const std::filesystem::path&)
+{
+    const auto tail = std::wstring(70, L'x') + L"\\" + std::wstring(70, L'y') + L"\\" +
+        std::wstring(70, L'z') + L"\\" + std::wstring(70, L'w') + L"\\wal";
+    const std::vector<std::wstring> prefixes{
+        LR"(\\wal-offline.invalid\bound-share\..\other\)",
+        LR"(\\wal-offline.invalid\bound-share\one\..\..\..\other\)",
+        LR"(\\wal-offline.invalid\bound-share\.\one\..\other\)",
+        LR"(//wal-offline.invalid/bound-share/../../other/)",
+        LR"(\\wal-offline.invalid\bound-share\one\two\..\..\other\)",
+    };
+    bool ok = true;
+    for (const auto& prefix : prefixes)
+    {
+        for (const auto& suffix : {L".wal", L".wal.compact.intent", L".wal.compact.predecessor.42"})
+        {
+            const auto input = prefix + tail + suffix;
+            const auto win32 = Win32FullPathForTest(input);
+            const auto inspected = apfsaccess::rw::InspectWalPathsForTest(input, kVolume);
+            std::wcout << L"[UNC] input=" << input << L" win32=" << win32
+                << L" io=" << inspected[0] << L" nt=" << inspected[1] << std::endl;
+            ok &= Require(win32.starts_with(LR"(\\wal-offline.invalid\bound-share\other\)"),
+                "Win32 string resolution cannot pop the bound UNC share");
+            ok &= Require(inspected[0] == LR"(\\?\UNC\)" + win32.substr(2),
+                "long UNC WAL I/O matches Win32 resolution within the original share root");
+            ok &= Require(inspected[1] == LR"(\??\UNC\)" + win32.substr(2),
+                "NT compaction destination retains the exact Win32 server/share root");
+            ok &= WalPathBindingUnchanged(input, inspected);
+        }
+    }
+    return ok;
+}
+
+bool TestWalPathResolutionReservedNames(const std::filesystem::path&)
+{
+    const auto prefix = std::wstring(L"D:\\") + std::wstring(70, L'x') + L"\\" +
+        std::wstring(70, L'y') + L"\\" + std::wstring(70, L'z') + L"\\" + std::wstring(70, L'w') + L"\\";
+    bool ok = true;
+    for (const auto& name : std::vector<std::wstring>{L"COM1  .wal", L"com9 .wal", L"LPT1   .wal",
+            L"lpt9 .wal", L"CON  .wal", L"prn  .wal", L"AUX .wal", L"NUL  .wal",
+            L"COM\xb9  .wal", L"LPT\xb2 .wal", L"COM1  .dir\\ordinary.wal"})
+    {
+        const auto input = prefix + name;
+        const auto inspected = apfsaccess::rw::InspectWalPathsForTest(input, kVolume);
+        std::wcout << L"[DOS] input=" << input << L" win32=" << Win32FullPathForTest(input)
+            << L" io=" << inspected[0] << std::endl;
+        ok &= Require(inspected[0] == input,
+            "space-padded reserved DOS basenames must not acquire extended filesystem semantics");
+        ok &= WalPathBindingUnchanged(input, inspected);
+    }
+    for (const auto& name : {L"COM10  .wal", L"LPT10 .wal", L"myCOM1 .wal", L"COM1x  .wal"})
+    {
+        const auto input = prefix + name;
+        const auto inspected = apfsaccess::rw::InspectWalPathsForTest(input, kVolume);
+        ok &= Require(inspected[0] == LR"(\\?\)" + input,
+            "ordinary nonreserved padded basenames retain literal filename bytes");
+        ok &= WalPathBindingUnchanged(input, inspected);
+    }
+    return ok;
+}
+
+bool TestWalPathResolutionUncUnsupportedComponents(const std::filesystem::path&)
+{
+    const auto tail = std::wstring(70, L'x') + L"\\" + std::wstring(70, L'y') + L"\\" +
+        std::wstring(70, L'z') + L"\\" + std::wstring(70, L'w') + L"\\";
+    const auto prefix = std::wstring(LR"(\\wal-offline.invalid\bound-share\)") + tail;
+    std::vector<std::wstring> inputs;
+    for (const auto& suffix : {L"a:stream.wal", L"a:stream.wal.compact.intent",
+            L"a:stream.wal.compact.predecessor.42", L"a:", L"C:\\other\\wal.wal",
+            L"a:stream.dir\\wal.wal", L"a:stream.dir\\..\\wal.wal",
+            L"file:stream.wal", L"file:stream.dir\\wal.wal", L"a:/other/wal.wal"})
+        inputs.push_back(prefix + suffix);
+    inputs.push_back(std::wstring(LR"(\\wal-offline.invalid\a:share\)") + tail + L"wal.wal");
+    inputs.push_back(std::wstring(LR"(\\wal-offline.invalid\C:\)") + tail + L"wal.wal");
+
+    bool ok = Require(std::filesystem::path(L"a:stream.wal").has_root_name() &&
+        !std::filesystem::path(L"file:stream.wal").has_root_name(),
+        "UNC witnesses cover both root-bearing and non-root-bearing colon components");
+    for (const auto& input : inputs)
+    {
+        const auto inspected = apfsaccess::rw::InspectWalPathsForTest(input, kVolume);
+        std::wcout << L"[UNC-UNSUPPORTED] input=" << input << L" io=" << inspected[0]
+            << L" nt=" << inspected[1] << std::endl;
+        ok &= Require(inspected[0] == input,
+            "unsupported UNC colon components retain the complete original I/O spelling");
+        ok &= Require(inspected[1] == LR"(\??\UNC\)" + input.substr(2),
+            "NT destination prefix conversion cannot remove unsupported UNC components or their parents");
+        ok &= WalPathBindingUnchanged(input, inspected);
+    }
+    return ok;
+}
+
+bool TestWalPathResolutionPreservedNamespaces(const std::filesystem::path&)
+{
+    const auto tail = std::wstring(70, L'x') + L"\\" + std::wstring(70, L'y') + L"\\" +
+        std::wstring(70, L'z') + L"\\" + std::wstring(70, L'w') + L"\\wal";
+    bool ok = true;
+    for (const auto& prefix : {L"D:", L"\\", LR"(\\.\pipe\NoOpen-)", LR"(//./pipe/NoOpen-)",
+            LR"(\\?\GLOBALROOT\Device\NoOpen\)", LR"(\??\NoOpen\)", LR"(\\?\D:\)",
+            LR"(\\?\UNC\wal-offline.invalid\bound-share\)"})
+    {
+        const auto input = prefix + tail;
+        const auto inspected = apfsaccess::rw::InspectWalPathsForTest(input, kVolume);
+        ok &= Require(inspected[0] == input,
+            "drive/root-relative and explicit device/extended namespaces retain their existing spelling");
+        ok &= WalPathBindingUnchanged(input, inspected);
+    }
+    const auto input = std::wstring(LR"(D:\..\one\..\)") + tail;
+    const auto inspected = apfsaccess::rw::InspectWalPathsForTest(input, kVolume);
+    const auto win32 = Win32FullPathForTest(input);
+    ok &= Require(!win32.empty() && inspected[0] == LR"(\\?\)" + win32 &&
+        inspected[1] == LR"(\??\)" + win32, "ordinary drive-root parent traversal still matches Win32 resolution");
+    ok &= WalPathBindingUnchanged(input, inspected);
+    return ok;
+}
+
+std::filesystem::path MakeLongWalPath(const std::filesystem::path& root, const char* leaf)
+{
+    auto directory = root;
+    while (directory.wstring().size() < 300)
+        directory /= std::string(60, 'x');
+    std::filesystem::create_directories(LongPathTestIoPath(directory));
+    return directory / leaf;
+}
+
+std::vector<std::uint8_t> ReadLongPathBytes(const std::filesystem::path& path)
+{
+    std::ifstream stream(LongPathTestIoPath(path), std::ios::binary);
+    return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+}
+
+bool TestLongPathWalDurabilityAndBinding(const std::filesystem::path& root)
+{
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    const auto path = MakeLongWalPath(root, "durability.wal");
+    std::cout << "[INFO] Unprefixed WAL characters " << path.wstring().size() << std::endl;
+    auto first = Wal::EncodeForTest(MakeRecord(1));
+    const auto second = Wal::EncodeForTest(MakeRecord(2));
+    first.insert(first.end(), second.begin(), second.end());
+    {
+        Wal owner({path, kVolume, 0});
+        if (!Require(path.wstring().size() > 280 && !path.wstring().starts_with(L"\\\\?\\"),
+                "long WAL fixture uses an ordinary unprefixed path above 280 characters") ||
+            !Require(owner.Append(MakeRecord(1), false) && owner.Append(MakeRecord(2)),
+                "long WAL durable append succeeds") ||
+            !Require(ReadLongPathBytes(path) == first, "long WAL bytes exactly match both encoded records")) return false;
+        DWORD child_exit = 99;
+        if (!Require(RunImmediateWalContender(path, child_exit) && child_exit == 0,
+                "long WAL owner retains the real cross-process identity lease") ||
+            !Require(owner.ValidatedAppendLeaseGeneration() != 0,
+                "long WAL path and receipt inspection validates the held physical file")) return false;
+        auto foreign = MakeRecord(3);
+        foreign.volume_identity = "foreign-volume";
+        if (!Require(owner.AppendWithResult(foreign) == Wal::AppendResult::RejectedBeforeWrite &&
+                ReadLongPathBytes(path) == first, "long WAL rejects foreign record identity without writes")) return false;
+        Wal alias({path.parent_path() / "." / path.filename(), kVolume, 0});
+        if (!Require(alias.AcquireExclusiveWriterLease() && !owner.HasExclusiveWriterLease() &&
+                alias.ValidatedAppendLeaseGeneration() != 0 && ReadLongPathBytes(path) == first,
+                "long lexical path alias transfers the same registered physical owner without writes")) return false;
+    }
+    const auto read = Wal::ReadAll(path, kVolume);
+    if (!Require(read.status == Wal::ReadStatus::Ok && read.records.size() == 2 &&
+            Wal::EncodeForTest(read.records[0]) == Wal::EncodeForTest(MakeRecord(1)) &&
+            Wal::EncodeForTest(read.records[1]) == second,
+            "long WAL reopen preserves exact decoded identity, paths and payload binding") ||
+        !Require(Wal::ReadAll(path, "foreign-volume").status == Wal::ReadStatus::VolumeMismatch,
+            "long WAL read retains volume identity refusal")) return false;
+    {
+        Wal bounded({path, kVolume, first.size()});
+        if (!Require(bounded.AppendWithResult(MakeRecord(3)) == Wal::AppendResult::RejectedBeforeWrite &&
+                ReadLongPathBytes(path) == first, "long WAL byte cap remains enforced")) return false;
+    }
+    {
+        Wal reopened({path, kVolume, 0});
+        std::string error;
+        if (!Require(reopened.AcquireExistingRepairLease(error) && ReadLongPathBytes(path) == first,
+                "long WAL existing-only repair fence opens without changing bytes") ||
+            !Require(reopened.Compact(2), "long WAL compaction publishes derived files durably")) return false;
+        const auto compacted = reopened.ReadAll();
+        const auto intent = CompactionIntentPath(path);
+        if (!Require(compacted.status == Wal::ReadStatus::Ok && compacted.records.size() == 2 &&
+                Wal::EncodeForTest(compacted.records[0]) == second &&
+                compacted.records[1].operation == Wal::OperationKind::CompactionIndex &&
+                std::filesystem::exists(LongPathTestIoPath(intent)) &&
+                intent.wstring().size() > path.wstring().size() &&
+                reopened.ValidatedAppendLeaseGeneration() != 0,
+                "long compaction retains the exact selected record and validates its longer receipt")) return false;
+    }
+    Wal restarted({path, kVolume, 0});
+    return Require(restarted.Append(MakeRecord(3)) && restarted.ReadAll().records.size() == 3,
+        "long WAL restarts and appends after durable compaction");
+}
+
+bool TestLongPathWalTornTailAndFailure(const std::filesystem::path& root)
+{
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    const auto path = MakeLongWalPath(root, "torn.wal");
+    {
+        Wal seed({path, kVolume, 0});
+        if (!Require(seed.Append(MakeRecord(1)) && seed.Append(MakeRecord(2)), "long torn-tail seed appends")) return false;
+    }
+    const auto complete = ReadLongPathBytes(path);
+    auto tail = Wal::EncodeForTest(MakeRecord(3));
+    tail.resize(tail.size() - 7);
+    if (!Require(WriteBytes(LongPathTestIoPath(path), tail, std::ios::app), "long WAL gets a real incomplete tail")) return false;
+    const auto torn = ReadLongPathBytes(path);
+    const auto inspected = Wal::ReadAll(path, kVolume);
+    if (!Require(inspected.status == Wal::ReadStatus::Ok && inspected.recovered_torn_tail &&
+            inspected.records.size() == 2 && ReadLongPathBytes(path) == torn,
+            "long WAL read-only inspection preserves the torn suffix")) return false;
+    {
+        Wal failed({path, kVolume, 0});
+        failed.SetFaultInjectionHook([](std::string_view point) { return point == "read-all-exclusive-truncate"; });
+        const auto read = failed.ReadAllWithExclusiveWriterLease();
+        DWORD child_exit = 99;
+        if (!Require(read.status == Wal::ReadStatus::IoError && read.records.empty() &&
+                failed.HasExclusiveWriterLease() && ReadLongPathBytes(path) == torn &&
+                RunImmediateWalContender(path, child_exit) && child_exit == 0,
+                "long torn-tail repair failure retains bytes and the real identity lease")) return false;
+    }
+    {
+        Wal recovered({path, kVolume, 0});
+        const auto read = recovered.ReadAllWithExclusiveWriterLease();
+        if (!Require(read.status == Wal::ReadStatus::Ok && read.recovered_torn_tail && read.records.size() == 2 &&
+                ReadLongPathBytes(path) == complete && recovered.Append(MakeRecord(3)),
+                "long WAL restart repairs only the torn suffix and resumes durable append")) return false;
+    }
+    const auto bad_path = MakeLongWalPath(root, "corrupt.wal");
+    auto bad = Wal::EncodeForTest(MakeRecord(1));
+    bad.back() ^= 1;
+    if (!Require(WriteBytes(LongPathTestIoPath(bad_path), bad, std::ios::trunc), "long corrupt WAL fixture writes")) return false;
+    Wal refused({bad_path, kVolume, 0});
+    return Require(Wal::ReadAll(bad_path, kVolume).status == Wal::ReadStatus::ChecksumMismatch &&
+        !refused.AcquireExclusiveWriterLease() && ReadLongPathBytes(bad_path) == bad,
+        "long WAL corruption is refused with evidence unchanged");
+}
+
+bool TestLongPathWalCompactionRestartAndAliases(const std::filesystem::path& root)
+{
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    const auto path = MakeLongWalPath(root, "restart.wal");
+    {
+        Wal owner({path, kVolume, 0});
+        if (!Require(owner.Append(MakeRecord(1)) && owner.Append(MakeRecord(2)), "long restart seed appends")) return false;
+        owner.SetFaultInjectionHook([](std::string_view point) { return point == "compact-before-intent-clear"; });
+        if (!Require(owner.CompactWithResult(2) == Wal::CompactionResult::BytesMayHavePersisted &&
+                std::filesystem::exists(LongPathTestIoPath(CompactionIntentPath(path))),
+                "long compaction ambiguous handoff retains the real recovery receipt")) return false;
+    }
+    {
+        Wal recovered({path, kVolume, 0});
+        if (!Require(recovered.AcquireExclusiveWriterLease(), "long compaction receipt resolves on restart")) return false;
+        const auto read = recovered.ReadAll();
+        if (!Require(read.status == Wal::ReadStatus::Ok && read.records.size() == 2 &&
+                Wal::EncodeForTest(read.records[0]) == Wal::EncodeForTest(MakeRecord(2)) &&
+                recovered.Append(MakeRecord(3)) && recovered.Compact(3),
+                "long compaction restart keeps selected bytes and supports another compaction")) return false;
+    }
+    const auto orphan_wal = MakeLongWalPath(root, "orphan.wal");
+    {
+        Wal seed({orphan_wal, kVolume, 0});
+        if (!Require(seed.Append(MakeRecord(1)), "long orphan-cleanup seed appends")) return false;
+    }
+    auto orphan = orphan_wal;
+    orphan += L".compact.12345.1";
+    if (!Require(WriteBytes(LongPathTestIoPath(orphan), {1, 2, 3}, std::ios::trunc), "long orphan fixture writes")) return false;
+    {
+        const auto original = ReadLongPathBytes(orphan_wal);
+        Wal recovered({orphan_wal, kVolume, 0});
+        if (!Require(recovered.AcquireExclusiveWriterLease() &&
+                !std::filesystem::exists(LongPathTestIoPath(orphan)) &&
+                ReadLongPathBytes(orphan_wal) == original,
+                "long orphan enumeration removes only the exact orphan and preserves canonical bytes")) return false;
+    }
+    const auto alias = MakeLongWalPath(root, "alias.wal");
+    const auto before = ReadLongPathBytes(path);
+    if (!Require(CreateHardLinkW(LongPathTestIoPath(alias).c_str(), LongPathTestIoPath(path).c_str(), nullptr) != FALSE,
+            "long WAL gets a real hard-link alias")) return false;
+    {
+        Wal refused({path, kVolume, 0});
+        if (!Require(!refused.AcquireExclusiveWriterLease() &&
+                refused.AppendWithResult(MakeRecord(4)) == Wal::AppendResult::RejectedBeforeWrite &&
+                refused.CompactWithResult(3) == Wal::CompactionResult::RejectedBeforeWrite &&
+                ReadLongPathBytes(path) == before && ReadLongPathBytes(alias) == before,
+                "long WAL hard-link alias refuses ownership, append and compaction without changed bytes")) return false;
+    }
+    if (!Require(DeleteFileW(LongPathTestIoPath(alias).c_str()) != FALSE, "long test removes only its owned alias")) return false;
+    Wal final({path, kVolume, 0});
+    return Require(final.AcquireExclusiveWriterLease() && final.ValidatedAppendLeaseGeneration() != 0,
+        "long WAL admission recovers after the owned alias is removed");
+}
+
+bool TestLongPathWalDerivedBoundary(const std::filesystem::path& root)
+{
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    auto directory = root;
+    if (!Require(directory.wstring().size() < MAX_PATH - 24,
+            "derived-boundary fixture starts below the canonical path limit")) return false;
+    while (directory.wstring().size() + 62 < MAX_PATH - 22)
+        directory /= std::string(60, 'y');
+    const auto remaining = MAX_PATH - 22 - directory.wstring().size() - 1;
+    directory /= std::string(remaining, 'z');
+    std::filesystem::create_directories(LongPathTestIoPath(directory));
+    const auto path = directory / "edge.wal";
+    {
+        Wal owner({path, kVolume, 0});
+        if (!Require(path.wstring().size() < MAX_PATH - 12 &&
+                CompactionIntentPath(path).wstring().size() >= MAX_PATH &&
+                owner.Append(MakeRecord(1)) && owner.Append(MakeRecord(2)) && owner.Compact(2),
+                "short canonical WAL compacts when only its derived siblings exceed MAX_PATH")) return false;
+        const auto read = owner.ReadAll();
+        if (!Require(read.status == Wal::ReadStatus::Ok && read.records.size() == 2 &&
+                Wal::EncodeForTest(read.records[0]) == Wal::EncodeForTest(MakeRecord(2)) &&
+                owner.ValidatedAppendLeaseGeneration() != 0,
+                "mixed short/long compaction paths still bind the same physical file and receipt")) return false;
+    }
+    Wal reopened({path, kVolume, 0});
+    return Require(reopened.AcquireExclusiveWriterLease() && reopened.Append(MakeRecord(3)),
+        "derived-boundary WAL reopens through its longer receipt");
+}
+
 int RunCompactionCrashChild()
 {
     std::wstring path;
@@ -1426,6 +1781,810 @@ bool TestAppendResultDistinguishesPrewriteAndAmbiguousFlush(const std::filesyste
                    apfsaccess::rw::WriteAheadLog::AppendResult::RejectedBeforeWrite,
                "size-limit rejection should report that no WAL bytes were written") &&
            Require(!std::filesystem::exists(rejected_path), "pre-write rejection should not create a WAL file");
+}
+
+bool TestReadOnlyAppendObservationRetainsCompletedCompaction(const std::filesystem::path& root)
+{
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    const auto directory = root / "read-only-append-observation";
+    std::filesystem::create_directories(directory);
+    const auto path = directory / "owner.wal";
+    Wal owner({path, kVolume, 0});
+    if (!Require(owner.Append(MakeRecord(1), false) && owner.Append(MakeRecord(2)),
+            "read-only observation fixture has a live append owner")) return false;
+    const auto generation = owner.ExclusiveWriterLeaseGeneration();
+    const auto capture = [&]
+    {
+        std::vector<std::pair<std::filesystem::path, std::vector<std::uint8_t>>> files;
+        for (const auto& entry : std::filesystem::directory_iterator(directory))
+            files.emplace_back(entry.path().filename(), ReadLongPathBytes(entry.path()));
+        std::sort(files.begin(), files.end(), [](const auto& left, const auto& right)
+        {
+            return left.first < right.first;
+        });
+        return files;
+    };
+    const auto original = capture();
+    if (!Require(generation != 0 && original.size() == 1 && !original.front().second.empty() &&
+            !std::filesystem::exists(CompactionIntentPath(path)),
+            "no-receipt control has the original WAL and nonzero owner generation") ||
+        !Require(owner.ValidatedAppendLeaseGeneration(true) == generation && capture() == original,
+            "read-only observation accepts a valid owner without creating a receipt")) return false;
+
+    if (!Require(owner.CompactWithResult(2, generation) == Wal::CompactionResult::Succeeded,
+            "read-only refusal fixture completes actual compaction successfully")) return false;
+    const auto compacted = Wal::ReadAll(path, kVolume);
+    const auto receipt = CompactionIntentPath(path);
+    const auto completion = Wal::ReadAll(receipt, kVolume);
+    if (!Require(compacted.status == Wal::ReadStatus::Ok && !compacted.recovered_torn_tail &&
+            compacted.records.size() == 2 && compacted.records.front().sequence == 2 &&
+            compacted.records.back().operation == Wal::OperationKind::CompactionIndex &&
+            completion.status == Wal::ReadStatus::Ok && !completion.recovered_torn_tail &&
+            !completion.records.empty() &&
+            HasCompletedCompactionProof(path),
+            "successful compaction leaves selected history and a real durable completion receipt")) return false;
+    const auto tombstone = CompactionPredecessorGuardPath(path, completion.records.back().object_id);
+    const auto before = capture();
+    const auto counters = owner.SnapshotCounters();
+    if (!Require(before.size() == 3 && !ReadLongPathBytes(receipt).empty() &&
+            IsZeroByteRegularFile(tombstone) && owner.HasExclusiveWriterLease() &&
+            owner.ExclusiveWriterLeaseGeneration() == generation &&
+            owner.ValidatedAppendLeaseGeneration() == generation,
+            "completed receipt retains the original live owner and its predecessor tombstone") ||
+        !Require(capture() == before,
+            "legacy validation preserves the completed WAL namespace")) return false;
+
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        if (!Require(owner.ValidatedAppendLeaseGeneration(true) == generation,
+                "bounded observation authenticates the original completed receipt and live append owner") ||
+            !Require(capture() == before,
+                "bounded observation preserves all WAL and sidecar names and bytes") ||
+            !Require(owner.HasExclusiveWriterLease() && owner.ExclusiveWriterLeaseGeneration() == generation &&
+                owner.ValidatedAppendLeaseGeneration() == generation &&
+                owner.ValidatedAppendLeaseGeneration(true) == generation && capture() == before,
+                "bounded and default observation retain the same original append owner")) return false;
+    }
+    auto receipt_bytes = ReadLongPathBytes(receipt);
+    auto corrupt = receipt_bytes;
+    corrupt.back() ^= 1;
+    if (!Require(WriteBytes(receipt, corrupt, std::ios::trunc), "inject real corrupt completion receipt")) return false;
+    const auto corrupt_files = capture();
+    if (!Require(owner.ValidatedAppendLeaseGeneration(true) == 0 && capture() == corrupt_files,
+        "corrupt completed evidence refuses without changing any WAL or sidecar bytes")) return false;
+    std::vector<std::uint8_t> oversized((1u << 20) + 1, 0);
+    if (!Require(WriteBytes(receipt, oversized, std::ios::trunc), "inject oversized completion evidence")) return false;
+    const auto oversized_files = capture();
+    if (!Require(owner.ValidatedAppendLeaseGeneration(true) == 0 && capture() == oversized_files,
+        "bounded receipt budget refuses before proportional allocation and preserves evidence")) return false;
+    if (!Require(WriteBytes(receipt, receipt_bytes, std::ios::trunc) &&
+        owner.ValidatedAppendLeaseGeneration(true) == generation && capture() == before,
+        "restored original completed receipt authenticates without cleanup or reopening")) return false;
+    const auto after = owner.SnapshotCounters();
+    return Require(after.append_handle_open_count == counters.append_handle_open_count &&
+        after.append_handle_flush_count == counters.append_handle_flush_count,
+        "observations neither reopen nor flush the retained append handle");
+}
+
+struct StartupEvidenceFile
+{
+    std::filesystem::path name;
+    std::vector<std::uint8_t> bytes;
+    DWORD volume_serial = 0;
+    std::uint64_t file_id = 0;
+    bool operator==(const StartupEvidenceFile&) const = default;
+};
+
+bool CaptureStartupEvidence(
+    const std::filesystem::path& directory,
+    std::vector<StartupEvidenceFile>& files)
+{
+    files.clear();
+    std::error_code ec;
+    std::filesystem::directory_iterator entry(directory, ec), end;
+    if (!Require(!ec, "startup namespace enumeration opens successfully")) return false;
+    for (; entry != end; entry.increment(ec))
+    {
+        if (!Require(!ec, "startup namespace enumeration advances successfully")) return false;
+        auto handle = CreateFileW(entry->path().wstring().c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (!Require(handle != INVALID_HANDLE_VALUE, "every startup evidence file can be read")) return false;
+        BY_HANDLE_FILE_INFORMATION info{};
+        LARGE_INTEGER size{};
+        bool ok = GetFileInformationByHandle(handle, &info) && GetFileSizeEx(handle, &size) &&
+            !(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
+            size.QuadPart >= 0 && size.QuadPart <= (2ll << 20);
+        StartupEvidenceFile file{};
+        if (ok)
+        {
+            file.name = entry->path().filename();
+            file.volume_serial = info.dwVolumeSerialNumber;
+            file.file_id = (static_cast<std::uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
+            file.bytes.resize(static_cast<std::size_t>(size.QuadPart));
+            std::size_t offset = 0;
+            while (ok && offset < file.bytes.size())
+            {
+                DWORD read = 0;
+                ok = ReadFile(handle, file.bytes.data() + offset,
+                    static_cast<DWORD>(file.bytes.size() - offset), &read, nullptr) && read != 0;
+                offset += read;
+            }
+        }
+        const bool closed = CloseHandle(handle) != FALSE;
+        if (!Require(ok && closed, "snapshot captures complete bytes and original file identity")) return false;
+        files.push_back(std::move(file));
+    }
+    if (!Require(!ec, "startup namespace enumeration completes successfully")) return false;
+    std::sort(files.begin(), files.end(), [](const auto& left, const auto& right)
+    {
+        return left.name < right.name;
+    });
+    return true;
+}
+
+bool SameStartupWatermarks(
+    const apfsaccess::rw::TransactionManager::DurabilityWatermarks& left,
+    const apfsaccess::rw::TransactionManager::DurabilityWatermarks& right)
+{
+    return left.accepted_sequence == right.accepted_sequence &&
+        left.apfs_durable_sequence == right.apfs_durable_sequence &&
+        left.cleanup_sequence == right.cleanup_sequence;
+}
+
+bool AppendStartupTransaction(apfsaccess::rw::TransactionManager& owner)
+{
+    apfsaccess::rw::TransactionManager::MutationIntent mutation{};
+    mutation.kind = apfsaccess::rw::TransactionManager::MutationKind::SetBasicInfo;
+    mutation.path = L"\\startup.txt";
+    mutation.timestamp_utc = 123456789;
+    return Require(owner.Begin() && owner.RecordMutation(mutation) && owner.Accept(),
+        "admitted owner appends a complete transaction through the production API");
+}
+
+bool SeedStartupJournal(
+    const std::filesystem::path& path,
+    const std::wstring& identity,
+    apfsaccess::rw::TransactionManager::DurabilityWatermarks& watermarks)
+{
+    apfsaccess::rw::TransactionManager producer(L"DeferredContent");
+    producer.SetVolumeIdentity(identity);
+    producer.SetJournalPath(path.wstring());
+    if (!AppendStartupTransaction(producer)) return false;
+    const auto accepted = producer.Watermarks().accepted_sequence;
+    if (!Require(accepted != 0 && producer.MarkApfsDurableThrough(accepted) &&
+            producer.MarkCleanedThrough(accepted),
+            "production fixture records acceptance, durability and cleanup watermarks")) return false;
+    watermarks = producer.Watermarks();
+    return true;
+}
+
+bool StartupAppendHandleFencesFile(const std::filesystem::path& path)
+{
+    for (const auto access : {DWORD{GENERIC_WRITE}, DWORD{DELETE}})
+    {
+        auto handle = CreateFileW(path.wstring().c_str(), access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        const auto error = GetLastError();
+        if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+        if (!Require(handle == INVALID_HANDLE_VALUE && error == ERROR_SHARING_VIOLATION,
+                "startup owner retains the original canonical append handle against write and delete")) return false;
+    }
+    return true;
+}
+
+bool StartupRefusalPreservesEvidence(const std::filesystem::path& path)
+{
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    using Tx = apfsaccess::rw::TransactionManager;
+    std::vector<StartupEvidenceFile> before, after;
+    if (!CaptureStartupEvidence(path.parent_path(), before)) return false;
+    {
+        Wal reader({path, kVolume, 0});
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            if (!Require(reader.ReadStartupEvidence({64ull << 20, 1000000}, 256ull << 20).status !=
+                    Wal::ReadStatus::Ok &&
+                    reader.ReadAllWithExclusiveWriterLease().status != Wal::ReadStatus::Ok,
+                    "startup primitive and subsequent strict reads refuse unsafe original evidence") ||
+                !CaptureStartupEvidence(path.parent_path(), after) ||
+                !Require(after == before, "refused WAL reads preserve every name, byte and file identity")) return false;
+        }
+    }
+    {
+        Tx owner(L"DeferredContent");
+        const auto watermarks = owner.Watermarks();
+        const auto next_sequence = owner.NextMutationSequence();
+        std::string error;
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            if (!Require(!owner.OpenStartupJournal(path.wstring(), L"volume-A", error) && !error.empty(),
+                    "startup Open repeatedly refuses unsafe evidence") ||
+                !CaptureStartupEvidence(path.parent_path(), after) ||
+                !Require(after == before && SameStartupWatermarks(owner.Watermarks(), watermarks),
+                    "refused Open preserves the namespace, all bytes and all watermarks")) return false;
+            std::vector<Tx::AcceptedTransaction> transactions(1);
+            if (!Require(!owner.LoadAcceptedTransactionsSinceCleanup(transactions, &error) &&
+                    !error.empty() && transactions.empty() && !owner.RecoveryStateValid() && !owner.Begin(),
+                    "history load after startup refusal returns no partial work and Begin stays blocked") ||
+                !CaptureStartupEvidence(path.parent_path(), after) ||
+                !Require(after == before && SameStartupWatermarks(owner.Watermarks(), watermarks) &&
+                    owner.NextMutationSequence() == next_sequence && owner.CurrentTransactionId() == 0,
+                    "refused history loads and Begin leave bytes, watermarks and sequence allocation unchanged")) return false;
+        }
+    }
+    return CaptureStartupEvidence(path.parent_path(), after) &&
+        Require(after == before, "destroying refused owners also preserves the original evidence");
+}
+
+bool StartupRefusedOwnerRejectsLegacySuccessors(const std::filesystem::path& path)
+{
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    using Tx = apfsaccess::rw::TransactionManager;
+    std::vector<StartupEvidenceFile> before, after;
+    if (!CaptureStartupEvidence(path.parent_path(), before)) return false;
+    {
+        Tx owner(L"DeferredContent");
+        const auto watermarks = owner.Watermarks();
+        const auto next_sequence = owner.NextMutationSequence();
+        std::string error;
+        if (!Require(!owner.OpenStartupJournal(path.wstring(), L"volume-A", error) && !error.empty() &&
+                !owner.RecoveryStateValid(), "transfer regression retains an actually refused startup owner")) return false;
+        const auto generation = owner.ObservedJournalWriterLeaseGeneration();
+        const auto opens = owner.JournalAppendHandleOpenCount();
+        const auto flushes = owner.JournalAppendHandleFlushCount();
+        if (!Require(generation != 0 && opens == 1 && flushes == 0,
+                "refused owner retains the production writer lease and original canonical append handle")) return false;
+        const auto unchanged = [&]
+        {
+            return Require(owner.OwnsJournalForMaintenance(path.wstring(), L"volume-A") &&
+                    owner.ObservedJournalWriterLeaseGeneration() == generation &&
+                    owner.JournalAppendHandleOpenCount() == opens && owner.JournalAppendHandleFlushCount() == flushes &&
+                    SameStartupWatermarks(owner.Watermarks(), watermarks) &&
+                    owner.NextMutationSequence() == next_sequence && !owner.RecoveryStateValid() && !owner.Begin(),
+                    "legacy successors retain the original refused owner, writer generation and blocked transaction state") &&
+                CaptureStartupEvidence(path.parent_path(), after) &&
+                Require(after == before, "legacy successor attempts preserve all original names, bytes and file IDs");
+        };
+        if (!unchanged()) return false;
+        const auto alias = path.parent_path() / "." / "OWNER.WAL";
+        for (const auto& candidate : {path, alias})
+        for (const auto& successor_identity : {std::wstring(L"volume-A"), std::wstring(L"volume-B")})
+        {
+            std::cout << "[INFO] Retained startup owner successor " <<
+                (candidate == path ? "same-path" : "lexical-alias") << std::endl;
+            {
+                Wal successor({candidate, std::string(successor_identity.begin(), successor_identity.end()), 0});
+                const auto read = successor.ReadAllWithExclusiveWriterLease();
+                if (!Require(read.status != Wal::ReadStatus::Ok && read.records.empty() &&
+                        !successor.HasExclusiveWriterLease() && successor.ExclusiveWriterLeaseGeneration() == 0 &&
+                        successor.SnapshotCounters().append_handle_open_count == 0,
+                        "legacy strict read cannot take a preserving owner's registered handles") ||
+                    !unchanged()) return false;
+            }
+            if (!unchanged()) return false;
+            for (bool identity_first : {true, false})
+            {
+                {
+                    Tx successor(L"DeferredContent");
+                    if (identity_first)
+                    {
+                        successor.SetVolumeIdentity(successor_identity);
+                        successor.SetJournalPath(candidate.wstring());
+                    }
+                    else
+                    {
+                        successor.SetJournalPath(candidate.wstring());
+                        successor.SetVolumeIdentity(successor_identity);
+                    }
+                    if (!Require(!successor.RecoveryStateValid() &&
+                            successor.ObservedJournalWriterLeaseGeneration() == 0 &&
+                            successor.JournalAppendHandleOpenCount() == 0 && !successor.Begin(),
+                            "ordinary transaction setters in either order cannot transfer preserving ownership") ||
+                        !unchanged()) return false;
+                    std::vector<Tx::AcceptedTransaction> transactions(1);
+                    if (!Require(!successor.LoadAcceptedTransactionsSinceCleanup(transactions, &error) &&
+                            !error.empty() && transactions.empty(),
+                            "legacy transaction successor cannot load accepted history after transfer refusal") ||
+                        !unchanged()) return false;
+                }
+                if (!unchanged()) return false;
+            }
+        }
+    }
+    return CaptureStartupEvidence(path.parent_path(), after) &&
+        Require(after == before, "successor and refused startup owner destruction preserve the original evidence");
+}
+
+bool TestStartupJournalEvidencePreservation(const std::filesystem::path& root)
+{
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    using Tx = apfsaccess::rw::TransactionManager;
+    if (!Require(root.is_absolute() && (root.root_name() == L"D:" || root.root_name() == L"d:"),
+            "startup evidence tests require the existing runner to set TEMP and TMP on D:")) return false;
+    const auto directory = root / "startup-evidence";
+    std::filesystem::create_directories(directory);
+    std::vector<StartupEvidenceFile> before, after;
+    for (bool compact : {false, true})
+    {
+        const auto fixture = directory / (compact ? "completed-compaction" : "clean-nonempty");
+        std::filesystem::create_directories(fixture);
+        const auto path = fixture / "owner.wal";
+        Tx::DurabilityWatermarks expected{};
+        if (!SeedStartupJournal(path, L"volume-A", expected)) return false;
+        if (compact)
+        {
+            Wal producer({path, kVolume, 0});
+            if (!Require(producer.CompactWithResult(1) == Wal::CompactionResult::Succeeded &&
+                    HasCompletedCompactionProof(path),
+                    "completed fixture uses production compaction and its durable original receipt")) return false;
+        }
+        if (!CaptureStartupEvidence(fixture, before) ||
+            !Require(before.size() == (compact ? 3u : 1u) && !ReadLongPathBytes(path).empty(),
+                "positive fixture contains a nonempty WAL and only its expected compaction evidence")) return false;
+        const auto original_history = Wal::ReadAll(path, kVolume);
+        if (!Require(original_history.status == Wal::ReadStatus::Ok && !original_history.records.empty(),
+                "positive fixture has independently readable complete history")) return false;
+        std::uint64_t max_sequence = 0, max_transaction_id = 0;
+        for (const auto& record : original_history.records)
+        {
+            max_sequence = (std::max)(max_sequence, record.sequence);
+            max_transaction_id = (std::max)(max_transaction_id, record.transaction_id);
+        }
+        {
+            Tx owner(L"DeferredContent");
+            std::string error;
+            if (!Require(owner.OpenStartupJournal(path.wstring(), L"volume-A", error) && error.empty() &&
+                    owner.RecoveryStateValid() && SameStartupWatermarks(owner.Watermarks(), expected),
+                    "fresh startup owner admits healthy evidence and recovers every watermark") ||
+                !StartupAppendHandleFencesFile(path)) return false;
+            const auto generation = owner.ObservedJournalWriterLeaseGeneration();
+            const auto opens = owner.JournalAppendHandleOpenCount();
+            const auto flushes = owner.JournalAppendHandleFlushCount();
+            const auto next_sequence = owner.NextMutationSequence();
+            if (!Require(generation != 0 && opens == 1 && flushes == 0 && next_sequence == max_sequence + 1 &&
+                    owner.ObservedJournalAppendLeaseGeneration() == generation,
+                    "startup acquires a real lease and one original append handle without flushing") ||
+                !CaptureStartupEvidence(fixture, after) ||
+                !Require(after == before, "startup admission preserves the entire original namespace and bytes")) return false;
+            for (int attempt = 0; attempt < 2; ++attempt)
+            {
+                std::vector<Tx::AcceptedTransaction> transactions(1);
+                if (!Require(owner.LoadAcceptedTransactionsSinceCleanup(transactions, &error) && error.empty() &&
+                        transactions.empty() && SameStartupWatermarks(owner.Watermarks(), expected) &&
+                        owner.NextMutationSequence() == next_sequence &&
+                        owner.ObservedJournalWriterLeaseGeneration() == generation &&
+                        owner.ObservedJournalAppendLeaseGeneration() == generation &&
+                        owner.JournalAppendHandleOpenCount() == opens &&
+                        owner.JournalAppendHandleFlushCount() == flushes,
+                        "later history reads preserve the cleaned state and original unflushed append owner") ||
+                    !CaptureStartupEvidence(fixture, after) ||
+                    !Require(after == before, "later history reads retain original completed receipts and tombstones")) return false;
+            }
+            if (!Require(!owner.OpenStartupJournal(path.wstring(), L"volume-A", error) && !error.empty() &&
+                    owner.RecoveryStateValid() && SameStartupWatermarks(owner.Watermarks(), expected),
+                    "startup admission refuses reuse of an already configured owner") ||
+                !CaptureStartupEvidence(fixture, after) || !Require(after == before,
+                    "fresh-owner refusal preserves healthy original evidence")) return false;
+            if (!Require(!owner.MaterializeAbsentStartupJournal(error) && !error.empty(),
+                    "existing healthy history and compaction proof cannot authorize empty materialization") ||
+                !CaptureStartupEvidence(fixture, after) ||
+                !Require(after == before && SameStartupWatermarks(owner.Watermarks(), expected) &&
+                    owner.ObservedJournalWriterLeaseGeneration() == generation,
+                    "refused materialization preserves existing history, proof and owner")) return false;
+            if (!AppendStartupTransaction(owner) ||
+                !Require(owner.Watermarks().accepted_sequence > expected.accepted_sequence &&
+                    owner.Watermarks().apfs_durable_sequence == expected.apfs_durable_sequence &&
+                    owner.Watermarks().cleanup_sequence == expected.cleanup_sequence &&
+                    owner.ObservedJournalWriterLeaseGeneration() == generation &&
+                    owner.JournalAppendHandleOpenCount() == opens,
+                    "admitted owner can legitimately append using its retained original lease and handle")) return false;
+            std::vector<StartupEvidenceFile> appended;
+            if (!CaptureStartupEvidence(fixture, appended) ||
+                !Require(appended.size() == before.size(), "legitimate append retains the original sidecar namespace")) return false;
+            for (std::size_t i = 0; i < before.size(); ++i)
+            {
+                const auto& original = before[i];
+                const auto& actual = appended[i];
+                if (original.name == path.filename())
+                {
+                    if (!Require(actual.name == original.name && actual.volume_serial == original.volume_serial &&
+                            actual.file_id == original.file_id && actual.bytes.size() > original.bytes.size() &&
+                            std::equal(original.bytes.begin(), original.bytes.end(), actual.bytes.begin()),
+                            "legitimate append extends only the original canonical file and preserves its full prefix")) return false;
+                }
+                else if (!Require(actual == original, "legitimate append preserves completed receipt and tombstone bytes")) return false;
+            }
+            const auto appended_watermarks = owner.Watermarks();
+            std::vector<Tx::AcceptedTransaction> transactions;
+            if (!Require(owner.LoadAcceptedTransactionsSinceCleanup(transactions, &error) && error.empty() &&
+                    transactions.size() == 1 && transactions.front().transaction_id == max_transaction_id + 1 &&
+                    transactions.front().accepted_sequence == owner.Watermarks().accepted_sequence &&
+                    transactions.front().mutations.size() == 1 &&
+                    transactions.front().mutations.front().sequence == next_sequence &&
+                    transactions.front().mutations.front().path_utf8 == "\\startup.txt",
+                    "history after legitimate append returns precisely the newly accepted transaction") ||
+                !CaptureStartupEvidence(fixture, after) ||
+                !Require(after == appended && SameStartupWatermarks(owner.Watermarks(), appended_watermarks) &&
+                    owner.ObservedJournalWriterLeaseGeneration() == generation &&
+                    owner.JournalAppendHandleOpenCount() == opens,
+                    "post-append history reads preserve all bytes, watermarks and the original owner")) return false;
+        }
+    }
+
+    const auto missing_directory = directory / "missing";
+    std::filesystem::create_directories(missing_directory);
+    const auto missing = missing_directory / "owner.wal";
+    if (!CaptureStartupEvidence(missing_directory, before) ||
+        !Require(before.empty(), "missing fixture begins with an empty namespace")) return false;
+    {
+        Tx owner(L"DeferredContent");
+        const auto watermarks = owner.Watermarks();
+        std::string error;
+        if (!Require(owner.OpenStartupJournal(missing.wstring(), L"volume-A", error) && error.empty(),
+                "fresh startup owner admits a genuinely missing journal")) return false;
+        const auto generation = owner.ObservedJournalWriterLeaseGeneration();
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            std::vector<Tx::AcceptedTransaction> transactions(1);
+            if (!Require(owner.LoadAcceptedTransactionsSinceCleanup(transactions, &error) && error.empty() &&
+                    transactions.empty() && SameStartupWatermarks(owner.Watermarks(), watermarks) &&
+                    generation != 0 && owner.ObservedJournalWriterLeaseGeneration() == generation &&
+                    owner.JournalAppendHandleOpenCount() == 0 && owner.JournalAppendHandleFlushCount() == 0,
+                    "missing startup and later history reads retain ownership without opening or flushing a file") ||
+                !CaptureStartupEvidence(missing_directory, after) ||
+                !Require(after == before, "missing WAL and every sidecar stay absent through history reads")) return false;
+        }
+    }
+    if (!CaptureStartupEvidence(missing_directory, after) ||
+        !Require(after == before, "missing WAL stays absent after its startup owner is destroyed")) return false;
+    {
+        Tx writer(L"DeferredContent");
+        std::string error;
+        if (!Require(writer.OpenStartupJournal(missing.wstring(), L"volume-A", error) && error.empty(),
+                "another fresh owner admits the still absent journal") ||
+            !CaptureStartupEvidence(missing_directory, after) ||
+            !Require(after == before, "readmission also leaves the missing WAL absent") ||
+            !Require(writer.MaterializeAbsentStartupJournal(error) && error.empty(),
+                "explicit startup materialization creates a genuinely absent empty journal") ||
+            !CaptureStartupEvidence(missing_directory, after) ||
+            !Require(after.size() == 1 && after.front().name == missing.filename() && after.front().bytes.empty() &&
+                writer.Watermarks().accepted_sequence == 0 && writer.Watermarks().apfs_durable_sequence == 0 &&
+                writer.Watermarks().cleanup_sequence == 0 && writer.NextMutationSequence() == 1 &&
+                writer.JournalAppendHandleOpenCount() == 1 && writer.JournalAppendHandleFlushCount() == 0,
+                "materialization writes zero records and retains one empty canonical file") ||
+            !AppendStartupTransaction(writer) || !CaptureStartupEvidence(missing_directory, after) ||
+            !Require(after.size() == 1 && after.front().name == missing.filename() &&
+                !after.front().bytes.empty() && writer.Watermarks().accepted_sequence != 0 &&
+                writer.JournalAppendHandleOpenCount() == 1,
+                "a legitimate accepted transaction appends after explicit empty materialization")) return false;
+    }
+
+    for (const std::string_view kind : {"torn-tail", "checksum-corrupt", "foreign-rid",
+            "numeric-orphan", "unknown-orphan", "incomplete-receipt", "corrupt-receipt", "oversized-receipt",
+            "missing-canonical-completed", "missing-canonical-unfinished"})
+    {
+        std::cout << "[INFO] Startup refusal fixture " << kind << std::endl;
+        const auto fixture = directory / kind;
+        std::filesystem::create_directories(fixture);
+        const auto path = fixture / "owner.wal";
+        Tx::DurabilityWatermarks expected{};
+        if (!SeedStartupJournal(path, kind == "foreign-rid" ? L"startup-foreign-rid" : L"volume-A", expected)) return false;
+        if (kind == "torn-tail" || kind == "checksum-corrupt")
+        {
+            auto bytes = ReadLongPathBytes(path);
+            if (!Require(!bytes.empty(), "malformed fixture starts from production journal bytes")) return false;
+            if (kind == "torn-tail") bytes.pop_back();
+            else bytes.back() ^= 1;
+            if (!Require(WriteBytes(path, bytes, std::ios::trunc), "inject malformed original journal tail")) return false;
+        }
+        else if (kind == "numeric-orphan" || kind == "unknown-orphan")
+        {
+            auto orphan = path;
+            orphan += kind == "numeric-orphan" ? L".compact.4242.1" : L".compact.unknown";
+            if (!Require(WriteBytes(orphan, ReadLongPathBytes(path), std::ios::trunc),
+                    "orphan fixture contains original production bytes in an unproven sibling")) return false;
+        }
+        else if (kind == "incomplete-receipt" || kind == "corrupt-receipt" || kind == "oversized-receipt" ||
+            kind == "missing-canonical-completed" || kind == "missing-canonical-unfinished")
+        {
+            Wal producer({path, kVolume, 0});
+            const bool unfinished = kind == "incomplete-receipt" || kind == "missing-canonical-unfinished";
+            bool injected = false;
+            if (unfinished)
+                producer.SetFaultInjectionHook([&](std::string_view stage)
+                {
+                    if (stage != "compact-after-replace") return false;
+                    injected = true;
+                    return true;
+                });
+            const auto result = producer.CompactWithResult(1);
+            producer.SetFaultInjectionHook({});
+            if (unfinished)
+            {
+                if (!Require(injected && result == Wal::CompactionResult::BytesMayHavePersisted &&
+                        std::filesystem::exists(CompactionIntentPath(path)) && !HasCompletedCompactionProof(path),
+                        "production compaction leaves a real unfinished receipt and predecessor evidence")) return false;
+            }
+            else
+            {
+                if (!Require(result == Wal::CompactionResult::Succeeded && HasCompletedCompactionProof(path),
+                        "receipt refusal fixture starts with production completed compaction")) return false;
+                if (kind == "corrupt-receipt" || kind == "oversized-receipt")
+                {
+                    auto bytes = ReadLongPathBytes(CompactionIntentPath(path));
+                    if (kind == "oversized-receipt") bytes.resize((1u << 20) + 1, 0);
+                    else bytes.back() ^= 1;
+                    if (!Require(WriteBytes(CompactionIntentPath(path), bytes, std::ios::trunc),
+                            "inject invalid original completed receipt bytes")) return false;
+                }
+            }
+        }
+        if (kind == "missing-canonical-completed" || kind == "missing-canonical-unfinished")
+        {
+            const auto relocated = fixture / "relocated-original.bin";
+            std::error_code ec;
+            std::filesystem::rename(path, relocated, ec);
+            if (!Require(!ec && !std::filesystem::exists(path) && std::filesystem::exists(relocated) &&
+                    std::filesystem::exists(CompactionIntentPath(path)),
+                    "after producer destruction, missing canonical fixture retains real sidecars and the relocated original")) return false;
+        }
+        if (!StartupRefusalPreservesEvidence(path)) return false;
+        if ((kind == "torn-tail" || kind == "numeric-orphan") &&
+            !StartupRefusedOwnerRejectsLegacySuccessors(path)) return false;
+    }
+
+    const auto bounded_directory = directory / "bounded";
+    std::filesystem::create_directories(bounded_directory);
+    const auto bounded_path = bounded_directory / "owner.wal";
+    Tx::DurabilityWatermarks expected{};
+    if (!SeedStartupJournal(bounded_path, L"volume-A", expected) ||
+        !CaptureStartupEvidence(bounded_directory, before)) return false;
+    const auto history = Wal::ReadAll(bounded_path, kVolume);
+    if (!Require(history.status == Wal::ReadStatus::Ok && history.records.size() > 1 &&
+            before.size() == 1 && before.front().bytes.size() > 1,
+            "bounded evidence fixture contains a complete production history")) return false;
+    {
+        Wal owner({bounded_path, kVolume, 0});
+        for (const auto limits : {apfsaccess::rw::WalReadLimits{before.front().bytes.size() - 1, 1000000},
+                apfsaccess::rw::WalReadLimits{64ull << 20, history.records.size() - 1}})
+        {
+            const auto read = owner.ReadStartupEvidence(limits, 256ull << 20);
+            if (!Require(read.status == Wal::ReadStatus::ResourceLimit && read.records.empty(),
+                    "bounded startup refuses excess bytes or records without returning partial history") ||
+                !CaptureStartupEvidence(bounded_directory, after) ||
+                !Require(after == before, "startup budget refusal preserves all original evidence")) return false;
+        }
+        const auto allocation = owner.ReadStartupEvidence({64ull << 20, 1000000}, 1);
+        if (!Require(allocation.status == Wal::ReadStatus::ResourceLimit && allocation.records.empty(),
+                "startup allocation budget refuses before admitting history") ||
+            !CaptureStartupEvidence(bounded_directory, after) ||
+            !Require(after == before, "allocation refusal preserves the original namespace and bytes")) return false;
+    }
+
+    const auto competing_directory = directory / "competing-owner";
+    std::filesystem::create_directories(competing_directory);
+    const auto held_path = competing_directory / "held.wal";
+    const auto contender_path = competing_directory / "contender.wal";
+    if (!CaptureStartupEvidence(competing_directory, before) ||
+        !Require(before.empty(), "competing-owner fixture starts without any files")) return false;
+    {
+        Wal holder({held_path, kVolume, 0});
+        if (!Require(holder.AcquireWriterLeaseOnly() && holder.HasExclusiveWriterLease(),
+                "competing fixture holds the actual production named-pipe writer lease")) return false;
+        const auto generation = holder.ExclusiveWriterLeaseGeneration();
+        if (!StartupRefusalPreservesEvidence(contender_path) ||
+            !Require(generation != 0 && holder.HasExclusiveWriterLease() &&
+                holder.ExclusiveWriterLeaseGeneration() == generation &&
+                holder.SnapshotCounters().append_handle_open_count == 0,
+                "same-identity refusal at another path retains the original real lease without opening files")) return false;
+    }
+    return CaptureStartupEvidence(competing_directory, after) &&
+        Require(after == before, "competing-owner refusal creates no WAL, receipt or lock file");
+}
+
+bool TestStartupJournalAbsentMaterialization(const std::filesystem::path& root)
+{
+    using Wal = apfsaccess::rw::WriteAheadLog;
+    using Tx = apfsaccess::rw::TransactionManager;
+    if (!Require(root.is_absolute() && (root.root_name() == L"D:" || root.root_name() == L"d:"),
+            "materialization regression uses the existing D: temporary runner")) return false;
+    const auto directory = root / "startup-materialization";
+    std::filesystem::create_directories(directory);
+    std::vector<StartupEvidenceFile> before, after;
+    const auto positive = directory / "genuinely-absent";
+    std::filesystem::create_directories(positive);
+    const auto positive_path = positive / "owner.wal";
+    {
+        Tx owner(L"DeferredContent");
+        std::string error;
+        if (!Require(owner.OpenStartupJournal(positive_path.wstring(), L"volume-A", error) && error.empty() &&
+                !owner.Begin(), "observed absence cannot begin a generic materialization transaction")) return false;
+        const auto generation = owner.ObservedJournalWriterLeaseGeneration();
+        const auto watermarks = owner.Watermarks();
+        if (!Require(owner.MaterializeAbsentStartupJournal(error) && error.empty() &&
+                generation != 0 && owner.ObservedJournalWriterLeaseGeneration() == generation &&
+                owner.ObservedJournalAppendLeaseGeneration() == generation &&
+                owner.JournalAppendHandleOpenCount() == 1 && owner.JournalAppendHandleFlushCount() == 0 &&
+                SameStartupWatermarks(owner.Watermarks(), watermarks) && owner.NextMutationSequence() == 1 &&
+                owner.CurrentTransactionId() == 0,
+                "CREATE_NEW materializes empty append authority under the original generation without records")) return false;
+        const auto read = Wal::ReadAll(positive_path, kVolume);
+        if (!Require(read.status == Wal::ReadStatus::Ok && read.records.empty() && !read.recovered_torn_tail,
+                "materialized journal has actual strict empty history") ||
+            !CaptureStartupEvidence(positive, before) ||
+            !Require(before.size() == 1 && before.front().bytes.empty(),
+                "materialization creates exactly one zero-byte canonical file") ||
+            !StartupAppendHandleFencesFile(positive_path)) return false;
+        std::vector<Tx::AcceptedTransaction> transactions(1);
+        if (!Require(owner.LoadAcceptedTransactionsSinceCleanup(transactions, &error) && error.empty() &&
+                transactions.empty() && !owner.MaterializeAbsentStartupJournal(error) && !error.empty() &&
+                owner.ObservedJournalWriterLeaseGeneration() == generation &&
+                owner.ObservedJournalAppendLeaseGeneration() == generation &&
+                SameStartupWatermarks(owner.Watermarks(), watermarks) && owner.Begin(),
+                "strict empty reseeding retains authority, refuses repeat creation and permits Begin") ||
+            !CaptureStartupEvidence(positive, after) ||
+            !Require(after == before, "history, repeated creation refusal and Begin write no records")) return false;
+    }
+    if (!CaptureStartupEvidence(positive, after) ||
+        !Require(after == before, "materialized original file identity survives owner destruction")) return false;
+
+    const auto existing = directory / "original-empty";
+    std::filesystem::create_directories(existing);
+    const auto existing_path = existing / "owner.wal";
+    if (!Require(WriteBytes(existing_path, {}, std::ios::trunc), "original empty control exists before startup") ||
+        !CaptureStartupEvidence(existing, before)) return false;
+    {
+        Tx owner(L"DeferredContent");
+        std::string error;
+        if (!Require(owner.OpenStartupJournal(existing_path.wstring(), L"volume-A", error),
+                "startup admits an originally present empty journal")) return false;
+        const auto generation = owner.ObservedJournalWriterLeaseGeneration();
+        const auto watermarks = owner.Watermarks();
+        if (!Require(!owner.MaterializeAbsentStartupJournal(error) && !error.empty() &&
+                owner.ObservedJournalWriterLeaseGeneration() == generation &&
+                owner.ObservedJournalAppendLeaseGeneration() == generation &&
+                SameStartupWatermarks(owner.Watermarks(), watermarks),
+                "even zero-debt existing proof cannot authorize absent-file materialization") ||
+            !CaptureStartupEvidence(existing, after) ||
+            !Require(after == before, "existing empty-file refusal preserves every byte and its original file ID")) return false;
+    }
+
+    const auto no_parent = directory / "missing-parent";
+    std::filesystem::create_directories(no_parent);
+    const auto uncreated_parent = no_parent / "not-created";
+    if (!CaptureStartupEvidence(no_parent, before)) return false;
+    {
+        Tx owner(L"DeferredContent");
+        std::string error;
+        if (!Require(owner.OpenStartupJournal((uncreated_parent / "owner.wal").wstring(), L"volume-A", error),
+                "startup can observe absence under a missing parent without creating it")) return false;
+        const auto generation = owner.ObservedJournalWriterLeaseGeneration();
+        if (!Require(!owner.MaterializeAbsentStartupJournal(error) && !error.empty() && !owner.Begin() && owner.Abort() &&
+                !std::filesystem::exists(uncreated_parent) && generation != 0 &&
+                owner.ObservedJournalWriterLeaseGeneration() == generation && owner.JournalAppendHandleOpenCount() == 0,
+                "materialization and generic Begin/Abort create no ancestors and retain the original lease") ||
+            !CaptureStartupEvidence(no_parent, after) || !Require(after == before,
+                "missing parent refusal leaves the namespace empty")) return false;
+    }
+
+    for (const std::string_view kind : {"one-byte", "foreign-rid", "same-rid", "completed-compaction"})
+    {
+        std::cout << "[INFO] Appeared startup journal " << kind << std::endl;
+        const auto fixture = directory / kind;
+        const auto staging = root / (std::string("materialization-source-") + std::string(kind));
+        std::filesystem::create_directories(fixture);
+        const auto path = fixture / "owner.wal";
+        std::vector<StartupEvidenceFile> produced_files;
+        if (kind != "one-byte")
+        {
+            std::filesystem::create_directories(staging);
+            Tx::DurabilityWatermarks produced{};
+            if (!SeedStartupJournal(staging / "owner.wal",
+                    kind == "foreign-rid" ? L"appeared-foreign-rid" : L"volume-A", produced)) return false;
+            if (kind == "completed-compaction")
+            {
+                Wal producer({staging / "owner.wal", kVolume, 0});
+                if (!Require(producer.CompactWithResult(1) == Wal::CompactionResult::Succeeded &&
+                        HasCompletedCompactionProof(staging / "owner.wal"),
+                        "appeared receipt fixture is produced by real completed compaction")) return false;
+            }
+            if (!CaptureStartupEvidence(staging, produced_files)) return false;
+        }
+        auto parent = CreateFileW(fixture.wstring().c_str(), FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (!Require(parent != INVALID_HANDLE_VALUE, "appeared-file fixture pins its existing direct parent")) return false;
+        const auto exercise = [&]()
+        {
+            Tx owner(L"DeferredContent");
+            std::string error;
+            if (!Require(owner.OpenStartupJournal(path.wstring(), L"volume-A", error) && error.empty() &&
+                    owner.ObservedJournalAppendLeaseGeneration() == 0,
+                    "original missing observation precedes external canonical-file appearance")) return false;
+            const auto generation = owner.ObservedJournalWriterLeaseGeneration();
+            const auto watermarks = owner.Watermarks();
+            const auto sequence = owner.NextMutationSequence();
+            if (kind == "one-byte")
+            {
+                if (!Require(WriteBytes(path, {0x01}, std::ios::trunc), "inject a newly appeared one-byte WAL")) return false;
+            }
+            else
+            {
+                for (const auto& file : produced_files)
+                {
+                    std::error_code ec;
+                    std::filesystem::rename(staging / file.name, fixture / file.name, ec);
+                    if (!Require(!ec, "move production appeared evidence with all original file IDs intact")) return false;
+                }
+            }
+            if (!CaptureStartupEvidence(fixture, before) ||
+                !Require(before.size() == (kind == "completed-compaction" ? 3u : 1u) &&
+                    (kind == "one-byte" || before == produced_files),
+                    "appeared fixture has exactly its expected original files")) return false;
+            for (int attempt = 0; attempt < 2; ++attempt)
+            {
+                if (!Require(!owner.MaterializeAbsentStartupJournal(error) && !error.empty() &&
+                        !owner.Begin() && owner.Abort() && generation != 0 &&
+                        owner.OwnsJournalForMaintenance(path.wstring(), L"volume-A") &&
+                        owner.ObservedJournalWriterLeaseGeneration() == generation &&
+                        owner.ObservedJournalAppendLeaseGeneration() == 0 &&
+                        owner.JournalAppendHandleOpenCount() == 0 && owner.JournalAppendHandleFlushCount() == 0 &&
+                        owner.CurrentTransactionId() == 0 && owner.NextMutationSequence() == sequence &&
+                        SameStartupWatermarks(owner.Watermarks(), watermarks),
+                        "appeared evidence refuses CREATE_NEW and generic Begin/Abort without changing owner or watermarks") ||
+                    !CaptureStartupEvidence(fixture, after) ||
+                    !Require(after == before, "materialization refusal preserves all appeared bytes, names and file IDs")) return false;
+            }
+            std::vector<Tx::AcceptedTransaction> transactions(1);
+            if (!Require(!owner.LoadAcceptedTransactionsSinceCleanup(transactions, &error) && !error.empty() &&
+                    transactions.empty() && !owner.Begin() && !owner.Abort() &&
+                    owner.ObservedJournalWriterLeaseGeneration() == generation &&
+                    SameStartupWatermarks(owner.Watermarks(), watermarks),
+                    "later strict history cannot adopt newly appeared valid or invalid WAL evidence") ||
+                !CaptureStartupEvidence(fixture, after) ||
+                !Require(after == before, "history refusal and Abort still write no records")) return false;
+            return true;
+        };
+        const bool passed = exercise();
+        const bool closed = CloseHandle(parent) != FALSE;
+        if (!Require(passed && closed, "appeared-file case completes under its retained direct parent") ||
+            !CaptureStartupEvidence(fixture, after) ||
+            !Require(after == before, "appeared original files survive owner and parent-pin destruction")) return false;
+    }
+
+    for (bool originally_present : {false, true})
+    {
+        const auto fixture = directory / (originally_present ? "unproven-existing" : "generic-append-escape");
+        std::filesystem::create_directories(fixture);
+        const auto path = fixture / "owner.wal";
+        if (originally_present && !WriteBytes(path, {0x01}, std::ios::trunc)) return false;
+        {
+            Wal owner({path, kVolume, 0});
+            const auto read = owner.ReadStartupEvidence({64ull << 20, 1000000}, 256ull << 20);
+            if (!Require((originally_present ? read.status != Wal::ReadStatus::Ok : read.status == Wal::ReadStatus::Ok) &&
+                    read.records.empty(), "direct WAL control observes missing or unproven original history")) return false;
+            const auto generation = owner.ExclusiveWriterLeaseGeneration();
+            const auto opens = owner.SnapshotCounters().append_handle_open_count;
+            if (!originally_present && !WriteBytes(path, {0x01}, std::ios::trunc)) return false;
+            if (!CaptureStartupEvidence(fixture, before)) return false;
+            if (!Require(owner.AppendWithResult(MakeRecord(1), true, generation) == Wal::AppendResult::RejectedBeforeWrite &&
+                    owner.AppendBatchWithResult({MakeRecord(1)}, true, generation) == Wal::AppendResult::RejectedBeforeWrite &&
+                    owner.CompactWithResult(1, generation) == Wal::CompactionResult::RejectedBeforeWrite &&
+                    !owner.AcquireExclusiveWriterLease() && !owner.MaterializeAbsentStartupJournal() &&
+                    owner.ValidatedAppendLeaseGeneration(true) == 0 && owner.HasExclusiveWriterLease() &&
+                    generation != 0 && owner.ExclusiveWriterLeaseGeneration() == generation &&
+                    owner.SnapshotCounters().append_handle_open_count == opens &&
+                    owner.SnapshotCounters().append_handle_flush_count == 0,
+                    "generic single/batch append, compaction and acquisition cannot bypass strict startup proof") ||
+                !CaptureStartupEvidence(fixture, after) ||
+                !Require(after == before, "direct WAL generic refusals preserve all bytes and the original file ID")) return false;
+        }
+        if (!CaptureStartupEvidence(fixture, after) ||
+            !Require(after == before, "direct refused WAL owner destruction preserves original evidence")) return false;
+    }
+    return true;
 }
 
 bool TestCompactionAndSizeLimit(const std::filesystem::path& root)
@@ -4058,10 +5217,22 @@ int main(int argc, char** argv)
     {
         if (filter.empty() || std::string_view(name).find(filter) != std::string_view::npos)
         {
-            ok &= test(root);
+            const auto before = check_count;
+            const bool passed = test(root);
+            ok &= passed;
+            std::cout << (passed ? "[PASS] " : "[FAIL] ") << name
+                << " checks=" << check_count - before << std::endl;
         }
     };
     run("TestAppendReadbackAndVolumeBinding", TestAppendReadbackAndVolumeBinding);
+    run("TestLongPathWalDurabilityAndBinding", TestLongPathWalDurabilityAndBinding);
+    run("TestLongPathWalTornTailAndFailure", TestLongPathWalTornTailAndFailure);
+    run("TestLongPathWalCompactionRestartAndAliases", TestLongPathWalCompactionRestartAndAliases);
+    run("TestLongPathWalDerivedBoundary", TestLongPathWalDerivedBoundary);
+    run("TestWalPathResolutionUncShareRoot", TestWalPathResolutionUncShareRoot);
+    run("TestWalPathResolutionReservedNames", TestWalPathResolutionReservedNames);
+    run("TestWalPathResolutionUncUnsupportedComponents", TestWalPathResolutionUncUnsupportedComponents);
+    run("TestWalPathResolutionPreservedNamespaces", TestWalPathResolutionPreservedNamespaces);
     run("TestInodeMetadataCodec", TestInodeMetadataCodec);
     run("TestInodeMetadataWal", TestInodeMetadataWal);
     run("TestAllocationSizeRoundTripAndValidation", TestAllocationSizeRoundTripAndValidation);
@@ -4078,6 +5249,9 @@ int main(int argc, char** argv)
     run("TestStrictRepairFailuresRetainWriterLease", TestStrictRepairFailuresRetainWriterLease);
     run("TestChecksumAndVersionRejection", TestChecksumAndVersionRejection);
     run("TestAppendResultDistinguishesPrewriteAndAmbiguousFlush", TestAppendResultDistinguishesPrewriteAndAmbiguousFlush);
+    run("TestReadOnlyAppendObservationRetainsCompletedCompaction", TestReadOnlyAppendObservationRetainsCompletedCompaction);
+    run("TestStartupJournalEvidencePreservation", TestStartupJournalEvidencePreservation);
+    run("TestStartupJournalAbsentMaterialization", TestStartupJournalAbsentMaterialization);
     run("TestCompactionAndSizeLimit", TestCompactionAndSizeLimit);
     run("TestCompactionPostReplaceFailureIsAmbiguous", TestCompactionPostReplaceFailureIsAmbiguous);
     run("TestAmbiguousRenameResultPreservesPublishedReplacement", TestAmbiguousRenameResultPreservesPublishedReplacement);
@@ -4131,13 +5305,13 @@ int main(int argc, char** argv)
         "APFSACCESS_KEEP_WAL_TEST_ARTIFACTS",
         keep_buffer.data(),
         static_cast<DWORD>(keep_buffer.size())) != 0;
-    if (ok || !keep_artifacts)
+    if (!keep_artifacts)
     {
         std::filesystem::remove_all(root, ec);
     }
     else
     {
-        std::cerr << "[INFO] Retained failed test artifacts at " << root << std::endl;
+        std::cout << "[INFO] Retained test artifacts at " << root << std::endl;
     }
     if (!ok)
     {

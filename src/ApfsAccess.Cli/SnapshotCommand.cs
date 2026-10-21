@@ -7,7 +7,8 @@ namespace ApfsAccess.Cli;
 
 internal static class SnapshotCommand
 {
-    internal const string Usage = "snapshots list --image ABSOLUTE_FILE --container-id APFS_CONTAINER_ID --volume-oid OID [--json]";
+    internal const string Usage = "snapshots list --image ABSOLUTE_FILE --container-id APFS_CONTAINER_ID --volume-oid OID [--json] | " +
+        SnapshotBrowseCommand.Usage + " | " + SnapshotSpaceCommand.Usage;
 
     internal static int Run(string[] args, Func<string, string, string, JsonElement>? read = null, CancellationToken cancellationToken = default)
     {

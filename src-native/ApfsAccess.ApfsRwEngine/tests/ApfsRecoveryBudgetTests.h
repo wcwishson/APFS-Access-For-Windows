@@ -141,7 +141,7 @@ inline bool TestApfsRecoveryBudgetSpacemanReferences()
 
 inline bool TestApfsRecoveryBudgetPendingHistory()
 {
-    Source raw;
+    Source raw(MetadataImage());
     auto checkpoint = MetadataCheckpoint();
     const std::vector<std::uint64_t> requested{7, 7, 7};
     std::vector<AppleRecoveryCheckpointView> output(1);

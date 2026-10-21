@@ -34,6 +34,21 @@ public sealed class ObserverRunnerHardeningTests
     }
 
     [Fact]
+    public async Task ParallelShortOutput_AlwaysCapturesContentAndExit()
+    {
+        const int count = 24;
+        var results = await Task.WhenAll(Enumerable.Range(0, count).Select(index => Task.Run(() =>
+            new ProcessObserverRunner().Run("cmd.exe", ["/d", "/c", "echo", $"observer-output-{index}"]))));
+
+        for (var index = 0; index < count; index++)
+        {
+            Assert.Equal(0, results[index].ExitCode);
+            Assert.Equal($"observer-output-{index}\r\n", results[index].StandardOutput);
+            Assert.Equal(string.Empty, results[index].StandardError);
+        }
+    }
+
+    [Fact]
     public void HangingProcess_WithShortTimeout_ThrowsTimeoutAndKillsTree()
     {
         var runner = new ProcessObserverRunner { Timeout = TimeSpan.FromSeconds(2) };

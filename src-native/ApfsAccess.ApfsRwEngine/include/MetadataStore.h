@@ -29,13 +29,30 @@
 #include <utility>
 #include <vector>
 
+namespace apfsaccess::catalog { class ContainerMountCoordinator; }
+
 namespace apfsaccess::rw
 {
 struct AppleVolumeReplayBoundary;
 class TransactionManager;
+class PayloadSpool;
+class NativeHardLinkSession;
+struct NativeHardLinkOpenEntry;
+class NativeCloneRangeSession;
+struct NativeCloneRangeRequest;
+class NativeSparseSession;
+struct NativeSparseOpenEntry;
+struct NativeSparseRequest;
+struct NativeSparseAllocatedRange;
+struct AppleCheckpointPublicationPlan;
 class NativeApfsSnapshotProjection;
+class RawSnapshotRuntimeAuthority;
+struct RawSnapshotRuntimeAccess;
 class MetadataStore
 {
+    friend class catalog::ContainerMountCoordinator;
+    friend struct RawSnapshotRuntimeAccess;
+    struct PreparedAppleMetadataPlan;
     struct RawAttributeReadPlan;
     struct CompressionReadSnapshot;
 public:
@@ -92,6 +109,11 @@ public:
         RestoreDirectoryFromSymbolicLink = 14,
         RewriteCompressedContent = 15,
         CloneFile = 16,
+        RenameVolume = 17,
+        CreateSnapshot = 18,
+        DeleteSnapshot = 19,
+        SetVolumeQuotaReserve = 20,
+        RepairVolumeFileCount = 24,
     };
 
     enum class NativeWriteCommitModel
@@ -126,6 +148,12 @@ public:
         std::uint64_t generation = 0;
         std::optional<UnlinkOutcome> expected_unlink_outcome;
         std::vector<std::byte> inline_payload;
+        // Process-local callback bytes used to bind a manifest write after
+        // metadata staging. This is never serialized as metadata or WAL
+        // payload; the prepublication hook consumes it into the payload spool.
+        std::vector<std::byte> deferred_payload;
+        bool deferred_payload_bound = false;
+        bool operator==(const MutationRequest&) const = default;
     };
 
     struct ObjectMapUpdate
@@ -241,6 +269,15 @@ public:
         std::wstring device_path;
         std::wstring volume_name;
         bool allow_raw_physical_write = false;
+        // Explicit operator opt-in for canonical-commit writes to one admitted
+        // raw APFS store range (deny-write shared open, GPT disk GUID plus APFS
+        // partition containment binding, container-range write clamp, and NXSB
+        // identity revalidation). Default-closed; test-only overrides never
+        // enable this path.
+        bool allow_raw_device_canonical_commit = false;
+        // Explicit runtime; raw additionally needs opaque authority enrollment.
+        // Full native snapshot census is mandatory for both source forms.
+        bool allow_native_snapshot_runtime = false;
         bool integrity_check_on_mount = true;
         std::wstring crash_replay_mode = L"FailClosed";
         bool allow_legacy_scaffold_for_fixtures = true;
@@ -291,12 +328,70 @@ public:
     [[nodiscard]] std::optional<std::uint64_t> TotalSizeBytes() const noexcept;
     [[nodiscard]] std::optional<std::uint64_t> FreeSizeBytes() const noexcept;
     [[nodiscard]] std::optional<std::uint64_t> CheckpointXid() const noexcept;
+    // Changes whenever the store is explicitly re-prepared. Coordinators use
+    // this to detect a retained borrowed-store reload that did not publish a
+    // new checkpoint/XID.
+    [[nodiscard]] std::uint64_t StateEpoch() const noexcept;
+    [[nodiscard]] std::uint64_t DebugAppleTransactionPlanningCount() const noexcept;
     [[nodiscard]] const catalog::AppleCheckpointView* AuthoritativeAppleCheckpointView() const noexcept;
     [[nodiscard]] bool ValidateRequiredRecoveryCheckpoints(
         const std::vector<std::uint64_t>& checkpoint_xids, std::string& error) const;
     [[nodiscard]] bool FindAcceptedReplayBoundary(std::uint64_t accepted_preimage_xid,
         AppleVolumeReplayBoundary& boundary, std::string& error) const;
+    // Read-only, bounded sole-owner ordinary-image proof from the original WAL.
+    // Caller serializes all mutations on the shared device through receipt
+    // handoff and retains its exclusive source observation across that handoff.
+    // Reconstructs complete canonical publications using uncached source reads.
+    [[nodiscard]] bool ProveRetainedAcceptedPrefix(TransactionManager& journal,
+        PayloadSpool& spool, const std::filesystem::path& journal_path, const std::string& volume_identity,
+        std::vector<std::uint64_t>& applied_sequences, std::string& error) const;
+    // Separate backup-image proof: exactly one accepted in-place plain Write
+    // since cleanup, <=1 MiB payload and <=8 MiB EOF, immediate successor only.
+    // Requires the original WAL/spool and exclusive whole-image owner. Returns
+    // no receipt until full canonical publication and retained history readback.
+    [[nodiscard]] bool ProveBackupRetainedAcceptedWrite(TransactionManager& journal,
+        PayloadSpool& spool, const std::filesystem::path& journal_path, const std::string& volume_identity,
+        std::vector<std::uint64_t>& applied_sequences, std::string& error) const;
+    // Explicit backup counterpart for bounded typed ordinary batches. Keeps the
+    // ordinary entry closed to snapshot runtime. Requires caller serialization
+    // and original WAL durability before proof/flush/watermark handoff.
+    [[nodiscard]] bool ProveBackupRetainedAcceptedPrefix(TransactionManager& journal,
+        PayloadSpool& spool, const std::filesystem::path& journal_path, const std::string& volume_identity,
+        std::vector<std::uint64_t>& applied_sequences, std::string& error) const;
+    // Flush only the held exclusive whole backup image after exact proof. Does
+    // not mark, clean, reopen, or grant mutable access to Device().
+    [[nodiscard]] bool FlushBackupImageRecoveryEvidence();
+    // The capability retains either the exact image owner or G08 held window.
+    // Physical use additionally requires its partition-derived original identity.
+    [[nodiscard]] bool ProveBackupRetainedAcceptedPrefix(TransactionManager& journal,
+        PayloadSpool& spool, const std::filesystem::path& journal_path, const std::string& volume_identity,
+        const class BackupRetainedSource& source, std::vector<std::uint64_t>& applied_sequences, std::string& error) const;
+    [[nodiscard]] bool FlushBackupRetainedRecoveryEvidence(const class BackupRetainedSource& source);
+    // Complete explicit backup profile on the same retained source. Staging and
+    // planning are private working state only: no WAL acceptance/publication grant.
+    // Initial held-window entry admits Write only; inventory/namespace operations
+    // require their own typed admission and recovery gates.
+    [[nodiscard]] bool PrepareBackupRetainedWritePath(const class BackupRetainedSource&, std::string& error);
+    [[nodiscard]] MutationStatus StageBackupRetainedMutation(const class BackupRetainedSource&,
+        const MutationRequest&, PayloadIdentity* = nullptr);
+    [[nodiscard]] bool PlanBackupRetainedPendingMutations(const class BackupRetainedSource&,
+        const std::vector<std::uint64_t>& pins, AppleCheckpointPublicationPlan&, std::string& error);
+    [[nodiscard]] MutationStatus StageBackupRetainedTypedMutation(const class BackupRetainedSource&,
+        const MutationRequest&, PayloadIdentity* = nullptr, std::optional<UnlinkOutcome>* = nullptr);
+    [[nodiscard]] bool PrepareBackupRetainedClone(const class BackupRetainedSource&,
+        const std::wstring& source_path, const std::wstring& target_path, MutationRequest&, std::string& error) const;
+    [[nodiscard]] bool PlanBackupRetainedTypedPendingMutations(const class BackupRetainedSource&,
+        const std::vector<std::uint64_t>& pins, AppleCheckpointPublicationPlan&, std::string& error);
+    [[nodiscard]] bool PlanBackupRetainedAcceptedMutations(const class BackupRetainedSource&,
+        TransactionManager& original, PayloadSpool&, AppleCheckpointPublicationPlan&, std::string& error);
+    [[nodiscard]] MutationStatus PreflightBackupRetainedCapacityMutations(const class BackupRetainedSource&,
+        std::span<const MutationRequest>, const std::vector<std::uint64_t>& pins = {});
     [[nodiscard]] bool PrepareNativeWritePath();
+    // Explicit raw-device writer admission. Requires the operator opt-in flag,
+    // a loaded authoritative container (for the range limit and the identity
+    // revalidation tuple), and a successful exclusive GPT-bound open. Fails
+    // closed with a typed reason; regular files never take this path.
+    [[nodiscard]] bool AdmitRawDeviceWriter(std::string& out_error);
     // Single-use initialization on a fresh store, serialized with all queries.
     // The context path is an absolute ordinary local image. Device offset must
     // equal expected.scope.store_offset_bytes; all identity fields are exact.
@@ -366,11 +461,33 @@ public:
     [[nodiscard]] bool UsesScaffoldCommitBlob() const noexcept;
     [[nodiscard]] std::size_t PendingMutationCount() const noexcept;
     [[nodiscard]] bool PendingMutationsAreContentWritesOnly() const noexcept;
+    // Metadata serialization required. This proves the pending shape, not WAL durability.
+    [[nodiscard]] std::optional<PayloadIdentity> PendingWriteTimestampIdentity(
+        const std::wstring& path, std::uint64_t object_id) const;
+    struct FreshFileCohort
+    {
+        std::wstring path;
+        PayloadIdentity identity{};
+        std::uint64_t source_checkpoint = 0;
+        std::vector<MutationRequest> initial_attributes;
+    };
+    // Shape proof only. The caller must separately prove durable acceptance and pins.
+    [[nodiscard]] bool PendingFreshFileCohortMatches(const FreshFileCohort& cohort) const;
+    // Metadata serialization required. Never substitute zeros for a missing written range.
+    [[nodiscard]] bool ReadPendingFreshFileCohortRange(const FreshFileCohort& cohort,
+        std::uint64_t offset, std::span<std::byte> destination,
+        const std::function<bool(std::uint64_t, std::span<std::byte>)>& read_written_range) const;
     [[nodiscard]] bool PendingMutationsAreDeletesOnly() const noexcept;
     [[nodiscard]] bool PendingMutationsCanSkipPreflightInodeGraphValidation() const noexcept;
     [[nodiscard]] bool PendingMutationsCanSkipPreflightProjectedBtreeValidation() const noexcept;
     [[nodiscard]] bool PendingMutationsCanContinueDeferredClose() const;
     [[nodiscard]] std::size_t PendingObjectMapUpdateCount() const noexcept;
+    // Management must not discard direct allocator reservations during reload.
+    // Conservatively includes any working free-list/cursor divergence.
+    [[nodiscard]] bool HasUncommittedAllocatorState() const noexcept {
+        return working_next_ephemeral_extent_ != next_ephemeral_extent_ ||
+            working_spaceman_free_extents_ != committed_spaceman_free_extents_;
+    }
     [[nodiscard]] std::size_t PendingAllocationCount() const noexcept;
     [[nodiscard]] std::size_t PendingSpacemanAllocationIndexCount() const noexcept;
     [[nodiscard]] std::size_t PendingDeallocationCount() const noexcept;
@@ -482,6 +599,8 @@ public:
     // further mutations: an acceptance append may have persisted.
     [[nodiscard]] CloneAcceptance AcceptNativeClone(TransactionManager& journal,
         const std::wstring& source, const std::wstring& target, CloneReceipt& receipt);
+    [[nodiscard]] CloneAcceptance AcceptBackupRetainedClone(const class BackupRetainedSource&, TransactionManager&,
+        const std::wstring& source, const std::wstring& target, CloneReceipt&, std::string& error);
     // Drained source; new target only. Does not reserve an inode or expose a target.
     [[nodiscard]] bool PrepareNativeClone(const std::wstring& source, const std::wstring& target, MutationRequest& out) const;
     enum class CloneReplay { Refused, Staged, AlreadyPublished };
@@ -490,7 +609,72 @@ public:
     // the first changed retained checkpoint, even if the source is now unlinked.
     [[nodiscard]] CloneReplay ReplayNativeClone(const WriteAheadLog::Record& record,
         std::uint64_t accepted_preimage_checkpoint);
+    [[nodiscard]] CloneReplay ReplayBackupRetainedClone(const class BackupRetainedSource&, const WriteAheadLog::Record&,
+        std::uint64_t accepted_preimage_checkpoint);
     [[nodiscard]] static bool NativeCloneFromWal(const WriteAheadLog::Record& record, MutationRequest& out);
+    enum class HardLinkAcceptance { Refused, Accepted, RecoveryRequired };
+    enum class HardLinkPublication { Refused, Published, AlreadyPublished, RecoveryRequired };
+    struct HardLinkReceipt { std::uint64_t transaction_id=0, sequence=0, checkpoint=0, source=0; };
+    using HardLinkSessionConsumer = std::function<HardLinkAcceptance(const NativeHardLinkSession&, std::string&)>;
+    // Open-entry values are revalidated references. The host retains the actual
+    // source and directory handles and owner gates throughout this callback.
+    [[nodiscard]] HardLinkAcceptance WithNativeHardLinkSession(
+        const NativeHardLinkOpenEntry& source, const NativeHardLinkOpenEntry& destination_directory,
+        const std::wstring& destination_leaf, std::uint64_t timestamp_ns,
+        const HardLinkSessionConsumer& consumer, std::string& error);
+    [[nodiscard]] HardLinkAcceptance AcceptNativeHardLink(TransactionManager&,
+        const NativeHardLinkSession&, HardLinkReceipt&, std::string& error);
+    // Dedicated ordinary sole-image owner only; caller holds exclusive store and
+    // original-journal gates. Acceptance exposes no working namespace change.
+    // Any ambiguous append/publication requires a fresh owner; retain all WAL.
+    [[nodiscard]] HardLinkAcceptance AcceptNativeHardLink(TransactionManager& journal,
+        const std::wstring& source, const std::wstring& target, std::uint64_t timestamp_ns,
+        HardLinkReceipt& receipt, std::string& error);
+    // Selects exactly one original accepted typed transaction since cleanup.
+    // Shared-coordinator, raw, encrypted, Fusion and snapshot owners refuse.
+    [[nodiscard]] HardLinkPublication PublishOrRecoverNativeHardLink(
+        TransactionManager& journal, std::string& error);
+    using HardLinkPostpublicationHook = std::function<bool(const MetadataStore&, std::string&)>;
+    // Runs after full image readback and committed reload, before durable/cleaned
+    // markers. Failure retains the accepted original for fresh-owner recovery.
+    [[nodiscard]] HardLinkPublication PublishOrRecoverNativeHardLink(
+        TransactionManager&, const HardLinkPostpublicationHook&, std::string& error);
+    enum class SparseAcceptance { Refused, Accepted, RecoveryRequired };
+    enum class SparsePublication { Refused, Published, AlreadyPublished, RecoveryRequired };
+    struct SparseReceipt { std::uint64_t transaction_id=0, sequence=0, checkpoint=0, inode=0; };
+    using SparseSessionConsumer = std::function<bool(const NativeSparseSession&, std::string&)>;
+    // The host borrows its actual open binding under owner gates for this
+    // synchronous callback. A path or serialized client record is no capability.
+    [[nodiscard]] bool WithNativeSparseSession(const NativeSparseOpenEntry&,
+        const SparseSessionConsumer&, std::string& error);
+    [[nodiscard]] SparseAcceptance AcceptNativeSparse(TransactionManager&, const NativeSparseSession&,
+        const NativeSparseRequest&, SparseReceipt&, std::string& error);
+    [[nodiscard]] SparseAcceptance AcceptNativeSparseV2(TransactionManager&, const NativeSparseSession&,
+        const NativeSparseRequest&, SparseReceipt&, std::string& error);
+    [[nodiscard]] bool QueryNativeAllocatedRanges(const NativeSparseSession&, std::uint64_t offset,
+        std::uint64_t length, std::size_t maximum, std::vector<NativeSparseAllocatedRange>&, std::string& error) const;
+    [[nodiscard]] bool QueryNativeAllocatedRangesV2(const NativeSparseSession&, std::uint64_t offset,
+        std::uint64_t length, std::size_t maximum, std::vector<NativeSparseAllocatedRange>&, std::string& error) const;
+    using SparsePostpublicationHook = std::function<bool(const MetadataStore&, std::string&)>;
+    // Exactly one original accepted sparse transaction since cleanup. No
+    // generic MetadataStore replay, raw, encrypted, Fusion or shared owner.
+    [[nodiscard]] SparsePublication PublishOrRecoverNativeSparse(TransactionManager&,
+        const SparsePostpublicationHook&, std::string& error);
+    [[nodiscard]] SparsePublication PublishOrRecoverNativeSparse(TransactionManager&, std::string& error);
+    enum class CloneRangeAcceptance { Refused, Accepted, RecoveryRequired };
+    enum class CloneRangePublication { Refused, Published, AlreadyPublished, RecoveryRequired };
+    struct CloneRangeReceipt { std::uint64_t transaction_id=0, sequence=0, checkpoint=0, source_inode=0, target_inode=0; };
+    using CloneRangeSessionConsumer = std::function<bool(const NativeCloneRangeSession&, std::string&)>;
+    // The caller retains both actual opens and its owner/journal gates for this
+    // synchronous borrow. Paths and serialized proofs cannot mint a session.
+    [[nodiscard]] bool WithNativeCloneRangeSession(const NativeHardLinkOpenEntry& source,
+        const NativeHardLinkOpenEntry& target, const CloneRangeSessionConsumer&, std::string& error);
+    [[nodiscard]] CloneRangeAcceptance AcceptNativeCloneRange(TransactionManager&, const NativeCloneRangeSession&,
+        const NativeCloneRangeRequest&, CloneRangeReceipt&, std::string& error);
+    using CloneRangePostpublicationHook = std::function<bool(const MetadataStore&, std::string&)>;
+    [[nodiscard]] CloneRangePublication PublishOrRecoverNativeCloneRange(TransactionManager&,
+        const CloneRangePostpublicationHook&, std::string& error);
+    [[nodiscard]] CloneRangePublication PublishOrRecoverNativeCloneRange(TransactionManager&, std::string& error);
     [[nodiscard]] bool PrepareCompressionRewrite(const std::wstring& path, MutationRequest& out) const;
     [[nodiscard]] static bool CompressionRewriteFromWal(const WriteAheadLog::Record& record, MutationRequest& out);
     // Use with the originating, still-open store. Compressed plans validate
@@ -542,6 +726,18 @@ public:
         ExtentAllocator::AddFreeExtentUndo* undo);
 
 private:
+    [[nodiscard]] bool FreshFileCohortHistoryMatches(const FreshFileCohort& cohort, bool for_payload) const;
+    SparseAcceptance AcceptNativeSparseImpl(TransactionManager&, const NativeSparseSession&,
+        const NativeSparseRequest&, SparseReceipt&, std::string&, bool scaled);
+    bool QueryNativeAllocatedRangesImpl(const NativeSparseSession&, std::uint64_t offset,
+        std::uint64_t length, std::size_t maximum, std::vector<NativeSparseAllocatedRange>&, std::string&, bool scaled) const;
+    friend struct NativeCheckpointHandoffTestAccess;
+    [[nodiscard]] bool LoadVolumeState(const catalog::RandomAccessSource& source);
+    [[nodiscard]] bool LoadContainerSuperblocks(const catalog::RandomAccessSource& source);
+    [[nodiscard]] bool LoadObjectMap(const catalog::RandomAccessSource* source,
+        const catalog::AppleCheckpointView* fresh_checkpoint,
+        std::optional<BlockDevice::StableImageIdentity> image_identity = {},
+        std::string raw_identity = {});
     [[nodiscard]] std::shared_ptr<const RawAttributeReadPlan> SnapshotRawAttributeReadPlan(
         std::uint64_t object_id, const std::string& name_utf8) const;
     [[nodiscard]] bool ReadRawAttributeRange(const RawAttributeReadPlan& plan,
@@ -615,7 +811,21 @@ private:
     [[nodiscard]] bool VerifyPublishedNativeClone(const MutationRequest& request) const;
     [[nodiscard]] bool PrepareNativeCloneCore(const std::wstring&, const std::wstring&, MutationRequest&, bool publishing) const;
     [[nodiscard]] CommitStatus CommitApplePendingMutations(
-        const std::vector<std::uint64_t>& required_checkpoint_xids, bool capacity_only = false);
+        const std::vector<std::uint64_t>& required_checkpoint_xids, bool capacity_only = false,
+        std::shared_ptr<PreparedAppleMetadataPlan>* out_prepared = nullptr,
+        std::shared_ptr<PreparedAppleMetadataPlan> prepared = {}, bool accepted_worker_handoff = false,
+        AppleCheckpointPublicationPlan* retained_replay_plan = nullptr,
+        const catalog::RandomAccessSource* retained_replay_source = nullptr, bool compact_plain_layout = true);
+    [[nodiscard]] CommitStatus CheckPendingAppleCapacity(
+        const std::vector<std::uint64_t>& required_checkpoint_xids,
+        std::shared_ptr<PreparedAppleMetadataPlan>* out_prepared, bool accepted_worker_handoff = false,
+        bool compact_plain_layout = true);
+    [[nodiscard]] CommitStatus CommitCanonicalTransaction(
+        const std::vector<std::uint64_t>& required_checkpoint_xids,
+        std::shared_ptr<PreparedAppleMetadataPlan> prepared, bool compact_plain_layout = true);
+    [[nodiscard]] CommitStatus CommitPendingMutations(
+        const std::vector<std::uint64_t>& required_checkpoint_xids,
+        std::shared_ptr<PreparedAppleMetadataPlan> prepared, bool compact_plain_layout = true);
     [[nodiscard]] MutationStatus ApplyMutationCore(const MutationRequest& request,
         PayloadIdentity* out_staged_payload_identity, std::optional<UnlinkOutcome>* out_unlink_outcome,
         bool capacity_preview, std::span<const MutationRequest> capacity_tail = {},
@@ -659,7 +869,8 @@ private:
     [[nodiscard]] std::vector<std::byte> ReadOrderedCheckpointWindowBytes(
         const std::vector<std::uint64_t>& ordered_blocks,
         std::size_t required_blocks) const;
-    [[nodiscard]] bool IsReservedMetadataBlock(std::uint64_t block_index) const;
+    [[nodiscard]] bool IsReservedMetadataBlock(std::uint64_t block_index,
+        bool reserve_private_checkpoint_band = true) const;
     [[nodiscard]] std::optional<std::uint64_t> ResolveNativeCheckpointBandStartBlock() const;
     [[nodiscard]] bool IsNativeCheckpointBandBlock(std::uint64_t block_index) const;
     [[nodiscard]] bool AreNativeCheckpointBlocksWritable(const std::vector<std::uint64_t>& block_indices) const;
@@ -679,7 +890,8 @@ private:
         std::vector<std::uint64_t> block_indices) const;
     [[nodiscard]] bool LoadObjectMapCheckpointBlock(std::uint64_t block_index, const std::vector<std::byte>& block);
     [[nodiscard]] bool LoadSpacemanCheckpointBlock(std::uint64_t block_index, const std::vector<std::byte>& block);
-    [[nodiscard]] bool LoadSpacemanChunkInfoState(std::uint64_t spaceman_block_index, const std::vector<std::byte>& block);
+    [[nodiscard]] bool LoadSpacemanChunkInfoState(std::uint64_t spaceman_block_index, const std::vector<std::byte>& block,
+        const catalog::RandomAccessSource* proof_source = nullptr);
     [[nodiscard]] bool RefreshNativeReadExtentProjection();
     [[nodiscard]] std::optional<std::uint64_t> ResolveInodeCheckpointBlockIndex() const;
     [[nodiscard]] bool LoadInodeCheckpointBlock(std::uint64_t block_index, const std::vector<std::byte>& block);
@@ -992,6 +1204,10 @@ private:
     // Shared raw-device lease: private per store by default, shared across
     // sibling sessions when a container coordinator supplies one.
     std::shared_ptr<BlockDevice> device_;
+    // Default-empty enrollment; the runtime grants only one exact SNP2 payload
+    // while its original coordinator serializes staging and publication.
+    std::weak_ptr<const RawSnapshotRuntimeAuthority> raw_snapshot_runtime_authority_;
+    mutable std::vector<std::byte> raw_snapshot_runtime_payload_;
     bool container_loaded_ = false;
     bool object_map_loaded_ = false;
     bool spaceman_loaded_ = false;
@@ -1030,6 +1246,7 @@ private:
     std::uint64_t working_next_ephemeral_extent_ = 0;
     std::uint64_t next_generated_object_id_ = 1;
     std::uint64_t highest_committed_apple_file_system_object_id_ = 0;
+    std::uint64_t state_epoch_ = 0;
     bool native_write_ready_ = false;
     bool commit_path_ready_ = false;
     bool canonical_state_loaded_ = false;
@@ -1286,6 +1503,11 @@ private:
     mutable PerfCounter commit_pending_perf_;
     mutable PerfCounter commit_transaction_perf_;
     mutable PerfCounter commit_canonical_perf_;
+    mutable PerfCounter apple_filesystem_tree_read_perf_;
+    mutable PerfCounter apple_record_preparation_perf_;
+    mutable PerfCounter apple_transaction_planning_perf_;
+    mutable PerfCounter apple_checkpoint_publication_perf_;
+    mutable PerfCounter apple_canonical_state_reload_perf_;
     mutable PerfCounter validate_inode_graph_perf_;
     mutable PerfCounter snapshot_committed_inodes_perf_;
     mutable PerfCounter read_committed_range_perf_;
@@ -1299,8 +1521,16 @@ private:
     mutable PerfCounter persist_replay_checkpoint_perf_;
     mutable PerfCounter persist_superblock_checkpoint_perf_;
     mutable PerfCounter take_last_committed_inode_changes_perf_;
+    mutable PerfCounter committed_directory_link_index_rebuild_perf_;
+    mutable PerfCounter committed_btree_index_rebuild_perf_;
+    mutable PerfCounter ensure_root_state_perf_;
     void ClearSnapshotReadState();
     bool immutable_snapshot_view_ = false;
     std::shared_ptr<const NativeApfsSnapshotProjection> native_snapshot_projection_;
+    // A canonical raw-volume projection is immutable for a checkpoint XID.
+    // Reusing it avoids rescanning the complete native catalog after every
+    // metadata reload while still forcing a fresh projection for each new
+    // durable checkpoint.
+    std::optional<std::uint64_t> native_read_extent_projection_checkpoint_xid_;
 };
 } // namespace apfsaccess::rw

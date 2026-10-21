@@ -1,0 +1,2461 @@
+{
+  "commit": "2edbcf3161084b51dbe11b8a960b0bc7c224b851",
+  "archiveSha256": "6f23c80c85c3e38f6ce9d5ee25446859fb0e994b2aa5755bd62e5b2cbecc8b7c",
+  "patchSha256": "7e3051bbfdbdaf2d3b085e33e82cc296952d4db79d8313d78af2e808bb6a4247",
+  "files": [
+    {
+      "path": "SMBLibrary/Authentication/GSSAPI/Enums/GSSAttributeName.cs",
+      "sha256": "551d8e756052590e938b4ac36d7abb5564b6afac36716c3c0a4d3fedceabbed6"
+    },
+    {
+      "path": "SMBLibrary/Authentication/GSSAPI/GSSProvider.cs",
+      "sha256": "ccab31b4135574f332a949eada73208f596c89d1394e7f574bf1da2a61e183e3"
+    },
+    {
+      "path": "SMBLibrary/Authentication/GSSAPI/IGSSMechanism.cs",
+      "sha256": "dc7a93b17392795711c7b0fa6ade497478373bf1f34481f9f23f133060e314cd"
+    },
+    {
+      "path": "SMBLibrary/Authentication/GSSAPI/SPNEGO/DerEncodingHelper.cs",
+      "sha256": "f13f05189ca32d6090474ccae05981a26b8aea61b9352f756329a0690a756157"
+    },
+    {
+      "path": "SMBLibrary/Authentication/GSSAPI/SPNEGO/SimpleProtectedNegotiationToken.cs",
+      "sha256": "16614af7bf16db55b9f3e5e23bfdcd9cda5a01a9287f362c57ef0114332b3e10"
+    },
+    {
+      "path": "SMBLibrary/Authentication/GSSAPI/SPNEGO/SimpleProtectedNegotiationTokenInit.cs",
+      "sha256": "459ef9588126af9a889052ed82c1476241daddd92a279b30ec40a91f720f42ef"
+    },
+    {
+      "path": "SMBLibrary/Authentication/GSSAPI/SPNEGO/SimpleProtectedNegotiationTokenInit2.cs",
+      "sha256": "0e46ea06b32c9ca4cdadf0989b8164ee6eb0243ed2a1c763a398bd3b738aac5f"
+    },
+    {
+      "path": "SMBLibrary/Authentication/GSSAPI/SPNEGO/SimpleProtectedNegotiationTokenResponse.cs",
+      "sha256": "ae64b057a8cb63c49db8d241a77c13f35276f588e0d0d05f7af16f193a44a12e"
+    },
+    {
+      "path": "SMBLibrary/Authentication/LoginCounter.cs",
+      "sha256": "ac916572e2dc584fed30a627f126744ce97e14a494b921041433e59a3fc3d0b3"
+    },
+    {
+      "path": "SMBLibrary/Authentication/NTLM/Helpers/AuthenticationMessageUtils.cs",
+      "sha256": "64f38475a81185ebec687dcd7ad495026098fb2dafe16a20e2d7ac662b11935e"
+    },
+    {
+      "path": "SMBLibrary/Authentication/NTLM/Helpers/AVPairUtils.cs",
+      "sha256": "21f402c6053b6c0248ce982d27d32df9785f36bd4f6eead50c31ea9f7303feb5"
+    },
+    {
+      "path": "SMBLibrary/Authentication/NTLM/Helpers/MD4.cs",
+      "sha256": "bd12e2ff706de34d3336a35c6c241e2233ebb2a4e0dd3c8a5ffdcc9d50c9f6cd"
+    },
+    {
+      "path": "SMBLibrary/Authentication/NTLM/Helpers/NTLMCryptography.cs",
+      "sha256": "39bdf728021c662c36f074bcfb8ca68a34eb5a2ddfb691c1279c1d4fb6d53369"
+    },
+    {
+      "path": "SMBLibrary/Authentication/NTLM/Helpers/RC4.cs",
+      "sha256": "6b16471ce8ae83c51f8e76eea89dfdf6b781ad952e0d0e5df1cc5084fa74a5d0"
+    },
+    {
+      "path": "SMBLibrary/Authentication/NTLM/IndependentNTLMAuthenticationProvider.cs",
+      "sha256": "4259f3d089154f458e8fc2cd24fcd5e4622611fa8752d9acb040d9d67d1f1e37"
+    },
+    {
+      "path": "SMBLibrary/Authentication/NTLM/NTLMAuthenticationProviderBase.cs",
+      "sha256": "fcdc93f58a9a865205e68058d5c109d9a6319d39474467a6de0a67c97d1b0641"
+    },
+    {
+      "path": "SMBLibrary/Authentication/NTLM/Structures/AuthenticateMessage.cs",
+      "sha256": "26d4bacc9f3330a3a59fb478c33c10955f4ddf34f4772ff52b9c20de1a91f4ae"
+    },
+    {
+      "path": "SMBLibrary/Authentication/NTLM/Structures/ChallengeMessage.cs",
+      "sha256": "cca2f937376944221a581caeafafb13fce34e0290fd0a7b7af1187c12a13df10"
+    },
+    {
+      "path": "SMBLibrary/Authentication/NTLM/Structures/Enums/AVPairKey.cs",
+      "sha256": "d5e2b945efd823c4b1625d5852e782a88bd9e225027f88e1811e9215911c96d4"
+    },
+    {
+      "path": "SMBLibrary/Authentication/NTLM/Structures/Enums/MessageTypeName.cs",
+      "sha256": "569b8a97282937f255eba3197e47283b1e303120b805de7a12ca39835f89a108"
+    },
+    {
+      "path": "SMBLibrary/Authentication/NTLM/Structures/Enums/NegotiateFlags.cs",
+      "sha256": "d4c6c0dc4101a462b59e89e67464a78ce119d3e2ca9a8b11abbebc7507c99d51"
+    },
+    {
+      "path": "SMBLibrary/Authentication/NTLM/Structures/NegotiateMessage.cs",
+      "sha256": "18a2c09b4624cfd7f201b7095d373825c23bf1f27c185a8004accd89face9566"
+    },
+    {
+      "path": "SMBLibrary/Authentication/NTLM/Structures/NTLMv2ClientChallenge.cs",
+      "sha256": "b4ebd14ba1af18d60e76965ab7bd2a60ba150ba7a49e4f162cd3427346d0bfc4"
+    },
+    {
+      "path": "SMBLibrary/Authentication/NTLM/Structures/NTLMVersion.cs",
+      "sha256": "6fa64e95ced849899d848808eb62e68fe79a03e8543f521cabbb3a42961880bd"
+    },
+    {
+      "path": "SMBLibrary/Client/Authentication/IAuthenticationClient.cs",
+      "sha256": "f26b353aaa43fff1dcc6a3e98757802209806a8af565d77ce38f727effaf06b0"
+    },
+    {
+      "path": "SMBLibrary/Client/Authentication/NTLMAuthenticationClient.cs",
+      "sha256": "12ee30faad71299daa7037b24e4edfe1de9752e085a0d644aa8bec59e5f846aa"
+    },
+    {
+      "path": "SMBLibrary/Client/ConnectionState.cs",
+      "sha256": "e399f8dbec81306bdcb422e17a3c53865ca4bc4d3ba37872fc9d80105601cc23"
+    },
+    {
+      "path": "SMBLibrary/Client/DFS/DfsNamespaceResolver.cs",
+      "sha256": "10c3a94140fe45d54f3debeeaff888a664e32bd5258b0da57c1962ce50c00a11"
+    },
+    {
+      "path": "SMBLibrary/Client/DFS/DfsPath.cs",
+      "sha256": "04294b90d5e32f211a632c2c22cdf6260906d2b5229bc1bc0da6601630a2585e"
+    },
+    {
+      "path": "SMBLibrary/Client/DFS/DfsReferralHelper.cs",
+      "sha256": "eb42c3522b8e2c0c0997de5c68c7a071cd9428c98b18ff8e0afba5bb1d94ac61"
+    },
+    {
+      "path": "SMBLibrary/Client/DFS/SMB2DfsFileStore.cs",
+      "sha256": "91da8e3e3287c62f1bb5052b1944d06c9d13135848a91d0baffa66f68b7353c0"
+    },
+    {
+      "path": "SMBLibrary/Client/Enums/AuthenticationMethod.cs",
+      "sha256": "2ec988cd4d8adfbe4f3b9e19aa8f0bb82455d04dee384ca8bba3aa613da663d3"
+    },
+    {
+      "path": "SMBLibrary/Client/Helpers/IPAddressHelper.cs",
+      "sha256": "91f4ea1aee1c8082433bb071abbd3101f6a009512270fc5ca1d49e1d91c2b800"
+    },
+    {
+      "path": "SMBLibrary/Client/Helpers/NamedPipeHelper.cs",
+      "sha256": "43bc60c81f50c9cdc895d0b0a7fc122d7e95499c1baa05aa52c3278f9dacfddd"
+    },
+    {
+      "path": "SMBLibrary/Client/Helpers/NTLMAuthenticationHelper.cs",
+      "sha256": "3835384d000dc93892ad3f0f25d178b94cb23fa5be641ca6870d30d2453b59be"
+    },
+    {
+      "path": "SMBLibrary/Client/Helpers/ServerServiceHelper.cs",
+      "sha256": "0ff72e12a914e114b597dba61ca319e8a715026eccc76f1253622e34a30928f3"
+    },
+    {
+      "path": "SMBLibrary/Client/ISMBClient.cs",
+      "sha256": "99e9ea7b74dad3b1442d997f8ecffb6d1e80ad25578c06d23ae7a403202f7e1b"
+    },
+    {
+      "path": "SMBLibrary/Client/ISMBFileStore.cs",
+      "sha256": "98f3fab8a74bbcf23a18111d0f5ec746c6d71bf2d42771cc3bc31fd2035636d6"
+    },
+    {
+      "path": "SMBLibrary/Client/NameServiceClient.cs",
+      "sha256": "f9986085e6b16b3c436d468e98e54e2cc93efc04c0cb3d5fcaf897c4694a5225"
+    },
+    {
+      "path": "SMBLibrary/Client/SMB1Client.cs",
+      "sha256": "8c73105c378cd4745a743ec1ac9f63a8a08c126518b9b124995653606e55dfab"
+    },
+    {
+      "path": "SMBLibrary/Client/SMB1FileStore.cs",
+      "sha256": "65b41d71517d8ecd6c2f7cd28e9ad0dcdf83a8938c9d293496de8d88b6ac4183"
+    },
+    {
+      "path": "SMBLibrary/Client/SMB2Client.cs",
+      "sha256": "713041f14448516d5716297763b30dc351d7c6a90bc840fdc4c4e3623b2adf9e"
+    },
+    {
+      "path": "SMBLibrary/Client/SMB2FileStore.cs",
+      "sha256": "2ab04ac01bd9b2ce51923fa698c9031f82c969b9e6578d13c529fb715c180be9"
+    },
+    {
+      "path": "SMBLibrary/DFS/DfsReferralEntry.cs",
+      "sha256": "5827f44057f3761d71b49427e0de9f0a32e5d0908ebda4be7e0269a19b4d96d7"
+    },
+    {
+      "path": "SMBLibrary/DFS/DfsReferralEntryV1.cs",
+      "sha256": "a5cb16ee8edbfa11747c5050c46d43469645d0d47e1e3328f66b6ba73c3b4dd2"
+    },
+    {
+      "path": "SMBLibrary/DFS/DfsReferralEntryV2.cs",
+      "sha256": "77a8c038f7c90087ee00db5371d0657694bdc2d677f5c62af54db49c12495e64"
+    },
+    {
+      "path": "SMBLibrary/DFS/DfsReferralEntryV3.cs",
+      "sha256": "e274854edd6ff4f43ac9df4f20c961cb5c20395e3a6af90861dbf836640de2bc"
+    },
+    {
+      "path": "SMBLibrary/DFS/DfsReferralEntryV4.cs",
+      "sha256": "8c839313a9b1e71c370ca319cd7cdf377226f830f8cb802edff7b2f9e7d344f8"
+    },
+    {
+      "path": "SMBLibrary/DFS/Enums/DfsReferralEntryFlags.cs",
+      "sha256": "0fee6b991b9dbd16bbfb93cc17353674e6fa79a5c3a5d7d057b6467ed425d329"
+    },
+    {
+      "path": "SMBLibrary/DFS/Enums/DfsReferralHeaderFlags.cs",
+      "sha256": "66b176b6f9555d612c264aebf6ecc257222b73f14f30c4a3f9cffa0791666150"
+    },
+    {
+      "path": "SMBLibrary/DFS/Enums/DfsServerType.cs",
+      "sha256": "e392bdbb9493d723dbdfbe06cffeba6e6b85b37746b1162c83418a656a199a4d"
+    },
+    {
+      "path": "SMBLibrary/DFS/Enums/RequestGetDfsReferralExFlags.cs",
+      "sha256": "ba0ab84c4109d9f108bde66198090c373f9e967f7924742f71e1e8337d07a773"
+    },
+    {
+      "path": "SMBLibrary/DFS/RequestGetDfsReferral.cs",
+      "sha256": "a1e4aca25baf66cb55555ab7e55c382c6ab493445ecba9b41b9c4016786e8a86"
+    },
+    {
+      "path": "SMBLibrary/DFS/RequestGetDfsReferralEx.cs",
+      "sha256": "d37f0c3da210841435f83d51463b567b0d119232ecc9eea6ac36bf4af5c617f7"
+    },
+    {
+      "path": "SMBLibrary/DFS/ResponseGetDfsReferral.cs",
+      "sha256": "3abf157b427e9dfdf3554c09806b6b9db398a0893cc58529a1d8638bb624b54d"
+    },
+    {
+      "path": "SMBLibrary/Enums/NTStatus.cs",
+      "sha256": "5e008d7ad2f19d01ffbc847fe5442c45e9a12ed14f9b1f6d66e84fc314803583"
+    },
+    {
+      "path": "SMBLibrary/Enums/SMBTransportType.cs",
+      "sha256": "b6172bee89c9e4e2f95ff2640eae4336f1fe54dd90ce547c955bbdeac4ea17a0"
+    },
+    {
+      "path": "SMBLibrary/Enums/Win32Error.cs",
+      "sha256": "f822495f1803db718d6f60f3059b8610a177ee171347027f4acbcdc0ca234379"
+    },
+    {
+      "path": "SMBLibrary/Exceptions/UnsupportedInformationLevelException.cs",
+      "sha256": "7426719af70132f4b186cf81f6dc1a2f0c3f32007a8e627c3fae938f366caadf"
+    },
+    {
+      "path": "SMBLibrary/Helpers/FileTimeHelper.cs",
+      "sha256": "279b3c578622612b6ed62cc15443d13b50229d627186b31dd1ad6609882f2ff8"
+    },
+    {
+      "path": "SMBLibrary/Helpers/SP800_1008.cs",
+      "sha256": "fa57bc90985fd4c4063ecc367368e10c1fc924e0daeca6979dc735efb395b0e1"
+    },
+    {
+      "path": "SMBLibrary/NetBios/NameServicePackets/Enums/NameRecordType.cs",
+      "sha256": "c9ce5afb0801e40acee70ae4fb04beacaa945e1c12d851c626e31c9f07585411"
+    },
+    {
+      "path": "SMBLibrary/NetBios/NameServicePackets/Enums/NameServiceOperation.cs",
+      "sha256": "d82823899e64cc476a6404679136cd9447a4e73e6c2786d0c01241d3341558ff"
+    },
+    {
+      "path": "SMBLibrary/NetBios/NameServicePackets/Enums/NetBiosSuffix.cs",
+      "sha256": "bf58dd92fe0a5eb5869da94a99d11e7257df93293aa4a8bda909f7f19ac0afd3"
+    },
+    {
+      "path": "SMBLibrary/NetBios/NameServicePackets/Enums/OperationFlags.cs",
+      "sha256": "9f4bbd17429e3e0210ccedfba81b0656933df8537736bb62d4b845aa996f8b65"
+    },
+    {
+      "path": "SMBLibrary/NetBios/NameServicePackets/Enums/QuestionClass.cs",
+      "sha256": "a28626e32921cf856e34f31fd85d993ef23ebef9ac0684f98877b4e94fb65c9a"
+    },
+    {
+      "path": "SMBLibrary/NetBios/NameServicePackets/Enums/ResourceRecordClass.cs",
+      "sha256": "7f76bb79dc1063ec0de005354adab8113af7fa93904b3705a08ef1f4d7e5427e"
+    },
+    {
+      "path": "SMBLibrary/NetBios/NameServicePackets/EnumStructures/NameFlags.cs",
+      "sha256": "63e3b2e74ee79a165560b6a75ca1ebca51ef89acce89f4749bb79553c9a2e2c2"
+    },
+    {
+      "path": "SMBLibrary/NetBios/NameServicePackets/NameQueryRequest.cs",
+      "sha256": "4f43c46be7a3cf3bd3cada01bd13ad253fe90c4e58df005d1bb90ad3ac5b3917"
+    },
+    {
+      "path": "SMBLibrary/NetBios/NameServicePackets/NameRegistrationRequest.cs",
+      "sha256": "979e1ec0cbbdbef146de314650489e41ce1ede7afb1a52e8128918d5feb4a63a"
+    },
+    {
+      "path": "SMBLibrary/NetBios/NameServicePackets/NameServicePacketHeader.cs",
+      "sha256": "48b7cbc47b452f9356f700454514d86d9a7716ff433de6c22ec356f9f49624a0"
+    },
+    {
+      "path": "SMBLibrary/NetBios/NameServicePackets/NodeStatusRequest.cs",
+      "sha256": "bbf93ca899d2dc970437781ffd981d869bcceba232b5ccc40634f8af03e0589f"
+    },
+    {
+      "path": "SMBLibrary/NetBios/NameServicePackets/NodeStatusResponse.cs",
+      "sha256": "d1778d16980ffa30d220ff7a6994d21ec7c5e18992f6a3e622948a743755e349"
+    },
+    {
+      "path": "SMBLibrary/NetBios/NameServicePackets/PositiveNameQueryResponse.cs",
+      "sha256": "a4bf9966c5f532f3f83d4a9381cac73fc8b9075a0f1eb7ebf97aefa050e3de9d"
+    },
+    {
+      "path": "SMBLibrary/NetBios/NameServicePackets/Structures/NodeStatistics.cs",
+      "sha256": "426ec4156f8f0c5116fd717222a96c00a79507635281b0c1f02215084645241c"
+    },
+    {
+      "path": "SMBLibrary/NetBios/NameServicePackets/Structures/QuestionSection.cs",
+      "sha256": "c2167f602270a95e3317ae7d11cac5b386bf2c99ea301fb845f8cc2c4a4e23e3"
+    },
+    {
+      "path": "SMBLibrary/NetBios/NameServicePackets/Structures/ResourceRecord.cs",
+      "sha256": "e2e0a929dcc91bc9ae83605c99f24c9f0bc4dfa2625d527f186d18494a90355b"
+    },
+    {
+      "path": "SMBLibrary/NetBios/NBTConnectionReceiveBuffer.cs",
+      "sha256": "ec9d56af4ca96669fc75e4b6b079ffad5ee557f50aac3471e0405f7f771d4c97"
+    },
+    {
+      "path": "SMBLibrary/NetBios/NetBiosUtils.cs",
+      "sha256": "6a2b10f9647df7f7a60bfc1d6f23e162d9ad62f1f833401ca8baa9ffbfa13d61"
+    },
+    {
+      "path": "SMBLibrary/NetBios/SessionPackets/Enums/SessionPacketTypeName.cs",
+      "sha256": "32037cb365c01df3d0dc4bbac4352d22e12e27d07ec62f6ce20d0366b5894396"
+    },
+    {
+      "path": "SMBLibrary/NetBios/SessionPackets/NegativeSessionResponsePacket.cs",
+      "sha256": "b5ddde9bffe026d8a7c31bbbd0c7b65538b363666a5f76274a7688d1cf7e80fc"
+    },
+    {
+      "path": "SMBLibrary/NetBios/SessionPackets/PositiveSessionResponsePacket.cs",
+      "sha256": "eabb40b5ae9875eba56385f7d0967442b9b4a7260bdcc65e4f17e764954d468b"
+    },
+    {
+      "path": "SMBLibrary/NetBios/SessionPackets/SessionKeepAlivePacket.cs",
+      "sha256": "09e5f445bdca978b37e6950761f1c78c6519c8189033dfa26313f57a3930a4c4"
+    },
+    {
+      "path": "SMBLibrary/NetBios/SessionPackets/SessionMessagePacket.cs",
+      "sha256": "d720ef42206278687a8dc59f12eeecfd2f3f543b2dbfdc9f3f6f594eb1eec00e"
+    },
+    {
+      "path": "SMBLibrary/NetBios/SessionPackets/SessionPacket.cs",
+      "sha256": "7d1454c7da59314b7382300d2bf4b0035e5d9ff94e01b4f49bdcde39420d4dd6"
+    },
+    {
+      "path": "SMBLibrary/NetBios/SessionPackets/SessionRequestPacket.cs",
+      "sha256": "127fcc241e8c9bcad0f0ad4eeff47ee5eb728d3e5985dd13c0ebc4de3f0bbc6e"
+    },
+    {
+      "path": "SMBLibrary/NetBios/SessionPackets/SessionRetargetResponsePacket.cs",
+      "sha256": "1c0858fef41b831182bba5ab87789cf6501834b963160f94c9644ad5a4f8d0d6"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/AccessMask/AccessMask.cs",
+      "sha256": "264def6504b80a482120acd6f3f7db2787f0b9c6e9c6f8c9465671e002271327"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/AccessMask/DirectoryAccessMask.cs",
+      "sha256": "6c56970cf25626e0455af94ae2831cf433ef2dc39b08145215880279fe330cab"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/AccessMask/FileAccessMask.cs",
+      "sha256": "623fb352d2e722b1ca4c1b2d7726caf3c76231e4aed3f1008a924b7471054a5b"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/FileInformation/CompressionFormat.cs",
+      "sha256": "c94fd9149867b8ac7336244b61de5088a2d15d5342e5e26ad877e39eac120b12"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/FileInformation/ExtendedAttributeFlags.cs",
+      "sha256": "d7851b3e04091a07dd5bb14299aabb23a71ec45bde65c3280cd80d50d59f3da2"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/FileInformation/FileAttributes.cs",
+      "sha256": "ae47fa90daed2d0220deab171c9f6130f4f8fe29516098d4f803729746fa3df3"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/FileInformation/FileInformationClass.cs",
+      "sha256": "ad24380b97f9c14522083fd40cf8d4be3d1938cfe34d346d2bc0281e013cde2a"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/FileSystemInformation/DeviceCharacteristics.cs",
+      "sha256": "e49bd15c595706b91a2e1a84510e9e2a9c4a96752de45f9e52cbd46857918181"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/FileSystemInformation/DeviceType.cs",
+      "sha256": "e5d4635317c1fb7f4029f059495563802b1cade25397684f41f9a2feac5173c3"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/FileSystemInformation/FileSystemAttributes.cs",
+      "sha256": "ac0b269bb5afbb50026d68033a355e17459136d20e1d7b8638aa8ccb8d3c982c"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/FileSystemInformation/FileSystemControlFlags.cs",
+      "sha256": "8d3d3a956a76bae58d00185fa4b8406f212a3bb11ed42a9aead1499ef323c8a0"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/FileSystemInformation/FileSystemInformationClass.cs",
+      "sha256": "6eada10920ef3a82a3a11b8c9b0f7451e50accc40916f26d2e68f83a2c526ad8"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/FileSystemInformation/SectorSizeInformationFlags.cs",
+      "sha256": "53997ce57656ccec975ee6c154d24464c1ac2982b7dbe0c6c459e4d4bd432846"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/IoControlCode.cs",
+      "sha256": "48009230baede7e6447f26ee2fec935433c97e0c6af65ee7300178569da2c4f3"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/NotifyChangeFilter.cs",
+      "sha256": "eeda7ddb02f87a79b09d890618ceac658ad510639bc84a565c0c53acf8e10ec6"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/NtCreateFile/CreateDisposition.cs",
+      "sha256": "a06cca8f76fb50d63885819f3a844d7b4c70aca48652f0872b0b96e69bc9441b"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/NtCreateFile/CreateOptions.cs",
+      "sha256": "0b4b93ca2f8c6d2bfa9c98307eb6701cf1fd6dc614e3148450265a59c9905a78"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/NtCreateFile/FileStatus.cs",
+      "sha256": "80249d51582b8404fbfcdce2df54fc4c859b4156071d1b3020432875fd690a9c"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/NtCreateFile/ShareAccess.cs",
+      "sha256": "21b6152a112cd69c8a915717356beaafc383fb07a0413c903563c8301166e478"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/SecurityInformation/ImpersonationLevel.cs",
+      "sha256": "671b20bba7f0e2b05b9e9387ac736489e30a3139182a5b757d077c445db65810"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Enums/SecurityInformation/SecurityInformation.cs",
+      "sha256": "2074d7892dc07d6a443bd8f38b1bbe41dfaba9471179d5944e42584faad23771"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/FileHandle.cs",
+      "sha256": "3309f35fbac344923e31ce63b1d28e05837f7992f8b1ea031768a427d5395647"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/INTFileStore.cs",
+      "sha256": "3e3699e570edacfdc6986998d040b03fd8a6aa5f9973d4270589683e5875567d"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/NamedPipeStore.cs",
+      "sha256": "2c37df75d14095cc3fe0bc8d05e7676271e2805627e10f0c4091c10f35c0b8fc"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/NTFileStoreHelper.cs",
+      "sha256": "0d5bf2bd343229de1c5c324c8265d5c4323720ac01b09f5fb5a9af39cac39896"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/FileInformation.cs",
+      "sha256": "84fd19cc7388cfc179ae41210196947e9c7904fe899b9a6443f2ef84e01ab9b6"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Query/FileAccessInformation.cs",
+      "sha256": "93a0dd354f497d378f4419538ae8083d8e517a551600bcd27d370ec28364dc23"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Query/FileAlignmentInformation.cs",
+      "sha256": "784f94919cbd3bd790ee8648259d6a2c07cf62ad694cec88788a389e559e5dca"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Query/FileAllInformation.cs",
+      "sha256": "bfe7f0f5eafd897ae21d6086c5d93e4190caefa88527234ceee0a0fa44b5cd5d"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Query/FileAlternateNameInformation.cs",
+      "sha256": "aa5e202f9c54195358211ee97ccc37476f38b8c8d66d48f0ab970fc6c2103f7b"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Query/FileAttributeTagInformation.cs",
+      "sha256": "b75afb1053386787aea531c39b17c120eac0d603b8655e56321c79aac55aeebc"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Query/FileBasicInformation.cs",
+      "sha256": "26d265dd168f00c6ec709526ca956d86465d4e3823972e97f642db3c3622f769"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Query/FileCompressionInformation.cs",
+      "sha256": "c59545bf144905a4b6d6ee75042027ce4ca7197109d30790fff343c750490f01"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Query/FileEaInformation.cs",
+      "sha256": "060aa514a4ce9080c83d09a238b7e7f27554b66d7d086a5b8df805cdbfe91ae5"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Query/FileFullEAEntry.cs",
+      "sha256": "2b6e5397f2c4c9816cbfc448d41e8e2e2e5f55be3e0f2c176fb514fc91d00615"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Query/FileFullEAInformation.cs",
+      "sha256": "d1f06e0c78ab96f017bb560e4236e5d21bd595c3c762ccc6786a95a2519207e0"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Query/FileInternalInformation.cs",
+      "sha256": "1c5ca49c2a7fdbf7118ea8bef224fbd20af61007228a0f4be019c00ba30495f7"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Query/FileModeInformation.cs",
+      "sha256": "39ca56a45beae759c61da477f75d9c7efa90afb2beecad1c0e4c7b03af38b7e1"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Query/FileNameInformation.cs",
+      "sha256": "1fd672e7d22d1cfa0bf13217c633589d14328e524f5193610454424f6d08b53e"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Query/FileNetworkOpenInformation.cs",
+      "sha256": "a61f0d5cb1be31449d87bd8a4486f8587aa98bcd088ce82aaf84c824445f36a4"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Query/FilePositionInformation.cs",
+      "sha256": "e651065d541e9fd94cb769e4109562dd2b4ffe51f330c9737720f4a542ef996d"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Query/FileStandardInformation.cs",
+      "sha256": "28b8e76671ef1573c0e3359cc3aeb81dd6ee8381cab54a32132ea31ee97d91d9"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Query/FileStreamEntry.cs",
+      "sha256": "e87f4ef1448de924d5f152a5d669bd8872415596e6818f9889f7d275caf5458d"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Query/FileStreamInformation.cs",
+      "sha256": "b9a4d4b7f0bbd01d281cd51eaecae05cfa092077ae5aac05f7445207d9580cf1"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/QueryDirectory/FileBothDirectoryInformation.cs",
+      "sha256": "3ea12dae84eb5724fae17e229bde0b582bbd94217adf536322df7d8b380bf714"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/QueryDirectory/FileDirectoryInformation.cs",
+      "sha256": "c0b135a1d2fd5d919476f65fb6d2f9b7b9669ee10edea4756ae2da321c7c7e96"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/QueryDirectory/FileFullDirectoryInformation.cs",
+      "sha256": "ac682bf64373e292254e328997078618bcbe070cbae152c462e09643a7497ab6"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/QueryDirectory/FileIdBothDirectoryInformation.cs",
+      "sha256": "13eb07a0a78aa9d7a0be8f2887525884764ed5871152ea975e79d0183ae35e00"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/QueryDirectory/FileIdFullDirectoryInformation.cs",
+      "sha256": "a9f50a58c6b38fa227ce9ed5f0d78e3bf8221166e7d1d27ea8a089dd6fd3c5a2"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/QueryDirectory/FileNamesInformation.cs",
+      "sha256": "63e275c15a139d79a91072bae25a87fdc6285e4b0df7b580ca070b728de841ac"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/QueryDirectory/QueryDirectoryFileInformation.cs",
+      "sha256": "2f3f45e31b645f5f53244e562d872be1577bd66e8edc223610bd712ccaa16618"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Set/FileAllocationInformation.cs",
+      "sha256": "0cc35b45830b29c94b63e5fbfe5d3f160503024338bd5ce820e824c8450f8003"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Set/FileDispositionInformation.cs",
+      "sha256": "b63ba50906dc8c6519a42868d0c35b0d790a20ed1971bf062025e243e78db1c8"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Set/FileEndOfFileInformation.cs",
+      "sha256": "217c2ad214de24072d4d9834b32a631d7eab1727446fefe1ac7eeec335cb9ec2"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Set/FileLinkInformationType1.cs",
+      "sha256": "f488cbfa9335802dab63fe65303ecf5ae70f9eb376a4baf150162edd47256250"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Set/FileLinkInformationType2.cs",
+      "sha256": "2c4af7759a64eeccb8640f5e4bb88b11ef15cfa50086e566c9c1a5baca8e65fc"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Set/FileRenameInformationType1.cs",
+      "sha256": "70b3f933e9c08be9138c55003ca6c39e04d36ee8cac89507b0ed1077dfb96aff"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Set/FileRenameInformationType2.cs",
+      "sha256": "b3621a9738285ea94035ccf5f2e69a2eb34f14f718c41453b77438f0d66ebf3d"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Set/FileValidDataLengthInformation.cs",
+      "sha256": "3817ac75de359d48a24275e1be52a05000bcc6b07ef7370c0b85220850ff1fe3"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileInformation/Set/SetFileTime.cs",
+      "sha256": "00ac4913a1edd6b8a46c870398397ed267ee35709bc055f8c53494cba947f8ac"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileNotifyInformation.cs",
+      "sha256": "861e1c4a8ca7da36f0f7d7eb3bdddf4cea81dd448f89f463053d232f303a408d"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileSystemInformation/FileFsAttributeInformation.cs",
+      "sha256": "4802f1f07871832fd1a55662ad2e2cb569d3f1efc38dabbf3b198d91c052efdb"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileSystemInformation/FileFsControlInformation.cs",
+      "sha256": "ac9622b0c8c6c97543cd8cc9e84cf7861b40c4e1952678db11eaf71cf02b9955"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileSystemInformation/FileFsDeviceInformation.cs",
+      "sha256": "b88bd9aaef71fe3a1b3ecb067abe5aa2349d8b3099cc8d39f8c7286de5aa249e"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileSystemInformation/FileFsFullSizeInformation.cs",
+      "sha256": "2e5c672f16749aea593b4551145a32356c1ec86b4c8c30eff64e0cb23ed591b3"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileSystemInformation/FileFsObjectIdInformation.cs",
+      "sha256": "86f447099a96a20a0029fd58633775898286a93839ad8402234d022bc75f9137"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileSystemInformation/FileFsSectorSizeInformation.cs",
+      "sha256": "2bd40d67d173445577c64950fb9855a98f46323a52eb50827b9a5390a5962e77"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileSystemInformation/FileFsSizeInformation.cs",
+      "sha256": "872d1a3da809a924468b85fa68dcc8aa2ec7dddc60627964e1f35646e588c351"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileSystemInformation/FileFsVolumeInformation.cs",
+      "sha256": "ea5d29d41f0ff24fc53eb684dafccd180f5bc559a5996af5c2727dfa6589189c"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/FileSystemInformation/FileSystemInformation.cs",
+      "sha256": "88d28a3e1aee691911e20baace7115cabe3d13592de74509db904db9fa3a57b4"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/IOCtl/ObjectIDBufferType1.cs",
+      "sha256": "18cf97657314bd7a848d76c016323793332b316d638124ec50b3585986cfbf56"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/IOCtl/PipeWaitRequest.cs",
+      "sha256": "1f1fb422393e2427f8587e24a6006a08b57b8353d6de0164fda637c4fd35d7b7"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/SecurityInformation/ACE/AccessAllowedACE.cs",
+      "sha256": "a8387519922b41ebb0445672814c4feef5c17641bf2d86b82a45c4e1894c51a8"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/SecurityInformation/ACE/AccessAllowedCallbackACE.cs",
+      "sha256": "64e12c0461b6e679ddbd5b175f5c6c933b5bfa520ff8a76b98c324d661f0af88"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/SecurityInformation/ACE/AccessDeniedACE.cs",
+      "sha256": "62c487dcced7e8dc8cae420054d942a87b7424bee658be8187b64f4e7feb8aa5"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/SecurityInformation/ACE/AccessDeniedCallbackACE.cs",
+      "sha256": "66ac77bc40e95377089363186f5394b0c4f05893e36ec4a91fd7588f1f6f3d06"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/SecurityInformation/ACE/ACE.cs",
+      "sha256": "75287625d72cc49681a0b518c1b54f09c7332e0078474fad1026303e71dccc09"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/SecurityInformation/ACE/AceHeader.cs",
+      "sha256": "eda2393880756b2fe346fc8ae2bc57bd200c371a6ea643015670b585c40d541b"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/SecurityInformation/ACE/Enums/AceFlags.cs",
+      "sha256": "c862b9e3380c404fd90eacdcd12cfa1633c674abe5ef1acefc3e9e0ea2a1a253"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/SecurityInformation/ACE/Enums/AceType.cs",
+      "sha256": "b9ee5908c6d1f46574ef82d19442502785e238149931b4acc0db7465a783eba1"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/SecurityInformation/ACL.cs",
+      "sha256": "9de611e3f78f0a24bb87b4fe7848409bc59792adcedd672fa26086c49d65a271"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/SecurityInformation/Enums/SecurityDescriptorControl.cs",
+      "sha256": "76e731d03bba85fa8143d00c23b9eaa43c349ed4a01c6536e1417fa3f6045acf"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/SecurityInformation/SecurityDescriptor.cs",
+      "sha256": "164cac4f214e7379929a86a3584c1c61934264aafcf91e6edf5e926403744eae"
+    },
+    {
+      "path": "SMBLibrary/NTFileStore/Structures/SecurityInformation/SID.cs",
+      "sha256": "c38e77095bec3558efb1136c43060a6a872db48e144e634035d5d51edebd9d52"
+    },
+    {
+      "path": "SMBLibrary/RPC/Enums/FaultStatus.cs",
+      "sha256": "5b4e26cd89c415d877ab96ce6c9cb8980ede4537948e9a3c213ff1ee8a3a1bdc"
+    },
+    {
+      "path": "SMBLibrary/RPC/Enums/NegotiationResult.cs",
+      "sha256": "b252cd69c458e495723e59be165aee55877a16fc5f6794a5ff0d0a71d6c4f697"
+    },
+    {
+      "path": "SMBLibrary/RPC/Enums/PacketFlags.cs",
+      "sha256": "bca33dbbca6ae13b0b4bee65ef19dd6b299c2bb8ce5d952039d0d1e9748a0d9b"
+    },
+    {
+      "path": "SMBLibrary/RPC/Enums/PacketTypeName.cs",
+      "sha256": "cdce0bb4a491808b59e57ca161e357176eea5e52f31f2dc314208858fdccd54e"
+    },
+    {
+      "path": "SMBLibrary/RPC/Enums/RejectionReason.cs",
+      "sha256": "aa7c85922d5fa681cbc22adc616f2f7ce10c7f2d186d257b79818195e8a852f1"
+    },
+    {
+      "path": "SMBLibrary/RPC/EnumStructures/DataRepresentationFormat.cs",
+      "sha256": "26554c23d70d4ba6d61fbc2873a0de413b2da01dd035c69a30949892785e740a"
+    },
+    {
+      "path": "SMBLibrary/RPC/NDR/INDRStructure.cs",
+      "sha256": "b85f54d9bec5f99176ca30c5229270db03d3f2e751adab9f5c5120a2235a6fe2"
+    },
+    {
+      "path": "SMBLibrary/RPC/NDR/NDRConformantArray.cs",
+      "sha256": "c7acbd5ab5890a5f62290073f8e68cc98431bf0c3208f9e4544c699d8f01296d"
+    },
+    {
+      "path": "SMBLibrary/RPC/NDR/NDRParser.cs",
+      "sha256": "94c05b2f7d92ff4b056296f9cfe652d7cfdbd620a8468ef1b6099d7353c7786e"
+    },
+    {
+      "path": "SMBLibrary/RPC/NDR/NDRTypeName.cs",
+      "sha256": "a732a9b0569b115c383cee2205d04ef6db4a19fa33bd7c82aacc112a408e0fc5"
+    },
+    {
+      "path": "SMBLibrary/RPC/NDR/NDRUnicodeString.cs",
+      "sha256": "2096a15d29f026ee298e07b7ef2a424590f0b107cefe163154c646892ea5e27a"
+    },
+    {
+      "path": "SMBLibrary/RPC/NDR/NDRWriter.cs",
+      "sha256": "0d04b0c74499c5391e7b641df3392f580af7d43e3468a0e570ec9888606a50da"
+    },
+    {
+      "path": "SMBLibrary/RPC/PDU/BindAckPDU.cs",
+      "sha256": "e91f01941be30798a0e60e8e9bbf52a3f06f8e77ac3ea23606bc2784c70aa58c"
+    },
+    {
+      "path": "SMBLibrary/RPC/PDU/BindNakPDU.cs",
+      "sha256": "935b364ab771cdec798f7df44d51190d538900838577f0e2e04479292a6b8ad6"
+    },
+    {
+      "path": "SMBLibrary/RPC/PDU/BindPDU.cs",
+      "sha256": "5200a527d82c77262a350e0d245cc0c5771678a4c82cbd18add0c52c0e92921a"
+    },
+    {
+      "path": "SMBLibrary/RPC/PDU/FaultPDU.cs",
+      "sha256": "3c2a7d4b1fc4ed8946afe355bc675648744f4ee40ce9245ddd5e50eae8a0a123"
+    },
+    {
+      "path": "SMBLibrary/RPC/PDU/RequestPDU.cs",
+      "sha256": "86addd4defc8c15f6d017e24625535f69d236bf92a60613aff480e05db33838b"
+    },
+    {
+      "path": "SMBLibrary/RPC/PDU/ResponsePDU.cs",
+      "sha256": "b596059f0d92f11be8184f6d1fc8465f89824c529b0675dc1e92512b09a5d04b"
+    },
+    {
+      "path": "SMBLibrary/RPC/PDU/RPCPDU.cs",
+      "sha256": "9dcd898c6ee5e7f404501eaf3be4c4025103cbb3d165838a4d1949314b22aecd"
+    },
+    {
+      "path": "SMBLibrary/RPC/RPCHelper.cs",
+      "sha256": "1a1318495cdbec1a0ddcdff2cc1cbed2af53b41a61e53d8ea6542339fef9c15a"
+    },
+    {
+      "path": "SMBLibrary/RPC/Structures/ContextElement.cs",
+      "sha256": "ca5b271ac002c1979364213a88ba6a68952fc76971f24e39d5d2a98a2f50fd17"
+    },
+    {
+      "path": "SMBLibrary/RPC/Structures/ContextList.cs",
+      "sha256": "ee56f45b27f3abe5c83f87eaf54e4f457b23e29a2cd5cd7c4aeff4f0158f39e4"
+    },
+    {
+      "path": "SMBLibrary/RPC/Structures/ResultElement.cs",
+      "sha256": "e23116eb85a10d010628be92428f0a922e6a789da8e387b3059f132b3503d42b"
+    },
+    {
+      "path": "SMBLibrary/RPC/Structures/ResultList.cs",
+      "sha256": "b0ae4ea9896d4706a785feb9797515c1c49ae91f32d042192548997dbf53e34a"
+    },
+    {
+      "path": "SMBLibrary/RPC/Structures/SyntaxID.cs",
+      "sha256": "c6bc1c9e933c9e4f7a83e690bb3023f6b2ecf9e1b18a09b97615c15c91f863f6"
+    },
+    {
+      "path": "SMBLibrary/RPC/Structures/Version.cs",
+      "sha256": "854ec208b6fa899306b335f5d638465456f3cc21acd439d093b2eb4a96544484"
+    },
+    {
+      "path": "SMBLibrary/RPC/Structures/VersionsSupported.cs",
+      "sha256": "0867b8f2eb252451b4cf206743e20ff9e0395bf14889c00affd5faa1c214118b"
+    },
+    {
+      "path": "SMBLibrary/Server/ConnectionManager.cs",
+      "sha256": "d139b576aaa3d9c68b2441b6a9bd97d1df676eeec509d617681107d1db48b833"
+    },
+    {
+      "path": "SMBLibrary/Server/ConnectionRequestEventArgs.cs",
+      "sha256": "e8bb45df5c0b3eb482b1407e32ead2501c2a007268907701f815d0d5d7244b27"
+    },
+    {
+      "path": "SMBLibrary/Server/ConnectionState/ConnectionState.cs",
+      "sha256": "11310d7aff434cccb2fec4f4ab1482b9e7553e2685ceb230e472a0c8f58096dd"
+    },
+    {
+      "path": "SMBLibrary/Server/ConnectionState/OpenFileObject.cs",
+      "sha256": "0a9e7473f8fe27c56ccff866e9e2565f08272f71d7f006590970551002a1704c"
+    },
+    {
+      "path": "SMBLibrary/Server/ConnectionState/OpenSearch.cs",
+      "sha256": "63352bc486500b18cd7497390ddd43ade1431a7852676ce95019e6697cdf4b3a"
+    },
+    {
+      "path": "SMBLibrary/Server/ConnectionState/ProcessStateObject.cs",
+      "sha256": "9c691a36e6ede597f4a327421a84f6dddedb83c115b141d099afc757bc381970"
+    },
+    {
+      "path": "SMBLibrary/Server/ConnectionState/SecurityContext.cs",
+      "sha256": "f1c534d28045cbd4d65c53bd10bf2c03747c8df7804e2dcaa1f6dc60503cd337"
+    },
+    {
+      "path": "SMBLibrary/Server/ConnectionState/SMB1AsyncContext.cs",
+      "sha256": "69c3092ad9462e7a8e529ba3a0a88b970a5d8838616d241476aefe1e56b16b20"
+    },
+    {
+      "path": "SMBLibrary/Server/ConnectionState/SMB1ConnectionState.cs",
+      "sha256": "8bd15effe83559bb38ee5731e78d0a8f82b2cc8473a6ef702578551948a94b69"
+    },
+    {
+      "path": "SMBLibrary/Server/ConnectionState/SMB1Session.cs",
+      "sha256": "000736e50d77ba8fb9c79a4d459c3b3bbebffe28e99cb5ad3fa5362ef434a407"
+    },
+    {
+      "path": "SMBLibrary/Server/ConnectionState/SMB2AsyncContext.cs",
+      "sha256": "debc4a0f3c16ad33eb4dc5c1c0fc67aca52283cc922491715b5e93e97636e518"
+    },
+    {
+      "path": "SMBLibrary/Server/ConnectionState/SMB2ConnectionState.cs",
+      "sha256": "396d06e5641cc6ba033e2a66e29e553c22dbcf5f4799e674c96b5c4e968ae264"
+    },
+    {
+      "path": "SMBLibrary/Server/ConnectionState/SMB2Session.cs",
+      "sha256": "d56b6310dc17842871879364e2a82d935a18096bc1c3b537cb9d29fe429f103c"
+    },
+    {
+      "path": "SMBLibrary/Server/Enums/SMBDialect.cs",
+      "sha256": "928e4eb434e3928e9bb48da173189d9a343062f8802f89fc315a5573c5aa3d40"
+    },
+    {
+      "path": "SMBLibrary/Server/Helpers/ServerPathUtils.cs",
+      "sha256": "f91c3e827c26fe8bfaa03ccf8dcc3b96530395102d102943093d40a889faebc5"
+    },
+    {
+      "path": "SMBLibrary/Server/Information/OpenFileInformation.cs",
+      "sha256": "bdb2db77dc35ccefe3293158d5947649702c5d2969adcad15c34b5d291ebdde1"
+    },
+    {
+      "path": "SMBLibrary/Server/Information/SessionInformation.cs",
+      "sha256": "e4305c992cbe82f8bb01a4093a0bace36e9667346b4db455ae32c49f1b50e663"
+    },
+    {
+      "path": "SMBLibrary/Server/NameServer.cs",
+      "sha256": "3b27d522cb996cc9284284e555c7c8c1e4d7b23ccc42af6b1859e3aa5ff13c66"
+    },
+    {
+      "path": "SMBLibrary/Server/Shares/AccessRequestArgs.cs",
+      "sha256": "6b970dc60200c0b78cf8d2d08a2cbca435b295d8d025017249bac15c1245273d"
+    },
+    {
+      "path": "SMBLibrary/Server/Shares/Enums/CachingPolicy.cs",
+      "sha256": "5c443bd4e2d903d76a73a0dc9e571fd240c2451d3950676a9700971585928a57"
+    },
+    {
+      "path": "SMBLibrary/Server/Shares/FileSystemShare.cs",
+      "sha256": "d93e4677e4324660976357e8b8638df7548e232e30377cff0728e3d3da86b5af"
+    },
+    {
+      "path": "SMBLibrary/Server/Shares/ISMBShare.cs",
+      "sha256": "7ce5f7ceb70d774e7c1305c674e7eda2b773a948542ae6ad06885eab76427edd"
+    },
+    {
+      "path": "SMBLibrary/Server/Shares/NamedPipeShare.cs",
+      "sha256": "1f67ad1e1cb3c4f3cb3f1b69ed1fedf2fd7ce7992a960ff1615f8437e8db5ac7"
+    },
+    {
+      "path": "SMBLibrary/Server/Shares/SMBShareCollection.cs",
+      "sha256": "8ef57f5615bf984221c987a7e33b457be4bfb1c00e0e4a017ce85fc592d0121f"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/CancelHelper.cs",
+      "sha256": "41bbad203bfc02738f656ce1b1165d566620dcfc3dce9372387bbc74ed396795"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/CloseHelper.cs",
+      "sha256": "e3d65c1730e8edf1999a2e51b3d66789644e1163a9b859846795461d47401595"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/EchoHelper.cs",
+      "sha256": "690de0e29702ad401bfe47ba477817c0a4cda61f52263a2f9dc21c624aed1519"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/FileStoreResponseHelper.cs",
+      "sha256": "ed862e52cadc91fa22955a35e2ea0a4612dde24ef3f028967d51270298105ef3"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/LockingHelper.cs",
+      "sha256": "6bfce9c38ba5fb71318af4e19503eae33ae5f3d67beb64e080691e77308eded3"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/NegotiateHelper.cs",
+      "sha256": "ba642a3ab18859442ac9760ce5d4848e7c23e29c6b0f2bd32d2c846c3e1fbc5e"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/NotifyChangeHelper.cs",
+      "sha256": "b78a3b72968ab0da756e13992a3197544e7b72d6774643574d02b6754ce8f7cd"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/NTCreateHelper.cs",
+      "sha256": "983930d29b7dc4f0cf5c0335f709ee9017c6d4a1c8ef411788435dc34df5db5e"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/NTTransactHelper.cs",
+      "sha256": "b0f3c7ea10df8c0eaf0df3f142739ca00b31d835564b73c18a1aff81e4d02a6c"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/OpenAndXHelper.cs",
+      "sha256": "90db9765de9b083526d0ecc98930e3e615993cc7859dd4dbcd510b18b71f8f5c"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/ReadWriteResponseHelper.cs",
+      "sha256": "e245ae445a26d06c789fecab563c2e7d1a86975f991e1f025e659c0bccc07757"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/SessionSetupHelper.cs",
+      "sha256": "71ff20d530c0b98fe298894c4aa4392e1079110356f2a90090dc69ac3650978a"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/SMB1FileStoreHelper.cs",
+      "sha256": "c8ca19803b7c09aca54a1ad3c686ac6d9b2ce7b5a0be0c2c396836db3d4fc222"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/SMB1FileStoreHelper.Query.cs",
+      "sha256": "f3e7ae4ee409ff21b83f101e08e85b6dcd2dc26f8478e5a8cbe001ff362065a2"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/SMB1FileStoreHelper.QueryDirectory.cs",
+      "sha256": "983f859de33b5a8ad0be076f62d7f6d3abb447c12ff61363fe37caa3e0cb9e52"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/SMB1FileStoreHelper.QueryFileSystem.cs",
+      "sha256": "144b2d883c86078bafbd5fe261aad08f04cae747f7df74aefd15703e85eb6f45"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/SMB1FileStoreHelper.Set.cs",
+      "sha256": "f6418fa63df4b7d440d8139aa31f3e9b4f0741fd4c4a98c82ee5c67ed62fbd60"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/Transaction2SubcommandHelper.cs",
+      "sha256": "d7ec2389d8e72e9295b4ec274f9aa231d6b3cca1df6a11a49add32091e180502"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/TransactionHelper.cs",
+      "sha256": "00dcf4e3024cb8c7c350862b50b8a0e517e28adec9af22a8ac0ffc602cb278ff"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/TransactionSubcommandHelper.cs",
+      "sha256": "102395c97ddddff3fba1326799bbf0e61e6e87d316f7a17cdcffcfe55052af1f"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB1/TreeConnectHelper.cs",
+      "sha256": "f0945040dac74ffc9f2804ccabdaeff486e44b569d4e8a33731f32d9133a72e0"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB2/CancelHelper.cs",
+      "sha256": "789635a5c6d9c3d28f6deea10765e76a04bfb03170d429236233c4cbac94b782"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB2/ChangeNotifyHelper.cs",
+      "sha256": "44e2ece5de9f27ba7038a9918c82c8145be42f371201c5226132119659635c4f"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB2/CloseHelper.cs",
+      "sha256": "8198bd0862c3c5fa71b622d54189a1bf168c17dbe20301f9538370b9791b55fd"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB2/CreateHelper.cs",
+      "sha256": "475dd98e05c88afda8f1dfdeaa846ca8366b15d810bd0eef0c3aa9ceda1abbc6"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB2/EchoHelper.cs",
+      "sha256": "89fd5020e549af564742b902d5c5c88e49129ac29865e865d49613362dc1d222"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB2/IOCtlHelper.cs",
+      "sha256": "0ca66636acfa57f868271193e4384eedaa74f354e52311656f1427765ad0478b"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB2/LockHelper.cs",
+      "sha256": "2d80ccdf0722d3f3f1c63326abc7640077a78de57fb159d8622b996ae8af1228"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB2/NegotiateHelper.cs",
+      "sha256": "9d81e4f2d4ce49c3182c9a904cc46bbe3fbb3a85dd814ff373bacbcfb1028dba"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB2/QueryDirectoryHelper.cs",
+      "sha256": "208eac14c1caa0c6fcdce76a2c3597aee86b9490042e264ae490ff4c8982a66e"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB2/QueryInfoHelper.cs",
+      "sha256": "2d665b79043ad863a37765022626b46b9d59f20f837841a24de3945a42abcaa4"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB2/ReadWriteResponseHelper.cs",
+      "sha256": "dddb567637d6d8a9f5b91ae08d04aa2db16e73202b86ecb8a5c770c763a60554"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB2/SessionSetupHelper.cs",
+      "sha256": "e4a2ed1a0e0adb90bd132e5642b4f87747d82ec2b4ade0d8688f6236f9938881"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB2/SetInfoHelper.cs",
+      "sha256": "4628c5ae82e2e0da9dacab82c11893dadc8918ff53d778cf3e61cabf33539ea1"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB2/TreeConnectHelper.cs",
+      "sha256": "ca458d9f092e93d0fdfa7f7359599f7199e4e2db5e9cfef8a0b9d4422b95ff05"
+    },
+    {
+      "path": "SMBLibrary/Server/SMBServer.cs",
+      "sha256": "d61c9a98360d5694e490054f8a7ff5952b6d79d456e665d51a97d9be27909e2c"
+    },
+    {
+      "path": "SMBLibrary/Server/SMBServer.SMB1.cs",
+      "sha256": "ed92d365d6826654b1638b49f38c5551b70016bcc5972fbb445638cbaf284cb0"
+    },
+    {
+      "path": "SMBLibrary/Server/SMBServer.SMB2.cs",
+      "sha256": "51adff5f313125ca4ebf64b55b74664b09fe0db699760b4bd5575c74afc498c6"
+    },
+    {
+      "path": "SMBLibrary/Services/Enums/PlatformName.cs",
+      "sha256": "65c8f4c9648d3bf2622a4d6cd141af8ef0f75787c3a9152552bfc6a584fe6d87"
+    },
+    {
+      "path": "SMBLibrary/Services/Exceptions/InvalidLevelException.cs",
+      "sha256": "d14f04e6535d097edc575b48dc998624e4e585095a3b1f3d655543cc635b093d"
+    },
+    {
+      "path": "SMBLibrary/Services/Exceptions/UnsupportedLevelException.cs",
+      "sha256": "f8f74d36c3f46909ca222fe8851cda42e71d66749848383732f550546155788b"
+    },
+    {
+      "path": "SMBLibrary/Services/Exceptions/UnsupportedOpNumException.cs",
+      "sha256": "1a8390dcf6c348336770486ef0b902b4784b69c3c11e5e0fdc40bf3b21041c14"
+    },
+    {
+      "path": "SMBLibrary/Services/RemoteService.cs",
+      "sha256": "87ef7bf62cb931dc4658d80c737dd6a5dc56af09c958188a469d927079a7a784"
+    },
+    {
+      "path": "SMBLibrary/Services/RemoteServiceHelper.cs",
+      "sha256": "c7b514c65e44094db2db464071cc5d6d1790d23423fc990469054d63c827cdf4"
+    },
+    {
+      "path": "SMBLibrary/Services/RPCPipeStream.cs",
+      "sha256": "1372df56712c57907960dd0ef4363be084a87ea18aa0593fcdce1944de445272"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/Enums/Permissions.cs",
+      "sha256": "19796aa2bebb9bac445a2eee18a1116892af5f14c96c1dd417d8f0bec497fba5"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/Enums/ServerServiceOpName.cs",
+      "sha256": "b239a6cb1f6f61336eef984ea8c5fa5a818952023d286cf263e7ef24b0c90835"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/Enums/ServerType.cs",
+      "sha256": "afef3dac87ed7388a000d9f7012f06d87925adc9a19dea89350f69366b95828d"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/EnumStructures/ShareTypeExtended.cs",
+      "sha256": "1d6f318059deb9ae12d62cbd9003869c96e2134a297a3d905ff1428c1b08b805"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/NetrServerGetInfoRequest.cs",
+      "sha256": "50deec5135111454697133230e3d8a4e85b1d526219fa574b85aff5ecac9023d"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/NetrServerGetInfoResponse.cs",
+      "sha256": "bff4654986ff32a8e54f00eb58424c7a8b632043de5e8372e6c73e2edb3f3a4c"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/NetrShareEnumRequest.cs",
+      "sha256": "a9fddc64ca3a926a518631f34eac1d533c0a6e5edfe20e0621ccd9a347c3325e"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/NetrShareEnumResponse.cs",
+      "sha256": "e8c767388ddfb0bd63df5c1eeba1de3bff5a917c11db0afed185bbc2fb60f779"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/NetrShareGetInfoRequest.cs",
+      "sha256": "369a2d02408e6a0a19308612d30f9726bfe633971a0c09ebf8492731f4c964a7"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/NetrShareGetInfoResponse.cs",
+      "sha256": "24ef5cbc181bb4d55db8f94e71a70f693b311dfd15fa9b60613d3cec54904a4b"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/ServerService.cs",
+      "sha256": "6c427cf2a1e666456960c2a454461447fe783149cfd7902d7b991787f6868ba2"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/Structures/ServerInfo/ServerInfo.cs",
+      "sha256": "5464fe0dd26f63df8b73eddd8348419eb19e74ca9ab90ab5f1cfb7aefc689b90"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/Structures/ServerInfo/ServerInfo100.cs",
+      "sha256": "cfd9c21a3c7bb16c07ff04211a8c907abbf293d2f8396e2333c3a9e613cf63bc"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/Structures/ServerInfo/ServerInfo101.cs",
+      "sha256": "208d52ed5bc0bb28857ccf2b137ef4acf76642e5839e05bff2794074d0c2893a"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/Structures/ServerInfo/ServerInfoLevel.cs",
+      "sha256": "07325fae3aca2e0628d9d7f24d6e323597c957c731bfdbf952c8acb1bf3dd261"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/Structures/ShareInfo/IShareInfoContainer.cs",
+      "sha256": "9fa1c983fddd8793dfc6c143b1612d2337ebbc97de2b7d1ad4f163d7facc3d29"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/Structures/ShareInfo/IShareInfoEntry.cs",
+      "sha256": "2edcc73ea1a7bc10ba1509c247ddd7fe3effddc9c18e21ebc8b9f1218dc0787f"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/Structures/ShareInfo/ShareEnum.cs",
+      "sha256": "d09a6bc3492df148a01a8a62e478766b3c31bf6561cd288046abd0ae01f3484f"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/Structures/ShareInfo/ShareInfo.cs",
+      "sha256": "32a7155f4b863f2db7324ff21793952f374a2e81bee72d44e3565bb538c34be0"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/Structures/ShareInfo/ShareInfo0Container.cs",
+      "sha256": "e886e322fce0880fabf231ffa7bf8d1c40878fd00089fb10a3df18234ab9f9e2"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/Structures/ShareInfo/ShareInfo0Entry.cs",
+      "sha256": "07e071fcca593e6dc6cf06f5950a21e55adae924a6d156b32d0b5671848772f4"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/Structures/ShareInfo/ShareInfo1Container.cs",
+      "sha256": "3688daf282af22d1e579c5defd7458c7fcb278cf5b0be6bf54161e0496dd3596"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/Structures/ShareInfo/ShareInfo1Entry.cs",
+      "sha256": "d422350920bd2742ede01cdf17263a4f168d1fe8305582acccacccc7fe3297eb"
+    },
+    {
+      "path": "SMBLibrary/Services/ServerService/Structures/ShareInfo/ShareInfo2Entry.cs",
+      "sha256": "e169943908a619526e73c70ca0802ffc75f9b4594339b7fee0d9c180763ea92e"
+    },
+    {
+      "path": "SMBLibrary/Services/WorkstationService/Enums/WorkstationServiceOpName.cs",
+      "sha256": "961a6266c49a582ddb27e937ffb4d376de7b4ee594188e204b9245f92c0576f8"
+    },
+    {
+      "path": "SMBLibrary/Services/WorkstationService/NetrWkstaGetInfoRequest.cs",
+      "sha256": "db5eba79bf0083db3ace984ee6bc6433f6cc3f267d1e33258ce4571469b4c60c"
+    },
+    {
+      "path": "SMBLibrary/Services/WorkstationService/NetrWkstaGetInfoResponse.cs",
+      "sha256": "dd1abee84bf40ff118a143ee99c44ce28647823142e77fab28f32b17bcb5f148"
+    },
+    {
+      "path": "SMBLibrary/Services/WorkstationService/Structures/WorkstationInfo.cs",
+      "sha256": "c2eee0a27053ec0f71ad9dfd15f5e9b06391b54e1b4cbb82cdbb3bc63afaf9e6"
+    },
+    {
+      "path": "SMBLibrary/Services/WorkstationService/Structures/WorkstationInfo100.cs",
+      "sha256": "03bd0c3c557b66a890654ff74465fbd0f468152fda76d3a10790d6417467a95b"
+    },
+    {
+      "path": "SMBLibrary/Services/WorkstationService/Structures/WorkstationInfo101.cs",
+      "sha256": "561429355ccbc3c079b8bec110326ac3ac8aef3632f0875914c316dd9fddac22"
+    },
+    {
+      "path": "SMBLibrary/Services/WorkstationService/Structures/WorkstationInfoLevel.cs",
+      "sha256": "28ea03733fccd42545164ae3e5823ec81ff1b8dd27bbc257c5d7eb5633fc317b"
+    },
+    {
+      "path": "SMBLibrary/Services/WorkstationService/WorkstationService.cs",
+      "sha256": "5510f665587612e33e6cef9236dcd3e5f49d906621ec8cdfbec5caa0ad9ad242"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/CheckDirectoryRequest.cs",
+      "sha256": "b669f94a5538724ea83e94faf40955b7856070ecba0d6cbe0c565e5be7a2d8e0"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/CheckDirectoryResponse.cs",
+      "sha256": "b7178f1c87b3e2eac424b757fd2a96b8e44d9a132c2da9b7dadf278e23733bde"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/CloseRequest.cs",
+      "sha256": "56c6e53f6ee07cd4767749ef03458926404c6cceeb88b98159c100c1a0210792"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/CloseResponse.cs",
+      "sha256": "3ae5d9d290066772656272fcdf35a7dd01c352356c319a78cd22f84d2df5cbc3"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/CreateDirectoryRequest.cs",
+      "sha256": "9b935615874b5b8c599f287ac36656058d7a19cf8e24cdfa8653161c1ca90c04"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/CreateDirectoryResponse.cs",
+      "sha256": "1fdb5cf36fb2898dc9f20f2c89249b837e5606b2304dd4c32344dc83581186c6"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/DeleteDirectoryRequest.cs",
+      "sha256": "e1e8c5c07e2cd30f94c688caa16e8cce8cf42eacac987dcaef9fc86bf28fbb12"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/DeleteDirectoryResponse.cs",
+      "sha256": "df124c33f6c69d06d2326ba31954c5a0a3abc44fb33d20bbefb81ab09d0079e9"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/DeleteRequest.cs",
+      "sha256": "118106862074f7b8b64525b030f5800b6d7b5cc302af3f989712a886971416c4"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/DeleteResponse.cs",
+      "sha256": "d43356fdff89b5716d290913d71689df59fc2a3c13ccb9174d8535787ed1b278"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/EchoRequest.cs",
+      "sha256": "d9d12f7e36e00482739113a082d150ad0543b9548b46b03012b40c74f03b8385"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/EchoResponse.cs",
+      "sha256": "554d96937391ba05ca5a07459542618fcc6c5bfc46cbbdb122840c90db058a42"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/ErrorResponse.cs",
+      "sha256": "03fad7bf86f5f562db284cd267e3ae16ca0aeb0c1813eddd612d26d4f87c63d2"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/FindClose2Request.cs",
+      "sha256": "be199dc513b1de0f7fd922e4f6d36740ace2201f5c1156ea3db3915e2001668e"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/FindClose2Response.cs",
+      "sha256": "919da763d9f851f07a17ce114e0f6bc2e617f7750f75dc669c91b74157a191a8"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/FlushRequest.cs",
+      "sha256": "2c4c05058dbf94800d8c5e319033aa7cab5fd3eab5e69c4cbbb4199e0fda9e55"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/FlushResponse.cs",
+      "sha256": "014c2e66ff7d31979e8e48120ae0d4d94888986becc82b5c95fa21bd64a6f67c"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/LockingAndXRequest.cs",
+      "sha256": "9e177159635eb5bbcecc6169b932f57b79019c67ae3964d24c6a38c5facade00"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/LockingAndXResponse.cs",
+      "sha256": "b844ffbd6a79850029b03663a1e4f8e1de92c91634f9104bfdb9e426a119cba8"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/LogoffAndXRequest.cs",
+      "sha256": "d0eca3704fbdda3d3bde709ae0c77d89bbb97907f1cf147347dec3c991374287"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/LogoffAndXResponse.cs",
+      "sha256": "24634529c58afa36972b58510bbf3c95632e3dad262e67ba48def4c53845e8a5"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/NegotiateRequest.cs",
+      "sha256": "ec643784ddd256d8204ad95a13f09f7629163d49ccafbf33ace241e4120ef51c"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/NegotiateResponse.cs",
+      "sha256": "ca557976647a000a36f10465ee37c11e13e45f25c5de26a2a122f22a6bf75aea"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/NegotiateResponseExtended.cs",
+      "sha256": "bb1a680292bb4434220f935f4952dbdd01bb64ede547179a2ce493885e21b20d"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/NegotiateResponseNotSupported.cs",
+      "sha256": "10afb2ed12f12d09b9cc118741d8bb31258d3af659fc2dc87e7c8ba37c9b070b"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/NTCancelRequest.cs",
+      "sha256": "cd5d38da00aa389ad93128cc1a29a41c13c08b86828a48db0806bf0784a1a89c"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/NTCreateAndXRequest.cs",
+      "sha256": "848916b9b321cb4607a658f14a70f33df31a1b15c91e0cb6eb6edb581a5a0262"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/NTCreateAndXResponse.cs",
+      "sha256": "9b02b7b9dcbbbdb0a1c3f8d99b1779ee863747c9b746106738add0a2c4baccf0"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/NTCreateAndXResponseExtended.cs",
+      "sha256": "f35f7ef43e4d31f7fb82ef6564d592fd66cf96edd175e46ba33f69777dcaf1a2"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/NTTransactInterimResponse.cs",
+      "sha256": "f46222d8ecd5c9699cc1e95098694e05c890047c6581cf6ec802b86021242b77"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/NTTransactRequest.cs",
+      "sha256": "a18d88c1c5e825d881917b2700720c2167cc0478f4d348ba9a9ba590d050654f"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/NTTransactResponse.cs",
+      "sha256": "6752dc14f8f3ec14cea7bfa9ba3094f44b7d26cc8df75a97541b866edc926125"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/NTTransactSecondaryRequest.cs",
+      "sha256": "ae41be4e4dd6f3684d3dc6a801df44ba3cf73c105f0dc51dbba396d9c382744d"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/OpenAndXRequest.cs",
+      "sha256": "cb49d21d285ce06b76d1c5ab54d5efa90fa2f414fc9cafca9a4b36f1623ff5a1"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/OpenAndXResponse.cs",
+      "sha256": "65b57a6ba408c7543549e3f2482fab4c3270c6cd0ce5bbc7b9c53557c77d16b4"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/OpenAndXResponseExtended.cs",
+      "sha256": "62738714cec1a6f4f4b7e2e9205cca2917a63a2ff979c78bf51c82757ca81207"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/QueryInformationDiskRequest.cs",
+      "sha256": "02ba8788cfcb9de35b3ff2a2076a1621480b474d1711b374cab55cf04738ada3"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/QueryInformationDiskResponse.cs",
+      "sha256": "9ba4e046776ae4b91138e090dcfd5eedea698bb97e3fd1b5c1f503f7bc2d9592"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/QueryInformationRequest.cs",
+      "sha256": "9a22e9a95d00da97a13f856ad2490a0dca1f6026c136da4db15c696bf0ea81d3"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/QueryInformationResponse.cs",
+      "sha256": "1e856d7087b1c1b0074c5df0a9843e1f0813b6f1bc090c6f80842c0a803b5a7c"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/ReadAndXRequest.cs",
+      "sha256": "2fcabe439782753ca947cc7436720771bb1b6c0387bd07d67f6c312ff7929236"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/ReadAndXResponse.cs",
+      "sha256": "0a032afa885aaaec8c9674f0f1825b84bea5eb8d1fbd7f4e3ac534170ae5e447"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/ReadRequest.cs",
+      "sha256": "594fef8807f00e8510edd453043d2669f65a117c8af0ee919fef9fec4e8ee7d2"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/ReadResponse.cs",
+      "sha256": "0698a244d7150c6544f6aa23eebf5ce9eb6cc5b43c2199c70c35b7586fee2060"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/RenameRequest.cs",
+      "sha256": "e6622d8ab9333da0be63524270e0096a9237d0dfe3ca3ebe91805a519d4ca29c"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/RenameResponse.cs",
+      "sha256": "559f05376236280b7b5a4fecee0c462d5dc0e8917965247271bc648afa0174f8"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/SessionSetupAndXRequest.cs",
+      "sha256": "9f3f922845db1bd908c36b04a8a9191408ff6f1edc1bbe183cbba3dc976213ae"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/SessionSetupAndXRequestExtended.cs",
+      "sha256": "1de23a231d90d4e9151fd51e8850992be6f843ab64925a0e3a55670fa8a525cf"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/SessionSetupAndXResponse.cs",
+      "sha256": "a23d70d6f69e0b9e6809050692fda5a37011a6e56cf7d8e53aa7d7ead4b26c84"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/SessionSetupAndXResponseExtended.cs",
+      "sha256": "1dc713874835fa0760a2d689ad08467f05e88b3ada9fa89cdf1b0d6f8012bcea"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/SetInformation2Request.cs",
+      "sha256": "c245cd247feb6fd31e31ef438acf1fcba5433b6ffa49f9478445947aa20652f8"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/SetInformation2Response.cs",
+      "sha256": "d53eb729a8ca31d12c1b173b6da04503669b2fec2ea655d6b68b6e6416431db6"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/SetInformationRequest.cs",
+      "sha256": "0b0c00725b9b9948520cdd98256350f667755b6d6268153018c94036970ebcc4"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/SetInformationResponse.cs",
+      "sha256": "647ae48078801e5cbee35147ba0a50dc53516310a0545855aedb7bad7c9c87a7"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/SMB1Command.cs",
+      "sha256": "dfd25fd2843c2d5702ebde4fd4f39358c97ee2ab0647ca01e1a23f2c2ca86746"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/SMBAndXCommand.cs",
+      "sha256": "ac295742e4406e7a4024e88d8ea8b786bb421acb9ba0c40043fab43a5a4bb62e"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/Transaction2InterimResponse.cs",
+      "sha256": "19b5b3b73dd5dda95cd60ab05795ab9a3ff39831bfd2a46cf97016e2afd7e690"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/Transaction2Request.cs",
+      "sha256": "0ae88abfec92c366bbcf23cedd1f745beae14527e6e40d672e4e2833d719b8d8"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/Transaction2Response.cs",
+      "sha256": "7e0b0973cf47d8d7f2ba3f397e6bdba3496380fb00a23d5fa779aeafd604b408"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/Transaction2SecondaryRequest.cs",
+      "sha256": "b04e47c3cc1ed6377701c07e98cfda1dfecef34e55c54f6ffb6604ce4f22c0b6"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/TransactionInterimResponse.cs",
+      "sha256": "8399d3b5d7d92f7f90d5450cd0880e99e01bee21951e5aee1e205a7e4c3bad02"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/TransactionRequest.cs",
+      "sha256": "5511210fb77c8f0f5c2369d27851f3be0b2feefaa62d65e5543e961963d004ec"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/TransactionResponse.cs",
+      "sha256": "b4c15f5941077d94c76a78ea889ee2d69d424e2c84681bda16eaed6ec7cccd0c"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/TransactionSecondaryRequest.cs",
+      "sha256": "8be09d1913d5ebe7ff9989b92974251cd05dc38229a8a847713753478635ce3e"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/TreeConnectAndXRequest.cs",
+      "sha256": "f907fbd6c7609641aea3703cd0730ade2424cc8d986fc4f9a8db71690bf23ba5"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/TreeConnectAndXResponse.cs",
+      "sha256": "ca50ffced152636f0d7b613fdd5409d28e5fd0791088cd9120f1d673a61e1c1d"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/TreeConnectAndXResponseExtended.cs",
+      "sha256": "02eebea6cc272f1278ca57cb31bcd76211c005e44ee2624864288bd61173ca24"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/TreeDisconnectRequest.cs",
+      "sha256": "095ff6568b61426ad413b5cd55a82cb6962c5d07e9e039d94caad5d6074524dd"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/TreeDisconnectResponse.cs",
+      "sha256": "f224ac6e57d6a67b064b3f348fab8da9df124897c2bd405331a01b50e022ef3d"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/WriteAndXRequest.cs",
+      "sha256": "8c46baee6d64a15a3cd694093b1082f30526b9c2db5853e454e391db8c08cf21"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/WriteAndXResponse.cs",
+      "sha256": "d05b76cddbd898303c7f2bb31978683068ab5782edc869ed622af051cdc8b385"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/WriteRawFinalResponse.cs",
+      "sha256": "bb9c0648c7eb447cf999cf11ee9386fec0f91918b4ba8fc1a8d8a0a351609cba"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/WriteRawInterimResponse.cs",
+      "sha256": "8528d758eb4d562b12d915e0c7fec37519d785651b74438fff88cedc0e0886fb"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/WriteRawRequest.cs",
+      "sha256": "84177916002a2c5a78fdd52617428b8f19719a8a74f7ccddf1b6c49ba21b23a1"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/WriteRequest.cs",
+      "sha256": "9866bdcc8d494b313f4cd5507088cfe340803f9b82dde4dabc8480a8f7a1f45e"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Commands/WriteResponse.cs",
+      "sha256": "df3e859ae9989eb2bea097bd9e59aa95dc9e1b9b0e15ad215ee03168f7d5e814"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/CommandName.cs",
+      "sha256": "e2477f8addc5e7a6310332b6fbd6b469ce4186eb529631ccd3fac7a527104bb4"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/ExtendedFileAttributes.cs",
+      "sha256": "da1067d2de567c258723587e2b7e2b82717a0130ad623787de254498986f43db"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/HeaderFlags.cs",
+      "sha256": "01dbd9ca841c05ced402974488f5682b07c1f10876b9586acade5ffbfd6a4dbb"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/HeaderFlags2.cs",
+      "sha256": "e7a27221f955ecb564b9ca6dfbc55c38067af6233422f6e0d75412f2fa6e9f8e"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/Locking/LockType.cs",
+      "sha256": "102819627583eb82aeaa6d5874a4a77f2e1fcf1d3caf5a14fe8dc40e50ff5b86"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/Negotiate/Capabilities.cs",
+      "sha256": "1f1aa09f95c09fc583d3ac1b960e053af33daa664e20e709ac141a74ca8413e6"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/Negotiate/SecurityMode.cs",
+      "sha256": "cf653a9d879811a18695ed8fbafb342995594339bb2af7769e6202e6d226289c"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/NTCreate/FileStatusFlags.cs",
+      "sha256": "442c9e6025990aaecdac39a8d79e6fd0316f2c2a6ea5025db41e879c6ff95430"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/NTCreate/NTCreateFlags.cs",
+      "sha256": "47c69e50d23fce92709534ce0bf854f63700b452c0015af1390fd3b71fc89da4"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/NTCreate/OpLockLevel.cs",
+      "sha256": "2220a2dcdb4dcf1c053316319beb7d9e902bc4d27875a27b658041a97ed52f7f"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/NTCreate/SecurityFlags.cs",
+      "sha256": "362d84204837c28c93e3abb5627272eefb72d0a132eaeba446c9899f7cc3bb2b"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/Open/AccessRights.cs",
+      "sha256": "2ed5d3b4f6e7b19b2ba05f2aa614bcaece1e5062d6d78c5ff5ca2286be5b4b3a"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/Open/OpenFlags.cs",
+      "sha256": "ec766a9a887c63ad269349a7da7451f1628fc625aa354045f35167eb486595d9"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/Open/OpenResult.cs",
+      "sha256": "f888be5d282b465dd55443a692930ee6e16f47118e7e2942b6e85055b9e6ec9b"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/ResourceType.cs",
+      "sha256": "6cd718c207fdb60663fd662c674721735f6a04a7df8b71bdf02bb8506c771523"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/SessionSetup/SessionSetupAction.cs",
+      "sha256": "df49c4b06539a99afc60edd1679f856521bab8f39153f5920c0e366acdaf23b1"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/SMBFileAttributes.cs",
+      "sha256": "e94aa999d536353e2fe46edf95ae1737b63720215313185daae8fdec92f8dc4f"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/Transaction/TransactionFlags.cs",
+      "sha256": "cee5439260e6ecef7f8d8382da69c0d3ca2b54be950bcab8820f15b743e649df"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/TreeConnect/OptionalSupportFlags.cs",
+      "sha256": "fe923d8bd9db10f3a4eec3087ec9c306ecfaf5b478b49c5cbee19e7f54aea6b9"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/TreeConnect/ServiceName.cs",
+      "sha256": "154c5cb43f86648b429dec31b5de3f13f9ad6b1e0c911af5ac9091febc689ca0"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/TreeConnect/TreeConnectFlags.cs",
+      "sha256": "792eb747f883ad60cba89565caff3dd105910b4bf6798a0d43fd585cc685bc4b"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Enums/Write/WriteMode.cs",
+      "sha256": "58d30deca4cf0ebc6d18d60eb47549b5eda96dd8dd3c16fe3628485bdc37109d"
+    },
+    {
+      "path": "SMBLibrary/SMB1/EnumStructures/NamedPipeStatus.cs",
+      "sha256": "694ca238db72aa85f03f925377574e151d9763760e93b49363f94e6f1f8ac6d0"
+    },
+    {
+      "path": "SMBLibrary/SMB1/EnumStructures/OpenResults.cs",
+      "sha256": "5b849f34ef5acc2b472e0bc728052d09f698a3bf7c60a845ab2f07261b9b932f"
+    },
+    {
+      "path": "SMBLibrary/SMB1/NTTransactSubcommands/Enums/NTTransactSubcommandName.cs",
+      "sha256": "dd0687479ec9da936888ada29d583c309629ca42b57eee5000faa398150d5591"
+    },
+    {
+      "path": "SMBLibrary/SMB1/NTTransactSubcommands/NTTransactCreateRequest.cs",
+      "sha256": "1b0fde40e503ece814854dc13a3f1ec24563db2f238088b7d11252abdd9da494"
+    },
+    {
+      "path": "SMBLibrary/SMB1/NTTransactSubcommands/NTTransactIOCTLRequest.cs",
+      "sha256": "c132e0ac9403857fd1a16dd8071900a8deb85948a5bdffae3eae8e63b6007449"
+    },
+    {
+      "path": "SMBLibrary/SMB1/NTTransactSubcommands/NTTransactIOCTLResponse.cs",
+      "sha256": "e937801b6f5b031a7d5e2c2b93b1d3c8f863c963ae8b7a013352309b6aca5b73"
+    },
+    {
+      "path": "SMBLibrary/SMB1/NTTransactSubcommands/NTTransactNotifyChangeRequest.cs",
+      "sha256": "6a5113186067274f604d3d9964ef9774a5ff24fb59a1fc83dbb317d40fb16b30"
+    },
+    {
+      "path": "SMBLibrary/SMB1/NTTransactSubcommands/NTTransactNotifyChangeResponse.cs",
+      "sha256": "c233089b44ee6c728e4b9cbee732a1416808d98812672e21aaee87b2ce320f2b"
+    },
+    {
+      "path": "SMBLibrary/SMB1/NTTransactSubcommands/NTTransactQuerySecurityDescriptorRequest.cs",
+      "sha256": "79d7847664214a48ae396d883556a3820ae01bdc63d10c995955fb8a313d26dc"
+    },
+    {
+      "path": "SMBLibrary/SMB1/NTTransactSubcommands/NTTransactQuerySecurityDescriptorResponse.cs",
+      "sha256": "f966dcd4ec73ae539abce4a98b583cab06c9288eb4fca28c027779c3ff083afb"
+    },
+    {
+      "path": "SMBLibrary/SMB1/NTTransactSubcommands/NTTransactSetSecurityDescriptorRequest.cs",
+      "sha256": "e7096f80c480837330c8ee6cbb87d41bd6a9b03977e614b489b4b1b358abe317"
+    },
+    {
+      "path": "SMBLibrary/SMB1/NTTransactSubcommands/NTTransactSetSecurityDescriptorResponse.cs",
+      "sha256": "c16ac1ab3ecfc6b5a4dd962ae28f678741920c0cb37ab107c15d5025cf799aaa"
+    },
+    {
+      "path": "SMBLibrary/SMB1/NTTransactSubcommands/NTTransactSubcommand.cs",
+      "sha256": "5a5d63c81900ff5f9f27324a7a00e774271bd07e0daf778d502f7984233f5d90"
+    },
+    {
+      "path": "SMBLibrary/SMB1/ServiceNameHelper.cs",
+      "sha256": "62e07ea576fd63a630f631f88e12460dd72dd587558859e330d028ebf2f39dab"
+    },
+    {
+      "path": "SMBLibrary/SMB1/SMB1Cryptography.cs",
+      "sha256": "659e62489cbdcf2fee8ddc53d61e948d2b604e93a5f260db966786dcd6bc4385"
+    },
+    {
+      "path": "SMBLibrary/SMB1/SMB1Header.cs",
+      "sha256": "0181edcd8e488c4af858dab840c26560848feee63207432ad9110febfd99f2f6"
+    },
+    {
+      "path": "SMBLibrary/SMB1/SMB1Helper.cs",
+      "sha256": "c7cdd9e25a5980667d8dbbb782719fb6d332d533e3a0c6e726a3b3a1d2394e25"
+    },
+    {
+      "path": "SMBLibrary/SMB1/SMB1Message.cs",
+      "sha256": "fd92bdb8e0d3b1c057c34fce9c588bdcafdafe25ac1f5b1c7808ef4fc876fcb4"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Enums/FindFlags.cs",
+      "sha256": "1b91f3e810b2b6b5b4dc234f26273687ec87df058d3282551fd699581f5ff177"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Enums/Open2Flags.cs",
+      "sha256": "adc2a824ca0f9ca4b644b7d5ea19c8ca2e2e6bc05f9deb82c84542646ec51ad4"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Enums/SearchStorageType.cs",
+      "sha256": "41a78f2c26dd8ab20389d374162e016de4d492a2fe87240b8d1d3d52713cee52"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Enums/Transaction2SubcommandName.cs",
+      "sha256": "20fd26ef29073570e8992c4e1a8e3631b6f67e6df34206cb5c7f1cef990666a7"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/EnumStructures/AccessModeOptions.cs",
+      "sha256": "f047d355f029a70e97ed9f60dab869b258a44302e4e420ef7f7476c58710102b"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/EnumStructures/ActionTaken.cs",
+      "sha256": "b41358f48c7d69cb4e791ac2501758a02efe48e0c849d8efc318236c2bfa11d6"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/EnumStructures/OpenMode.cs",
+      "sha256": "d5238d0d416f339b65a3fadba68d3284e55522b252ffe2ae5672f8373075f41f"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2CreateDirectoryRequest.cs",
+      "sha256": "20d580758df3f9c411f3a6d64959b2cef34b36fc8e4f9a47acd7146c61efa6ae"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2CreateDirectoryResponse.cs",
+      "sha256": "fd2e3f03956f734c591022f848d875afd4c68ed86cd1cd8b4aba3cf905553c70"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2FindFirst2Request.cs",
+      "sha256": "7f25af73942f81c6c3fa7fd3a100b72e70c2f12e59a88a7938a3aafef0abe137"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2FindFirst2Response.cs",
+      "sha256": "f43d2570e8f63c0111f9e90f5ec04714a3567abd3b4734fbad59511fdfffcb3d"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2FindNext2Request.cs",
+      "sha256": "1a0789efa927036da48bb9bb3e4ea0cacb5cc635bf02f6e2f66bc06cda575447"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2FindNext2Response.cs",
+      "sha256": "3ec2016413a4365648096a6f3e3e167e8e52a335dd6dad70d61da1fddbdace6a"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2GetDfsReferralRequest.cs",
+      "sha256": "d6daf72a068c9a2c3e20d3ddc3e6b00079c6f4b249865bce3892c3035438b07e"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2GetDfsReferralResponse.cs",
+      "sha256": "a2c0ea913e29662e55b82c4a1366ddc17a497d49f1b82588d72e44f6528c077b"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2Open2Request.cs",
+      "sha256": "a2abb0b42e86700bb551b79d0aeffa6be73eb5b953a64efdf89bd6cc811a2b9f"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2Open2Response.cs",
+      "sha256": "c34ade95f87b58732adc6aaf62aaa0290d1a45428d01e44103f4f5508d7f135a"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2QueryFileInformationRequest.cs",
+      "sha256": "b5a7bac819501d3ea32789c4a85a5351777ffd1d8192fa022281111043f79fb6"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2QueryFileInformationResponse.cs",
+      "sha256": "1381fcf8086ccbf36ac548a5e7cb7bdd3cdc9995f0422f0b3d31a8d63d22df08"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2QueryFSInformationRequest.cs",
+      "sha256": "a3ebe079b1ad277438887c4fd42d776e6b993a6391e7daf69b771b33945176d8"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2QueryFSInformationResponse.cs",
+      "sha256": "b48897e54c09a2c87078d79235c87328fd8b4cd6df0329eab660b22974bf05eb"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2QueryPathInformationRequest.cs",
+      "sha256": "87c4f23a0d7c416a747d5d4dd2aefb0184a4d1df15c05ac6fb9c890db28a5c6a"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2QueryPathInformationResponse.cs",
+      "sha256": "ff0a039cab840f105df9199025bcbe35b836f6fd28a6a58c457eb84b979572d3"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2SetFileInformationRequest.cs",
+      "sha256": "b75a126d0dd97f086e522708eb2bbc22b640c8907ccf051cc4ad19b961d8b7b0"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2SetFileInformationResponse.cs",
+      "sha256": "17240b7e09163a8c582ed2595f245c1162f0d21bc27a749e2ba1ed65413eef59"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2SetFSInformationRequest.cs",
+      "sha256": "327b4d054e53773aac32592c988abd5ad94a319ba0b50e9a780798f988fe3d1a"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2SetFSInformationResponse.cs",
+      "sha256": "ded73b342a3331308dfcb77b4b604987a6edadf5d36a7534206fbe096b315ec0"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2SetPathInformationRequest.cs",
+      "sha256": "eef3b5a56763d02861472b457b71fe711944948d78abcf88496b21e1eb166547"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2SetPathInformationResponse.cs",
+      "sha256": "099644ef836cd064f8e44071243527f54a49b00d1af18674d47ff972a0b50a43"
+    },
+    {
+      "path": "SMBLibrary/SMB1/Transaction2Subcommands/Transaction2Subcommand.cs",
+      "sha256": "6a29e9ee2e0b5f0c56dcf3f280336cc9c9bd828d6a428eb1609df582ed0ff0bf"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/Enums/NamedPipeState.cs",
+      "sha256": "ac4d8319f8d4a66eadb6dd11b242a19742cd4303b5a6574ec1546a6ede15190f"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/Enums/PipeState.cs",
+      "sha256": "378237b58ee433fb40ca53bbe53806094b8733ec076f61f10f8e4de5320a29d3"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/Enums/TransactionSubcommandName.cs",
+      "sha256": "541b9156b98cc3f58bf33b893a6ff89ed977bfc8c0bc91a62a7d0772020255dc"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionCallNamedPipeRequest.cs",
+      "sha256": "13a759b3f98edcf030e3fe9ad4b9bb045bbb8ba00398a1acd8fd9550905e0277"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionCallNamedPipeResponse.cs",
+      "sha256": "c20b480330a065970f64a73c9e2a1fa3467839b1fbbc011799609f959e439422"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionPeekNamedPipeRequest.cs",
+      "sha256": "c0869e79226318a9184f1900a4507788fe58a0b9f83671a6d1c94ff117732f8b"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionPeekNamedPipeResponse.cs",
+      "sha256": "1157e08d2c7f15245563d9cc388c8a850f710f64104ef56208981db64f97ba1a"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionQueryNamedPipeInfoRequest.cs",
+      "sha256": "91dc5fe2f8e3367b51fa51d870a374227ad15e0fadb89779a51cb99ec1996711"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionQueryNamedPipeInfoResponse.cs",
+      "sha256": "60ea9132b50f1e26879e4d2ef00f41f46a24dd8c52bef462a2863dc484608b22"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionQueryNamedPipeStateRequest.cs",
+      "sha256": "0cd0d2f32f51d03aa8cea714d8d2a3d3b1f0f24c583ba361fdb47fdde4c334f3"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionQueryNamedPipeStateResponse.cs",
+      "sha256": "81c790d7b1782936a00eb68e27e171e1ae3be0392d2497abbe1442d0e9785f82"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionRawReadNamedPipeRequest.cs",
+      "sha256": "bfa5426df65b2c69643d944b389de20287d377fb5fda100e3c3347cc04e3e61e"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionRawReadNamedPipeResponse.cs",
+      "sha256": "9ce9cabc70577775cd99fc1e8816a0d0558e611ee63aa79cb3f11eff67797e6a"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionRawWriteNamedPipeRequest.cs",
+      "sha256": "426c49b04d234edc46841043c0af7b3ef8143eadc1d25290b16a40fd934337cf"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionRawWriteNamedPipeResponse.cs",
+      "sha256": "4e38efbe302b82a568ef7e99be479454ba5952fee729df93c90a05b2861123b7"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionReadNamedPipeRequest.cs",
+      "sha256": "d00039dc9d39e957ea6deab61d10420b77ef955823cca9a91f0318896040282a"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionReadNamedPipeResponse.cs",
+      "sha256": "3bfcbe26c0a635c93a7e143ae320423afa4942588dbfd2255dfc2e15bc2f81ea"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionSetNamedPipeStateRequest.cs",
+      "sha256": "eaba98c4127fc2a1b178f7ca9cdde2a99b9d46db6d2973e82d7f3482146872eb"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionSetNamedPipeStateResponse.cs",
+      "sha256": "aebf97f0044c7772c0eddbbed745d9871f13ec58ce0cfb2ca58cd9dc45a818f2"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionSubcommand.cs",
+      "sha256": "cfcdde5017e3483c0242cb9e2f57c946535d60a6d4f46e4c368d23e33dfa9f7f"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionTransactNamedPipeRequest.cs",
+      "sha256": "2799f185ac1673c2f58f5becfd96f74548a907eae5b1f01439bb7535f4316219"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionTransactNamedPipeResponse.cs",
+      "sha256": "dd3f491327a5831afa7e5f7c15dbe59640b3dbe26e0bd532b1885846ae50db9d"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionWaitNamedPipeRequest.cs",
+      "sha256": "50791e2f94e3dbcf3bb586c4e8dc5d1b32d5406d34120c6a95d11aa73ccfa455"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionWriteNamedPipeRequest.cs",
+      "sha256": "c611d5381dd94ee36b79d8043b092eca8b9bee42b9370e8129edf934d76dade4"
+    },
+    {
+      "path": "SMBLibrary/SMB1/TransactionSubcommands/TransactionWriteNamedPipeResponse.cs",
+      "sha256": "bf1c3ca9dcfee0116a5855c70cc1ecda0b5fe79b7a66676735f309084327198a"
+    },
+    {
+      "path": "SMBLibrary/SMB1/UTimeHelper.cs",
+      "sha256": "8ae5338e70b2c5b4a1b7b50533d3ae7d4945b5f263d8a743ee3be5a93bbf8bf7"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Enums/FindInformationLevel.cs",
+      "sha256": "176c158cc59fe5c40375eb97b504393b46838f622a39f7b1148aac0d6838b7e0"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Enums/QueryFSInformationLevel.cs",
+      "sha256": "b908ebacf6af7b518010a21efbd4c5b4d9b3e83256eb2feba138a398a8d1106d"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Enums/QueryInformationLevel.cs",
+      "sha256": "b680a63aa7cff3da10a068ce885fa23089075c6a4e46c54a892064ba837b700a"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Enums/SetInformationLevel.cs",
+      "sha256": "418f6310f5ac94bfeab10e432fbf46651257e5eb778e80616863adafc676913f"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Helpers/FindInformationHelper.cs",
+      "sha256": "ec62902919576dd069d93b90b17824cf87e64374da9bfd0fbe90b31d92e4b848"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Helpers/QueryFSInformationHelper.cs",
+      "sha256": "2509b150dd16e42ab5fadddbe7de698169c13305e65258bdba30a4f0a9f82feb"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Helpers/QueryInformationHelper.cs",
+      "sha256": "ff75e84f103e3da07ba99e6d477710828fbd502bc0f5d173b02d9d648f6e4ee0"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Helpers/SetInformationHelper.cs",
+      "sha256": "14bb68dd961f1344bc2bae379ed3e8a028b59f52dd29fbd55ea831d90bb1d477"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/ExtendedFileAttributes/ExtendedAttributeName.cs",
+      "sha256": "fc77418beb70bdcac0f09f950a38da53eccede78f1fcc4dae1654bdb25fefa42"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/ExtendedFileAttributes/ExtendedAttributeNameList.cs",
+      "sha256": "96631ef44c88cb952fbb53fa01c6e8b995729e0fe2c789421e83d03203b1982a"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/ExtendedFileAttributes/FullExtendedAttribute.cs",
+      "sha256": "f78ecf53ee8a7fabde49ddf2a7ce968eebf0b8aef8139c1ba8616b616efdfad1"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/ExtendedFileAttributes/FullExtendedAttributeList.cs",
+      "sha256": "acdcc7248ad209aedb9f2125c707b99e39615e7d82a0197393ced529a2963a80"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/FindInformation/FindFileBothDirectoryInfo.cs",
+      "sha256": "c49f4d18f571c8ce124e33f5109a30467a56b9f04d18885e7690a6789546f30d"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/FindInformation/FindFileDirectoryInfo.cs",
+      "sha256": "431bc4ec328ebe1bcc588e47f56f6d3123e0449c0fc527e022bb5b04ad84470b"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/FindInformation/FindFileFullDirectoryInfo.cs",
+      "sha256": "a3fa93417d724e2df9056f5ead142b4ab372b4b132f5e1f8c2c9bd3612fa93cd"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/FindInformation/FindFileIDBothDirectoryInfo.cs",
+      "sha256": "a228f89b1857046baa8af67db7490ad03900f435e6f1a3b8c1b9f827742e14d5"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/FindInformation/FindFileIDFullDirectoryInfo.cs",
+      "sha256": "7b84f08eda403d0c4d8e3ee291312bdb8d5e00f2bb6a297e4316a6fa9bd9736e"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/FindInformation/FindFileNamesInfo.cs",
+      "sha256": "e33ab4d600636f05e0719325641b76d29508db5d529d5d3cbe46a92c0e15a323"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/FindInformation/FindInformation.cs",
+      "sha256": "e062eaab667d6c1ffb47fcd0557ce391487230b19c8ec45596de217399568b8c"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/FindInformation/FindInformationList.cs",
+      "sha256": "fd2ef7f90356815892881c96c4940d530f4645e67f9c067c3d404086327ef37d"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/QueryFSInformation/QueryFSAttibuteInfo.cs",
+      "sha256": "751b01bafb768e1ebafdb291bce219d55ef22f12389aa026087401bc03a1204a"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/QueryFSInformation/QueryFSDeviceInfo.cs",
+      "sha256": "661c571810d6dab38bbb41523d33cca15c74ac85756bd226de5892a93f42290a"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/QueryFSInformation/QueryFSInformation.cs",
+      "sha256": "e47299bf70848cd66b87df2822daf32f67573fe3a72eeab0209e267440f6e4be"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/QueryFSInformation/QueryFSSizeInfo.cs",
+      "sha256": "8266999036226946ea6ff43f53e91aff1eb3c3be1210dcdc33269ec977569402"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/QueryFSInformation/QueryFSVolumeInfo.cs",
+      "sha256": "bb6242d0c285af06b5dac83994503a3a4b85ae632fdadc717d4f97894a6739a5"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/QueryInformation/QueryFileAllInfo.cs",
+      "sha256": "bf4e8734c95cad477bed0ca18167cbef86aa1f8095c9a7f37f38c91366eb10fe"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/QueryInformation/QueryFileAltNameInfo.cs",
+      "sha256": "7b658f3a6cffbf597d3131f360d84b6ce862651eb5bae7d700a0780f5fbce4d8"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/QueryInformation/QueryFileBasicInfo.cs",
+      "sha256": "4c6f71efaff3c5fd690f1b1457d2f40e1d13693c6eae514b91ee098e5f7b3c4f"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/QueryInformation/QueryFileCompressionInfo.cs",
+      "sha256": "e0962a75a039c34b3924ee47fb16a07a8e87f18669a28a18aa635a6120db4467"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/QueryInformation/QueryFileEaInfo.cs",
+      "sha256": "9fcbaa58fa0fee2ae19dcddb0548e01eed3eeadd319b0db75db12a08a55f8c71"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/QueryInformation/QueryFileNameInfo.cs",
+      "sha256": "d227f320caa05014132ecb547f905dbb76f413b736202cdaac723169e9834ee9"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/QueryInformation/QueryFileStandardInfo.cs",
+      "sha256": "13f054cf2422b2d2e8a571d94cba85db4f101eee04886a0309b5bf1a7f036c20"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/QueryInformation/QueryFileStreamInfo.cs",
+      "sha256": "0de13df9ffa6d90f27a1cec0c40ecc7b6b4d7839a41346c0d990893c977b9263"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/QueryInformation/QueryInformation.cs",
+      "sha256": "bd3ba1fd3648cc0e061408ccc0ac5463d9ff2b2b382e937cceae8ef76ced9380"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/SetInformation/SetFileAllocationInfo.cs",
+      "sha256": "ef2fb48ddaad6fbed867dc66c45081bbefc72101268b1545ec175ddc9e9bb9fd"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/SetInformation/SetFileBasicInfo.cs",
+      "sha256": "bf3874caaf2625cff3c38e6cb117397b09e54fb935f2b944ae3cb93e3e57e858"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/SetInformation/SetFileDispositionInfo.cs",
+      "sha256": "0a2503f042a23bb55655d0f09d3ba89c63eb6893803c3e6ce076dcec55521f9a"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/SetInformation/SetFileEndOfFileInfo.cs",
+      "sha256": "1777fa0c4273b7d8023b5f3955d5b5b9fbaf9b2fe2de330c84f34d07bb663309"
+    },
+    {
+      "path": "SMBLibrary/SMB1FileStore/Structures/SetInformation/SetInformation.cs",
+      "sha256": "5631fe119d4a96a69d00b74d5864202faaa711b1cf09fa428fccbd95078831b7"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/CancelRequest.cs",
+      "sha256": "1dbfa0ca3cefdbc68289b81a8060a3a91d4b9ae28872b277298349cabe4fa2b4"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/ChangeNotifyRequest.cs",
+      "sha256": "cc4f95cc47c1cf82024df5967fe54970e3279b0f607778df9e7a45fbba169c54"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/ChangeNotifyResponse.cs",
+      "sha256": "e2a502e2b27f075443aee71d54c98ed633f6e469599cbd2afe80a5c1d30b8428"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/CloseRequest.cs",
+      "sha256": "a54387435395e4e31931a58c56135e22649e6a32fffb4b76347995f6f1358e72"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/CloseResponse.cs",
+      "sha256": "80fe8b425f061a0204cf62ac62184368dc934c0e1446bf04413267f457d9ed73"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/CreateRequest.cs",
+      "sha256": "fdb71fcddb2276f95768b992e6c04541ca0c0a8f0ddb53aeac81e811e7106954"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/CreateResponse.cs",
+      "sha256": "ad3fdac7572e5e6e3250bdc52b81d9ecce33337fac9426098e7d345ac083781e"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/EchoRequest.cs",
+      "sha256": "73a6ec23cb8ffb2e47cbad93e3755bbf0b6ef11990a4709df37c203a7776a4da"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/EchoResponse.cs",
+      "sha256": "3fb11e255e66981ceb3f66dc14ba8e03e681336fad88c74ded57b4e2c2226c9d"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/ErrorResponse.cs",
+      "sha256": "89118e985a561ad06bc2fc9762f45f2de9e1e9696891c5147362bd1af710921d"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/FlushRequest.cs",
+      "sha256": "e2c4cefcec9b1618ec473c234449b4129d7d4841a9e6dc0dafcdc409a928080f"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/FlushResponse.cs",
+      "sha256": "81c708027297b8a51d33964f67d161b5aee826437e8332402f4d5fd60119d94e"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/IOCtlRequest.cs",
+      "sha256": "f338bb8109ae066f2cb44778c96b9f29bf611d8163cf0e0b25fec0511b134ea1"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/IOCtlResponse.cs",
+      "sha256": "eaab0542364f9d682ab62d4afd5d893ddce18f4cefcb5f8a5dc3375129579b4a"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/LockRequest.cs",
+      "sha256": "4ed8ef7543b651577fa28aa0233a07e5943644260534e8fcdd557590e898bf6f"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/LockResponse.cs",
+      "sha256": "40e9145fc13d46e03624be549c03ca019bfda4fb6036e02e11be4660ff697a35"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/LogoffRequest.cs",
+      "sha256": "ca034466ae5d527a7c779d38edcdf61b2a76eea40643f3cdbd4b2218764f1f02"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/LogoffResponse.cs",
+      "sha256": "eb2b888845bbaf7c72feb193ab5eab33b17b6c73094eef59e46c2b63a7313438"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/NegotiateRequest.cs",
+      "sha256": "f3b8a4189c46f2f279cd49bb6b2f91dae4c287abed098a60c7a9d8b26304c554"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/NegotiateResponse.cs",
+      "sha256": "41dcc5907f2076b28d638bf7747b7b882f14ae02632ebae7d202b478d1ebb270"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/QueryDirectoryRequest.cs",
+      "sha256": "77ed1a6b30e4ab667b76d4b10aaaf81109f35d48deb802b14a2ab889875a2c26"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/QueryDirectoryResponse.cs",
+      "sha256": "57ea0861ddc5bbf4e28b691bc5c1ac56a3cdb1202e07e7bbc4b12cc9f80ba2e7"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/QueryInfoRequest.cs",
+      "sha256": "5ccbc5860a01a60ad8c9706966e0c3d7e30bffc30ec03456be9255fecc361162"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/QueryInfoResponse.cs",
+      "sha256": "92e52ceb4993fffec59e1f6985acde90b41926592f57a7b0cc05150628008912"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/ReadRequest.cs",
+      "sha256": "47c524c289a89311e51e8f50f687d10af25e9f759df81d0a6d266446e9e2f7c3"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/ReadResponse.cs",
+      "sha256": "b1e71470e23484a61df8f77618c936a093435a9c645af04a6c2520b377ec5420"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/SessionSetupRequest.cs",
+      "sha256": "b368877a4852bb30c49e95614b3381d421f6ace0a8a9174de18e01c1fe6b3a16"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/SessionSetupResponse.cs",
+      "sha256": "26e76bab0833711a9887fb9204b573bb78c4d793b743bb0435edb3b54b0a4303"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/SetInfoRequest.cs",
+      "sha256": "2246b8784576fed876b2d283128b67359e8109cb4d23318a4f567bc73720c537"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/SetInfoResponse.cs",
+      "sha256": "47ce0a1be203e18719e41f00b7f46a7bd341d506e23e0d161e284d0e60e4b291"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/SMB2Command.cs",
+      "sha256": "259f5894c721ae5101537e4b33aefd36e4862b0fbeb6d8034bc617a6a11c3007"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/TreeConnectRequest.cs",
+      "sha256": "75aa64436164e2d9e15bc549ce230826574822bdf7beea3dac8aca9f95c8e84e"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/TreeConnectResponse.cs",
+      "sha256": "138ae2e65a63447574c60af04aa004aeca07c346177506d6b9406a135a2f1469"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/TreeDisconnectRequest.cs",
+      "sha256": "5176813f9a284a8a7dc78f4bff82f5401eb35caf3b7afce830e19db8d4a50f17"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/TreeDisconnectResponse.cs",
+      "sha256": "1f59e41df8e65bf22c8612ebe7f1404a5e95f917c999c8bb3ca9c6aaf41eb23f"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/WriteRequest.cs",
+      "sha256": "719c5d6262b46e93b86a00edce63adee204b87f9853ee461f2acaf1ec336695d"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/WriteResponse.cs",
+      "sha256": "f19e1d1861d404b12e774d8072d1b31b69b46098f044bf589e81a97ae996143f"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/ChangeNotify/ChangeNotifyFlags.cs",
+      "sha256": "2f3cfc699a359978597ece4cd1086819c9c1c19975c155be431bad66e1d1da59"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/Close/CloseFlags.cs",
+      "sha256": "5adc56a8210924b8885c52379423e9d75aa7a14fad16115662c62f866405bcf0"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/Create/CreateAction.cs",
+      "sha256": "3901221dd4fa9ca6876d3bffcdbcc6a2fe317ebd0fe02f20f296d0564764ad3a"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/Create/CreateResponseFlags.cs",
+      "sha256": "bd6b6f0282c5ee31e4e3753c161b6508e612b5f4d71a6d47e33dad9adb2d5b36"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/Create/OplockLevel.cs",
+      "sha256": "30aab6a065a648db1e8dbc5a33016f91f4b6f6c233841ca5fb4e4763caa011ad"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/InfoType.cs",
+      "sha256": "f9e3b90c7db1ffdd71926efc5e2cdcf480ec107abe40bd6532431e4acd641ca3"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/IOCtl/IOCtlRequestFlags.cs",
+      "sha256": "01ba87422055ee2ff8785c7c2f0d6dc6d44fd333c2fcc38f69cac5e014f5818e"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/Negotiate/Capabilities.cs",
+      "sha256": "3c05efe8bc9b3c87c59939fb5a08dfd135d740e19fe4052e3e5ebfc117d0c855"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/Negotiate/NegotiateContextType.cs",
+      "sha256": "bd4805f8cdfb1fd0bd23ca6571e270c3cc54a6467ff2bf7083bfe62d6bd6c6c7"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/Negotiate/SecurityMode.cs",
+      "sha256": "53c73a1da3f8dcee889aa1efc7e82c1dcfa73b14174c185009a74fe6b1550e6e"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/Negotiate/SMB2Dialect.cs",
+      "sha256": "ec259237b7c7dd41bde3d723d2e3f5cce18537cac9feb00988e100f3aff8e031"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/QueryDirectory/QueryDirectoryFlags.cs",
+      "sha256": "e9eb4cc91e942749df750c648c4d1bdc0eb0b128e1882b2a7101e3d2d2334d80"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/Read/ReadFlags.cs",
+      "sha256": "eac8aec664542c95032727fc31df700c9e618be7cff98ed025fe4b246e6d61aa"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/SessionSetup/SessionFlags.cs",
+      "sha256": "e8b145a5184f5b165f9f0ce71b0325607fe53480b346e051e216e5648ff4a956"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/SessionSetup/SessionSetupFlags.cs",
+      "sha256": "ecbb0c6e678067ac35b2db3a962e7648671bb60e79a7147f650ddffc5d083194"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/SMB2CommandName.cs",
+      "sha256": "b772cbdc201ef84ea72a309d7d05e2a126533df8d94294bd60d80f6a7edef200"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/SMB2PacketHeaderFlags.cs",
+      "sha256": "388d308704b335b0609a27e5ceaf47ea0220c8e49e4a75ba3ed5ebaeb71261c4"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/SMB2TransformHeaderFlags.cs",
+      "sha256": "3df9425edf8f86329e5107279956953c01e28ef619b398e6c073a87b8515abb6"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/TreeConnect/ShareCapabilities.cs",
+      "sha256": "8e72153c751281f209b6a016064c26680d6c5d221e1d37f30c012a36886eccdf"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/TreeConnect/ShareFlags.cs",
+      "sha256": "f0df66404e0c74bafe6efd87ae1d5134b4a39da06bddb3cbe79c82ba79e0051a"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/TreeConnect/ShareType.cs",
+      "sha256": "7e2beba046c87065331083ef23b98364097fa175488056cf740aec55f0105dde"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Enums/Write/WriteFlags.cs",
+      "sha256": "38b27d01f0c1c2960ca686bbf1927c7ae21c653d5a4e21116179747996abfd31"
+    },
+    {
+      "path": "SMBLibrary/SMB2/SMB2Cryptography.cs",
+      "sha256": "951f190487d012a1157c3e85419302b7ef479baf77964dd8aba0f1cd46e8d3bd"
+    },
+    {
+      "path": "SMBLibrary/SMB2/SMB2Header.cs",
+      "sha256": "7bfab7c7ea07b50b4dc569b64f9f88ec7b218b659e2dac934845dd80b941c002"
+    },
+    {
+      "path": "SMBLibrary/SMB2/SMB2TransformHeader.cs",
+      "sha256": "7c3a835070d134f1026ded4310227c1cbd33ea7e69fd35d6a7c802749ec30a46"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Structures/CreateContext.cs",
+      "sha256": "7e79d860809db9a6abba523e505a12f59c3a1d16404a923011ce0330a2c11a02"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Structures/Enums/CipherAlgorithm.cs",
+      "sha256": "8e801becf40a009d22fa1808ed63cb2c28289cf7853fd6ef2f5c496f261f4592"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Structures/Enums/HashAlgorithm.cs",
+      "sha256": "4e113e67d95c91cfbba2b29d5958e81e56b1d8492d8df595707c3f2dd0d90ac6"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Structures/Enums/LockFlags.cs",
+      "sha256": "de7fde069c7c849c1da800d6defdeb562ba8298f20036aef009ad0411c684ff0"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Structures/FileID.cs",
+      "sha256": "508616c563136d6a3be192c4ec0f75ef3ecc2019b01f0f94d51bac01d3dab828"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Structures/LockElement.cs",
+      "sha256": "7c2c901836211080538439b1201a8ba5e6f65da9236c8b644cbf2cf8d1dec756"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Structures/NegotiateContext/EncryptionCapabilities.cs",
+      "sha256": "e436c242bb7f075acfb20de9d7e8e7cc9fb4fb26741bc993f16ae0ae273bbdd6"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Structures/NegotiateContext/NegotiateContext.cs",
+      "sha256": "c273dc65a65e0beac56a2b4dca757b181192ead01c7cebe1ca6c3edbcd56b464"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Structures/NegotiateContext/PreAuthIntegrityCapabilities.cs",
+      "sha256": "8e6a1cf2cbdb2fce6d343abe8af8a2dd51379341f1ad587c789e1e8af2ce4e7b"
+    },
+    {
+      "path": "SMBLibrary/Utilities/LogEntry.cs",
+      "sha256": "fe152fad96b913c96feae6e6aecff47339ed1a9bbe6901f6b1fb4fe39c2148f6"
+    },
+    {
+      "path": "SMBLibrary/Utilities/SocketUtils.cs",
+      "sha256": "893e429364fd81acf5afea69b6fc2de8b6630cba32e48a3ef3d8419d52d103f7"
+    },
+    {
+      "path": "Utilities/ByteUtils/BigEndianReader.cs",
+      "sha256": "0306b4f14cb76a9236e8db7b6af7297b26702f33d2bda274fc7384d20d33cd64"
+    },
+    {
+      "path": "Utilities/ByteUtils/BigEndianWriter.cs",
+      "sha256": "db292cf2fbb99987304468788479ed6e706d75db1efe6463420032802cb5996b"
+    },
+    {
+      "path": "Utilities/ByteUtils/ByteReader.cs",
+      "sha256": "daccb7a91596e2813cff88c687312aba2a9d48d2c6089013608019865ecc1f2a"
+    },
+    {
+      "path": "Utilities/ByteUtils/ByteUtils.cs",
+      "sha256": "9472e8e7c0a4db5aeb2b8d1c508ffd7e0d7426132367faf526ebf161d4f4176f"
+    },
+    {
+      "path": "Utilities/ByteUtils/ByteWriter.cs",
+      "sha256": "9d4cf5d6999188d5952fb2c2d6cf96d519d4a11867496399c8b8127164e25454"
+    },
+    {
+      "path": "Utilities/ByteUtils/LittleEndianReader.cs",
+      "sha256": "541cb63d21e83271b8c5c9806970b189753163fc4f1064484f5e59c50598f034"
+    },
+    {
+      "path": "Utilities/ByteUtils/LittleEndianWriter.cs",
+      "sha256": "a39f9781373d64fec1ced1a1150f9e4cc21aa0c98d2290b7b148f5b569f13aeb"
+    },
+    {
+      "path": "Utilities/Comparers/ReverseComparer.cs",
+      "sha256": "5fd7945fc1ceeb960b94f11c6bddb812f0c4e1da00e549da914658b3b56d7c56"
+    },
+    {
+      "path": "Utilities/Conversion/BigEndianConverter.cs",
+      "sha256": "8adda9b611dadaa848c38a2c82629c5833405356ebfbf8c56bb0afcbdc0e56cd"
+    },
+    {
+      "path": "Utilities/Conversion/Conversion.SimpleTypes.cs",
+      "sha256": "c04b7b308f7fc3478a07aeecdb8b2c3e8cdc35e187cf0f26ddfe959fce5bf841"
+    },
+    {
+      "path": "Utilities/Conversion/LittleEndianConverter.cs",
+      "sha256": "ce2d46f278595d9d9ff316e859f064fe83b98f5113c1d147dc49bfc85cc85cef"
+    },
+    {
+      "path": "Utilities/Cryptography/AesCcm.cs",
+      "sha256": "28b5eaf21bd206ef8e8b8cb4239b351949549545dda1c8590e36be76e83d0553"
+    },
+    {
+      "path": "Utilities/Cryptography/AesCmac.cs",
+      "sha256": "1c86f247f38c2c28713da60c5806da3694279621b3f02d3b7ea26233eec52a8f"
+    },
+    {
+      "path": "Utilities/Cryptography/CRC32.cs",
+      "sha256": "05246a8028bd1d7c8c07b0b6ac7b04dd6f94ca2ff6d8850be670275bd615016f"
+    },
+    {
+      "path": "Utilities/Generics/BlockingQueue.cs",
+      "sha256": "489e9e533b9cc16bdf0c46033e1a9ee15bf72f9e011c46a23f849f380cbbdefc"
+    },
+    {
+      "path": "Utilities/Generics/KeyValuePairList.cs",
+      "sha256": "693cbe336da9b2909957e40a65a45ee1ce4e59e4b3551841693817be7d20e2b9"
+    },
+    {
+      "path": "Utilities/Generics/KeyValuePairList.Sort.cs",
+      "sha256": "8256690e60aa580bc1f1257e8ce533e191550185a47b88f20765d8f45ab00f5e"
+    },
+    {
+      "path": "Utilities/Generics/Map.cs",
+      "sha256": "749a611ba04f9435c932a01a3e751266d509dbb16b0d87f1a67f74a02beb7496"
+    },
+    {
+      "path": "Utilities/Generics/Reference.cs",
+      "sha256": "50e6a0f08ba4a82c8f1cf6f13b03324fd4353db72e0008324f67a584637f8ce1"
+    },
+    {
+      "path": "Utilities/Generics/SortedList.cs",
+      "sha256": "4e2504ad1261076fb71089958f8563080f3dfefae41f0bc34719e3247f27541d"
+    },
+    {
+      "path": "Utilities/Strings/QuotedStringUtils.cs",
+      "sha256": "fcbed8ff7592b21cacaaad18a21808f02dfa70c8428b11249312e066493dac6a"
+    },
+    {
+      "path": "Utilities/Threading/CountdownLatch.cs",
+      "sha256": "b3918ce869cf00aa39fb078fe77ba4616bff21a4c5fa168465ab0cff42ad232a"
+    },
+    {
+      "path": "Utilities/Threading/Parallel.cs",
+      "sha256": "8e3a9fbd9dcb5fcd684f15893b3eb95028026ab90d78187656af36f678f65f1a"
+    }
+  ],
+  "changes": [
+    {
+      "path": "SMBLibrary/Server/SMB2/IOCtlHelper.cs",
+      "afterSha256": "c2674cfefeee8629dd42d098c435a76fb9d367da597aeb0ffa59876c6ce16c3c"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB2/NegotiateHelper.cs",
+      "afterSha256": "9469df7c932ce7bb7b17dcc2c1f851a2e8a46990fff84425b79acae339e2bffb"
+    },
+    {
+      "path": "SMBLibrary/Server/SMB2/SessionSetupHelper.cs",
+      "afterSha256": "1141f45609f9bbdd7239fe0336dc30504f94d780d81274b567a80834440a61ee"
+    },
+    {
+      "path": "SMBLibrary/Server/SMBServer.cs",
+      "afterSha256": "117c164a8f8ff427a22793bef696b2238f24eb95312737b372209ad74e2cb457"
+    },
+    {
+      "path": "SMBLibrary/Server/SMBServer.SMB2.cs",
+      "afterSha256": "b7e6d4cbaecc40fc41f9c32cc51a8e3a51988e8c75582a6729f53809ebbfa812"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Commands/LockRequest.cs",
+      "afterSha256": "bb846a9531614a2482b99b1c87ea843d92e15f161be76f76cb987a9716e2f160"
+    },
+    {
+      "path": "SMBLibrary/SMB2/Structures/LockElement.cs",
+      "afterSha256": "df6bd5e4836d703723186b49d3864684a6b9aa55a14cadf4f1552780178e9aa3"
+    }
+  ]
+}

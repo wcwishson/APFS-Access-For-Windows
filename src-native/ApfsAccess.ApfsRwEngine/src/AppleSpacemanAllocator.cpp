@@ -1,4 +1,8 @@
 #include "AppleSpacemanAllocator.h"
+#include "ApfsFusionAllocationPlan.h"
+#include "ApfsFusionSpaceman.h"
+#include "FusionPlanningParser.h"
+#include "FusionReclamationProof.h"
 
 #include "ApfsTransactionWriter.h"
 
@@ -161,11 +165,20 @@ bool RangeFits(std::uint64_t start, std::uint64_t count, std::uint64_t limit)
 bool FindChunkIndex(const catalog::AppleSpacemanView& view,
     std::uint64_t block, std::size_t& out_index)
 {
-    const auto upper = std::upper_bound(view.chunks.begin(),
-        view.chunks.end(), block, [](std::uint64_t value, const auto& chunk) {
+    const auto block_size = catalog::ReadU32LE(view.bytes, 0x20).value_or(0);
+    if (!block_size) return false;
+    const auto tier = catalog::kFusionTier2ByteAddress / block_size;
+    const std::size_t device = block >= tier ? 1 : 0;
+    if (device) block -= tier;
+    const auto begin = std::lower_bound(view.chunks.begin(), view.chunks.end(), device,
+        [](const auto& c, auto d) { return c.device_index < d; });
+    const auto end = std::upper_bound(begin, view.chunks.end(), device,
+        [](auto d, const auto& c) { return d < c.device_index; });
+    const auto upper = std::upper_bound(begin,
+        end, block, [](std::uint64_t value, const auto& chunk) {
             return value < chunk.start_block;
         });
-    if (upper == view.chunks.begin())
+    if (upper == begin)
     {
         return false;
     }
@@ -184,6 +197,13 @@ bool ClassifyDeferredFree(const catalog::AppleSpacemanView& view,
     std::uint64_t physical_block, std::uint64_t block_count,
     std::size_t& out_queue_index)
 {
+    const auto bs = catalog::ReadU32LE(view.bytes, 0x20).value_or(0);
+    if (view.devices[1].block_count && bs && physical_block >= catalog::kFusionTier2ByteAddress / bs)
+    {
+        out_queue_index = 2;
+        return RangeFits(physical_block - catalog::kFusionTier2ByteAddress / bs,
+            block_count, view.devices[1].block_count);
+    }
     if (!RangeFits(physical_block, block_count, view.devices[0].block_count))
     {
         return false;
@@ -228,7 +248,8 @@ bool AddDeferredFree(AppleSpacemanAllocationPlan& plan,
 bool MainPoolRangeIsAllocated(const catalog::AppleSpacemanView& view,
     std::uint64_t physical_block, std::uint64_t block_count)
 {
-    if (!RangeFits(physical_block, block_count, view.devices[0].block_count))
+    std::size_t queue = 0;
+    if (!ClassifyDeferredFree(view, physical_block, block_count, queue))
     {
         return false;
     }
@@ -241,8 +262,10 @@ bool MainPoolRangeIsAllocated(const catalog::AppleSpacemanView& view,
             return false;
         }
         const auto& chunk = view.chunks[chunk_index];
+        const auto base = chunk.device_index ? catalog::kFusionTier2ByteAddress /
+            catalog::ReadU32LE(view.bytes, 0x20).value() : 0;
         if (chunk.allocation_bitmap.empty() ||
-            !BitSet(chunk.allocation_bitmap, block - chunk.start_block))
+            !BitSet(chunk.allocation_bitmap, block - base - chunk.start_block))
         {
             return false;
         }
@@ -324,18 +347,21 @@ bool ReclaimMainPoolRange(catalog::AppleSpacemanView& view,
     return true;
 }
 
+#include "FusionTier2Reclamation.inc"
+
 bool ReclaimMatureFreeQueues(catalog::AppleSpacemanView& view,
     std::uint64_t expected_checkpoint_xid,
     std::uint64_t oldest_required_checkpoint_xid,
     std::uint64_t transaction_xid,
     std::set<std::size_t>& dirty_ip_bitmaps,
     std::set<std::size_t>& touched_chunks,
-    std::array<bool, 3>& rebuild_queue, std::string& out_error)
+    std::array<bool, 3>& rebuild_queue, std::string& out_error, bool internal_pool_only)
 {
     for (std::size_t queue_index = 0;
          queue_index < view.free_queues.size(); ++queue_index)
     {
         auto& queue = view.free_queues[queue_index];
+        if (internal_pool_only && queue_index != 0) continue;
         if (queue.entries.empty())
         {
             continue;
@@ -362,7 +388,10 @@ bool ReclaimMatureFreeQueues(catalog::AppleSpacemanView& view,
                     ? ReclaimMainPoolRange(view, entry.physical_block,
                         entry.block_count, transaction_xid, touched_chunks,
                         out_error)
-                    : Fail(out_error, "AppleSpacemanFreeQueuePoolMismatch");
+                    : queue_index == 2 && view.devices[1].block_count
+                        ? ReclaimFusionTier2Range(view,entry.physical_block,entry.block_count,
+                            transaction_xid,touched_chunks,out_error)
+                        : Fail(out_error, "AppleSpacemanFreeQueuePoolMismatch");
             if (!reclaimed)
             {
                 return false;
@@ -746,11 +775,11 @@ bool RotateInternalPoolBitmap(
 
 } // namespace
 
-bool PlanAppleSpacemanAllocation(
+static bool PlanSpacemanAllocationImpl(
     const catalog::AppleSpacemanView& view,
     const AppleSpacemanAllocationRequest& request,
     AppleSpacemanAllocationPlan& out_plan,
-    std::string& out_error)
+    std::string& out_error, std::size_t tier2_block_count, bool fusion)
 {
     out_plan = AppleSpacemanAllocationPlan{};
     out_error.clear();
@@ -780,16 +809,23 @@ bool PlanAppleSpacemanAllocation(
     if (!ReclaimMatureFreeQueues(updated, request.expected_checkpoint_xid,
             plan.effective_oldest_required_checkpoint_xid,
             request.transaction_xid, dirty_ip_bitmaps, touched_chunks,
-            rebuild_queue, out_error))
+            rebuild_queue, out_error, request.reclaim_internal_pool_only))
     {
         return false;
     }
-    if (updated.devices[0].free_count < request.main_block_count)
+    if (updated.devices[0].free_count < request.main_block_count ||
+        updated.devices[1].free_count < tier2_block_count ||
+        tier2_block_count > SIZE_MAX - request.main_block_count)
     {
         return Fail(out_error, "AppleSpacemanMainPoolExhausted");
     }
+    const std::array<std::size_t, 2> requested{request.main_block_count, tier2_block_count};
+    std::array<std::size_t, 2> allocated{};
+    const auto block_size = catalog::ReadU32LE(view.bytes, 0x20).value_or(0);
     const auto allocate_from_chunk = [&](std::size_t chunk_index) {
         auto& chunk = updated.chunks[chunk_index];
+        const auto device = chunk.device_index;
+        if (device >= 2 || allocated[device] == requested[device]) return;
         if (chunk.free_count == 0)
         {
             return;
@@ -806,7 +842,7 @@ bool PlanAppleSpacemanAllocation(
         }
         for (std::uint32_t ordinal = 0;
              ordinal < chunk.block_count &&
-             plan.allocated_main_blocks.size() < request.main_block_count;
+             allocated[device] < requested[device];
              ++ordinal)
         {
             const std::uint32_t bit = request.search_from_end
@@ -817,9 +853,11 @@ bool PlanAppleSpacemanAllocation(
                 continue;
             }
             SetBit(chunk.allocation_bitmap, bit);
-            plan.allocated_main_blocks.push_back(chunk.start_block + bit);
+            plan.allocated_main_blocks.push_back(chunk.start_block + bit +
+                (device ? catalog::kFusionTier2ByteAddress / block_size : 0));
+            ++allocated[device];
             --chunk.free_count;
-            --updated.devices[0].free_count;
+            --updated.devices[device].free_count;
             chunk.xid = request.transaction_xid;
             touched_chunks.insert(chunk_index);
         }
@@ -828,7 +866,7 @@ bool PlanAppleSpacemanAllocation(
     {
         for (std::size_t ordinal = 0;
              ordinal < updated.chunks.size() &&
-             plan.allocated_main_blocks.size() < request.main_block_count;
+             plan.allocated_main_blocks.size() < request.main_block_count + tier2_block_count;
              ++ordinal)
         {
             allocate_from_chunk(updated.chunks.size() - 1 - ordinal);
@@ -838,20 +876,20 @@ bool PlanAppleSpacemanAllocation(
     {
         for (std::size_t index = 0;
              index < updated.chunks.size() &&
-             plan.allocated_main_blocks.size() < request.main_block_count;
+             plan.allocated_main_blocks.size() < request.main_block_count + tier2_block_count;
              ++index)
         {
             allocate_from_chunk(index);
         }
     }
-    if (plan.allocated_main_blocks.size() != request.main_block_count)
+    if (allocated != requested)
     {
         return Fail(out_error, "AppleSpacemanMainPoolExhausted");
     }
 
     const auto fail_internal_pool_exhaustion = [&]()
     {
-        if (plan.effective_oldest_required_checkpoint_xid < request.expected_checkpoint_xid)
+        if (!fusion && plan.effective_oldest_required_checkpoint_xid < request.expected_checkpoint_xid)
         {
             // Diagnose retention pressure without changing the real request or
             // publishing anything. The probe cannot recurse: its floor is current.
@@ -866,7 +904,7 @@ bool PlanAppleSpacemanAllocation(
         }
         return Fail(out_error, "AppleSpacemanInternalPoolExhausted");
     };
-    std::set<std::size_t> touched_cibs;
+    std::set<std::pair<std::size_t, std::size_t>> touched_cibs;
     for (const std::size_t chunk_index : touched_chunks)
     {
         auto& chunk = updated.chunks[chunk_index];
@@ -890,13 +928,14 @@ bool PlanAppleSpacemanAllocation(
         bitmap_write.physical_block = new_bitmap_block;
         bitmap_write.bytes = chunk.allocation_bitmap;
         plan.writes.push_back(std::move(bitmap_write));
-        touched_cibs.insert(chunk.cib_index);
+        touched_cibs.insert({chunk.device_index, chunk.cib_index});
     }
 
-    std::set<std::size_t> touched_cabs;
-    for (const std::size_t cib_index : touched_cibs)
+    std::set<std::pair<std::size_t, std::size_t>> touched_cabs;
+    for (const auto& [device_index, cib_index] : touched_cibs)
     {
-        auto& cib = updated.devices[0].cibs[cib_index];
+        auto& device = updated.devices[device_index];
+        auto& cib = device.cibs[cib_index];
         std::uint64_t new_cib_block = 0;
         if (!ReserveInternalPoolBlock(updated, new_cib_block, dirty_ip_bitmaps))
         {
@@ -931,31 +970,32 @@ bool PlanAppleSpacemanAllocation(
         cib_write.bytes = cib.bytes;
         plan.writes.push_back(std::move(cib_write));
 
-        if (updated.devices[0].cabs.empty())
+        if (device.cabs.empty())
         {
             PutU64LE(updated.bytes,
-                updated.devices[0].address_offset + cib_index * 8,
+                device.address_offset + cib_index * 8,
                 new_cib_block);
         }
         else
         {
             const std::size_t cab_index = cib_index / updated.cibs_per_cab;
             const std::size_t index_in_cab = cib_index % updated.cibs_per_cab;
-            if (cab_index >= updated.devices[0].cabs.size() ||
-                index_in_cab >= updated.devices[0].cabs[cab_index].cib_blocks.size())
+            if (cab_index >= device.cabs.size() ||
+                index_in_cab >= device.cabs[cab_index].cib_blocks.size())
             {
                 return Fail(out_error, "AppleSpacemanCabStateInvalid");
             }
-            auto& cab = updated.devices[0].cabs[cab_index];
+            auto& cab = device.cabs[cab_index];
             cab.cib_blocks[index_in_cab] = new_cib_block;
             PutU64LE(cab.bytes, 0x28 + index_in_cab * 8, new_cib_block);
-            touched_cabs.insert(cab_index);
+            touched_cabs.insert({device_index, cab_index});
         }
     }
 
-    for (const std::size_t cab_index : touched_cabs)
+    for (const auto& [device_index, cab_index] : touched_cabs)
     {
-        auto& cab = updated.devices[0].cabs[cab_index];
+        auto& device = updated.devices[device_index];
+        auto& cab = device.cabs[cab_index];
         std::uint64_t new_cab_block = 0;
         if (!ReserveInternalPoolBlock(updated, new_cab_block, dirty_ip_bitmaps))
         {
@@ -977,7 +1017,7 @@ bool PlanAppleSpacemanAllocation(
         cab.object.xid = request.transaction_xid;
         cab.object.physical_block = new_cab_block;
         PutU64LE(updated.bytes,
-            updated.devices[0].address_offset + cab_index * 8,
+            device.address_offset + cab_index * 8,
             new_cab_block);
         AppleSpacemanPlannedWrite cab_write;
         cab_write.kind = AppleSpacemanWriteKind::ChunkInfoAddressBlock;
@@ -990,7 +1030,7 @@ bool PlanAppleSpacemanAllocation(
     {
         std::size_t queue_index = 0;
         if (!ClassifyDeferredFree(updated, release.physical_block,
-                release.block_count, queue_index) || queue_index != 1 ||
+                release.block_count, queue_index) || queue_index == 0 ||
             !MainPoolRangeIsAllocated(view, release.physical_block,
                 release.block_count) ||
             !AddDeferredFree(plan, updated, release.physical_block,
@@ -1012,7 +1052,7 @@ bool PlanAppleSpacemanAllocation(
         }
         rebuild_queue[deferred.queue_index] = true;
     }
-    const std::uint32_t block_size = updated.internal_pool.active_bitmaps.empty()
+    const std::uint32_t queue_block_size = updated.internal_pool.active_bitmaps.empty()
         ? 0
         : static_cast<std::uint32_t>(
             updated.internal_pool.active_bitmaps.front().bytes.size());
@@ -1026,6 +1066,19 @@ bool PlanAppleSpacemanAllocation(
             continue;
         }
         auto& queue = updated.free_queues[queue_index];
+        if (!queue.tree_oid)
+        {
+            if (!fusion || !next_ephemeral_object_id || next_ephemeral_object_id == UINT64_MAX)
+                return Fail(out_error, "AppleSpacemanEphemeralObjectIdUnavailable");
+            queue.tree_oid = next_ephemeral_object_id++;
+            queue.tree_flags = kAppleBtreeEphemeral | kAppleBtreeAllowGhosts |
+                kAppleBtreeUint64Keys | kAppleBtreeSequentialInsert;
+            queue.fixed_key_size = queue.longest_key = 16;
+            queue.fixed_value_size = queue.longest_value = 8;
+            queue.tree_node_limit = 64;
+            PutU64LE(updated.bytes, 0xC8 + queue_index * 0x28 + 8, queue.tree_oid);
+            PutU16LE(updated.bytes, 0xC8 + queue_index * 0x28 + 0x18, queue.tree_node_limit);
+        }
         std::vector<catalog::AppleSpacemanFreeQueueEntry> entries;
         if (!NormalizeFreeQueueEntries(queue, plan.deferred_frees,
                 queue_index, request.transaction_xid, entries, out_error))
@@ -1040,7 +1093,7 @@ bool PlanAppleSpacemanAllocation(
         }
 
         AppleBtreeOptions dry_options = FreeQueueOptions(
-            queue, block_size, request.transaction_xid);
+            queue, queue_block_size, request.transaction_xid);
         dry_options.root_physical_block = 1;
         dry_options.first_child_object_id =
             queue.tree_oid == 0x7FFFFFFFFFFFF000ull
@@ -1058,7 +1111,7 @@ bool PlanAppleSpacemanAllocation(
         }
 
         AppleBtreeOptions write_options = FreeQueueOptions(
-            queue, block_size, request.transaction_xid);
+            queue, queue_block_size, request.transaction_xid);
         write_options.max_nodes = (std::min<std::size_t>)(
             write_options.max_nodes, 4096);
         // Ephemeral nodes have no spaceman-owned physical address. Placeholder
@@ -1156,6 +1209,7 @@ bool PlanAppleSpacemanAllocation(
     }
 
     PutU64LE(updated.bytes, 0x48, updated.devices[0].free_count);
+    if (fusion) PutU64LE(updated.bytes, 0x78, updated.devices[1].free_count);
     for (const std::size_t bitmap_index : dirty_ip_bitmaps)
     {
         AppleSpacemanPlannedWrite bitmap_write;
@@ -1196,6 +1250,151 @@ bool PlanAppleSpacemanAllocation(
     updated.object.xid = request.transaction_xid;
     out_plan = std::move(plan);
     return true;
+}
+
+bool PlanAppleSpacemanAllocation(const catalog::AppleSpacemanView& view,
+    const AppleSpacemanAllocationRequest& request, AppleSpacemanAllocationPlan& out,
+    std::string& error)
+{
+    out = {};
+    if (view.devices[1].block_count) return Fail(error, "AppleSpacemanTier2BoundPlannerRequired");
+    return PlanSpacemanAllocationImpl(view, request, out, error, 0, false);
+}
+
+namespace {
+bool PlanFusionSpacemanAllocationImpl(const catalog::ApfsFusionStore& store,
+    const AppleSpacemanAllocationRequest& input, std::size_t tier2_blocks,
+    FusionSpacemanAllocationPlan& out, std::string& error,
+    std::vector<AppleCheckpointGuardBlock>* reclaim_guards) try
+{
+    out = {};
+    if (reclaim_guards) reclaim_guards->clear();
+    catalog::AppleSpacemanView view;
+    if (!catalog::LoadFusionSpacemanAllocationView(store, view, error)) return false;
+    const auto& nx = store.Checkpoint().superblock;
+    if (input.expected_checkpoint_xid != nx.xid || input.transaction_xid != nx.next_xid ||
+        input.first_ephemeral_object_id < nx.next_oid)
+        return Fail(error, "FusionAllocationIdentityMismatch");
+    for (const auto& map : store.Checkpoint().mappings)
+        if (map.object_id >= input.first_ephemeral_object_id)
+            return Fail(error, "FusionAllocationEphemeralOidCollision");
+    const auto overlaps = [](auto a, auto n, auto b, auto m) {
+        return n && m && a < b + m && b < a + n;
+    };
+    for (const auto& release : input.released_blocks) {
+        catalog::FusionRoute route;
+        if (!release.block_count || release.block_count > UINT64_MAX / nx.block_size ||
+            !store.MapPhysical(release.physical_block, 0, release.block_count * nx.block_size, route, error))
+            return Fail(error, "FusionAllocationReleaseBounds");
+        const auto b = release.physical_block, n = release.block_count;
+        const auto tier = catalog::kFusionTier2ByteAddress / nx.block_size;
+        if (overlaps(b,n,0ull,1ull) || overlaps(b,n,tier,1ull) ||
+            overlaps(b,n,nx.xp_desc_base_block,static_cast<std::uint64_t>(nx.xp_desc_block_count)) ||
+            overlaps(b,n,nx.xp_data_base_block,static_cast<std::uint64_t>(nx.xp_data_block_count)) ||
+            overlaps(b,n,nx.fusion_middle_tree_oid,1ull) ||
+            overlaps(b,n,nx.fusion_writeback_start,nx.fusion_writeback_blocks) ||
+            overlaps(b,n,view.internal_pool.base_block,view.internal_pool.block_count) ||
+            overlaps(b,n,view.internal_pool.bitmap_base_block,static_cast<std::uint64_t>(view.internal_pool.bitmap_block_count)))
+            return Fail(error, "FusionAllocationReservedRelease");
+        for (const auto& queue : view.free_queues) for (const auto& e : queue.entries)
+            if (overlaps(b,n,e.physical_block,e.block_count))
+                return Fail(error, "FusionAllocationAlreadyQueued");
+    }
+    auto request = input;
+    request.oldest_required_checkpoint_xid = input.oldest_required_checkpoint_xid
+        ? (std::min)(input.oldest_required_checkpoint_xid,nx.xid) : nx.xid;
+    request.reclaim_internal_pool_only = true;
+    std::set<std::uint64_t> historical_owners;
+    std::set<std::uint64_t> seen_xids;
+    for (std::uint32_t i = 0; i < nx.xp_desc_block_count; ++i) {
+        std::vector<std::byte> bytes;
+        if (!store.Read((nx.xp_desc_base_block + i) * nx.block_size, nx.block_size, bytes))
+            return Fail(error, "FusionAllocationHistoryUnreadable");
+        const auto header = catalog::ParseNxSuperblock(bytes);
+        if (!header || !catalog::VerifyObjectChecksum(bytes, nx.block_size) ||
+            header->xid > nx.xid || !seen_xids.insert(header->xid).second) continue;
+        std::string ignored;
+        auto old = catalog::LoadContainerCheckpointView(store, 0, store.SizeBytes(), ignored, header->xid);
+        if (!old) continue; // An incomplete ring generation is not selectable.
+        catalog::AppleSpacemanView historical;
+        if (!catalog::LoadFusionPlanningAllocation(store, store, *old, historical, error)) return false;
+        if (historical.internal_pool.base_block != view.internal_pool.base_block ||
+            historical.internal_pool.block_count != view.internal_pool.block_count ||
+            historical.internal_pool.bitmap_size_blocks != view.internal_pool.bitmap_size_blocks ||
+            historical.internal_pool.bitmap_base_block != view.internal_pool.bitmap_base_block ||
+            historical.internal_pool.bitmap_block_count != view.internal_pool.bitmap_block_count)
+            return Fail(error, "FusionAllocationHistoricalPoolChanged");
+        request.oldest_required_checkpoint_xid = (std::min)(request.oldest_required_checkpoint_xid,header->xid);
+        for (const auto& bitmap : historical.internal_pool.active_bitmaps)
+            request.protected_internal_pool_bitmap_indices.push_back(bitmap.rotation_index);
+        const auto owned = [&](std::uint64_t b) {
+            historical_owners.insert(b);
+            if (b < view.internal_pool.base_block || b - view.internal_pool.base_block >= view.internal_pool.block_count) return false;
+            const auto bit = b - view.internal_pool.base_block;
+            const auto per = static_cast<std::uint64_t>(nx.block_size) * 8;
+            return BitSet(view.internal_pool.active_bitmaps[static_cast<std::size_t>(bit/per)].bytes,bit%per);
+        };
+        for (const auto& d : historical.devices) {
+            for (const auto& c : d.cibs) if (!owned(c.object.physical_block)) return Fail(error,"FusionAllocationHistoricalMetadataFree");
+            for (const auto& c : d.cabs) if (!owned(c.object.physical_block)) return Fail(error,"FusionAllocationHistoricalMetadataFree");
+        }
+        for (const auto& c : historical.chunks) if (c.bitmap_block && !owned(c.bitmap_block))
+            return Fail(error,"FusionAllocationHistoricalMetadataFree");
+    }
+    // Queue age is necessary but not sufficient: every selectable generation
+    // must also prove that the candidate IP range has no remaining owner.
+    for (const auto& entry : view.free_queues[0].entries)
+        if (entry.xid <= request.oldest_required_checkpoint_xid) {
+            const auto live = historical_owners.lower_bound(entry.physical_block);
+            if (live != historical_owners.end() && *live - entry.physical_block < entry.block_count)
+                return Fail(error, "FusionAllocationHistoricalReclaimCollision");
+        }
+    FusionReclamationCensus census;
+    if (reclaim_guards) {
+        // A typed entry requests a fresh canonical proof. No caller-provided
+        // view, flag, or queue age alone can authorize device-block reuse.
+        if (!CollectFusionReclamationCensus(store,census,error)) return false;
+        request.oldest_required_checkpoint_xid = (std::min)(
+            request.oldest_required_checkpoint_xid,census.oldest_checkpoint_xid);
+        for (std::size_t q = 1; q < view.free_queues.size(); ++q)
+            for (const auto& entry : view.free_queues[q].entries) {
+                if (entry.xid > request.oldest_required_checkpoint_xid) continue;
+                const auto owner = std::lower_bound(census.owners.begin(),census.owners.end(),entry.physical_block,
+                    [](const auto& range,std::uint64_t b) { return range.physical_block+range.block_count <= b; });
+                if (owner != census.owners.end() && owner->physical_block < entry.physical_block+entry.block_count)
+                    return Fail(error,"FusionAllocationRetainedDeviceOwnerCollision");
+            }
+        request.reclaim_internal_pool_only = false;
+    }
+    AppleSpacemanAllocationPlan plan;
+    if (!PlanSpacemanAllocationImpl(view, request, plan, error, tier2_blocks, true) ||
+        !store.CheckAvailable(error)) return false;
+    FusionSpacemanAllocationPlan candidate;
+    const auto tier = catalog::kFusionTier2ByteAddress / nx.block_size;
+    for (auto b : plan.allocated_main_blocks)
+        if (b >= tier) candidate.allocated_tier2_blocks.push_back(b);
+    std::erase_if(plan.allocated_main_blocks, [tier](auto b) { return b >= tier; });
+    candidate.main = std::move(plan);
+    if (reclaim_guards) *reclaim_guards = std::move(census.guards);
+    out = std::move(candidate);
+    return true;
+}
+catch (const std::bad_alloc&) { out = {}; return Fail(error, "FusionAllocationMemoryLimit"); }
+catch (const std::length_error&) { out = {}; return Fail(error, "FusionAllocationMemoryLimit"); }
+}
+
+bool PlanFusionSpacemanAllocation(const catalog::ApfsFusionStore& store,
+    const AppleSpacemanAllocationRequest& request, std::size_t tier2_blocks,
+    FusionSpacemanAllocationPlan& out, std::string& error)
+{
+    return PlanFusionSpacemanAllocationImpl(store,request,tier2_blocks,out,error,nullptr);
+}
+
+bool PlanFusionReclaimingSpacemanAllocation(const catalog::ApfsFusionStore& store,
+    const AppleSpacemanAllocationRequest& request, std::size_t tier2_blocks,
+    FusionSpacemanAllocationPlan& out, std::vector<AppleCheckpointGuardBlock>& guards, std::string& error)
+{
+    return PlanFusionSpacemanAllocationImpl(store,request,tier2_blocks,out,error,&guards);
 }
 
 bool VerifyAppleSpacemanOwnershipUnchanged(

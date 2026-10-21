@@ -3,8 +3,12 @@
 #include "ApfsContainerCatalog.h"
 #include "BlockDevice.h"
 #include <array>
+#include <atomic>
 #include <functional>
 #include <memory>
+#include <map>
+
+namespace apfsaccess::rw { class ApfsFusionReadSession; class ApfsFusionImageWriteSession; }
 
 namespace apfsaccess::catalog
 {
@@ -39,6 +43,7 @@ struct FusionBindRequest
     std::uint64_t checkpoint_xid = 0; // exact complete generation; no fallback
     FusionRoleConvention convention = FusionRoleConvention::Unspecified;
     std::shared_ptr<ApfsReadBudget> budget;
+    std::shared_ptr<const std::atomic<bool>> cancellation;
 };
 
 struct FusionRoute
@@ -67,7 +72,7 @@ public:
     static bool InspectImage(const std::wstring& path, FusionImageIdentity& out,
         std::string& error);
     static std::unique_ptr<ApfsFusionStore> BindImages(const FusionBindRequest& request,
-        std::string& error);
+        std::string& error, unsigned* unavailable_members = nullptr);
     ~ApfsFusionStore() override;
     ApfsFusionStore(const ApfsFusionStore&) = delete;
     ApfsFusionStore& operator=(const ApfsFusionStore&) = delete;
@@ -98,6 +103,10 @@ public:
     const std::string& LastError() const noexcept;
 
     bool CheckAvailable(std::string& error) const;
+    // True when bind tolerated an exact tier-ahead-by-one crash skew (the
+    // main anchor stays authoritative). Lets status surfaces report the
+    // pending mirror heal truthfully instead of showing a fully synced set.
+    [[nodiscard]] bool TierAheadSkewTolerated() const noexcept;    unsigned UnavailableMembers() const noexcept;
     // Retains both held leases. Every cached catalog access must invoke it.
     std::function<bool(std::string&)> RetainAvailabilityLease() const;
     void Cancel() const;
@@ -117,13 +126,35 @@ public:
     };
     // Test-only injection; excluded from the production object/API build.
     static std::unique_ptr<ApfsFusionStore> BindTestSources(const FusionBindRequest& request,
-        const std::vector<TestMember>& sources, std::string& error);
+        const std::vector<TestMember>& sources, std::string& error, unsigned* unavailable_members = nullptr);
 #endif
 private:
+    friend class rw::ApfsFusionReadSession;
+    friend class rw::ApfsFusionImageWriteSession;
+    // Only the image owner can bind its existing exclusive leases. No path
+    // reopen or injected source can replace a member between read and write.
+    static std::unique_ptr<ApfsFusionStore> BindHeldImages(const FusionBindRequest& request,
+        const std::array<std::shared_ptr<rw::BlockDevice>, 2>& devices,
+        std::shared_ptr<const std::atomic<bool>> owner_cancellation,
+        std::string& error, unsigned* unavailable_members = nullptr,
+        const std::map<std::uint64_t, std::vector<std::byte>>* recovery_preimage = nullptr);
+    // Borrowed, uncopyable reservation; only the admitted session can create it
+    // after charging an operation allowance. Never changes ReadBudget().
+    class RuntimeRead final {
+        friend class rw::ApfsFusionReadSession;
+        friend class ApfsFusionStore;
+        RuntimeRead(const ApfsFusionStore& source, std::uint64_t offset, std::size_t size)
+            : source_(source), offset_(offset), size_(size) {}
+        RuntimeRead(const RuntimeRead&) = delete;
+        const ApfsFusionStore& source_;
+        std::uint64_t offset_; std::size_t size_;
+    };
+    bool RuntimeCapable() const noexcept;
+    bool ReadRuntime(const RuntimeRead& request, std::vector<std::byte>& out) const;
     struct Impl;
     explicit ApfsFusionStore(std::unique_ptr<Impl> impl);
     static std::unique_ptr<ApfsFusionStore> FinishBind(std::unique_ptr<Impl> impl,
-        const FusionBindRequest& request, std::string& error);
+        const FusionBindRequest& request, std::string& error, unsigned* unavailable_members = nullptr);
     std::shared_ptr<Impl> impl_;
 };
 } // namespace apfsaccess::catalog

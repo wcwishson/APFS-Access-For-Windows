@@ -54,7 +54,7 @@ public sealed class ObserverCatalogAttachTests
         var partition = Assert.Single(fixture.Partitions);
         var containerHex = ContainerHexOf(partition.ContainerUuid);
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
-            containerHex, [new ObserverEvidenceJson.VolumeJson("Data", 101)]);
+            containerHex, [new ObserverEvidenceJson.VolumeJson("Data", 101)], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp);
 
         var volume = Assert.Single(
@@ -93,7 +93,7 @@ public sealed class ObserverCatalogAttachTests
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
             containerHex,
             [new ObserverEvidenceJson.VolumeJson("Other", 101),
-             new ObserverEvidenceJson.VolumeJson("P", 102)]);
+             new ObserverEvidenceJson.VolumeJson("P", 102)], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp);
 
         // A2: one row per snapshot volume, not one row per legacy partition.
@@ -139,7 +139,7 @@ public sealed class ObserverCatalogAttachTests
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
             containerHex,
             [new ObserverEvidenceJson.VolumeJson("Data", 101),
-             new ObserverEvidenceJson.VolumeJson("Data", 102)]);
+             new ObserverEvidenceJson.VolumeJson("Data", 102)], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp);
 
         var volumes = (await backend.ProbeVolumesAsync(imagePath, CancellationToken.None))
@@ -191,7 +191,7 @@ public sealed class ObserverCatalogAttachTests
         var hexes = fixture.Partitions.Select(static partition => ContainerHexOf(partition.ContainerUuid)).ToArray();
         var evidence = ObserverEvidenceJson.BuildContainers(
             [(hexes[0], [new ObserverEvidenceJson.VolumeJson("X", 101)]),
-             (hexes[1], [new ObserverEvidenceJson.VolumeJson("Y", 102)])]);
+             (hexes[1], [new ObserverEvidenceJson.VolumeJson("Y", 102)])], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp);
 
         var volumes = (await backend.ProbeVolumesAsync(imagePath, CancellationToken.None))
@@ -222,7 +222,7 @@ public sealed class ObserverCatalogAttachTests
         var hexes = fixture.Partitions.Select(static partition => ContainerHexOf(partition.ContainerUuid)).ToArray();
         var evidence = ObserverEvidenceJson.BuildContainers(
             [(hexes[0], [new ObserverEvidenceJson.VolumeJson("Data", 101)]),
-             (hexes[1], [new ObserverEvidenceJson.VolumeJson("Backup", 103)])]);
+             (hexes[1], [new ObserverEvidenceJson.VolumeJson("Backup", 103)])], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp);
 
         var volumes = (await backend.ProbeVolumesAsync(imagePath, CancellationToken.None))
@@ -248,7 +248,7 @@ public sealed class ObserverCatalogAttachTests
             new CatalogFixtureSpec(16, [new CatalogPartitionSpec("LegacyName", Volumes: [new CatalogVolumeSpec("Data")])]));
         var containerHex = ContainerHexOf(Assert.Single(fixture.Partitions).ContainerUuid);
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
-            containerHex, [new ObserverEvidenceJson.VolumeJson("Data", 101)]);
+            containerHex, [new ObserverEvidenceJson.VolumeJson("Data", 101)], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp);
 
         var volume = Assert.Single(
@@ -274,7 +274,7 @@ public sealed class ObserverCatalogAttachTests
                 Volumes: [new CatalogVolumeSpec("Data", FsFlags: 0x8)])]));
         var containerHex = ContainerHexOf(Assert.Single(fixture.Partitions).ContainerUuid);
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
-            containerHex, [new ObserverEvidenceJson.VolumeJson("Data", 101, FsFlags: 0x8, EncryptionMode: "password")]);
+            containerHex, [new ObserverEvidenceJson.VolumeJson("Data", 101, FsFlags: 0x8, EncryptionMode: "password")], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp);
 
         var volume = Assert.Single(

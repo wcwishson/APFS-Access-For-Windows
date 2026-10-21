@@ -31,7 +31,7 @@ void Positives() {
         const auto& snap=out[0];Check(snap.identity.snapshot_xid==10 && snap.identity.name_utf8=="backup","XID and raw name");
         Check(!snap.snapshot_uuid_hex,"no invented UUID");
         Check(snap.metadata.volume.superblock.uuid_hex==f.scope.volume_uuid_hex,"APSB UUID is volume UUID");
-        Check(snap.identity.root_physical_block==183 && snap.identity.omap_physical_block==5,
+        Check(snap.identity.root_physical_block==183 && snap.identity.omap_physical_block==181,
             "snapshot mapping selected through newer checkpoint OMAP instead of live root");
         Check(snap.metadata.create_time_ns==1234567890123456 && snap.metadata.inum==987,"raw metadata preserved");
         VectorRandomAccessSource source(f.image);ApfsSnapshotInfo exact;
@@ -123,6 +123,16 @@ void SnapshotRepairRegressions() {
         try { test(); Pass(label.c_str()); }
         catch (const std::exception& e) { ++failed; std::cerr << "FAIL " << label << ": " << e.what() << "\n"; }
     };
+    run("physical descriptor cannot borrow a nonempty live OMAP index without its own inventory",[] {
+        Fixture f;f.Edit(180,[](auto& b){PutU64LE(b,0x80,5);});
+        VectorRandomAccessSource source(f.image);std::string error;
+        const auto cp=LoadAppleCheckpointView(source,0,source.SizeBytes(),error);
+        Check(cp.has_value(),"malformed descriptor retains a parseable current checkpoint");
+        AppleSnapshotCatalogRecords out;
+        const bool loaded=LoadAppleSnapshotDescriptorCatalog(source,*cp,101,180,10,out,error);
+        Check(!loaded&&error=="SnapshotMetadataRootMissing"&&out.live.filesystem.empty()&&out.inventory.empty(),
+            "inconsistent descriptor/index refuses without partial catalog: "+error);
+    });
     const auto configure = [](Fixture& f, bool child, std::uint64_t xid, bool wrong_oid) {
         if (!child) {
             f.Put(6,BuildBtreeNode({{Fixture::root_oid,183,0,9},
@@ -148,15 +158,37 @@ void SnapshotRepairRegressions() {
                 Fixture f;configure(f,child,xid,false);
                 std::vector<ApfsSnapshotInfo> out(1);std::string error;
                 const bool ok=f.Enumerate(out,error);
+                VectorRandomAccessSource source(f.image);
+                std::string checkpoint_error;
+                auto cp = LoadAppleCheckpointView(source, 0, source.SizeBytes(), checkpoint_error);
+                Check(cp.has_value(), "canonical catalog checkpoint");
+                AppleSnapshotCatalogRecords catalog;
+                std::string catalog_error;
+                const bool catalog_ok = LoadAppleSnapshotCatalog(source, *cp, 101, catalog, catalog_error);
+                Check(catalog_ok == ok, "owned catalog preserves strict mapping admission: " + catalog_error);
+                AppleSnapshotCatalogRecords physical;
+                std::string physical_error;
+                const bool physical_ok = LoadAppleSnapshotDescriptorCatalog(source, *cp, 101, 180, 10,
+                    physical, physical_error);
+                Check(physical_ok == ok, "physical descriptor retains snapshot S and checkpoint C: " + physical_error);
                 if (xid<=9) {
                     Check(ok,"historical header rejected: "+error);
                     Check(out.size()==1 && out[0].identity.snapshot_xid==10 &&
                         out[0].identity.root_physical_block==183,"historical snapshot identity");
+                    Check(catalog.inventory.size() == 1 && catalog.snapshots.size() == 1 &&
+                        !catalog.snapshots[0].filesystem.empty(), "canonical catalog retains complete historical trees");
+                    Check(!physical.live.filesystem.empty(), "physical descriptor complete filesystem at S10");
                 } else {
                     Check(!ok,"header newer than selected mapping accepted");
                     Check(out.empty(),"failed mapping validation leaked inventory");
                     Check(error==(child?"CatalogBtreeFutureXid":"SnapshotFsTreeFutureXid"),
                         "wrong version refusal: "+error);
+                    Check(catalog.inventory.empty() && catalog.snapshots.empty() && catalog.live.filesystem.empty(),
+                        "failed owned catalog remains empty");
+                    Check(catalog_error == error, "owned catalog preserves exact future-XID refusal");
+                    Check(physical.live.filesystem.empty() && physical.inventory.empty(), "physical descriptor failure clears output");
+                    Check(child ? physical_error == error : physical_error.ends_with("FutureXid"),
+                        "physical descriptor preserves mapping bound refusal: " + physical_error);
                 }
             });
         }
@@ -177,6 +209,14 @@ void SnapshotRepairRegressions() {
         std::vector<ApfsSnapshotInfo> out;std::string error;
         Check(f.Enumerate(out,error),"independent node mapping versions: "+error);
         Check(out.size()==1,"one independently mapped tree");
+        VectorRandomAccessSource source(f.image);
+        auto cp = LoadAppleCheckpointView(source, 0, source.SizeBytes(), error);
+        Check(cp.has_value(), "independent inverse checkpoint");
+        AppleSnapshotCatalogRecords catalog, physical;
+        Check(LoadAppleSnapshotCatalog(source, *cp, 101, catalog, error), "inverse owned catalog: " + error);
+        Check(LoadAppleSnapshotDescriptorCatalog(source, *cp, 101, 180, 10, physical, error),
+            "inverse physical descriptor root M9 child M10 at S10/C20: " + error);
+        Check(physical.live.filesystem.size() == 1, "inverse physical descriptor decodes child");
     });
     run("OMAP tree remains checkpoint bounded",[&] {
         Fixture f;configure(f,true,9,false);
@@ -185,6 +225,15 @@ void SnapshotRepairRegressions() {
         Check(!f.Enumerate(out,error),"future checkpoint OMAP accepted");
         Check(out.empty(),"future OMAP leaked inventory");
         Check(error.find("FutureXid")!=std::string::npos,"wrong OMAP refusal: "+error);
+        VectorRandomAccessSource source(f.image);
+        auto cp = LoadAppleCheckpointView(source, 0, source.SizeBytes(), error);
+        Check(!cp || cp->container.superblock.xid == 20, "future OMAP never advances enclosing checkpoint");
+        if (cp) {
+            AppleSnapshotCatalogRecords catalog;
+            Check(!LoadAppleSnapshotDescriptorCatalog(source, *cp, 101, 180, 10, catalog, error),
+                "physical descriptor refuses OMAP21 at C20");
+            Check(catalog.live.filesystem.empty() && !error.empty(), "future OMAP physical descriptor clears output");
+        }
     });
     run("ValidateExact in-place success",[] {
         Fixture f;std::vector<ApfsSnapshotInfo> out;std::string error;

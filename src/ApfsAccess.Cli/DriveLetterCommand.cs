@@ -50,10 +50,16 @@ internal static class DriveLetterCommand
     private static async Task<AckPayload> SendAsync(DriveLetterPreferenceRequestPayload request)
     {
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-        await using var peer = await NamedPipeMessageClient.ConnectAsync(ApfsPipeConstants.PipeName, 3000, deadline.Token).ConfigureAwait(false);
+        return await ExchangeAsync(ApfsPipeConstants.PipeName, request, deadline.Token).ConfigureAwait(false);
+    }
+
+    internal static async Task<AckPayload> ExchangeAsync(string pipeName,
+        DriveLetterPreferenceRequestPayload request, CancellationToken cancellationToken)
+    {
+        await using var peer = await AgentControlClient.ConnectAsync(pipeName, 3000, cancellationToken).ConfigureAwait(false);
         var id = Guid.NewGuid().ToString("D");
-        await peer.SendAsync(PipeMessageCodec.Create(ApfsMessageTypes.DriveLetterPreferenceRequested, request, id), deadline.Token).ConfigureAwait(false);
-        while (await peer.ReadMessageAsync(deadline.Token).ConfigureAwait(false) is { } message)
+        await peer.SendAsync(PipeMessageCodec.Create(ApfsMessageTypes.DriveLetterPreferenceRequested, request, id), cancellationToken).ConfigureAwait(false);
+        while (await peer.ReadMessageAsync(cancellationToken).ConfigureAwait(false) is { } message)
         {
             if (message.RequestId != id || message.Type != ApfsMessageTypes.Ack) continue;
             if (!PipeMessageCodec.TryGetPayload<AckPayload>(message, out var ack) || ack is null)

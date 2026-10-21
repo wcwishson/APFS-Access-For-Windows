@@ -12,19 +12,25 @@ struct SnapshotFixture {
     ApfsSnapshotScope scope;
     std::vector<BtreeRecord> snapshots;
     static constexpr std::uint64_t root_oid = 0x2000 + 101, snap_oid = 0x3000 + 101;
-    explicit SnapshotFixture(std::size_t block_size = 4096) : bs(block_size) {
+    explicit SnapshotFixture(std::size_t block_size = 4096, std::uint64_t internal_pool_blocks = 4,
+        std::uint32_t checkpoint_ring_blocks = 8) : bs(block_size) {
         BuilderStore spec; spec.block_size = static_cast<std::uint32_t>(bs);
         spec.block_count = 512; spec.xid = 20; spec.volumes[0].uuid_hex = std::string(32, 'b');
+        spec.authoritative_internal_pool_blocks = internal_pool_blocks;
+        spec.authoritative_checkpoint_ring_blocks = checkpoint_ring_blocks;
         image = BuildAuthoritativeStoreImage(spec);
         // Apple requires OMAP_MANUALLY_MANAGED on the container OMAP.
         // Keep the shared legacy fixture helper untouched; specialize here.
         Edit(2,[](auto& b){PutU32LE(b,0x20,1);});
         scope = {0, image.size(), std::string(32, 'a'), std::string(32, 'b'), 101, 20};
         BuilderVolume snap; snap.oid = 180; snap.uuid_hex = scope.volume_uuid_hex;
-        snap.vol_omap_oid_override = 5; snap.root_oid_override = root_oid;
+        snap.vol_omap_oid_override = 181; snap.root_oid_override = root_oid;
         snap.extentref_tree_oid = 184;
         auto apsb = BuildApsb(snap, 10, bs);
         PutU32LE(apsb, 0x18, kObjectPhysical | kObjectTypeFs); Put(180, apsb);
+        // The descriptor has no inventory. Its OMAP must not borrow the live
+        // header's nonempty snapshot index; versioned filesystem mappings remain shared.
+        Put(181, BuildOmap(6, 20, bs, 181, kObjectPhysical | kObjectTypeOmap, kObjectPhysical | kObjectTypeBtree));
         Put(183, BuildRootFsLeaf(10, bs, root_oid, kObjectTypeBtree, kObjectTypeFsTree));
         Put(184, BuildRawLeafNode({}, {}, 10, bs, 0, 184,
             kObjectPhysical | kObjectTypeBtree, kObjectTypeBlockRefTree));

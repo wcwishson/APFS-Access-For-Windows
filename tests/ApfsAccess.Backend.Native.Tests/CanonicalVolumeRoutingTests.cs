@@ -48,7 +48,7 @@ public sealed class CanonicalVolumeRoutingTests
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
             ContainerHexA,
             [new ObserverEvidenceJson.VolumeJson("SnapA", 201),
-             new ObserverEvidenceJson.VolumeJson("SnapB", 202)]);
+             new ObserverEvidenceJson.VolumeJson("SnapB", 202)], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp);
         await backend.ProbeVolumesAsync(imagePath, CancellationToken.None);
 
@@ -78,7 +78,7 @@ public sealed class CanonicalVolumeRoutingTests
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
             ContainerHexA,
             [new ObserverEvidenceJson.VolumeJson("Data", 201),
-             new ObserverEvidenceJson.VolumeJson("Data", 202)]);
+             new ObserverEvidenceJson.VolumeJson("Data", 202)], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp);
         var volumes = await backend.ProbeVolumesAsync(imagePath, CancellationToken.None);
 
@@ -103,7 +103,7 @@ public sealed class CanonicalVolumeRoutingTests
                 "P", Volumes: [new CatalogVolumeSpec("Data")])]));
         var evidence = ObserverEvidenceJson.BuildContainers(
             [(ContainerHexA, [new ObserverEvidenceJson.VolumeJson("Data", 101)]),
-             (ContainerHexB, [new ObserverEvidenceJson.VolumeJson("Data", 101)])]);
+             (ContainerHexB, [new ObserverEvidenceJson.VolumeJson("Data", 101)])], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp);
 
         var volumes = (await backend.ProbeVolumesAsync(imagePath, CancellationToken.None))
@@ -133,7 +133,7 @@ public sealed class CanonicalVolumeRoutingTests
             new CatalogFixtureSpec(16, [new CatalogPartitionSpec(
                 "P", Volumes: [new CatalogVolumeSpec("Data")])]));
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
-            ContainerHexA, [new ObserverEvidenceJson.VolumeJson("SnapA", 201)]);
+            ContainerHexA, [new ObserverEvidenceJson.VolumeJson("SnapA", 201)], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp);
         var discovered = Assert.Single(
             await backend.ProbeVolumesAsync(imagePath, CancellationToken.None));
@@ -158,7 +158,7 @@ public sealed class CanonicalVolumeRoutingTests
             new CatalogFixtureSpec(16, [new CatalogPartitionSpec(
                 "P", Volumes: [new CatalogVolumeSpec("Data")])]));
         var evidence = ObserverEvidenceJson.BuildSingleContainer(
-            ContainerHexA, [new ObserverEvidenceJson.VolumeJson("SnapA", 201)]);
+            ContainerHexA, [new ObserverEvidenceJson.VolumeJson("SnapA", 201)], devicePath: imagePath);
         using var backend = CreateBackend(evidence, temp);
 
         var resolved = await InvokeResolveVolumeAsync(
@@ -208,7 +208,9 @@ public sealed class CanonicalVolumeRoutingTests
         var method = typeof(NativeApfsBackend).GetMethod(
             "ResolveVolumeAsync", BindingFlags.NonPublic | BindingFlags.Instance);
         Assert.NotNull(method);
-        return await Assert.IsType<Task<VolumeInfo?>>(method!.Invoke(backend, [volumeId, cancellationToken]));
+        var raw = method!.Invoke(backend, [volumeId, cancellationToken]);
+        var task = Assert.IsAssignableFrom<Task<VolumeInfo?>>(raw);
+        return await task;
     }
 
     private static (string? RecoveryIdentity, ulong? VolumeObjectId, string? ContainerUuidHex) ReadMountTarget(

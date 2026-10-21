@@ -1,0 +1,78 @@
+void FusionReclamationControls(const fs::path& root) {
+    for (const bool sibling : {false,true}) Run(sibling ? "Fusion sibling Tier2 owner forbids mature queue2 reuse" : "Fusion main metadata owner forbids mature queue1 reuse",[&]{
+        Files f(root,2);VolumePlanFixture(f);if(sibling)AddSiblingVolume(f);
+        std::string error;auto store=ApfsFusionStore::BindImages(f.request,error);Check(store!=nullptr,error);
+        AppleSpacemanView view;Check(LoadFusionSpacemanAllocationView(*store,view,error),error);store.reset();
+        const auto queue_index=sibling?2u:1u;const auto& queue=view.free_queues[queue_index];
+        Check(!queue.entries.empty(),"canonical queue fixture");auto entries=queue.entries;
+        entries.front()={20,sibling?f.TierBlock()+40:30,1};
+        f.Place(0,queue.root.physical_block,Queue(f,queue.tree_oid,queue.root.physical_block,entries));
+        const auto count=std::accumulate(entries.begin(),entries.end(),std::uint64_t{0},[](auto n,const auto& entry){return n+entry.block_count;});
+        const auto oldest=std::min_element(entries.begin(),entries.end(),[](const auto& a,const auto& b){return a.xid<b.xid;})->xid;
+        f.Edit(0,view.object.physical_block,[&](auto& sm){Put(sm,0xC8+queue_index*0x28,count);Put(sm,0xD8+queue_index*0x28,oldest);});
+        Persist(f);const auto main=Load(f.main),tier=Load(f.tier);store=ApfsFusionStore::BindImages(f.request,error);Check(store!=nullptr,error);
+        Check(LoadFusionSpacemanAllocationView(*store,view,error),"queue record is canonically parsed: "+error);
+        AppleSpacemanAllocationRequest request;request.expected_checkpoint_xid=20;request.transaction_xid=21;
+        request.first_ephemeral_object_id=10000;request.main_block_count=1;
+        FusionSpacemanAllocationPlan plan;std::vector<AppleCheckpointGuardBlock> guards;
+        const auto admitted=PlanFusionReclaimingSpacemanAllocation(*store,request,1,plan,guards,error);
+        Check(!admitted&&error=="FusionVolumeOwnerQueued","live owner collision: "+error);
+        Check(plan.main.writes.empty()&&guards.empty(),"refused proof leaked allocation");store.reset();
+        Check(Load(f.main)==main&&Load(f.tier)==tier,"owner collision changed a member");
+    });
+    Run("Fusion historical Tier2 owner forbids forged mature queue2 age",[&]{
+        Files f(root,2);VolumePlanFixture(f);std::string error;auto runtime=OpenRuntime(f.directory,error);Check(runtime!=nullptr,error);
+        const auto written=runtime->Overwrite(30,4096,Bytes(4096,std::byte{0x6D}),error);Check(written,error);runtime.reset();f.Refresh(21);
+        auto store=ApfsFusionStore::BindImages(f.request,error);Check(store!=nullptr,error);
+        AppleSpacemanView view;Check(LoadFusionSpacemanAllocationView(*store,view,error),error);const auto nx=store->Checkpoint().superblock;store.reset();
+        auto entries=view.free_queues[2].entries;
+        const auto old=std::find_if(entries.begin(),entries.end(),[&](const auto& entry){return entry.physical_block==f.TierBlock()+20;});
+        Check(old!=entries.end()&&old->xid==21,"actual old payload queued");old->xid=20;
+        std::sort(entries.begin(),entries.end(),[](const auto& a,const auto& b){return std::tie(a.xid,a.physical_block)<std::tie(b.xid,b.physical_block);});
+        f.sources[0]->bytes=Load(f.main);f.sources[1]->bytes=Load(f.tier);
+        auto tree=Queue(f,view.free_queues[2].tree_oid,view.free_queues[2].root.physical_block,entries);Put(tree,0x10,21);Seal(tree);
+        f.Place(0,view.free_queues[2].root.physical_block,tree);
+        f.Edit(0,view.object.physical_block,[&](auto& sm){Put(sm,0x128,entries.front().xid);});
+        Save(f.main,f.sources[0]->bytes);Save(f.tier,f.sources[1]->bytes);f.Refresh(21);
+        const auto main=Load(f.main),tier=Load(f.tier);store=ApfsFusionStore::BindImages(f.request,error);Check(store!=nullptr,error);
+        Check(LoadFusionSpacemanAllocationView(*store,view,error),"historical forged age still parses: "+error);
+        AppleSpacemanAllocationRequest request;request.expected_checkpoint_xid=21;request.transaction_xid=nx.next_xid;
+        request.first_ephemeral_object_id=nx.next_oid;request.main_block_count=1;
+        FusionSpacemanAllocationPlan plan;std::vector<AppleCheckpointGuardBlock> guards;
+        const auto admitted=PlanFusionReclaimingSpacemanAllocation(*store,request,1,plan,guards,error);
+        Check(!admitted&&error=="FusionVolumeOwnerQueued","retained payload collision: "+error);store.reset();
+        Check(Load(f.main)==main&&Load(f.tier)==tier,"historical collision changed a member");
+    });
+    Run("Fusion historical IP ownership blocks forged mature queue age",[&]{
+        Files f(root,2);VolumePlanFixture(f);std::string error;
+        auto runtime=OpenRuntime(f.directory,error);Check(runtime!=nullptr,error);
+        const bool written=runtime->Overwrite(30,3000,Bytes(5000,std::byte{0x6D}),error);
+        Check(written,error);runtime.reset();f.Refresh(21);
+        auto store=ApfsFusionStore::BindImages(f.request,error);Check(store!=nullptr,error);
+        AppleSpacemanView view;Check(LoadFusionSpacemanAllocationView(*store,view,error),error);
+        const auto nx=store->Checkpoint().superblock;store.reset();
+        auto& queue=view.free_queues[0];Check(!queue.entries.empty(),"real deferred IP entries");
+        for(auto& entry:queue.entries)entry.xid=20;
+        f.sources[0]->bytes=Load(f.main);f.sources[1]->bytes=Load(f.tier);
+        auto tree=Queue(f,queue.tree_oid,queue.root.physical_block,queue.entries);
+        Put(tree,0x10,21);Seal(tree);f.Place(0,queue.root.physical_block,tree);
+        f.Edit(0,view.object.physical_block,[](auto& sm){Put(sm,0xD8,20);});
+        Save(f.main,f.sources[0]->bytes);Save(f.tier,f.sources[1]->bytes);f.Refresh(21);
+        const auto main=Load(f.main),tier=Load(f.tier);
+        store=ApfsFusionStore::BindImages(f.request,error);Check(store!=nullptr,error);
+        Check(LoadFusionSpacemanAllocationView(*store,view,error),"current graph remains canonical: "+error);
+        AppleSpacemanAllocationRequest request;request.expected_checkpoint_xid=21;request.transaction_xid=nx.next_xid;
+        request.first_ephemeral_object_id=nx.next_oid;request.main_block_count=1;request.oldest_required_checkpoint_xid=UINT64_MAX;
+        FusionSpacemanAllocationPlan plan;
+        Check(!PlanFusionSpacemanAllocation(*store,request,0,plan,error)&&error=="FusionAllocationHistoricalReclaimCollision", "history collision: "+error);
+        store.reset();Check(Load(f.main)==main&&Load(f.tier)==tier,"reclaim refusal changed a member");
+    });
+    Run("Fusion caller retention cannot be promoted past a stricter floor",[&]{
+        Files f(root,2);VolumePlanFixture(f);auto owner=f.Open();std::string error;
+        AppleSpacemanAllocationRequest request;request.expected_checkpoint_xid=20;request.transaction_xid=21;
+        request.first_ephemeral_object_id=10000;request.main_block_count=1;request.oldest_required_checkpoint_xid=1;
+        FusionSpacemanAllocationPlan plan;
+        const bool ok=PlanFusionSpacemanAllocation(Access::Store(*owner),request,0,plan,error);
+        Check(ok,error);Check(plan.main.effective_oldest_required_checkpoint_xid==1,"strict retention floor lost");
+    });
+}

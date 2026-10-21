@@ -1,13 +1,16 @@
 #include "BlockDevice.h"
 #include "ApfsFormat.h"
+#include "SnapshotRuntimeSource.h"
 #include "MetadataStore.h"
 #include "TestFixtureBuilder.h"
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <cstdint>
 #include <cwctype>
 #include <filesystem>
@@ -15,15 +18,97 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 #include <windows.h>
+
+namespace apfsaccess::rw
+{
+// Pure state injection: synthetic handle values are never queried, written or
+// closed. Production raw admission has no test override.
+struct BlockDeviceRawSnapshotTestPeer
+{
+    static void Seed(BlockDevice& device, const RawSnapshotDescriptors& descriptors)
+    {
+        std::lock_guard<std::mutex> handle_lock(device.handle_mutex_);
+        std::lock_guard<std::mutex> source_lock(device.write_source_mutex_);
+        device.read_handle_.store(reinterpret_cast<HANDLE>(std::uintptr_t{0x1000}));
+        device.write_handle_.store(reinterpret_cast<HANDLE>(std::uintptr_t{0x2000}));
+        device.raw_writer_accepted_.store(true);
+        device.writable_.store(true);
+        device.regular_file_.store(false);
+        device.raw_write_limit_bytes_.store(descriptors.media.limit_bytes);
+        device.raw_write_source_size_bytes_ = descriptors.media.disk_size_bytes - device.BaseOffsetBytes();
+        device.raw_writer_identity_ = "gpt:injected|base:4096|limit:8192";
+        device.write_source_handles_retired_ = false;
+        device.raw_snapshot_lease_retired_ = false;
+        device.raw_snapshot_descriptors_attempted_ = true;
+        device.raw_snapshot_descriptors_complete_ = true;
+        device.raw_snapshot_descriptors_ = descriptors;
+        device.raw_snapshot_descriptors_error_.clear();
+    }
+    static void Clear(BlockDevice& device)
+    {
+        std::lock_guard<std::mutex> handle_lock(device.handle_mutex_);
+        device.InvalidateWriteSourceHandlesLocked();
+        device.read_handle_.store(INVALID_HANDLE_VALUE);
+        device.write_handle_.store(INVALID_HANDLE_VALUE);
+        device.raw_writer_accepted_.store(false);
+        device.writable_.store(false);
+    }
+    static void UseOriginalImageHandlesForRawRead(BlockDevice& device, std::uint64_t limit)
+    {
+        std::lock_guard<std::mutex> handle_lock(device.handle_mutex_);
+        std::lock_guard<std::mutex> source_lock(device.write_source_mutex_);
+        if (!device.exclusive_write_image_ || device.read_handle_.load()==INVALID_HANDLE_VALUE ||
+            device.write_handle_.load()==INVALID_HANDLE_VALUE) throw std::runtime_error("Real exclusive image handles required");
+        device.regular_file_.store(false);
+        device.raw_writer_accepted_.store(true);
+        device.raw_write_limit_bytes_.store(limit);
+        device.raw_write_source_size_bytes_=limit;
+        device.raw_writer_identity_="injected-real-image-read-only";
+        device.raw_snapshot_lease_retired_=false;
+        device.write_source_handles_retired_=false;
+    }
+    static void Retire(BlockDevice& device)
+    {
+        std::lock_guard<std::mutex> handle_lock(device.handle_mutex_);
+        device.InvalidateWriteSourceHandlesLocked();
+    }
+    static void BeginWrite(BlockDevice& device) { device.BeginWriteSourceAdmission(); }
+    static void EndWrite(BlockDevice& device) { device.EndWriteSourceAdmission(); }
+    static std::uint64_t WriteGeneration(BlockDevice& device)
+    {
+        std::lock_guard<std::mutex> lock(device.write_source_mutex_);
+        return device.write_source_generation_;
+    }
+    static void FailCachedDescriptor(BlockDevice& device)
+    {
+        std::lock_guard<std::mutex> lock(device.write_source_mutex_);
+        device.raw_snapshot_descriptors_error_ = "RawHardwareDescriptorUnavailable:50";
+    }
+    static void InterruptCachedDescriptor(BlockDevice& device)
+    {
+        std::lock_guard<std::mutex> lock(device.handle_mutex_);
+        device.raw_snapshot_descriptors_complete_=false;
+        device.raw_snapshot_descriptors_error_.clear();
+    }
+    static void ExhaustEpoch(BlockDevice& device)
+    {
+        std::lock_guard<std::mutex> lock(device.write_source_mutex_);
+        device.raw_snapshot_retirement_epoch_ = std::numeric_limits<std::uint64_t>::max();
+        device.RetireRawSnapshotLeaseLocked();
+    }
+};
+} // namespace apfsaccess::rw
 
 namespace
 {
@@ -58,6 +143,540 @@ constexpr std::uint64_t kNativeInodeExtensionOffset = 0;
 constexpr std::uint64_t kNativeBtreeExtensionOffset = kNativeInodeExtensionBlocks;
 
 bool Require(bool condition, const std::string& message);
+
+template<class T>
+void StoreRawDescriptorField(std::vector<std::byte>& bytes, std::size_t offset, const T& value)
+{
+    if (offset > bytes.size() || sizeof(value) > bytes.size() - offset)
+        throw std::logic_error("Raw descriptor fixture offset invalid");
+    std::memcpy(bytes.data() + offset, &value, sizeof(value));
+}
+
+std::vector<std::byte> BuildRawDeviceDescriptorForTest(std::string_view serial = "SAMPLE-UNIT-4839")
+{
+    constexpr auto header = offsetof(STORAGE_DEVICE_DESCRIPTOR, RawDeviceProperties);
+    std::vector<std::byte> bytes(header);
+    STORAGE_DEVICE_DESCRIPTOR device{};
+    device.Version = sizeof(device);
+    device.BusType = BusTypeUsb;
+    const auto text = [&](std::string_view value) {
+        const auto offset = static_cast<DWORD>(bytes.size());
+        for (const char ch : value) bytes.push_back(std::byte(static_cast<unsigned char>(ch)));
+        bytes.push_back(std::byte{0});
+        return offset;
+    };
+    device.VendorIdOffset = text(" Samsung ");
+    device.ProductIdOffset = text("USB Test Media");
+    device.ProductRevisionOffset = text("1.00");
+    device.SerialNumberOffset = text(serial);
+    device.Size = static_cast<DWORD>(bytes.size());
+    std::memcpy(bytes.data(), &device, header);
+    return bytes;
+}
+
+std::vector<std::byte> BuildRawDeviceIdDescriptorForTest(
+    const std::vector<apfsaccess::rw::RawDeviceVpdIdentifier>& identifiers)
+{
+    constexpr auto header = offsetof(STORAGE_DEVICE_ID_DESCRIPTOR, Identifiers);
+    constexpr auto entry_header = offsetof(STORAGE_IDENTIFIER, Identifier);
+    std::vector<std::byte> bytes(header);
+    for (std::size_t index = 0; index < identifiers.size(); ++index)
+    {
+        const auto& value = identifiers[index];
+        STORAGE_IDENTIFIER id{};
+        id.CodeSet = static_cast<STORAGE_IDENTIFIER_CODE_SET>(value.code_set);
+        id.Type = static_cast<STORAGE_IDENTIFIER_TYPE>(value.type);
+        id.Association = static_cast<STORAGE_ASSOCIATION_TYPE>(value.association);
+        id.IdentifierSize = static_cast<WORD>(value.bytes.size());
+        id.NextOffset = index + 1 == identifiers.size() ? 0 : static_cast<WORD>(entry_header + value.bytes.size());
+        const auto offset = bytes.size();
+        bytes.resize(offset + entry_header + value.bytes.size());
+        std::memcpy(bytes.data() + offset, &id, entry_header);
+        std::copy(value.bytes.begin(), value.bytes.end(), bytes.begin() + offset + entry_header);
+    }
+    bytes.resize(std::max(bytes.size(), sizeof(STORAGE_DEVICE_ID_DESCRIPTOR)));
+    StoreRawDescriptorField(bytes, 0, static_cast<DWORD>(sizeof(STORAGE_DEVICE_ID_DESCRIPTOR)));
+    StoreRawDescriptorField(bytes, 4, static_cast<DWORD>(bytes.size()));
+    StoreRawDescriptorField(bytes, 8, static_cast<DWORD>(identifiers.size()));
+    return bytes;
+}
+
+struct RawMediaDescriptorFixture
+{
+    std::vector<std::byte> layout;
+    GET_LENGTH_INFORMATION length{};
+    STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR alignment{};
+    RawMediaDescriptorFixture()
+    {
+        constexpr auto header = offsetof(DRIVE_LAYOUT_INFORMATION_EX, PartitionEntry);
+        layout.resize(header + sizeof(PARTITION_INFORMATION_EX));
+        DRIVE_LAYOUT_INFORMATION_EX disk{};
+        disk.PartitionStyle = PARTITION_STYLE_GPT;
+        disk.PartitionCount = 1;
+        disk.Gpt.DiskId = {0x11223344, 0x5566, 0x7788, {0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01}};
+        std::memcpy(layout.data(), &disk, header);
+        PARTITION_INFORMATION_EX partition{};
+        partition.PartitionStyle = PARTITION_STYLE_GPT;
+        partition.StartingOffset.QuadPart = 4096;
+        partition.PartitionLength.QuadPart = 32768;
+        partition.Gpt.PartitionType = {0x7c3457ef, 0x0000, 0x11aa, {0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac}};
+        partition.Gpt.PartitionId = {0x22334455, 0x6677, 0x8899, {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01, 0x02}};
+        StoreRawDescriptorField(layout, header, partition);
+        length.Length.QuadPart = 65536;
+        alignment.Version = alignment.Size = sizeof(alignment);
+        alignment.BytesPerLogicalSector = 512;
+        alignment.BytesPerPhysicalSector = 4096;
+    }
+    bool Parse(apfsaccess::rw::RawSnapshotMediaBinding& out, std::string& error,
+               std::uint64_t base = 4096, std::uint64_t limit = 8192) const
+    {
+        return apfsaccess::rw::ParseRawSnapshotMediaBinding(layout,
+            std::as_bytes(std::span(&length, 1)), std::as_bytes(std::span(&alignment, 1)), base, limit, out, error);
+    }
+};
+
+bool TestRawSnapshotDescriptorParsing()
+{
+    using namespace apfsaccess::rw;
+    RawDeviceDescriptor device;
+    std::string error;
+    auto valid = BuildRawDeviceDescriptorForTest();
+    bool ok = Require(ParseRawDeviceDescriptor(valid, device, error) && device.vendor == "Samsung" &&
+        device.serial == "SAMPLE-UNIT-4839" && device.bus_type == BusTypeUsb,
+        "Held device descriptor must parse bounded ASCII and trim only edge spaces");
+    // Recorded bytes are a parser fixture only, never live source authority.
+    constexpr std::string_view recorded_hex =
+        "280000007800000000000100480000005100000062000000670000000700000024000000"
+        "008006021F00000053616D73756E6720466C617368204472697665204649542031313030"
+        "53616D73756E672000466C61736820447269766520464954200031313030004141303030303030303030303034383900";
+    std::vector<std::byte> recorded;
+    for (std::size_t offset = 0; offset < recorded_hex.size(); offset += 2)
+    {
+        unsigned int value = 0;
+        const auto result = std::from_chars(recorded_hex.data() + offset, recorded_hex.data() + offset + 2, value, 16);
+        if (result.ec != std::errc{} || result.ptr != recorded_hex.data() + offset + 2) return false;
+        recorded.push_back(std::byte(value));
+    }
+    ok &= Require(recorded.size() == 120 && ParseRawDeviceDescriptor(recorded, device, error) &&
+        device == RawDeviceDescriptor{BusTypeUsb, "Samsung", "Flash Drive FIT", "1100", "AA00000000000489"},
+        "Actual recorded Samsung descriptor must parse nonempty raw properties and all four bounded strings");
+    std::vector<std::byte> unaligned{std::byte{0}};
+    unaligned.insert(unaligned.end(), valid.begin(), valid.end());
+    ok &= Require(ParseRawDeviceDescriptor(std::span<const std::byte>(unaligned).subspan(1), device, error),
+        "Descriptor parser must accept unaligned byte storage without native structure dereferences");
+    const auto reject = [&](std::vector<std::byte> bytes, const char* reason) {
+        device.serial = "stale output";
+        return Require(!ParseRawDeviceDescriptor(bytes, device, error) && device == RawDeviceDescriptor{} && !error.empty(), reason);
+    };
+    auto bytes = valid;
+    bytes.pop_back();
+    ok &= reject(bytes, "Truncated declared descriptor must clear output");
+    bytes = valid;
+    StoreRawDescriptorField(bytes, offsetof(STORAGE_DEVICE_DESCRIPTOR, SerialNumberOffset), DWORD{4});
+    ok &= reject(bytes, "Serial offset inside descriptor header must refuse");
+    bytes = valid;
+    StoreRawDescriptorField(bytes, offsetof(STORAGE_DEVICE_DESCRIPTOR, SerialNumberOffset), static_cast<DWORD>(bytes.size()));
+    ok &= reject(bytes, "Serial offset at descriptor end must refuse");
+    bytes = valid;
+    bytes.back() = std::byte{'X'};
+    ok &= reject(bytes, "Unterminated serial must refuse");
+    bytes = valid;
+    bytes[bytes.size() - 2] = std::byte{0x80};
+    ok &= reject(bytes, "Non-ASCII serial must refuse");
+    bytes = valid;
+    StoreRawDescriptorField(bytes, offsetof(STORAGE_DEVICE_DESCRIPTOR, RawPropertiesLength), DWORD{65536});
+    ok &= reject(bytes, "Out-of-bounds raw property length must refuse");
+    bytes = valid;
+    StoreRawDescriptorField(bytes, offsetof(STORAGE_DEVICE_DESCRIPTOR, BusType), BusTypeUnknown);
+    ok &= reject(bytes, "Unknown transport cannot qualify a hardware descriptor");
+    ok &= reject(BuildRawDeviceDescriptorForTest(std::string(kRawSnapshotTextMaxBytes + 1, 'x')),
+        "Oversized serial must refuse before allocation of identity text");
+    bytes = valid;
+    bytes.resize(kRawSnapshotDescriptorMaxBytes + 1);
+    ok &= reject(bytes, "Descriptor cap must apply even to trailing supplied bytes");
+    bytes = valid;
+    StoreRawDescriptorField(bytes, offsetof(STORAGE_DEVICE_DESCRIPTOR, Version), DWORD{0});
+    ok &= reject(bytes, "Unknown descriptor version must refuse");
+    bytes = valid;
+    StoreRawDescriptorField(bytes, offsetof(STORAGE_DEVICE_DESCRIPTOR, SerialNumberOffset), DWORD{0});
+    ok &= Require(ParseRawDeviceDescriptor(bytes, device, error) && device.serial.empty(),
+        "Optional serial availability must remain empty instead of fabricating identity");
+
+    const RawDeviceVpdIdentifier eui{StorageIdCodeSetBinary, StorageIdTypeEUI64, StorageIdAssocDevice,
+        {std::byte{0x00}, std::byte{0x25}, std::byte{0x38}, std::byte{0x45},
+         std::byte{0x67}, std::byte{0x89}, std::byte{0xab}, std::byte{0xcd}}};
+    std::vector<RawDeviceVpdIdentifier> ids;
+    auto port = eui;
+    port.association = StorageIdAssocPort;
+    auto id_bytes = BuildRawDeviceIdDescriptorForTest({port, eui});
+    ok &= Require(ParseRawDeviceIdDescriptor(id_bytes, ids, error) && ids == std::vector<RawDeviceVpdIdentifier>{port, eui},
+        "VPD parser must retain associations instead of silently upgrading a port ID");
+    const auto reject_id = [&](std::vector<std::byte> value, const char* reason) {
+        ids = {eui};
+        return Require(!ParseRawDeviceIdDescriptor(value, ids, error) && ids.empty() && !error.empty(), reason);
+    };
+    constexpr auto id_header = offsetof(STORAGE_DEVICE_ID_DESCRIPTOR, Identifiers);
+    bytes = id_bytes;
+    StoreRawDescriptorField(bytes, 8, DWORD{129});
+    ok &= reject_id(bytes, "Unbounded VPD count must refuse");
+    bytes = id_bytes;
+    StoreRawDescriptorField(bytes, id_header + offsetof(STORAGE_IDENTIFIER, NextOffset), WORD{1});
+    ok &= reject_id(bytes, "VPD chain cannot overlap its own header or payload");
+    bytes = id_bytes;
+    StoreRawDescriptorField(bytes, id_header + offsetof(STORAGE_IDENTIFIER, NextOffset), WORD{65535});
+    ok &= reject_id(bytes, "VPD chain offset cannot escape the descriptor");
+    bytes = BuildRawDeviceIdDescriptorForTest({eui});
+    StoreRawDescriptorField(bytes, id_header + offsetof(STORAGE_IDENTIFIER, NextOffset), WORD{28});
+    ok &= reject_id(bytes, "Last VPD identifier must terminate the chain");
+    bytes = BuildRawDeviceIdDescriptorForTest({eui});
+    StoreRawDescriptorField(bytes, id_header + offsetof(STORAGE_IDENTIFIER, IdentifierSize), WORD{257});
+    ok &= reject_id(bytes, "Oversized or truncated VPD payload must refuse");
+    ok &= reject_id(BuildRawDeviceIdDescriptorForTest({eui, eui}), "Duplicate VPD records must refuse");
+    bytes = BuildRawDeviceIdDescriptorForTest({eui});
+    StoreRawDescriptorField(bytes, id_header + offsetof(STORAGE_IDENTIFIER, Association), DWORD{0xffffffff});
+    ok &= reject_id(bytes, "Unknown VPD association must refuse");
+    return ok;
+}
+
+bool TestRawSnapshotMediaAndQualification(apfsaccess::rw::RawSnapshotDescriptors& descriptors)
+{
+    using namespace apfsaccess::rw;
+    std::string error;
+    RawMediaDescriptorFixture fixture;
+    bool ok = Require(fixture.Parse(descriptors.media, error) && descriptors.media.disk_size_bytes == 65536 &&
+        descriptors.media.partition_offset_bytes == 4096 && descriptors.media.limit_bytes == 8192 &&
+        descriptors.media.disk_guid[0] == std::byte{0x11} && descriptors.media.disk_guid[4] == std::byte{0x55},
+        "Binding must preserve full disk size, unique APFS window and RFC-4122 GUID bytes");
+    ok &= Require(ParseRawDeviceDescriptor(BuildRawDeviceDescriptorForTest(), descriptors.device, error),
+        "Qualification fixture must use a parsed descriptor");
+    RawSnapshotMediaBinding media;
+    auto bad = fixture;
+    constexpr auto header = offsetof(DRIVE_LAYOUT_INFORMATION_EX, PartitionEntry);
+    bad.layout.resize(header + 2 * sizeof(PARTITION_INFORMATION_EX));
+    std::copy(fixture.layout.begin() + header, fixture.layout.end(), bad.layout.begin() + header + sizeof(PARTITION_INFORMATION_EX));
+    StoreRawDescriptorField(bad.layout, offsetof(DRIVE_LAYOUT_INFORMATION_EX, PartitionCount), DWORD{2});
+    ok &= Require(!bad.Parse(media, error) && media == RawSnapshotMediaBinding{}, "Ambiguous containing APFS partitions must refuse");
+    bad = fixture;
+    StoreRawDescriptorField(bad.layout, header + offsetof(PARTITION_INFORMATION_EX, Gpt) + offsetof(PARTITION_INFORMATION_GPT, PartitionId), GUID{});
+    ok &= Require(!bad.Parse(media, error), "Missing partition GUID cannot be substituted by the disk GUID");
+    bad = fixture;
+    bad.length.Length.QuadPart = 32768;
+    ok &= Require(!bad.Parse(media, error), "Partition outside whole-disk capacity must refuse");
+    bad = fixture;
+    bad.alignment.BytesPerPhysicalSector = 0;
+    ok &= Require(!bad.Parse(media, error), "Unavailable physical geometry must refuse without guessing logical geometry");
+    DISK_GEOMETRY logical_geometry{};logical_geometry.BytesPerSector=512;
+    const auto geometry_bytes=std::as_bytes(std::span(&logical_geometry,1));
+    ok &= Require(ParseRawSnapshotMediaBinding(fixture.layout,std::as_bytes(std::span(&fixture.length,1)),{},
+        4096,8192,media,error,geometry_bytes) && media.logical_sector_bytes==512 && media.physical_sector_bytes==0,
+        "Explicit unavailable alignment retains independently reported logical geometry and unknown physical size");
+    const auto logical_only=media;
+    ok &= Require(ValidateRawSnapshotMediaBinding(logical_only,error),"Serialized unknown physical size remains explicit canonical data");
+    ok &= Require(!ParseRawSnapshotMediaBinding(fixture.layout,std::as_bytes(std::span(&fixture.length,1)),{},
+        4096,8192,media,error),"Missing both held geometry sources refuses");
+    ok &= Require(!ParseRawSnapshotMediaBinding(fixture.layout,std::as_bytes(std::span(&fixture.length,1)),{},
+        4096,8192,media,error,geometry_bytes.first(geometry_bytes.size()-1)),"Truncated held logical geometry refuses");
+    ok &= Require(!ParseRawSnapshotMediaBinding(fixture.layout,std::as_bytes(std::span(&fixture.length,1)),
+        std::as_bytes(std::span(&bad.alignment,1)),4096,8192,media,error,geometry_bytes),
+        "Malformed reported alignment cannot use logical-only fallback");
+    logical_geometry.BytesPerSector=768;
+    ok &= Require(!ParseRawSnapshotMediaBinding(fixture.layout,std::as_bytes(std::span(&fixture.length,1)),{},
+        4096,8192,media,error,std::as_bytes(std::span(&logical_geometry,1))),"Invalid logical geometry refuses");
+    bad = fixture;
+    StoreRawDescriptorField(bad.layout, offsetof(DRIVE_LAYOUT_INFORMATION_EX, PartitionCount), DWORD{1025});
+    ok &= Require(!bad.Parse(media, error), "Layout count must be bounded by returned bytes and policy cap");
+    ok &= Require(!fixture.Parse(media, error, std::numeric_limits<std::uint64_t>::max() - 4095, 8192),
+        "Overflowing absolute window must refuse using subtraction bounds");
+    RawHardwareQualification serial{RawHardwareIdentityKind::QualifiedSerialTuple, BusTypeUsb,
+        "Samsung", "USB Test Media", "SAMPLE-UNIT-4839", 0};
+    RawSnapshotBinding binding;
+    ok &= Require(QualifyRawSnapshotBinding(descriptors, serial, binding, error) &&
+        binding.hardware.kind == RawHardwareIdentityKind::QualifiedSerialTuple && binding.hardware.serial == serial.qualified_serial &&
+        binding.hardware.vpd_identifier.empty(), "Explicit qualified serial tuple must produce one canonical hardware tag");
+    const auto original = binding;
+    auto unqualified = serial;
+    unqualified.qualified_serial.clear();
+    ok &= Require(!QualifyRawSnapshotBinding(descriptors, unqualified, binding, error) && binding == RawSnapshotBinding{},
+        "Observed serial is not automatically a qualified unit serial");
+    unqualified = serial;
+    unqualified.bus_type = BusTypeSata;
+    ok &= Require(!QualifyRawSnapshotBinding(descriptors, unqualified, binding, error), "Different transport profile must refuse");
+    for (const auto value : {"", "00000000", "FFFFFFFF", "UNKNOWN", "123456789", "N/A"})
+    {
+        auto generic = descriptors;
+        generic.device.serial = value;
+        unqualified = serial;
+        unqualified.qualified_serial = value;
+        ok &= Require(!QualifyRawSnapshotBinding(generic, unqualified, binding, error),
+            "Explicitly supplied generic serial must still refuse");
+    }
+    auto copy = descriptors;
+    copy.device.serial = "SAMPLE-UNIT-9999";
+    ok &= Require(!QualifyRawSnapshotBinding(copy, serial, binding, error),
+        "Copied GPT and window must not qualify a different hardware unit serial");
+    copy.media.partition_guid[15] ^= std::byte{1};
+    auto copy_policy = serial;
+    copy_policy.qualified_serial = copy.device.serial;
+    ok &= Require(QualifyRawSnapshotBinding(copy, copy_policy, binding, error) && binding != original,
+        "Different qualified device and partition values must remain distinguishable in durable equality");
+    RawDeviceVpdIdentifier id{StorageIdCodeSetBinary, StorageIdTypeEUI64, StorageIdAssocDevice,
+        {std::byte{0x00}, std::byte{0x25}, std::byte{0x38}, std::byte{0x45},
+         std::byte{0x67}, std::byte{0x89}, std::byte{0xab}, std::byte{0xcd}}};
+    auto vpd = descriptors;
+    vpd.device_id_available = true;
+    vpd.identifiers = {id};
+    RawHardwareQualification vpd_policy{RawHardwareIdentityKind::QualifiedDeviceVpd, BusTypeUsb,
+        "Samsung", "USB Test Media", {}, StorageIdTypeEUI64};
+    ok &= Require(QualifyRawSnapshotBinding(vpd, vpd_policy, binding, error) && binding.hardware.serial.empty() &&
+        binding.hardware.vpd_identifier == id.bytes, "Device-associated qualified binary VPD must bind exact bytes");
+    for (const auto association : {StorageIdAssocPort, StorageIdAssocTarget})
+    {
+        vpd.identifiers.front().association = association;
+        ok &= Require(!QualifyRawSnapshotBinding(vpd, vpd_policy, binding, error), "Port/target VPD cannot stand in for unit identity");
+    }
+    vpd.identifiers = {id, id};
+    ok &= Require(!QualifyRawSnapshotBinding(vpd, vpd_policy, binding, error), "Multiple qualifying VPD candidates must refuse ambiguity");
+    vpd.identifiers = {id};
+    vpd.identifiers.front().bytes.assign(8, std::byte{0});
+    ok &= Require(!QualifyRawSnapshotBinding(vpd, vpd_policy, binding, error), "All-zero VPD must refuse");
+    vpd.identifiers.clear();
+    ok &= Require(!QualifyRawSnapshotBinding(vpd, vpd_policy, binding, error), "Unavailable selected VPD must not fall back to a serial or layout");
+    vpd = descriptors;
+    vpd.device_id_available = true;
+    id.type = StorageIdTypeVendorSpecific;
+    vpd.identifiers = {id};
+    vpd_policy.qualified_vpd_type = StorageIdTypeVendorSpecific;
+    ok &= Require(!QualifyRawSnapshotBinding(vpd, vpd_policy, binding, error),
+        "Vendor-specific bytes cannot upgrade a layout/model identifier to qualified device VPD");
+    vpd_policy.qualified_vpd_type = StorageIdTypeEUI64;
+    vpd = descriptors;
+    vpd.device_id_available = false;
+    ok &= Require(QualifyRawSnapshotBinding(vpd, serial, binding, error) && binding == original,
+        "An explicitly qualified serial remains usable when optional VPD is unavailable; no fallback is performed");
+    vpd=descriptors;vpd.device_id_available=true;id.type=StorageIdTypeEUI64;
+    id.bytes.assign(kRawSnapshotDescriptorMaxBytes+1,std::byte{0x11});vpd.identifiers={id};
+    ok &= Require(!QualifyRawSnapshotBinding(vpd,vpd_policy,binding,error),
+        "Oversized typed VPD input refuses before scanning content");
+    return ok;
+}
+
+struct InjectedRawSnapshotFixture
+{
+    apfsaccess::rw::BlockDevice device{L"injected-raw-no-path-open", 4096};
+    ~InjectedRawSnapshotFixture() { apfsaccess::rw::BlockDeviceRawSnapshotTestPeer::Clear(device); }
+};
+
+bool TestRawSnapshotHeldLease(const apfsaccess::rw::RawSnapshotDescriptors& descriptors)
+{
+    using namespace apfsaccess::rw;
+    using Peer = BlockDeviceRawSnapshotTestPeer;
+    InjectedRawSnapshotFixture fixture, foreign;
+    auto& device = fixture.device;
+    bool ok = Require(!device.CaptureHeldRawSnapshotLease(), "Unadmitted source must not capture a raw lease or open its path");
+    Peer::Seed(device, descriptors);
+    Peer::Seed(foreign.device, descriptors);
+    const auto lease = device.CaptureHeldRawSnapshotLease();
+    if (!Require(lease.has_value(), "Injected admitted original handle pair must capture cached continuity")) return false;
+    const auto copied = *lease;
+    const auto identity = device.RawWriterIdentity();
+    apfsaccess::catalog::NxSuperblock nx;
+    nx.block_size=4096;nx.block_count=2;
+    SnapshotRuntimeDeviceSource source(device,nx);
+    std::vector<std::byte> source_bytes{std::byte{0x42}};
+    ok &= Require(source.IsValid()&&source.SizeBytes()==8192&&
+        source.Read(8192,0,source_bytes)&&source_bytes.empty(),
+        "Raw snapshot source admits exactly its NX window with a current original lease");
+    ok &= Require(!source.Read(8192,1,source_bytes)&&source_bytes.empty()&&
+        !source.Read(8193,0,source_bytes)&&source_bytes.empty(),
+        "NX range refusals precede any I/O on injected handles");
+    auto oversized_nx=nx;oversized_nx.block_count=3;
+    SnapshotRuntimeDeviceSource oversized_source(device,oversized_nx);
+    ok &= Require(!oversized_source.IsValid()&&oversized_source.SizeBytes()==0,
+        "NX source cannot extend beyond the admitted raw write window");
+    ok &= Require(copied == *lease && !device.IsHeldRawSnapshotLeaseCurrent(BlockDevice::RawSnapshotLease{}) &&
+        !foreign.device.IsHeldRawSnapshotLeaseCurrent(copied), "Default/foreign tokens must refuse even with equal media and handle values");
+    const auto generation = Peer::WriteGeneration(device);
+    Peer::BeginWrite(device);
+    ok &= Require(device.IsHeldRawSnapshotLeaseCurrent(copied) && device.CaptureHeldRawSnapshotLease() == lease,
+        "Stable raw continuity must survive an active write admission without reserving writes");
+    Peer::EndWrite(device);
+    ok &= Require(Peer::WriteGeneration(device) == generation + 2 && device.IsHeldRawSnapshotLeaseCurrent(copied) &&
+        device.RawWriterIdentity() == identity, "Per-write generation advances must not alter lease or existing raw identity bytes");
+    ok &= Require(source.IsValid()&&source.SizeBytes()==8192&&source.Read(0,0,source_bytes),
+        "Own writes do not retire the captured raw snapshot read source");
+    RawSnapshotDescriptors queried;
+    std::string error;
+    ok &= Require(device.QueryHeldRawSnapshotDescriptors(copied, queried, error) && queried == descriptors,
+        "Descriptor capture must consume only cached injected evidence without querying synthetic handles");
+    RawHardwareQualification policy{RawHardwareIdentityKind::QualifiedSerialTuple, BusTypeUsb,
+        "Samsung", "USB Test Media", "SAMPLE-UNIT-4839", 0};
+    RawSnapshotBinding binding;
+    ok &= Require(device.QueryHeldRawSnapshotBinding(copied, policy, binding, error) &&
+        binding.media == descriptors.media, "Native held-binding API must qualify its own cached descriptors");
+    const auto original_binding = binding;
+    bool attempted=false,complete=false;unsigned calls=0;
+    bool injected=false;
+    try {
+        raw_snapshot_detail::AttemptDescriptorCacheOnce(attempted,complete,[&]() -> bool {
+            ++calls;RawDeviceDescriptor first;std::string diagnostic;
+            if(!ParseRawDeviceDescriptor(BuildRawDeviceDescriptorForTest(),first,diagnostic))return false;
+            throw std::bad_alloc();
+        });
+    } catch(const std::bad_alloc&) {injected=true;}
+    raw_snapshot_detail::AttemptDescriptorCacheOnce(attempted,complete,[&](){++calls;return true;});
+    ok &= Require(injected&&attempted&&!complete&&calls==1,
+        "Exception after a successful descriptor parser consumes the attempt without success or retry");
+    Peer::InterruptCachedDescriptor(device);
+    queried=descriptors;
+    ok &= Require(!device.QueryHeldRawSnapshotDescriptors(copied,queried,error)&&
+        error=="RawSnapshotDescriptorQueryIncomplete"&&queried==RawSnapshotDescriptors{},
+        "Production cache retry refuses incomplete attempt even when parser diagnostics are empty");
+    Peer::Seed(device,descriptors);
+    Peer::BeginWrite(device);
+    Peer::EndWrite(device);
+    ok &= Require(device.QueryHeldRawSnapshotBinding(copied, policy, binding, error) && binding == original_binding,
+        "Held hardware/media binding must remain byte-equal through ordinary write generations");
+    Peer::FailCachedDescriptor(device);
+    ok &= Require(!device.QueryHeldRawSnapshotBinding(copied, policy, binding, error) && binding == RawSnapshotBinding{} &&
+        error == "RawHardwareDescriptorUnavailable:50", "Cached unavailable hardware must remain a refusal without retry or stale binding");
+    Peer::Retire(device);
+    ok &= Require(!device.IsHeldRawSnapshotLeaseCurrent(copied) && !device.CaptureHeldRawSnapshotLease(),
+        "Handle retirement must immediately and permanently invalidate captured continuity");
+    source_bytes={std::byte{0x42}};
+    ok &= Require(!source.IsValid()&&source.SizeBytes()==0&&!source.Read(0,0,source_bytes)&&source_bytes.empty(),
+        "Retired source refuses even zero-byte reads and clears prior output without opening the path");
+    Peer::Seed(device, descriptors);
+    const auto replacement = device.CaptureHeldRawSnapshotLease();
+    ok &= Require(replacement && replacement != lease && !device.IsHeldRawSnapshotLeaseCurrent(copied),
+        "Same handle values reinstalled after retirement must not revive an earlier epoch");
+    SnapshotRuntimeDeviceSource replacement_source(device,nx);
+    ok &= Require(!source.IsValid()&&replacement_source.IsValid()&&replacement_source.SizeBytes()==8192,
+        "Replacement lease creates a new read source but cannot revive the previously captured source");
+    ok &= Require(!device.QueryHeldRawSnapshotDescriptors(copied, queried, error) && queried == RawSnapshotDescriptors{},
+        "Retired token cannot consume a replacement descriptor cache");
+    Peer::ExhaustEpoch(device);
+    Peer::Seed(device, descriptors);
+    ok &= Require(!device.CaptureHeldRawSnapshotLease(), "Retirement epoch exhaustion must fail closed without wraparound");
+    return ok;
+}
+
+bool TestRawSnapshotReusedOwnerLifetime(const apfsaccess::rw::RawSnapshotDescriptors& descriptors)
+{
+    using namespace apfsaccess::rw;
+    using Peer = BlockDeviceRawSnapshotTestPeer;
+    alignas(BlockDevice) std::array<std::byte, sizeof(BlockDevice)> storage{};
+    auto* first = std::construct_at(reinterpret_cast<BlockDevice*>(storage.data()), L"injected-owner-reuse", 4096);
+    Peer::Seed(*first, descriptors);
+    const auto old = first->CaptureHeldRawSnapshotLease();
+    Peer::Clear(*first);
+    std::destroy_at(first);
+    auto* replacement = std::construct_at(reinterpret_cast<BlockDevice*>(storage.data()), L"injected-owner-reuse", 4096);
+    Peer::Seed(*replacement, descriptors);
+    const bool ok = Require(old && replacement->CaptureHeldRawSnapshotLease() &&
+        !replacement->IsHeldRawSnapshotLeaseCurrent(*old),
+        "A reused owner address/handles/window/epoch must still refuse the original lifetime token");
+    Peer::Clear(*replacement);
+    std::destroy_at(replacement);
+    return ok;
+}
+
+bool RunRawSnapshotBindingTests()
+{
+    apfsaccess::rw::RawSnapshotDescriptors descriptors;
+    bool ok = TestRawSnapshotDescriptorParsing();
+    ok &= TestRawSnapshotMediaAndQualification(descriptors);
+    ok &= TestRawSnapshotHeldLease(descriptors);
+    ok &= TestRawSnapshotReusedOwnerLifetime(descriptors);
+    return ok;
+}
+
+bool ParseRawMetadataNumber(std::string_view text, std::uint64_t& out)
+{
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), out);
+    return !text.empty() && result.ec == std::errc{} && result.ptr == text.data() + text.size();
+}
+
+int InspectHeldRawSnapshotMetadata(int argc, char** argv)
+{
+    using namespace apfsaccess::rw;
+    std::uint64_t base = 0, limit = 0;
+    if (argc != 5 || std::string_view(argv[2]) != R"(\\.\PhysicalDrive2)" ||
+        !ParseRawMetadataNumber(argv[3], base) || !ParseRawMetadataNumber(argv[4], limit))
+    {
+        std::cerr << "Usage after Root's exact Samsung preflight: --inspect-held-raw-snapshot \\\\.\\PhysicalDrive2 <base> <limit>\n";
+        return 2;
+    }
+    BlockDevice device(std::filesystem::path(argv[2]).wstring(), base);
+    std::string error;
+    // This selector opens the normal admitted original pair, then performs
+    // metadata queries only. It never calls Write, WriteBatch, Flush or probe.
+    if (!device.AdmitExclusiveRawWriter(limit, error))
+    {
+        std::cerr << "RAW METADATA UNAVAILABLE " << error << '\n';
+        return 1;
+    }
+    const auto lease = device.CaptureHeldRawSnapshotLease();
+    RawSnapshotDescriptors descriptors;
+    if (!lease || !device.QueryHeldRawSnapshotDescriptors(*lease, descriptors, error))
+    {
+        std::cerr << "RAW HARDWARE IDENTITY UNAVAILABLE " << error << '\n';
+        return 1;
+    }
+    // Root explicitly qualified this tuple from its live 2026-10-13 property
+    // probe. The production API must independently match its own held handle.
+    const RawHardwareQualification samsung{RawHardwareIdentityKind::QualifiedSerialTuple, BusTypeUsb,
+        "Samsung", "Flash Drive FIT", "AA00000000000489", 0};
+    RawSnapshotBinding binding;
+    if (descriptors.device.revision != "1100" ||
+        !device.QueryHeldRawSnapshotBinding(*lease, samsung, binding, error))
+    {
+        std::cerr << "RAW HARDWARE IDENTITY UNAVAILABLE: exact qualified Samsung Flash Drive FIT tuple mismatch " << error << '\n';
+        return 1;
+    }
+    std::vector<std::byte> nx_bytes, bounded_bytes;
+    if (!device.Read(0,4096,nx_bytes)) return 1;
+    const auto nx=apfsaccess::catalog::ParseNxSuperblock(nx_bytes);
+    if (!nx) return 1;
+    SnapshotRuntimeDeviceSource source(device,*nx);
+    if (!source.IsValid()||source.SizeBytes()!=limit||
+        !source.Read(0,4096,bounded_bytes)||bounded_bytes!=nx_bytes||
+        !source.Read(limit,0,bounded_bytes)||!bounded_bytes.empty()||
+        source.Read(limit,1,bounded_bytes)||!bounded_bytes.empty()) return 1;
+    std::cout<<"source_window_valid=true\nsource_window_bytes="<<source.SizeBytes()<<"\nnx_checksum_valid=true\n";
+    const auto hex = [](std::span<const std::byte> bytes) {
+        std::string value;
+        constexpr char digits[] = "0123456789abcdef";
+        for (const auto byte : bytes)
+        {
+            const auto n = std::to_integer<unsigned char>(byte);
+            value.push_back(digits[n >> 4]);
+            value.push_back(digits[n & 15]);
+        }
+        return value;
+    };
+    const auto& media = descriptors.media;
+    const auto& hardware = descriptors.device;
+    std::cout << "RAW HELD METADATA\npath=\\\\.\\PhysicalDrive2\nbytes_written=0\nqualified=true\nidentity_kind=QualifiedSerialTuple\n"
+        << "raw_identity=" << device.RawWriterIdentity() << "\nbus=" << hardware.bus_type
+        << "\nvendor=" << std::quoted(hardware.vendor) << "\nproduct=" << std::quoted(hardware.product)
+        << "\nrevision=" << std::quoted(hardware.revision) << "\nserial=" << std::quoted(hardware.serial)
+        << "\nserial_candidate=" << (hardware.serial.size() >= 4 && raw_snapshot_detail::NonGenericText(hardware.serial))
+        << "\ndevice_id_available=" << descriptors.device_id_available
+        << "\ndisk_guid=" << hex(media.disk_guid) << "\npartition_guid=" << hex(media.partition_guid)
+        << "\npartition_offset=" << media.partition_offset_bytes << "\npartition_length=" << media.partition_length_bytes
+        << "\nbase=" << media.base_offset_bytes << "\nlimit=" << media.limit_bytes << "\ndisk_size=" << media.disk_size_bytes
+        << "\nlogical_sector=" << media.logical_sector_bytes << "\nphysical_sector=" << media.physical_sector_bytes << '\n';
+    for (const auto& id : descriptors.identifiers)
+        std::cout << "vpd association=" << id.association << " code_set=" << id.code_set << " type=" << id.type
+            << " bytes=" << hex(id.bytes) << " candidate=" << raw_snapshot_detail::QualifiedVpd(id) << '\n';
+    RawSnapshotDescriptors cached;
+    RawSnapshotBinding cached_binding;
+    if (!device.QueryHeldRawSnapshotDescriptors(*lease, cached, error) || cached != descriptors ||
+        !device.QueryHeldRawSnapshotBinding(*lease, samsung, cached_binding, error) || cached_binding != binding ||
+        !device.IsHeldRawSnapshotLeaseCurrent(*lease)) return 1;
+    std::cout << "continuity=true\nmetadata_cache_equal=true\nbinding_cache_equal=true\nraw_snapshot_mutation_enabled=false\n";
+    return 0;
+}
 
 std::optional<std::uint64_t> ExtractNestedUnsignedValue(
     const std::string& json,
@@ -439,6 +1058,378 @@ bool TestBlockDeviceOffsetIo(const std::filesystem::path& run_root)
     return ok;
 }
 
+bool SeedWriteSourceImage(const std::filesystem::path& path, const std::vector<std::byte>& bytes)
+{
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    return Require(out.good(), "Write-source fixture must be a real complete image file");
+}
+
+bool TestRawSnapshotSourceRejectsRetirementDuringRead(const std::filesystem::path& run_root)
+{
+    using namespace apfsaccess::rw;
+    ScopedEnvironmentVariable cache_setting(L"APFSACCESS_EXPERIMENTAL_BLOCK_READ_CACHE",L"1");
+    const auto seed=BuildPatternPayload(64*1024,0x73);
+    const auto path=run_root/"raw-source-read-retirement.img";
+    if(!SeedWriteSourceImage(path,seed))return false;
+    std::string error;
+    auto device=BlockDevice::OpenExclusiveManagementImage(path.wstring(),4096,error);
+    if(!Require(!!device,"Real source-read fixture must open: "+error))return false;
+    // Read-only fixture state uses real retained handles. No descriptor query,
+    // raw write, physical target or shipping admission override is involved.
+    BlockDeviceRawSnapshotTestPeer::UseOriginalImageHandlesForRawRead(*device,8192);
+    apfsaccess::catalog::NxSuperblock nx;nx.block_size=4096;nx.block_count=2;
+    SnapshotRuntimeDeviceSource source(*device,nx);
+    std::vector<std::byte> bytes;
+    bool ok=Require(source.Read(17,2100,bytes)&&bytes==std::vector<std::byte>(seed.begin()+4113,seed.begin()+6213),
+        "Captured raw source must read the real nonzero-base container-relative window");
+    bool retirement_reached=false;
+    device->SetReadCacheMissHookForTests([&]{
+        retirement_reached=true;BlockDeviceRawSnapshotTestPeer::Retire(*device);
+    });
+    bytes={std::byte{0x42}};
+    ok&=Require(!source.Read(4096,4096,bytes)&&bytes.empty()&&retirement_reached&&
+        !source.IsValid()&&source.SizeBytes()==0,
+        "Retirement after actual I/O must discard completed bytes before the source returns");
+    device->SetReadCacheMissHookForTests({});
+    device.reset();
+    std::ifstream input(path,std::ios::binary);
+    const std::vector<char> after((std::istreambuf_iterator<char>(input)),{});
+    ok&=Require(after.size()==seed.size()&&std::memcmp(after.data(),seed.data(),seed.size())==0,
+        "Real read-retirement proof must preserve the entire image");
+    return ok;
+}
+
+bool TestBlockDeviceExclusiveWriteSourceCapture(const std::filesystem::path& run_root)
+{
+    using Device = apfsaccess::rw::BlockDevice;
+    static_assert(std::is_default_constructible_v<Device::WriteSourceObservation>);
+    static_assert(std::is_copy_constructible_v<Device::WriteSourceObservation>);
+    static_assert(std::is_copy_assignable_v<Device::WriteSourceObservation>);
+    static_assert(!std::is_aggregate_v<Device::WriteSourceObservation>);
+    ScopedEnvironmentVariable no_fault(L"APFSACCESS_RW_FAULT_WRITE", nullptr);
+    ScopedEnvironmentVariable no_flush_fault(L"APFSACCESS_RW_FAULT_FLUSH", nullptr);
+    bool ok = true;
+    for (const auto* cache : {L"0", L"1"})
+    {
+        ScopedEnvironmentVariable cache_setting(L"APFSACCESS_EXPERIMENTAL_BLOCK_READ_CACHE", cache);
+        const auto path = run_root / (cache[0] == L'0' ? "source-capture-uncached.img" : "source-capture-cached.img");
+        const auto seed = BuildPatternPayload(64 * 1024, 0x31);
+        if (!SeedWriteSourceImage(path, seed)) return false;
+        std::string error;
+        auto device = Device::OpenExclusiveManagementImage(path.wstring(), 4096, error);
+        if (!Require(!!device, "Exclusive management image must open: " + error)) return false;
+        const auto observation = device->CaptureExclusiveWriteSourceObservation();
+        if (!Require(observation.has_value(), "Real exclusive image must grant an observation with either cache setting")) return false;
+        Device::WriteSourceObservation invalid;
+        auto copied = *observation;
+        ok &= Require(copied == *observation && invalid != copied &&
+            !device->IsExclusiveWriteSourceObservationCurrent(invalid), "Default token must be invalid; copies preserve equality");
+        ok &= Require(!device->IsRawWriterAccepted(), "Exclusive image must not acquire raw-device authority");
+        std::vector<std::byte> bytes;
+        ok &= Require(device->Read(0, 4096, bytes) && bytes ==
+            std::vector<std::byte>(seed.begin() + 4096, seed.begin() + 8192), "Exclusive observation must bind the nonzero image window");
+        ok &= Require(device->Flush() && device->CaptureExclusiveWriteSourceObservation() == observation &&
+            device->IsExclusiveWriteSourceObservationCurrent(copied), "Read and flush must preserve an unchanged observation");
+        const auto competing = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+        const auto competing_error = GetLastError();
+        if (competing != INVALID_HANDLE_VALUE) CloseHandle(competing);
+        ok &= Require(competing == INVALID_HANDLE_VALUE && competing_error == ERROR_SHARING_VIOLATION,
+            "Positive observation must come from an actual exclusive image lease");
+        ok &= Require(device->Write(0, bytes) && device->Flush(), "Same-byte real write must succeed");
+        const auto after_write = device->CaptureExclusiveWriteSourceObservation();
+        ok &= Require(after_write && after_write != observation &&
+            !device->IsExclusiveWriteSourceObservationCurrent(copied), "Same-byte writes must invalidate previous observations");
+        ok &= Require(device->Read(0, seed.size() - 4096, bytes) && bytes ==
+            std::vector<std::byte>(seed.begin() + 4096, seed.end()), "Same-byte write must leave the complete held window unchanged");
+        ok &= Require(device->Write(0, std::span<const std::byte>{}) && device->WriteBatch({}) &&
+            device->CaptureExclusiveWriteSourceObservation() == after_write, "Empty operations must not admit writes");
+    }
+    return ok;
+}
+
+bool TestBlockDeviceExclusiveWriteSourceAdmission(const std::filesystem::path& run_root)
+{
+    using Device = apfsaccess::rw::BlockDevice;
+    ScopedEnvironmentVariable no_cache(L"APFSACCESS_EXPERIMENTAL_BLOCK_READ_CACHE", L"0");
+    ScopedEnvironmentVariable no_fault(L"APFSACCESS_RW_FAULT_WRITE", nullptr);
+    const auto path = run_root / "source-active-admission.img";
+    const auto seed = BuildPatternPayload(64 * 1024, 0x42);
+    if (!SeedWriteSourceImage(path, seed)) return false;
+    std::string error;
+    auto device = Device::OpenExclusiveManagementImage(path.wstring(), 0, error);
+    if (!Require(!!device, "Active admission fixture must open: " + error)) return false;
+    const auto observation = device->CaptureExclusiveWriteSourceObservation();
+    if (!Require(observation.has_value(), "Active admission fixture needs an initial observation")) return false;
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool entered = false, released = false, written = false;
+    bool hook_refused = false;
+    device->SetWriteCacheInvalidationHookForTests([&] {
+        hook_refused = !device->CaptureExclusiveWriteSourceObservation() &&
+            !device->IsExclusiveWriteSourceObservationCurrent(*observation);
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true;
+        condition.notify_all();
+        condition.wait(lock, [&] { return released; });
+    });
+    std::thread writer([&] { written = device->Write(0, std::span<const std::byte>(seed).first(4096)); });
+    bool reached_hook = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        reached_hook = condition.wait_for(lock, std::chrono::seconds(10), [&] { return entered; });
+    }
+    bool ok = Require(reached_hook, "Write must reach real admission before I/O");
+    ok &= Require(!device->CaptureExclusiveWriteSourceObservation() &&
+        !device->IsExclusiveWriteSourceObservationCurrent(*observation), "Concurrent capture must refuse while a write is admitted");
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        released = true;
+    }
+    condition.notify_all();
+    writer.join();
+    device->SetWriteCacheInvalidationHookForTests({});
+    ok &= Require(written && hook_refused, "Hook and concurrent caller must observe admission without lock inversion");
+    const auto recovered = device->CaptureExclusiveWriteSourceObservation();
+    if (!Require(recovered.has_value(), "Completed admission must permit a new observation")) return false;
+    device->SetWriteCacheInvalidationHookForTests([] { throw std::runtime_error("source-admission-unwind"); });
+    bool threw = false;
+    try { (void)device->Write(0, std::span<const std::byte>(seed).first(4096)); }
+    catch (const std::runtime_error&) { threw = true; }
+    device->SetWriteCacheInvalidationHookForTests({});
+    ok &= Require(threw && !device->IsExclusiveWriteSourceObservationCurrent(*recovered) &&
+        device->CaptureExclusiveWriteSourceObservation().has_value(), "Exception after admission must invalidate and release source observation state");
+    std::vector<std::byte> bytes;
+    ok &= Require(device->Read(0, seed.size(), bytes) && bytes == seed, "Blocked and unwound same-byte writes must preserve exact fixture bytes");
+    return ok;
+}
+
+bool TestBlockDeviceExclusiveWriteSourceBatch(const std::filesystem::path& run_root)
+{
+    using Device = apfsaccess::rw::BlockDevice;
+    ScopedEnvironmentVariable no_cache(L"APFSACCESS_EXPERIMENTAL_BLOCK_READ_CACHE", L"0");
+    ScopedEnvironmentVariable no_fault(L"APFSACCESS_RW_FAULT_WRITE", nullptr);
+    ScopedEnvironmentVariable async_depth(L"APFSACCESS_ASYNC_BLOCK_IO_DEPTH", L"4");
+    const auto path = run_root / "source-batch-admission.img";
+    const auto seed = BuildPatternPayload(8 * 1024 * 1024, 0x53);
+    if (!SeedWriteSourceImage(path, seed)) return false;
+    std::string error;
+    auto device = Device::OpenExclusiveManagementImage(path.wstring(), 4096, error);
+    if (!Require(!!device, "Batch admission fixture must open: " + error)) return false;
+    bool ok = true;
+    for (int mode = 0; mode != 6; ++mode)
+    {
+        const bool asynchronous = mode == 2 || mode == 3;
+        ScopedEnvironmentVariable async_setting(L"APFSACCESS_DISABLE_ASYNC_BLOCK_IO", asynchronous ? L"0" : L"1");
+        const auto async_before = ExtractNestedUnsignedValue(device->PerformanceJson(), "asyncBatchWrite", "count");
+        const auto observation = device->CaptureExclusiveWriteSourceObservation();
+        if (!Require(observation.has_value(), "Each real batch needs an initial observation")) return false;
+        const auto span = std::span<const std::byte>(seed);
+        std::array<Device::WriteSpan, 2> writes = {
+            Device::WriteSpan{0, span.subspan(4096, mode == 3 ? 4 * 1024 * 1024 : 4096)},
+            Device::WriteSpan{8192, span.subspan(12288, 4096)}
+        };
+        if (mode == 4)
+        {
+            writes = {Device::WriteSpan{512, span.subspan(4608, 512)},
+                Device::WriteSpan{4608, span.subspan(8704, 512)}};
+        }
+        else if (mode == 5)
+        {
+            writes[1] = Device::WriteSpan{4096, span.subspan(8192, 4096)};
+        }
+        bool hook_refused = false;
+        device->SetWriteCacheInvalidationHookForTests([&] {
+            hook_refused = !device->CaptureExclusiveWriteSourceObservation() &&
+                !device->IsExclusiveWriteSourceObservationCurrent(*observation);
+        });
+        ok &= Require(device->WriteBatch(std::span<const Device::WriteSpan>(writes).first(mode == 0 || mode == 3 ? 1 : 2)),
+            "Single, synchronous, asynchronous, split-large, RMW and merged batches must succeed");
+        device->SetWriteCacheInvalidationHookForTests({});
+        const auto async_after = ExtractNestedUnsignedValue(device->PerformanceJson(), "asyncBatchWrite", "count");
+        ok &= Require(async_before && async_after && *async_after == *async_before + (asynchronous ? 1 : 0),
+            "Batch fixture must execute the requested synchronous or real asynchronous funnel");
+        ok &= Require(hook_refused && !device->IsExclusiveWriteSourceObservationCurrent(*observation) &&
+            device->CaptureExclusiveWriteSourceObservation().has_value(), "Every batch funnel must invalidate and release source admission");
+    }
+    std::vector<std::byte> bytes;
+    ok &= Require(device->Read(0, seed.size() - 4096, bytes) && bytes ==
+        std::vector<std::byte>(seed.begin() + 4096, seed.end()), "All batch variants must preserve exact same-byte fixture contents");
+    return ok;
+}
+
+bool TestBlockDeviceExclusiveWriteSourceFailures(const std::filesystem::path& run_root)
+{
+    using Device = apfsaccess::rw::BlockDevice;
+    ScopedEnvironmentVariable no_cache(L"APFSACCESS_EXPERIMENTAL_BLOCK_READ_CACHE", L"0");
+    ScopedEnvironmentVariable async_enabled(L"APFSACCESS_DISABLE_ASYNC_BLOCK_IO", L"0");
+    const auto path = run_root / "source-failed-admission.img";
+    const auto seed = BuildPatternPayload(64 * 1024, 0x64);
+    const auto replacement = BuildPatternPayload(8192, 0xA7);
+    if (!SeedWriteSourceImage(path, seed)) return false;
+    std::string error;
+    auto device = Device::OpenExclusiveManagementImage(path.wstring(), 4096, error);
+    if (!Require(!!device, "Failed admission fixture must open: " + error)) return false;
+    bool ok = true;
+    auto expected = std::vector<std::byte>(seed.begin() + 4096, seed.end());
+    for (int mode = 0; mode != 4; ++mode)
+    {
+        const auto observation = device->CaptureExclusiveWriteSourceObservation();
+        if (!Require(observation.has_value(), "Failed writes need a real initial observation")) return false;
+        ScopedEnvironmentVariable fault(L"APFSACCESS_RW_FAULT_WRITE", mode == 3 ? nullptr : mode == 2 ? L"first-half" : L"fail");
+        ScopedEnvironmentVariable async_fault(L"APFSACCESS_RW_FAULT_ASYNC_BATCH_AFTER_ISSUES", mode == 3 ? L"1" : nullptr);
+        const std::array<Device::WriteSpan, 2> writes = {
+            Device::WriteSpan{0, replacement}, Device::WriteSpan{16384, replacement}
+        };
+        const auto success = mode == 1 || mode == 3 ? device->WriteBatch(writes) : device->Write(0, replacement);
+        ok &= Require(!success && !device->IsExclusiveWriteSourceObservationCurrent(*observation),
+            "Failed single/batch and real partial writes must invalidate previous observations");
+        if (mode == 2) std::copy_n(replacement.begin(), 4096, expected.begin());
+        if (mode == 3) std::copy(replacement.begin(), replacement.end(), expected.begin());
+        std::vector<std::byte> bytes;
+        ok &= Require(device->Read(0, expected.size(), bytes) && bytes == expected,
+            "Failed writes must preserve bytes; partial writes must change only the completed portion");
+        ok &= Require(device->CaptureExclusiveWriteSourceObservation().has_value(), "Failed admission must leave no active write count");
+    }
+    return ok;
+}
+
+bool TestBlockDeviceExclusiveWriteSourceAdoptionAndRefusals(const std::filesystem::path& run_root)
+{
+    using Device = apfsaccess::rw::BlockDevice;
+    const auto seed = BuildPatternPayload(64 * 1024, 0x75);
+    const auto adopted_path = run_root / "source-adopted-exclusive.img";
+    const auto peer_path = run_root / "source-foreign-exclusive.img";
+    const auto shared_path = run_root / "source-shared.img";
+    if (!SeedWriteSourceImage(adopted_path, seed) || !SeedWriteSourceImage(peer_path, seed) ||
+        !SeedWriteSourceImage(shared_path, seed)) return false;
+    std::string error;
+    const auto held = CreateFileW(adopted_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (!Require(held != INVALID_HANDLE_VALUE, "Adoption must use an actual exclusive read/write handle")) return false;
+    auto adopted = Device::AdoptExclusiveRepairImage(adopted_path.wstring(), held, error);
+    if (!Require(!!adopted, "Actual exclusive repair image must adopt: " + error)) return false;
+    auto peer = Device::OpenExclusiveManagementImage(peer_path.wstring(), 4096, error);
+    if (!Require(!!peer, "Foreign exclusive image must open: " + error)) return false;
+    const auto observation = adopted->CaptureExclusiveWriteSourceObservation();
+    const auto peer_observation = peer->CaptureExclusiveWriteSourceObservation();
+    if (!Require(observation && peer_observation, "Both legitimate exclusive factories must grant observations")) return false;
+    bool ok = Require(!peer->IsExclusiveWriteSourceObservationCurrent(*observation) &&
+        !adopted->IsExclusiveWriteSourceObservationCurrent(*peer_observation), "Foreign held objects and windows must refuse each other's tokens");
+    for (const auto* cache : {L"0", L"1"})
+    {
+        ScopedEnvironmentVariable cache_setting(L"APFSACCESS_EXPERIMENTAL_BLOCK_READ_CACHE", cache);
+        Device shared(shared_path.wstring());
+        ok &= Require(!shared.CaptureExclusiveWriteSourceObservation() && !shared.HasWriteHandle(),
+            "Capture on an unopened shared path must not acquire a handle");
+        std::vector<std::byte> bytes;
+        ok &= Require(shared.Read(0, seed.size(), bytes) && bytes == seed && shared.IsWritable(),
+            "Shared-file negative must use a real readable writable source");
+        ok &= Require(!shared.CaptureExclusiveWriteSourceObservation() &&
+            !shared.IsExclusiveWriteSourceObservationCurrent(*observation), "Shared writable file and cache opt-in cannot grant exclusive authority");
+    }
+    auto read_only = Device::OpenStableReadOnlyImage(shared_path.wstring(), error);
+    if (!Require(!!read_only, "Read-only negative must hold a real stable image: " + error)) return false;
+    ok &= Require(!read_only->CaptureExclusiveWriteSourceObservation() && !read_only->HasWriteHandle(),
+        "Read-only deny-write lease must not grant writer authority");
+    Device unadmitted_raw(LR"(\\.\PhysicalDrive4294967295)");
+    ok &= Require(!unadmitted_raw.CaptureExclusiveWriteSourceObservation() && !unadmitted_raw.HasWriteHandle(),
+        "Raw pathname alone must not grant authority or trigger an open");
+
+    // A retained duplicate violates sole ownership without externally closing a
+    // handle still owned by BlockDevice (which would risk a later double close).
+    HANDLE duplicate = INVALID_HANDLE_VALUE;
+    if (!Require(DuplicateHandle(GetCurrentProcess(), held, GetCurrentProcess(), &duplicate,
+        0, FALSE, DUPLICATE_SAME_ACCESS) != FALSE, "Retirement fixture must duplicate its real file object")) return false;
+    ok &= Require(!adopted->CaptureExclusiveWriteSourceObservation() &&
+        !adopted->IsExclusiveWriteSourceObservationCurrent(*observation), "Lost sole ownership must retire observation without reopening");
+    CloseHandle(duplicate);
+    ok &= Require(!adopted->CaptureExclusiveWriteSourceObservation(),
+        "Closing the unexpected duplicate must not revive retired observation authority");
+    adopted.reset();
+    auto reopened = Device::OpenExclusiveManagementImage(adopted_path.wstring(), 0, error);
+    ok &= Require(reopened && reopened->CaptureExclusiveWriteSourceObservation() &&
+        !reopened->IsExclusiveWriteSourceObservationCurrent(*observation), "New handle lifetime for the same file must refuse the previous object's token");
+    reopened.reset();
+    auto empty_window = Device::OpenExclusiveManagementImage(adopted_path.wstring(), seed.size(), error);
+    ok &= Require(empty_window && !empty_window->CaptureExclusiveWriteSourceObservation(),
+        "A real exclusive lease with no bytes in its selected window must refuse observation");
+    return ok;
+}
+
+bool TestBlockDeviceWriteSourceRejectsUnqualifiedAdoption(const std::filesystem::path& run_root)
+{
+    using Device = apfsaccess::rw::BlockDevice;
+    const auto path = run_root / "source-unqualified-adoption.img";
+    const auto seed = BuildPatternPayload(64 * 1024, 0x86);
+    if (!SeedWriteSourceImage(path, seed)) return false;
+    const std::array<std::pair<DWORD, DWORD>, 6> modes = {{
+        {GENERIC_READ, 0},
+        {GENERIC_WRITE, 0},
+        {GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ},
+        {GENERIC_READ | GENERIC_WRITE, FILE_SHARE_WRITE},
+        {GENERIC_READ | GENERIC_WRITE, FILE_SHARE_DELETE},
+        {GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE}
+    }};
+    bool ok = true;
+    for (const auto& [access, sharing] : modes)
+    {
+        const auto handle = CreateFileW(path.c_str(), access, sharing, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (!Require(handle != INVALID_HANDLE_VALUE, "Unqualified adoption must hold a real file")) return false;
+        std::string error;
+        auto device = Device::AdoptExclusiveRepairImage(path.wstring(), handle, error);
+        if (access == (GENERIC_READ | GENERIC_WRITE) &&
+            !Require(!!device, "Existing shared repair I/O behavior must remain available: " + error)) return false;
+        ok &= Require(!device || !device->CaptureExclusiveWriteSourceObservation(),
+            "Read-only, write-only and shared transferred handles must never qualify");
+    }
+    return ok;
+}
+
+bool TestBlockDeviceWriteSourceRequiresFixedSize(const std::filesystem::path& run_root)
+{
+    using Device = apfsaccess::rw::BlockDevice;
+    ScopedEnvironmentVariable no_fault(L"APFSACCESS_RW_FAULT_WRITE", nullptr);
+    const auto path = run_root / "source-fixed-size.img";
+    const auto seed = BuildPatternPayload(64 * 1024, 0x97);
+    if (!SeedWriteSourceImage(path, seed)) return false;
+    const auto handle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (!Require(handle != INVALID_HANDLE_VALUE, "Fixed-size fixture must hold an exclusive image")) return false;
+    std::string error;
+    auto device = Device::AdoptExclusiveRepairImage(path.wstring(), handle, error);
+    if (!Require(!!device, "Fixed-size fixture must adopt: " + error)) return false;
+    const auto observation = device->CaptureExclusiveWriteSourceObservation();
+    if (!Require(observation.has_value(), "Fixed-size fixture requires a real initial observation")) return false;
+    bool ok = Require(device->Write(seed.size(), std::span<const std::byte>(seed).first(4096)),
+        "Fixture must actually extend its held image through the ordinary write funnel");
+    ok &= Require(!device->CaptureExclusiveWriteSourceObservation() &&
+        !device->IsExclusiveWriteSourceObservationCurrent(*observation),
+        "Changed file size must retire the fixed-size observation source");
+    FILE_END_OF_FILE_INFO end{};
+    end.EndOfFile.QuadPart = static_cast<LONGLONG>(seed.size());
+    ok &= Require(SetFileInformationByHandle(handle, FileEndOfFileInfo, &end, sizeof(end)) != FALSE,
+        "Fixture must restore its real original length");
+    ok &= Require(!device->CaptureExclusiveWriteSourceObservation(),
+        "Restoring original length must not revive a retired source");
+    return ok;
+}
+
+bool RunBlockDeviceWriteSourceObservationTests(const std::filesystem::path& run_root)
+{
+    bool ok = TestRawSnapshotSourceRejectsRetirementDuringRead(run_root);
+    ok &= TestBlockDeviceExclusiveWriteSourceCapture(run_root);
+    ok &= TestBlockDeviceExclusiveWriteSourceAdmission(run_root);
+    ok &= TestBlockDeviceExclusiveWriteSourceBatch(run_root);
+    ok &= TestBlockDeviceExclusiveWriteSourceFailures(run_root);
+    ok &= TestBlockDeviceExclusiveWriteSourceAdoptionAndRefusals(run_root);
+    ok &= TestBlockDeviceWriteSourceRejectsUnqualifiedAdoption(run_root);
+    ok &= TestBlockDeviceWriteSourceRequiresFixedSize(run_root);
+    return ok;
+}
+
 bool TestBlockDeviceWriteStaysBoundToReadObject(const std::filesystem::path& run_root)
 {
     const auto path = run_root / "block-source.img";
@@ -509,6 +1500,31 @@ bool TestBlockDeviceRejectsNonFileWrites(const std::filesystem::path& run_root)
     apfsaccess::rw::BlockDevice missing((run_root / "missing-source.img").wstring());
     ok &= Require(!directory.IsWritable() && !missing.IsWritable(),
         "Directory and unknown sources must fail closed");
+    return ok;
+}
+
+bool TestBlockDevicePresenceProbeKeepsImageFastPath(const std::filesystem::path& run_root)
+{
+    const auto image_path = run_root / "block-device-presence-probe.img";
+    {
+        std::ofstream seed(image_path, std::ios::binary | std::ios::trunc);
+        seed.write("presence", 8);
+    }
+
+    apfsaccess::rw::BlockDevice image(image_path.wstring());
+    bool ok = true;
+    ok &= Require(
+        image.ProbeUnderlyingDevice(),
+        "Regular image presence probe should remain a no-extra-handle fast path");
+    ok &= Require(
+        apfsaccess::rw::BlockDevice::IsDeviceUnavailableError(ERROR_DEVICE_NOT_CONNECTED),
+        "Device-not-connected should be classified as unavailable");
+    ok &= Require(
+        apfsaccess::rw::BlockDevice::IsDeviceUnavailableError(ERROR_IO_DEVICE),
+        "I/O-device failure should be classified as unavailable");
+    ok &= Require(
+        !apfsaccess::rw::BlockDevice::IsDeviceUnavailableError(ERROR_ACCESS_DENIED),
+        "Access-denied should not be treated as proof of physical removal");
     return ok;
 }
 
@@ -1445,6 +2461,7 @@ bool TestBlockDeviceReadCacheHitIsNotAdmittedDuringWrite(const std::filesystem::
 
 bool TestBlockDeviceReadCacheQuotaIsBounded(const std::filesystem::path& run_root)
 {
+    ScopedEnvironmentVariable default_entry_budget(L"APFSACCESS_BLOCK_READ_CACHE_ENTRIES", L"256");
     ScopedEnvironmentVariable read_cache_opt_in(
         L"APFSACCESS_EXPERIMENTAL_BLOCK_READ_CACHE",
         L"1");
@@ -3668,6 +4685,96 @@ bool TestRequiredCheckpointXidsReachEveryCommitEntryPoint(
     return ok;
 }
 
+bool TestBlockDeviceReadCacheLargerWorkingSet(const std::filesystem::path& run_root)
+{
+    ScopedEnvironmentVariable cache(L"APFSACCESS_EXPERIMENTAL_BLOCK_READ_CACHE", L"1");
+    constexpr std::size_t block_bytes = 4096;
+    constexpr std::size_t block_count = 400;
+    const auto seed = BuildPatternPayload(block_bytes * block_count, 0x96);
+    bool ok = true;
+    for (const auto* budget : {L"256", L"2048"})
+    {
+        ScopedEnvironmentVariable entries(L"APFSACCESS_BLOCK_READ_CACHE_ENTRIES", budget);
+        const auto image = run_root / (std::wstring(L"read_cache_working_set_") + budget + L".bin");
+        {
+            std::ofstream out(image, std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char*>(seed.data()), static_cast<std::streamsize>(seed.size()));
+            if (!out.good()) return Require(false, "Read-cache working set fixture must be saved");
+        }
+        apfsaccess::rw::BlockDevice device(image.wstring());
+        // Establish the writer before warming so lifecycle invalidation is complete.
+        if (!Require(device.IsWritable() && device.HasWriteHandle(),
+                "Working-set fixture must establish writer before warming cache")) return false;
+        for (int pass = 0; pass < 2; ++pass)
+            for (std::size_t index = 0; index < block_count; ++index)
+            {
+                std::vector<std::byte> bytes;
+                ok &= Require(device.Read(index * block_bytes, block_bytes, bytes) &&
+                    bytes.size() == block_bytes &&
+                    std::equal(bytes.begin(), bytes.end(), seed.begin() + index * block_bytes),
+                    "Every cached working-set read must preserve exact source bytes");
+            }
+        const bool larger = std::wstring_view(budget) == L"2048";
+        const auto perf = device.PerformanceJson();
+        ok &= Require(ExtractNestedUnsignedValue(perf, "readCache", "misses").value_or(0) ==
+            (larger ? block_count : 2 * block_count), "Larger entry budget must retain the complete repeated working set");
+        ok &= Require(ExtractNestedUnsignedValue(perf, "readCache", "evictions").value_or(0) ==
+            (larger ? 0 : 2 * block_count - 256), "Eviction counters must describe the actual cache churn");
+        ok &= Require(ExtractNestedUnsignedValue(perf, "readCache", "bytes").value_or(0) ==
+            (larger ? block_count : 256) * block_bytes, "Entry budget must preserve exact bounded byte accounting");
+        const auto raw_reads_before_write = ExtractNestedUnsignedValue(perf, "rawRead", "count").value_or(0);
+        const auto hits_before_write = ExtractNestedUnsignedValue(perf, "readCache", "hits").value_or(0);
+        const auto replacement = BuildPatternPayload(block_bytes, 0xA7);
+        ok &= Require(device.Write(0, replacement), "Working-set overwrite must succeed");
+        std::vector<std::byte> after;
+        ok &= Require(device.Read(0, block_bytes, after) && after == replacement,
+            "Larger cache must invalidate before admitting a post-write read");
+        const auto after_perf = device.PerformanceJson();
+        ok &= Require(ExtractNestedUnsignedValue(after_perf, "rawRead", "count").value_or(0) ==
+                raw_reads_before_write + 1 &&
+            ExtractNestedUnsignedValue(after_perf, "readCache", "hits").value_or(0) == hits_before_write,
+            "Overwritten block must require fresh I/O before refilling its cache entry");
+        const auto expected_cached_bytes = (larger ? block_count : 256) * block_bytes;
+        ok &= Require(ExtractNestedUnsignedValue(after_perf, "readCache", "bytes").value_or(0) ==
+                expected_cached_bytes,
+            "Overwrite and fresh refill must preserve the bounded unrelated working set");
+        std::vector<std::byte> retained;
+        ok &= Require(device.Read((block_count - 1) * block_bytes, block_bytes, retained) &&
+            retained.size() == block_bytes &&
+            std::equal(retained.begin(), retained.end(), seed.begin() + (block_count - 1) * block_bytes),
+            "Non-overlapping resident block must preserve its original exact bytes");
+        const auto retained_perf = device.PerformanceJson();
+        ok &= Require(ExtractNestedUnsignedValue(retained_perf, "readCache", "hits").value_or(0) ==
+                hits_before_write + 1 &&
+            ExtractNestedUnsignedValue(retained_perf, "rawRead", "count").value_or(0) == raw_reads_before_write + 1,
+            "Non-overlapping resident block must remain a cache hit after overwrite");
+    }
+    {
+        ScopedEnvironmentVariable entries(L"APFSACCESS_BLOCK_READ_CACHE_ENTRIES", L"2048");
+        constexpr std::size_t window = 65536;
+        const auto quota_image = run_root / "read_cache_large_budget_byte_limit.bin";
+        const auto quota_seed = BuildPatternPayload(129 * window, 0xB8);
+        {
+            std::ofstream out(quota_image, std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char*>(quota_seed.data()), static_cast<std::streamsize>(quota_seed.size()));
+            if (!out.good()) return Require(false, "Larger-cache byte-limit fixture must be saved");
+        }
+        apfsaccess::rw::BlockDevice device(quota_image.wstring());
+        for (std::size_t index = 0; index < 129; ++index)
+        {
+            std::vector<std::byte> bytes;
+            ok &= Require(device.Read(index * window, window, bytes) && bytes.size() == window &&
+                std::equal(bytes.begin(), bytes.end(), quota_seed.begin() + index * window),
+                "Byte-limited larger cache must preserve every window");
+        }
+        const auto perf = device.PerformanceJson();
+        ok &= Require(ExtractNestedUnsignedValue(perf, "readCache", "bytes").value_or(0) == 8ull * 1024 * 1024 &&
+            ExtractNestedUnsignedValue(perf, "readCache", "evictions").value_or(0) == 1,
+            "Larger entry budget must retain the same eight-MiB hard byte limit");
+    }
+    return ok;
+}
+
 bool TestRetentionCapacityIsRetryableWithoutPretendingCommit(
     const std::filesystem::path& run_root)
 {
@@ -4089,8 +5196,31 @@ bool TestSingleExtentPreparedWriteUsesDirectFastPath(const std::filesystem::path
 
 int main(int argc, char** argv)
 {
+    if (argc >= 2 && std::string_view(argv[1]) == "--inspect-held-raw-snapshot")
+        return InspectHeldRawSnapshotMetadata(argc, argv);
+    if (argc >= 2 && std::string_view(argv[1]) == "--test-held-raw-snapshot-binding")
+    {
+        if (argc != 2) return 2;
+        const bool ok = RunRawSnapshotBindingTests();
+        std::cout << (ok ? "RAW SNAPSHOT BINDING PASS\n" : "RAW SNAPSHOT BINDING FAIL\n");
+        return ok ? 0 : 1;
+    }
     _wputenv_s(L"APFSACCESS_PERF_COUNTERS", L"1");
-
+    if (argc == 3 && std::string_view(argv[1]) == "--test-block-write-source-observation")
+    {
+        const auto root = std::filesystem::path(argv[2]);
+        if (!root.is_absolute() || _wcsicmp(root.root_name().c_str(), L"D:") != 0)
+        {
+            std::cerr << "Usage: --test-block-write-source-observation <absolute D: fixture directory>\n";
+            return 2;
+        }
+        std::error_code error;
+        std::filesystem::create_directories(root, error);
+        if (error) return 1;
+        const bool ok = RunBlockDeviceWriteSourceObservationTests(root);
+        std::cout << (ok ? "BLOCK WRITE SOURCE OBSERVATION PASS\n" : "BLOCK WRITE SOURCE OBSERVATION FAIL\n");
+        return ok ? 0 : 1;
+    }
     std::error_code ec;
     const auto run_root = std::filesystem::temp_directory_path(ec) / ("ApfsAccessRwEngineTests_" + std::to_string(GetCurrentProcessId()));
     if (ec)
@@ -4134,6 +5264,7 @@ int main(int argc, char** argv)
     {
         bool ok = TestBlockDeviceWriteStaysBoundToReadObject(run_root);
         ok &= TestBlockDeviceRejectsNonFileWrites(run_root);
+        ok &= TestBlockDevicePresenceProbeKeepsImageFastPath(run_root);
         std::filesystem::remove_all(run_root, ec);
         return ok ? 0 : 1;
     }
@@ -4146,9 +5277,30 @@ int main(int argc, char** argv)
         return ok ? 0 : 1;
     }
 
+    if (argc == 2 && std::string_view(argv[1]) == "--test-block-read-cache")
+    {
+        bool ok = TestBlockDeviceReadCacheLargerWorkingSet(run_root);
+        ok &= TestBlockDeviceReadCacheDisabledByDefault(run_root);
+        ok &= TestBlockDeviceReadCacheRejectsNonOptInValues(run_root);
+        ok &= TestBlockDeviceReadCacheInvalidatesAfterWrite(run_root);
+        ok &= TestBlockDeviceReadCacheMissDoesNotReinsertAfterConcurrentWrite(run_root);
+        ok &= TestBlockDeviceReadCacheMissStartedDuringWriteDoesNotSurvive(run_root);
+        ok &= TestBlockDeviceWriteBatchMissDoesNotReinsertAfterConcurrentWrite(run_root);
+        ok &= TestBlockDeviceReadCacheHookExceptionRecoversEpoch(run_root);
+        ok &= TestBlockDeviceWriteInvalidationHookRunsWithoutProductionLocks(run_root);
+        ok &= TestBlockDeviceReadCacheHitIsNotAdmittedDuringWrite(run_root);
+        ok &= TestBlockDeviceReadCacheQuotaIsBounded(run_root);
+        ok &= TestBlockDeviceReadCacheServesContainedRange(run_root);
+        std::filesystem::remove_all(run_root, ec);
+        return ok ? 0 : 1;
+    }
+
     bool ok = true;
+    ok &= RunRawSnapshotBindingTests();
+    ok &= RunBlockDeviceWriteSourceObservationTests(run_root);
     ok &= TestBlockDeviceWriteStaysBoundToReadObject(run_root);
     ok &= TestBlockDeviceRejectsNonFileWrites(run_root);
+    ok &= TestBlockDevicePresenceProbeKeepsImageFastPath(run_root);
     ok &= TestSingleExtentPreparedWriteUsesDirectFastPath(run_root);
     ok &= TestLargeSpacemanCheckpointUsesExtension(run_root);
     ok &= TestTask4RetentionPlumbing(run_root);
@@ -4193,6 +5345,7 @@ int main(int argc, char** argv)
     ok &= TestBlockDeviceWriteInvalidationHookRunsWithoutProductionLocks(run_root);
     ok &= TestBlockDeviceReadCacheHitIsNotAdmittedDuringWrite(run_root);
     ok &= TestBlockDeviceReadCacheQuotaIsBounded(run_root);
+    ok &= TestBlockDeviceReadCacheLargerWorkingSet(run_root);
     ok &= TestBlockDeviceReadCacheServesContainedRange(run_root);
     ok &= TestBlockDeviceWriteBatchMergesAdjacentWrites(run_root);
     ok &= TestBlockDeviceWriteBatchGroupsNearbyUnalignedSpans(run_root);

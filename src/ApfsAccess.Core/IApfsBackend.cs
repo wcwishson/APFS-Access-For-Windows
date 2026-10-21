@@ -35,3 +35,52 @@ public interface IContainerMountBackend
         IReadOnlyList<MountRequest> requests,
         CancellationToken cancellationToken);
 }
+
+public enum SnapshotControlAction
+{
+    Create,
+    Delete,
+    Recover,
+    List,
+}
+
+public sealed record SnapshotControlResult(bool Success, string Code, LiveSnapshotInventory? Inventory = null);
+
+public interface ISnapshotControlBackend
+{
+    // Sends a snapshot control request to the live container owner session
+    // identified by stable container UUID and volume object ID. The backend
+    // supplies the owner-held control path and token; callers never provide
+    // journal paths or registry material. Extra lines carry the validated
+    // snapshot parameters (create: name; delete: nine-line exact identity;
+    // recover: none).
+    Task<SnapshotControlResult> SendSnapshotControlAsync(
+        string containerUuid,
+        ulong volumeObjectId,
+        SnapshotControlAction action,
+        IReadOnlyList<string>? extraLines,
+        CancellationToken cancellationToken);
+}
+
+public sealed record ImageVerifyResult(
+    bool Supported,
+    string Outcome,
+    int NativeExitCode,
+    int FindingCount,
+    string? Detail);
+
+public interface IVerifyBackend
+{
+    // Read-only offline verification of one derived scope. The scope binds
+    // the exact image path, container, volume, checkpoint, and store window
+    // from observed inventory records; the backend re-validates the scope
+    // shape, leases the image read-only, runs the bounded native observer,
+    // and verifies every report claim (exit code, scope echo, identity,
+    // findings, coverage) before returning. Tool failures throw
+    // (NativeVerificationExitException, FileNotFoundException, or
+    // InvalidDataException on tamper); callers map those to typed
+    // verify-error evidence. Never a repair authorization.
+    Task<ImageVerifyResult> VerifyImageAsync(
+        VerifyScope scope,
+        CancellationToken cancellationToken);
+}

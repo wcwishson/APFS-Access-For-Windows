@@ -56,6 +56,9 @@ struct NativeCompressionManifest266Fixture
             const auto leaf = id == 700 ? "compressed" : "alias";
             AppleDirectoryRecord link;
             link.parent_id = 2; link.file_id = 17; link.flags = 8; link.name_utf8 = leaf; link.date_added = id;
+            AppleExtendedField sibling{1, 0, std::vector<std::byte>(8)};
+            apfsaccess::testfixture::PutU64LE(sibling.data, 0, id);
+            link.extended_fields.push_back(std::move(sibling));
             if (!add(EncodeAppleDirectoryRecord(link, encoded, error)) ||
                 !add(EncodeAppleSiblingLinkRecord({17, id, 2, leaf}, encoded, error)) ||
                 !add(EncodeAppleSiblingMapRecord({id, 17}, encoded, error))) return false;
@@ -73,7 +76,7 @@ struct NativeCompressionManifest266Fixture
         if (!add(EncodeAppleXattrRecord({17, "com.apple.ResourceFork", kAppleXattrDataStream, descriptor}, encoded, error)) ||
             !add(EncodeAppleDataStreamIdRecord({777, 1}, encoded, error)) ||
             !add(EncodeAppleFileExtentRecord({777, 0, 4096, 200, 0, 4096}, encoded, error)) ||
-            !EncodeApplePhysicalExtentRecord({200, 1, kApplePhysicalExtentKindNew, 777, 1}, encoded, error)) return false;
+            !EncodeApplePhysicalExtentRecord({200, 1, kApplePhysicalExtentKindNew, 17, 1}, encoded, error)) return false;
         volume.extentref_records.push_back(encoded); ++volume.additional_file_system_allocated_blocks;
         resource.resize(4096); builder.authoritative_seeded_main_blocks.push_back({200, resource});
         if (!SortAppleBtreeRecords(records, AppleBtreeKeyOrder::FileSystemCaseSensitive, error) ||

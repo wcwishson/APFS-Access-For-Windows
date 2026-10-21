@@ -1,16 +1,28 @@
 #include "WriteAheadLog.h"
+#include "FusionOriginalContinuation.h"
 #include "InodeMetadataPatch.h"
 #include "CompressionRewrite.h"
 #include "NativeClone.h"
+#include "NativeHardLink.h"
+#include "NativeSparse.h"
+#include "NativeSparseV2.h"
+#include "NativeCloneRange.h"
+#include "NativeVolumeRename.h"
+#include "NativeSnapshotIntent.h"
+#include "NativeCountRepair.h"
+#include "ProtectedJournalEpoch.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iterator>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <span>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -49,13 +61,13 @@ std::uint64_t NextWriterLeaseGeneration()
     return generation;
 }
 
-void AppendU16(std::vector<std::uint8_t>& buffer, std::uint16_t value)
+template<class Buffer> void AppendU16(Buffer& buffer, std::uint16_t value)
 {
     buffer.push_back(static_cast<std::uint8_t>(value & 0xffu));
     buffer.push_back(static_cast<std::uint8_t>((value >> 8u) & 0xffu));
 }
 
-void AppendU32(std::vector<std::uint8_t>& buffer, std::uint32_t value)
+template<class Buffer> void AppendU32(Buffer& buffer, std::uint32_t value)
 {
     for (int shift = 0; shift < 32; shift += 8)
     {
@@ -63,7 +75,7 @@ void AppendU32(std::vector<std::uint8_t>& buffer, std::uint32_t value)
     }
 }
 
-void AppendU64(std::vector<std::uint8_t>& buffer, std::uint64_t value)
+template<class Buffer> void AppendU64(Buffer& buffer, std::uint64_t value)
 {
     for (int shift = 0; shift < 64; shift += 8)
     {
@@ -71,14 +83,14 @@ void AppendU64(std::vector<std::uint8_t>& buffer, std::uint64_t value)
     }
 }
 
-std::uint16_t ReadU16(const std::vector<std::uint8_t>& buffer, std::size_t offset)
+std::uint16_t ReadU16(std::span<const std::uint8_t> buffer, std::size_t offset)
 {
     return static_cast<std::uint16_t>(
         buffer[offset] |
         (static_cast<std::uint16_t>(buffer[offset + 1]) << 8u));
 }
 
-std::uint32_t ReadU32(const std::vector<std::uint8_t>& buffer, std::size_t offset)
+std::uint32_t ReadU32(std::span<const std::uint8_t> buffer, std::size_t offset)
 {
     std::uint32_t value = 0;
     for (int shift = 0; shift < 32; shift += 8)
@@ -88,7 +100,7 @@ std::uint32_t ReadU32(const std::vector<std::uint8_t>& buffer, std::size_t offse
     return value;
 }
 
-std::uint64_t ReadU64(const std::vector<std::uint8_t>& buffer, std::size_t offset)
+std::uint64_t ReadU64(std::span<const std::uint8_t> buffer, std::size_t offset)
 {
     std::uint64_t value = 0;
     for (int shift = 0; shift < 64; shift += 8)
@@ -98,19 +110,12 @@ std::uint64_t ReadU64(const std::vector<std::uint8_t>& buffer, std::size_t offse
     return value;
 }
 
-std::uint32_t ChecksumRecord(std::vector<std::uint8_t> buffer)
+template<class Buffer> std::uint32_t ChecksumRecord(const Buffer& buffer)
 {
-    if (buffer.size() >= kChecksumOffset + sizeof(std::uint32_t))
-    {
-        std::fill(
-            buffer.begin() + kChecksumOffset,
-            buffer.begin() + kChecksumOffset + sizeof(std::uint32_t),
-            std::uint8_t{0});
-    }
-
     std::uint32_t hash = 2166136261u;
-    for (const auto byte : buffer)
+    for (std::size_t i = 0; i < buffer.size(); ++i)
     {
+        const auto byte = buffer.size() >= 16 && i >= 12 && i < 16 ? std::uint8_t{0} : buffer[i];
         hash ^= byte;
         hash *= 16777619u;
     }
@@ -162,6 +167,59 @@ bool IsStrictUtf8(std::string_view value)
 
 bool InlinePayloadIsConsistentImpl(const WriteAheadLog::Record& record)
 {
+    if (record.operation == WriteAheadLog::OperationKind::CloneRange)
+        return NativeCloneRangeWalIsConsistent(record) && IsStrictUtf8(record.path_utf8) && IsStrictUtf8(record.secondary_path_utf8);
+    if (record.operation == WriteAheadLog::OperationKind::NativeSparse)
+        return (NativeSparseWalIsConsistent(record) || NativeSparseV2WalIsConsistent(record)) && IsStrictUtf8(record.path_utf8);
+    if (record.operation == WriteAheadLog::OperationKind::HardLink)
+        return NativeHardLinkWalIsConsistent(record) &&
+            IsStrictUtf8(record.path_utf8) && IsStrictUtf8(record.secondary_path_utf8);
+    if (record.operation == WriteAheadLog::OperationKind::CreateSnapshot || record.operation == WriteAheadLog::OperationKind::DeleteSnapshot)
+    {
+        NativeSnapshotIntent intent; std::array<std::uint8_t,32> digest{};
+        return DecodeNativeSnapshotIntent(record.inline_payload, intent) &&
+            (!intent.raw_receipt || record.volume_identity == intent.raw_receipt->selected_journal_identity) &&
+            intent.create == (record.operation == WriteAheadLog::OperationKind::CreateSnapshot) &&
+            record.object_id == intent.scope.volume_oid && record.parent_object_id == intent.scope.checkpoint_xid + 1 &&
+            record.payload_length == record.inline_payload.size() && record.path_utf8 == "\\" &&
+            record.secondary_path_utf8.empty() && !record.flags && !record.unlink_outcome &&
+            !record.logical_offset && !record.logical_length && !record.payload_offset && !record.payload_spool_id &&
+            ComputeSha256(record.inline_payload,digest) && digest == record.payload_sha256;
+    }
+    if (record.operation == WriteAheadLog::OperationKind::RepairVolumeFileCount)
+    {
+        NativeCountRepair repair;
+        std::array<std::uint8_t, 32> digest{};
+        return DecodeNativeCountRepair(record.inline_payload, repair) &&
+            record.volume_identity == CountRepairJournalIdentity(repair) &&
+            record.object_id == repair.volume && record.parent_object_id == repair.checkpoint + 1 &&
+            record.payload_length == record.inline_payload.size() && record.path_utf8 == "\\" &&
+            record.secondary_path_utf8.empty() && !record.flags && !record.unlink_outcome &&
+            !record.logical_offset && !record.logical_length && !record.payload_offset && !record.payload_spool_id &&
+            ComputeSha256(record.inline_payload, digest) && digest == record.payload_sha256;
+    }
+    if (record.operation == WriteAheadLog::OperationKind::SetVolumeQuotaReserve)
+    {
+        NativeVolumeQuotaReserve rename;
+        std::array<std::uint8_t, 32> digest{};
+        return DecodeNativeVolumeQuotaReserve(record.inline_payload, rename) &&
+            record.object_id == rename.volume && record.parent_object_id == rename.checkpoint + 1 &&
+            record.payload_length == record.inline_payload.size() && record.path_utf8 == "\\" &&
+            record.secondary_path_utf8.empty() && !record.flags && !record.unlink_outcome &&
+            !record.logical_offset && !record.logical_length && !record.payload_offset && !record.payload_spool_id &&
+            ComputeSha256(record.inline_payload, digest) && digest == record.payload_sha256;
+    }
+    if (record.operation == WriteAheadLog::OperationKind::RenameVolume)
+    {
+        NativeVolumeRename rename;
+        std::array<std::uint8_t, 32> digest{};
+        return DecodeNativeVolumeRename(record.inline_payload, rename) &&
+            record.object_id == rename.volume && record.parent_object_id == rename.checkpoint + 1 &&
+            record.payload_length == record.inline_payload.size() && record.path_utf8 == "\\" &&
+            record.secondary_path_utf8.empty() && !record.flags && !record.unlink_outcome &&
+            !record.logical_offset && !record.logical_length && !record.payload_offset && !record.payload_spool_id &&
+            ComputeSha256(record.inline_payload, digest) && digest == record.payload_sha256;
+    }
     if (record.operation == WriteAheadLog::OperationKind::CloneFile)
     {
         NativeCloneProof p; std::array<std::uint8_t,32> digest{};
@@ -240,6 +298,14 @@ bool IsKnownOperation(WriteAheadLog::OperationKind operation)
     case WriteAheadLog::OperationKind::SetAllocationSize:
     case WriteAheadLog::OperationKind::RestoreDirectoryFromSymbolicLink:
     case WriteAheadLog::OperationKind::CloneFile:
+    case WriteAheadLog::OperationKind::HardLink:
+    case WriteAheadLog::OperationKind::NativeSparse:
+    case WriteAheadLog::OperationKind::CloneRange:
+    case WriteAheadLog::OperationKind::CreateSnapshot:
+    case WriteAheadLog::OperationKind::DeleteSnapshot:
+    case WriteAheadLog::OperationKind::SetVolumeQuotaReserve:
+    case WriteAheadLog::OperationKind::RenameVolume:
+    case WriteAheadLog::OperationKind::RepairVolumeFileCount:
     case WriteAheadLog::OperationKind::RewriteCompressedContent:
     case WriteAheadLog::OperationKind::TransactionMarker:
     case WriteAheadLog::OperationKind::CompactionIndex:
@@ -504,6 +570,100 @@ bool LockWholeFileExclusive(HANDLE handle)
                &range) != FALSE;
 }
 
+bool HasUnsupportedWalUncComponent(const std::filesystem::path& path)
+{
+    auto preferred = path;
+    preferred.make_preferred();
+    const auto& wide = preferred.native();
+    if (!wide.starts_with(LR"(\\)") || wide.starts_with(LR"(\\?\)") ||
+        wide.starts_with(LR"(\\.\)")) return false;
+    for (const auto& component : preferred.relative_path())
+    {
+        if (component.has_root_path() || component.native().find(L':') != std::wstring::npos)
+            return true;
+    }
+    return false;
+}
+
+std::filesystem::path NormalizeWalFilesystemPath(const std::filesystem::path& path)
+{
+    auto preferred = path;
+    preferred.make_preferred();
+    const auto& wide = preferred.native();
+    if (!wide.starts_with(LR"(\\)") || wide.starts_with(LR"(\\?\)") ||
+        wide.starts_with(LR"(\\.\)")) return path.lexically_normal();
+    // Appending a drive-like UNC component can replace the accumulated path.
+    if (HasUnsupportedWalUncComponent(preferred)) return path;
+
+    const auto relative = preferred.relative_path();
+    auto component = relative.begin();
+    if (component == relative.end() || component->empty() || *component == L"." || *component == L"..")
+        return path;
+    const auto share = *component++;
+    // C++ treats the share as relative; Win32's .. floor is server AND share.
+    std::filesystem::path rooted_tail(L"\\");
+    for (; component != relative.end(); ++component) rooted_tail /= *component;
+    return preferred.root_path() / share / rooted_tail.lexically_normal().relative_path();
+}
+
+std::filesystem::path AbsoluteWalFilesystemPath(const std::filesystem::path& path, std::error_code& error)
+{
+    if (HasUnsupportedWalUncComponent(path))
+    {
+        error.clear();
+        return path;
+    }
+    const auto absolute = std::filesystem::absolute(path, error);
+    return error ? absolute : NormalizeWalFilesystemPath(absolute);
+}
+
+std::filesystem::path WalIoPath(const std::filesystem::path& path)
+{
+    if (HasUnsupportedWalUncComponent(path)) return path;
+    const auto& original = path.native();
+    if (original.size() < MAX_PATH - 12 || !path.is_absolute() ||
+        original.starts_with(LR"(\\?\)") || original.starts_with(LR"(\\.\)") ||
+        original.starts_with(LR"(\??\)")) return path;
+
+    auto normalized = NormalizeWalFilesystemPath(path);
+    normalized.make_preferred();
+    const auto& wide = normalized.native();
+    if (wide.starts_with(LR"(\\?\)") || wide.starts_with(LR"(\\.\)") ||
+        wide.starts_with(LR"(\??\)")) return path;
+    // Extended syntax must not turn Win32 trimmed/device names into different files.
+    for (const auto& component : normalized.relative_path())
+    {
+        const auto name = component.wstring();
+        if (name.empty()) continue;
+        if (name.back() == L'.' || name.back() == L' ' || name.find(L':') != std::wstring::npos)
+            return path;
+        auto base = name.substr(0, name.find(L'.'));
+        while (!base.empty() && base.back() == L' ') base.pop_back();
+        if (_wcsicmp(base.c_str(), L"CON") == 0 || _wcsicmp(base.c_str(), L"PRN") == 0 ||
+            _wcsicmp(base.c_str(), L"AUX") == 0 || _wcsicmp(base.c_str(), L"NUL") == 0 ||
+            (base.size() == 4 &&
+             (_wcsnicmp(base.c_str(), L"COM", 3) == 0 || _wcsnicmp(base.c_str(), L"LPT", 3) == 0) &&
+             ((base[3] >= L'1' && base[3] <= L'9') || base[3] == 0xb9 || base[3] == 0xb2 || base[3] == 0xb3)))
+            return path;
+    }
+    if (wide.size() >= 3 && wide[1] == L':' && wide[2] == L'\\')
+        return std::filesystem::path(LR"(\\?\)" + wide);
+    if (wide.starts_with(LR"(\\)"))
+        return std::filesystem::path(LR"(\\?\UNC\)" + wide.substr(2));
+    return path;
+}
+
+HANDLE OpenWalFile(const std::filesystem::path& path, DWORD access, DWORD sharing,
+    LPSECURITY_ATTRIBUTES security, DWORD disposition, DWORD attributes, HANDLE template_file)
+{
+    return CreateFileW(WalIoPath(path).c_str(), access, sharing, security, disposition, attributes, template_file);
+}
+
+DWORD WalFileAttributes(const std::filesystem::path& path)
+{
+    return GetFileAttributesW(WalIoPath(path).c_str());
+}
+
 std::filesystem::path CompactionPredecessorGuardPath(
     const std::filesystem::path& wal_path,
     std::uint64_t file_id)
@@ -638,14 +798,14 @@ bool DeleteOpenedFile(HANDLE& handle)
 bool FlushContainingDirectory(const std::filesystem::path& path)
 {
     std::error_code ec;
-    const auto absolute_path = std::filesystem::absolute(path, ec).lexically_normal();
+    const auto absolute_path = AbsoluteWalFilesystemPath(path, ec);
     if (ec || absolute_path.parent_path().empty())
     {
         return false;
     }
 
     const auto parent_wide = absolute_path.parent_path().wstring();
-    auto* directory = CreateFileW(
+    auto* directory = OpenWalFile(
         parent_wide.c_str(),
         GENERIC_WRITE | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -678,7 +838,7 @@ bool DeleteOpenedFileDurably(HANDLE& handle, const std::filesystem::path& path)
 
 bool PathIsAbsent(const std::filesystem::path& path)
 {
-    const auto attributes = GetFileAttributesW(path.wstring().c_str());
+    const auto attributes = WalFileAttributes(path.wstring().c_str());
     if (attributes != INVALID_FILE_ATTRIBUTES)
     {
         return false;
@@ -693,7 +853,7 @@ bool PathMatchesPhysicalFile(
     bool require_single_link)
 {
     const auto wide_path = path.wstring();
-    auto* handle = CreateFileW(
+    auto* handle = OpenWalFile(
         wide_path.c_str(),
         FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -716,6 +876,30 @@ bool PathMatchesPhysicalFile(
     return matches;
 }
 
+std::wstring WalRenameDestinationPath(const std::filesystem::path& destination)
+{
+    std::error_code ec;
+    auto absolute_destination = AbsoluteWalFilesystemPath(destination, ec);
+    if (ec)
+    {
+        return {};
+    }
+    auto destination_wide = WalIoPath(absolute_destination).wstring();
+    if (destination_wide.starts_with(LR"(\\?\)"))
+    {
+        destination_wide.replace(0, 4, LR"(\??\)");
+    }
+    else if (destination_wide.starts_with(LR"(\\)"))
+    {
+        destination_wide = LR"(\??\UNC\)" + destination_wide.substr(2);
+    }
+    else if (!destination_wide.starts_with(LR"(\??\)"))
+    {
+        destination_wide.insert(0, LR"(\??\)");
+    }
+    return destination_wide;
+}
+
 bool RenameOpenedFileWithoutReplacing(
     HANDLE source_handle,
     const std::filesystem::path& destination)
@@ -724,18 +908,8 @@ bool RenameOpenedFileWithoutReplacing(
     {
         return false;
     }
-
-    std::error_code ec;
-    auto absolute_destination = std::filesystem::absolute(destination, ec).lexically_normal();
-    if (ec)
-    {
-        return false;
-    }
-    auto destination_wide = absolute_destination.wstring();
-    if (!destination_wide.starts_with(LR"(\??\)"))
-    {
-        destination_wide.insert(0, LR"(\??\)");
-    }
+    const auto destination_wide = WalRenameDestinationPath(destination);
+    if (destination_wide.empty()) return false;
     const auto destination_bytes = destination_wide.size() * sizeof(wchar_t);
     if (destination_bytes > (std::numeric_limits<DWORD>::max)())
     {
@@ -771,7 +945,7 @@ bool WriteFileBytesDurably(
     }
 
     const auto wide_path = path.wstring();
-    handle = CreateFileW(
+    handle = OpenWalFile(
         wide_path.c_str(),
         GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -816,7 +990,7 @@ bool WriteWalRecordsDurably(
     handle = INVALID_HANDLE_VALUE;
     identity = {};
     const auto wide_path = path.wstring();
-    handle = CreateFileW(
+    handle = OpenWalFile(
         wide_path.c_str(),
         GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -982,7 +1156,7 @@ bool IsStrictCompactionIntentHistory(
     return true;
 }
 
-void StoreU32(std::vector<std::uint8_t>& buffer, std::size_t offset, std::uint32_t value)
+template<class Buffer> void StoreU32(Buffer& buffer, std::size_t offset, std::uint32_t value)
 {
     for (int shift = 0; shift < 32; shift += 8)
     {
@@ -993,7 +1167,7 @@ void StoreU32(std::vector<std::uint8_t>& buffer, std::size_t offset, std::uint32
 bool FlushPathToDisk(const std::filesystem::path& path)
 {
     const auto wide_path = path.wstring();
-    HANDLE handle = CreateFileW(
+    HANDLE handle = OpenWalFile(
         wide_path.c_str(),
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -1016,7 +1190,7 @@ bool ReadFileBytes(const std::filesystem::path& path, std::vector<std::uint8_t>&
 {
     limited = false;
     bytes.clear();
-    std::ifstream input(path, std::ios::binary);
+    std::ifstream input(WalIoPath(path), std::ios::binary);
     if (!input.good())
     {
         return false;
@@ -1040,7 +1214,8 @@ bool ReadFileBytes(const std::filesystem::path& path, std::vector<std::uint8_t>&
     return input.good() || input.eof();
 }
 
-bool ReadPinnedIntentBytes(HANDLE handle, std::vector<std::uint8_t>& bytes)
+bool ReadPinnedIntentBytes(HANDLE handle, std::vector<std::uint8_t>& bytes,
+    std::optional<std::uint64_t> expected_size = {})
 {
     LARGE_INTEGER size{};
     LARGE_INTEGER original_position{};
@@ -1050,13 +1225,14 @@ bool ReadPinnedIntentBytes(HANDLE handle, std::vector<std::uint8_t>& bytes)
         GetFileSizeEx(handle, &size) == FALSE ||
         size.QuadPart < 0 ||
         static_cast<std::uint64_t>(size.QuadPart) > kMaxRecordBytes ||
-        SetFilePointerEx(handle, zero, &original_position, FILE_CURRENT) == FALSE ||
-        SetFilePointerEx(handle, zero, nullptr, FILE_BEGIN) == FALSE)
+        (expected_size && static_cast<std::uint64_t>(size.QuadPart) != *expected_size))
     {
         return false;
     }
 
     bytes.resize(static_cast<std::size_t>(size.QuadPart));
+    if (SetFilePointerEx(handle, zero, &original_position, FILE_CURRENT) == FALSE ||
+        SetFilePointerEx(handle, zero, nullptr, FILE_BEGIN) == FALSE) return false;
     auto* cursor = bytes.data();
     auto remaining = bytes.size();
     bool read_all = true;
@@ -1083,12 +1259,12 @@ bool ReadPinnedIntentBytes(HANDLE handle, std::vector<std::uint8_t>& bytes)
 bool TruncateTornTail(const std::filesystem::path& path, std::size_t complete_prefix_bytes)
 {
     std::error_code ec;
-    std::filesystem::resize_file(path, complete_prefix_bytes, ec);
+    std::filesystem::resize_file(WalIoPath(path), complete_prefix_bytes, ec);
     return !ec && FlushPathToDisk(path);
 }
 
 bool DecodeRecord(
-    const std::vector<std::uint8_t>& bytes,
+    std::span<const std::uint8_t> bytes,
     std::size_t offset,
     std::size_t record_size,
     std::uint16_t version,
@@ -1096,9 +1272,7 @@ bool DecodeRecord(
     WriteAheadLog::Record& record,
     WriteAheadLog::ReadStatus& status)
 {
-    std::vector<std::uint8_t> record_bytes(
-        bytes.begin() + static_cast<std::ptrdiff_t>(offset),
-        bytes.begin() + static_cast<std::ptrdiff_t>(offset + record_size));
+    const auto record_bytes = bytes.subspan(offset, record_size);
 
     const auto expected_checksum = ReadU32(record_bytes, kChecksumOffset);
     if (ChecksumRecord(record_bytes) != expected_checksum)
@@ -1212,7 +1386,7 @@ bool DecodeRecord(
         (record.operation != WriteAheadLog::OperationKind::RemoveExtendedAttribute ||
             version == kLegacyVersion);
     if (!IsKnownOperation(record.operation) || !extended_attribute_version_is_valid ||
-        ((record.operation == WriteAheadLog::OperationKind::RewriteCompressedContent || record.operation == WriteAheadLog::OperationKind::CloneFile) && version != kInlinePayloadVersion) ||
+        ((record.operation == WriteAheadLog::OperationKind::RewriteCompressedContent || record.operation == WriteAheadLog::OperationKind::CloneFile || record.operation == WriteAheadLog::OperationKind::HardLink || record.operation == WriteAheadLog::OperationKind::NativeSparse || record.operation == WriteAheadLog::OperationKind::CloneRange || record.operation == WriteAheadLog::OperationKind::SetVolumeQuotaReserve || record.operation == WriteAheadLog::OperationKind::RenameVolume || record.operation == WriteAheadLog::OperationKind::CreateSnapshot || record.operation == WriteAheadLog::OperationKind::DeleteSnapshot || record.operation == WriteAheadLog::OperationKind::RepairVolumeFileCount) && version != kInlinePayloadVersion) ||
         (record.operation == WriteAheadLog::OperationKind::SetInodeMetadata && version != kInlinePayloadVersion) ||
         !InlinePayloadIsConsistentImpl(record) ||
         !ExtendedAttributeMutationIsConsistentImpl(record) ||
@@ -1235,20 +1409,80 @@ bool DecodeRecord(
     return true;
 }
 
+bool IsProtectedWalPrefix(std::span<const std::uint8_t> bytes)
+{
+    constexpr std::string_view magic = "\xe4" "APFSWAL";
+    const auto prefix = (std::min)(magic.size(), bytes.size());
+    return prefix && std::memcmp(bytes.data(), magic.data(), prefix) == 0;
+}
+
+struct WalFrameHeader
+{
+    std::uint16_t version = 0;
+    std::uint32_t bytes = 0;
+};
+
+WriteAheadLog::ReadStatus DecodeWalFrameHeader(
+    std::span<const std::uint8_t> bytes, WalFrameHeader& frame)
+{
+    using Status = WriteAheadLog::ReadStatus;
+    if (bytes.size() < 12 || ReadU32(bytes, 0) != kMagic) return Status::Corrupt;
+    frame.version = ReadU16(bytes, 4);
+    if (frame.version != kLegacyVersion && frame.version != kInlinePayloadVersion &&
+        frame.version != kUnlinkOutcomeVersion) return Status::VersionMismatch;
+    const auto expected = frame.version == kUnlinkOutcomeVersion ? kUnlinkOutcomeHeaderSize :
+        frame.version == kInlinePayloadVersion ? kInlinePayloadHeaderSize : kLegacyHeaderSize;
+    frame.bytes = ReadU32(bytes, 8);
+    return ReadU16(bytes, 6) == expected && frame.bytes >= expected && frame.bytes <= kMaxRecordBytes
+        ? Status::Ok : Status::Corrupt;
+}
+
 WriteAheadLog::ReadResult DecodeWalBytes(
     const std::vector<std::uint8_t>& bytes,
     const std::string& expected_volume_identity,
-    std::uint64_t* complete_prefix_bytes)
+    std::uint64_t* complete_prefix_bytes,
+    WalReadLimits limits = {},
+    std::optional<std::size_t> evidence_record_count = {})
 {
     WriteAheadLog::ReadResult result{};
     if (complete_prefix_bytes != nullptr)
     {
         *complete_prefix_bytes = 0;
     }
+    if (bytes.size() > limits.bytes)
+    {
+        result.status = WriteAheadLog::ReadStatus::ResourceLimit;
+        return result;
+    }
+    // A bounded held-handle framing pass supplies the exact reservation. Legacy
+    // readers keep their existing incremental allocation and torn-tail behavior.
+    if (evidence_record_count)
+    {
+        if (*evidence_record_count > limits.records)
+        {
+            result.status = WriteAheadLog::ReadStatus::ResourceLimit;
+            return result;
+        }
+        result.records.reserve(*evidence_record_count);
+    }
 
     std::size_t cursor = 0;
     while (cursor < bytes.size())
     {
+        // A protected anchor is shorter than a legacy header. Detect its domain
+        // BEFORE legacy torn-tail handling, including a partially written magic.
+        if (IsProtectedWalPrefix(std::span(bytes).subspan(cursor)))
+        {
+            result.status = WriteAheadLog::ReadStatus::VersionMismatch;
+            result.records.clear();
+            return result;
+        }
+        if (result.records.size() >= evidence_record_count.value_or(limits.records))
+        {
+            result.records.clear();
+            result.status = WriteAheadLog::ReadStatus::ResourceLimit;
+            return result;
+        }
         if (bytes.size() - cursor < kLegacyHeaderSize)
         {
             result.recovered_torn_tail = true;
@@ -1259,31 +1493,14 @@ WriteAheadLog::ReadResult DecodeWalBytes(
             return result;
         }
 
-        const auto magic = ReadU32(bytes, cursor);
-        const auto version = ReadU16(bytes, cursor + 4);
-        const auto header_size = ReadU16(bytes, cursor + 6);
-        const auto record_size = ReadU32(bytes, cursor + 8);
-        if (magic != kMagic)
+        WalFrameHeader frame;
+        const auto frame_status = DecodeWalFrameHeader(std::span(bytes).subspan(cursor, 12), frame);
+        if (frame_status != WriteAheadLog::ReadStatus::Ok)
         {
-            result.status = WriteAheadLog::ReadStatus::Corrupt;
+            result.status = frame_status;
             return result;
         }
-        if (version != kLegacyVersion && version != kInlinePayloadVersion && version != kUnlinkOutcomeVersion)
-        {
-            result.status = WriteAheadLog::ReadStatus::VersionMismatch;
-            return result;
-        }
-        const auto expected_header_size = version == kUnlinkOutcomeVersion
-            ? kUnlinkOutcomeHeaderSize
-            : version == kInlinePayloadVersion ? kInlinePayloadHeaderSize : kLegacyHeaderSize;
-        if (header_size != expected_header_size ||
-            record_size < expected_header_size ||
-            record_size > kMaxRecordBytes)
-        {
-            result.status = WriteAheadLog::ReadStatus::Corrupt;
-            return result;
-        }
-        if (bytes.size() - cursor < record_size)
+        if (bytes.size() - cursor < frame.bytes)
         {
             result.recovered_torn_tail = true;
             if (complete_prefix_bytes != nullptr)
@@ -1298,8 +1515,8 @@ WriteAheadLog::ReadResult DecodeWalBytes(
         if (!DecodeRecord(
                 bytes,
                 cursor,
-                record_size,
-                version,
+                frame.bytes,
+                frame.version,
                 expected_volume_identity,
                 record,
                 record_status))
@@ -1308,16 +1525,338 @@ WriteAheadLog::ReadResult DecodeWalBytes(
             return result;
         }
         result.records.push_back(std::move(record));
-        cursor += record_size;
+        cursor += frame.bytes;
     }
 
+    if (evidence_record_count && result.records.size() != *evidence_record_count)
+    {
+        result.records.clear();
+        result.status = WriteAheadLog::ReadStatus::Corrupt;
+        return result;
+    }
     if (complete_prefix_bytes != nullptr)
     {
         *complete_prefix_bytes = static_cast<std::uint64_t>(cursor);
     }
     return result;
 }
+namespace jc = apfsaccess::journal;
+namespace cc = apfsaccess::crypto;
+constexpr std::size_t kProtectedAnchorBytes = 104, kProtectedBatchRecords = 8;
+constexpr std::array<std::uint8_t, 16> kProtectedWalHeader{0xe4, 'A', 'P', 'F', 'S', 'W', 'A', 'L', 1, 0, 0, 0, 16, 0, 0, 0};
+constexpr std::string_view kProtectedAnchor = "WALROOT1";
+struct ProtectedPosition
+{
+    std::uint64_t offset = 0, ordinal = 0, sequence = 0;
+    std::array<std::uint8_t, 32> previous{};
+};
+cc::CryptoResult EncodeProtectedWalRecord(const WriteAheadLog::Record& record);
+using ProtectedHead = WriteAheadLog::ProtectedHistoryHead;
+struct ProtectedCheckpoint
+{
+    ProtectedHead previous;
+    std::uint64_t floor = 0, retained = 0;
+    std::array<std::uint8_t, 32> semantic{};
+};
+constexpr std::size_t kCheckpointPlainBytes = 112;
+bool ProtectedHeadValid(const ProtectedHead& h, bool continued = false)
+{
+    return h.bytes >= kProtectedAnchorBytes && h.bytes <= (64ull << 20) && h.records <= 65536 &&
+        h.last_sequence != UINT64_MAX && (h.records == 0 ? (continued || h.last_sequence == 0) : h.last_sequence != 0) &&
+        std::any_of(h.sha256.begin(), h.sha256.end(), [](auto b) { return b != 0; });
+}
+bool ProtectedSemanticStart(std::array<std::uint8_t, 32>& digest)
+{
+    constexpr std::string_view domain = "APFS-WAL-RETAIN1";
+    return ComputeSha256(std::as_bytes(std::span(domain.data(), domain.size())), digest);
+}
+bool ProtectedSemanticStep(std::array<std::uint8_t, 32>& digest, std::span<const std::byte> plain)
+{
+    std::array<std::uint8_t, 64> combined{};
+    std::copy(digest.begin(), digest.end(), combined.begin());
+    std::array<std::uint8_t, 32> part{};
+    if (!ComputeSha256(plain, part)) return false;
+    std::copy(part.begin(), part.end(), combined.begin() + 32);
+    return ComputeSha256(std::as_bytes(std::span(combined)), digest);
+}
+void ProtectedPut64(std::span<std::byte> b, std::size_t at, std::uint64_t n)
+{ for (unsigned i = 0; i < 8; ++i) b[at + i] = std::byte((n >> (i * 8)) & 255); }
+bool ProtectedCheckpointDecode(std::span<const std::byte> b, ProtectedCheckpoint& c)
+{
+    if (b.size() != kCheckpointPlainBytes || std::memcmp(b.data(), "WALCP001", 8)) return false;
+    const auto data = std::span(reinterpret_cast<const std::uint8_t*>(b.data()), b.size());
+    std::memcpy(c.previous.sha256.data(), b.data() + 8, 32);
+    c.previous.bytes = ReadU64(data, 40); c.previous.records = ReadU64(data, 48);
+    c.previous.last_sequence = ReadU64(data, 56); c.floor = ReadU64(data, 64); c.retained = ReadU64(data, 72);
+    std::memcpy(c.semantic.data(), b.data() + 80, 32);
+    return ProtectedHeadValid(c.previous) && c.floor && c.floor <= c.previous.last_sequence + 1 &&
+        c.retained <= c.previous.records && ((c.retained == 0) == (c.previous.records == 0));
+}
+std::array<std::byte, kCheckpointPlainBytes> ProtectedCheckpointEncode(const ProtectedCheckpoint& c)
+{
+    std::array<std::byte, kCheckpointPlainBytes> b{};
+    std::memcpy(b.data(), "WALCP001", 8); std::memcpy(b.data() + 8, c.previous.sha256.data(), 32);
+    ProtectedPut64(b, 40, c.previous.bytes); ProtectedPut64(b, 48, c.previous.records);
+    ProtectedPut64(b, 56, c.previous.last_sequence); ProtectedPut64(b, 64, c.floor); ProtectedPut64(b, 72, c.retained);
+    std::memcpy(b.data() + 80, c.semantic.data(), 32); return b;
+}
+void WipeRecord(WriteAheadLog::Record& r) noexcept
+{
+    const auto wipe = [](auto& b) { if (!b.empty()) SecureZeroMemory(b.data(), b.size() * sizeof(b[0])); b.clear(); };
+    wipe(r.volume_identity); wipe(r.path_utf8); wipe(r.secondary_path_utf8); wipe(r.inline_payload);
+    if (r.unlink_outcome) { wipe(r.unlink_outcome->path_utf8); r.unlink_outcome.reset(); }
+    SecureZeroMemory(r.payload_sha256.data(), r.payload_sha256.size());
+}
+void WipeRecords(std::vector<WriteAheadLog::Record>& records) noexcept
+{ for (auto& r : records) WipeRecord(r); records.clear(); }
+struct ProtectedReadExceptionCleanup
+{
+    WriteAheadLog::ReadResult& result;
+    int exceptions = std::uncaught_exceptions();
+    ~ProtectedReadExceptionCleanup()
+    { if (std::uncaught_exceptions() > exceptions) WipeRecords(result.records); }
+};
+struct ProtectedHandle
+{
+    HANDLE value = INVALID_HANDLE_VALUE;
+    explicit ProtectedHandle(HANDLE h = INVALID_HANDLE_VALUE) noexcept : value(h) {}
+    ~ProtectedHandle() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+    ProtectedHandle(const ProtectedHandle&) = delete;
+    ProtectedHandle(ProtectedHandle&& h) noexcept : value(std::exchange(h.value, INVALID_HANDLE_VALUE)) {}
+};
+bool ProtectedPathSyntax(const std::filesystem::path& p)
+{
+    const auto s = p.wstring();
+    if (s.size() < 4 || s.size() > 240 || !((s[0] >= L'A' && s[0] <= L'Z') || (s[0] >= L'a' && s[0] <= L'z')) ||
+        s[1] != L':' || s[2] != L'\\' || s.back() == L'\\' || s.find_first_of(L":/*?\"<>|", 3) != s.npos) return false;
+    for (auto c : s) if (c < 32) return false;
+    for (std::size_t at = 3; at < s.size();)
+    {
+        auto end = s.find(L'\\', at); if (end == s.npos) end = s.size();
+        const auto part = s.substr(at, end - at);
+        if (part.empty() || part == L"." || part == L".." || part.back() == L'.' || part.back() == L' ') return false;
+        const auto stem = part.substr(0, part.find(L'.'));
+        const auto equal = [&](const wchar_t* reserved) {
+            return CompareStringOrdinal(stem.c_str(), -1, reserved, -1, TRUE) == CSTR_EQUAL;
+        };
+        if (equal(L"CON") || equal(L"PRN") || equal(L"AUX") || equal(L"NUL") || equal(L"CONIN$") || equal(L"CONOUT$") ||
+            (stem.size() == 4 && (CompareStringOrdinal(stem.data(), 3, L"COM", 3, TRUE) == CSTR_EQUAL ||
+                CompareStringOrdinal(stem.data(), 3, L"LPT", 3, TRUE) == CSTR_EQUAL))) return false;
+        at = end + 1;
+    }
+    return true;
+}
+bool ProtectedExactHandle(HANDLE h, const std::filesystem::path& path, bool directory)
+{
+    FILE_ATTRIBUTE_TAG_INFO info{};
+    if (GetFileType(h) != FILE_TYPE_DISK || !GetFileInformationByHandleEx(h, FileAttributeTagInfo, &info, sizeof(info)) ||
+        (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) || ((info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) != directory ||
+        (!directory && !HasSinglePhysicalLink(h))) return false;
+    wchar_t resolved[512]{};
+    const auto n = GetFinalPathNameByHandleW(h, resolved, 512, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    const auto expected = L"\\\\?\\" + path.wstring();
+    return n && n < 512 && CompareStringOrdinal(resolved, -1, expected.c_str(), -1, TRUE) == CSTR_EQUAL;
+}
+struct ProtectedPins
+{
+    std::vector<ProtectedHandle> handles;
+    bool Pin(const std::filesystem::path& path)
+    {
+        if (!ProtectedPathSyntax(path)) return false;
+        const auto text = path.wstring();
+        if (GetDriveTypeW(text.substr(0, 3).c_str()) != DRIVE_FIXED) return false;
+        for (std::size_t end = 2;;)
+        {
+            const auto prefix = text.substr(0, end == 2 ? 3 : end);
+            ProtectedHandle h(CreateFileW(prefix.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+            if (h.value == INVALID_HANDLE_VALUE || !ProtectedExactHandle(h.value, prefix, true)) return false;
+            handles.push_back(std::move(h));
+            if (end == text.size()) break;
+            end = text.find(L'\\', end + 1); if (end == text.npos) end = text.size();
+        }
+        return true;
+    }
+};
+bool ProtectedConfigValid(const WriteAheadLog::Options& o)
+{
+    if (!o.protected_persistence) return false;
+    const auto& p = *o.protected_persistence;
+    const auto nonzero = [](auto& d) { return std::any_of(d.begin(), d.end(), [](auto b) { return b != std::byte{}; }); };
+    return ProtectedPathSyntax(o.path) && ProtectedPathSyntax(p.key_directory) && !o.volume_identity.empty() &&
+        o.volume_identity.size() <= 4096 && o.volume_identity.find('\0') == o.volume_identity.npos &&
+        nonzero(p.source_binding) && nonzero(p.journal_identity) &&
+        o.max_bytes >= 512 && o.max_bytes <= p.read_limits.bytes && p.read_limits.bytes <= (64ull << 20) &&
+        p.read_limits.records > 0 && p.read_limits.records <= 65536 &&
+        p.max_allocation_bytes > 0 && p.max_allocation_bytes <= (256ull << 20) &&
+        WalRegistryKey(o.path.parent_path()) != WalRegistryKey(p.key_directory);
+}
+bool ProtectedContext(const WriteAheadLog::Options& o, const ProtectedPosition& at, jc::JournalRecordContext& context)
+{
+    std::array<std::byte, 128> bytes{};
+    std::memcpy(bytes.data(), "APFS-WAL-CONTEXT1", 17);
+    std::memcpy(bytes.data() + 24, o.protected_persistence->journal_identity.data(), 32);
+    std::array<std::uint8_t, 32> volume{};
+    if (!ComputeSha256(std::as_bytes(std::span(o.volume_identity.data(), o.volume_identity.size())), volume)) return false;
+    // Hash fixed-width components, then bind physical position, ordinal, prior
+    // authenticated WAL sequence and complete previous ciphertext hash.
+    std::memcpy(bytes.data() + 56, volume.data(), 32);
+    for (unsigned i = 0; i < 8; ++i)
+    {
+        bytes[88 + i] = std::byte((at.offset >> (8 * i)) & 255);
+        bytes[96 + i] = std::byte((at.ordinal >> (8 * i)) & 255);
+        bytes[104 + i] = std::byte((at.sequence >> (8 * i)) & 255);
+    }
+    std::array<std::byte, 160> complete{};
+    std::memcpy(complete.data(), bytes.data(), bytes.size());
+    std::memcpy(complete.data() + 128, at.previous.data(), 32);
+    std::array<std::uint8_t, 32> digest{};
+    if (!ComputeSha256(complete, digest)) return false;
+    context.purpose = at.ordinal == 0 ? 0x57414c01U : 0x57414c02U;
+    context.chunk = at.ordinal;
+    std::memcpy(context.operation.data(), digest.data(), 32);
+    return true;
+}
+bool ProtectedAdvance(ProtectedPosition& at, std::span<const std::byte> frame, std::uint64_t sequence)
+{
+    if (!ComputeSha256(frame, at.previous)) return false;
+    at.offset += frame.size(); ++at.ordinal; at.sequence = sequence;
+    return true;
+}
+bool DerivedWitnessNamespaceSettled(const std::filesystem::path& path)
+{
+    if (path.empty()) return true;
+    const auto absent = [&](const wchar_t* suffix) {
+        WIN32_FIND_DATAW found{};
+        const auto search = FindFirstFileW(WalIoPath(path.wstring() + suffix).c_str(), &found);
+        if (search != INVALID_HANDLE_VALUE) { FindClose(search); return false; }
+        const auto error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+    };
+    if (!absent(L".wreset*")) return false;
+    if (PathIsAbsent(path))
+        for (auto suffix : {L".wrsaved.*", L".wrdone.*", L".wrfail.*"}) if (!absent(suffix)) return false;
+    return true;
+}
+bool ContinuationNamespaceAbsent(const std::filesystem::path& path)
+{
+    if (path.empty()) return true;
+    WIN32_FIND_DATAW data{};
+    const auto search = FindFirstFileW((path.wstring() + L".jcont*").c_str(), &data);
+    if (search != INVALID_HANDLE_VALUE) { FindClose(search); return false; }
+    const auto error = GetLastError();
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+}
+WriteAheadLog::ReadStatus ProtectedError(const jc::JournalStatus& s)
+{
+    if (s.error == jc::JournalError::ResourceLimit || s.crypto_error == cc::CryptoError::ResourceLimit ||
+        s.crypto_error == cc::CryptoError::AllocationFailed || s.crypto_error == cc::CryptoError::MemoryLockFailed)
+        return WriteAheadLog::ReadStatus::ResourceLimit;
+    if (s.error == jc::JournalError::BindingMismatch) return WriteAheadLog::ReadStatus::VolumeMismatch;
+    if (s.error == jc::JournalError::IntegrityFailure) return WriteAheadLog::ReadStatus::ChecksumMismatch;
+    return WriteAheadLog::ReadStatus::IoError;
+}
+WriteAheadLog::ReadResult DecodeProtectedWal(std::span<const std::uint8_t> bytes, const WriteAheadLog::Options& o,
+    WalReadLimits limits, std::uint64_t allocation, ProtectedPosition& position, ProtectedCheckpoint* checkpoint = nullptr,
+    jc::ProtectedJournalReadPass* reader = nullptr, std::span<const std::byte> continuation_anchor = {},
+    std::uint64_t continuation_sequence = 0)
+{
+    using Wal = WriteAheadLog;
+    Wal::ReadResult result{};
+    ProtectedReadExceptionCleanup replay_cleanup{result};
+    position = {};
+    const auto fail = [&](Wal::ReadStatus status) {
+        WipeRecords(result.records); result.status = status; return std::move(result);
+    };
+    if (bytes.size() < kProtectedAnchorBytes || !std::equal(kProtectedWalHeader.begin(), kProtectedWalHeader.end(), bytes.begin()))
+        return fail(Wal::ReadStatus::Corrupt);
+    if (bytes.size() > limits.bytes || bytes.size() > allocation / 4) return fail(Wal::ReadStatus::ResourceLimit);
+    position.offset = kProtectedWalHeader.size();
+    ProtectedCheckpoint proof{};
+    std::array<std::uint8_t, 32> semantic{};
+    if (!ProtectedSemanticStart(semantic)) return fail(Wal::ReadStatus::IoError);
+    while (position.offset < bytes.size())
+    {
+        const auto left = bytes.subspan(static_cast<std::size_t>(position.offset));
+        if (left.size() < 80 || std::memcmp(left.data(), "APFSREC1", 8) || ReadU32(left, 8) != 1 || ReadU32(left, 12) != 64)
+            return fail(Wal::ReadStatus::Corrupt);
+        const auto length = ReadU32(left, 16);
+        if (length < 80 || length > jc::kMaxJournalRecordBytes || length > left.size()) return fail(Wal::ReadStatus::Corrupt);
+        if (position.ordinal && (result.records.size() >= limits.records ||
+            result.records.size() >= (allocation - bytes.size() * 4) / (2 * sizeof(Wal::Record) + 4)))
+            return fail(Wal::ReadStatus::ResourceLimit);
+        jc::JournalRecordContext context{};
+        if (!ProtectedContext(o, position, context)) return fail(Wal::ReadStatus::IoError);
+        const auto frame = std::as_bytes(left.first(length));
+        auto plain = reader ? reader->Open(context, frame) :
+            jc::ProtectedJournalEpoch::Open(o.protected_persistence->key_directory.wstring(),
+                o.protected_persistence->source_binding, context, frame);
+        if (!plain) return fail(ProtectedError(plain.status));
+        auto sequence = position.sequence;
+        if (position.ordinal == 0)
+        {
+            if (!continuation_anchor.empty())
+            {
+                if (continuation_anchor.size() != 192 || plain.bytes.Size() != continuation_anchor.size() ||
+                    std::memcmp(plain.bytes.Bytes().data(), continuation_anchor.data(), continuation_anchor.size()))
+                    return fail(Wal::ReadStatus::Corrupt);
+                sequence = continuation_sequence;
+            }
+            else if (plain.bytes.Size() == kProtectedAnchor.size())
+            {
+                if (std::memcmp(plain.bytes.Bytes().data(), kProtectedAnchor.data(), kProtectedAnchor.size())) return fail(Wal::ReadStatus::Corrupt);
+            }
+            else if (!ProtectedCheckpointDecode(plain.bytes.Bytes(), proof)) return fail(Wal::ReadStatus::Corrupt);
+        }
+        else
+        {
+            const auto data = std::span(reinterpret_cast<const std::uint8_t*>(plain.bytes.Bytes().data()), plain.bytes.Size());
+            if (data.size() < kLegacyHeaderSize || ReadU32(data, 0) != kMagic || ReadU32(data, 8) != data.size())
+                return fail(Wal::ReadStatus::Corrupt);
+            const auto version = ReadU16(data, 4);
+            const std::size_t header = version == 1 ? kLegacyHeaderSize : version == 2 ? kInlinePayloadHeaderSize : version == 3 ? kUnlinkOutcomeHeaderSize : 0;
+            if (!header || ReadU16(data, 6) != header || data.size() < header) return fail(Wal::ReadStatus::VersionMismatch);
+            Wal::Record record{};
+            struct Cleanup { Wal::Record& r; ~Cleanup() { WipeRecord(r); } } cleanup{record};
+            Wal::ReadStatus status{};
+            if (!DecodeRecord(data, 0, data.size(), version, o.volume_identity, record, status)) return fail(status);
+            if (!record.sequence || record.sequence == UINT64_MAX || record.sequence <= sequence ||
+                record.operation == Wal::OperationKind::CompactionIndex ||
+                record.state < Wal::RecordState::Prepared || record.state > Wal::RecordState::CleanupArmed)
+                return fail(Wal::ReadStatus::Corrupt);
+            sequence = record.sequence;
+            if (proof.floor && result.records.size() < proof.retained)
+            {
+                if (!ProtectedSemanticStep(semantic, plain.bytes.Bytes())) return fail(Wal::ReadStatus::IoError);
+                if (result.records.size() + 1 == proof.retained &&
+                    (semantic != proof.semantic || sequence != proof.previous.last_sequence)) return fail(Wal::ReadStatus::Corrupt);
+            }
+            result.records.push_back(std::move(record));
+        }
+        if (!ProtectedAdvance(position, frame, sequence)) return fail(Wal::ReadStatus::IoError);
+    }
+    if (proof.floor && (result.records.size() < proof.retained || (!proof.retained && semantic != proof.semantic)))
+        return fail(Wal::ReadStatus::Corrupt);
+    if (checkpoint) *checkpoint = proof;
+    return result;
+}
 } // namespace
+
+struct WriteAheadLog::ProtectedState
+{
+    ProtectedPins wal_pins, key_pins;
+    std::unique_ptr<jc::ProtectedJournalEpoch> epoch;
+    ProtectedPosition position;
+    bool verified = false, poisoned = false, write_pending = false, head_mismatch = false;
+};
+
+// Pure observations for focused tests; no filesystem access or public header API.
+std::array<std::wstring, 4> InspectWalPathsForTest(
+    const std::filesystem::path& path, std::string_view volume_identity)
+{
+    return {WalIoPath(path).wstring(), WalRenameDestinationPath(path),
+        WalRegistryKey(path), WriterLeaseName(volume_identity)};
+}
 
 WriteAheadLog::WriteAheadLog(Options options)
     : options_(std::move(options))
@@ -1331,13 +1870,1353 @@ WriteAheadLog::~WriteAheadLog()
     (void)CloseAppendHandle();
 }
 
+bool WriteAheadLog::ProtectedMaintenanceAbsent() const
+{
+    if (!DerivedWitnessNamespaceSettled(options_.path)) return false;
+    if (!continuation_admission_ && !ContinuationNamespaceAbsent(options_.path)) return false;
+    // Completed certificates are immutable retained authority. Require the exact
+    // namespace admitted by that capability, including missing/foreign evidence.
+    if (continuation_admission_)
+    {
+        const auto& expected = continuation_admission_->immutable_siblings;
+        if (!continuation_authority_ || !continuation_admission_->validate_authority ||
+            !continuation_admission_->validate_authority() || expected.size() > 512) return false;
+        if (expected.empty()) { if (!ContinuationNamespaceAbsent(options_.path)) return false; }
+        else {
+        WIN32_FIND_DATAW entry{}; std::size_t count = 0;
+        const auto h = FindFirstFileW((options_.path.wstring() + L".jcont*").c_str(), &entry);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        bool valid = true;
+        do
+        {
+            ++count;
+            if (count > expected.size() || (entry.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) ||
+                std::none_of(expected.begin(), expected.end(), [&](const auto& name) {
+                    return CompareStringOrdinal(entry.cFileName, -1, name.c_str(), -1, TRUE) == CSTR_EQUAL;
+                })) { valid = false; break; }
+        } while (FindNextFileW(h, &entry));
+        const auto error = GetLastError(); FindClose(h);
+        if (!valid || error != ERROR_NO_MORE_FILES || count != expected.size()) return false;
+        }
+    }
+    WIN32_FIND_DATAW found{};
+    const auto pattern = options_.path.wstring() + L".compact*";
+    auto search = FindFirstFileW(WalIoPath(pattern).c_str(), &found);
+    if (search != INVALID_HANDLE_VALUE) { FindClose(search); return false; }
+    if (GetLastError() != ERROR_FILE_NOT_FOUND) return false;
+    if (PathIsAbsent(options_.path))
+    {
+        for (auto suffix : {L".pcold.*", L".pcfailed.*"})
+        {
+            search = FindFirstFileW((options_.path.wstring() + suffix).c_str(), &found);
+            if (search != INVALID_HANDLE_VALUE) { FindClose(search); return false; }
+            if (GetLastError() != ERROR_FILE_NOT_FOUND) return false;
+        }
+    }
+    return true;
+}
+
+bool WriteAheadLog::EnsureProtectedState() const
+{ return EnsureProtectedState(false); }
+
+bool WriteAheadLog::EnsureProtectedState(bool allow_pending) const
+{
+    try
+    {
+        if (!ProtectedConfigValid(options_)) return false;
+        if (!protected_state_)
+        {
+            auto state = std::make_unique<ProtectedState>();
+            if (!state->wal_pins.Pin(options_.path.parent_path()) ||
+                !state->key_pins.Pin(options_.protected_persistence->key_directory)) return false;
+            protected_state_ = std::move(state);
+        }
+        return allow_pending || ProtectedMaintenanceAbsent();
+    }
+    catch (...) { return false; }
+}
+
+WriteAheadLog::ReadResult WriteAheadLog::ReadProtected(WalReadLimits limits,
+    std::uint64_t allocation, bool retain_writer) const
+{
+    ReadResult failed{}; failed.status = ReadStatus::IoError;
+    try
+    {
+        if (!EnsureProtectedState() || (retain_writer && !EnsureWriterLease())) return failed;
+        const auto& protection = *options_.protected_persistence;
+        limits.bytes = (std::min)(limits.bytes, (std::min)(protection.read_limits.bytes, options_.max_bytes));
+        limits.records = (std::min)(limits.records, protection.read_limits.records);
+        allocation = (std::min)(allocation, protection.max_allocation_bytes);
+        ProtectedHandle opened;
+        auto handle = static_cast<HANDLE>(append_handle_);
+        if (!handle)
+        {
+            opened.value = OpenWalFile(options_.path, retain_writer ? GENERIC_READ | GENERIC_WRITE : GENERIC_READ,
+                retain_writer ? FILE_SHARE_READ : FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+            handle = opened.value;
+            if (handle == INVALID_HANDLE_VALUE)
+            {
+                // No journal, no epoch slot and no maintenance writes. The pipe
+                // lease is retained when the instance requested exclusive replay.
+                if (GetLastError() == ERROR_FILE_NOT_FOUND) return {};
+                return failed;
+            }
+        }
+        if (!ProtectedExactHandle(handle, options_.path, false)) return failed;
+        BY_HANDLE_FILE_INFORMATION before{}, after{};
+        if (!GetFileInformationByHandle(handle, &before)) return failed;
+        const auto size = (std::uint64_t(before.nFileSizeHigh) << 32) | before.nFileSizeLow;
+        if (size > limits.bytes || size > allocation / 4)
+        { failed.status = ReadStatus::ResourceLimit; return failed; }
+        std::vector<std::uint8_t> bytes;
+        if (!ReadPinnedIntentBytes(handle, bytes, size)) return failed;
+        ProtectedPosition position;
+        auto reader = jc::ProtectedJournalReadPass::Acquire(protection.key_directory.wstring(), protection.source_binding);
+        if (!reader) { failed.status = ProtectedError(reader.status); return failed; }
+        auto decoded = DecodeProtectedWal(bytes, options_, limits, allocation, position, nullptr, reader.reader.get(),
+            continuation_admission_ ? std::span<const std::byte>(continuation_admission_->anchor) : std::span<const std::byte>{},
+            continuation_admission_ ? continuation_admission_->last_sequence : 0);
+        ProtectedReadExceptionCleanup cleanup{decoded};
+        const bool stable = GetFileInformationByHandle(handle, &after) &&
+            before.dwVolumeSerialNumber == after.dwVolumeSerialNumber && before.nFileIndexHigh == after.nFileIndexHigh &&
+            before.nFileIndexLow == after.nFileIndexLow && before.nFileSizeHigh == after.nFileSizeHigh &&
+            before.nFileSizeLow == after.nFileSizeLow && CompareFileTime(&before.ftLastWriteTime, &after.ftLastWriteTime) == 0 &&
+            ProtectedExactHandle(handle, options_.path, false) && ProtectedMaintenanceAbsent();
+        if (!stable) { WipeRecords(decoded.records); return failed; }
+        if (decoded.status != ReadStatus::Ok) return decoded;
+        if (retain_writer)
+        {
+            if (!SetFilePointerEx(handle, {}, nullptr, FILE_END)) { WipeRecords(decoded.records); return failed; }
+            if (!append_handle_) { append_handle_ = std::exchange(opened.value, INVALID_HANDLE_VALUE); ++append_handle_open_count_; }
+            append_handle_size_ = size; append_handle_size_known_ = true;
+            protected_state_->position = position;
+            protected_state_->verified = true;
+        }
+        return decoded;
+    }
+    catch (const std::bad_alloc&) { failed.status = ReadStatus::ResourceLimit; return failed; }
+    catch (const std::length_error&) { failed.status = ReadStatus::ResourceLimit; return failed; }
+    catch (...) { return failed; }
+}
+
+bool WriteAheadLog::EnsureProtectedAppendHandle(bool allow_create) const
+{
+    if (!EnsureProtectedState() || protected_state_->poisoned || protected_state_->head_mismatch || !EnsureWriterLease()) return false;
+    if (append_handle_) return protected_state_->verified && ValidatedAppendLeaseGeneration() != 0;
+    auto replay = ReadProtected(options_.protected_persistence->read_limits,
+        options_.protected_persistence->max_allocation_bytes, true);
+    const bool good = replay.status == ReadStatus::Ok;
+    WipeRecords(replay.records);
+    if (!good || append_handle_) return good && append_handle_;
+    if (!allow_create) return false;
+    if (!protected_state_->epoch)
+    {
+        auto epoch = jc::ProtectedJournalEpoch::AcquireWriter(options_.protected_persistence->key_directory.wstring(),
+            options_.protected_persistence->source_binding);
+        if (!epoch) return false;
+        protected_state_->epoch = std::move(epoch.epoch);
+    }
+    ProtectedPosition start;
+    start.offset = kProtectedWalHeader.size();
+    jc::JournalRecordContext context{};
+    if (!ProtectedContext(options_, start, context)) return false;
+    auto anchor = protected_state_->epoch->Seal(context,
+        std::as_bytes(std::span(kProtectedAnchor.data(), kProtectedAnchor.size())));
+    if (!anchor) return false;
+    const auto bytes = anchor.bytes.Bytes();
+    std::vector<std::uint8_t> encoded(kProtectedWalHeader.begin(), kProtectedWalHeader.end());
+    encoded.insert(encoded.end(), reinterpret_cast<const std::uint8_t*>(bytes.data()),
+        reinterpret_cast<const std::uint8_t*>(bytes.data() + bytes.size()));
+    auto handle = OpenWalFile(options_.path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+        CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    append_handle_ = handle; ++append_handle_open_count_;
+    append_handle_size_ = 0; append_handle_size_known_ = true;
+    protected_state_->position = start; protected_state_->verified = ProtectedExactHandle(handle, options_.path, false);
+    protected_state_->write_pending = true;
+    if (!protected_state_->verified || AppendEncoded(encoded) != EncodedAppendResult::Succeeded || !FlushAppendHandle() ||
+        !ProtectedAdvance(protected_state_->position, bytes, 0))
+    {
+        protected_state_->poisoned = true;
+        (void)CloseAppendHandle();
+        return false;
+    }
+    protected_state_->write_pending = false;
+    return true;
+}
+
+WriteAheadLog::AppendResult WriteAheadLog::AppendProtected(std::span<const Record> records,
+    bool durable_flush, std::uint64_t expected_writer_generation) const
+{
+    bool materialized = false;
+    try
+    {
+        if (!EnsureProtectedState() || protected_state_->poisoned || protected_state_->head_mismatch || records.size() > kProtectedBatchRecords ||
+            (expected_writer_generation && (!writer_lease_handle_ || writer_lease_generation_ != expected_writer_generation)))
+            return AppendResult::RejectedBeforeWrite;
+        if (records.empty()) return AppendResult::Succeeded;
+        std::vector<cc::SecureBytes> plaintexts;
+        std::uint64_t added = 0, sequence = 0;
+        for (const auto& record : records)
+        {
+            if ((!record.volume_identity.empty() && record.volume_identity != options_.volume_identity) ||
+                !IsKnownOperation(record.operation) || !record.sequence || record.sequence == UINT64_MAX || record.sequence <= sequence ||
+                record.operation == OperationKind::CompactionIndex || record.state < RecordState::Prepared || record.state > RecordState::CleanupArmed)
+                return AppendResult::RejectedBeforeWrite;
+            Record writable = record;
+            struct Cleanup { Record& r; ~Cleanup() { WipeRecord(r); } } cleanup{writable};
+            if (writable.volume_identity.empty()) writable.volume_identity = options_.volume_identity;
+            auto plain = EncodeProtectedWalRecord(writable);
+            if (!plain) return AppendResult::RejectedBeforeWrite;
+            added += plain.bytes.Size() + 80;
+            plaintexts.push_back(std::move(plain.bytes)); sequence = record.sequence;
+        }
+        if (!EnsureWriterLease()) return AppendResult::RejectedBeforeWrite;
+        if (!append_handle_)
+        {
+            auto replay = ReadProtected(options_.protected_persistence->read_limits,
+                options_.protected_persistence->max_allocation_bytes, true);
+            const bool good = replay.status == ReadStatus::Ok;
+            WipeRecords(replay.records);
+            if (!good) return AppendResult::RejectedBeforeWrite;
+        }
+        const auto& p = *options_.protected_persistence;
+        const auto& at = protected_state_->position;
+        const auto base = append_handle_ ? at.offset : kProtectedAnchorBytes;
+        const auto count = at.ordinal ? at.ordinal - 1 : 0;
+        if (records.front().sequence <= at.sequence || base > options_.max_bytes || added > options_.max_bytes - base ||
+            count > p.read_limits.records || records.size() > p.read_limits.records - count ||
+            base + added > p.max_allocation_bytes / 4 ||
+            count + records.size() > (p.max_allocation_bytes - (base + added) * 4) / (2 * sizeof(Record) + 4))
+            return AppendResult::RejectedBeforeWrite;
+        const bool absent = !append_handle_;
+        if (!EnsureProtectedAppendHandle(true))
+            return protected_state_->poisoned ? AppendResult::BytesMayHavePersisted : AppendResult::RejectedBeforeWrite;
+        materialized = absent;
+        if (!protected_state_->epoch)
+        {
+            auto epoch = jc::ProtectedJournalEpoch::AcquireWriter(p.key_directory.wstring(), p.source_binding);
+            if (!epoch) return absent ? AppendResult::BytesMayHavePersisted : AppendResult::RejectedBeforeWrite;
+            protected_state_->epoch = std::move(epoch.epoch);
+        }
+        auto position = protected_state_->position;
+        std::vector<std::uint8_t> encrypted;
+        encrypted.reserve(static_cast<std::size_t>(added));
+        for (std::size_t i = 0; i < records.size(); ++i)
+        {
+            jc::JournalRecordContext context{};
+            if (!ProtectedContext(options_, position, context)) return absent ? AppendResult::BytesMayHavePersisted : AppendResult::RejectedBeforeWrite;
+            auto frame = protected_state_->epoch->Seal(context, plaintexts[i].Bytes());
+            if (!frame) return absent ? AppendResult::BytesMayHavePersisted : AppendResult::RejectedBeforeWrite;
+            const auto b = frame.bytes.Bytes();
+            encrypted.insert(encrypted.end(), reinterpret_cast<const std::uint8_t*>(b.data()), reinterpret_cast<const std::uint8_t*>(b.data() + b.size()));
+            if (!ProtectedAdvance(position, b, records[i].sequence)) return absent ? AppendResult::BytesMayHavePersisted : AppendResult::RejectedBeforeWrite;
+        }
+        if (fault_injection_hook_ && fault_injection_hook_("protected-before-write"))
+            return absent ? AppendResult::BytesMayHavePersisted : AppendResult::RejectedBeforeWrite;
+        protected_state_->write_pending = true;
+        const auto result = AppendEncoded(encrypted);
+        if (result != EncodedAppendResult::Succeeded)
+        {
+            protected_state_->poisoned = true; (void)CloseAppendHandle();
+            return result == EncodedAppendResult::BytesMayHavePersisted || absent ? AppendResult::BytesMayHavePersisted : AppendResult::RejectedBeforeWrite;
+        }
+        protected_state_->position = position;
+        if (durable_flush && !FlushAppendHandle())
+        {
+            protected_state_->poisoned = true; (void)CloseAppendHandle();
+            return AppendResult::BytesMayHavePersisted;
+        }
+        protected_state_->write_pending = false;
+        return AppendResult::Succeeded;
+    }
+    catch (...)
+    {
+        if (protected_state_ && protected_state_->write_pending)
+        { protected_state_->poisoned = true; (void)CloseAppendHandle(); }
+        if (materialized || (protected_state_ && protected_state_->poisoned)) return AppendResult::BytesMayHavePersisted;
+        return AppendResult::RejectedBeforeWrite;
+    }
+}
+
+namespace
+{
+struct ProtectedRecordCleanup
+{
+    WriteAheadLog::ReadResult& result;
+    ~ProtectedRecordCleanup() { WipeRecords(result.records); }
+};
+bool ProtectedHeadOf(std::span<const std::uint8_t> bytes, const WriteAheadLog::ReadResult& decoded, ProtectedHead& head)
+{
+    head = {}; head.bytes = bytes.size(); head.records = decoded.records.size();
+    head.last_sequence = decoded.records.empty() ? 0 : decoded.records.back().sequence;
+    return decoded.status == WriteAheadLog::ReadStatus::Ok && ComputeSha256(std::as_bytes(bytes), head.sha256) && ProtectedHeadValid(head);
+}
+bool ProtectedReadBounded(HANDLE h, std::vector<std::uint8_t>& bytes, std::uint64_t limit)
+{
+    std::uint64_t size = 0;
+    return TryGetPhysicalFileSize(h, size) && size <= limit && ReadPinnedIntentBytes(h, bytes, size);
+}
+bool ProtectedReadBlob(HANDLE h, const std::filesystem::path& path, const WriteAheadLog::Options& o,
+    std::vector<std::uint8_t>& bytes, WriteAheadLog::ReadResult& decoded, ProtectedHead& head, ProtectedCheckpoint& proof)
+{
+    if (!ProtectedExactHandle(h, path, false) || !ProtectedReadBounded(h, bytes, o.max_bytes)) return false;
+    ProtectedPosition position;
+    decoded = DecodeProtectedWal(bytes, o, o.protected_persistence->read_limits,
+        o.protected_persistence->max_allocation_bytes, position, &proof);
+    return ProtectedHeadOf(bytes, decoded, head) && ProtectedExactHandle(h, path, false);
+}
+std::vector<std::uint8_t> ProtectedRetention(const std::vector<WriteAheadLog::Record>& records, std::uint64_t floor)
+{
+    std::uint64_t maximum_id = 0;
+    for (const auto& r : records) maximum_id = (std::max)(maximum_id, r.transaction_id);
+    std::unordered_set<std::uint64_t> transactions;
+    for (const auto& r : records)
+        if (!r.transaction_id || r.sequence >= floor || r.state != WriteAheadLog::RecordState::Prepared ||
+            r.operation == WriteAheadLog::OperationKind::TransactionMarker || r.operation == WriteAheadLog::OperationKind::DurabilityWatermark ||
+            r.transaction_id == maximum_id || &r == &records.back()) transactions.insert(r.transaction_id);
+    std::vector<std::uint8_t> keep; keep.reserve(records.size());
+    for (const auto& r : records) keep.push_back(static_cast<std::uint8_t>(transactions.contains(r.transaction_id)));
+    return keep;
+}
+template<class F> bool ProtectedWalkKept(const WriteAheadLog::Options& o, std::span<const std::uint8_t> bytes,
+    const std::vector<WriteAheadLog::Record>& records, const std::vector<std::uint8_t>& keep, F f)
+{
+    ProtectedPosition at; at.offset = kProtectedWalHeader.size();
+    std::size_t index = 0;
+    while (at.offset < bytes.size())
+    {
+        const auto left = bytes.subspan(static_cast<std::size_t>(at.offset));
+        if (left.size() < 80) return false;
+        const auto length = ReadU32(left, 16);
+        if (length < 80 || length > left.size()) return false;
+        const auto frame = std::as_bytes(left.first(length));
+        auto sequence = at.sequence;
+        if (at.ordinal)
+        {
+            if (index >= records.size()) return false;
+            if (keep[index])
+            {
+                jc::JournalRecordContext context{};
+                if (!ProtectedContext(o, at, context)) return false;
+                auto plain = jc::ProtectedJournalEpoch::Open(o.protected_persistence->key_directory.wstring(),
+                    o.protected_persistence->source_binding, context, frame);
+                if (!plain || !f(plain.bytes.Bytes())) return false;
+            }
+            sequence = records[index++].sequence;
+        }
+        if (!ProtectedAdvance(at, frame, sequence)) return false;
+    }
+    return index == records.size();
+}
+std::filesystem::path ProtectedSibling(const std::filesystem::path& path, const wchar_t* suffix)
+{ return std::filesystem::path(path.wstring() + suffix); }
+std::filesystem::path ProtectedArchive(const std::filesystem::path& path, const wchar_t* suffix, const std::array<std::uint8_t, 32>& digest)
+{
+    constexpr wchar_t hex[] = L"0123456789abcdef";
+    auto name = path.wstring() + suffix;
+    for (auto b : digest) { name.push_back(hex[b >> 4]); name.push_back(hex[b & 15]); }
+    return std::filesystem::path(name);
+}
+bool ProtectedPendingKnown(const std::filesystem::path& path)
+{
+    WIN32_FIND_DATAW data{};
+    const auto search = FindFirstFileW((path.wstring() + L".compact*").c_str(), &data);
+    if (search == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND;
+    const auto next = path.filename().wstring() + L".compact.pnext", old = path.filename().wstring() + L".compact.pold";
+    bool valid = true;
+    do
+    {
+        if (CompareStringOrdinal(data.cFileName, -1, next.c_str(), -1, TRUE) != CSTR_EQUAL &&
+            CompareStringOrdinal(data.cFileName, -1, old.c_str(), -1, TRUE) != CSTR_EQUAL) valid = false;
+    } while (FindNextFileW(search, &data));
+    const auto error = GetLastError(); FindClose(search);
+    return valid && error == ERROR_NO_MORE_FILES;
+}
+ProtectedHandle ProtectedOpenMaintenance(const std::filesystem::path& path, bool& valid)
+{
+    const auto h = OpenWalFile(path, GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { if (GetLastError() != ERROR_FILE_NOT_FOUND) valid = false; }
+    else if (!ProtectedExactHandle(h, path, false)) valid = false;
+    return ProtectedHandle(h);
+}
+}
+
+bool WriteAheadLog::CaptureProtectedHistoryHead(ProtectedHistoryHead& head) const
+{
+    std::lock_guard<std::recursive_mutex> lock(WalOperationMutex(options_.path)); head = {};
+    if (!options_.protected_persistence) return false;
+    try
+    {
+        auto decoded = ReadProtected(options_.protected_persistence->read_limits, options_.protected_persistence->max_allocation_bytes, true);
+        ProtectedRecordCleanup cleanup{decoded}; std::vector<std::uint8_t> bytes;
+        ProtectedHead captured;
+        if (!append_handle_ || decoded.status != ReadStatus::Ok ||
+            !ProtectedReadBounded(static_cast<HANDLE>(append_handle_), bytes, options_.max_bytes) || !ProtectedHeadOf(bytes, decoded, captured)) return false;
+        if (continuation_admission_ && decoded.records.empty()) captured.last_sequence = continuation_admission_->last_sequence;
+        head = captured; return true;
+    }
+    catch (...) { head = {}; return false; }
+}
+
+bool WriteAheadLog::VerifyProtectedHistoryPrefix(const ProtectedHistoryHead& expected) const
+{
+    std::lock_guard<std::recursive_mutex> lock(WalOperationMutex(options_.path));
+    if (!options_.protected_persistence || !HasExclusiveWriterLease()) return false;
+    auto read = ReadProtected(options_.protected_persistence->read_limits,
+        options_.protected_persistence->max_allocation_bytes, true);
+    ProtectedRecordCleanup cleanup{read};
+    if (read.status != ReadStatus::Ok || read.recovered_torn_tail) return false;
+    if (!expected.bytes) return !expected.records && !expected.last_sequence && expected.sha256 == ProtectedHistoryHead{}.sha256;
+    std::vector<std::uint8_t> bytes;
+    ProtectedHead prefix;
+    if (!append_handle_ || !ProtectedReadBounded(static_cast<HANDLE>(append_handle_), bytes, options_.max_bytes) ||
+        expected.bytes > bytes.size() || expected.records > read.records.size()) return false;
+    bytes.resize(static_cast<std::size_t>(expected.bytes));
+    for (std::size_t n = static_cast<std::size_t>(expected.records); n < read.records.size(); ++n) WipeRecord(read.records[n]);
+    read.records.resize(static_cast<std::size_t>(expected.records));
+    if (!ProtectedHeadOf(bytes, read, prefix)) return false;
+    if (continuation_admission_ && read.records.empty()) prefix.last_sequence = continuation_admission_->last_sequence;
+    return prefix == expected;
+}
+
+bool WriteAheadLog::ProtectedAppendCapacityAvailable(std::span<const Record> records) const
+{
+    std::lock_guard<std::recursive_mutex> lock(WalOperationMutex(options_.path));
+    if (!options_.protected_persistence || !HasExclusiveWriterLease()) return false;
+    const auto& p = *options_.protected_persistence;
+    auto read = ReadProtected(p.read_limits, p.max_allocation_bytes, true); ProtectedRecordCleanup cleanup{read};
+    if (read.status != ReadStatus::Ok || read.recovered_torn_tail) return false;
+    std::uint64_t bytes = 4096, count = read.records.size();
+    if (append_handle_ && !TryGetPhysicalFileSize(static_cast<HANDLE>(append_handle_), bytes)) return false;
+    const auto limit = (std::min)({options_.max_bytes, p.read_limits.bytes, p.max_allocation_bytes / 4});
+    const auto record_limit = p.read_limits.records;
+    if (bytes > limit || count > record_limit || records.size() > record_limit - count) return false;
+    for (const auto& row : records) {
+        auto encoded = EncodeForTest(row);
+        const auto additional = encoded.size() + jc::kJournalRecordHeaderBytes + crypto::kGcmTagBytes;
+        if (encoded.empty() || additional > limit - bytes) return false;
+        bytes += additional; ++count;
+    }
+    return count <= (p.max_allocation_bytes - bytes * 4) / (2 * sizeof(Record) + 4);
+}
+
+bool WriteAheadLog::DecodeCertifiedOriginalRecord(std::span<const std::uint8_t> bytes,
+    const std::string& identity, Record& record)
+{
+    if (bytes.size() < kLegacyHeaderSize || bytes.size() > 16384 || ReadU32(bytes, 0) != kMagic || ReadU32(bytes, 8) != bytes.size()) return false;
+    const auto version = ReadU16(bytes, 4);
+    const auto header = version == 1 ? kLegacyHeaderSize : version == 2 ? kInlinePayloadHeaderSize : version == 3 ? kUnlinkOutcomeHeaderSize : 0;
+    ReadStatus status{};
+    const bool valid = header && ReadU16(bytes, 6) == header && bytes.size() >= header && DecodeRecord(bytes, 0, bytes.size(), version, identity, record, status);
+    if (!valid) WipeRecord(record);
+    return valid;
+}
+
+bool WriteAheadLog::SealContinuationAnchor(const ContinuationAdmission& admission,
+    jc::ProtectedJournalEpoch& epoch, std::vector<std::uint8_t>& encrypted) const
+{
+    return SealContinuationRecords(admission, {}, epoch, encrypted);
+}
+
+bool WriteAheadLog::SealContinuationRecords(const ContinuationAdmission& admission, std::span<const Record> records,
+    jc::ProtectedJournalEpoch& epoch, std::vector<std::uint8_t>& encrypted) const
+{
+    encrypted.clear();
+    if (!ProtectedConfigValid(options_) || admission.last_sequence == UINT64_MAX ||
+        std::memcmp(admission.anchor.data(), "WALCONT1", 8)) return false;
+    const auto a = std::span(reinterpret_cast<const std::uint8_t*>(admission.anchor.data()), admission.anchor.size());
+    const auto role = ReadU64(a, 24);
+    if (ReadU64(a, 8) != 6 || !ReadU64(a, 16) || (role != 1 && role != 2) ||
+        ReadU64(a, 96) != admission.last_sequence || (role == 1 && !admission.last_sequence) ||
+        !ReadU64(a, 104) || !ReadU64(a, 112) || ReadU64(a, 112) != ReadU64(a, 120) ||
+        ReadU64(a, 112) != ReadU64(a, 128) || !ReadU64(a, 168) || ReadU64(a, 176) || ReadU64(a, 184) ||
+        records.size() > options_.protected_persistence->read_limits.records) return false;
+    ProtectedPosition at; at.offset = kProtectedWalHeader.size();
+    encrypted.assign(kProtectedWalHeader.begin(), kProtectedWalHeader.end());
+    const auto seal = [&](std::span<const std::byte> bytes, std::uint64_t sequence) {
+        jc::JournalRecordContext context{};
+        if (!ProtectedContext(options_, at, context)) return false;
+        auto frame = epoch.Seal(context, bytes);
+        if (!frame || frame.bytes.Size() > options_.max_bytes - encrypted.size()) return false;
+        const auto b = frame.bytes.Bytes();
+        encrypted.insert(encrypted.end(), reinterpret_cast<const std::uint8_t*>(b.data()),
+            reinterpret_cast<const std::uint8_t*>(b.data() + b.size()));
+        return ProtectedAdvance(at, b, sequence);
+    };
+    if (!seal(admission.anchor, admission.last_sequence)) { encrypted.clear(); return false; }
+    for (const auto& record : records) {
+        // Certified witness groups retain their original, potentially separated
+        // positions. Original records keep their consecutive sequence contract.
+        const bool ordered = role == 2 ? record.sequence > at.sequence :
+            at.sequence != UINT64_MAX && record.sequence == at.sequence + 1;
+        if (!ordered || record.sequence == UINT64_MAX || record.volume_identity != options_.volume_identity) {
+            encrypted.clear(); return false;
+        }
+        auto plain = EncodeProtectedWalRecord(record);
+        if (!plain || !seal(plain.bytes.Bytes(), record.sequence)) { encrypted.clear(); return false; }
+    }
+    return true;
+}
+
+WriteAheadLog::ReadResult WriteAheadLog::DecodeContinuationEvidence(std::span<const std::uint8_t> bytes,
+    const std::optional<ContinuationAdmission>& admission, ProtectedHistoryHead& head) const
+{
+    head = {};
+    ReadResult failed; failed.status = ReadStatus::Corrupt;
+    if (!ProtectedConfigValid(options_)) return failed;
+    auto pass = jc::ProtectedJournalReadPass::Acquire(options_.protected_persistence->key_directory.wstring(),
+        options_.protected_persistence->source_binding);
+    if (!pass) { failed.status = ProtectedError(pass.status); return failed; }
+    ProtectedPosition position;
+    auto decoded = DecodeProtectedWal(bytes, options_, options_.protected_persistence->read_limits,
+        options_.protected_persistence->max_allocation_bytes, position, nullptr, pass.reader.get(),
+        admission ? std::span<const std::byte>(admission->anchor) : std::span<const std::byte>{},
+        admission ? admission->last_sequence : 0);
+    if (decoded.status == ReadStatus::Ok && ComputeSha256(std::as_bytes(bytes), head.sha256))
+    {
+        head.bytes = bytes.size(); head.records = decoded.records.size(); head.last_sequence = position.sequence;
+        if (ProtectedHeadValid(head, admission.has_value())) return decoded;
+    }
+    WipeRecords(decoded.records); head = {}; return failed;
+}
+
+bool WriteAheadLog::InstallContinuationAdmission(const ContinuationAdmission& admission,
+    std::shared_ptr<void> retained_authority) const
+{
+    std::lock_guard<std::recursive_mutex> lock(WalOperationMutex(options_.path));
+    if (!retained_authority || !ProtectedConfigValid(options_) ||
+        std::memcmp(admission.anchor.data(), "WALCONT1", 8) ||
+        admission.last_sequence == UINT64_MAX || !EnsureWriterLease(true) || !CloseAppendFileHandle()) return false;
+    continuation_admission_ = admission; continuation_authority_ = std::move(retained_authority);
+    if (protected_state_)
+    {
+        protected_state_->poisoned = false; protected_state_->head_mismatch = false;
+        protected_state_->write_pending = false;
+    }
+    auto read = ReadProtected(options_.protected_persistence->read_limits,
+        options_.protected_persistence->max_allocation_bytes, true);
+    const bool valid = read.status == ReadStatus::Ok && !read.recovered_torn_tail;
+    WipeRecords(read.records);
+    if (!valid) { continuation_admission_.reset(); continuation_authority_.reset(); }
+    return valid;
+}
+
+WriteAheadLog::ReadResult WriteAheadLog::ReadAllAtProtectedHead(const ProtectedHistoryHead& expected) const
+{
+    std::lock_guard<std::recursive_mutex> lock(WalOperationMutex(options_.path));
+    ReadResult failed{}; failed.status = ReadStatus::Corrupt;
+    if (!options_.protected_persistence || !ProtectedHeadValid(expected, continuation_admission_.has_value())) return failed;
+    try
+    {
+        auto decoded = ReadProtected(options_.protected_persistence->read_limits, options_.protected_persistence->max_allocation_bytes, true);
+        ProtectedReadExceptionCleanup cleanup{decoded}; std::vector<std::uint8_t> bytes; ProtectedHead head;
+        if (append_handle_ && decoded.status == ReadStatus::Ok &&
+            ProtectedReadBounded(static_cast<HANDLE>(append_handle_), bytes, options_.max_bytes) && ProtectedHeadOf(bytes, decoded, head) &&
+            (continuation_admission_ && decoded.records.empty() ? (head.last_sequence = continuation_admission_->last_sequence, true) : true) && head == expected)
+        {
+            protected_state_->head_mismatch = false; return decoded;
+        }
+        WipeRecords(decoded.records);
+        if (protected_state_) { protected_state_->head_mismatch = true; (void)CloseAppendFileHandle(); }
+        return failed;
+    }
+    catch (...)
+    {
+        if (protected_state_) { protected_state_->head_mismatch = true; (void)CloseAppendFileHandle(); }
+        return failed;
+    }
+}
+
+WriteAheadLog::CompactionResult WriteAheadLog::CompactProtectedWithResult(std::uint64_t floor,
+    const ProtectedHistoryHead& expected, ProtectedHistoryHead& replacement, std::uint64_t generation) const
+{
+    std::lock_guard<std::recursive_mutex> lock(WalOperationMutex(options_.path)); replacement = {};
+    bool wrote = false;
+    const auto cut = [&](std::string_view stage) { return fault_injection_hook_ && fault_injection_hook_(stage); };
+    const auto failed = [&]() {
+        if (wrote && protected_state_) { protected_state_->poisoned = true; (void)CloseAppendFileHandle(); }
+        return wrote ? CompactionResult::BytesMayHavePersisted : CompactionResult::RejectedBeforeWrite;
+    };
+    try
+    {
+        if (continuation_admission_ || !options_.protected_persistence || !ProtectedHeadValid(expected) || !floor || floor > expected.last_sequence + 1 ||
+            !EnsureProtectedState() || protected_state_->poisoned || protected_state_->head_mismatch || !EnsureWriterLease() ||
+            (generation && generation != writer_lease_generation_)) return failed();
+        auto records = ReadProtected(options_.protected_persistence->read_limits, options_.protected_persistence->max_allocation_bytes, true);
+        ProtectedRecordCleanup cleanup{records}; std::vector<std::uint8_t> original; ProtectedHead actual;
+        if (!append_handle_ || records.status != ReadStatus::Ok ||
+            !ProtectedReadBounded(static_cast<HANDLE>(append_handle_), original, options_.max_bytes) ||
+            !ProtectedHeadOf(original, records, actual) || actual != expected) return failed();
+        const auto pending = ProtectedSibling(options_.path, L".compact.pnext");
+        const auto old = ProtectedSibling(options_.path, L".compact.pold");
+        const auto archive = ProtectedArchive(options_.path, L".pcold.", expected.sha256);
+        if (!ProtectedPathSyntax(pending) || !ProtectedPathSyntax(old) || !ProtectedPathSyntax(archive) ||
+            !PathIsAbsent(pending) || !PathIsAbsent(old) || !PathIsAbsent(archive)) return failed();
+        // Readable deferred/reopened bytes do not prove durability. The replacement
+        // receipt depends on this exact original surviving every later rename cut.
+        if (cut("pcompact-original-flush") || !ProtectedExactHandle(static_cast<HANDLE>(append_handle_), options_.path, false) ||
+            !FlushAppendHandle() || !ProtectedExactHandle(static_cast<HANDLE>(append_handle_), options_.path, false) ||
+            cut("pcompact-after-original-flush")) return failed();
+        const auto keep = ProtectedRetention(records.records, floor);
+        ProtectedCheckpoint proof; proof.previous = expected; proof.floor = floor;
+        proof.retained = static_cast<std::uint64_t>(std::count(keep.begin(), keep.end(), std::uint8_t{1}));
+        if (!ProtectedSemanticStart(proof.semantic) || !ProtectedWalkKept(options_, original, records.records, keep,
+            [&](auto plain) { return ProtectedSemanticStep(proof.semantic, plain); })) return failed();
+        std::uint64_t size = 16 + kCheckpointPlainBytes + 80;
+        if (!ProtectedWalkKept(options_, original, records.records, keep, [&](auto plain) { size += plain.size() + 80; return true; }) ||
+            size > options_.max_bytes || original.size() + size > options_.protected_persistence->max_allocation_bytes / 8 ||
+            records.records.size() + proof.retained > (options_.protected_persistence->max_allocation_bytes - (original.size() + size) * 8) / (2 * sizeof(Record) + 64)) return failed();
+        if (cut("pcompact-before-reseal")) return failed();
+        if (!protected_state_->epoch)
+        {
+            auto epoch = jc::ProtectedJournalEpoch::AcquireWriter(options_.protected_persistence->key_directory.wstring(), options_.protected_persistence->source_binding);
+            if (!epoch) return failed(); protected_state_->epoch = std::move(epoch.epoch);
+        }
+        std::vector<std::uint8_t> encrypted(kProtectedWalHeader.begin(), kProtectedWalHeader.end()); encrypted.reserve(static_cast<std::size_t>(size));
+        ProtectedPosition at; at.offset = 16;
+        const auto seal = [&](std::span<const std::byte> plain, std::uint64_t sequence) {
+            jc::JournalRecordContext context{}; if (!ProtectedContext(options_, at, context)) return false;
+            auto frame = protected_state_->epoch->Seal(context, plain); if (!frame) return false;
+            const auto b = frame.bytes.Bytes(); encrypted.insert(encrypted.end(), reinterpret_cast<const std::uint8_t*>(b.data()), reinterpret_cast<const std::uint8_t*>(b.data() + b.size()));
+            return ProtectedAdvance(at, b, sequence);
+        };
+        auto anchor = ProtectedCheckpointEncode(proof);
+        const bool sealed_anchor = seal(anchor, 0); SecureZeroMemory(anchor.data(), anchor.size());
+        if (!sealed_anchor) return failed();
+        std::size_t index = 0;
+        if (!ProtectedWalkKept(options_, original, records.records, keep, [&](auto plain) {
+            while (index < keep.size() && !keep[index]) ++index;
+            return index < keep.size() && seal(plain, records.records[index++].sequence);
+        }) || encrypted.size() != size || cut("pcompact-before-create")) return failed();
+        ProtectedHandle candidate(OpenWalFile(pending, GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr, CREATE_NEW,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH, nullptr));
+        if (candidate.value == INVALID_HANDLE_VALUE) return failed(); wrote = true;
+        if (!ProtectedExactHandle(candidate.value, pending, false) || cut("pcompact-after-create")) return failed();
+        DWORD written = 0;
+        if (cut("pcompact-partial-write")) { (void)WriteFile(candidate.value, encrypted.data(), 13, &written, nullptr); return failed(); }
+        if (!WriteFile(candidate.value, encrypted.data(), static_cast<DWORD>(encrypted.size()), &written, nullptr) || written != encrypted.size() ||
+            cut("pcompact-after-write") || cut("pcompact-flush") || !FlushFileBuffers(candidate.value) || cut("pcompact-after-flush")) return failed();
+        std::vector<std::uint8_t> readback; ReadResult verified; ProtectedRecordCleanup verified_cleanup{verified}; ProtectedHead new_head; ProtectedCheckpoint checked;
+        if (!ProtectedReadBlob(candidate.value, pending, options_, readback, verified, new_head, checked) || readback != encrypted ||
+            checked.previous != expected || cut("pcompact-after-readback")) return failed();
+        CloseHandle(std::exchange(candidate.value, INVALID_HANDLE_VALUE));
+        const auto result = RecoverProtectedCompaction(expected, floor, ProtectedRecoveryChoice::PromoteReplacement, replacement);
+        return result == CompactionResult::RejectedBeforeWrite ? failed() : result;
+    }
+    catch (...) { return failed(); }
+}
+
+WriteAheadLog::CompactionResult WriteAheadLog::RecoverProtectedCompaction(const ProtectedHistoryHead& previous,
+    std::uint64_t floor, ProtectedRecoveryChoice choice, ProtectedHistoryHead& recovered) const
+{
+    std::lock_guard<std::recursive_mutex> lock(WalOperationMutex(options_.path)); recovered = {};
+    bool wrote = false;
+    const auto cut = [&](std::string_view stage) { return fault_injection_hook_ && fault_injection_hook_(stage); };
+    const auto failed = [&]() {
+        if (wrote && protected_state_) { protected_state_->poisoned = true; (void)CloseAppendFileHandle(); }
+        return wrote ? CompactionResult::BytesMayHavePersisted : CompactionResult::RejectedBeforeWrite;
+    };
+    try
+    {
+        if (!options_.protected_persistence || !ProtectedHeadValid(previous) || !floor || floor > previous.last_sequence + 1 ||
+            (choice != ProtectedRecoveryChoice::RetainOriginal && choice != ProtectedRecoveryChoice::PromoteReplacement) ||
+            !EnsureProtectedState(true) || !EnsureWriterLease(true) || !ProtectedPendingKnown(options_.path) ||
+            !DerivedWitnessNamespaceSettled(options_.path)) return failed();
+        (void)CloseAppendFileHandle();
+        const auto pending = ProtectedSibling(options_.path, L".compact.pnext"), old = ProtectedSibling(options_.path, L".compact.pold");
+        const auto archive = ProtectedArchive(options_.path, L".pcold.", previous.sha256);
+        if (!ProtectedPathSyntax(pending) || !ProtectedPathSyntax(old) || !ProtectedPathSyntax(archive)) return failed();
+        bool valid = true;
+        auto canonical = ProtectedOpenMaintenance(options_.path, valid);
+        auto predecessor = ProtectedOpenMaintenance(old, valid);
+        auto candidate = ProtectedOpenMaintenance(pending, valid);
+        if (!valid) return failed();
+        std::uint64_t total_bytes = 0;
+        for (auto h : {canonical.value, predecessor.value, candidate.value})
+            if (h != INVALID_HANDLE_VALUE)
+            {
+                std::uint64_t size = 0;
+                if (!TryGetPhysicalFileSize(h, size) || size > options_.max_bytes) return failed();
+                total_bytes += size;
+            }
+        if (total_bytes > options_.protected_persistence->max_allocation_bytes / 8) return failed();
+        ReadResult current_records, old_records, next_records;
+        ProtectedRecordCleanup c1{current_records}, c2{old_records}, c3{next_records};
+        std::vector<std::uint8_t> current_bytes, old_bytes, next_bytes;
+        ProtectedHead current_head, old_head, next_head; ProtectedCheckpoint current_proof, old_proof, next_proof;
+        if (canonical.value != INVALID_HANDLE_VALUE && !ProtectedReadBlob(canonical.value, options_.path, options_, current_bytes, current_records, current_head, current_proof)) return failed();
+        if (predecessor.value != INVALID_HANDLE_VALUE && !ProtectedReadBlob(predecessor.value, old, options_, old_bytes, old_records, old_head, old_proof)) return failed();
+        if (predecessor.value != INVALID_HANDLE_VALUE && (old_head != previous || current_head == previous)) return failed();
+        const bool original_canonical = canonical.value != INVALID_HANDLE_VALUE && current_head == previous;
+        // Also required for explicit recovery and a no-op RetainOriginal: the
+        // reopened handle has no reliable knowledge of earlier owners' flushes.
+        const auto flush_original_canonical = [&]() {
+            return !original_canonical || (!cut("precover-original-flush") &&
+                ProtectedExactHandle(canonical.value, options_.path, false) && FlushFileBuffers(canonical.value) &&
+                ProtectedExactHandle(canonical.value, options_.path, false) && !cut("precover-after-original-flush"));
+        };
+        if (choice == ProtectedRecoveryChoice::RetainOriginal)
+        {
+            if (!PathIsAbsent(archive)) return failed();
+            if (canonical.value != INVALID_HANDLE_VALUE && !original_canonical) return failed();
+            if (!original_canonical && predecessor.value == INVALID_HANDLE_VALUE) return failed();
+            if (!flush_original_canonical()) return failed();
+            if (candidate.value != INVALID_HANDLE_VALUE)
+            {
+                if (!ProtectedReadBounded(candidate.value, next_bytes, options_.max_bytes)) return failed();
+                std::array<std::uint8_t, 32> hash{};
+                if (!ComputeSha256(std::as_bytes(std::span(next_bytes)), hash)) return failed();
+                auto quarantine = ProtectedArchive(options_.path, L".pcfailed.", hash);
+                for (unsigned n = 0; !PathIsAbsent(quarantine) && n < 16; ++n)
+                    quarantine = std::filesystem::path(ProtectedArchive(options_.path, L".pcfailed.", hash).wstring() + L"." + std::to_wstring(n));
+                if (!ProtectedPathSyntax(quarantine) || !PathIsAbsent(quarantine) || cut("pcompact-before-quarantine")) return failed();
+                if (!RenameOpenedFileWithoutReplacing(candidate.value, quarantine)) return failed(); wrote = true;
+                if (!ProtectedExactHandle(candidate.value, quarantine, false) || cut("pcompact-after-quarantine") || !FlushFileBuffers(candidate.value)) return failed();
+            }
+            if (!original_canonical)
+            {
+                if (cut("pcompact-before-restore")) return failed();
+                if (!RenameOpenedFileWithoutReplacing(predecessor.value, options_.path)) return failed(); wrote = true;
+                if (!ProtectedExactHandle(predecessor.value, options_.path, false) || cut("pcompact-after-restore") || !FlushFileBuffers(predecessor.value)) return failed();
+            }
+        }
+        else
+        {
+            ProtectedHandle archived;
+            if (!original_canonical && predecessor.value == INVALID_HANDLE_VALUE)
+            {
+                archived.value = OpenWalFile(archive, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+                std::uint64_t archive_size = 0;
+                if (archived.value == INVALID_HANDLE_VALUE || !TryGetPhysicalFileSize(archived.value, archive_size) || archive_size > options_.max_bytes ||
+                    total_bytes + archive_size > options_.protected_persistence->max_allocation_bytes / 8 ||
+                    !ProtectedReadBlob(archived.value, archive, options_, old_bytes, old_records, old_head, old_proof) || old_head != previous) return failed();
+            }
+            if (candidate.value != INVALID_HANDLE_VALUE)
+            {
+                if (canonical.value != INVALID_HANDLE_VALUE && !original_canonical) return failed();
+                if (!ProtectedReadBlob(candidate.value, pending, options_, next_bytes, next_records, next_head, next_proof)) return failed();
+            }
+            else
+            {
+                if (canonical.value == INVALID_HANDLE_VALUE || original_canonical) return failed();
+                next_proof = current_proof; next_head = current_head;
+            }
+            const auto& proof = next_proof;
+            if (proof.previous != previous || proof.floor != floor || proof.retained != (candidate.value != INVALID_HANDLE_VALUE ? next_records.records.size() : current_records.records.size())) return failed();
+            const auto& source_records = original_canonical ? current_records.records : old_records.records;
+            const auto& source_bytes = original_canonical ? current_bytes : old_bytes;
+            const auto keep = ProtectedRetention(source_records, floor);
+            std::array<std::uint8_t, 32> digest{};
+            if (static_cast<std::uint64_t>(std::count(keep.begin(), keep.end(), std::uint8_t{1})) != proof.retained ||
+                !ProtectedSemanticStart(digest) || !ProtectedWalkKept(options_, source_bytes, source_records, keep,
+                    [&](auto plain) { return ProtectedSemanticStep(digest, plain); }) || digest != proof.semantic) return failed();
+            if (predecessor.value != INVALID_HANDLE_VALUE || original_canonical)
+                if (!PathIsAbsent(archive)) return failed();
+            if (!flush_original_canonical()) return failed();
+            if (original_canonical)
+            {
+                if (cut("pcompact-before-old-rename")) return failed();
+                if (!RenameOpenedFileWithoutReplacing(canonical.value, old)) return failed(); wrote = true;
+                if (!ProtectedExactHandle(canonical.value, old, false) || cut("pcompact-after-old-rename") || cut("pcompact-old-flush") || !FlushFileBuffers(canonical.value)) return failed();
+            }
+            if (candidate.value != INVALID_HANDLE_VALUE)
+            {
+                if (cut("pcompact-before-new-rename")) return failed();
+                if (!RenameOpenedFileWithoutReplacing(candidate.value, options_.path)) return failed(); wrote = true;
+                if (!ProtectedExactHandle(candidate.value, options_.path, false) || cut("pcompact-after-new-rename") || cut("pcompact-new-flush") || !FlushFileBuffers(candidate.value)) return failed();
+            }
+            const auto old_handle = original_canonical ? canonical.value : predecessor.value;
+            if (old_handle != INVALID_HANDLE_VALUE)
+            {
+                if (cut("pcompact-before-archive")) return failed();
+                if (!RenameOpenedFileWithoutReplacing(old_handle, archive)) return failed(); wrote = true;
+                if (!ProtectedExactHandle(old_handle, archive, false) || cut("pcompact-after-archive") || cut("pcompact-archive-flush") || !FlushFileBuffers(old_handle)) return failed();
+            }
+        }
+        for (auto* h : {&canonical.value, &predecessor.value, &candidate.value})
+            if (*h != INVALID_HANDLE_VALUE) CloseHandle(std::exchange(*h, INVALID_HANDLE_VALUE));
+        if (cut("pcompact-before-reopen")) return failed();
+        protected_state_->poisoned = false; protected_state_->head_mismatch = false;
+        if (!CaptureProtectedHistoryHead(recovered)) return failed();
+        return CompactionResult::Succeeded;
+    }
+    catch (...) { return failed(); }
+}
+
+namespace
+{
+constexpr std::size_t kDerivedBodyLimit = 900 * 1024, kDerivedReceiptBytes = 512;
+constexpr std::size_t kDerivedReceiptFrame = kDerivedReceiptBytes + 80;
+constexpr std::string_view kDerivedChunkPath = "\\encrypted-publication-chunk-v2";
+constexpr std::string_view kDerivedEndPath = "\\encrypted-publication-end-v2";
+struct DerivedInspection
+{
+    ProtectedPosition position;
+    std::uint64_t matched = 0;
+};
+struct DerivedReceipt
+{
+    std::array<std::byte, 264> authority{};
+    PhysicalFileIdentity old_id{}, candidate_id{};
+    std::uint64_t old_bytes = 0, records = 0;
+    std::array<std::uint8_t, 32> old_hash{}, semantic{};
+    DerivedInspection stop;
+    ProtectedHead candidate;
+};
+template<class T> bool DerivedNonzero(const T& bytes)
+{ return std::any_of(bytes.begin(), bytes.end(), [](auto b) { return b != decltype(b){}; }); }
+bool DerivedSameId(const PhysicalFileIdentity& a, const PhysicalFileIdentity& b)
+{ return a.volume_serial == b.volume_serial && a.file_id == b.file_id; }
+bool DerivedHashFile(HANDLE h, std::uint64_t cap, std::uint64_t& size,
+    std::array<std::uint8_t, 32>& digest, PhysicalFileIdentity& id)
+{
+    if (!TryGetPhysicalFileSize(h, size) || size > cap || !TryGetPhysicalFileIdentity(h, id)) return false;
+    DWORD object_bytes = 0, got = 0;
+    if (BCryptGetProperty(BCRYPT_SHA256_ALG_HANDLE, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_bytes),
+        sizeof(object_bytes), &got, 0) < 0 || got != sizeof(object_bytes) || !object_bytes) return false;
+    auto object = cc::SecureBytes::Allocate(object_bytes), buffer = cc::SecureBytes::Allocate(64 * 1024);
+    if (!object || !buffer) return false;
+    struct Hash { BCRYPT_HASH_HANDLE h = nullptr; ~Hash() { if (h) BCryptDestroyHash(h); } } hash;
+    if (BCryptCreateHash(BCRYPT_SHA256_ALG_HANDLE, &hash.h, reinterpret_cast<PUCHAR>(object.bytes.Bytes().data()),
+        static_cast<ULONG>(object.bytes.Size()), nullptr, 0, 0) < 0 || !SetFilePointerEx(h, {}, nullptr, FILE_BEGIN)) return false;
+    for (std::uint64_t at = 0; at < size;)
+    {
+        const auto n = static_cast<DWORD>((std::min)(size - at, std::uint64_t{64 * 1024})); DWORD read = 0;
+        if (!ReadFile(h, buffer.bytes.Bytes().data(), n, &read, nullptr) || read != n ||
+            BCryptHashData(hash.h, reinterpret_cast<PUCHAR>(buffer.bytes.Bytes().data()), n, 0) < 0) return false;
+        at += n;
+    }
+    std::uint64_t after = 0; PhysicalFileIdentity identity{};
+    return BCryptFinishHash(hash.h, digest.data(), static_cast<ULONG>(digest.size()), 0) >= 0 &&
+        TryGetPhysicalFileSize(h, after) && after == size && TryGetPhysicalFileIdentity(h, identity) && DerivedSameId(identity, id);
+}
+bool DerivedRecordsDigest(std::span<const WriteAheadLog::Record> records, std::array<std::uint8_t, 32>& digest)
+{
+    constexpr std::string_view domain = "APFS-DERIVED-WITNESS-RECORDS1";
+    if (!ComputeSha256(std::as_bytes(std::span(domain)), digest)) return false;
+    for (const auto& r : records) {
+        auto plain = EncodeProtectedWalRecord(r);
+        if (!plain || !ProtectedSemanticStep(digest, plain.bytes.Bytes())) return false;
+    }
+    return true;
+}
+bool DerivedReceiptContext(const WriteAheadLog::Options& o, jc::JournalRecordContext& context)
+{
+    context = {}; std::array<std::byte, 128> b{};
+    constexpr std::string_view domain = "APFS-DERIVED-WITNESS-RESET1";
+    std::memcpy(b.data(), domain.data(), domain.size());
+    std::memcpy(b.data() + 32, o.protected_persistence->journal_identity.data(), 32);
+    std::array<std::uint8_t, 32> volume{};
+    if (!ComputeSha256(std::as_bytes(std::span(o.volume_identity)), volume)) return false;
+    std::memcpy(b.data() + 64, volume.data(), 32); std::array<std::uint8_t, 32> digest{};
+    if (!ComputeSha256(b, digest)) return false;
+    std::memcpy(context.operation.data(), digest.data(), 32); context.purpose = 0x57414c03u;
+    return true;
+}
+cc::CryptoResult DerivedEncodeReceipt(const DerivedReceipt& r)
+{
+    auto encoded = cc::SecureBytes::Allocate(kDerivedReceiptBytes); if (!encoded) return encoded;
+    auto b = encoded.bytes.Bytes(); std::memcpy(b.data(), r.authority.data(), 224);
+    std::memcpy(b.data() + 464, r.authority.data() + 224, 40);
+    ProtectedPut64(b, 224, r.old_id.volume_serial); ProtectedPut64(b, 232, r.old_id.file_id);
+    ProtectedPut64(b, 240, r.old_bytes); std::memcpy(b.data() + 248, r.old_hash.data(), 32);
+    ProtectedPut64(b, 280, r.stop.position.offset); ProtectedPut64(b, 288, r.stop.matched);
+    ProtectedPut64(b, 296, r.stop.position.ordinal); ProtectedPut64(b, 304, r.stop.position.sequence);
+    std::memcpy(b.data() + 312, r.stop.position.previous.data(), 32); ProtectedPut64(b, 344, 1);
+    std::memcpy(b.data() + 352, r.semantic.data(), 32); ProtectedPut64(b, 384, r.records);
+    ProtectedPut64(b, 392, r.candidate_id.volume_serial); ProtectedPut64(b, 400, r.candidate_id.file_id);
+    std::memcpy(b.data() + 408, r.candidate.sha256.data(), 32);
+    ProtectedPut64(b, 440, r.candidate.bytes); ProtectedPut64(b, 448, r.candidate.records); ProtectedPut64(b, 456, r.candidate.last_sequence);
+    return encoded;
+}
+bool DerivedDecodeReceipt(std::span<const std::byte> plain, DerivedReceipt& r)
+{
+    if (plain.size() != kDerivedReceiptBytes || std::memcmp(plain.data(), "WRSTV001", 8)) return false;
+    const auto b = std::span(reinterpret_cast<const std::uint8_t*>(plain.data()), plain.size());
+    if (ReadU64(b, 8) != 1 || ReadU64(b, 344) != 1 ||
+        std::any_of(plain.begin() + 504, plain.end(), [](auto v) { return v != std::byte{}; }) ||
+        ReadU64(b, 464) < 88 || ReadU64(b, 464) > 4096) return false;
+    std::memcpy(r.authority.data(), plain.data(), 224); std::memcpy(r.authority.data() + 224, plain.data() + 464, 40);
+    if (ReadU64(b, 224) > UINT32_MAX || ReadU64(b, 392) > UINT32_MAX) return false;
+    r.old_id.volume_serial = static_cast<std::uint32_t>(ReadU64(b, 224)); r.old_id.file_id = ReadU64(b, 232);
+    r.old_bytes = ReadU64(b, 240); std::memcpy(r.old_hash.data(), b.data() + 248, 32);
+    r.stop.position.offset = ReadU64(b, 280); r.stop.matched = ReadU64(b, 288);
+    r.stop.position.ordinal = ReadU64(b, 296); r.stop.position.sequence = ReadU64(b, 304);
+    std::memcpy(r.stop.position.previous.data(), b.data() + 312, 32);
+    std::memcpy(r.semantic.data(), b.data() + 352, 32); r.records = ReadU64(b, 384);
+    r.candidate_id.volume_serial = static_cast<std::uint32_t>(ReadU64(b, 392)); r.candidate_id.file_id = ReadU64(b, 400);
+    std::memcpy(r.candidate.sha256.data(), b.data() + 408, 32);
+    r.candidate.bytes = ReadU64(b, 440); r.candidate.records = ReadU64(b, 448); r.candidate.last_sequence = ReadU64(b, 456);
+    // v8 receipts count the retained predecessors as well as the selected packet.
+    return r.old_bytes > kProtectedAnchorBytes && r.old_bytes <= (64ull << 20) && r.stop.position.offset >= kProtectedAnchorBytes &&
+        r.stop.position.offset < r.old_bytes && r.records >= 2 && r.records <= 4096 && r.stop.matched && r.stop.matched < r.records &&
+        r.stop.position.ordinal && r.stop.position.ordinal <= 4097 && r.stop.position.sequence < UINT64_MAX &&
+        DerivedNonzero(r.old_hash) && DerivedNonzero(r.semantic) && ProtectedHeadValid(r.candidate) &&
+        r.candidate.records == r.records && r.candidate.last_sequence == r.records;
+}
+bool DerivedPartialHeader(std::span<const std::uint8_t> bytes, std::uint64_t expected, bool wal_header = false)
+{
+    if (wal_header) return bytes.size() < kProtectedWalHeader.size() &&
+        std::equal(bytes.begin(), bytes.end(), kProtectedWalHeader.begin());
+    if (bytes.empty() || bytes.size() >= expected || expected > jc::kMaxJournalRecordBytes) return false;
+    std::array<std::byte, 64> header{};
+    std::memcpy(header.data(), "APFSREC1", 8); ProtectedPut64(header, 8, (std::uint64_t{64} << 32) | 1);
+    ProtectedPut64(header, 16, ((expected - 64) << 32) | expected);
+    if (!std::equal(bytes.begin(), bytes.begin() + (std::min)(bytes.size(), std::size_t{24}),
+        reinterpret_cast<const std::uint8_t*>(header.data()))) return false;
+    for (auto i = std::size_t{52}; i < (std::min)(bytes.size(), std::size_t{64}); ++i) if (bytes[i]) return false;
+    return true;
+}
+bool DerivedInspect(const WriteAheadLog::Options& o, std::span<const std::uint8_t> bytes,
+    std::span<const WriteAheadLog::Record> expected,
+    const std::function<bool(std::span<const WriteAheadLog::Record>)>& typed, DerivedInspection& inspection)
+{
+    using Wal = WriteAheadLog;
+    if (bytes.size() < kProtectedAnchorBytes || !std::equal(kProtectedWalHeader.begin(), kProtectedWalHeader.end(), bytes.begin())) return false;
+    std::size_t stop = 16;
+    while (stop < bytes.size()) {
+        const auto left = bytes.subspan(stop);
+        if (left.size() < 80) break;
+        if (std::memcmp(left.data(), "APFSREC1", 8) || ReadU32(left, 8) != 1 || ReadU32(left, 12) != 64) return false;
+        const auto n = ReadU32(left, 16); if (n < 80 || n > jc::kMaxJournalRecordBytes) return false;
+        if (n > left.size()) break; stop += n;
+    }
+    if (stop < kProtectedAnchorBytes || stop == bytes.size()) return false;
+    ProtectedPosition at; ProtectedCheckpoint checkpoint;
+    auto decoded = DecodeProtectedWal(bytes.first(stop), o, {o.protected_persistence->read_limits.bytes,
+        (std::min)(std::size_t{4096}, o.protected_persistence->read_limits.records)}, o.protected_persistence->max_allocation_bytes, at, &checkpoint);
+    ProtectedRecordCleanup wipe{decoded};
+    if (decoded.status != Wal::ReadStatus::Ok || checkpoint.floor) return false;
+    std::size_t selected = 0; const auto accepted = expected.front().parent_object_id;
+    for (std::size_t n = 0; n < decoded.records.size(); ++n) {
+        const auto& r = decoded.records[n];
+        if (r.sequence != n + 1 || !r.parent_object_id || r.parent_object_id > accepted ||
+            (selected && r.parent_object_id != accepted)) return false;
+        if (r.parent_object_id == accepted) {
+            if (selected >= expected.size()) return false;
+            auto row = expected[selected++]; struct Wipe { Wal::Record& r; ~Wipe() { WipeRecord(r); } } guard{row};
+            row.sequence = r.sequence;
+            auto a = EncodeProtectedWalRecord(r), b = EncodeProtectedWalRecord(row);
+            if (!a || !b || a.bytes.Size() != b.bytes.Size() || !std::equal(a.bytes.Bytes().begin(), a.bytes.Bytes().end(), b.bytes.Bytes().begin())) return false;
+        }
+    }
+    if (!selected || selected >= expected.size() || at.sequence == UINT64_MAX - 1 || !typed(decoded.records)) return false;
+    auto next = expected[selected]; struct Wipe { Wal::Record& r; ~Wipe() { WipeRecord(r); } } guard{next};
+    next.sequence = at.sequence + 1; auto plain = EncodeProtectedWalRecord(next);
+    if (!plain || !DerivedPartialHeader(bytes.subspan(stop), plain.bytes.Size() + 80)) return false;
+    // Once the whole epoch ID is physically present, use the accepted Open path
+    // to distinguish a valid bound immutable slot from missing/corrupt keys. The
+    // probe never supplies records or publishes any plaintext result.
+    if (bytes.size() - stop >= 40) {
+        std::vector<std::uint8_t> probe(plain.bytes.Size() + 80);
+        std::memcpy(probe.data(), bytes.data() + stop, (std::min)(bytes.size() - stop, std::size_t{64}));
+        jc::JournalRecordContext context{}; if (!ProtectedContext(o, at, context)) return false;
+        auto result = jc::ProtectedJournalEpoch::Open(o.protected_persistence->key_directory.wstring(),
+            o.protected_persistence->source_binding, context, std::as_bytes(std::span(probe)));
+        if (!result && result.status.error != jc::JournalError::IntegrityFailure) return false;
+    }
+    inspection = {at, selected}; return true;
+}
+struct DerivedFile
+{
+    std::filesystem::path path;
+    ProtectedHandle handle;
+    std::uint64_t bytes = 0;
+    PhysicalFileIdentity id{};
+    std::array<std::uint8_t, 32> hash{};
+};
+bool DerivedRefresh(DerivedFile& file, std::uint64_t cap)
+{ return ProtectedExactHandle(file.handle.value, file.path, false) && DerivedHashFile(file.handle.value, cap, file.bytes, file.hash, file.id); }
+bool DerivedReadReceipt(DerivedFile& file, const WriteAheadLog::Options& o, DerivedReceipt& receipt)
+{
+    if (file.bytes != kDerivedReceiptFrame) return false;
+    std::vector<std::uint8_t> b; if (!ProtectedReadBounded(file.handle.value, b, kDerivedReceiptFrame)) return false;
+    jc::JournalRecordContext context{}; if (!DerivedReceiptContext(o, context)) return false;
+    auto result = jc::ProtectedJournalEpoch::Open(o.protected_persistence->key_directory.wstring(),
+        o.protected_persistence->source_binding, context, std::as_bytes(std::span(b)));
+    return result && DerivedDecodeReceipt(result.bytes.Bytes(), receipt);
+}
+bool DerivedCandidate(DerivedFile& file, const WriteAheadLog::Options& o, std::span<const WriteAheadLog::Record> expected,
+    const std::array<std::uint8_t, 32>& semantic, ProtectedHead& head)
+{
+    std::vector<std::uint8_t> b; WriteAheadLog::ReadResult result; ProtectedRecordCleanup wipe{result}; ProtectedCheckpoint proof;
+    std::array<std::uint8_t, 32> digest{};
+    return ProtectedReadBlob(file.handle.value, file.path, o, b, result, head, proof) && !proof.floor &&
+        result.records.size() == expected.size() && DerivedRecordsDigest(result.records, digest) && digest == semantic;
+}
+}
+
+WriteAheadLog::CompactionResult WriteAheadLog::RebuildDerivedWitnessV4(
+    std::span<const Record> expected, const DerivedWitnessAuthorizer& authorize,
+    const std::function<bool()>& original_barrier, ProtectedHistoryHead& replacement) const
+{ return RebuildDerivedWitness(4, expected, authorize, original_barrier, replacement); }
+
+WriteAheadLog::CompactionResult WriteAheadLog::RebuildDerivedWitnessV8(
+    std::span<const Record> expected, const DerivedWitnessAuthorizer& authorize,
+    const std::function<bool()>& original_barrier, ProtectedHistoryHead& replacement) const
+{ return RebuildDerivedWitness(8, expected, authorize, original_barrier, replacement); }
+
+WriteAheadLog::CompactionResult WriteAheadLog::RebuildDerivedWitness(
+    std::uint64_t expected_version, std::span<const Record> expected, const DerivedWitnessAuthorizer& authorize,
+    const std::function<bool()>& original_barrier, ProtectedHistoryHead& replacement) const
+{
+    std::lock_guard<std::recursive_mutex> lock(WalOperationMutex(options_.path)); replacement = {};
+    bool wrote = false;
+    const auto cut = [&](std::string_view stage) { return fault_injection_hook_ && fault_injection_hook_(stage); };
+    const auto failed = [&]() {
+        replacement = {};
+        if (wrote && protected_state_) { protected_state_->poisoned = true; (void)CloseAppendFileHandle(); }
+        return wrote ? CompactionResult::BytesMayHavePersisted : CompactionResult::RejectedBeforeWrite;
+    };
+    try
+    {
+        if ((expected_version != 4 && expected_version != 8) || continuation_admission_ || !options_.protected_persistence || !authorize || !original_barrier || !ProtectedConfigValid(options_) || expected.size() < 2 || expected.size() > 226 ||
+            expected.size() > options_.protected_persistence->read_limits.records) return failed();
+        DerivedWitnessResetAuthority a;
+        a.source_binding = options_.protected_persistence->source_binding;
+        a.accepted_sequence = expected.front().parent_object_id; a.transaction_id = expected.front().transaction_id; a.inode = expected.front().object_id;
+        if (expected.front().inline_payload.size() < 88 || expected.back().inline_payload.size() != 88) return failed();
+        const auto first = std::span(reinterpret_cast<const std::uint8_t*>(expected.front().inline_payload.data()), expected.front().inline_payload.size());
+        const auto terminal = std::span(reinterpret_cast<const std::uint8_t*>(expected.back().inline_payload.data()), expected.back().inline_payload.size());
+        a.template_bytes = ReadU64(first, 40); a.body_bytes = ReadU64(terminal, 40);
+        if (ReadU64(first, 48) != 32) return failed();
+        std::memcpy(a.template_sha256.data(), first.data() + 56, 32); std::memcpy(a.body_sha256.data(), terminal.data() + 56, 32);
+        if (!a.accepted_sequence || a.accepted_sequence == UINT64_MAX || !a.transaction_id || a.transaction_id == UINT64_MAX || a.inode < 16 ||
+            !a.template_bytes || a.template_bytes > kDerivedBodyLimit || a.body_bytes < 88 || a.body_bytes > kDerivedBodyLimit ||
+            !DerivedNonzero(a.template_sha256) || !DerivedNonzero(a.body_sha256)) return failed();
+        const auto next_path = ProtectedSibling(options_.path, L".wreset.next"), intent_path = ProtectedSibling(options_.path, L".wreset.intent");
+        const auto old_path = ProtectedSibling(options_.path, L".wreset.old");
+        std::array<std::uint8_t, 32> dummy{};
+        if (!ProtectedPathSyntax(next_path) || !ProtectedPathSyntax(intent_path) || !ProtectedPathSyntax(old_path) ||
+            !ProtectedPathSyntax(ProtectedArchive(options_.path, L".wrsaved.", dummy)) ||
+            !ProtectedPathSyntax(ProtectedArchive(options_.path, L".wrdone.", dummy)) ||
+            !ProtectedPathSyntax(std::filesystem::path(ProtectedArchive(options_.path, L".wrfail.", dummy).wstring() + L".15"))) return failed();
+        std::vector<std::byte> body;
+        struct BodyCleanup { std::vector<std::byte>& bytes; ~BodyCleanup() { if (!bytes.empty()) SecureZeroMemory(bytes.data(), bytes.size()); } } body_cleanup{body};
+        body.reserve(static_cast<std::size_t>(a.body_bytes));
+        std::uint64_t candidate_bytes = kProtectedAnchorBytes;
+        for (std::size_t n = 0; n < expected.size(); ++n)
+        {
+            const auto& r = expected[n];
+            if (r.volume_identity != options_.volume_identity || r.sequence != n + 1 || r.operation != OperationKind::Write ||
+                r.state != RecordState::Prepared || r.parent_object_id != a.accepted_sequence || r.transaction_id != a.transaction_id ||
+                r.object_id != a.inode || r.flags || r.payload_spool_id || r.payload_offset || r.unlink_outcome ||
+                !r.secondary_path_utf8.empty() || r.inline_payload.empty() || r.inline_payload.size() > 4096 || !InlinePayloadIsConsistent(r)) return failed();
+            if (n + 1 < expected.size()) {
+                if (r.path_utf8 != kDerivedChunkPath || r.logical_offset != body.size() ||
+                    body.size() >= a.body_bytes || r.inline_payload.size() != (std::min)(std::uint64_t{4096}, a.body_bytes - body.size())) return failed();
+                body.insert(body.end(), r.inline_payload.begin(), r.inline_payload.end());
+            } else {
+                const auto b = std::span(reinterpret_cast<const std::uint8_t*>(r.inline_payload.data()), r.inline_payload.size());
+                if (r.path_utf8 != kDerivedEndPath || r.logical_offset || b.size() != 88 || ReadU64(b, 0) != 2 ||
+                    ReadU64(b, 8) != a.accepted_sequence || ReadU64(b, 16) != a.transaction_id || ReadU64(b, 24) != a.inode ||
+                    ReadU64(b, 32) != expected.size() - 1 || ReadU64(b, 40) != a.body_bytes || ReadU64(b, 48) != 32 ||
+                    std::memcmp(b.data() + 56, a.body_sha256.data(), 32)) return failed();
+            }
+            auto plain = EncodeProtectedWalRecord(r); if (!plain || plain.bytes.Size() > UINT64_MAX - candidate_bytes - 80) return failed();
+            candidate_bytes += plain.bytes.Size() + 80;
+        }
+        std::array<std::uint8_t, 32> body_hash{}, semantic{};
+        if (body.size() != a.body_bytes || ReadU64(std::span(reinterpret_cast<const std::uint8_t*>(body.data()), body.size()), 0) != expected_version ||
+            ReadU64(std::span(reinterpret_cast<const std::uint8_t*>(body.data()), body.size()), 8) != a.accepted_sequence ||
+            ReadU64(std::span(reinterpret_cast<const std::uint8_t*>(body.data()), body.size()), 16) != a.transaction_id ||
+            ReadU64(std::span(reinterpret_cast<const std::uint8_t*>(body.data()), body.size()), 24) != a.inode ||
+            !ComputeSha256(body, body_hash) || body_hash != a.body_sha256 || !DerivedRecordsDigest(expected, semantic)) return failed();
+        const auto& limits = *options_.protected_persistence;
+        if (candidate_bytes > options_.max_bytes || candidate_bytes > limits.read_limits.bytes ||
+            !EnsureProtectedState(true) || !EnsureWriterLease(true) || !CloseAppendFileHandle()) return failed();
+        // A reset cannot adopt or resolve any ordinary/protected compaction debt.
+        WIN32_FIND_DATAW found{};
+        auto search = FindFirstFileW((options_.path.wstring() + L".compact*").c_str(), &found);
+        if (search != INVALID_HANDLE_VALUE) { FindClose(search); return failed(); }
+        if (GetLastError() != ERROR_FILE_NOT_FOUND) return failed();
+        std::array<std::byte, 264> authority{};
+        bool valid = true;
+        const auto open = [&](const std::filesystem::path& path, std::uint64_t cap) {
+            auto f = std::make_unique<DerivedFile>(); f->path = path;
+            auto opened = ProtectedOpenMaintenance(path, valid); f->handle.value = std::exchange(opened.value, INVALID_HANDLE_VALUE);
+            if (f->handle.value == INVALID_HANDLE_VALUE) return std::unique_ptr<DerivedFile>{};
+            if (!DerivedRefresh(*f, cap)) valid = false;
+            return f;
+        };
+        auto canonical = open(options_.path, options_.max_bytes);
+        std::vector<std::unique_ptr<DerivedFile>> files;
+        DerivedFile* next = nullptr; DerivedFile* intent = nullptr; DerivedFile* old = nullptr; DerivedFile* done = nullptr;
+        std::uint64_t all_bytes = canonical ? canonical->bytes : 0; unsigned failed_files = 0, archive_files = 0;
+        DerivedReceipt receipt{}; bool have_receipt = false;
+        search = FindFirstFileW((options_.path.wstring() + L".wr*").c_str(), &found);
+        if (search != INVALID_HANDLE_VALUE)
+        {
+            struct Find { HANDLE h; ~Find() { FindClose(h); } } close{search};
+            do {
+                if (files.size() >= 67 || (found.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) return failed();
+                const auto path = options_.path.parent_path() / found.cFileName;
+                if (!ProtectedPathSyntax(path)) return failed();
+                const auto name = path.wstring(); const auto base = options_.path.wstring();
+                const bool pending = name == next_path.wstring() || name == intent_path.wstring() || name == old_path.wstring();
+                const bool saved = name.starts_with(base + L".wrsaved."), completed = name.starts_with(base + L".wrdone.");
+                const bool failed_artifact = name.starts_with(base + L".wrfail.");
+                if (!pending && !saved && !completed && !failed_artifact) return failed();
+                const auto cap = name == intent_path.wstring() || completed ? kDerivedReceiptFrame : options_.max_bytes;
+                auto f = open(path, cap); if (!valid || !f) return failed(); all_bytes += f->bytes;
+                if (all_bytes > limits.read_limits.bytes) return failed();
+                if (name == next_path.wstring()) next = f.get();
+                else if (name == intent_path.wstring()) intent = f.get();
+                else if (name == old_path.wstring()) old = f.get();
+                else {
+                    if (++archive_files > 64 || (failed_artifact && ++failed_files > 32)) return failed();
+                    const auto prefix = saved ? L".wrsaved." : completed ? L".wrdone." : L".wrfail.";
+                    const auto exact = ProtectedArchive(options_.path, prefix, f->hash).wstring();
+                    bool named = name == exact && !failed_artifact;
+                    if (failed_artifact) for (unsigned n = 0; n < 16; ++n) named |= name == exact + L"." + std::to_wstring(n);
+                    if (!named || (saved && f->bytes <= kProtectedAnchorBytes)) return failed();
+                    if (completed) {
+                        DerivedReceipt prior; if (!DerivedReadReceipt(*f, options_, prior)) return failed();
+                        const auto scope = std::span(reinterpret_cast<const std::uint8_t*>(prior.authority.data()), prior.authority.size());
+                        const bool selected_v8 = expected_version == 8 && ReadU64(scope, 112) == a.accepted_sequence &&
+                            ReadU64(scope, 120) == a.transaction_id && ReadU64(scope, 136) == a.inode &&
+                            ReadU64(scope, 144) == a.template_bytes && ReadU64(scope, 152) == a.body_bytes &&
+                            std::memcmp(scope.data() + 160, a.template_sha256.data(), 32) == 0 &&
+                            std::memcmp(scope.data() + 192, a.body_sha256.data(), 32) == 0;
+                        if (selected_v8 || (expected_version == 4 && prior.semantic == semantic &&
+                            prior.records == expected.size() && prior.candidate.bytes == candidate_bytes)) {
+                            if (done) return failed(); done = f.get(); receipt = prior;
+                        }
+                    }
+                }
+                files.push_back(std::move(f));
+            } while (FindNextFileW(search, &found));
+            if (GetLastError() != ERROR_NO_MORE_FILES) return failed();
+        }
+        else if (GetLastError() != ERROR_FILE_NOT_FOUND) return failed();
+        if (!valid) return failed();
+        wrote = next || intent || old;
+        const auto held_bytes = (canonical ? canonical->bytes : 0) + (next ? next->bytes : 0) + (old ? old->bytes : 0);
+        const auto conservative = held_bytes + candidate_bytes + a.template_bytes + a.body_bytes + kDerivedReceiptFrame;
+        const auto record_cap = (std::min)(std::size_t{4096}, limits.read_limits.records);
+        if (conservative > limits.max_allocation_bytes / 16 ||
+            record_cap + expected.size() > (limits.max_allocation_bytes - conservative * 16) / (2 * sizeof(Record) + 64)) return failed();
+        if (intent && intent->bytes == kDerivedReceiptFrame) {
+            if (!DerivedReadReceipt(*intent, options_, receipt) || done) return failed();
+            have_receipt = true;
+        } else if (done) {
+            if (next || intent || old) return failed();
+            have_receipt = true;
+        }
+        DerivedFile* raw = nullptr; DerivedFile* replacement_file = nullptr;
+        DerivedInspection inspection;
+        const auto matches_raw = [&](DerivedFile* f) {
+            return f && DerivedSameId(f->id, receipt.old_id) && f->bytes == receipt.old_bytes && f->hash == receipt.old_hash;
+        };
+        if (have_receipt) {
+            const auto archive_path = ProtectedArchive(options_.path, L".wrsaved.", receipt.old_hash);
+            DerivedFile* archive = nullptr;
+            for (auto& f : files) if (f->path == archive_path) archive = f.get();
+            for (auto* f : {canonical.get(), old, archive}) if (matches_raw(f)) { if (raw) return failed(); raw = f; }
+            if (!raw || (old && raw != old) || (archive && raw != archive)) return failed();
+            if (raw == canonical.get()) { if (!next || done) return failed(); replacement_file = next; }
+            else {
+                if (canonical && next) return failed(); replacement_file = canonical ? canonical.get() : next;
+                if (!replacement_file || (done && !canonical)) return failed();
+            }
+            if (!DerivedSameId(replacement_file->id, receipt.candidate_id)) return failed();
+        } else {
+            if (!canonical || old || archive_files > 62 || failed_files + static_cast<unsigned>(!!next) + static_cast<unsigned>(!!intent) > 32) return failed();
+            raw = canonical.get();
+            if (!PathIsAbsent(ProtectedArchive(options_.path, L".wrsaved.", raw->hash))) return failed();
+        }
+        unsigned key_entries = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(limits.key_directory)) {
+            if (++key_entries >= 4096) return failed();
+            const auto attributes = GetFileAttributesW(entry.path().c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) return failed();
+        }
+        std::vector<std::uint8_t> raw_bytes;
+        std::vector<Record> candidate_records(expected.begin(), expected.end());
+        struct CandidateCleanup {
+            std::vector<Record>& records;
+            ~CandidateCleanup() { for (auto& record : records) WipeRecord(record); }
+        } candidate_cleanup{candidate_records};
+        const auto typed = [&](std::span<const Record> prefix) {
+            DerivedWitnessResetAuthority minted;
+            if (!authorize(prefix, minted) || minted.source_binding != a.source_binding || !DerivedNonzero(minted.original_journal_identity) ||
+                !DerivedNonzero(minted.scope_binding) || minted.accepted_sequence != a.accepted_sequence || minted.transaction_id != a.transaction_id ||
+                !minted.preimage_xid || minted.preimage_xid == UINT64_MAX || minted.inode != a.inode || minted.template_bytes != a.template_bytes ||
+                minted.template_sha256 != a.template_sha256 || minted.body_bytes != a.body_bytes || minted.body_sha256 != a.body_sha256 ||
+                minted.authorization_bytes != expected.front().inline_payload.size() || minted.authorization_sha256 != expected.front().payload_sha256) return false;
+            // v8 retained owners and spent-authorization receipts remain live
+            // authority on restart. Keep their exact authenticated records.
+            if (expected_version == 8) {
+                const auto selected = std::find_if(prefix.begin(), prefix.end(),
+                    [&](const auto& record) { return record.parent_object_id == a.accepted_sequence; });
+                const auto prior = static_cast<std::size_t>(selected - prefix.begin());
+                if (prior > 4096 - expected.size()) return false;
+                for (auto& record : candidate_records) WipeRecord(record);
+                candidate_records.assign(prefix.begin(), selected);
+                for (const auto& record : expected) {
+                    candidate_records.push_back(record);
+                    candidate_records.back().sequence = candidate_records.size();
+                }
+                candidate_bytes = kProtectedAnchorBytes;
+                for (const auto& record : candidate_records) {
+                    auto plain = EncodeProtectedWalRecord(record);
+                    if (!plain || plain.bytes.Size() > UINT64_MAX - candidate_bytes - 80) return false;
+                    candidate_bytes += plain.bytes.Size() + 80;
+                }
+                if (candidate_records.size() > limits.read_limits.records || candidate_bytes > options_.max_bytes ||
+                    candidate_bytes > limits.read_limits.bytes || !DerivedRecordsDigest(candidate_records, semantic)) return false;
+                const auto held = held_bytes + candidate_bytes + a.template_bytes + a.body_bytes + kDerivedReceiptFrame;
+                if (held > limits.max_allocation_bytes / 16 || record_cap + candidate_records.size() >
+                    (limits.max_allocation_bytes - held * 16) / (2 * sizeof(Record) + 64)) return false;
+            }
+            a = minted;
+            std::memcpy(authority.data(), "WRSTV001", 8); ProtectedPut64(authority, 8, 1);
+            std::memcpy(authority.data() + 16, a.source_binding.data(), 32); std::memcpy(authority.data() + 48, a.original_journal_identity.data(), 32);
+            std::memcpy(authority.data() + 80, a.scope_binding.data(), 32); ProtectedPut64(authority, 112, a.accepted_sequence);
+            ProtectedPut64(authority, 120, a.transaction_id); ProtectedPut64(authority, 128, a.preimage_xid); ProtectedPut64(authority, 136, a.inode);
+            ProtectedPut64(authority, 144, a.template_bytes); ProtectedPut64(authority, 152, a.body_bytes);
+            std::memcpy(authority.data() + 160, a.template_sha256.data(), 32); std::memcpy(authority.data() + 192, a.body_sha256.data(), 32);
+            ProtectedPut64(authority, 224, a.authorization_bytes); std::memcpy(authority.data() + 232, a.authorization_sha256.data(), 32);
+            return true;
+        };
+        if (!ProtectedReadBounded(raw->handle.value, raw_bytes, options_.max_bytes) || !DerivedInspect(options_, raw_bytes, expected, typed, inspection)) return failed();
+        if (have_receipt) {
+            ProtectedHead head;
+            if (receipt.semantic != semantic || receipt.records != candidate_records.size() || receipt.candidate.bytes != candidate_bytes ||
+                !DerivedCandidate(*replacement_file, options_, candidate_records, semantic, head) || head != receipt.candidate) return failed();
+        }
+        if (have_receipt && (receipt.authority != authority || receipt.stop.matched != inspection.matched || receipt.stop.position.offset != inspection.position.offset ||
+            receipt.stop.position.ordinal != inspection.position.ordinal || receipt.stop.position.sequence != inspection.position.sequence ||
+            receipt.stop.position.previous != inspection.position.previous)) return failed();
+        if (!have_receipt) {
+            for (auto* f : {next, intent}) if (f) {
+                std::vector<std::uint8_t> b; if (!ProtectedReadBounded(f->handle.value, b, f == intent ? kDerivedReceiptFrame : candidate_bytes)) return failed();
+                if (f == intent) { if (!b.empty() && !DerivedPartialHeader(b, kDerivedReceiptFrame)) return failed(); }
+                else if (b.size() == candidate_bytes) { ProtectedHead h; if (!DerivedCandidate(*f, options_, candidate_records, semantic, h)) return failed(); }
+                else if (b.size() > candidate_bytes || !std::equal(b.begin(), b.begin() + (std::min)(b.size(), kProtectedWalHeader.size()), kProtectedWalHeader.begin())) return failed();
+            }
+        }
+        // These barriers are unconditional on every entry, including reopened
+        // complete receipts/candidates and already-durable original acceptance.
+        if (cut("wreset-before-original-barrier") || !original_barrier() || cut("wreset-after-original-barrier") ||
+            cut("wreset-raw-flush") || !FlushFileBuffers(raw->handle.value) || !DerivedRefresh(*raw, options_.max_bytes) ||
+            raw->bytes != raw_bytes.size() || !ComputeSha256(std::as_bytes(std::span(raw_bytes)), body_hash) || raw->hash != body_hash ||
+            cut("wreset-after-raw-flush")) return failed();
+        for (auto& f : files) if (!FlushFileBuffers(f->handle.value)) return failed();
+        if (!have_receipt)
+        {
+            for (auto* f : {next, intent}) if (f) {
+                std::filesystem::path quarantine;
+                for (unsigned n = 0; n < 16; ++n) {
+                    auto p = std::filesystem::path(ProtectedArchive(options_.path, L".wrfail.", f->hash).wstring() + L"." + std::to_wstring(n));
+                    if (PathIsAbsent(p)) { quarantine = std::move(p); break; }
+                }
+                if (quarantine.empty() || !ProtectedPathSyntax(quarantine) || cut("wreset-before-quarantine") ||
+                    !RenameOpenedFileWithoutReplacing(f->handle.value, quarantine)) return failed();
+                wrote = true; f->path = quarantine;
+                if (!ProtectedExactHandle(f->handle.value, f->path, false) || cut("wreset-after-quarantine") ||
+                    cut("wreset-quarantine-flush") || !FlushFileBuffers(f->handle.value)) return failed();
+            }
+            next = intent = nullptr;
+            if (cut("wreset-before-epoch")) return failed();
+            wrote = true; // Slot publication can persist even on a failed acquisition.
+            auto epoch = jc::ProtectedJournalEpoch::AcquireWriter(limits.key_directory.wstring(), limits.source_binding);
+            if (!epoch || cut("wreset-after-epoch")) return failed();
+            std::vector<std::uint8_t> encrypted(kProtectedWalHeader.begin(), kProtectedWalHeader.end()); encrypted.reserve(static_cast<std::size_t>(candidate_bytes));
+            ProtectedPosition position; position.offset = 16;
+            const auto seal = [&](std::span<const std::byte> plain, std::uint64_t sequence) {
+                jc::JournalRecordContext context{}; if (!ProtectedContext(options_, position, context)) return false;
+                auto frame = epoch.epoch->Seal(context, plain); if (!frame) return false;
+                const auto b = frame.bytes.Bytes(); encrypted.insert(encrypted.end(), reinterpret_cast<const std::uint8_t*>(b.data()), reinterpret_cast<const std::uint8_t*>(b.data() + b.size()));
+                return ProtectedAdvance(position, b, sequence);
+            };
+            if (!seal(std::as_bytes(std::span(kProtectedAnchor)), 0)) return failed();
+            for (const auto& r : candidate_records) { auto plain = EncodeProtectedWalRecord(r); if (!plain || !seal(plain.bytes.Bytes(), r.sequence)) return failed(); }
+            if (encrypted.size() != candidate_bytes) return failed();
+            const auto create = [&](const std::filesystem::path& path) {
+                auto f = std::make_unique<DerivedFile>(); f->path = path;
+                f->handle.value = OpenWalFile(path, GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr, CREATE_NEW,
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH, nullptr);
+                if (f->handle.value == INVALID_HANDLE_VALUE || !ProtectedExactHandle(f->handle.value, path, false)) return std::unique_ptr<DerivedFile>{};
+                return f;
+            };
+            const auto write = [&](DerivedFile& f, std::span<const std::uint8_t> b, bool partial) {
+                DWORD written = 0; const auto n = static_cast<DWORD>(partial ? (std::min)(b.size(), std::size_t{13}) : b.size());
+                return WriteFile(f.handle.value, b.data(), n, &written, nullptr) && written == n;
+            };
+            if (cut("wreset-before-candidate-create")) return failed();
+            auto candidate = create(next_path); if (!candidate) return failed(); next = candidate.get(); files.push_back(std::move(candidate));
+            if (cut("wreset-after-candidate-create")) return failed();
+            if (cut("wreset-partial-candidate-write")) { (void)write(*next, encrypted, true); return failed(); }
+            if (!write(*next, encrypted, false) || cut("wreset-after-candidate-write") || cut("wreset-candidate-flush") ||
+                !FlushFileBuffers(next->handle.value) || cut("wreset-after-candidate-flush") || !DerivedRefresh(*next, options_.max_bytes)) return failed();
+            ProtectedHead head;
+            if (!DerivedCandidate(*next, options_, candidate_records, semantic, head) || cut("wreset-after-candidate-readback")) return failed();
+            receipt.authority = authority; receipt.old_id = raw->id; receipt.old_bytes = raw->bytes; receipt.old_hash = raw->hash;
+            receipt.stop = inspection; receipt.semantic = semantic; receipt.records = candidate_records.size(); receipt.candidate_id = next->id; receipt.candidate = head;
+            auto plain = DerivedEncodeReceipt(receipt); if (!plain) return failed();
+            jc::JournalRecordContext context{}; if (!DerivedReceiptContext(options_, context)) return failed();
+            auto sealed = epoch.epoch->Seal(context, plain.bytes.Bytes()); if (!sealed || sealed.bytes.Size() != kDerivedReceiptFrame) return failed();
+            if (cut("wreset-before-receipt-create")) return failed();
+            auto receipt_file = create(intent_path); if (!receipt_file) return failed(); intent = receipt_file.get(); files.push_back(std::move(receipt_file));
+            if (cut("wreset-after-receipt-create")) return failed();
+            const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(sealed.bytes.Bytes().data()), sealed.bytes.Size());
+            if (cut("wreset-partial-receipt-write")) { (void)write(*intent, bytes, true); return failed(); }
+            if (!write(*intent, bytes, false) || cut("wreset-after-receipt-write") || cut("wreset-receipt-flush") ||
+                !FlushFileBuffers(intent->handle.value) || cut("wreset-after-receipt-flush") || !DerivedRefresh(*intent, kDerivedReceiptFrame)) return failed();
+            DerivedReceipt checked;
+            if (!DerivedReadReceipt(*intent, options_, checked) || checked.authority != authority || checked.candidate != head ||
+                cut("wreset-after-receipt-readback")) return failed();
+            replacement_file = next; have_receipt = true;
+        }
+        if (!have_receipt || !replacement_file) return failed();
+        if (intent && !PathIsAbsent(ProtectedArchive(options_.path, L".wrdone.", intent->hash))) return failed();
+        if (intent && !FlushFileBuffers(intent->handle.value)) return failed();
+        if (cut("wreset-ready-candidate-flush") || !FlushFileBuffers(replacement_file->handle.value)) return failed();
+        const auto move = [&](DerivedFile& f, const std::filesystem::path& destination, std::string_view before,
+            std::string_view after, std::string_view flush) {
+            if (!PathIsAbsent(destination) || cut(before) || !RenameOpenedFileWithoutReplacing(f.handle.value, destination)) return false;
+            wrote = true; f.path = destination;
+            return ProtectedExactHandle(f.handle.value, f.path, false) && !cut(after) && !cut(flush) && FlushFileBuffers(f.handle.value);
+        };
+        if (raw->path == options_.path && !move(*raw, old_path, "wreset-before-save", "wreset-after-save", "wreset-saved-flush")) return failed();
+        if (replacement_file->path != options_.path && !move(*replacement_file, options_.path,
+            "wreset-before-promote", "wreset-after-promote", "wreset-promoted-flush")) return failed();
+        ProtectedHead checked;
+        if (!DerivedCandidate(*replacement_file, options_, candidate_records, semantic, checked) || checked != receipt.candidate ||
+            cut("wreset-after-promoted-readback")) return failed();
+        const auto archive_path = ProtectedArchive(options_.path, L".wrsaved.", receipt.old_hash);
+        if (raw->path != archive_path && !move(*raw, archive_path, "wreset-before-archive", "wreset-after-archive", "wreset-archive-flush")) return failed();
+        if (!DerivedRefresh(*raw, options_.max_bytes) || !matches_raw(raw) || cut("wreset-after-archive-readback")) return failed();
+        if (intent) {
+            const auto settled = ProtectedArchive(options_.path, L".wrdone.", intent->hash);
+            if (!move(*intent, settled, "wreset-before-settle", "wreset-after-settle", "wreset-settled-flush")) return failed();
+            DerivedReceipt proof; if (!DerivedReadReceipt(*intent, options_, proof) || proof.authority != authority || proof.candidate != checked) return failed();
+        }
+        if (cut("wreset-before-reopen")) return failed();
+        canonical.reset(); files.clear();
+        protected_state_->poisoned = false; protected_state_->head_mismatch = false;
+        if (!CaptureProtectedHistoryHead(replacement) || replacement != receipt.candidate || cut("wreset-after-reopen")) return failed();
+        return CompactionResult::Succeeded;
+    }
+    catch (...) { return failed(); }
+}
+
 void WriteAheadLog::Reconfigure(Options options)
 {
     auto reconfigure = [&]()
     {
         UnregisterPath();
         (void)CloseAppendHandle();
+        protected_state_.reset();
+        continuation_admission_.reset(); continuation_authority_.reset();
         options_ = std::move(options);
+        startup_journal_state_ = StartupJournalState::Unobserved;
+        startup_writer_lease_generation_ = 0;
+        startup_evidence_valid_ = false;
         RegisterPath();
     };
     auto& current_mutex = WalOperationMutex(options_.path);
@@ -1386,12 +3265,24 @@ void WriteAheadLog::UnregisterPath() noexcept
     registered_path_.clear();
 }
 
+bool WriteAheadLog::AnotherStartupEvidenceOwnerForPath() const
+{
+    const auto key = WalRegistryKey(options_.path);
+    std::lock_guard<std::mutex> lock(GetWalRegistryMutex());
+    const auto found = GetWalRegistry().find(key);
+    if (found == GetWalRegistry().end()) return false;
+    return std::any_of(found->second.begin(), found->second.end(), [&](const auto* owner)
+    {
+        return owner != nullptr && owner != this && owner->preserve_startup_evidence_;
+    });
+}
+
 bool WriteAheadLog::TryTransferRegisteredHandlesForPath(
     const std::filesystem::path& path,
     const WriteAheadLog* successor)
 {
     const auto key = WalRegistryKey(path);
-    if (key.empty() || successor == nullptr ||
+    if (key.empty() || successor == nullptr || successor->options_.protected_persistence ||
         successor->append_handle_ != nullptr || successor->writer_lease_handle_ != nullptr)
     {
         return false;
@@ -1403,9 +3294,12 @@ bool WriteAheadLog::TryTransferRegisteredHandlesForPath(
     {
         return false;
     }
+    if (std::any_of(found->second.begin(), found->second.end(), [&](const auto* owner)
+        { return owner != nullptr && owner != successor && owner->preserve_startup_evidence_; }))
+        return false;
     for (auto* owner : found->second)
     {
-        if (owner == nullptr || owner == successor ||
+        if (owner == nullptr || owner == successor || owner->options_.protected_persistence || owner->preserve_startup_evidence_ ||
             owner->append_handle_ == nullptr || owner->writer_lease_handle_ == nullptr ||
             owner->options_.volume_identity != successor->options_.volume_identity)
         {
@@ -1443,15 +3337,21 @@ bool WriteAheadLog::EnsureAppendHandle(
     bool resolve_compaction_intent,
     bool allow_create) const
 {
+    if (options_.protected_persistence) return EnsureProtectedAppendHandle(allow_create);
+    if (preserve_startup_evidence_)
+        return append_handle_ != nullptr && startup_evidence_valid_ &&
+            writer_lease_handle_ != nullptr && writer_lease_generation_ == startup_writer_lease_generation_ &&
+            ValidatedAppendLeaseGeneration(true) != 0 && StartupCompactionNamespaceIsProven();
     if (append_handle_ != nullptr)
     {
         return writer_lease_handle_ != nullptr;
     }
+    if (AnotherStartupEvidenceOwnerForPath()) return false;
     if (!EnsureWriterLease())
     {
         return false;
     }
-    if (!CleanupPreIntentCompactionOrphans())
+    if (preserve_startup_evidence_ && !StartupCompactionNamespaceIsProven())
     {
         (void)CloseWriterLeaseHandle();
         return false;
@@ -1459,7 +3359,7 @@ bool WriteAheadLog::EnsureAppendHandle(
 
     const auto wide_path = options_.path.wstring();
     const auto intent_wide = CompactionIntentPath(options_.path).wstring();
-    const auto intent_attributes = GetFileAttributesW(intent_wide.c_str());
+    const auto intent_attributes = WalFileAttributes(intent_wide.c_str());
     const bool pending_compaction_intent = intent_attributes != INVALID_FILE_ATTRIBUTES;
     if (!pending_compaction_intent)
     {
@@ -1473,7 +3373,7 @@ bool WriteAheadLog::EnsureAppendHandle(
     HANDLE handle = INVALID_HANDLE_VALUE;
     for (int attempt = 0; attempt < 3 && handle == INVALID_HANDLE_VALUE; ++attempt)
     {
-        auto* path_guard = CreateFileW(
+        auto* path_guard = OpenWalFile(
             wide_path.c_str(),
             FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -1511,7 +3411,7 @@ bool WriteAheadLog::EnsureAppendHandle(
                 pending_compaction_intent && resolve_compaction_intent
                     ? FILE_SHARE_READ | FILE_SHARE_DELETE
                     : FILE_SHARE_READ;
-            handle = CreateFileW(
+            handle = OpenWalFile(
                 wide_path.c_str(),
                 GENERIC_WRITE,
                 append_share_mode,
@@ -1549,7 +3449,7 @@ bool WriteAheadLog::EnsureAppendHandle(
         }
         if (pending_compaction_intent)
         {
-            if (attempt == 0 && RestoreMissingCanonicalForPublishArmedIntent())
+            if (!preserve_startup_evidence_ && attempt == 0 && RestoreMissingCanonicalForPublishArmedIntent())
             {
                 continue;
             }
@@ -1562,7 +3462,7 @@ bool WriteAheadLog::EnsureAppendHandle(
             return false;
         }
 
-        handle = CreateFileW(
+        handle = OpenWalFile(
             wide_path.c_str(),
             GENERIC_WRITE,
             FILE_SHARE_READ,
@@ -1606,12 +3506,19 @@ bool WriteAheadLog::EnsureAppendHandle(
     append_handle_size_ = static_cast<std::uint64_t>(end.QuadPart);
     append_handle_size_known_ = true;
     ++append_handle_open_count_;
-    if (resolve_compaction_intent && !ResolvePendingCompactionIntent())
+    // A competing RID can obtain its own pipe lease. Namespace cleanup therefore
+    // also requires ownership of the validated canonical file's write handle.
+    if (!preserve_startup_evidence_ && !CleanupPreIntentCompactionOrphans())
     {
         (void)CloseAppendHandle();
         return false;
     }
-    if (resolve_compaction_intent && pending_compaction_intent)
+    if (resolve_compaction_intent && !preserve_startup_evidence_ && !ResolvePendingCompactionIntent())
+    {
+        (void)CloseAppendHandle();
+        return false;
+    }
+    if (resolve_compaction_intent && !preserve_startup_evidence_ && pending_compaction_intent)
     {
         if (!CloseAppendFileHandle())
         {
@@ -1632,7 +3539,13 @@ bool WriteAheadLog::EnsureAppendHandle(
 }
 
 bool WriteAheadLog::EnsureWriterLease() const
+{ return EnsureWriterLease(false); }
+
+bool WriteAheadLog::EnsureWriterLease(bool allow_protected_maintenance) const
 {
+    if (!allow_protected_maintenance && !DerivedWitnessNamespaceSettled(options_.path)) return false;
+    if (!allow_protected_maintenance && !continuation_admission_ && !ContinuationNamespaceAbsent(options_.path)) return false;
+    if (options_.protected_persistence && !EnsureProtectedState(allow_protected_maintenance)) return false;
     if (writer_lease_handle_ != nullptr)
     {
         return true;
@@ -1666,6 +3579,12 @@ bool WriteAheadLog::EnsureWriterLease() const
 
 bool WriteAheadLog::CloseAppendFileHandle() const noexcept
 {
+    if (protected_state_)
+    {
+        protected_state_->verified = false;
+        protected_state_->position = {};
+        protected_state_->epoch.reset();
+    }
     if (append_handle_ == nullptr)
     {
         return true;
@@ -1680,6 +3599,7 @@ bool WriteAheadLog::CloseAppendFileHandle() const noexcept
 
 bool WriteAheadLog::CloseWriterLeaseHandle() const noexcept
 {
+    if (protected_state_) protected_state_->epoch.reset();
     if (writer_lease_handle_ == nullptr)
     {
         writer_lease_generation_ = 0;
@@ -1736,7 +3656,7 @@ bool WriteAheadLog::PersistCompactionIntent(
 
     const auto intent_path = CompactionIntentPath(options_.path);
     const auto intent_wide = intent_path.wstring();
-    auto* existing_handle = CreateFileW(
+    auto* existing_handle = OpenWalFile(
         intent_wide.c_str(),
         GENERIC_READ | GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -1974,22 +3894,22 @@ bool WriteAheadLog::DeleteRetainedCompactionTemp(
     }
 
     std::error_code ec;
-    const auto absolute_wal = std::filesystem::absolute(options_.path, ec).lexically_normal();
+    const auto absolute_wal = AbsoluteWalFilesystemPath(options_.path, ec);
     if (ec || absolute_wal.parent_path().empty())
     {
         return false;
     }
     const auto prefix = absolute_wal.filename().wstring() + L".compact.";
     bool removed = false;
-    std::filesystem::directory_iterator entry(absolute_wal.parent_path(), ec);
+    std::filesystem::directory_iterator entry(WalIoPath(absolute_wal.parent_path()), ec);
     const std::filesystem::directory_iterator end;
     while (!ec && entry != end)
     {
-        const auto candidate = entry->path();
+        const auto candidate = absolute_wal.parent_path() / entry->path().filename();
         const auto filename = candidate.filename().wstring();
         if (HasExactNumericPairSuffix(filename, prefix))
         {
-            auto* candidate_handle = CreateFileW(
+            auto* candidate_handle = OpenWalFile(
                 candidate.wstring().c_str(),
                 DELETE | FILE_READ_ATTRIBUTES,
                 FILE_SHARE_READ,
@@ -2062,13 +3982,13 @@ bool WriteAheadLog::CleanupPreIntentCompactionOrphans() const
     }
 
     std::error_code ec;
-    const auto absolute_wal = std::filesystem::absolute(options_.path, ec).lexically_normal();
+    const auto absolute_wal = AbsoluteWalFilesystemPath(options_.path, ec);
     if (ec || absolute_wal.parent_path().empty())
     {
         return false;
     }
     const auto intent_path = CompactionIntentPath(absolute_wal);
-    const auto intent_attributes = GetFileAttributesW(intent_path.wstring().c_str());
+    const auto intent_attributes = WalFileAttributes(intent_path.wstring().c_str());
     if (intent_attributes != INVALID_FILE_ATTRIBUTES)
     {
         return true;
@@ -2084,7 +4004,7 @@ bool WriteAheadLog::CleanupPreIntentCompactionOrphans() const
         absolute_wal.filename().wstring() + L".compact.intent.tmp.",
     };
     std::vector<std::filesystem::path> candidates;
-    for (std::filesystem::directory_iterator entry(absolute_wal.parent_path(), ec), end;
+    for (std::filesystem::directory_iterator entry(WalIoPath(absolute_wal.parent_path()), ec), end;
          !ec && entry != end;
          entry.increment(ec))
     {
@@ -2094,7 +4014,7 @@ bool WriteAheadLog::CleanupPreIntentCompactionOrphans() const
                 return HasExactNumericPairSuffix(filename, prefix);
             }))
         {
-            candidates.push_back(entry->path());
+            candidates.push_back(absolute_wal.parent_path() / entry->path().filename());
         }
     }
     if (ec || candidates.empty())
@@ -2125,7 +4045,7 @@ bool WriteAheadLog::CleanupPreIntentCompactionOrphans() const
     {
         PinnedCandidate opened{};
         opened.path = candidate;
-        opened.handle = CreateFileW(
+        opened.handle = OpenWalFile(
             candidate.wstring().c_str(),
             DELETE | FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ,
@@ -2148,7 +4068,7 @@ bool WriteAheadLog::CleanupPreIntentCompactionOrphans() const
         pinned.push_back(std::move(opened));
     }
 
-    const auto intent_before_delete = GetFileAttributesW(intent_path.wstring().c_str());
+    const auto intent_before_delete = WalFileAttributes(intent_path.wstring().c_str());
     if (intent_before_delete != INVALID_FILE_ATTRIBUTES)
     {
         close_pinned();
@@ -2215,7 +4135,7 @@ bool WriteAheadLog::DeleteCompletedCompactionPredecessorTombstone(
     const auto guard_path = CompactionPredecessorGuardPath(
         options_.path,
         predecessor_file_id);
-    auto* guard_handle = CreateFileW(
+    auto* guard_handle = OpenWalFile(
         guard_path.wstring().c_str(),
         DELETE | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -2250,7 +4170,7 @@ bool WriteAheadLog::DeleteCompletedCompactionPredecessorTombstone(
 bool WriteAheadLog::ClearCompletedCompactionIntentForNewCompaction() const
 {
     const auto intent_path = CompactionIntentPath(options_.path);
-    auto* intent_handle = CreateFileW(
+    auto* intent_handle = OpenWalFile(
         intent_path.wstring().c_str(),
         GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -2304,7 +4224,7 @@ bool WriteAheadLog::RestoreMissingCanonicalForPublishArmedIntent() const
     }
 
     const auto intent_path = CompactionIntentPath(options_.path);
-    auto* intent_guard = CreateFileW(
+    auto* intent_guard = OpenWalFile(
         intent_path.wstring().c_str(),
         GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -2348,7 +4268,7 @@ bool WriteAheadLog::RestoreMissingCanonicalForPublishArmedIntent() const
     const auto predecessor_guard_path = CompactionPredecessorGuardPath(
         options_.path,
         predecessor_identity.file_id);
-    auto* predecessor_guard = CreateFileW(
+    auto* predecessor_guard = OpenWalFile(
         predecessor_guard_path.wstring().c_str(),
         GENERIC_READ | DELETE | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -2375,7 +4295,7 @@ bool WriteAheadLog::RestoreMissingCanonicalForPublishArmedIntent() const
     }
 
     const auto canonical_wide = options_.path.wstring();
-    const auto canonical_attributes = GetFileAttributesW(canonical_wide.c_str());
+    const auto canonical_attributes = WalFileAttributes(canonical_wide.c_str());
     const auto canonical_error =
         canonical_attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
     const bool canonical_is_absent =
@@ -2390,7 +4310,7 @@ bool WriteAheadLog::RestoreMissingCanonicalForPublishArmedIntent() const
     const bool predecessor_restored =
         (renamed || PathMatchesPhysicalFile(options_.path, predecessor_identity, true)) &&
         PathMatchesPhysicalFile(options_.path, predecessor_identity, true);
-    const auto guard_attributes = GetFileAttributesW(predecessor_guard_path.wstring().c_str());
+    const auto guard_attributes = WalFileAttributes(predecessor_guard_path.wstring().c_str());
     const auto guard_error = guard_attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
     const bool guard_is_absent =
         guard_attributes == INVALID_FILE_ATTRIBUTES &&
@@ -2414,7 +4334,7 @@ bool WriteAheadLog::ResolvePendingCompactionIntent() const
 {
     const auto intent_path = CompactionIntentPath(options_.path);
     const auto intent_wide = intent_path.wstring();
-    auto* intent_guard = CreateFileW(
+    auto* intent_guard = OpenWalFile(
         intent_wide.c_str(),
         GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -2484,7 +4404,7 @@ bool WriteAheadLog::ResolvePendingCompactionIntent() const
         state_allows_predecessor && current_is_predecessor
             ? DELETE | FILE_READ_ATTRIBUTES
             : GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES;
-    auto* predecessor_guard = CreateFileW(
+    auto* predecessor_guard = OpenWalFile(
         predecessor_guard_wide.c_str(),
         predecessor_guard_access,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -2769,7 +4689,7 @@ bool WriteAheadLog::ClearCompactionIntent(
 {
     const auto intent_path = CompactionIntentPath(options_.path);
     const auto intent_wide = intent_path.wstring();
-    auto* intent_handle = CreateFileW(
+    auto* intent_handle = OpenWalFile(
         intent_wide.c_str(),
         DELETE | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -2803,7 +4723,7 @@ bool WriteAheadLog::ClearCompactionIntent(
         remaining_links == 0;
     const bool closed = CloseHandle(intent_handle) != FALSE;
     intent_handle = INVALID_HANDLE_VALUE;
-    const auto attributes = GetFileAttributesW(intent_wide.c_str());
+    const auto attributes = WalFileAttributes(intent_wide.c_str());
     const auto error = attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
     const bool path_absent = attributes == INVALID_FILE_ATTRIBUTES &&
                              (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND);
@@ -2823,9 +4743,56 @@ bool WriteAheadLog::ClearCompactionIntent(
     return cleared;
 }
 
+bool WriteAheadLog::AcquireExistingRepairLease(std::string& error) const
+{
+    if (options_.protected_persistence) { error = "Protected journal repair is unsupported; evidence retained."; return false; }
+    std::lock_guard<std::recursive_mutex> lock(WalOperationMutex(options_.path));
+    const auto fail = [&](const char* why) { error = why; return false; };
+    if (options_.path.empty() || append_handle_ || !EnsureWriterLease())
+        return fail("The canonical journal has an active owner or invalid path.");
+    // The normal WAL opener may repair compaction receipts/tails. This admission
+    // deliberately never enters that path. Any receipt belongs to its original owner.
+    WIN32_FIND_DATAW found{};
+    const auto pattern = options_.path.wstring() + L".compact*";
+    HANDLE search = FindFirstFileW(WalIoPath(pattern).c_str(), &found);
+    if (search != INVALID_HANDLE_VALUE) {
+        FindClose(search); return fail("Existing compaction evidence requires its original recovery owner.");
+    }
+    if (GetLastError() != ERROR_FILE_NOT_FOUND)
+        return fail("Cannot verify the journal receipt namespace.");
+    HANDLE handle = OpenWalFile(options_.path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return fail("Existing canonical journal writer lease unavailable.");
+    if (!IsSafeWalPathHandle(handle)) {
+        CloseHandle(handle); return fail("Journal must be an ordinary single-link file without compaction debt.");
+    }
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(handle, &size) || size.QuadPart < 0 || size.QuadPart > 8ll * 1024 * 1024) {
+        CloseHandle(handle); return fail("Journal exceeds the bounded 8 MiB command profile.");
+    }
+    if (!SetFilePointerEx(handle, {}, nullptr, FILE_END)) {
+        CloseHandle(handle); return fail("Cannot position existing journal at EOF.");
+    }
+    append_handle_ = handle; append_handle_size_ = size.QuadPart;
+    append_handle_size_known_ = true; ++append_handle_open_count_;
+    const auto read = ReadAllInternal(options_.path, options_.volume_identity, false, nullptr,
+        {8ull * 1024 * 1024, 65536});
+    if (read.status != ReadStatus::Ok || read.recovered_torn_tail)
+        return fail("Malformed, incomplete or conflicting canonical journal; evidence retained unchanged.");
+    return true;
+}
+
 bool WriteAheadLog::AcquireExclusiveWriterLease() const
 {
     std::lock_guard<std::recursive_mutex> operation_lock(WalOperationMutex(options_.path));
+    if (options_.protected_persistence)
+    {
+        if (protected_state_ && protected_state_->poisoned) return false;
+        auto read = ReadProtected(options_.protected_persistence->read_limits,
+            options_.protected_persistence->max_allocation_bytes, true);
+        const bool ok = read.status == ReadStatus::Ok; WipeRecords(read.records); return ok;
+    }
+    if (preserve_startup_evidence_) return EnsureAppendHandle();
     if (options_.path.empty())
     {
         return true;
@@ -2840,7 +4807,7 @@ bool WriteAheadLog::AcquireExclusiveWriterLease() const
     const auto parent = options_.path.parent_path();
     if (!parent.empty())
     {
-        std::filesystem::create_directories(parent, ec);
+        std::filesystem::create_directories(WalIoPath(parent), ec);
         if (ec)
         {
             return false;
@@ -2848,7 +4815,7 @@ bool WriteAheadLog::AcquireExclusiveWriterLease() const
     }
     if (TryTransferRegisteredHandlesForPath(options_.path, this))
     {
-        if (!CleanupPreIntentCompactionOrphans())
+        if (preserve_startup_evidence_ ? !StartupCompactionNamespaceIsProven() : !CleanupPreIntentCompactionOrphans())
         {
             (void)CloseAppendHandle();
             return false;
@@ -2902,6 +4869,13 @@ WriteAheadLog::EncodedAppendResult WriteAheadLog::AppendEncoded(
     }
 
     auto* handle = static_cast<HANDLE>(append_handle_);
+    if (options_.protected_persistence && fault_injection_hook_ && fault_injection_hook_("protected-partial-write"))
+    {
+        DWORD written = 0;
+        (void)WriteFile(handle, encoded.data(), static_cast<DWORD>((std::min)(encoded.size(), std::size_t{13})), &written, nullptr);
+        (void)CloseAppendHandle();
+        return EncodedAppendResult::BytesMayHavePersisted;
+    }
     const auto* cursor = encoded.data();
     auto remaining = encoded.size();
     std::size_t written_total = 0;
@@ -2915,7 +4889,7 @@ WriteAheadLog::EncodedAppendResult WriteAheadLog::AppendEncoded(
             written != chunk_bytes)
         {
             (void)CloseAppendHandle();
-            return written_total == 0 && written == 0
+            return !options_.protected_persistence && written_total == 0 && written == 0
                 ? EncodedAppendResult::RejectedBeforeWrite
                 : EncodedAppendResult::BytesMayHavePersisted;
         }
@@ -2946,6 +4920,7 @@ WriteAheadLog::AppendResult WriteAheadLog::AppendWithResult(
     std::uint64_t expected_writer_generation) const
 {
     std::lock_guard<std::recursive_mutex> operation_lock(WalOperationMutex(options_.path));
+    if (options_.protected_persistence) return AppendProtected(std::span(&record, 1), durable_flush, expected_writer_generation);
     if (options_.path.empty())
     {
         return AppendResult::Succeeded;
@@ -2957,7 +4932,9 @@ WriteAheadLog::AppendResult WriteAheadLog::AppendWithResult(
     }
 
     std::error_code ec;
-    std::filesystem::create_directories(options_.path.parent_path(), ec);
+    if (preserve_startup_evidence_ && !EnsureAppendHandle()) return AppendResult::RejectedBeforeWrite;
+    if (!preserve_startup_evidence_)
+        std::filesystem::create_directories(WalIoPath(options_.path.parent_path()), ec);
     if (ec)
     {
         return AppendResult::RejectedBeforeWrite;
@@ -2981,8 +4958,8 @@ WriteAheadLog::AppendResult WriteAheadLog::AppendWithResult(
     {
         const auto existing_size = append_handle_ != nullptr && append_handle_size_known_
             ? append_handle_size_
-            : (std::filesystem::exists(options_.path, ec)
-                ? std::filesystem::file_size(options_.path, ec)
+            : (std::filesystem::exists(WalIoPath(options_.path), ec)
+                ? std::filesystem::file_size(WalIoPath(options_.path), ec)
                 : 0);
         if (ec || existing_size + encoded.size() > options_.max_bytes)
         {
@@ -3021,6 +4998,7 @@ WriteAheadLog::AppendResult WriteAheadLog::AppendBatchWithResult(
     std::uint64_t expected_writer_generation) const
 {
     std::lock_guard<std::recursive_mutex> operation_lock(WalOperationMutex(options_.path));
+    if (options_.protected_persistence) return AppendProtected(records, durable_flush, expected_writer_generation);
     if (records.empty() || options_.path.empty())
     {
         return AppendResult::Succeeded;
@@ -3032,7 +5010,9 @@ WriteAheadLog::AppendResult WriteAheadLog::AppendBatchWithResult(
     }
 
     std::error_code ec;
-    std::filesystem::create_directories(options_.path.parent_path(), ec);
+    if (preserve_startup_evidence_ && !EnsureAppendHandle()) return AppendResult::RejectedBeforeWrite;
+    if (!preserve_startup_evidence_)
+        std::filesystem::create_directories(WalIoPath(options_.path.parent_path()), ec);
     if (ec)
     {
         return AppendResult::RejectedBeforeWrite;
@@ -3072,8 +5052,8 @@ WriteAheadLog::AppendResult WriteAheadLog::AppendBatchWithResult(
     {
         const auto existing_size = append_handle_ != nullptr && append_handle_size_known_
             ? append_handle_size_
-            : (std::filesystem::exists(options_.path, ec)
-                ? std::filesystem::file_size(options_.path, ec)
+            : (std::filesystem::exists(WalIoPath(options_.path), ec)
+                ? std::filesystem::file_size(WalIoPath(options_.path), ec)
                 : 0);
         if (ec ||
             existing_size > options_.max_bytes ||
@@ -3106,6 +5086,12 @@ WriteAheadLog::AppendResult WriteAheadLog::AppendBatchWithResult(
 bool WriteAheadLog::FlushPendingAppends() const
 {
     std::lock_guard<std::recursive_mutex> operation_lock(WalOperationMutex(options_.path));
+    if (options_.protected_persistence)
+    {
+        if (!ValidatedAppendLeaseGeneration() || !protected_state_ || protected_state_->poisoned) return false;
+        if (FlushAppendHandle()) return true;
+        protected_state_->poisoned = true; (void)CloseAppendHandle(); return false;
+    }
     if (options_.path.empty())
     {
         return true;
@@ -3126,7 +5112,29 @@ WriteAheadLog::CompactionResult WriteAheadLog::CompactWithResult(
     std::uint64_t minimum_sequence_to_keep,
     std::uint64_t expected_writer_generation) const
 {
+    return CompactOrdinaryWithResult(minimum_sequence_to_keep, expected_writer_generation, nullptr);
+}
+
+#include "WriteAheadLogFusionContinuation.inc"
+
+WriteAheadLog::CompactionResult WriteAheadLog::CompactOrdinaryWithResult(
+    std::uint64_t minimum_sequence_to_keep,
+    std::uint64_t expected_writer_generation,
+    const FusionCertifiedPredecessor* predecessor) const
+{
     std::lock_guard<std::recursive_mutex> operation_lock(WalOperationMutex(options_.path));
+    if (predecessor && (!predecessor->original || !predecessor->revalidate ||
+        predecessor->original->floor != minimum_sequence_to_keep ||
+        predecessor->original->writer_generation != expected_writer_generation ||
+        !MatchesFusionOriginalForContinuation(*predecessor->original) || !predecessor->revalidate()))
+        return CompactionResult::RejectedBeforeWrite;
+    struct RestoreFusionEvidencePolicy {
+        bool& policy; bool previous;
+        ~RestoreFusionEvidencePolicy() { policy = previous; }
+    } restore_fusion_policy{preserve_startup_evidence_, preserve_startup_evidence_};
+    if (predecessor) preserve_startup_evidence_ = false;
+    if (options_.protected_persistence) return CompactionResult::RejectedBeforeWrite;
+    if (preserve_startup_evidence_ && !EnsureAppendHandle()) return CompactionResult::RejectedBeforeWrite;
     if (options_.path.empty())
     {
         return CompactionResult::Succeeded;
@@ -3186,8 +5194,9 @@ WriteAheadLog::CompactionResult WriteAheadLog::CompactWithResult(
     kept.reserve(read.records.size() + 1);
     for (const auto& record : read.records)
     {
-        if (record.sequence >= minimum_sequence_to_keep ||
-            record.operation == OperationKind::CompactionIndex)
+        if ((record.sequence >= minimum_sequence_to_keep &&
+             (!predecessor || record.operation != OperationKind::CompactionIndex)) ||
+            (!predecessor && record.operation == OperationKind::CompactionIndex))
         {
             kept.push_back(record);
         }
@@ -3202,7 +5211,7 @@ WriteAheadLog::CompactionResult WriteAheadLog::CompactWithResult(
     kept.push_back(index);
 
     std::error_code ec;
-    std::filesystem::create_directories(options_.path.parent_path(), ec);
+    std::filesystem::create_directories(WalIoPath(options_.path.parent_path()), ec);
     if (ec)
     {
         return CompactionResult::RejectedBeforeWrite;
@@ -3263,7 +5272,7 @@ WriteAheadLog::CompactionResult WriteAheadLog::CompactWithResult(
             : CompactionResult::BytesMayHavePersisted;
     }
     const auto target_wide = options_.path.wstring();
-    auto* link_guard = CreateFileW(
+    auto* link_guard = OpenWalFile(
         target_wide.c_str(),
         GENERIC_READ | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -3319,8 +5328,8 @@ WriteAheadLog::CompactionResult WriteAheadLog::CompactWithResult(
         replaced_identity.file_id);
     const auto predecessor_guard_wide = predecessor_guard_path.wstring();
     if (CreateHardLinkW(
-            predecessor_guard_wide.c_str(),
-            target_wide.c_str(),
+            WalIoPath(predecessor_guard_wide).c_str(),
+            WalIoPath(target_wide).c_str(),
             nullptr) == FALSE)
     {
         CloseHandle(link_guard);
@@ -3343,7 +5352,7 @@ WriteAheadLog::CompactionResult WriteAheadLog::CompactWithResult(
         (void)CloseAppendHandle();
         return CompactionResult::BytesMayHavePersisted;
     }
-    auto* predecessor_guard = CreateFileW(
+    auto* predecessor_guard = OpenWalFile(
         predecessor_guard_wide.c_str(),
         FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -3473,7 +5482,7 @@ WriteAheadLog::CompactionResult WriteAheadLog::CompactWithResult(
     bool canonical_unlinked = false;
     if (!injected_replace_failure)
     {
-        auto* unlink_guard = CreateFileW(
+        auto* unlink_guard = OpenWalFile(
             target_wide.c_str(),
             DELETE | FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -3527,7 +5536,7 @@ WriteAheadLog::CompactionResult WriteAheadLog::CompactWithResult(
             PathMatchesPhysicalFile(predecessor_guard_path, replaced_identity, true);
         const bool unlink_guard_closed = CloseHandle(unlink_guard) != FALSE;
         unlink_guard = INVALID_HANDLE_VALUE;
-        const auto canonical_attributes = GetFileAttributesW(target_wide.c_str());
+        const auto canonical_attributes = WalFileAttributes(target_wide.c_str());
         const auto canonical_error =
             canonical_attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
         canonical_unlinked =
@@ -3689,12 +5698,190 @@ WriteAheadLog::CompactionResult WriteAheadLog::CompactWithResult(
 WriteAheadLog::ReadResult WriteAheadLog::ReadAll() const
 {
     std::lock_guard<std::recursive_mutex> operation_lock(WalOperationMutex(options_.path));
+    if (options_.protected_persistence) return ReadProtected(options_.protected_persistence->read_limits,
+        options_.protected_persistence->max_allocation_bytes, false);
     return ReadAllInternal(options_.path, options_.volume_identity, false, nullptr);
+}
+
+bool WriteAheadLog::StartupCompactionNamespaceIsProven() const
+{
+    if (options_.protected_persistence) return EnsureProtectedState();
+    std::vector<std::wstring> allowed;
+    if (append_handle_ != nullptr)
+    {
+        const auto intent = CompactionIntentPath(options_.path);
+        auto receipt = OpenWalFile(intent, GENERIC_READ, FILE_SHARE_READ, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (receipt != INVALID_HANDLE_VALUE)
+        {
+            const auto history = ReadAllEvidenceFromHeldHandle(receipt, options_.volume_identity,
+                {1ull << 20, 8}, 8ull << 20);
+            const bool closed = CloseHandle(receipt) != FALSE;
+            if (!closed || history.status != ReadStatus::Ok ||
+                !IsStrictCompactionIntentHistory(history.records, options_.volume_identity) ||
+                !ValidatedAppendLeaseGeneration(true)) return false;
+            allowed.push_back(intent.filename().wstring());
+            allowed.push_back(CompactionPredecessorGuardPath(options_.path,
+                history.records.back().object_id).filename().wstring());
+        }
+        else
+        {
+            const auto error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) return false;
+        }
+    }
+    WIN32_FIND_DATAW found{};
+    auto search = FindFirstFileW(WalIoPath(options_.path.wstring() + L".compact*").c_str(), &found);
+    if (search == INVALID_HANDLE_VALUE)
+    {
+        const auto error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+    }
+    bool valid = true;
+    unsigned count = 0;
+    do
+    {
+        if (++count > 2 ||
+            (found.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) ||
+            std::find(allowed.begin(), allowed.end(), found.cFileName) == allowed.end())
+        {
+            valid = false;
+            break;
+        }
+    } while (FindNextFileW(search, &found));
+    const auto error = GetLastError();
+    const bool closed = FindClose(search) != FALSE;
+    return valid && error == ERROR_NO_MORE_FILES && closed;
+}
+
+bool WriteAheadLog::MaterializeAbsentStartupJournal() const
+{
+    std::lock_guard<std::recursive_mutex> operation_lock(WalOperationMutex(options_.path));
+    if (options_.protected_persistence) return false;
+    if (!preserve_startup_evidence_ || startup_journal_state_ != StartupJournalState::Absent ||
+        !startup_evidence_valid_ || append_handle_ != nullptr || writer_lease_handle_ == nullptr ||
+        startup_writer_lease_generation_ == 0 || writer_lease_generation_ != startup_writer_lease_generation_ ||
+        writer_lease_name_ != WriterLeaseName(options_.volume_identity) ||
+        options_.volume_identity.empty() || !options_.path.is_absolute()) return false;
+    startup_evidence_valid_ = false;
+    if (!StartupCompactionNamespaceIsProven()) return false;
+    // Ancestors are already pinned by the caller. Never retry an existing leaf.
+    auto handle = OpenWalFile(options_.path, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+        CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    append_handle_ = handle;
+    ++append_handle_open_count_;
+    startup_journal_state_ = StartupJournalState::Materialized;
+    PhysicalFileIdentity created{};
+    std::uint64_t size = 0;
+    const bool valid = IsSafeWalPathHandle(handle) && TryGetPhysicalFileIdentity(handle, created) &&
+        TryGetPhysicalFileSize(handle, size) && size == 0 && PathMatchesPhysicalFile(options_.path, created, true);
+    append_handle_size_ = size;
+    append_handle_size_known_ = valid;
+    startup_evidence_valid_ = valid;
+    if (!valid || !StartupCompactionNamespaceIsProven() || !ValidatedAppendLeaseGeneration(true))
+    {
+        startup_evidence_valid_ = false;
+        return false;
+    }
+    return true;
+}
+
+WriteAheadLog::ReadResult WriteAheadLog::ReadStartupEvidence(
+    WalReadLimits limits, std::uint64_t max_allocation_bytes) const
+{
+    std::lock_guard<std::recursive_mutex> operation_lock(WalOperationMutex(options_.path));
+    if (options_.protected_persistence)
+    {
+        preserve_startup_evidence_ = true;
+        startup_evidence_valid_ = false;
+        auto result = ReadProtected(limits, max_allocation_bytes, true);
+        if (result.status != ReadStatus::Ok || !writer_lease_handle_ ||
+            (startup_writer_lease_generation_ && startup_writer_lease_generation_ != writer_lease_generation_))
+        { if (result.status == ReadStatus::Ok) result.status = ReadStatus::IoError; return result; }
+        startup_writer_lease_generation_ = writer_lease_generation_;
+        if (append_handle_) startup_journal_state_ = StartupJournalState::Present;
+        else if (PathIsAbsent(options_.path)) startup_journal_state_ = StartupJournalState::Absent;
+        else { result.status = ReadStatus::IoError; return result; }
+        startup_evidence_valid_ = true;
+        return result;
+    }
+    preserve_startup_evidence_ = true;
+    startup_evidence_valid_ = false;
+    ReadResult failed{};
+    failed.status = ReadStatus::IoError;
+    limits.bytes = (std::min)(limits.bytes, 64ull << 20);
+    limits.records = (std::min)(limits.records, std::size_t{1000000});
+    if (options_.path.empty() || options_.volume_identity.empty() ||
+        (startup_writer_lease_generation_ != 0 && (writer_lease_handle_ == nullptr ||
+            writer_lease_generation_ != startup_writer_lease_generation_)) || !EnsureWriterLease()) return failed;
+    if (startup_writer_lease_generation_ == 0) startup_writer_lease_generation_ = writer_lease_generation_;
+    auto reader = OpenWalFile(options_.path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (reader == INVALID_HANDLE_VALUE)
+    {
+        const auto error = GetLastError();
+        if (append_handle_ == nullptr && (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) &&
+            (startup_journal_state_ == StartupJournalState::Unobserved || startup_journal_state_ == StartupJournalState::Absent))
+        {
+            startup_journal_state_ = StartupJournalState::Absent;
+            if (!StartupCompactionNamespaceIsProven()) return failed;
+            startup_evidence_valid_ = true;
+            return {};
+        }
+        return failed;
+    }
+    if (startup_journal_state_ == StartupJournalState::Absent)
+    {
+        CloseHandle(reader);
+        return failed;
+    }
+    if (startup_journal_state_ == StartupJournalState::Unobserved) startup_journal_state_ = StartupJournalState::Present;
+    PhysicalFileIdentity original{}, owned{};
+    std::uint64_t size = 0;
+    bool valid = IsSafeWalPathHandle(reader) && TryGetPhysicalFileIdentity(reader, original) &&
+        TryGetPhysicalFileSize(reader, size) && PathMatchesPhysicalFile(options_.path, original, true);
+    if (valid && append_handle_ == nullptr)
+    {
+        auto writer = OpenWalFile(options_.path, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        valid = writer != INVALID_HANDLE_VALUE && IsSafeWalPathHandle(writer) &&
+            TryGetPhysicalFileIdentity(writer, owned) && owned.volume_serial == original.volume_serial &&
+            owned.file_id == original.file_id && SetFilePointerEx(writer, {}, nullptr, FILE_END);
+        if (valid)
+        {
+            append_handle_ = writer;
+            append_handle_size_ = size;
+            append_handle_size_known_ = true;
+            ++append_handle_open_count_;
+        }
+        else if (writer != INVALID_HANDLE_VALUE) CloseHandle(writer);
+    }
+    if (valid)
+    {
+        valid = TryGetPhysicalFileIdentity(static_cast<HANDLE>(append_handle_), owned) &&
+            owned.volume_serial == original.volume_serial && owned.file_id == original.file_id &&
+            append_handle_size_known_ && append_handle_size_ == size;
+    }
+    auto result = valid ? ReadAllEvidenceFromHeldHandle(reader, options_.volume_identity,
+        limits, max_allocation_bytes) : failed;
+    valid = CloseHandle(reader) != FALSE && valid;
+    // Authenticate the retained file and receipt before publishing append trust.
+    startup_evidence_valid_ = valid;
+    if (!valid || !StartupCompactionNamespaceIsProven() || !ValidatedAppendLeaseGeneration(true))
+    {
+        startup_evidence_valid_ = false;
+        return failed;
+    }
+    startup_evidence_valid_ = result.status == ReadStatus::Ok && !result.recovered_torn_tail;
+    return result;
 }
 
 WriteAheadLog::ReadResult WriteAheadLog::ReadAllWithExclusiveWriterLease(WalReadLimits limits) const
 {
     std::lock_guard<std::recursive_mutex> operation_lock(WalOperationMutex(options_.path));
+    if (options_.protected_persistence) return ReadProtected(limits, options_.protected_persistence->max_allocation_bytes, true);
+    if (preserve_startup_evidence_) return ReadStartupEvidence(limits, 256ull << 20);
     if (!AcquireExclusiveWriterLease())
     {
         ReadResult failed{};
@@ -3767,6 +5954,98 @@ std::uint64_t WriteAheadLog::ExclusiveWriterLeaseGeneration() const
     return writer_lease_handle_ == nullptr ? 0 : writer_lease_generation_;
 }
 
+std::uint64_t WriteAheadLog::ValidatedAppendLeaseGeneration(bool bounded_evidence) const
+{
+    std::lock_guard<std::recursive_mutex> operation_lock(WalOperationMutex(options_.path));
+    if (options_.protected_persistence)
+    {
+        std::uint64_t size = 0;
+        return EnsureProtectedState() && protected_state_->verified && !protected_state_->poisoned && !protected_state_->head_mismatch &&
+            writer_lease_handle_ && append_handle_ && append_handle_size_known_ &&
+            TryGetPhysicalFileSize(static_cast<HANDLE>(append_handle_), size) && size == append_handle_size_ &&
+            ProtectedExactHandle(static_cast<HANDLE>(append_handle_), options_.path, false) ? writer_lease_generation_ : 0;
+    }
+    if (preserve_startup_evidence_ && (!startup_evidence_valid_ ||
+        writer_lease_generation_ != startup_writer_lease_generation_)) return 0;
+    if (writer_lease_handle_ == nullptr || append_handle_ == nullptr ||
+        !append_handle_size_known_) return 0;
+    auto handle = static_cast<HANDLE>(append_handle_);
+    std::uint64_t size = 0;
+    PhysicalFileIdentity owned{}, current{};
+    if (!IsSafeWalPathHandle(handle) || !TryGetPhysicalFileSize(handle, size) ||
+        size != append_handle_size_ || !TryGetPhysicalFileIdentity(handle, owned)) return 0;
+    const auto intent = CompactionIntentPath(options_.path);
+    auto receipt = OpenWalFile(intent.c_str(), GENERIC_READ | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (receipt != INVALID_HANDLE_VALUE)
+    {
+        PhysicalFileIdentity receipt_identity{};
+        std::vector<std::uint8_t> bytes;
+        bool completed = IsSafeWalPathHandle(receipt) &&
+            TryGetPhysicalFileIdentity(receipt, receipt_identity) &&
+            PathMatchesPhysicalFile(intent, receipt_identity, true);
+        if (completed)
+        {
+            auto history = bounded_evidence
+                ? ReadAllEvidenceFromHeldHandle(receipt, options_.volume_identity,
+                    {1ull << 20, 8}, 8ull << 20)
+                : (ReadPinnedIntentBytes(receipt, bytes)
+                    ? DecodeWalBytes(bytes, options_.volume_identity, nullptr) : ReadResult{});
+            if (!bounded_evidence && bytes.empty()) history.status = ReadStatus::IoError;
+            completed = history.status == ReadStatus::Ok && !history.recovered_torn_tail &&
+                IsStrictCompactionIntentHistory(history.records, options_.volume_identity);
+            if (completed)
+            {
+                const auto& terminal = history.records.back();
+                completed = terminal.state == RecordState::Cleaned &&
+                    terminal.flags == kCompactionIntentNamespaceDurableFlag &&
+                    terminal.parent_object_id == owned.volume_serial && terminal.logical_offset == owned.file_id;
+                if (completed)
+                {
+                    const auto predecessor = CompactionPredecessorGuardPath(options_.path, terminal.object_id);
+                    auto tombstone = OpenWalFile(predecessor.c_str(), GENERIC_READ | FILE_READ_ATTRIBUTES,
+                        FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+                    if (tombstone == INVALID_HANDLE_VALUE)
+                    {
+                        const auto error = GetLastError();
+                        completed = error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+                    }
+                    else
+                    {
+                        PhysicalFileIdentity identity{};
+                        std::uint64_t predecessor_size = 0;
+                        completed = IsSafeWalPathHandle(tombstone) &&
+                            TryGetPhysicalFileIdentity(tombstone, identity) &&
+                            identity.volume_serial == owned.volume_serial && identity.file_id == terminal.object_id &&
+                            TryGetPhysicalFileSize(tombstone, predecessor_size) && predecessor_size == 0 &&
+                            PathMatchesPhysicalFile(predecessor, identity, true);
+                        completed = CloseHandle(tombstone) != FALSE && completed;
+                    }
+                }
+            }
+        }
+        completed = PathMatchesPhysicalFile(intent, receipt_identity, true) && completed;
+        const bool closed = CloseHandle(receipt) != FALSE;
+        if (!completed || !closed) return 0;
+    }
+    else
+    {
+        const auto error = GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) return 0;
+    }
+    auto path_handle = OpenWalFile(options_.path.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (path_handle == INVALID_HANDLE_VALUE) return 0;
+    const bool retained = IsSafeWalPathHandle(path_handle) &&
+        TryGetPhysicalFileIdentity(path_handle, current) &&
+        owned.volume_serial == current.volume_serial && owned.file_id == current.file_id;
+    const bool closed = CloseHandle(path_handle) != FALSE;
+    return retained && closed ? writer_lease_generation_ : 0;
+}
+
 void WriteAheadLog::SetFaultInjectionHook(FaultInjectionHook hook)
 {
     fault_injection_hook_ = std::move(hook);
@@ -3778,6 +6057,188 @@ WriteAheadLog::ReadResult WriteAheadLog::ReadAll(
 {
     std::lock_guard<std::recursive_mutex> operation_lock(WalOperationMutex(path));
     return ReadAllInternal(path, expected_volume_identity, false, nullptr);
+}
+
+namespace
+{
+bool EvidenceInputSizeFits(std::uint64_t size, WalReadLimits limits, std::uint64_t allocation)
+{
+    return limits.bytes != UINT64_MAX && limits.records != SIZE_MAX && allocation != UINT64_MAX &&
+        size <= limits.bytes && size <= kMaxRecordBytes && size <= SIZE_MAX && size <= allocation / 4;
+}
+
+bool EvidenceSizeFits(std::uint64_t size, std::size_t records,
+    WalReadLimits limits, std::uint64_t allocation)
+{
+    // Keep the byte-buffer/variable-data allowance. The framing pass permits one
+    // exact vector reservation, with no geometric growth or second record array.
+    return EvidenceInputSizeFits(size, limits, allocation) && records <= limits.records &&
+        records <= (allocation - size * 4) / (sizeof(WriteAheadLog::Record) + 4ull);
+}
+
+WriteAheadLog::ReadStatus CountEvidenceFrames(HANDLE handle, std::uint64_t size,
+    WalReadLimits limits, std::uint64_t allocation, std::size_t& count)
+{
+    using Status = WriteAheadLog::ReadStatus;
+    count = 0;
+    if (!EvidenceInputSizeFits(size, limits, allocation)) return Status::ResourceLimit;
+    LARGE_INTEGER original{}, zero{};
+    if (!SetFilePointerEx(handle, zero, &original, FILE_CURRENT)) return Status::IoError;
+    const auto finish = [&](Status status) {
+        return SetFilePointerEx(handle, original, nullptr, FILE_BEGIN) ? status : Status::IoError;
+    };
+    std::array<std::uint8_t, 64u << 10> window{};
+    std::uint64_t window_start = 0;
+    std::size_t window_bytes = 0;
+    std::uint64_t cursor = 0;
+    while (cursor < size)
+    {
+        const auto remaining = size - cursor;
+        const auto needed = static_cast<std::size_t>((std::min)(remaining, std::uint64_t{12}));
+        const auto offset = cursor - window_start;
+        if (offset > window_bytes || needed > window_bytes - static_cast<std::size_t>(offset))
+        {
+            LARGE_INTEGER position{}; position.QuadPart = static_cast<LONGLONG>(cursor);
+            const auto wanted = static_cast<DWORD>((std::min)(remaining, std::uint64_t{window.size()}));
+            DWORD read = 0;
+            if (!SetFilePointerEx(handle, position, nullptr, FILE_BEGIN) ||
+                !ReadFile(handle, window.data(), wanted, &read, nullptr) || read != wanted)
+                return finish(Status::IoError);
+            window_start = cursor; window_bytes = read;
+        }
+        const auto header = std::span(window).subspan(static_cast<std::size_t>(cursor - window_start), needed);
+        if (IsProtectedWalPrefix(header)) return finish(Status::VersionMismatch);
+        if (count >= limits.records) return finish(Status::ResourceLimit);
+        if (remaining < kLegacyHeaderSize) return finish(Status::Corrupt);
+        WalFrameHeader frame;
+        const auto status = DecodeWalFrameHeader(header, frame);
+        if (status != Status::Ok) return finish(status);
+        if (frame.bytes > remaining) return finish(Status::Corrupt);
+        ++count;
+        if (!EvidenceSizeFits(size, count, limits, allocation)) return finish(Status::ResourceLimit);
+        cursor += frame.bytes;
+    }
+    return finish(Status::Ok);
+}
+}
+
+bool WriteAheadLog::EvidenceAppendCapacityAvailable(const std::vector<Record>& records,
+    WalReadLimits limits, std::uint64_t allocation) const
+{
+    std::lock_guard<std::recursive_mutex> operation_lock(WalOperationMutex(options_.path));
+    if (options_.protected_persistence)
+    {
+        if (records.empty() || records.size() > kProtectedBatchRecords || !ValidatedAppendLeaseGeneration()) return false;
+        const auto& p = *options_.protected_persistence;
+        std::uint64_t size = append_handle_size_, sequence = protected_state_->position.sequence;
+        for (const auto& r : records)
+        {
+            if ((!r.volume_identity.empty() && r.volume_identity != options_.volume_identity) || !r.sequence || r.sequence <= sequence || r.sequence == UINT64_MAX ||
+                !IsKnownOperation(r.operation) || r.operation == OperationKind::CompactionIndex ||
+                r.state < RecordState::Prepared || r.state > RecordState::CleanupArmed) return false;
+            Record writable = r;
+            struct Cleanup { Record& r; ~Cleanup() { WipeRecord(r); } } cleanup{writable};
+            if (writable.volume_identity.empty()) writable.volume_identity = options_.volume_identity;
+            auto encoded = EncodeProtectedWalRecord(writable);
+            if (!encoded) return false;
+            size += encoded.bytes.Size() + 80; sequence = r.sequence;
+        }
+        const auto count = protected_state_->position.ordinal - 1 + records.size();
+        allocation = (std::min)(allocation, p.max_allocation_bytes);
+        return size <= options_.max_bytes && size <= limits.bytes && size <= p.read_limits.bytes && size <= allocation / 4 &&
+            count <= limits.records && count <= p.read_limits.records && count <= (allocation - size * 4) / (2 * sizeof(Record) + 4);
+    }
+    if (records.empty() || records.size() > 8) return false;
+    const auto generation = ValidatedAppendLeaseGeneration(true);
+    if (!generation) return false;
+    std::uint64_t size = append_handle_size_;
+    for (const auto& record : records)
+    {
+        const auto encoded = EncodeForTest(record);
+        if (encoded.empty() || encoded.size() > UINT64_MAX - size) return false;
+        size += encoded.size();
+    }
+    if ((options_.max_bytes && size > options_.max_bytes) ||
+        !EvidenceInputSizeFits(size, limits, allocation)) return false;
+    auto reader = OpenWalFile(options_.path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (reader == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION before{}, after{}, owned{};
+    bool valid = IsSafeWalPathHandle(reader) && GetFileInformationByHandle(reader, &before) &&
+        GetFileInformationByHandle(static_cast<HANDLE>(append_handle_), &owned) &&
+        before.dwVolumeSerialNumber == owned.dwVolumeSerialNumber &&
+        before.nFileIndexHigh == owned.nFileIndexHigh && before.nFileIndexLow == owned.nFileIndexLow &&
+        ((static_cast<std::uint64_t>(before.nFileSizeHigh) << 32u) | before.nFileSizeLow) == append_handle_size_;
+    std::size_t count = 0;
+    valid = valid && CountEvidenceFrames(reader, append_handle_size_, limits, allocation, count) == ReadStatus::Ok &&
+        count <= SIZE_MAX - records.size() && EvidenceSizeFits(size, count + records.size(), limits, allocation) &&
+        IsSafeWalPathHandle(reader) && GetFileInformationByHandle(reader, &after) &&
+        before.dwVolumeSerialNumber == after.dwVolumeSerialNumber &&
+        before.nFileIndexHigh == after.nFileIndexHigh && before.nFileIndexLow == after.nFileIndexLow &&
+        before.nFileSizeHigh == after.nFileSizeHigh && before.nFileSizeLow == after.nFileSizeLow &&
+        CompareFileTime(&before.ftCreationTime, &after.ftCreationTime) == 0 &&
+        CompareFileTime(&before.ftLastWriteTime, &after.ftLastWriteTime) == 0;
+    const bool closed = CloseHandle(reader) != FALSE;
+    return valid && closed && ValidatedAppendLeaseGeneration(true) == generation;
+}
+
+WriteAheadLog::ReadResult WriteAheadLog::ReadAllEvidenceFromHeldHandle(
+    void* held_handle,
+    const std::string& expected_volume_identity,
+    WalReadLimits limits,
+    std::uint64_t max_allocation_bytes)
+{
+    ReadResult failed{};
+    failed.status = ReadStatus::IoError;
+    const auto handle = static_cast<HANDLE>(held_handle);
+    BY_HANDLE_FILE_INFORMATION before{}, after{};
+    if (handle == nullptr || handle == INVALID_HANDLE_VALUE ||
+        GetFileType(handle) != FILE_TYPE_DISK || !IsSafeWalPathHandle(handle) ||
+        !GetFileInformationByHandle(handle, &before)) return failed;
+
+    const auto size = (static_cast<std::uint64_t>(before.nFileSizeHigh) << 32u) | before.nFileSizeLow;
+    // Bound input first; a constant-space framing pass then budgets the exact
+    // record reservation before allocating bytes or decoded variable data.
+    if (!EvidenceInputSizeFits(size, limits, max_allocation_bytes))
+    {
+        failed.status = ReadStatus::ResourceLimit;
+        return failed;
+    }
+    const auto unchanged = [&]()
+    {
+        return IsSafeWalPathHandle(handle) && GetFileInformationByHandle(handle, &after) &&
+            before.dwVolumeSerialNumber == after.dwVolumeSerialNumber &&
+            before.nFileIndexHigh == after.nFileIndexHigh && before.nFileIndexLow == after.nFileIndexLow &&
+            before.nFileSizeHigh == after.nFileSizeHigh && before.nFileSizeLow == after.nFileSizeLow &&
+            CompareFileTime(&before.ftCreationTime, &after.ftCreationTime) == 0 &&
+            CompareFileTime(&before.ftLastWriteTime, &after.ftLastWriteTime) == 0;
+    };
+    try
+    {
+        std::size_t record_count = 0;
+        failed.status = CountEvidenceFrames(handle, size, limits, max_allocation_bytes, record_count);
+        if (!unchanged()) { failed.status = ReadStatus::IoError; return failed; }
+        if (failed.status != ReadStatus::Ok) return failed;
+        failed.status = ReadStatus::IoError;
+        std::vector<std::uint8_t> bytes;
+        if (!ReadPinnedIntentBytes(handle, bytes, size) || bytes.size() != size || !unchanged()) return failed;
+        auto decoded = DecodeWalBytes(bytes, expected_volume_identity, nullptr, limits, record_count);
+        if (!unchanged()) return failed;
+        if (decoded.recovered_torn_tail && decoded.status == ReadStatus::Ok)
+            decoded.status = ReadStatus::Corrupt;
+        if (decoded.status != ReadStatus::Ok) decoded.records.clear();
+        return decoded;
+    }
+    catch (const std::bad_alloc&)
+    {
+        failed.status = ReadStatus::ResourceLimit;
+        return failed;
+    }
+    catch (const std::length_error&)
+    {
+        failed.status = ReadStatus::ResourceLimit;
+        return failed;
+    }
 }
 
 WriteAheadLog::ReadResult WriteAheadLog::ReadAllInternal(
@@ -3792,7 +6253,8 @@ WriteAheadLog::ReadResult WriteAheadLog::ReadAllInternal(
     {
         *complete_prefix_bytes = 0;
     }
-    if (path.empty() || !std::filesystem::exists(path))
+    if (!DerivedWitnessNamespaceSettled(path) || !ContinuationNamespaceAbsent(path)) { result.status = ReadStatus::IoError; return result; }
+    if (path.empty() || !std::filesystem::exists(WalIoPath(path)))
     {
         return result;
     }
@@ -3805,93 +6267,21 @@ WriteAheadLog::ReadResult WriteAheadLog::ReadAllInternal(
         return result;
     }
 
-    std::size_t cursor = 0;
-    while (cursor < bytes.size())
-    {
-        if (result.records.size() >= limits.records)
-        {
-            result.records.clear();
-            result.status = ReadStatus::ResourceLimit;
-            return result;
-        }
-        if (bytes.size() - cursor < kLegacyHeaderSize)
-        {
-            result.recovered_torn_tail = true;
-            if (complete_prefix_bytes)
-            {
-                *complete_prefix_bytes = static_cast<std::uint64_t>(cursor);
-            }
-            if (repair_torn_tail && !TruncateTornTail(path, cursor))
-            {
-                result.status = ReadStatus::IoError;
-            }
-            return result;
-        }
-
-        const auto magic = ReadU32(bytes, cursor);
-        const auto version = ReadU16(bytes, cursor + 4);
-        const auto header_size = ReadU16(bytes, cursor + 6);
-        const auto record_size = ReadU32(bytes, cursor + 8);
-
-        if (magic != kMagic)
-        {
-            result.status = ReadStatus::Corrupt;
-            return result;
-        }
-        if (version != kLegacyVersion && version != kInlinePayloadVersion && version != kUnlinkOutcomeVersion)
-        {
-            result.status = ReadStatus::VersionMismatch;
-            return result;
-        }
-        const auto expected_header_size = version == kUnlinkOutcomeVersion
-            ? kUnlinkOutcomeHeaderSize
-            : version == kInlinePayloadVersion ? kInlinePayloadHeaderSize : kLegacyHeaderSize;
-        if (header_size != expected_header_size ||
-            record_size < expected_header_size ||
-            record_size > kMaxRecordBytes)
-        {
-            result.status = ReadStatus::Corrupt;
-            return result;
-        }
-        if (bytes.size() - cursor < record_size)
-        {
-            result.recovered_torn_tail = true;
-            if (complete_prefix_bytes)
-            {
-                *complete_prefix_bytes = static_cast<std::uint64_t>(cursor);
-            }
-            if (repair_torn_tail && !TruncateTornTail(path, cursor))
-            {
-                result.status = ReadStatus::IoError;
-            }
-            return result;
-        }
-
-        Record record{};
-        ReadStatus record_status = ReadStatus::Ok;
-        if (!DecodeRecord(bytes, cursor, record_size, version, expected_volume_identity, record, record_status))
-        {
-            result.status = record_status;
-            return result;
-        }
-
-        result.records.push_back(std::move(record));
-        cursor += record_size;
-    }
-
-    if (complete_prefix_bytes)
-    {
-        *complete_prefix_bytes = static_cast<std::uint64_t>(cursor);
-    }
-
+    std::uint64_t prefix = 0;
+    auto* decoded_prefix = complete_prefix_bytes ? complete_prefix_bytes : &prefix;
+    result = DecodeWalBytes(bytes, expected_volume_identity, decoded_prefix, limits);
+    if (result.recovered_torn_tail && repair_torn_tail &&
+        !TruncateTornTail(path, static_cast<std::size_t>(*decoded_prefix)))
+        result.status = ReadStatus::IoError;
     return result;
 }
 
-std::vector<std::uint8_t> WriteAheadLog::EncodeForTest(
-    const Record& record,
-    std::uint16_t version_override)
+namespace
 {
-    std::vector<std::uint8_t> buffer;
+template<class Buffer> bool EncodeWalRecord(const WriteAheadLog::Record& record,
+    std::uint16_t version_override, Buffer& buffer)
+{
+    using OperationKind = WriteAheadLog::OperationKind;
     const auto version = version_override == 0
         ? (record.unlink_outcome ? kUnlinkOutcomeVersion :
             record.operation == OperationKind::SetExtendedAttribute || !record.inline_payload.empty()
@@ -3899,7 +6289,7 @@ std::vector<std::uint8_t> WriteAheadLog::EncodeForTest(
                 : kLegacyVersion)
         : version_override;
     if ((record.operation == OperationKind::SetExtendedAttribute && version != kInlinePayloadVersion) ||
-        ((record.operation == OperationKind::RewriteCompressedContent || record.operation == OperationKind::CloneFile) && version != kInlinePayloadVersion) ||
+        ((record.operation == OperationKind::RewriteCompressedContent || record.operation == OperationKind::CloneFile || record.operation == OperationKind::HardLink || record.operation == OperationKind::NativeSparse || record.operation == OperationKind::CloneRange || record.operation == OperationKind::SetVolumeQuotaReserve || record.operation == OperationKind::RenameVolume || record.operation == OperationKind::CreateSnapshot || record.operation == OperationKind::DeleteSnapshot || record.operation == OperationKind::RepairVolumeFileCount) && version != kInlinePayloadVersion) ||
         (record.operation == OperationKind::RemoveExtendedAttribute && version != kLegacyVersion) ||
         (!record.inline_payload.empty() && version != kInlinePayloadVersion) ||
         (record.unlink_outcome.has_value() != (version == kUnlinkOutcomeVersion)) ||
@@ -3981,7 +6371,49 @@ std::vector<std::uint8_t> WriteAheadLog::EncodeForTest(
     }
 
     StoreU32(buffer, kChecksumOffset, ChecksumRecord(buffer));
-    return buffer;
+    return true;
+}
+
+// The common serializer writes directly into this locked owner; no temporary
+// plaintext vector or checksum copy is needed for protected persistence.
+struct SecureWalEncoding
+{
+    cc::SecureBytes bytes;
+    std::size_t used = 0;
+    cc::CryptoError error = cc::CryptoError::None;
+    std::uint32_t os_status = 0;
+    void reserve(std::size_t size)
+    {
+        if (size > jc::kMaxJournalPlaintextBytes) { error = cc::CryptoError::ResourceLimit; throw std::length_error("Protected WAL record limit"); }
+        auto result = cc::SecureBytes::Allocate(size);
+        if (!result) { error = result.error; os_status = result.os_status; throw std::bad_alloc(); }
+        bytes = std::move(result.bytes);
+    }
+    void push_back(std::uint8_t v) noexcept { (*this)[used++] = v; }
+    std::uint8_t& operator[](std::size_t at) noexcept { return reinterpret_cast<std::uint8_t*>(bytes.Bytes().data())[at]; }
+    std::uint8_t operator[](std::size_t at) const noexcept { return reinterpret_cast<const std::uint8_t*>(bytes.Bytes().data())[at]; }
+    std::size_t size() const noexcept { return used; }
+    std::uint8_t* end() noexcept { return reinterpret_cast<std::uint8_t*>(bytes.Bytes().data()) + used; }
+    template<class It> void insert(std::uint8_t*, It first, It last) noexcept
+    { for (; first != last; ++first) push_back(static_cast<std::uint8_t>(*first)); }
+};
+cc::CryptoResult EncodeProtectedWalRecord(const WriteAheadLog::Record& record)
+{
+    SecureWalEncoding encoded;
+    try
+    {
+        if (!EncodeWalRecord(record, 0, encoded)) return {cc::CryptoError::InvalidArgument, 0, {}};
+        return {cc::CryptoError::None, 0, std::move(encoded.bytes)};
+    }
+    catch (...) { return {encoded.error == cc::CryptoError::None ? cc::CryptoError::AllocationFailed : encoded.error, encoded.os_status, {}}; }
+}
+} // namespace
+
+std::vector<std::uint8_t> WriteAheadLog::EncodeForTest(const Record& record, std::uint16_t version_override)
+{
+    std::vector<std::uint8_t> bytes;
+    if (!EncodeWalRecord(record, version_override, bytes)) return {};
+    return bytes;
 }
 
 bool WriteAheadLog::InlinePayloadIsConsistent(const Record& record)
@@ -4006,6 +6438,19 @@ bool WriteAheadLog::InodeMetadataMutationIsConsistent(const Record& record)
 
 bool WriteAheadLog::NativeCloneIsConsistent(const Record& record)
 { return record.operation != OperationKind::CloneFile || InlinePayloadIsConsistentImpl(record); }
+bool WriteAheadLog::NativeHardLinkIsConsistent(const Record& record)
+{ return record.operation != OperationKind::HardLink || InlinePayloadIsConsistentImpl(record); }
+bool WriteAheadLog::NativeSparseIsConsistent(const Record& record)
+{ return record.operation != OperationKind::NativeSparse || InlinePayloadIsConsistentImpl(record); }
+bool WriteAheadLog::NativeCloneRangeIsConsistent(const Record& record)
+{ return record.operation != OperationKind::CloneRange || InlinePayloadIsConsistentImpl(record); }
+bool WriteAheadLog::SnapshotIntentIsConsistent(const Record& record)
+{ return (record.operation != OperationKind::CreateSnapshot && record.operation != OperationKind::DeleteSnapshot) || InlinePayloadIsConsistentImpl(record); }
+
+bool WriteAheadLog::VolumeRenameIsConsistent(const Record& record)
+{ return record.operation != OperationKind::RenameVolume || InlinePayloadIsConsistentImpl(record); }
+bool WriteAheadLog::CountRepairIsConsistent(const Record& record)
+{ return record.operation != OperationKind::RepairVolumeFileCount || InlinePayloadIsConsistentImpl(record); }
 
 bool WriteAheadLog::CompressionRewriteIsConsistent(const Record& record)
 {
@@ -4022,3 +6467,8 @@ bool WriteAheadLog::UnlinkOutcomeIsConsistent(const Record& record)
     return UnlinkOutcomeIsConsistentImpl(record);
 }
 } // namespace apfsaccess::rw
+
+namespace apfsaccess::rw { bool WriteAheadLog::VolumeQuotaReserveIsConsistent(const Record& record)
+{ return record.operation != OperationKind::SetVolumeQuotaReserve || InlinePayloadIsConsistentImpl(record); } }
+
+#include "WriteAheadLogProtectedStartup.inc"

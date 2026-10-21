@@ -577,19 +577,74 @@ private:
         if (covered != allocated || stream_count != 1 || old_records != new_records) return false;
         // Extent-reference removal is checked separately from attribute absence.
         // Historical allocation remains pinned by LoadAppleRecoveryCheckpoints.
-        const auto unrelated = [&](const auto& records, bool old_tree, Records& output) {
-            for (const auto& extent : records)
+        using Range = std::pair<std::uint64_t, std::uint64_t>;
+        std::vector<Range> removed, added;
+        const auto add_range = [&](auto& ranges, std::uint64_t block, std::uint64_t bytes) {
+            if (!block || !bytes || bytes % original.block_size ||
+                ranges.size() >= MaxTreeRecords || block > UINT64_MAX - bytes / original.block_size) return false;
+            ranges.emplace_back(block, block + bytes / original.block_size);
+            return true;
+        };
+        for (const auto stream : retired)
+        {
+            const auto found = original.attribute_stream_extents.find(stream);
+            if (found == original.attribute_stream_extents.end() || !found->second) return false;
+            for (const auto& extent : *found->second)
+                if (extent.physical_address % original.block_size ||
+                    !add_range(removed, extent.physical_address / original.block_size, extent.bytes)) return false;
+        }
+        for (const auto& extent : extents)
+            if (!add_range(added, extent.physical_block, extent.length_bytes)) return false;
+        // An attribute's physical owner is its header inode, not its stream ID.
+        // Subtract only authenticated stream/file ranges, preserving independent
+        // attributes with the same owner and any coalesced neighboring records.
+        const auto unrelated = [&](const auto& records, std::vector<Range> excluded,
+                                   std::uint64_t excluded_owner, Records& output) {
+            std::sort(excluded.begin(), excluded.end());
+            for (std::size_t i = 1; i < excluded.size(); ++i)
+                if (excluded[i].first < excluded[i - 1].second) return false;
+            auto sorted = records;
+            std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+                return a.physical_block < b.physical_block;
+            });
+            std::vector<rw::ApplePhysicalExtentRecord> retained_refs;
+            const auto retain = [&](const auto& source, std::uint64_t begin, std::uint64_t end) {
+                if (begin == end) return;
+                auto part = source;
+                part.physical_block = begin; part.block_count = end - begin;
+                if (!retained_refs.empty())
+                {
+                    auto& prior = retained_refs.back();
+                    if (prior.physical_block + prior.block_count == begin && prior.kind == part.kind &&
+                        prior.owning_object_id == part.owning_object_id && prior.reference_count == part.reference_count)
+                    {
+                        prior.block_count += part.block_count;
+                        return;
+                    }
+                }
+                retained_refs.push_back(part);
+            };
+            std::size_t range = 0;
+            for (const auto& extent : sorted)
             {
-                if (retired.contains(extent.owning_object_id))
+                if (!extent.block_count || extent.physical_block > UINT64_MAX - extent.block_count) return false;
+                const auto end = extent.physical_block + extent.block_count;
+                auto cursor = extent.physical_block;
+                while (range < excluded.size() && excluded[range].first < end)
                 {
-                    if (!old_tree || extent.reference_count != 1) return false;
-                    continue;
+                    auto& cut = excluded[range];
+                    if (cut.first < cursor || extent.owning_object_id != excluded_owner || extent.reference_count != 1)
+                        return false;
+                    retain(extent, cursor, cut.first);
+                    cursor = (std::min)(end, cut.second);
+                    if (cursor == cut.second) ++range;
+                    else cut.first = cursor;
                 }
-                if (extent.owning_object_id == proof.private_id)
-                {
-                    if (old_tree || extent.reference_count != 1) return false;
-                    continue;
-                }
+                retain(extent, cursor, end);
+            }
+            if (range != excluded.size()) return false;
+            for (const auto& extent : retained_refs)
+            {
                 Raw encoded;
                 if (!rw::EncodeApplePhysicalExtentRecord(extent, encoded, error) ||
                     !output.emplace(encoded.key, encoded.value).second) return false;
@@ -597,7 +652,8 @@ private:
             return true;
         };
         Records old_refs, new_refs;
-        return unrelated(before.physical, true, old_refs) && unrelated(after.physical, false, new_refs) && old_refs == new_refs;
+        return unrelated(before.physical, std::move(removed), proof.object, old_refs) &&
+            unrelated(after.physical, std::move(added), proof.private_id, new_refs) && old_refs == new_refs;
     }
 };
 }

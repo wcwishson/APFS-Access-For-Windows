@@ -26,7 +26,7 @@ struct HostCompressionRewrite211Fixture
     static bool UsesResourceFork(unsigned type) { return type == 4 || type == 8 || type == 10 || type == 12 || type == 14; }
 
     bool Initialize(unsigned type, bool corrupt = false, bool omit_name = false, bool external_finder = false,
-        bool archive_clear = false, std::uint64_t quota_blocks = 0)
+        bool archive_clear = false, std::uint64_t quota_blocks = 0, std::uint64_t private_id = 17)
     {
         using namespace apfsaccess::rw;
         auto builder = TwoProjectableVolumeStore();
@@ -161,7 +161,7 @@ struct HostCompressionRewrite211Fixture
             else marker.back() ^= std::byte{1};
         }
         AppleInodeRecord inode;
-        inode.object_id = inode.private_id = 17; inode.parent_id = 2; inode.children_or_links = 2;
+        inode.object_id = 17; inode.private_id = private_id; inode.parent_id = 2; inode.children_or_links = 2;
         inode.mode = 0100640; inode.owner = 501; inode.group = 20;
         inode.bsd_flags = kAppleBsdCompressedFlag; inode.uncompressed_size = eof;
         inode.create_time = inode.modification_time = inode.change_time = inode.access_time = 1700000000000000000ULL;
@@ -183,6 +183,9 @@ struct HostCompressionRewrite211Fixture
             const auto leaf = sibling == 700 ? "compressed" : "alias";
             AppleDirectoryRecord link;
             link.parent_id = 2; link.file_id = 17; link.flags = 8; link.name_utf8 = leaf; link.date_added = sibling;
+            AppleExtendedField sibling_id{1, 0, std::vector<std::byte>(8)};
+            apfsaccess::testfixture::PutU64LE(sibling_id.data, 0, sibling);
+            link.extended_fields.push_back(std::move(sibling_id));
             if (!add(EncodeAppleDirectoryRecord(link, encoded, error)) ||
                 !add(EncodeAppleSiblingLinkRecord({17, sibling, 2, leaf}, encoded, error)) ||
                 !add(EncodeAppleSiblingMapRecord({sibling, 17}, encoded, error))) return false;
@@ -202,7 +205,7 @@ struct HostCompressionRewrite211Fixture
         if (!add(EncodeAppleXattrRecord({17, "com.apple.ResourceFork", kAppleXattrDataStream, descriptor}, encoded, error)) ||
             !add(EncodeAppleDataStreamIdRecord({777, 1}, encoded, error)) ||
             !add(EncodeAppleFileExtentRecord({777, 0, resource_allocation, resource_first_block, 0, 4096}, encoded, error)) ||
-            !EncodeApplePhysicalExtentRecord({resource_first_block, resource_blocks, kApplePhysicalExtentKindNew, 777, 1}, encoded, error)) return false;
+            !EncodeApplePhysicalExtentRecord({resource_first_block, resource_blocks, kApplePhysicalExtentKindNew, 17, 1}, encoded, error)) return false;
         volume.extentref_records.push_back(encoded);
         volume.additional_file_system_allocated_blocks += resource_blocks;
         resource.resize(static_cast<std::size_t>(resource_allocation));
@@ -221,7 +224,7 @@ struct HostCompressionRewrite211Fixture
             if (!add(EncodeAppleXattrRecord({17, "com.apple.FinderInfo", kAppleXattrDataStream, descriptor}, encoded, error)) ||
                 !add(EncodeAppleDataStreamIdRecord({778, 1}, encoded, error)) ||
                 !add(EncodeAppleFileExtentRecord({778, 0, 4096, 103, 0, 4096}, encoded, error)) ||
-                !EncodeApplePhysicalExtentRecord({103, 1, kApplePhysicalExtentKindNew, 778, 1}, encoded, error)) return false;
+                !EncodeApplePhysicalExtentRecord({103, 1, kApplePhysicalExtentKindNew, 17, 1}, encoded, error)) return false;
             volume.extentref_records.push_back(encoded); ++volume.additional_file_system_allocated_blocks;
             builder.authoritative_seeded_main_blocks.push_back({103, std::vector<std::byte>(4096, std::byte{0x46})});
         }

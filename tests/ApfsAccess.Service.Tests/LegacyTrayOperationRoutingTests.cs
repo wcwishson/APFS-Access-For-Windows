@@ -418,7 +418,7 @@ public sealed class LegacyTrayOperationRoutingTests
     }
 
     [Fact]
-    public async Task LegacyQuit_FailedTerminalShutdownEvidenceStillStopsAfterFailureAck()
+    public async Task LegacyQuit_FailedTerminalShutdownEvidenceRetainsServiceAfterFailureAck()
     {
         var backend = new RecordingBackend(startMounted: true);
         await using var fixture = CreateFixture(backend);
@@ -439,7 +439,17 @@ public sealed class LegacyTrayOperationRoutingTests
         var ack = ReadAck(response);
         Assert.False(ack.Success);
         Assert.Equal(ApfsOperationCodes.UnsafeOwnership, ack.Code);
-        Assert.True(fixture.Lifetime.WasStopped);
+        Assert.False(fixture.Lifetime.WasStopped);
+        Assert.Single(await backend.GetMountStateAsync(CancellationToken.None));
+        Assert.Equal(1, fixture.ExecutorCalls);
+        var evidencePath = Assert.Single(Directory.GetFiles(fixture.EvidenceRoot, "*.json"));
+        var evidence = JsonSerializer.Deserialize<OperationResultPayload>(
+            File.ReadAllText(evidencePath), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        Assert.NotNull(evidence);
+        Assert.Equal(ApfsOperationStates.Failed, evidence.State);
+        Assert.False(evidence.Success);
+        Assert.Equal("shutdown-incomplete", evidence.FinalStatus);
+        Assert.Equal("not-proven", evidence.OwnershipProof);
         Assert.Equal(0, backend.UnmountCalls);
     }
 

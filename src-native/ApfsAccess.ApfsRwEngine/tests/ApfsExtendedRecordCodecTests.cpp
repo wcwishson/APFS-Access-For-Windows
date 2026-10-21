@@ -2,6 +2,7 @@
 #include "ApfsTransactionWriter.h"
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -106,6 +107,52 @@ bool TestInodeRoundTripPreservesCompleteMetadata()
     return ok;
 }
 
+bool TestInodePayloadOnlyExtendedFieldLength()
+{
+    BtreeRecord input;
+    input.key = {std::byte{41}, {}, {}, {}, {}, {}, {}, std::byte{0x30}};
+    input.value.resize(0x5c + 4 + 4 + 40);
+    const auto put64 = [&](std::size_t at, std::uint64_t value) {
+        for (unsigned i = 0; i < 8; ++i) input.value[at + i] = std::byte((value >> (8 * i)) & 255);
+    };
+    const auto put16 = [&](std::size_t at, std::uint16_t value) {
+        input.value[at] = std::byte(value & 255); input.value[at + 1] = std::byte(value >> 8);
+    };
+    put64(0, 2); put64(8, 41); input.value[0x38] = std::byte{1};
+    put16(0x50, 0100644); put64(0x54, 123);
+    put16(0x5c, 1); put16(0x5e, 40);
+    input.value[0x60] = std::byte{8}; put16(0x62, 40);
+    put64(0x64, 123); put64(0x6c, 4096);
+    std::string error;
+    AppleInodeRecord decoded;
+    bool ok = Require(ApfsExtendedRecordCodec::DecodeInode(input, decoded, error),
+        "observed payload-only xfield length is decoded for mutation: " + error);
+    AppleDataStreamRecord stream;
+    ok &= Require(decoded.object_id == 41 && decoded.extended_fields.size() == 1,
+        "payload-only inode identity and complete field inventory");
+    if (decoded.extended_fields.size() == 1)
+        ok &= Require(ApfsExtendedRecordCodec::DecodeDataStream(decoded.extended_fields[0], stream, error) &&
+            stream.size == 123 && stream.allocated_size == 4096,
+            "payload-only dstream preserves logical and allocated length");
+    auto inclusive = input; inclusive.value[0x5e] = std::byte{44};
+    BtreeRecord encoded;
+    ok &= Require(EncodeAppleInodeRecord(decoded, encoded, error) &&
+        encoded.key == inclusive.key && encoded.value == inclusive.value,
+        "mutation encoder keeps its descriptor-inclusive bytes for replay compatibility");
+    for (const auto used : {0u, 39u, 41u, 43u, 45u, 65535u}) {
+        auto malformed = input;
+        malformed.value[0x5e] = std::byte(used & 255);
+        malformed.value[0x5f] = std::byte(used >> 8);
+        ok &= Require(!ApfsExtendedRecordCodec::DecodeInode(malformed, decoded, error) &&
+            decoded.object_id == 0 && decoded.extended_fields.empty(),
+            "incorrect native xfield byte counts refuse without publishing decoded fields");
+    }
+    auto trailing = input; trailing.value.push_back(std::byte{});
+    ok &= Require(!ApfsExtendedRecordCodec::DecodeInode(trailing, decoded, error),
+        "native xfield data cannot hide trailing bytes");
+    return ok;
+}
+
 bool TestSiblingRecordsRoundTripExactIdentity()
 {
     std::string error;
@@ -175,7 +222,7 @@ bool TestExternalXattrCarriesCompleteDataStream()
     AppleXattrRecord decoded;
     std::string error;
     bool ok = true;
-    for (const std::uint16_t ignored_length : {0, 48, 65535})
+    for (const auto ignored_length : std::array<std::uint16_t,3>{0,48,65535})
     {
         raw.value[2] = static_cast<std::byte>(ignored_length & 0xff);
         raw.value[3] = static_cast<std::byte>(ignored_length >> 8);
@@ -468,6 +515,27 @@ bool TestSecurityAceProjection()
     return ok;
 }
 
+bool TestRawXattrNames()
+{
+    bool ok = true;
+    for (const auto& name : std::vector<std::string>{".", "/", "raw/name:with\\bytes",
+             std::string(821, 'x'), "raw.\xE6\xB5\x8B\xE8\xAF\x95"}) {
+        AppleXattrRecord input{21,name,kAppleXattrDataEmbedded,Bytes("opaque value")};
+        BtreeRecord row;std::string error;AppleXattrRecord output;
+        ok &= Require(EncodeAppleXattrRecord(input,row,error) &&
+            ApfsExtendedRecordCodec::DecodeXattr(row,output,error) && output.name_utf8==name && output.data==input.data,
+            "raw attribute bytes survive without filename projection");
+    }
+    for (const auto& name : std::vector<std::string>{std::string("\xC0\xAF",2),
+             std::string("\xED\xA0\x80",3),std::string("\xF4\x90\x80\x80",4),std::string("\xE6\xB5",2)}) {
+        AppleXattrRecord input{21,name,kAppleXattrDataEmbedded,{}};
+        BtreeRecord row;std::string error;AppleXattrRecord output;
+        ok &= Require(EncodeAppleXattrRecord(input,row,error) &&
+            !ApfsExtendedRecordCodec::DecodeXattr(row,output,error) && output.name_utf8.empty() && output.data.empty(),
+            "invalid attribute UTF8 refuses with empty result");
+    }
+    return ok;
+}
 bool TestMalformedRecordsFailClosed()
 {
     std::string error;
@@ -501,11 +569,13 @@ int main()
 {
     bool ok = true;
     ok &= TestInodeRoundTripPreservesCompleteMetadata();
+    ok &= TestInodePayloadOnlyExtendedFieldLength();
     ok &= TestSiblingRecordsRoundTripExactIdentity();
     ok &= TestEmbeddedXattrRoundTripPreservesOpaqueBytes();
     ok &= TestExternalXattrCarriesCompleteDataStream();
     ok &= TestEmbeddedXattrSizeBoundary();
     ok &= TestMalformedRecordsFailClosed();
+    ok &= TestRawXattrNames();
     ok &= TestSecurityRecordCodec();
     ok &= TestSecurityPrincipalVectors();
     ok &= TestSecurityAceProjection();

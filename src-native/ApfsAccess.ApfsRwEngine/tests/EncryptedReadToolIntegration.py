@@ -5,6 +5,7 @@ Run with --root <private candidate directory>. All evidence is public metadata.
 import argparse, ctypes as C, hashlib, json, os, re, struct, subprocess, time, msvcrt, sys
 from pathlib import Path
 from ctypes import wintypes as W
+from EncryptedFailureEvidence import capture_failure, finish_cleanup, persist_failures
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root', required=True)
@@ -33,6 +34,7 @@ k.OpenProcess.argtypes = [W.DWORD,W.BOOL,W.DWORD]
 k.OpenProcess.restype = W.HANDLE
 INVALID = C.c_void_p(-1).value
 records = []
+failure_evidence = []
 
 def vector(name):
     text = VECTORS.read_text(encoding='utf-8-sig')
@@ -123,7 +125,7 @@ def run(name, cmd=None, payload=frame(), expected_exit=0, expected_error=None,
     start=time.monotonic()
     p=subprocess.Popen(cmd,stdin=stdin,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
         startupinfo=startup,close_fds=True,creationflags=subprocess.CREATE_NO_WINDOW)
-    prefix=b''; actual_args=None; locked=False
+    prefix=b''; actual_args=None; locked=False; timeout_evidence=None
     try:
         if hold or lease_check or cancel or audit:
             # Child emits this only after its real deny-write/delete lease exists.
@@ -148,7 +150,16 @@ def run(name, cmd=None, payload=frame(), expected_exit=0, expected_error=None,
         if hold:
             p.wait(timeout=7)
             p.stdin.close(); p.stdin=None
-        out,err=p.communicate(timeout=7); err=prefix+err
+        try:
+            out,err=p.communicate(timeout=7)
+        except subprocess.TimeoutExpired as error:
+            if name == 'permissive_pipe_refused':
+                timeout_evidence = capture_failure(name,p,start,error,prefix=prefix,
+                                                   credential=SECRET,timeout=7)
+                failure_evidence.append(timeout_evidence)
+                persist_failures(EVIDENCE/'failure-evidence.json',failure_evidence)
+            raise
+        err=prefix+err
         check(p.returncode==expected_exit,name+': exact exit (observed '+str(p.returncode)+')')
         if expected_error: check(expected_error.encode() in err,name+': typed error')
         if expected_bytes is not None: check(out==expected_bytes,name+': exact file bytes')
@@ -168,11 +179,26 @@ def run(name, cmd=None, payload=frame(), expected_exit=0, expected_error=None,
         records.append(record)
         print('PASS '+name,flush=True)
     finally:
-        if p.poll() is None:
-            p.kill(); p.wait(timeout=5)
-        if opened: opened.close()
-        if unprotected_writer is not None: os.close(unprotected_writer)
-        if event: k.CloseHandle(event)
+        kill_requested=False; cleanup_error=None
+        try:
+            if p.poll() is None:
+                kill_requested=True
+                p.kill(); p.wait(timeout=5)
+        except BaseException as error:
+            cleanup_error=error
+            raise
+        finally:
+            try:
+                if opened: opened.close()
+                if unprotected_writer is not None: os.close(unprotected_writer)
+                if event: k.CloseHandle(event)
+            except BaseException as error:
+                cleanup_error=error
+                raise
+            finally:
+                if timeout_evidence is not None:
+                    finish_cleanup(timeout_evidence,p,start,kill_requested,cleanup_error,credential=SECRET)
+                    persist_failures(EVIDENCE/'failure-evidence.json',failure_evidence)
 
 def batch():
     subprocess.run([str(BUILDER),str(FIXTURES)],check=True,capture_output=True,timeout=5)
@@ -250,5 +276,5 @@ if __name__ == '__main__':
     finally:
         EVIDENCE.mkdir(exist_ok=True)
         (EVIDENCE/'integration-results.json').write_text(json.dumps({'timezone':'Asia/Shanghai',
-            'at':time.strftime('%Y-%m-%dT%H:%M:%S%z'),'cases':records,
+            'at':time.strftime('%Y-%m-%dT%H:%M:%S%z'),'cases':records,'failureEvidence':failure_evidence,
             'passed':sum(r['pass'] for r in records),'failed':sum(not r['pass'] for r in records)},indent=2),encoding='utf-8')

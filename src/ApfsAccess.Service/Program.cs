@@ -4,23 +4,25 @@ using ApfsAccess.Core;
 using ApfsAccess.Service;
 
 var runtimeRoot = ConfigurePortableRuntimeEnvironment();
-using var serviceInstanceLease = ServiceInstanceLease.TryAcquire(runtimeRoot);
+var builder = Host.CreateApplicationBuilder(args);
+
+// Machine-local settings survive portable payload replacement. Explicit launch
+// overrides retain precedence for bounded validation and recovery helpers.
+builder.Configuration
+    .AddJsonFile(Path.Combine(runtimeRoot, "local-settings.json"), optional: true, reloadOnChange: false)
+    .AddEnvironmentVariables();
+if (args.Length > 0) builder.Configuration.AddCommandLine(args);
+
+ConfigureNativeRecoveryRoot(builder.Configuration);
+var configuredOptions = ServiceOptionsBinding.Configure(builder.Services, builder.Configuration, runtimeRoot);
+using var serviceInstanceLease = ServiceInstanceLease.TryAcquire(runtimeRoot,
+    ServiceInstanceLease.ConfiguredLeaseName(configuredOptions.PrivateControlInstanceId));
 if (serviceInstanceLease is null)
 {
     Console.Error.WriteLine("APFS Access service is already running.");
     Environment.ExitCode = 17;
     return;
 }
-
-var builder = Host.CreateApplicationBuilder(args);
-
-builder.Services.Configure<ServiceHostOptions>(
-    builder.Configuration.GetSection(ServiceHostOptions.SectionName)
-);
-
-var configuredOptions = builder.Configuration
-    .GetSection(ServiceHostOptions.SectionName)
-    .Get<ServiceHostOptions>() ?? new ServiceHostOptions();
 
 builder.Services.Configure<HostOptions>(options =>
 {
@@ -29,12 +31,14 @@ builder.Services.Configure<HostOptions>(options =>
 });
 
 builder.Services.AddSingleton(_ => new VolumeDriveLetterAssignments(Path.Combine(runtimeRoot, "volume-drive-letters.json")));
+builder.Services.AddSingleton(_ => new PhysicalWritePermissions(Path.Combine(runtimeRoot, "physical-write-permissions.json")));
 builder.Services.AddSingleton<IMountPolicy>(sp => new FirstFreeMountPolicy(
     configuredOptions.MountLetterPool, sp.GetRequiredService<VolumeDriveLetterAssignments>()));
 
 if (string.Equals(configuredOptions.BackendMode, "Native", StringComparison.OrdinalIgnoreCase))
 {
-    builder.Services.AddSingleton<IApfsBackend>(_ => new NativeApfsBackend(configuredOptions));
+    builder.Services.AddSingleton<IApfsBackend>(sp => new NativeApfsBackend(configuredOptions,
+        sp.GetRequiredService<PhysicalWritePermissions>()));
 }
 else
 {
@@ -54,21 +58,35 @@ builder.Services.AddSingleton(static sp =>
         sp.GetRequiredService<AgentControlCommandExecutor>().ExecuteAsync,
         Path.Combine(runtimeRoot, "agent-operations"));
 });
-builder.Services.AddSingleton(static sp => new TrayPipeHostService(
+builder.Services.AddSingleton(sp => new TrayPipeHostService(
     sp.GetRequiredService<ILogger<TrayPipeHostService>>(),
     sp.GetRequiredService<RuntimeStatusPublisher>(),
     sp.GetRequiredService<ApfsMountWorker>(),
     sp.GetRequiredService<IHostApplicationLifetime>(),
-    sp.GetRequiredService<AgentControlOperationService>()));
+    sp.GetRequiredService<AgentControlOperationService>(), configuredOptions.PrivateControlInstanceId is {} instance
+        ? ApfsAccess.Ipc.FusionControlEndpoint.ForPrivateInstance(instance) : ApfsAccess.Ipc.ApfsPipeConstants.PipeName));
 builder.Services.AddHostedService(static sp => sp.GetRequiredService<TrayPipeHostService>());
 
 await builder.Build().RunAsync();
+
+static void ConfigureNativeRecoveryRoot(IConfiguration configuration)
+{
+    if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("APFSACCESS_RECOVERY_ROOT")))
+        return;
+
+    var configuredRoot = configuration["Service:NativeRecoveryRoot"];
+    if (!string.IsNullOrWhiteSpace(configuredRoot))
+        Environment.SetEnvironmentVariable("APFSACCESS_RECOVERY_ROOT", Path.GetFullPath(configuredRoot));
+}
 
 static string ConfigurePortableRuntimeEnvironment()
 {
     var runtimeRoot = ResolveRuntimeRoot();
     var tempRoot = Path.Combine(runtimeRoot, "temp");
-    var spoolRoot = Path.Combine(runtimeRoot, "payload-spool");
+    var configuredSpoolRoot = Environment.GetEnvironmentVariable("APFSACCESS_SPOOL_ROOT");
+    var spoolRoot = string.IsNullOrWhiteSpace(configuredSpoolRoot)
+        ? Path.Combine(runtimeRoot, "payload-spool")
+        : Path.GetFullPath(configuredSpoolRoot);
 
     Directory.CreateDirectory(runtimeRoot);
     Directory.CreateDirectory(tempRoot);

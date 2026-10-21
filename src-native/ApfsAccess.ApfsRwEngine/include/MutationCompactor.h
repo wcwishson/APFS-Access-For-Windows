@@ -30,6 +30,11 @@ public:
         RestoreDirectoryFromSymbolicLink = 14,
         RewriteCompressedContent = 15,
         CloneFile = 16,
+        RenameVolume = 17,
+        CreateSnapshot = 18,
+        DeleteSnapshot = 19,
+        RepairVolumeFileCount = 24,
+        SetVolumeQuotaReserve = 20,
     };
 
     struct MutationView

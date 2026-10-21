@@ -1,4 +1,6 @@
 #include "ApfsFusionStore.h"
+#include "ApfsFusionEmptyWriteback.h"
+#include "FusionHeldReadCache.h"
 // Format facts (independent implementation, no external driver code linked):
 // Apple File System Reference (2020-06-22), nx_superblock_t and Fusion, pp. 34,
 // 172-173: https://developer.apple.com/support/downloads/Apple-File-System-Reference.pdf
@@ -157,12 +159,19 @@ struct ApfsFusionStore::Impl
     };
     std::array<Member, 2> members;
     std::shared_ptr<ApfsReadBudget> budget;
+    std::shared_ptr<const std::atomic<bool>> cancellation;
     std::array<ApfsPhysicalStoreDescriptor, 2> descriptors;
     ApfsContainerDescriptor container;
     ContainerCheckpointView checkpoint;
     std::uint32_t block_size = 0;
     mutable std::string error;
     mutable bool poisoned = false;
+    mutable unsigned unavailable_members = 0;
+    bool held_runtime_capable = false;
+    // Set when bind tolerated an exact tier-ahead-by-one crash skew (main
+    // stays authoritative). Cleared implicitly: every later bind recomputes
+    // it, and the next successful publication re-mirrors both anchors equal.
+    bool tier_ahead_skew_tolerated = false;
 
     bool Refuse(const char* reason, bool poison = false) const
     {
@@ -173,16 +182,21 @@ struct ApfsFusionStore::Impl
     bool Verify() const
     {
         if (poisoned) return false;
+        if (cancellation && cancellation->load()) return Refuse("FusionReadCancelled",true);
         if (budget->Failed()) return Refuse(budget->Failure(), true);
+        for (std::size_t i=0;i<members.size();++i) {
+            const auto& m=members[i];
+            if(!m.source || !m.verify || !m.verify() || m.source->SizeBytes()!=m.binding.exact_identity.size_bytes)
+                unavailable_members |= 1u<<i;
+        }
+        if(unavailable_members)return Refuse("FusionMemberDisappearedOrChanged",true);
         for (const auto& m : members)
         {
-            if (!m.source || !m.verify || !m.verify() ||
-                m.source->SizeBytes() != m.binding.exact_identity.size_bytes)
-                return Refuse("FusionMemberDisappearedOrChanged", true);
             const auto inherited = m.source->ReadBudget();
             if (inherited && inherited != budget)
                 return Refuse("FusionReadBudgetIdentityMismatch", true);
         }
+        if (cancellation && cancellation->load()) return Refuse("FusionReadCancelled",true);
         // Verification callbacks/held-handle queries can fail the allowance.
         // Publication must also see changes made during the last member check.
         if (budget->Failed()) return Refuse(budget->Failure(), true);
@@ -213,7 +227,7 @@ struct ApfsFusionStore::Impl
         return true;
     }
     bool ReadMember(std::size_t index, std::uint64_t offset, std::size_t size,
-        std::vector<std::byte>& out) const
+        std::vector<std::byte>& out, bool reserved = false) const
     {
         out.clear();
         if (!Verify()) return false;
@@ -222,9 +236,9 @@ struct ApfsFusionStore::Impl
             return Refuse("FusionMemberReadRangeInvalid");
         const auto inherited = m.source->ReadBudget();
         if (inherited && inherited != budget) return Refuse("FusionReadBudgetIdentityMismatch", true);
-        if (!inherited && !budget->Read(size)) return Refuse(budget->Failure(), true);
+        if (!reserved && !inherited && !budget->Read(size)) return Refuse(budget->Failure(), true);
         if (!m.source->Read(m.binding.store_offset + offset, size, out) || out.size() != size)
-        { out.clear(); return Refuse("FusionMemberShortReadOrIoFailure", true); }
+        { unavailable_members |= 1u<<index; out.clear(); return Refuse("FusionMemberShortReadOrIoFailure", true); }
         if (!Verify()) { out.clear(); return false; }
         return true;
     }
@@ -265,6 +279,8 @@ std::function<bool(std::string&)> ApfsFusionStore::RetainAvailabilityLease() con
         error = state->error; return false;
     };
 }
+unsigned ApfsFusionStore::UnavailableMembers() const noexcept {return impl_->unavailable_members;}
+bool ApfsFusionStore::TierAheadSkewTolerated() const noexcept { return impl_->tier_ahead_skew_tolerated; }
 void ApfsFusionStore::Cancel() const { (void)impl_->Refuse("FusionReadCancelled", true); }
 bool ApfsFusionStore::InspectImage(const std::wstring& path, FusionImageIdentity& out, std::string& error)
 {
@@ -275,18 +291,20 @@ bool ApfsFusionStore::InspectImage(const std::wstring& path, FusionImageIdentity
 #endif
     return Fail(error, "FusionOrdinaryLocalImageReadLeaseRequired");
 }
-std::unique_ptr<ApfsFusionStore> ApfsFusionStore::BindImages(const FusionBindRequest& r, std::string& error)
+std::unique_ptr<ApfsFusionStore> ApfsFusionStore::BindImages(const FusionBindRequest& r, std::string& error, unsigned* unavailable_members)
 {
+    if(unavailable_members)*unavailable_members=0;
     error.clear();
     if (!RequestValid(r, error)) return {};
-    auto impl = std::make_unique<Impl>(); impl->budget = r.budget;
+    auto impl = std::make_unique<Impl>(); impl->budget = r.budget; impl->cancellation = r.cancellation;
     for (const auto& m : r.members)
     {
 #ifdef _WIN32
         auto image = std::make_shared<LockedImage>(m.path);
         FusionImageIdentity identity;
         if (!image->Identity(identity) || identity != m.exact_identity)
-        { error = "FusionExactImageIdentityMismatchOrUnavailable"; return {}; }
+        { if(unavailable_members)*unavailable_members=1u<<(m.role==FusionMemberRole::Main?0:1);
+          error = "FusionExactImageIdentityMismatchOrUnavailable"; return {}; }
         auto& target = impl->members[m.role == FusionMemberRole::Main ? 0 : 1];
         target.binding = m; target.source = image;
         target.verify = [image] { return image->Verify(); };
@@ -294,33 +312,129 @@ std::unique_ptr<ApfsFusionStore> ApfsFusionStore::BindImages(const FusionBindReq
         error = "FusionRegularImagePlatformUnsupported"; return {};
 #endif
     }
-    return FinishBind(std::move(impl), r, error);
+    impl->held_runtime_capable = true;
+    return FinishBind(std::move(impl), r, error, unavailable_members);
+}
+std::unique_ptr<ApfsFusionStore> ApfsFusionStore::BindHeldImages(const FusionBindRequest& r,
+    const std::array<std::shared_ptr<rw::BlockDevice>, 2>& devices,
+    std::shared_ptr<const std::atomic<bool>> owner_cancellation,
+    std::string& error, unsigned* unavailable_members,
+    const std::map<std::uint64_t, std::vector<std::byte>>* recovery_preimage)
+{
+    if (unavailable_members) *unavailable_members = 0;
+    error.clear();
+    if (!RequestValid(r, error)) return {};
+    class HeldImage final : public RandomAccessSource
+    {
+    public:
+        std::shared_ptr<rw::BlockDevice> device;
+        FusionImageIdentity identity;
+        std::shared_ptr<const std::atomic<bool>> cancelled;
+        std::map<std::uint64_t, std::vector<std::byte>> preimage;
+        FusionHeldReadCache parser_cache;
+        mutable std::mutex identity_gate;
+        mutable std::optional<rw::BlockDevice::WriteSourceObservation> identity_observation;
+        bool Verify() const
+        {
+            std::lock_guard lock(identity_gate);
+            if (!cancelled || cancelled->load() || !device) return false;
+            const auto current = device->CaptureExclusiveWriteSourceObservation();
+            if (!current) { identity_observation.reset(); return false; }
+            // Only an opaque current observation of these original exclusive
+            // handles can reuse the complete identity comparison. Every write
+            // admission/retirement changes it, including a failed write.
+            if (current == identity_observation) return !cancelled->load();
+            FusionImageIdentity now;
+            // Last-write time changes under our exclusive writer. All stable
+            // file identity/geometry fields must remain exactly bound.
+            if (!(device->QueryHeldImageIdentity(now) && now.volume_serial == identity.volume_serial &&
+                now.file_id == identity.file_id && now.size_bytes == identity.size_bytes &&
+                now.creation_time == identity.creation_time &&
+                device->IsExclusiveWriteSourceObservationCurrent(*current))) return false;
+            identity_observation = current;
+            return !cancelled->load();
+        }
+        std::uint64_t SizeBytes() const override { return identity.size_bytes; }
+        bool Read(std::uint64_t at, std::size_t size, std::vector<std::byte>& out) const override
+        {
+            out.clear();
+            if (!Verify() || at > identity.size_bytes || size > identity.size_bytes - at || size > kMaxRead)
+                return false;
+            const auto alignment = (std::max)(std::uint32_t{512}, device->GetGeometry().logical_block_size);
+            const bool read = at % alignment == 0 && size % alignment == 0
+                ? parser_cache.Read(*device, at, size, out) : device->Read(at, size, out);
+            if (!read ||
+                out.size() != size || !Verify()) { out.clear(); return false; }
+            // Private owner replay view only. Physical verification and all
+            // writes bypass this overlay through the original held devices.
+            for (const auto& [start, bytes] : preimage)
+            {
+                const auto begin = (std::max)(start, at);
+                const auto end = (std::min)(start + bytes.size(), at + size);
+                if (begin < end) std::copy(bytes.begin() + (begin - start), bytes.begin() + (end - start), out.begin() + (begin - at));
+            }
+            return true;
+        }
+    };
+    auto impl = std::make_unique<Impl>();
+    impl->budget = r.budget; impl->cancellation = r.cancellation;
+    if (!devices[0] || !devices[1] || devices[0] == devices[1])
+        return (Fail(error, "FusionHeldExclusivePairRequired"), nullptr);
+    for (const auto& m : r.members)
+    {
+        const auto role = m.role == FusionMemberRole::Main ? 0u : 1u;
+        auto image = std::make_shared<HeldImage>(); image->device = devices[role]; image->cancelled = owner_cancellation;
+        if (recovery_preimage) for (const auto& [address, bytes] : *recovery_preimage)
+        {
+            const auto member = address >= kFusionTier2ByteAddress ? 1u : 0u;
+            if (member != role) continue;
+            const auto local = address - (member ? kFusionTier2ByteAddress : 0);
+            if (bytes.size() != 4096 || local % 4096 || local >= m.store_size || bytes.size() > m.store_size - local)
+                return (Fail(error, "FusionRecoveryPreimageBounds"), nullptr);
+            image->preimage.emplace(m.store_offset + local, bytes);
+        }
+        if (image->device->BaseOffsetBytes() || !image->device->HasWriteHandle() ||
+            !image->device->QueryHeldImageIdentity(image->identity) ||
+            image->identity != m.exact_identity || !image->Verify())
+        {
+            if (unavailable_members) *unavailable_members = 1u << role;
+            error = "FusionHeldExclusiveIdentityMismatch"; return {};
+        }
+        auto& target = impl->members[role];
+        target.binding = m; target.source = image;
+        target.verify = [image] { return image->Verify(); };
+    }
+    impl->held_runtime_capable = true;
+    return FinishBind(std::move(impl), r, error, unavailable_members);
 }
 #ifdef APFS_FUSION_STORE_TESTING
 bool ApfsFusionStore::TestOrdinaryLocalImagePathSyntax(const std::wstring& path)
 { return OrdinaryLocalImagePathSyntax(path); }
 std::unique_ptr<ApfsFusionStore> ApfsFusionStore::BindTestSources(const FusionBindRequest& r,
-    const std::vector<TestMember>& sources, std::string& error)
+    const std::vector<TestMember>& sources, std::string& error, unsigned* unavailable_members)
 {
+    if (unavailable_members) *unavailable_members = 0;
     error.clear();
     if (!RequestValid(r, error)) return {};
     if (sources.size() != 2) { error = "FusionCompleteTwoMemberSetRequired"; return {}; }
     if (sources[0].source == sources[1].source) { error = "FusionDuplicateSource"; return {}; }
-    auto impl = std::make_unique<Impl>(); impl->budget = r.budget;
+    auto impl = std::make_unique<Impl>(); impl->budget = r.budget; impl->cancellation = r.cancellation;
     for (std::size_t i = 0; i < 2; ++i)
     {
         auto& target = impl->members[r.members[i].role == FusionMemberRole::Main ? 0 : 1];
         target.binding = r.members[i]; target.source = sources[i].source;
         target.verify = sources[i].verify_unchanged;
     }
-    return FinishBind(std::move(impl), r, error);
+    return FinishBind(std::move(impl), r, error, unavailable_members);
 }
 #endif
 
 std::unique_ptr<ApfsFusionStore> ApfsFusionStore::FinishBind(std::unique_ptr<Impl> p,
-    const FusionBindRequest& r, std::string& error)
+    const FusionBindRequest& r, std::string& error, unsigned* unavailable_members)
 {
+    if (unavailable_members) *unavailable_members = 0;
     const auto refuse = [&](const char* reason) -> std::unique_ptr<ApfsFusionStore> {
+        if (unavailable_members) *unavailable_members = p->unavailable_members;
         error = p->poisoned ? p->error : reason; return {}; };
     if (!p->Verify()) return refuse("FusionMemberUnavailable");
     if (!p->budget->Materialize(2, 2 * (sizeof(NxSuperblock) + 1024)))
@@ -355,14 +469,52 @@ std::unique_ptr<ApfsFusionStore> ApfsFusionStore::FinishBind(std::unique_ptr<Imp
             return refuse("FusionSetUuidMismatch");
     }
     if (nx[0].block_size != nx[1].block_size) return refuse("FusionMemberBlockSizeMismatch");
-    if (nx[0].xid != nx[1].xid) return refuse("FusionMemberAnchorGenerationMismatch");
-    // apfsck fusion_super_compare: every byte except checksum and UUID role bit.
-    for (std::size_t n = 8; n < p->members[0].anchor.size(); ++n)
+    // Crash-skew tolerance: publication writes the tier-2 anchor mirror
+    // before the main switch and flushes in between, so an interruption can
+    // leave tier-2 exactly one generation ahead with main still coherent.
+    // The reverse (main ahead) cannot occur under that order: the main
+    // switch is last, and the tier-2 mirror is always flushed first. Accept
+    // only the exact ahead-by-one shape with a structurally plausible mirror
+    // (same container, geometry, features, chained xids, role-bit-correct
+    // fusion UUID); the main anchor stays authoritative and the next
+    // successful transaction re-mirrors, healing the skew. Anything else
+    // refuses exactly like before: an unrelated or torn tier-2 anchor must
+    // never select main by assumption.
+    bool tier_ahead_skew = false;
+    if (nx[0].xid != nx[1].xid)
     {
-        auto a = p->members[0].anchor[n], b = p->members[1].anchor[n];
-        if (n == 0x50F) b &= std::byte{0xFE};
-        if (a != b) return refuse("FusionMemberAnchorContentMismatch");
+        const auto& main = nx[0];
+        const auto& tier = nx[1];
+        const bool plausible =
+            main.xid != std::numeric_limits<std::uint64_t>::max() &&
+            tier.xid == main.xid + 1 &&
+            tier.next_xid == main.next_xid + 1 &&
+            tier.block_count == main.block_count &&
+            tier.features == main.features &&
+            tier.readonly_features == main.readonly_features &&
+            tier.incompatible_features == main.incompatible_features &&
+            tier.uuid_hex == main.uuid_hex &&
+            std::equal(tier.fusion_uuid.begin(), tier.fusion_uuid.begin() + 15,
+                main.fusion_uuid.begin()) &&
+            (std::to_integer<unsigned>(tier.fusion_uuid[15]) & 1) == 1 &&
+            (std::to_integer<unsigned>(main.fusion_uuid[15]) & 1) == 0;
+        if (!plausible) return refuse("FusionMemberAnchorGenerationMismatch");
+        tier_ahead_skew = true;
     }
+    // apfsck fusion_super_compare: every byte except checksum and UUID role bit.
+    // Skipped under tolerated skew: the generations legitimately differ there
+    // (xid, next_xid, ring pointers, checksums); plausibility is established
+    // above instead.
+    if (!tier_ahead_skew)
+    {
+        for (std::size_t n = 8; n < p->members[0].anchor.size(); ++n)
+        {
+            auto a = p->members[0].anchor[n], b = p->members[1].anchor[n];
+            if (n == 0x50F) b &= std::byte{0xFE};
+            if (a != b) return refuse("FusionMemberAnchorContentMismatch");
+        }
+    }
+    p->tier_ahead_skew_tolerated = tier_ahead_skew;
     p->block_size = nx[0].block_size;
     const auto main_blocks = p->members[0].binding.store_size / p->block_size;
     const auto tier_blocks = p->members[1].binding.store_size / p->block_size;
@@ -496,13 +648,7 @@ std::unique_ptr<ApfsFusionStore> ApfsFusionStore::FinishBind(std::unique_ptr<Imp
     if (wbc->physical_block >= main_blocks ||
         !source.Read(wbc->physical_block * p->block_size, wbc->size_bytes, cache))
         return refuse("FusionWritebackReadFailed");
-    if (ReadU64LE(cache, 0x20) != 0x70) return refuse("FusionWritebackVersionUnsupported");
-    if (ReadU32LE(cache, 0x4C) != 0u) return refuse("FusionWritebackReservedFieldUnsupported");
-    if (ReadU64LE(cache, 0x28) != 0 || ReadU64LE(cache, 0x30) != 0 ||
-        ReadU64LE(cache, 0x38) != 0 || ReadU64LE(cache, 0x40) != 0 ||
-        ReadU32LE(cache, 0x48) != 0u || ReadU64LE(cache, 0x50) != 0 ||
-        ReadU64LE(cache, 0x58) != 0 || ReadU64LE(cache, 0x60) != 0)
-        return refuse("FusionNonemptyWritebackRoutingUnestablished");
+    if (!CheckAppleFusionEmptyWritebackBody(cache, error)) return {};
     const auto mt_oid = nx[0].fusion_middle_tree_oid;
     if (mt_oid > (2 * kFusionTier2ByteAddress - 1) / p->block_size)
         return refuse("FusionMiddleTreeAddressInvalid");
@@ -554,6 +700,16 @@ std::unique_ptr<ApfsFusionStore> ApfsFusionStore::FinishBind(std::unique_ptr<Imp
     return std::unique_ptr<ApfsFusionStore>(new ApfsFusionStore(std::move(p)));
 }
 
+bool ApfsFusionStore::RuntimeCapable() const noexcept { return impl_->held_runtime_capable; }
+bool ApfsFusionStore::ReadRuntime(const RuntimeRead& request, std::vector<std::byte>& out) const
+{
+    out.clear();
+    if (&request.source_ != this || !RuntimeCapable()) return false;
+    FusionRoute route;
+    if (!impl_->Map(request.offset_, request.size_, route)) return false;
+    return impl_->ReadMember(route.role == FusionMemberRole::Main ? 0 : 1,
+        route.member_offset, request.size_, out, true);
+}
 std::uint64_t ApfsFusionStore::SizeBytes() const { return kFusionTier2ByteAddress + impl_->members[1].binding.store_size; }
 std::uint64_t ApfsFusionStore::CapacityBytes() const noexcept
 { return impl_->members[0].binding.store_size + impl_->members[1].binding.store_size; }

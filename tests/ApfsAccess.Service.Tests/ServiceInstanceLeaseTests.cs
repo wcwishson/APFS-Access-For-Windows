@@ -5,6 +5,26 @@ namespace ApfsAccess.Service.Tests;
 public sealed class ServiceInstanceLeaseTests
 {
     [Fact]
+    public void ConfiguredPrivateInstancesRetainSingletonPerIdentityWithoutTakingDefaultLease()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "backup-private-leases-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            Assert.Null(ServiceInstanceLease.ConfiguredLeaseName(null));
+            Assert.Throws<ArgumentException>(() => ServiceInstanceLease.ConfiguredLeaseName(Guid.Empty));
+            var a = ServiceInstanceLease.ConfiguredLeaseName(Guid.NewGuid());
+            var b = ServiceInstanceLease.ConfiguredLeaseName(Guid.NewGuid());
+            using var first = ServiceInstanceLease.TryAcquire(root, a);
+            using var second = ServiceInstanceLease.TryAcquire(root, b);
+            Assert.NotNull(first); Assert.NotNull(second);
+            using var duplicate = ServiceInstanceLease.TryAcquire(root, a);
+            Assert.Null(duplicate);
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
     public void DefaultLeaseUsesMachineWideNamespace()
     {
         var field = typeof(ServiceInstanceLease).GetField(

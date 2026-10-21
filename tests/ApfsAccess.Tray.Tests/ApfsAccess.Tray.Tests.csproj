@@ -17,9 +17,13 @@
 
   <ItemGroup>
     <Using Include="Xunit" />
+    <Compile Remove="ImageKeyManagementObservationProbe.cs" />
+    <Compile Include="..\ApfsAccess.Service.Tests\FusionServiceRouteTests.cs" Link="FusionServiceRouteTests.cs" />
+    <Compile Include="..\fixtures\SnapshotRecoveryFixture.cs" Link="SnapshotRecoveryFixture.cs" />
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\ApfsAccess.Service\ApfsAccess.Service.csproj" />
     <ProjectReference Include="..\..\src\ApfsAccess.Core\ApfsAccess.Core.csproj" />
     <ProjectReference Include="..\..\src\ApfsAccess.Ipc\ApfsAccess.Ipc.csproj" />
     <ProjectReference Include="..\..\src\ApfsAccess.Bootstrap\ApfsAccess.Bootstrap.csproj" />
