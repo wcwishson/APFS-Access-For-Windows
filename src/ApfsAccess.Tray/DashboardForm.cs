@@ -1,5 +1,4 @@
 using System.Drawing.Drawing2D;
-using System.Reflection;
 using ApfsAccess.Ipc;
 
 namespace ApfsAccess.Tray;
@@ -187,13 +186,6 @@ public sealed class DashboardForm : Form
         BackColor = _currentTheme.WindowBackground;
         Font = new Font("Segoe UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
 
-        SetStyle(
-            ControlStyles.AllPaintingInWmPaint |
-            ControlStyles.UserPaint |
-            ControlStyles.OptimizedDoubleBuffer |
-            ControlStyles.ResizeRedraw,
-            true);
-        DoubleBuffered = true;
 
         _rootPanel = new TableLayoutPanel
         {
@@ -648,16 +640,6 @@ public sealed class DashboardForm : Form
         _detailContainer.SizeChanged += (_, _) => AdjustMemberPanelHeight();
         _contentSplit.SizeChanged += (_, _) => { if (!_resizing && !_adjustingContentSplit) AdjustContentSplitDistance(); };
 
-        EnableDoubleBuffering(_rootPanel);
-        EnableDoubleBuffering(_summaryHeaderPanel);
-        EnableDoubleBuffering(_rowsPanel);
-        EnableDoubleBuffering(_topologyLayout);
-        EnableDoubleBuffering(_topologyTree);
-        EnableDoubleBuffering(_detailContainer);
-        EnableDoubleBuffering(_detailsTopPanel);
-        EnableDoubleBuffering(_memberPanel);
-        EnableDoubleBuffering(_contentSplit);
-        EnableDoubleBuffering(_detailsScroll);
 
         _topologyLayout.Controls.Add(_topologyTree, 0, 0);
         _topologyLayout.Controls.Add(_detailContainer, 1, 0);
@@ -1419,12 +1401,6 @@ public sealed class DashboardForm : Form
         _treeContextMenu.Items.Add(new ToolStripMenuItem("Collapse all nodes", null, (_, _) => _topologyTree.CollapseAll()));
     }
 
-    private static void EnableDoubleBuffering(Control control)
-    {
-        if (SystemInformation.TerminalServerSession) return;
-        typeof(Control).GetProperty("DoubleBuffered", BindingFlags.Instance | BindingFlags.NonPublic)
-            ?.SetValue(control, true, null);
-    }
 
     private void AdjustMemberPanelHeight()
     {
