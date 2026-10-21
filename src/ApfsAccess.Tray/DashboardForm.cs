@@ -1,4 +1,5 @@
 using System.Drawing.Drawing2D;
+using System.Reflection;
 using ApfsAccess.Ipc;
 
 namespace ApfsAccess.Tray;
@@ -185,6 +186,14 @@ public sealed class DashboardForm : Form
         MinimumSize = new Size(ScaleDpi(360), ScaleDpi(280));
         BackColor = _currentTheme.WindowBackground;
         Font = new Font("Segoe UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
+
+        SetStyle(
+            ControlStyles.AllPaintingInWmPaint |
+            ControlStyles.UserPaint |
+            ControlStyles.OptimizedDoubleBuffer |
+            ControlStyles.ResizeRedraw,
+            true);
+        DoubleBuffered = true;
 
         _rootPanel = new TableLayoutPanel
         {
@@ -398,7 +407,7 @@ public sealed class DashboardForm : Form
 
         _memberPanel = new FlowLayoutPanel
         {
-            Dock = DockStyle.Fill,
+            Dock = DockStyle.Top,
             AutoSize = false,
             WrapContents = true,
             BackColor = BackColor,
@@ -522,9 +531,9 @@ public sealed class DashboardForm : Form
             Padding = new Padding(0),
             Margin = new Padding(0),
         };
-        _detailsTopPanel.Controls.Add(_storageBar);
         _detailsTopPanel.Controls.Add(_memberPanel);
-        _memberPanel.BringToFront();
+        _detailsTopPanel.Controls.Add(_storageBar);
+        _storageBar.BringToFront();
 
         _contentSplit = new SplitContainer
         {
@@ -632,13 +641,23 @@ public sealed class DashboardForm : Form
             e.Graphics.FillPath(gripBrush, gripPath);
         };
 
-        _detailContainer.Controls.Add(_detailsTopPanel);
         _detailContainer.Controls.Add(_contentSplit);
-        _contentSplit.BringToFront();
+        _detailContainer.Controls.Add(_detailsTopPanel);
+        _detailsTopPanel.BringToFront();
 
         _detailContainer.SizeChanged += (_, _) => AdjustMemberPanelHeight();
-        _memberPanel.SizeChanged += (_, _) => AdjustMemberPanelHeight();
         _contentSplit.SizeChanged += (_, _) => { if (!_resizing && !_adjustingContentSplit) AdjustContentSplitDistance(); };
+
+        EnableDoubleBuffering(_rootPanel);
+        EnableDoubleBuffering(_summaryHeaderPanel);
+        EnableDoubleBuffering(_rowsPanel);
+        EnableDoubleBuffering(_topologyLayout);
+        EnableDoubleBuffering(_topologyTree);
+        EnableDoubleBuffering(_detailContainer);
+        EnableDoubleBuffering(_detailsTopPanel);
+        EnableDoubleBuffering(_memberPanel);
+        EnableDoubleBuffering(_contentSplit);
+        EnableDoubleBuffering(_detailsScroll);
 
         _topologyLayout.Controls.Add(_topologyTree, 0, 0);
         _topologyLayout.Controls.Add(_detailContainer, 1, 0);
@@ -1040,7 +1059,6 @@ public sealed class DashboardForm : Form
         {
             _storageBarActive = false;
             _storageBar.Visible = false;
-            AdjustMemberPanelHeight();
             return;
         }
 
@@ -1048,7 +1066,6 @@ public sealed class DashboardForm : Form
         {
             _storageBarActive = false;
             _storageBar.Visible = false;
-            AdjustMemberPanelHeight();
             return;
         }
 
@@ -1091,7 +1108,6 @@ public sealed class DashboardForm : Form
                 _storageBar.SetStorage(disk.SizeBytes, unallocated, segments, $"Disk {disk.DeviceIdentifier} Physical Layout");
                 _storageBarActive = true;
                 _storageBar.Visible = true;
-                AdjustMemberPanelHeight();
                 return;
             }
         }
@@ -1127,7 +1143,6 @@ public sealed class DashboardForm : Form
 
                 _storageBarActive = true;
                 _storageBar.Visible = true;
-                AdjustMemberPanelHeight();
                 return;
             }
         }
@@ -1144,7 +1159,6 @@ public sealed class DashboardForm : Form
                 _storageBar.SetStorage(storeSize, 0, [storeSegment], "APFS Store Slice Storage");
                 _storageBarActive = true;
                 _storageBar.Visible = true;
-                AdjustMemberPanelHeight();
                 return;
             }
         }
@@ -1174,7 +1188,6 @@ public sealed class DashboardForm : Form
                 _storageBar.SetStorage(total, free, segments, title);
                 _storageBarActive = true;
                 _storageBar.Visible = true;
-                AdjustMemberPanelHeight();
                 return;
             }
         }
@@ -1217,7 +1230,6 @@ public sealed class DashboardForm : Form
                 _storageBar.SetStorage((long)shared.Total.Bytes, (long)shared.Free.Bytes, segments, title);
                 _storageBarActive = true;
                 _storageBar.Visible = true;
-                AdjustMemberPanelHeight();
                 return;
             }
             else if (status.MountedVolumes?.FirstOrDefault(m => m.VolumeId == node.Row?.VolumeId)?.CatalogSpace is { } catSpace && catSpace.ContainerTotal.Bytes > 0)
@@ -1231,14 +1243,12 @@ public sealed class DashboardForm : Form
                 _storageBar.SetStorage((long)catSpace.ContainerTotal.Bytes, (long)catSpace.ContainerFree.Bytes, segments, title);
                 _storageBarActive = true;
                 _storageBar.Visible = true;
-                AdjustMemberPanelHeight();
                 return;
             }
         }
 
         _storageBarActive = false;
         _storageBar.Visible = false;
-        AdjustMemberPanelHeight();
     }
 
     private void PopulateContextMenu()
@@ -1409,6 +1419,13 @@ public sealed class DashboardForm : Form
         _treeContextMenu.Items.Add(new ToolStripMenuItem("Collapse all nodes", null, (_, _) => _topologyTree.CollapseAll()));
     }
 
+    private static void EnableDoubleBuffering(Control control)
+    {
+        if (SystemInformation.TerminalServerSession) return;
+        typeof(Control).GetProperty("DoubleBuffered", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?.SetValue(control, true, null);
+    }
+
     private void AdjustMemberPanelHeight()
     {
         if (_adjustingMemberPanelHeight) return;
@@ -1427,28 +1444,40 @@ public sealed class DashboardForm : Form
             {
                 availWidth = _detailsTopPanel.Width;
             }
+            if (availWidth <= 0)
+            {
+                availWidth = 400;
+            }
 
-            int flowHeight = 0;
-            if (availWidth > 0)
-            {
-                var pref = _memberPanel.GetPreferredSize(new Size(availWidth, 0));
-                flowHeight = Math.Max(ScaleDpi(28), pref.Height);
-            }
-            else
-            {
-                var pref = _memberPanel.GetPreferredSize(Size.Empty);
-                flowHeight = Math.Max(ScaleDpi(28), pref.Height);
-            }
+            var pref = _memberPanel.GetPreferredSize(new Size(availWidth, 0));
+            var minFlowHeight = ScaleDpi(28);
+            var flowHeight = Math.Max(minFlowHeight, pref.Height);
 
             var barHeight = (_storageBarActive && _storageBar is not null) ? _storageBar.Height : 0;
             var totalHeight = barHeight + flowHeight;
 
-            if (_detailsTopPanel.Height != totalHeight)
+            _detailsTopPanel.SuspendLayout();
+            _memberPanel.SuspendLayout();
+            try
             {
-                _detailsTopPanel.Height = totalHeight;
-                _detailsTopPanel.PerformLayout();
-                _detailContainer?.PerformLayout();
+                if (_memberPanel.Height != flowHeight)
+                {
+                    _memberPanel.Height = flowHeight;
+                }
+                if (_detailsTopPanel.Height != totalHeight)
+                {
+                    _detailsTopPanel.Height = totalHeight;
+                }
             }
+            finally
+            {
+                _memberPanel.ResumeLayout(true);
+                _detailsTopPanel.ResumeLayout(true);
+            }
+
+            _memberPanel.PerformLayout();
+            _detailsTopPanel.PerformLayout();
+            _detailContainer?.PerformLayout();
         }
         finally
         {
@@ -1569,20 +1598,27 @@ public sealed class DashboardForm : Form
     protected override void OnDpiChanged(DpiChangedEventArgs e)
     {
         base.OnDpiChanged(e);
-        if (_topologyTree is not null)
+        SuspendLayout();
+        try
         {
-            _topologyTree.ItemHeight = Math.Max(26, ScaleDpi(26));
+            if (_topologyTree is not null)
+            {
+                _topologyTree.ItemHeight = Math.Max(26, ScaleDpi(26));
+            }
+            if (_contentSplit is not null)
+            {
+                _contentSplit.SplitterWidth = Math.Max(4, ScaleDpi(6));
+                _contentSplit.Panel1MinSize = ScaleDpi(60);
+                _contentSplit.Panel2MinSize = ScaleDpi(60);
+            }
+            ResizeTopology();
+            ResizeRows();
+            AdjustMemberPanelHeight();
         }
-        if (_contentSplit is not null)
+        finally
         {
-            _contentSplit.SplitterWidth = Math.Max(4, ScaleDpi(6));
-            _contentSplit.Panel1MinSize = ScaleDpi(60);
-            _contentSplit.Panel2MinSize = ScaleDpi(60);
+            ResumeLayout(true);
         }
-        ResizeTopology();
-        ResizeRows();
-        AdjustMemberPanelHeight();
-        Invalidate(true);
     }
 
     private int ScaleDpi(int value) => ScaleDpi(value, DeviceDpi);
@@ -2410,11 +2446,19 @@ public sealed class DashboardForm : Form
             return;
         }
 
-        var width = Math.Max(100, _rowsPanel.ClientSize.Width - ScaleDpi(4));
-        foreach (Control control in _rowsPanel.Controls)
+        _rowsPanel.SuspendLayout();
+        try
         {
-            control.Width = width;
-            ResizeRowContent(control);
+            var width = Math.Max(100, _rowsPanel.ClientSize.Width - ScaleDpi(4));
+            foreach (Control control in _rowsPanel.Controls)
+            {
+                control.Width = width;
+                ResizeRowContent(control);
+            }
+        }
+        finally
+        {
+            _rowsPanel.ResumeLayout(true);
         }
 
         if (!_userAdjustedContentSplit)
@@ -2550,14 +2594,28 @@ public sealed class DashboardForm : Form
     }
 
     private const int WM_SETTINGCHANGE = 0x001A;
+    private const int WM_ENTERSIZEMOVE = 0x0231;
+    private const int WM_EXITSIZEMOVE = 0x0232;
 
     protected override void WndProc(ref Message m)
     {
-        base.WndProc(ref m);
-        if (m.Msg == WM_SETTINGCHANGE && _themeMode == AppThemeMode.System)
+        switch (m.Msg)
         {
-            ApplyTheme(AppThemeMode.System);
+            case WM_ENTERSIZEMOVE:
+                _resizing = true;
+                break;
+            case WM_EXITSIZEMOVE:
+                _resizing = false;
+                ResizeTopology();
+                ResizeRows();
+                AdjustMemberPanelHeight();
+                break;
+            case WM_SETTINGCHANGE when _themeMode == AppThemeMode.System:
+                ApplyTheme(AppThemeMode.System);
+                break;
         }
+
+        base.WndProc(ref m);
     }
 
     public async Task SetThemeModeAsync(AppThemeMode mode)

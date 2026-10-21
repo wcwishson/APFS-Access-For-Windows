@@ -466,8 +466,39 @@ public sealed class DashboardFormModernizationTests(Xunit.Abstractions.ITestOutp
         Assert.Contains("Volume \"Alpha\"", storageBar.Title);
         Assert.Contains("Alpha (Selected)", storageBar.Segments[0].Name);
 
-        // 4. Verify User-adjusted content split distance is preserved on ResizeRows
+        var detailsTopPanel = (Panel)typeof(DashboardForm).GetField("_detailsTopPanel", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(form)!;
+        var memberPanel = (FlowLayoutPanel)typeof(DashboardForm).GetField("_memberPanel", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(form)!;
         var contentSplit = (SplitContainer)typeof(DashboardForm).GetField("_contentSplit", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(form)!;
+
+        // 1. Select Store (Row is null)
+        var storeNode = allNodes.Single(n => n.Name == storeId);
+        tree.SelectedNode = storeNode;
+        typeof(DashboardForm).GetMethod("ShowSelectedNode", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(form, null);
+
+        // 2. Select Volume Alpha (Row is not null)
+        tree.SelectedNode = vol1Node;
+        typeof(DashboardForm).GetMethod("ShowSelectedNode", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(form, null);
+
+        // 3. Select Container (Row is null)
+        var contNode2 = allNodes.Single(n => n.Name == containerId);
+        tree.SelectedNode = contNode2;
+        typeof(DashboardForm).GetMethod("ShowSelectedNode", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(form, null);
+
+        // 4. Select Volume Alpha back (Row is not null)
+        tree.SelectedNode = vol1Node;
+        typeof(DashboardForm).GetMethod("ShowSelectedNode", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(form, null);
+
+        bool IsLocallyVisible(Control c) => (bool)typeof(Control).GetMethod("GetState", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(c, [2])!;
+        var visibleButtons = memberPanel.Controls.Cast<Control>().Where(IsLocallyVisible).ToList();
+        Assert.NotEmpty(visibleButtons);
+        Assert.True(memberPanel.Height >= 28, $"memberPanel.Height was {memberPanel.Height}");
+        Assert.True(detailsTopPanel.Height >= storageBar.Height + memberPanel.Height, $"detailsTopPanel.Height was {detailsTopPanel.Height}, expected at least {storageBar.Height + memberPanel.Height}");
+        foreach (var btn in visibleButtons)
+        {
+            Assert.True(btn.Width > 0 && btn.Height > 0, $"Button '{btn.Text}' had zero bounds: {btn.Bounds}");
+        }
+
+        // 4. Verify User-adjusted content split distance is preserved on ResizeRows
         typeof(DashboardForm).GetField("_userAdjustedContentSplit", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(form, true);
         contentSplit.SplitterDistance = 180;
         typeof(DashboardForm).GetMethod("ResizeRows", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(form, null);

@@ -10,7 +10,7 @@ namespace ApfsAccess.Tray.Tests;
 public sealed partial class TopologyStatusIntegrationTests
 {
     private static DeviceInventory ActionInventory() { var d = Inventory(); return d with { Volumes = d.Volumes.Select(v => v with { SupportsNativeWrite = true }).ToArray() }; }
-    private sealed class ActionPolicy : IMountPolicy { public char SelectDriveLetter(VolumeInfo v, IReadOnlySet<char> used) => 'R'; public bool ShouldAutoMount(VolumeInfo v) => true; }
+    private sealed class ActionPolicy : IMountPolicy { public char SelectDriveLetter(VolumeInfo v, IReadOnlySet<char> used) => 'R'; public bool ShouldAutoMount(VolumeInfo v) => v.VolumeId == Id(202); }
     private sealed class ActionOptions : Microsoft.Extensions.Options.IOptionsMonitor<ServiceHostOptions>
     {
         public ServiceHostOptions CurrentValue { get; } = new() { AutoMountEnabled = true, EnableNativeWrite = true, WriteRolloutChannel = "Enabled", WriteBackendMode = "Native", NativeWritePromotionPolicy = "ScaffoldOnly", ReadWriteMode = "RwWithRoFallback" };
